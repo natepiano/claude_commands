@@ -11,7 +11,7 @@ from typing import cast
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, mesh_runs
-from scripts.direct.test_verify_tree_cancel import CANCEL_LINE, VerifyTreeCancelFixture
+from scripts.direct.verify_tree_cancel_test_support import cancellation_lines, VerifyTreeCancelFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -111,7 +111,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         self.assertIn("exit 77", cancel_text)
         self.assertIn("cancelled", cancel_text.lower())
         self.assertIn("resubmit", cancel_text.lower())
-        self.assertIn(CANCEL_LINE.format(cmd="test"), cancel_text)
+        self.assertEqual(len(cancellation_lines(cancel_text, "test")), 1, cancel_text)
         self.assertNotIn("pass-only completion message", cancel_text)
         self.assertNotIn("FAIL", cancel_text)
         self.assertIn("PASS (exit 0)", pass_text)

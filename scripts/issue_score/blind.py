@@ -9,7 +9,7 @@ from typing import cast
 from uuid import uuid4
 
 from scripts.lib import conf
-from .selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
 from . import evaluate, questions, vault
 from .records import BlindAssignment, BlindFiles, BlindItem, BlindKey, BlindScore, BlindSheet, PreferenceTally, state_dir as configured_state_dir

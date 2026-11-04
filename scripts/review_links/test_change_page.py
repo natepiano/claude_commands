@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass
 from datetime import date
 from http.client import HTTPConnection
@@ -20,7 +20,7 @@ from html.parser import HTMLParser
 from io import StringIO
 from pathlib import Path
 from typing import Literal, cast, override
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from unittest.mock import patch
 from urllib.parse import urlencode, urljoin, urlsplit
 
@@ -230,10 +230,6 @@ class ChangePageTests(unittest.TestCase):
 - **Showrunner checkout:** `{self.repo}`
 - **Showrunner session:** fallback-owner
 - **Change review:** `{self.review_list}`
-## Units
-| Unit | Plan | Worktree | Branch |
-| --- | --- | --- | --- |
-| builder-unit | plan.md | /unused/feature | feature |
 """, encoding="utf-8")
         runner = fixture_member("showrunner", name="page-owner", doc=staff.LiveDoc("natedev", self.production))
         self.unit = fixture_member("unit", name="builder-unit", parent=runner.id,
@@ -259,7 +255,9 @@ class ChangePageTests(unittest.TestCase):
         _ = self.enterContext(patch.object(change_page, "deliver", side_effect=finish_delivery))
         _ = self.enterContext(patch.object(change_page, "send_message", side_effect=self.capture_message))
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
-        server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+        # Restart tests start recovery after they create the pending records.
+        with patch.object(change_page, "recover_pending"):
+            server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
         self.port = server.server_port
         self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
@@ -991,14 +989,13 @@ class ChangePageTests(unittest.TestCase):
         refreshed.feed(self.request(path, {}).body)
         self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
 
-    def test_a_units_table_name_does_not_replace_its_current_staff_session(self) -> None:
+    def test_a_renamed_unit_gets_its_current_staff_session(self) -> None:
         from scripts.production.staff_test_support import fixture_runtime_id
 
         _ = staff.rename(self.unit.id, "x")
         current = staff.update_current_session(self.unit.id, staff.native_id(fixture_runtime_id("session-x")))
         self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
         self.assertEqual(self.raw_messages[0][0], f"session:{current.current_session}")
-        self.assertIn("builder-unit", self.production.read_text())
         self.assertEqual(self.messages[0][0], "x")
 
     def test_a_delivery_resolves_the_staff_session_after_an_account_move(self) -> None:
@@ -2634,6 +2631,60 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("0 changes left", body)
         self.assertNotIn('value="next"', body)
         self.assertEqual(self.request(path, {"outcome": "next", "token": page.token}).status, 400)
+
+
+class FixtureStartupRecoveryTests(unittest.TestCase):
+    @contextmanager
+    def delayed_startup(self) -> Generator[tuple[ChangePageTests, threading.Thread], None, None]:
+        fixture = ChangePageTests()
+        deferred: list[threading.Thread] = []
+        start = threading.Thread.start
+
+        def defer_recovery(thread: threading.Thread) -> None:
+            if not deferred:
+                deferred.append(thread)
+            else:
+                start(thread)
+
+        try:
+            with patch.object(threading.Thread, "start", new=defer_recovery):
+                fixture.setUp()
+            self.assertEqual(len(deferred), 1)
+            yield fixture, deferred[0]
+        finally:
+            fixture.doCleanups()
+
+    def test_fixture_startup_cannot_clear_a_later_legacy_verdict(self) -> None:
+        with self.delayed_startup() as (fixture, recovery):
+            status = change_page.DeliveryStatus(fixture.root)
+            _ = status.path(fixture.page, "C1").write_text(json.dumps({
+                "attempt": "old-attempt", "state": "pending", "kind": "verdict",
+            }), encoding="utf-8")
+            recovery.run()
+            _ = status.begin(fixture.page, "C1", "validation", "New words")
+            self.assertEqual(status.slots(fixture.page, "C1").verdict,
+                             change_page.DeliveryIntent("old-attempt", "verdict"))
+            self.assertEqual(fixture.messages, [])
+
+    def test_fixture_startup_cannot_send_during_a_legacy_context_rewrite(self) -> None:
+        with self.delayed_startup() as (fixture, recovery):
+            status = change_page.DeliveryStatus(fixture.root)
+            _ = status.begin(fixture.page, "C1", "validation", "Keep these words")
+            path = status.path(fixture.page, "C1")
+            fields = cast(dict[str, object], json.loads(path.read_text()))
+            fields["page"] = {"review_list": "/missing-list", "production": "/wrong-production", "row": "C999"}
+            before = fixture.review_list.read_bytes()
+            recovery.run()
+            _ = path.write_text(json.dumps(fields), encoding="utf-8")
+            restarted = change_page.DeliveryStatus(fixture.root)
+            change_page.recover_pending(restarted)
+            change_page.recover_pending(restarted)
+            self.assertEqual(len(fixture.messages), 1)
+            self.assertIn("User feedback: Keep these words", fixture.messages[0][2])
+            self.assertIn(f"Production: {fixture.production}", fixture.messages[0][2])
+            self.assertNotIn("page", cast(dict[str, object], json.loads(path.read_text())))
+            self.assertEqual(fixture.review_list.read_bytes(), before)
+            self.assertIsInstance(status.slots(fixture.page, "C1").validation, change_page.ValidationRequested)
 
 
 if __name__ == "__main__":

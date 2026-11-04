@@ -11,7 +11,7 @@ from scripts.lib import conf
 from scripts.production import change_routing, staff
 import proposals_folder
 import proposals_table
-from production_units import Refusal, production_field
+from scripts.production.production_doc import Refusal, production_field
 
 if TYPE_CHECKING:
     from update_registration import QuestionStaff

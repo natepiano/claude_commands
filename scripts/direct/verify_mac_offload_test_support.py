@@ -209,6 +209,9 @@ from pathlib import Path
 import sys
 
 arguments = sys.argv[1:]
+if tuple(arguments) in (("mend", "--version"), ("+nightly", "fmt", "--version"), ("clippy", "--version")):
+    print("cargo fixture 1.0")
+    raise SystemExit(0)
 event = {
     "args": arguments,
     "token_held": Path(os.environ["TEST_TOKEN_RECORD"]).exists(),
@@ -711,7 +714,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
         self.write_executable(self.bin_directory / "git", GIT_STUB)
         self.write_executable(self.bin_directory / "rustc", RUSTC_STUB)
-        self.write_executable(self.bin_directory / "taplo", "#!/bin/sh\nexit 0\n")
+        self.write_executable(self.bin_directory / "taplo", "import sys\nif sys.argv[1:] == ['--version']:\n    print('taplo fixture 1.0')\n")
         self.write_executable(self.runner, RUNNER_STUB)
         self.write_executable(self.root / "free-now.py", FREE_NOW_STUB)
         blocker = "#!/bin/sh\nexit 99\n"
@@ -775,8 +778,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 }
             ],
         }
-        assertion_guard = self.root / "assertion-guard.py"
-        self.write_executable(assertion_guard, "raise SystemExit(0)\n")
         self.environment = {
             **config_environment(self.root),
             **{
@@ -813,7 +814,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
-            "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),

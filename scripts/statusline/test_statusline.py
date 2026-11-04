@@ -13,12 +13,13 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NotRequired, TypedDict, final, override
+from typing import NotRequired, TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
 from scripts.production import session_labels, showrunners, staff
 from scripts.shutdown import remote
+from scripts.statusline import assignment
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
@@ -32,15 +33,17 @@ ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
 
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
-                 colors: Path | str = "", own: str = "",
+                 colors: Path | str = "",
                  counts: str = "", staff_text: str = "", **marks: str) -> list[str]:
     """Run statusline.jq once over every input and return its output lines.
 
     `colors` is a file path or temporary config text; empty text omits the argument.
     """
+    record = assignment.staff_record(staff_text)
+    label, role = assignment.assignment(record, str(cast(dict[str, object], inputs[0]).get("session_id", "")) if isinstance(inputs[0], dict) else "")
     stdin = "\n".join(json.dumps(each) for each in inputs)
     stored = [] if labels is None else ["--slurpfile", "labels", str(labels)]
-    parent = ["--arg", "staff", staff_text, "--arg", "own", own, "--arg", "counts", counts]
+    parent = ["--arg", "assignment", label, "--arg", "role", role, "--arg", "counts", counts]
     with tempfile.TemporaryDirectory() as directory:
         configured: list[str] = []
         if colors:
@@ -82,6 +85,25 @@ class ShowrunnerRecord(TypedDict):
 
 
 class ColorTests(unittest.TestCase):
+    def test_direct_jq_without_a_label_shows_only_the_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            colors = Path(directory) / "statusline.conf"
+            _ = colors.write_text("role.showrunner=purple\n", encoding="utf-8")
+            for arguments in ([], ["--arg", "assignment", ""]):
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(
+                        ["jq", "-r", "--arg", "pwd", "/tmp/fallback",
+                         "--arg", "role", "showrunner", *arguments,
+                         "--rawfile", "colors", str(colors), "-f", str(PROGRAM)],
+                        input=json.dumps({"workspace": {"current_dir": "/tmp/project"}}),
+                        capture_output=True, text=True, check=True,
+                        env={"PATH": os.environ["PATH"]},
+                    )
+                    line = result.stdout.splitlines()[0]
+                    self.assertEqual(line, "/tmp/project")
+                    self.assertNotIn(" | ", line)
+                    self.assertNotIn("\x1b", line)
+
     def test_direct_jq_colors_the_entire_staff_assignment(self) -> None:
         line = status_lines({"session_id": UNIT.id}, colors=SHIPPED_COLORS, staff_text=staff_text(OWNER, UNIT))[0]
         self.assertEqual(line.split(" | ")[0], "\x1b[33mtrunk unit for show\x1b[0m")
@@ -101,17 +123,15 @@ class ColorTests(unittest.TestCase):
         payload = {**limits({"used_percentage": 20}, {"used_percentage": 9}), "session_id": OWNER.id,
                    "model": {"display_name": "Opus 5.5"}, "effort": {"level": "high"},
                    "context_window": ContextWindow(total_input_tokens=103_438, context_window_size=250_000)}
-        own = json.dumps({"sessionId": "sid", "name": "natedev"})
         for cwd, path in (("/etc/nixos/", "/etc/nixos"), (f"{home}/rust/hana_catalyst", "~/rust/hana_catalyst"),
                           (home, "~"), (f"{home}x/elsewhere", f"{home}x/elsewhere"), ("/", "/")):
             with self.subTest(cwd=cwd):
-                self.assertEqual(status_lines({**payload, "workspace": {"current_dir": cwd}}, own=own,
+                self.assertEqual(status_lines({**payload, "workspace": {"current_dir": cwd}},
                                              staff_text=staff_text(staff.StaffRow(OWNER.id, "showrunner", "natedev", None, current_session=OWNER.id)),
                                              STAFF_ID=OWNER.id), [
                     f"natedev showrunner | {path}", "claude1 | Opus 5.5 high | 103,438 | weekly 91% left"])
-        unit = json.dumps({"sessionId": "sid", "name": "cables"})
         lines = status_lines({**payload, "session_id": UNIT.id, "workspace": {"current_dir": f"{home}/rust/hana_catalyst_cables"}},
-                             own=unit, staff_text=staff_text(
+                             staff_text=staff_text(
                                  staff.StaffRow(OWNER.id, "showrunner", "hana", None, current_session=OWNER.id),
                                  staff.StaffRow(UNIT.id, "unit", "cables", OWNER.id, current_session=UNIT.id)), STAFF_ID=UNIT.id)
         self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables")
@@ -440,6 +460,20 @@ class RoleTests(unittest.TestCase):
         _ = path.write_text(staff_text(*rows), encoding="utf-8")
         return path
 
+    def test_the_unit_label_is_its_staff_name_and_never_its_plan(self) -> None:
+        runner = replace(OWNER, name="production", current_session=staff.StaffId("0c373d45-68b5-4292-85bb-2223c0ffe5b5"))
+        unit = replace(UNIT, current_session=staff.StaffId("59a78f32-fccb-4988-ae0a-a740b45a9859"),
+                       worktree=staff.PresentWorktree(remote.local_machine(), self.home))
+        _ = (self.home / ".unit.toml").write_text('plan = "docs/plans/roles.md"\nresponsibilities = []\n')
+        _ = self.write_staff(runner, unit)
+        self.assertEqual(assignment.assignment(staff.StaffSnapshot((runner, unit)), runner.current_session),
+                         ("production showrunner", "showrunner"))
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                self.assertEqual(self.first_line(runner.current_session, shell=shell), "production showrunner | ~")
+                self.assertEqual(self.first_line(unit.current_session, shell=shell),
+                                 "trunk unit for production | ~")
+
     def test_staff_assignment_survives_a_restart_without_any_environment_labels(self) -> None:
         _ = self.write_staff(OWNER, UNIT)
         self.showrunner_record(os.getpid(), "trunk", session_id="own-id")
@@ -528,13 +562,15 @@ class RoleTests(unittest.TestCase):
                         parent = reader.record.by_id(row.parent) if row.parent is not None else None
                         self.assertIsNotNone(parent)
                         assert parent is not None
-                        self.assertEqual(role, f"{row.name} unit for {parent.name}")
+                        self.assertEqual(role, f"trunk unit for {parent.name}")
 
     def test_python_and_jq_share_timer_folder_and_name_precedence(self) -> None:
         machine = remote.local_machine()
         doc = self.home / "runner's production.md"
         runner = replace(OWNER, name="hana", doc=staff.LiveDoc(machine, doc))
         folder = str(self.home / "geometry material")
+        Path(folder).mkdir()
+        _ = (Path(folder) / ".unit.toml").write_text('plan = "docs/plans/material.md"\nresponsibilities = []\n')
         unit = replace(UNIT, name="geometry-material", worktree=staff.PresentWorktree(machine, Path(folder)))
         other = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "showrunner", "other", None, current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
         duplicate = replace(unit, id=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), parent=other.id)
@@ -542,7 +578,7 @@ class RoleTests(unittest.TestCase):
         sources = {source.timer.slug: source}
         instance = self.home / ".local/state/notifier/showrunner-different-slug"
         instance.mkdir(parents=True)
-        _ = doc.write_text("# No Units table\n")
+        _ = doc.write_text("# Production\n")
         _ = (instance / "conf").write_text(
             f"TARGET=session:runner-id\nCHECK=zsh /scripts/production_check.sh {shlex.quote(str(doc))}\n")
         cases: list[tuple[str, tuple[staff.StaffRow, ...], dict[str, str], str, str, str, str]] = [
@@ -578,7 +614,7 @@ class RoleTests(unittest.TestCase):
                 self.assertEqual(row.id if row is not None else "", expected)
                 self.showrunner_record(os.getpid(), name, session_id=session_id)
                 role = ("worker" if row is not None and row.kind == "worker"
-                        else f"{row.name} unit for hana" if row is not None and row.kind == "unit"
+                        else "geometry-material unit for hana" if row is not None and row.kind == "unit"
                         else f"{row.name} showrunner" if row is not None else "unassigned")
                 for shell in SHELLS:
                     rendered = self.command_lines({"session_id": session_id, "cwd": cwd}, shell=shell, **environment)
@@ -618,6 +654,7 @@ class RoleTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         for name in ("statusline.sh", "statusline.jq"):
             _ = (scripts / name).write_text((PROGRAM.parent / name).read_text(encoding="utf-8"), encoding="utf-8")
+        (scripts / "assignment.py").symlink_to(PROGRAM.with_name("assignment.py"))
         command = f'statusline="{scripts}"; . "$statusline/statusline.sh"'
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}

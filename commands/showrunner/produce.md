@@ -24,11 +24,12 @@ When `PRODUCTION_DOC` carries `**Kind:** style`, read
 
 State:
 
-- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
+- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG` — from the production doc.
   After a `/showrunner:rename apply` succeeds, read them again from the
   renamed doc, along with `UPDATES` and `PROMPT_FILE`, which come from its
   slug: apply moves the doc, the update timer and the state directory, and
   switches `CHECKOUT` to the new merge branch.
+- `UNITS` — the production's staff rows with a present worktree. A retired row has a `RemovedWorktree`.
 - `ZONE` — the user's zone setting, which
   `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.
@@ -91,11 +92,12 @@ State:
   `/showrunner:produce PRODUCTION_DOC resume` and act first on what was in
   flight and the `Next:` line. The production doc, `LOG` and `STATE_DIR` are
   the whole state.
+  Compaction runs by itself during work. The per-call context message is off in `config/context_usage.conf`.
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
 - **A unit's pane** is looked up each time it is needed, never remembered:
   `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py where unit <slug> <unit>`
-  prints its host and pane (`<unit>` is the Units row's Unit value). No tool finds a pane by a
+  prints its host and pane (`<unit>` is the unit's staff row name). No tool finds a pane by a
   session name; the user may rename a session at any time.
 - **The user's words for a unit director** go into its terminal. Send
   `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py type unit <slug> <unit> "From the user (via the showrunner): <words>"`.
@@ -129,7 +131,7 @@ State:
   - packaging;
   - cargo-berth overlap answers, incursion resolves, orphan retirement and
     releases (<Dependencies/> rule 3);
-  - whether a unit edits files outside its **Owns**, another unit's crate
+  - whether a unit edits files outside its `.unit.toml` responsibilities, another unit's crate
     included: settle it by who holds the files on the berth board and when
     each holder merges, as <Dependencies/> rule 3 settles a file wait. No
     rule needs the user's OK for this (user, 2026-10-04).
@@ -148,7 +150,7 @@ State:
   User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
   2026-10-12: "have them available for direct interaction from me but also
   have a natural home under an L1".
-  - **A child showrunner is never a unit.** It has no Units row. Never type
+  - **A child showrunner is never a unit.** Never type
     into its pane or its units' panes. One merge exception: a same-repository
     child with `**Kind:** style` sends
     `From the showrunner of <style slug>: hand-off <hash>`. Correctness-review
@@ -213,8 +215,8 @@ State:
   - **Turn a unit into a lower showrunner only with
     `/showrunner:promote_showrunner <unit> <production doc>`**, once the unit
     has committed the new production's doc. The unit keeps its conversation,
-    restarts on the showrunner account and reports to you, and its Units row
-    retires.
+    restarts on the showrunner account and reports to you, and its staff row
+    becomes a showrunner row.
   - **Start a lower showrunner only with `/showrunner:add_showrunner
     <production doc>`**, never in your own pane and never as a unit. It gets
     its own herdr session on the selected account and is attached to you
@@ -403,7 +405,8 @@ When the production doc's **Production rules** say CI does not apply, pass
 For a planned production, run
 `python3 ~/.claude/scripts/production/production_lifecycle.py open
 --production PRODUCTION_DOC`. The command creates and pushes the merge
-branch, records the running doc and plans, and initializes `LOG`. Rerun it
+branch, records the running doc, finds the plans from staff rows and
+`.unit.toml`, and initializes `LOG`. Rerun it
 after a failed step; it resumes at the first unfinished step.
 </OpenMergeBranch>
 
@@ -416,7 +419,7 @@ phases and plans; unit pause, move and end apply to them too.
 
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
-`<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
+`<name>` is the unit's staff row name without `-unit`; the existing row is adopted.
 Use `--standby` for a unit waiting for an assignment. Tell the user one line
 per unit director: its session name and the place add_unit printed (its tab in `agents`).
 
@@ -812,15 +815,17 @@ files for a small fix checkpoint. Log each point and its result. Pass
 `--no-ci` to both calls when the production rules say CI does not apply.
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
-in the background: `zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
+in the background: `HANA_TEST_PURPOSE="CI promotion smoke" zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
 It builds, checks hana stays up 60 s, and stops it, then builds and runs each
 demo example (list in the script) for 20 s with the command you would type, so
-each starts at once from the clone `~/rust/hana_catalyst_mac`. Exit 3 means the
+each starts from a task-owned scratch clone. The script ends its `gate:` task
+and removes the clone when the run ends. Exit 3 means the
 Mac is unreachable: skip it. Exit 9 means the Mac is blocked, busy with a test,
 or its coordination state cannot be read: skip the run; it is not an outage.
 It never gates a merge; a failure (7 hana, 8 an example) goes to the unit whose
-merge it was. Never skip it: the user demos
-from that clone. User, 2026-10-04, 2026-10-05 and 2026-10-06.
+merge it was. Never skip it. For a separate test clone on either machine,
+use `copies.py clone <source> --task gate:<id>` and `scratch.py end --task gate:<id>`
+when the test ends; a phase task must name a real phase.
 </CIPoint>
 
 ---
@@ -833,7 +838,7 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    background with `dangerouslyDisableSandbox: true`:
 
    ```sh
-   bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
+   HANA_TEST_PURPOSE="promotion smoke" bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
    ```
 
    It builds `hana`, starts it on port 15790 with an empty config directory,
@@ -1149,7 +1154,7 @@ and its existing workers. See `commands/shutdown.md`.
 <Wrap>
 When every unit's final-gate and as-built checkpoints are merged:
 
-A unit whose Plan cell is `permanent` (the nightly review) is outside that
+A unit whose `.unit.toml` plan is `permanent` (the nightly review) is outside that
 condition: wrap neither waits on it nor retires its worktree or branch.
 
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
@@ -1217,8 +1222,8 @@ condition: wrap neither waits on it nor retires its worktree or branch.
     lock, run fewer at once, never none. User, 2026-10-06, replacing the
     2026-10-01 one-phase rule.
 - **Disk.** Units keep saved run output under a few GB (`/unit:direct` →
-  <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
-  find the large output before anything else. User, 2026-10-04.
+  <ToolingContract/>). When builds turn cold for no reason, check `df -h /` and, when present, `df -h /build`.
+  Find the large output before any other action. User, 2026-10-04.
 - Never ask the user to review until <DesignCheck/> passed on the shots.
 - Never pass on a unit director's claim without checking it.
 - Updates hold only what the schedule prompt allows.

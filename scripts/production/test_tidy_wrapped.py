@@ -25,7 +25,7 @@ SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
 
 
 def production(status: str) -> str:
-    return f"# Example\n\n> **Status: PRODUCTION — {status}.** One line.\n\n## Units\n"
+    return f"# Example\n\n> **Status: PRODUCTION — {status}.** One line.\n"
 
 
 class TidyWrappedTests(unittest.TestCase):
@@ -71,8 +71,10 @@ class TidyWrappedTests(unittest.TestCase):
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
                                           "cleanup@example.invalid", {"file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
-        _ = doc.write_text(doc.read_text() + "\n| Unit | Plan |\n| --- | --- |\n"
-                           + "| alpha-unit | standby |\n| beta-unit | (retired) plan.md |\n")
+        owner = fixture_member("showrunner", name="done", doc=staff.WrappedDoc("natedev", doc.resolve()))
+        _ = fixture_member("unit", name="alpha-unit", parent=owner.id)
+        _ = fixture_member("unit", name="beta-unit", parent=owner.id,
+                           worktree=staff.RemovedWorktree("natedev", self.root / "beta"))
         state = self.state_files("done")
         with copies.standing("alpha-unit", source, "HEAD") as unit_tree:
             with copies.standing("done", source, "HEAD") as production_tree:
@@ -113,7 +115,8 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_wrap_accepts_production_and_unit_names_that_cannot_own_copies(self) -> None:
         doc = self.doc("Done_Name", "wrapped")
-        _ = doc.write_text(doc.read_text() + "\n| Unit | Plan |\n| --- | --- |\n| Alpha_unit | standby |\n")
+        owner = fixture_member("showrunner", name="Done_Name", doc=staff.WrappedDoc("natedev", doc))
+        _ = fixture_member("unit", name="Alpha_unit", parent=owner.id)
         state = self.state_files("Done_Name")
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -1267,8 +1267,12 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
 def _reviewer_destination(
     run: Path, working_dir: Path | NoLauncherWorkingDirectory = NO_LAUNCHER_WORKING_DIRECTORY,
 ) -> str:
+    from scripts.direct import plan_history
+    from scripts.production import staff
+
     state = worker_lifecycle.read_json_object(run / STATE)
-    directory = _text(state.get("working_dir"))
+    current = plan_history.staff_directory(dict(state), staff.initial_snapshot())
+    directory = _text(current.get("working_dir"))
     if not directory and isinstance(working_dir, Path):
         directory = str(working_dir.expanduser().resolve())
     if not directory:
@@ -1723,7 +1727,7 @@ def _run_unit(state: dict[str, object]) -> tuple[str, str]:
 
 
 def find_moved_unit_runs(units: tuple[UnitWorktree, ...], former: tuple[str, ...]) -> WorkerRepairSearch:
-    """Match missing run or worker paths to current Units rows without changing state."""
+    """Match missing run or worker paths to current unit staff rows without changing state."""
     from scripts.lib import unit_runs
     grouped: dict[tuple[UnitWorktree, Path], set[Path]] = {}
     skipped: list[str] = []

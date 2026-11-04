@@ -34,7 +34,7 @@ import fake_herdr
 from fake_herdr import CommandResponse
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import staff
+from scripts.production import staff, fake_unit_host
 from scripts.message import sessions
 from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
@@ -94,6 +94,11 @@ def codex_launch_evidence(root: Path, argv: list[str]) -> Generator[dict[str, ob
     identity = fixture_runtime_id("herdr-codex-launch")
     proc = root / "codex-launch-proc"
     (proc / str(pid) / "fd").mkdir(parents=True, exist_ok=True)
+    _ = (proc / str(pid) / "cmdline").write_bytes("\0".join(argv).encode())
+    if "resume" not in argv:
+        rollout = root / "rollout-launch.jsonl"
+        write_text_atomic(rollout, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+        (proc / str(pid) / "fd" / "7").symlink_to(rollout)
 
     def environment(observed_pid: int) -> dict[str, str]:
         if observed_pid != pid:
@@ -125,6 +130,40 @@ def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, objec
 
 
 class NativePaneSessionTests(StaffTestCase):
+    def test_codex_native_process_refuses_an_unheld_thread_from_environment(self) -> None:
+        identity = fixture_runtime_id("unheld-thread")
+        proc = self.root / "unheld-proc"
+        process = proc / "998079"
+        (process / "fd").mkdir(parents=True)
+        for arguments in (["codex"], ["codex", "app-server", "--managed-daemon"],
+                          ["codex", "exec", "resume", identity],
+                          ["codex", "-c", "resume", identity]):
+            _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
+            with (self.subTest(arguments=arguments),
+                  patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+                  patch.object(herdr, "_PLATFORM", "linux"),
+                  patch.object(sessions, "process_start", return_value="same-process"),
+                  patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": identity})):
+                with self.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
+                    _ = herdr.native_process(998079, "codex")
+
+    def test_codex_native_process_accepts_only_the_thread_in_its_resume_arguments(self) -> None:
+        identity = fixture_runtime_id("argv-thread")
+        wrong = fixture_runtime_id("wrong-thread")
+        proc = self.root / "resume-proc"
+        process = proc / "998079"
+        (process / "fd").mkdir(parents=True)
+        for arguments in (["codex", "resume", identity],
+                          ["node", "/opt/@openai/codex/bin/codex.js", "resume", identity],
+                          ["codex", "-m", "model", "resume", identity]):
+            _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
+            with (self.subTest(arguments=arguments),
+                  patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+                  patch.object(herdr, "_PLATFORM", "linux"),
+                  patch.object(sessions, "process_start", return_value="same-process"),
+                  patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": wrong})):
+                self.assertEqual(herdr.native_process(998079, "codex").identity, identity)
+
     def test_codex_daemon_client_uses_resume_id_without_rollout_or_exported_thread(self) -> None:
         identity = fixture_runtime_id("daemon-client-resume")
         arguments = ["resume", identity]
@@ -160,7 +199,7 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertIsInstance(startup.activity, herdr.AgentProcessPresent)
             launch = client.codex_launch("w1:p1")
             self.assertEqual(launch["session_id"], identity)
-        self.assertEqual(native.call_args_list, [call(998075, "codex"), call(998075, "codex", resume_id="")])
+        self.assertEqual(native.call_args_list, [call(998075, "codex")] * 2)
 
     def test_native_pane_process_returns_the_proved_account_and_launch_identity_for_the_exact_codex_pid(self) -> None:
         current = fixture_runtime_id("pane-current-thread")
@@ -198,6 +237,7 @@ class NativePaneSessionTests(StaffTestCase):
         launch = fixture_runtime_id("native-fallback-launch")
         proc = self.root / "fallback-proc"
         (proc / "998076" / "fd").mkdir(parents=True)
+        _ = (proc / "998076" / "cmdline").write_bytes(f"codex\0resume\0{launch}\0".encode())
         environment = {"CODEX_THREAD_ID": launch, "CODEX_HOME": str(self.root / ".codex2")}
         payload = {"result": {"process_info": {"foreground_processes": [
             {"pid": 998076, "argv": ["codex", "resume", launch]}]}}}
@@ -261,6 +301,17 @@ class NativePaneSessionTests(StaffTestCase):
 
 
 class CodexAnomalyNameTests(StaffTestCase):
+    def test_codex_managed_daemon_distinguishes_thread_holders(self) -> None:
+        managed = ["/opt/bin/codex", "app-server", "--listen", "unix://",
+                   "--analytics-default-enabled", "--managed-daemon"]
+        wrapped = ["node", "/opt/@openai/codex/bin/codex.js", *managed[1:]]
+        for arguments, expected in ((managed, True), (wrapped, True),
+                (["nodejs", *wrapped[1:]], True), (managed[:-1], False),
+                (["codex", "resume", "thread"], False), ([], False),
+                (["other", "app-server", "--managed-daemon"], False)):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(herdr.codex_managed_daemon(arguments), expected)
+
     def test_daemon_rollouts_prove_threads_without_notes_from_its_tui_clients(self) -> None:
         proc = self.root / "proc"
         process = proc / "42"
@@ -286,6 +337,13 @@ class CodexAnomalyNameTests(StaffTestCase):
             self.assertEqual(output.getvalue(), "")
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 _ = herdr.codex_rollout_thread(42)
+            _ = (process / "cmdline").write_bytes(b"codex\0app-server\0--managed-daemon\0")
+            live = sorted(identities)[0]
+            (proc / "43" / "fd" / "0").symlink_to(self.root / f"rollout-{live}.jsonl")
+            self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), {live})
+            (proc / "43" / "fd" / "0").unlink()
+            self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), set())
+            self.assertEqual(output.getvalue(), "")
 
     def assert_unknown_codex_note(self, source: Literal["tab", "registry", "pid"]) -> None:
         pid = 998071
@@ -1320,6 +1378,29 @@ class LaunchDestinationTests(StaffTestCase):
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
 
+    def test_pane_launch_waits_for_shell_cleanup_before_sending_the_command(self) -> None:
+        client = herdr.Herdr("agents")
+        clock = StartupClock()
+
+        def advance(seconds: float) -> None:
+            clock.elapsed += seconds
+
+        def checked(*_args: object, **_kwargs: object) -> bool:
+            self.assertFalse(run.called)
+            if clock.elapsed < 0.2:
+                raise herdr.HerdrFailure("pane runs other work: direnv, bash", "wrong_target")
+            return clock.elapsed >= 0.4
+
+        with (patch.object(herdr, "check_target", side_effect=checked) as check,
+              patch.object(herdr, "_pane_row", return_value=herdr.NoPane("worker")),
+              patch.object(time, "monotonic", lambda: clock.elapsed),
+              patch.object(time, "sleep", side_effect=advance),
+              patch.object(client, "run") as run):
+            client.run_in_pane("worker", ["claude", "--resume", "thread"])
+        self.assertGreaterEqual(check.call_count, 5)
+        self.assertGreaterEqual(clock.elapsed, 0.4)
+        run.assert_called_once_with("pane", "run", "worker", "claude --resume thread")
+
     def test_all_destinations_start_and_label_before_start(self) -> None:
         run_in_pane = herdr.Herdr.run_in_pane
         for destination in (herdr.NewTab("workers", "worker"),
@@ -1557,7 +1638,9 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             def activity_read(_shell: herdr.PaneShell, _kind: str,
                               _tracked: set[herdr.AgentProcessIdentity]) -> herdr.PaneAtShell | herdr.PaneRunning:
                 return client.pane_activity("w1:p1")
-            with patch.object(herdr, "_startup_processes", side_effect=activity_read):
+            with (patch.object(herdr, "_startup_processes", side_effect=activity_read),
+                  patch.object(client, "result", return_value=self.listing()),
+                  patch.object(client, "pane_activity", return_value=herdr.PaneAtShell())):
                 yield client, path, entry
 
 
@@ -1577,13 +1660,8 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             rows = self.rows()
             def close(pane: str) -> None:
                 rows[:] = [row for row in rows if row["pane_id"] != pane]
-            def activity_read(_shell: herdr.PaneShell, _kind: str,
-                              _tracked: set[herdr.AgentProcessIdentity]) -> herdr.PaneAtShell | herdr.PaneRunning:
-                return client.pane_activity("w1:p1")
-            with (patch.object(client, "result", return_value=self.listing()),
-                  patch.object(client, "panes", side_effect=lambda: list(rows)),
+            with (patch.object(client, "panes", side_effect=lambda: list(rows)),
                   patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()) as activity,
-                  patch.object(herdr, "_startup_processes", side_effect=activity_read),
                   patch.object(client, "_close_pane", side_effect=close) as closed,
                   patch.object(pane_launch, "retire_launch", wraps=pane_launch.retire_launch) as retired):
                 client.close_retained_pane("w1:p1", terminal="term-one")
@@ -1598,9 +1676,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             with self.subTest(terminal=terminal), self.retained() as (client, path, entry):
                 fresh = self.rows()
                 fresh[0]["terminal_id"] = terminal
-                with (patch.object(client, "result", return_value=self.listing()),
-                      patch.object(client, "panes", return_value=fresh),
-                      patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()),
+                with (patch.object(client, "panes", return_value=fresh),
                       patch.object(client, "_close_pane") as closed,
                       self.assertRaisesRegex(herdr.HerdrFailure, "terminal identity changed")):
                     client.close_retained_pane("w1:p1")
@@ -1612,9 +1688,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
         with self.retained() as (client, path, entry):
             moved = {**self.rows()[0], "pane_id": "w2:p1", "workspace_id": "w2"}
             errors = io.StringIO()
-            with (patch.object(client, "result", return_value=self.listing()),
-                  patch.object(client, "panes", side_effect=[self.rows(), [moved, self.rows()[1]]]),
-                  patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()),
+            with (patch.object(client, "panes", side_effect=[self.rows(), [moved, self.rows()[1]]]),
                   patch.object(client, "_close_pane"),
                   redirect_stderr(errors)):
                 self.assertIsNone(client.close_retained_pane("w1:p1"))
@@ -1624,8 +1698,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
 
     def test_close_refuses_proved_foreground_work_and_keeps_the_launch(self) -> None:
         with self.retained() as (client, path, entry):
-            with (patch.object(client, "result", return_value=self.listing()),
-                  patch.object(client, "pane_activity", return_value=herdr.PaneRunning(("editor",))),
+            with (patch.object(client, "pane_activity", return_value=herdr.PaneRunning(("editor",))),
                   patch.object(client, "_close_pane") as closed,
                   self.assertRaisesRegex(herdr.HerdrFailure, "pane runs other work: editor")):
                 client.close_retained_pane("w1:p1")
@@ -1636,9 +1709,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
     def test_unconfirmed_close_keeps_the_launch_for_a_rerun(self) -> None:
         with self.retained() as (client, path, entry):
             errors = io.StringIO()
-            with (patch.object(client, "result", return_value=self.listing()),
-                  patch.object(client, "panes", return_value=self.rows()),
-                  patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()),
+            with (patch.object(client, "panes", return_value=self.rows()),
                   patch.object(client, "_close_pane") as closed,
                   redirect_stderr(errors)):
                 self.assertIsNone(client.close_retained_pane("w1:p1"))
@@ -1651,23 +1722,16 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
 
     def test_a_pane_that_stays_open_keeps_its_launch_record(self) -> None:
         with self.retained() as (client, path, entry):
-            commands: list[tuple[str, ...]] = []
-            def transport(*arguments: str, deadline: float = math.inf) -> str:
-                del deadline
-                commands.append(arguments)
-                return "{}"
             with (patch.object(client, "panes", return_value=self.rows()),
-                  patch.object(client, "result", return_value=self.listing()),
-                  patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()),
-                  patch.object(client, "run", side_effect=transport)):
+                  patch.object(client, "run", return_value="{}") as sent):
                 client.close_retained_pane("w1:p1", terminal="term-one")
+            commands = [cast(tuple[str, ...], event.args) for event in sent.call_args_list]
             self.assertIn(("pane", "close", "w1:p1"), commands)
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)
 
     def test_a_terminal_that_moves_during_close_keeps_its_launch_record(self) -> None:
         with self.retained() as (client, path, entry):
             moved = False
-            commands: list[tuple[str, ...]] = []
             def rows() -> list[herdr.PaneIdentity]:
                 original = self.rows()
                 if moved:
@@ -1676,15 +1740,13 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             def transport(*arguments: str, deadline: float = math.inf) -> str:
                 nonlocal moved
                 del deadline
-                commands.append(arguments)
                 if arguments == ("pane", "close", "w1:p1"):
                     moved = True
                 return "{}"
             with (patch.object(client, "panes", side_effect=rows),
-                  patch.object(client, "result", return_value=self.listing()),
-                  patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()),
-                  patch.object(client, "run", side_effect=transport)):
+                  patch.object(client, "run", side_effect=transport) as sent):
                 client.close_retained_pane("w1:p1", terminal="term-one")
+            commands = [cast(tuple[str, ...], event.args) for event in sent.call_args_list]
             self.assertIn(("pane", "close", "w1:p1"), commands)
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)
 
@@ -2854,17 +2916,18 @@ class HerdrTests(unittest.TestCase):
         terminal = before.get("terminal_id", "")
         self.assertTrue(terminal)
         self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w2"], json.dumps({"result": {
-            "move_result": {"created_tab": {"tab_id": "w2:t7"}, "pane": {"pane_id": "w2:p9"}}}}))
-        moved = self.herdr.move_pane_to_tab(pane, "w2", "alpha")
+            "move_result": {"changed": True, "created_tab": {"tab_id": "w2:t7"}, "pane": {"pane_id": "w2:p9"}}}}))
+        moved = "w2:p9"
+        _ = self.herdr.result("pane", "move", pane, "--new-tab", "--workspace", "w2")
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
-            {"pane_id": moved.pane, "label": "alpha"}]}}))
+            {"pane_id": moved, "label": "alpha"}]}}))
         after_move = self.herdr.panes()[0]
         self.assertEqual(after_move["session_id"], session_id)
         self.assertEqual(after_move.get("terminal_id"), terminal)
         inherited = (shell / "environ").read_bytes()
         shutil.rmtree(agent)
         after_exit = self.herdr.panes()[0]
-        self.assertEqual(after_exit["pane_id"], moved.pane)
+        self.assertEqual(after_exit["pane_id"], moved)
         self.assertIsNone(after_exit["session_id"])
         self.assertEqual(after_exit.get("terminal_id"), terminal)
         self.assertEqual((shell / "environ").read_bytes(), inherited)
@@ -2919,21 +2982,20 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(self.herdr.tab_sessions(), [herdr.TabSession("w1:p1", "missing", "", None),
                                                      herdr.TabSession("w2:p1", "unlabelled", "", None)])
 
-    def test_session_of_and_lookup_share_exact_label_and_ambiguity_rules(self) -> None:
+    def test_session_of_keeps_exact_label_and_ambiguity_rules(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p1", "label": "alpha"}, {"pane_id": "w1:p2", "label": "alpha-extra"},
             {"pane_id": "w2:p1", "label": "duplicate"}, {"pane_id": "w3:p1", "label": "duplicate"},
             {"pane_id": "w1:p3", "label": ""}, {"pane_id": "w1:p4", "label": None}]}}))
         client = self.herdr
-        cases = [("alpha", herdr.PaneFound("w1:p1"), herdr.TabSession("w1:p1", "alpha", "", None)),
-                 ("", herdr.PaneFound("w1:p3"), herdr.TabSession("w1:p3", "", "", None)),
-                 ("Alpha", herdr.NoPane("Alpha"), herdr.NoPane("Alpha")),
-                 ("alph", herdr.NoPane("alph"), herdr.NoPane("alph")),
-                 ("missing", herdr.NoPane("missing"), herdr.NoPane("missing")),
-                 ("duplicate", herdr.SeveralPanes("duplicate", 2), herdr.SeveralPanes("duplicate", 2))]
-        for label, pane, tab in cases:
+        cases = [("alpha", herdr.TabSession("w1:p1", "alpha", "", None)),
+                 ("", herdr.TabSession("w1:p3", "", "", None)),
+                 ("Alpha", herdr.NoPane("Alpha")),
+                 ("alph", herdr.NoPane("alph")),
+                 ("missing", herdr.NoPane("missing")),
+                 ("duplicate", herdr.SeveralPanes("duplicate", 2))]
+        for label, tab in cases:
             with self.subTest(label=label):
-                self.assertEqual(client.lookup(label), pane)
                 self.assertEqual(client.session_of(label), tab)
 
     def test_panes_reads_session_values_and_allows_absent_conversations(self) -> None:
@@ -3103,17 +3165,6 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
                          [("boss", layout_row_ids(["boss", "alpha"]))])
 
-    def test_move_pane_to_tab_keeps_running_pane_and_titles_only_the_created_tab(self) -> None:
-        self.configure_herdr(["pane", "move", "w1:p2", "--new-tab", "--workspace", "w2"], json.dumps({"result": {
-            "move_result": {"created_tab": {"tab_id": "w2:t7"}, "pane": {"pane_id": "w2:p9"}},
-        }}))
-        placed = self.herdr.move_pane_to_tab("w1:p2", "w2", "models")
-        self.assertEqual(placed, herdr.TabWithPane("w2:p9", "w2:t7"))
-        self.assertEqual([command[2:] for command in self.commands()], [
-            ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w2"],
-            ["tab", "rename", "w2:t7", "models"],
-        ])
-
     def test_fake_refuses_workspace_labels_before_reading_responses(self) -> None:
         self.responses_path.unlink()
         for workspace in ("sdlc", "wlower", "w", "wD-label"):
@@ -3135,72 +3186,48 @@ class HerdrTests(unittest.TestCase):
                 result = self.run_fake([str(self.fake), "--session", "fixture", *command])
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "workspace tabs", ""))
 
-    def test_move_pane_to_workspace_uses_its_id_and_returns_the_pane_after_ordering(self) -> None:
-        _ = unit_membership("target", "models")
-        _ = fixture_member("showrunner", name="apple-terminal")
-        members = {row.name: row for row in staff.initial_snapshot().rows}
-        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
-            {"workspace_id": "w1", "label": "source"}, {"workspace_id": "w2", "label": "target"}]}}))
-        for pane, tab, moved in (("w1:p2", "w2:t7", "w2:p9"), ("w2:p9", "w2:t8", "w2:p11"),
-                                  ("w2:p2", "w2:t9", "w2:p12")):
-            self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w2"], json.dumps({"result": {
-                "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": moved}}}}))
-        self.configure_herdr(["tab", "list", "--workspace", "w2"], json.dumps({"result": {"tabs": [
-            {"tab_id": "w2:t1", "label": "target", "pane_count": 1},
-            {"tab_id": "w2:t2", "label": "apple-terminal", "pane_count": 1},
-            {"tab_id": "w2:t7", "label": "models", "pane_count": 1}]}}))
-        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
-            {"pane_id": pane, "tab_id": tab, "agent_session": {"value": members[name].current_session}}
-            for pane, tab, name in (("w2:p1", "w2:t1", "target"), ("w2:p2", "w2:t2", "apple-terminal"),
-                                    ("w2:p9", "w2:t7", "models"))]}}))
-        self.configure_herdr(["tab", "list"], json.dumps({"result": {"tabs": [
-            {"tab_id": "w2:t1", "workspace_id": "w2", "label": "target"},
-            {"tab_id": "w2:t8", "workspace_id": "w2", "label": "models"},
-            {"tab_id": "w2:t9", "workspace_id": "w2", "label": "apple-terminal"}]}}))
-        self.assertEqual(self.herdr.move_pane_to_workspace("w1:p2", "target", "models"), "w2:p11")
-        self.assertEqual([command[2:] for command in self.commands()], [
-            ["workspace", "list"], ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w2"],
-            ["tab", "rename", "w2:t7", "models"], ["workspace", "list"], ["tab", "list", "--workspace", "w2"],
-            ["pane", "list"], ["pane", "move", "w2:p9", "--new-tab", "--workspace", "w2"],
-            ["tab", "rename", "w2:t8", "models"], ["pane", "move", "w2:p2", "--new-tab", "--workspace", "w2"],
-            ["tab", "rename", "w2:t9", "apple-terminal"], ["workspace", "list"], ["tab", "list"], ["pane", "list"],
-        ])
-        self.assertEqual([tab["name"] for space in herdr.saved_layout("fixture")["workspaces"]
-                          if space["name"] == "target" for tab in space["tabs"]], layout_row_ids(["target", "models", "apple-terminal"]))
 
-    def test_order_tabs_puts_the_showrunner_first_then_moves_each_tab_out_of_place(self) -> None:
-        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
-            {"workspace_id": "w1", "label": "boss", "focused": False, "active_tab_id": "w1:t2"},
-            {"workspace_id": "w2", "label": "other", "focused": True, "active_tab_id": "w2:t1"}]}}))
-        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
-            {"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "delta", "pane_count": 1},
-            {"tab_id": "w1:t3", "label": "alpha", "pane_count": 1}]}}))
-        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
-            {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"},
-            {"pane_id": "w1:p3", "tab_id": "w1:t3"}, {"pane_id": "w2:p1", "tab_id": "w2:t1"}]}}))
-        for pane, tab in (("w1:p3", "w1:t4"), ("w1:p2", "w1:t5")):
-            self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w1"], json.dumps({"result": {
-                "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": pane}}}}))
-        self.assertEqual(herdr.Herdr("fixture").order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[])), {"w1:p3": "w1:p3", "w1:p2": "w1:p2"})
-        acted = [command[2:] for command in self.commands() if command[2:4] not in (["workspace", "list"], ["tab", "list"],
-                                                                                     ["pane", "list"])]
-        self.assertEqual(acted, [["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t4", "alpha"],
-                                 ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t5", "delta"],
-                                 ["tab", "focus", "w1:t5"], ["workspace", "focus", "w2"]])
+    def test_order_tabs_preserves_split_ids_and_moves_only_tabs_out_of_place(self) -> None:
+        _ = unit_membership("boss", "zulu")
+        cases = [(("boss", "delta", "alpha"), -1, False, ["boss", "alpha", "delta"], "alpha", 1),
+                 (("boss", "zed", "alpha"), 0, False, ["boss", "boss", "alpha", "zed"], "alpha", 1),
+                 (("boss", "zed", "alpha"), 2, False, ["boss", "alpha", "alpha", "zed"], "alpha", 1),
+                 (("boss", "alpha", "zed"), -1, False, ["boss", "alpha", "zed"], "", 0),
+                 *(( ("boss", "zulu", "zebra", "apple"), 1, reverse,
+                    ["boss", "zulu", "zulu", "apple", "zebra"], "apple", 2) for reverse in (False, True))]
+        for titles, split, reverse, expected, moved_title, position in cases:
+            with self.subTest(titles=titles, split=split, reverse=reverse):
+                client = LayoutHerdr()
+                client.spaces = [("w1", "boss"), ("w2", "other")]
+                for title in titles:
+                    _ = client.add_tab("w1", title)
+                by_title = {pane["label"]: pane for pane in client.tabs}
+                if split >= 0:
+                    client.tabs.insert(split if reverse else split + 1, {**client.tabs[split], "pane_id": "split-pane"})
+                before = {pane["pane_id"]: pane["tab_id"] for pane in client.tabs}
+                processes = [herdr.HerdrProcess(991004, herdr.HerdrPlace("fixture", by_title["zulu"]["pane_id"]),
+                    {"SHOWRUNNER_UNIT": "boss", "SHOWRUNNER_UNIT_ID": "zulu"}, "claude", "/repo")] if "zulu" in by_title else []
+                with patch.object(herdr, "herdr_processes", return_value=processes):
+                    moved = client.order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[]))
+                self.assertEqual(client.layout(), [("boss", expected), ("other", [])])
+                self.assertEqual({pane["pane_id"]: pane["tab_id"] for pane in client.tabs}, before)
+                self.assertEqual(moved, {pane: pane for pane, tab in before.items()
+                                         if moved_title and tab == by_title[moved_title]["tab_id"]})
+                self.assertEqual(client.commands, [("tab.move", by_title[moved_title]["tab_id"], str(position))] if moved_title else [])
 
     def test_retitle_names_the_pane_and_tab_then_orders_only_on_a_change(self) -> None:
-        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+        self.configure_herdr(["tab", "list"], json.dumps({"result": {"tabs": [
             {"tab_id": "w1:t1", "label": "boss"}, {"tab_id": "w1:t2", "label": "old-name"}]}}))
         for label, changed in (("old-name", True), ("new-name", False)):
             with self.subTest(label=label):
                 self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
                     {"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1", "label": label}]}}))
                 if not changed:
-                    self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+                    self.configure_herdr(["tab", "list"], json.dumps({"result": {"tabs": [
                         {"tab_id": "w1:t2", "label": "new-name"}]}}))
                 self.log.unlink(missing_ok=True)
                 with patch.object(herdr.Herdr, "order_tabs", return_value={}) as ordered:
-                    self.assertEqual(herdr.Herdr("fixture").retitle("w1:p2", "new-name"), changed)
+                    self.assertEqual(herdr.Herdr("fixture").retitle("w1:p2", "new-name", tab=True), changed)
                 acted = [command[2:] for command in self.commands() if command[3:4] == ["rename"]]
                 self.assertEqual(acted, [["pane", "rename", "w1:p2", "new-name"], ["tab", "rename", "w1:t2", "new-name"]]
                                  if changed else [])
@@ -4556,57 +4583,6 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]])
 
 
-    def test_order_tabs_leaves_a_tab_with_several_panes_and_an_ordered_space_alone(self) -> None:
-        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
-            {"workspace_id": "w1", "label": "boss", "focused": True, "active_tab_id": "w1:t1"}]}}))
-        for pane, tab in (("w1:p3", "w1:t4"), ("w1:p2", "w1:t5")):
-            self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w1"], json.dumps({"result": {
-                "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": pane}}}}))
-        for split_first, split_last, ordered in ((True, False, False), (False, True, False), (False, False, True)):
-            with self.subTest(split_first=split_first, split_last=split_last, ordered=ordered):
-                titles = ("boss", "alpha", "zed") if ordered else ("boss", "zed", "alpha")
-                tabs = [{"tab_id": f"w1:t{index}", "label": title,
-                         "pane_count": 2 if (index == 1 and split_first) or (index == 3 and split_last) else 1}
-                        for index, title in enumerate(titles, 1)]
-                self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": tabs}}))
-                panes = [{"pane_id": f"w1:p{index}", "tab_id": f"w1:t{index}"} for index in (1, 2, 3)]
-                if split_first or split_last:
-                    panes.append({"pane_id": "w1:p4", "tab_id": "w1:t1" if split_first else "w1:t3"})
-                self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
-                self.log.unlink(missing_ok=True)
-                moved = herdr.Herdr("fixture").order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[]))
-                self.assertEqual(moved, {"w1:p3": "w1:p3", "w1:p2": "w1:p2"} if split_first else {})
-                acted = [command[2:] for command in self.commands() if command[3:4] in (["move"], ["rename"], ["focus"])]
-                self.assertEqual(acted, [
-                    ["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t4", "alpha"],
-                    ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t5", "zed"],
-                    ["tab", "focus", "w1:t1"]] if split_first else [])
-
-
-    def test_order_tabs_detects_a_unit_in_any_pane_of_an_unchanged_split_tab(self) -> None:
-        _ = unit_membership("boss", "zulu")
-        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
-            {"workspace_id": "w1", "label": "boss", "focused": True, "active_tab_id": "w1:t1"}]}}))
-        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
-            {"tab_id": f"w1:t{index}", "label": title, "pane_count": 2 if index == 2 else 1}
-            for index, title in enumerate(("boss", "zulu", "zebra", "apple"), 1)]}}))
-        for pane, tab in (("w1:p4", "w1:t5"), ("w1:p3", "w1:t6")):
-            self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w1"], json.dumps({"result": {
-                "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": pane}}}}))
-        processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p2"),
-                                       {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "one"}, "claude", "/repo")]
-        for split_panes in (("w1:p2", "w1:p5"), ("w1:p5", "w1:p2")):
-            with self.subTest(split_panes=split_panes), patch.object(herdr, "herdr_processes", return_value=processes):
-                panes = [{"pane_id": f"w1:p{index}", "tab_id": f"w1:t{index}"} for index in (1, 3, 4)]
-                panes.extend({"pane_id": pane, "tab_id": "w1:t2"} for pane in split_panes)
-                self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
-                self.log.unlink(missing_ok=True)
-                self.assertEqual(herdr.Herdr("fixture").order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[])),
-                                 {"w1:p4": "w1:p4", "w1:p3": "w1:p3"})
-                moved_panes = [command[4] for command in self.commands() if command[2:4] == ["pane", "move"]]
-                self.assertEqual(moved_panes, ["w1:p4", "w1:p3"])
-
-
     def test_shared_session_is_never_stopped_and_close_agent_closes_only_the_tab(self) -> None:
         self.share()
         self.configure_startup_shell("w1:p2")
@@ -4920,28 +4896,40 @@ class HerdrTests(unittest.TestCase):
 
 
 def layout_row_ids(names: list[str]) -> list[str]:
-    record = staff.initial_snapshot()
-    identities: list[str] = []
-    for name in names:
-        row = next((row for row in record.rows if row.name == name), None)
-        assert row is not None
-        identities.append(row.id)
-    return identities
+    rows = staff.initial_snapshot().rows
+    return [next(row.id for row in rows if row.name == name) for name in names]
 
 
 class LayoutHerdr(herdr.Herdr):
     """An in-memory herdr session: workspaces and tabs in order, one pane per tab."""
 
-    def __init__(self) -> None:
-        super().__init__("fixture")
+    def __init__(self, session: str = "fixture") -> None:
+        super().__init__(session)
         self.spaces: list[tuple[str, str]] = []
         self.tabs: list[dict[str, str]] = []
         self.count: int = 0
+        self.commands: list[tuple[str, ...]] = []
+        self.focused_pane: str = ""
+        self.focused_workspace: str = ""
 
     @override
-    def _close_placeholders(self, workspace: str) -> None:
+    def socket_request(self, method: str, **params: object) -> dict[str, object]:
+        self.commands.append((method, *(str(value) for value in params.values())))
+        if method != "tab.move":
+            raise AssertionError(f"unexpected socket request {method}: {params}")
+        tab_id, index = str(params["tab_id"]), params["insert_index"]
+        assert isinstance(index, int)
+        workspace = next(pane["workspace_id"] for pane in self.tabs if pane["tab_id"] == tab_id)
+        siblings = list(dict.fromkeys(pane["tab_id"] for pane in self.tabs if pane["workspace_id"] == workspace))
+        siblings.insert(index, siblings.pop(siblings.index(tab_id)))
+        ordered = iter(pane for tab in siblings for pane in self.tabs if pane["tab_id"] == tab)
+        self.tabs = [next(ordered) if pane["workspace_id"] == workspace else pane for pane in self.tabs]
+        return {}
+
+    @override
+    def _close_placeholders(self, workspace: str) -> bool:
         with patch.object(herdr, "Herdr", return_value=self):
-            super()._close_placeholders(workspace)
+            return super()._close_placeholders(workspace)
 
     @override
     def startup_processes(self, pane: str, kind: str, timeout: float) -> herdr.PaneStartupObservation:
@@ -4975,37 +4963,49 @@ class LayoutHerdr(herdr.Herdr):
     @override
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
         self.require_time(deadline)
-        words = list(arguments)
-        match words[:2]:
+        match arguments[:2]:
+            case ["agent", "list"]:
+                return {"agents": []}
             case ["pane", "process-info"]:
-                activity = self.pane_activity(words[-1])
+                activity = self.pane_activity(arguments[-1])
                 command = activity.commands[0] if isinstance(activity, herdr.PaneRunning) else "zsh"
                 foreground = 43 if isinstance(activity, herdr.PaneRunning) else 42
                 return {"process_info": {"shell_pid": 42, "foreground_process_group_id": foreground,
                     "foreground_processes": [{"pid": foreground, "name": command, "argv": [command]}]}}
             case ["workspace", "list"]:
-                return {"workspaces": [{"workspace_id": ident, "label": label, "focused": False} for ident, label in self.spaces]}
+                focused = next((pane for pane in self.tabs if pane["pane_id"] == self.focused_pane), dict[str, str]())
+                return {"workspaces": [{"workspace_id": ident, "label": label,
+                    "focused": ident == (self.focused_workspace or focused.get("workspace_id")), "active_tab_id": focused.get("tab_id", "")}
+                    for ident, label in self.spaces]}
             case ["workspace", "create"]:
                 ident = self.new_id("w")
-                self.spaces.append((ident, words[words.index("--label") + 1]))
+                self.spaces.append((ident, arguments[arguments.index("--label") + 1]))
                 result = self.add_tab(ident, herdr.LAYOUT_PLACEHOLDER)
-                return result
+                return {**result, "workspace": {"workspace_id": ident}}
             case ["tab", "create"]:
-                return self.add_tab(words[words.index("--workspace") + 1], words[words.index("--label") + 1])
+                return self.add_tab(arguments[arguments.index("--workspace") + 1], arguments[arguments.index("--label") + 1])
             case ["tab", "list"]:
-                shown = [tab for tab in self.tabs if "--workspace" not in words or tab["workspace_id"] == words[-1]]
-                return {"tabs": [{**tab, "pane_count": 1} for tab in shown]}
+                shown = [tab for tab in self.tabs if "--workspace" not in arguments or tab["workspace_id"] == arguments[-1]]
+                return {"tabs": [{**group[0], "pane_count": len(group)}
+                    for tab_id in dict.fromkeys(p["tab_id"] for p in shown)
+                    if (group := [p for p in shown if p["tab_id"] == tab_id])]}
             case ["pane", "list"]:
-                return {"panes": [{"pane_id": tab["pane_id"], "tab_id": tab["tab_id"], "workspace_id": tab["workspace_id"],
-                                   "label": tab["label"], "agent_session": {"value": tab.get("session_id", "")}} for tab in self.tabs]}
+                return {"panes": [{**tab, "label": tab.get("pane_label", tab["label"]),
+                    "focused": tab["pane_id"] == self.focused_pane,
+                    "agent_session": {"value": tab.get("mark", tab.get("session_id", ""))}} for tab in self.tabs]}
             case ["pane", "move"]:
-                tab = next(tab for tab in self.tabs if tab["pane_id"] == words[2])
+                self.commands.append(arguments)
+                tab = next(tab for tab in self.tabs if tab["pane_id"] == arguments[2])
                 self.tabs.remove(tab)
-                moved = {**tab, "tab_id": self.new_id("t"), "workspace_id": words[words.index("--workspace") + 1]}
+                moved = {**tab, "tab_id": self.new_id("t"), "workspace_id": arguments[arguments.index("--workspace") + 1]}
+                if moved["workspace_id"] != tab["workspace_id"]:
+                    moved["pane_id"] = self.new_id("p")
                 self.tabs.append(moved)
-                return {"move_result": {"created_tab": {"tab_id": moved["tab_id"]}, "pane": {"pane_id": moved["pane_id"]}}}
+                if "--no-focus" not in arguments:
+                    self.focused_pane = moved["pane_id"]
+                return {"move_result": {"changed": True, "created_tab": {"tab_id": moved["tab_id"]}, "pane": {"pane_id": moved["pane_id"]}}}
             case _:
-                raise AssertionError(f"unexpected herdr call {words}")
+                raise AssertionError(f"unexpected herdr call {arguments}")
 
     @override
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
@@ -5014,49 +5014,345 @@ class LayoutHerdr(herdr.Herdr):
     @override
     def run(self, *arguments: str, deadline: float = math.inf) -> str:
         self.require_time(deadline)
-        words = list(arguments)
-        match words[:2]:
-            case ["tab", "rename"]:
-                tab = next(tab for tab in self.tabs if tab["tab_id"] == words[2])
-                if "session_id" not in tab and words[3] != herdr.LAYOUT_PLACEHOLDER:
-                    self.assign_session(tab, words[3])
-                tab["label"] = words[3]
-            case ["workspace", "close"]:
-                self.spaces = [space for space in self.spaces if space[0] != words[2]]
-                self.tabs = [tab for tab in self.tabs if tab["workspace_id"] != words[2]]
-            case ["pane", "close"]:
-                self.tabs = [tab for tab in self.tabs if tab["pane_id"] != words[2]]
-            case ["tab", "close"]:
-                self.tabs = [tab for tab in self.tabs if tab["tab_id"] != words[2]]
-            case ["pane", "rename"] | ["tab", "focus"] | ["workspace", "focus"]:
-                pass
-            case _:
-                raise AssertionError(f"unexpected herdr call {words}")
+        self.commands.append(arguments)
+        kind, action, ident, *values = arguments
+        if action == "rename":
+            for pane in self.tabs:
+                if pane[kind + "_id"] == ident:
+                    if kind == "tab" and "session_id" not in pane and values[0] != herdr.LAYOUT_PLACEHOLDER:
+                        self.assign_session(pane, values[0])
+                    pane["pane_label" if kind == "pane" else "label"] = values[0]
+        elif action == "close":
+            self.tabs = [pane for pane in self.tabs if pane[kind + "_id"] != ident]
+            if kind == "workspace":
+                self.spaces = [space for space in self.spaces if space[0] != ident]
+        elif action == "focus":
+            if kind == "pane":
+                self.focused_pane = ident
+            elif kind == "workspace":
+                self.focused_workspace = ident
+        else:
+            raise AssertionError(f"unexpected herdr call {arguments}")
         return "{}"
 
 
-class TitledLayoutHerdr(LayoutHerdr):
-    """Record tab and pane renames through the real layout code."""
+TitledLayoutHerdr = LayoutHerdr
+
+
+def split_tree(direction: str, ratio: float, first: object, second: object) -> dict[str, object]:
+    def node(value: object) -> object:
+        return {"type": "pane", "pane_id": value} if isinstance(value, str) else value
+    return {"type": "split", "direction": direction, "ratio": ratio, "first": node(first), "second": node(second)}
+
+
+class RowTabsHerdr(LayoutHerdr):
+    """Model native sessions, split trees, and new public IDs at the transport boundary."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.unknown: set[str] = set()
+        self.missing_argv: set[str] = set()
+        self.zoomed: set[str] = set()
+        self.focused_pane: str = "p1"
+        self.trees: dict[str, dict[str, object]] = {"t0": split_tree("right", 0.3, "p0", "p1")}
+        self.count: int = 100
+
+    @override
+    def socket_request(self, method: str, **params: object) -> dict[str, object]:
+        if method == "layout.export":
+            self.commands.append((method, *(str(value) for value in params.values())))
+            tab = str(params["tab_id"])
+            members = [pane for pane in self.tabs if pane["tab_id"] == tab]
+            leaf: dict[str, object] = {"type": "pane", "pane_id": members[0]["pane_id"]}
+            return {"layout": {"zoomed": tab in self.zoomed,
+                "root": leaf if len(members) == 1 else self.trees[tab]}}
+        return super().socket_request(method, **params)
+
+    def native_process(self, pid: int, kind: str) -> herdr.NativeAgentProcess:
+        if kind != "claude":
+            raise ValueError("private native session is unavailable")
+        return herdr.NativeAgentProcess(self.tabs[pid - 991000]["session_id"], "private-generation", {})
+
+    def replace_leaf(self, tree: dict[str, object], pane: str, replacement: dict[str, object]) -> dict[str, object]:
+        if tree.get("type") == "pane":
+            return replacement if tree.get("pane_id") == pane else tree
+        return {**tree, **{side: self.replace_leaf(herdr.json_object(tree[side], "fixture tree"), pane, replacement)
+                          for side in ("first", "second")}}
 
     @override
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
-        self.require_time(deadline)
-        if arguments[:2] == ("agent", "list"):
-            return {"agents": []}
-        if arguments[:2] == ("pane", "list"):
-            return {"panes": [{"pane_id": tab["pane_id"], "tab_id": tab["tab_id"],
-                               "workspace_id": tab["workspace_id"],
-                               "label": tab.get("pane_label", tab["label"]),
-                               "agent_session": {"value": tab.get("session_id", "")}} for tab in self.tabs]}
+        if arguments[:2] == ("pane", "process-info"):
+            pane = next(row for row in self.tabs if row["pane_id"] == arguments[-1])
+            if pane["pane_id"] in self.unknown:
+                raise herdr.HerdrFailure("private process facts are unavailable")
+            if "session_id" not in pane:
+                return {"process_info": {"shell_pid": 990042, "foreground_process_group_id": 990042,
+                    "foreground_processes": [{"pid": 990042, "argv": ["zsh"], "name": "zsh"}]}}
+            pid = 991000 + self.tabs.index(pane)
+            process: dict[str, object] = {"pid": pid, "name": "claude"}
+            if pane["pane_id"] not in self.missing_argv:
+                process["argv"] = ["claude"]
+            return {"process_info": {"shell_pid": 990000 + self.tabs.index(pane),
+                "foreground_process_group_id": pid, "foreground_processes": [process]}}
+        if arguments[:2] == ("pane", "move") and "--tab" in arguments:
+            self.commands.append(arguments)
+            pane = next(pane for pane in self.tabs if pane["pane_id"] == arguments[2])
+            tab = arguments[arguments.index("--tab") + 1]
+            target = arguments[arguments.index("--target-pane") + 1]
+            workspace = next(item["workspace_id"] for item in self.tabs if item["tab_id"] == tab)
+            self.tabs.remove(pane)
+            pane.update(tab_id=tab, workspace_id=workspace, pane_id=self.new_id("p"))
+            self.tabs.append(pane)
+            root = self.trees.get(tab, {"type": "pane", "pane_id": target})
+            self.trees[tab] = self.replace_leaf(root, target, split_tree(
+                arguments[arguments.index("--split") + 1], float(arguments[arguments.index("--ratio") + 1]), target, pane["pane_id"]))
+            return {"move_result": {"changed": True, "pane": {"pane_id": pane["pane_id"]}}}
         return super().result(*arguments, deadline=deadline)
 
+
+class RowTabTests(StaffTestCase):
+    rows: dict[str, staff.StaffRow] = {}
+    client: RowTabsHerdr = RowTabsHerdr()
+
     @override
-    def run(self, *arguments: str, deadline: float = math.inf) -> str:
-        self.require_time(deadline)
-        if arguments[:2] == ("pane", "rename"):
-            next(tab for tab in self.tabs if tab["pane_id"] == arguments[2])["pane_label"] = arguments[3]
-            return "{}"
-        return super().run(*arguments, deadline=deadline)
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})))
+        self.rows = {}
+        self.rows["parent"] = fixture_member("showrunner", name="new-production")
+        self.rows["unit"] = fixture_member("unit", name="director", parent=self.rows["parent"].id)
+        for key in ("split", "worker", "stopped"):
+            self.rows[key] = fixture_member("worker", name=key, parent=self.rows["unit"].id)
+        self.client = RowTabsHerdr()
+        self.client.spaces = [("w1", "old-production"), ("w2", self.rows["parent"].name)]
+        for index, row in enumerate((self.rows["unit"], self.rows["split"], self.rows["worker"])):
+            self.client.tabs.append({"pane_id": f"p{index}", "tab_id": "t0" if index < 2 else "t1",
+                "workspace_id": "w1", "label": "duplicate-old-title", "pane_label": row.name, "session_id": row.current_session, "mark": "stale",
+                "terminal_id": f"terminal-{index}"})
+        proc = {"HERDR_PROC": str(self.root / "proc"), "HERDR_PLATFORM": "linux"}
+        fake_unit_host.process(proc, 990042, 1, ["zsh"], {})
+        _ = cast(object, self.enterContext(patch.dict(os.environ, proc)))
+        _ = self.enterContext(patch.object(herdr, "native_process", side_effect=self.client.native_process))
+
+    def bindings(self) -> list[tuple[str, str]]:
+        return [(space["name"], tab["name"]) for space in herdr.saved_layout("fixture")["workspaces"]
+                for tab in space["tabs"]]
+
+    @contextmanager
+    def refused_command(self, method: Literal["run", "result"], prefix: tuple[str, ...], reason: str,
+                        *, option: str = "") -> Generator[io.StringIO]:
+        original = self.client.run if method == "run" else self.client.result
+        def refuse(*arguments: str, deadline: float = math.inf) -> str | dict[str, object]:
+            if arguments[:len(prefix)] == prefix and (not option or option in arguments):
+                raise herdr.HerdrFailure(reason)
+            return original(*arguments, deadline=deadline)
+        with patch.object(self.client, method, side_effect=refuse), redirect_stderr(io.StringIO()) as errors:
+            yield errors
+
+    def assert_complete_rerun(self) -> None:
+        self.client.commands.clear()
+        self.assertFalse(self.client.move_row_tabs(self.rows["unit"].id))
+        self.assertEqual(self.client.commands, [])
+
+    def test_transfer_preserves_shared_tabs_separate_tabs_and_nested_grid_splits(self) -> None:
+        initial = [dict(pane) for pane in self.client.tabs]
+        for grid in (False, True):
+            with self.subTest(grid=grid):
+                self.client.tabs = [dict(pane) for pane in initial]
+                self.client.focused_pane = "p1"
+                if grid:
+                    self.client.tabs.append({**initial[0], "pane_id": "p3", "terminal_id": "terminal-3",
+                                             "session_id": self.rows["stopped"].current_session})
+                    self.client.tabs[2]["tab_id"] = "t0"
+                    self.client.trees["t0"] = split_tree("right", 0.4, split_tree("down", 0.3, "p0", "p1"),
+                                                      split_tree("down", 0.7, "p2", "p3"))
+                terminals = {pane["terminal_id"] for pane in self.client.tabs}
+                before = self.staff_file.read_bytes()
+                self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+                self.assertEqual({pane["workspace_id"] for pane in self.client.tabs}, {"w2"})
+                panes = {pane["terminal_id"]: pane for pane in self.client.tabs}
+                self.assertEqual(panes["terminal-0"]["tab_id"], panes["terminal-1"]["tab_id"])
+                self.assertEqual(panes["terminal-0"]["tab_id"] == panes["terminal-2"]["tab_id"], grid)
+                ids = [panes[f"terminal-{index}"]["pane_id"] for index in range(4 if grid else 3)]
+                expected = (split_tree("right", 0.4, split_tree("down", 0.3, ids[0], ids[1]),
+                                       split_tree("down", 0.7, ids[2], ids[3])) if grid else split_tree("right", 0.3, ids[0], ids[1]))
+                self.assertEqual(self.client.trees[panes["terminal-0"]["tab_id"]], expected)
+                if grid:
+                    self.assertEqual(len({pane["tab_id"] for pane in self.client.tabs}), 1)
+                self.assertEqual(self.client.focused_pane, panes["terminal-1"]["pane_id"])
+                self.assertEqual({pane["terminal_id"] for pane in self.client.tabs}, terminals)
+                self.assertFalse({"p0", "p1", "p2", "p3"} & {pane["pane_id"] for pane in self.client.tabs})
+                self.assertCountEqual(self.bindings(), [(self.rows["parent"].name, row.id)
+                                      for row in self.rows.values() if row.kind != "showrunner"])
+                self.assertEqual(self.staff_file.read_bytes(), before)
+                self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", "w2")],
+                                 [self.rows["unit"].name] if grid else [self.rows["unit"].name, self.rows["worker"].name])
+                self.assertFalse(any(command[:2] in (("pane", "close"), ("agent", "start"), ("tab", "close"))
+                                     for command in self.client.commands))
+                self.assert_complete_rerun()
+
+    def test_unknown_native_evidence_writes_bindings_and_never_reports_unchanged(self) -> None:
+        self.client.tabs = self.client.tabs[:1]
+        for missing_argv, foreign in ((False, False), (True, False), (False, True)):
+            with self.subTest(missing_argv=missing_argv, foreign=foreign):
+                self.client.tabs[0]["session_id"] = self.rows["parent" if foreign else "unit"].current_session
+                self.client.unknown = set() if missing_argv else {"p0"}
+                self.client.missing_argv = {"p0"} if missing_argv else set()
+                for _attempt in range(2):
+                    with redirect_stderr(io.StringIO()) as errors:
+                        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+                    self.assertEqual(self.client.tabs[0]["workspace_id"], "w1")
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn("argv" if missing_argv else "private process facts are unavailable", errors.getvalue())
+                    self.assertCountEqual(self.bindings(), [(self.rows["parent"].name, row.id)
+                                          for row in self.rows.values() if row.kind != "showrunner"])
+
+    def test_stopped_rows_restart_in_the_new_production_with_only_pane_replies(self) -> None:
+        self.client.tabs.clear()
+
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            self.client.require_time(deadline)
+            if arguments == ("pane", "list"):
+                return {"panes": []}
+            raise herdr.HerdrFailure(f"unconfigured command: {arguments}")
+
+        with patch.object(self.client, "result", side_effect=result):
+            self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+            self.assertCountEqual(self.bindings(), [(self.rows["parent"].name, row.id)
+                                  for row in self.rows.values() if row.kind != "showrunner"])
+            saved = herdr.layout_path("fixture").read_bytes()
+            self.assertFalse(self.client.move_row_tabs(self.rows["unit"].id))
+            self.assertEqual(herdr.layout_path("fixture").read_bytes(), saved)
+        self.assertEqual(self.client.saved_row_tab(self.rows["stopped"].id, self.rows["stopped"].name),
+                         herdr.NewTab(self.rows["parent"].name, self.rows["stopped"].name))
+
+    def test_retitle_row_uses_native_sessions_despite_stale_marks_and_duplicate_titles(self) -> None:
+        for pane in self.client.tabs[:2]:
+            pane["pane_label"] = "old-pane"
+        self.client.tabs[1]["session_id"] = self.rows["unit"].current_session
+        self.client.tabs[2]["mark"] = self.rows["unit"].current_session
+        self.assertTrue(self.client.retitle_row(self.rows["unit"].id))
+        renames = [command for command in self.client.commands if command[:2] == ("pane", "rename")]
+        self.assertCountEqual(renames, [("pane", "rename", "p0", self.rows["unit"].name),
+                                      ("pane", "rename", "p1", self.rows["unit"].name)])
+        self.assertEqual(self.client.tabs[2]["label"], "duplicate-old-title")
+        self.client.commands.clear()
+        self.assertFalse(self.client.retitle_row(self.rows["unit"].id))
+        self.assertEqual(self.client.commands, [])
+
+    def test_ordering_retry_keeps_split_tabs_and_closes_only_the_placeholder(self) -> None:
+        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        original = {pane["terminal_id"]: (pane["pane_id"], pane["tab_id"]) for pane in self.client.tabs}
+        self.client.tabs.reverse()
+        _ = self.client.add_tab("w2", herdr.LAYOUT_PLACEHOLDER)
+        selected = self.client.focused_pane
+        self.client.spaces.append(("w3", "unrelated"))
+        _ = self.client.add_tab("w3", "unrelated")
+        foreign = self.client.tabs[-1]["pane_id"]
+        request = self.client.socket_request
+
+        def refuse(method: str, **params: object) -> dict[str, object]:
+            if method == "tab.move":
+                self.client.focused_pane, self.client.focused_workspace = foreign, "w3"
+                raise herdr.HerdrFailure("private order failure")
+            return request(method, **params)
+
+        with patch.object(self.client, "socket_request", side_effect=refuse), self.assertRaisesRegex(herdr.HerdrFailure, "private order failure"):
+            _ = self.client.move_row_tabs(self.rows["unit"].id)
+        self.assertEqual(self.client.focused_pane, selected)
+        self.assertTrue(next(space for space in self.client.listed("workspace") if space["workspace_id"] == "w2")["focused"])
+        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", "w2")],
+                         [self.rows["unit"].name, self.rows["worker"].name])
+        self.assertEqual({pane["terminal_id"]: (pane["pane_id"], pane["tab_id"]) for pane in self.client.tabs if pane["workspace_id"] == "w2"}, original)
+        self.assertFalse(any(pane["label"] == herdr.LAYOUT_PLACEHOLDER for pane in self.client.tabs))
+        self.assert_complete_rerun()
+
+    def test_an_unrelated_focused_split_survives_destination_ordering(self) -> None:
+        for index, name in enumerate(("zulu", "alpha"), 3):
+            row = fixture_member("showrunner", name=name)
+            self.client.tabs.append({"pane_id": f"p{index}", "tab_id": f"t{index}", "workspace_id": "w2",
+                "label": name, "terminal_id": f"terminal-{index}", "session_id": row.current_session})
+        self.client.tabs.append({**self.client.tabs[-2], "pane_id": "p5", "terminal_id": "terminal-5"})
+        herdr._write_layout("fixture", herdr.SavedLayout(at=time.time(), workspaces=[herdr.SavedSpace(  # pyright: ignore[reportPrivateUsage]
+            name=self.rows["parent"].name, seen=time.time(), tabs=[herdr.SavedName(name=ident, seen=time.time())
+                for ident in [self.rows["unit"].id, self.rows["worker"].id, *layout_row_ids(["alpha", "zulu"])]] )]))
+        self.client.focused_pane = "p5"
+        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        self.assertEqual(self.client.focused_pane, "p5")
+        self.assertEqual(next(pane["tab_id"] for pane in self.client.tabs if pane["pane_id"] == "p5"), "t3")
+        self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", "w2")],
+                         [self.rows["unit"].name, self.rows["worker"].name, "alpha", "zulu"])
+        self.assertTrue(any(command[0] == "tab.move" for command in self.client.commands))
+
+    def test_a_title_failure_is_repaired_on_rerun_without_moving_the_pane_again(self) -> None:
+        self.client.tabs = self.client.tabs[:1]
+        with self.refused_command("run", ("tab", "rename"), "private rename failure") as errors:
+            self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        self.assertIn("private rename failure", errors.getvalue())
+        pane_id = self.client.tabs[0]["pane_id"]
+        self.client.commands.clear()
+        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        self.assertEqual(self.client.tabs[0]["label"], self.rows["unit"].name)
+        self.assertEqual(self.client.tabs[0]["pane_id"], pane_id)
+        self.assertFalse(any(command[:2] == ("pane", "move") for command in self.client.commands))
+        self.assert_complete_rerun()
+
+    def test_a_missing_destination_is_created_and_the_moved_tabs_are_ordered(self) -> None:
+        _ = self.client.spaces.pop()
+        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        workspace = next(ident for ident, name in self.client.spaces if name == self.rows["parent"].name)
+        self.assertEqual({pane["workspace_id"] for pane in self.client.tabs}, {workspace})
+        self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", workspace)],
+                         [self.rows["unit"].name, self.rows["worker"].name])
+        self.assertFalse(any(pane["label"] == herdr.LAYOUT_PLACEHOLDER for pane in self.client.tabs))
+
+    def test_worker_retitle_keeps_the_director_tab_title(self) -> None:
+        self.client.tabs[0]["label"] = self.rows["unit"].name
+        self.client.tabs[1]["pane_label"] = "old-pane"
+        self.assertTrue(self.client.retitle_row(self.rows["split"].id))
+        self.assertEqual(self.client.tabs[1]["pane_label"], self.rows["split"].name)
+        self.assertEqual(self.client.tabs[0]["label"], self.rows["unit"].name)
+        self.assertFalse(any(command[:2] == ("tab", "rename") for command in self.client.commands))
+        self.assertFalse(self.client.retitle_row(self.rows["split"].id))
+
+    def test_rerun_repairs_a_worker_tab_title_and_keeps_the_shared_director_title(self) -> None:
+        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        worker = next(pane for pane in self.client.tabs if pane["terminal_id"] == "terminal-2")
+        self.client.tabs.append({**worker, "pane_id": "shell", "terminal_id": "shell-terminal"})
+        del self.client.tabs[-1]["session_id"]
+        for pane in self.client.tabs:
+            pane["label"] = "stale title"
+        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", "w2")],
+                         [self.rows["unit"].name, self.rows["worker"].name])
+        self.assertFalse(self.client.move_row_tabs(self.rows["unit"].id))
+
+    def test_an_interrupted_rebuild_names_the_tab_and_panes_left_in_the_source(self) -> None:
+        self.client.tabs = self.client.tabs[:2]
+        with self.refused_command("result", ("pane", "move"), "private split failure", option="--tab") as errors:
+            self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        self.assertEqual({pane["workspace_id"] for pane in self.client.tabs}, {"w1", "w2"})
+        for text in ("t0", "p1", "split", "private split failure"):
+            self.assertIn(text, errors.getvalue())
+        self.assertFalse(any(command[:2] in (("pane", "close"), ("agent", "start")) for command in self.client.commands))
+
+    def test_zoom_and_unchanged_moves_keep_bindings_without_claiming_success(self) -> None:
+        self.client.tabs = self.client.tabs[:1]
+        result = self.client.result
+        def unchanged(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[:2] == ("pane", "move"):
+                return {"move_result": {"changed": False, "reason": "private refusal"}}
+            return result(*arguments, deadline=deadline)
+        for zoomed, message in ((True, "tab is zoomed; unzoom it and run again"), (False, "private refusal")):
+            with self.subTest(zoomed=zoomed):
+                self.client.zoomed = {"t0"} if zoomed else set()
+                with patch.object(self.client, "result", side_effect=unchanged), redirect_stderr(io.StringIO()) as errors:
+                    self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+                self.assertIn(message, errors.getvalue())
+                self.assertEqual(self.client.tabs[0]["workspace_id"], "w1")
+                self.assertIn((self.rows["parent"].name, self.rows["unit"].id), self.bindings())
+                self.assertFalse(any(command[:2] == ("pane", "move") for command in self.client.commands))
 
 
 @final
@@ -5146,26 +5442,24 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertFalse(classifier.has_unit_title("child"))
 
     def test_session_names_restore_saved_tab_order_and_resolve_each_pane(self) -> None:
-        old = TitledLayoutHerdr()
+        old = LayoutHerdr()
         for key in ("sdlc", "zulu", "alpha"):
             _ = old.open_tab("sdlc", key, "/repo", {})
         order = [tab["pane_label"] for tab in old.tabs]
         self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], layout_row_ids(order))
 
-        fresh = TitledLayoutHerdr()
+        fresh = LayoutHerdr()
         for key in reversed(order):
             _ = fresh.open_tab("sdlc", key, "/repo", {})
         self.assertEqual([tab["pane_label"] for tab in fresh.tabs], order)
         for tab in fresh.tabs:
             key = tab["pane_label"]
-            self.assertEqual(fresh.lookup(key), herdr.PaneFound(tab["pane_id"]))
-            self.assertEqual(fresh.lookup(tab["label"]), herdr.PaneFound(tab["pane_id"]))
             self.assertEqual(tab["label"], key)
             self.assertTrue(herdr.attach_hint("sdlc", key).endswith("tab " + key))
         self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], layout_row_ids(order))
 
     def test_showrunner_unit_director_and_plain_tabs_and_panes_take_the_session_name(self) -> None:
-        client = TitledLayoutHerdr()
+        client = LayoutHerdr()
         cases: tuple[tuple[str, str, dict[str, str]], ...] = (
             ("control", "control", {}),
             ("control", "roles", {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}),
@@ -5209,19 +5503,6 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(shown["natedev"], ["natedev", "accounts", "builds", "herdr", "unit-board", "zebra"])
         self.assertEqual(shown["fps"], ["performance", "alpha", "benchmark", "frame-cost", "metrics-gathering"])
 
-    def test_move_pane_to_workspace_orders_the_unit_tab_and_saves_its_destination(self) -> None:
-        _ = unit_membership("target", "models")
-        client = LayoutHerdr()
-        _ = client.open_tab("source", "source", "/repo", {})
-        pane = client.open_tab("source", "models", "/unit", {})
-        _ = client.open_tab("target", "target", "/repo", {})
-        _ = client.open_tab("target", "apple-terminal", "/repo", {})
-        moved = client.move_pane_to_workspace(pane, "target", "models")
-        self.assertEqual(client.layout(), [("source", ["source"]), ("target", ["target", "models", "apple-terminal"])])
-        self.assertEqual(next(tab["workspace_id"] for tab in client.tabs if tab["pane_id"] == moved),
-                         next(ident for ident, label in client.spaces if label == "target"))
-        self.assertEqual([tab["name"] for space in herdr.saved_layout("fixture")["workspaces"]
-                          if space["name"] == "target" for tab in space["tabs"]], layout_row_ids(["target", "models", "apple-terminal"]))
 
     def test_the_snapshot_keeps_the_row_id_when_its_name_changes(self) -> None:
         client = self.running()

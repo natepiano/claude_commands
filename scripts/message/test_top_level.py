@@ -23,7 +23,8 @@ import roster
 import herdr
 import sessions
 import top_level
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.message import unit_labels
 from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
@@ -259,6 +260,20 @@ class TopLevelTests(unittest.TestCase):
         self.assertEqual(errors, ["top_level: roster: daemon closed mid-call"])
         self.assertEqual(recorded, [("reachable", "reachable-id")])
 
+    def test_docless_staff_warning_keeps_other_top_level_recipients(self) -> None:
+        address = self.add("reachable", session_id="reachable-id")
+        bad = staff.StaffRow(staff.StaffId("bad"), "showrunner", "bad", None,
+                             current_session=staff.StaffId("bad-session"))
+        diagnostics = unit_labels.StaffDiagnostics()
+        self.assertEqual(unit_labels.registered_showrunners(
+            diagnostics, known_sessions={}, membership=staff.StaffSnapshot((bad,))), [])
+        self.problems, self.warnings = diagnostics.problems, diagnostics.warnings
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual(result, 0)
+        self.assertEqual(lines, [f"reachable\tuds:{address}"])
+        self.assertEqual(errors, ["top_level: roster: warning: bad: the production document is not recorded"])
+        self.assertEqual(recorded, [("reachable", "reachable-id")])
+
     def test_durable_warning_prints_once_without_losing_a_readable_recipient(self) -> None:
         address = self.add('reachable', session_id='reachable-id')
         self.warnings = ['durable role /fixture/design.json: missing or invalid repository']
@@ -307,13 +322,16 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         self.socket_path = self.folder / "live.sock"
         listener = self.enterContext(socket.socket(socket.AF_UNIX))
         listener.bind(str(self.socket_path))
-        child = self.enterContext(subprocess.Popen(
+        owned = OwnedTestProcesses()
+        self.addCleanup(owned.finish)
+        child = subprocess.Popen(
             [sys.executable, "-c", "import sys; sys.stdin.read()"],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ))
+            env=owned.environment(),
+        )
+        owned.track(child)
         self.child_pid = child.pid
         self.process_starts = {}
-        self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
         environment = cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.folder), "NOTIFIER_SESSIONS_DIR": str(self.directory),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}", "SSH_RECORD": str(self.folder / "ssh.log"),

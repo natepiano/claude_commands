@@ -1759,7 +1759,9 @@ def _turn_sandbox_policy(mode: str) -> dict[str, object]:
 
 def _resume_params(session_dir: str, name: str, thread_id: str) -> dict[str, object]:
     """Restore a roster thread's standing instructions whenever it is reopened."""
-    params: dict[str, object] = {"threadId": thread_id}
+    params: dict[str, object] = {"threadId": thread_id,
+        **({"cwd": cwd} if (cwd := _as_str(plan_history.staff_directory(
+            {"owner_session": thread_id}, staff.snapshot()).get("working_dir"))) else {})}
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     policy = roster_access_policy(record)
     if isinstance(policy, (ReadOnlyReviewer, PhaseBoundDesigner)):
@@ -2247,31 +2249,31 @@ FRESH_DETACHED_RUN_SCAN = FreshDetachedRunScan()
 
 
 def _close_messages_if_empty(
-    session_dir: str, name: str, thread_id: str,
+    session_dir: str, name: str, launcher: RosterActiveLauncher,
     runs: DetachedRunWatch | FreshDetachedRunScan = FRESH_DETACHED_RUN_SCAN,
 ) -> bool:
     """Exclude senders while claiming an empty inbox and closing its launcher."""
     with worker_lifecycle.lock_worker(session_dir, name):
         entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        if not RosterActiveLauncher(thread_id, (os.getpid(),)).owns(entry):
+        if not launcher.owns(entry):
             return True
         with _pending_file(session_dir, name) as handle:
             current = _run_watch(session_dir, name, runs).current()
-            if _pending_for_thread(handle, thread_id) or current.live or current.dead:
+            if _pending_for_thread(handle, launcher.thread_id) or current.live or current.dead:
                 return False
-            _write_pending(handle, thread_id, [], accepting_messages=False)
+            _write_pending(handle, launcher.thread_id, [], accepting_messages=False)
             return True
 
 
-def _close_messages_and_keep_pending(session_dir: str, name: str, thread_id: str) -> int:
+def _close_messages_and_keep_pending(session_dir: str, name: str, launcher: RosterActiveLauncher) -> int:
     """Close the launcher's inbox while keeping its parked messages for the next launch."""
     with worker_lifecycle.lock_worker(session_dir, name):
         entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        if not RosterActiveLauncher(thread_id, (os.getpid(),)).owns(entry):
+        if not launcher.owns(entry):
             return 0
         with _pending_file(session_dir, name) as handle:
-            messages = _pending_for_thread(handle, thread_id)
-            _write_pending(handle, thread_id, messages, accepting_messages=False)
+            messages = _pending_for_thread(handle, launcher.thread_id)
+            _write_pending(handle, launcher.thread_id, messages, accepting_messages=False)
             return len(messages)
 
 
@@ -4263,7 +4265,7 @@ def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = Fal
 def _thread_start_params(args: argparse.Namespace) -> dict[str, object]:
     """The `thread/start` request for one worker."""
     params: dict[str, object] = {
-        "cwd": _as_str(_attr(args, "cwd")),
+        "cwd": (_as_str(plan_history.staff_directory({"owner_session": unit_runs.director(Path(_as_str(_attr(args, "session_dir"))))}, staff.snapshot()).get("working_dir")) if _as_str(_attr(args, "session_dir")) else "") or _as_str(_attr(args, "cwd")),
         "approvalPolicy": "never",
         # The SandboxMode string, not a SandboxPolicy object: the server rejects
         # {"type": "dangerFullAccess"} with "unknown variant `type`".
@@ -4880,7 +4882,7 @@ def _hold_messages_for_next_launch(stream: TurnStream, log: TextIO, reason: str)
     """Close the thread to messages and keep the held ones for the next launch."""
     if stream.end_marker.exists():
         return
-    kept = _close_messages_and_keep_pending(stream.session_dir, stream.name, stream.thread_id)
+    kept = _close_messages_and_keep_pending(stream.session_dir, stream.name, _stream_launcher(stream))
     if kept:
         messages = "1 message" if kept == 1 else f"{kept} messages"
         held = f"{messages} held for the next launch"
@@ -4944,7 +4946,7 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithTh
                 if stream.client.has_pending_frames:
                     stream.state_change_owed = True
                     return StreamStep.NEXT_FRAME
-                if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+                if _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
                     return StreamStep.FINISH
         _keep_resident_on_selected_server(stream, log)
     return StreamStep.NEXT_FRAME
@@ -4979,7 +4981,7 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
             return StreamStep.NEXT_FRAME
         if isinstance(moved, MovedWorker) and _adopt_moved_worker(stream, moved):
             return StreamStep.NEXT_FRAME
-        if not _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+        if not _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
             return StreamStep.NEXT_FRAME
     if quota_owed:
         return StreamStep.NEXT_FRAME
@@ -5446,7 +5448,7 @@ def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
         stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
     _end_dead_runs(stream.session_dir, stream.name, stream.runs)
-    if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+    if _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
         return StreamStep.FINISH
     # The turn ended on a run still going: stay attached until its result is held.
     if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
@@ -5716,6 +5718,25 @@ def _refuse_taken_follow_up(client: Client, replacement: str, session_dir: str) 
     raise SystemExit("name was taken while the follow-up ran; follow-up did not start")
 
 
+def _worker_rollout_path(session_dir: str, thread_id: str, home: Path) -> Path | None:
+    """Find the saved history in the worker and recorded server homes."""
+    homes = {home, *(server_record_home(record) for record in _recorded_run_servers(session_dir) if record)}
+    paths: set[Path] = set()
+    for source in homes:
+        for directory in ("sessions", "archived_sessions"):
+            paths.update(path.resolve() for path in (source / directory).glob(f"**/rollout-*-{thread_id}.jsonl"))
+    if len(paths) > 1:
+        raise SystemExit(f"RoleNeedsRecovery: multiple saved histories for {thread_id}; replacement refused")
+    path = next(iter(paths), None)
+    if path is not None:
+        try:
+            with path.open("rb") as history:
+                _ = history.read(1)
+        except OSError as error:
+            raise SystemExit(f"RoleNeedsRecovery: saved history is unreadable at {path}: {error}; replacement refused") from error
+    return path
+
+
 def _resume_worker_thread(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
     workers_home: Path, *, staff_admission: WorkerStartAllowed,
@@ -5730,6 +5751,14 @@ def _resume_worker_thread(
     own_reviewer = previous_record.get("role") == "review" and bool(previous_record.get("unit_ledger"))
     sandbox = _worker_sandbox(args, session_dir, name)
     resumed = client.call("thread/resume", params)
+    if resumed.get("error"):
+        path = _worker_rollout_path(session_dir, thread_id, workers_home)
+        if path is not None:
+            resumed = client.call("thread/resume", {**params, "path": str(path)})
+            if resumed.get("error"):
+                _post_board_status(session_dir, name,
+                    f"saved history for {thread_id} could not resume from {path}: {json.dumps(resumed.get('error'))}; replacement refused")
+                _ = _require(resumed, "thread/resume")
     if not resumed.get("error"):
         result = _require(resumed, "thread/resume")
         if _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
@@ -5767,7 +5796,8 @@ def _resume_worker_thread(
     _ = client.call("thread/name/set", {"threadId": replacement, "name": unit_workers.shown_name(Path(session_dir), name)})
     _post_board_status(
         session_dir, name,
-        f"{codex_home_display(workers_home)} refused to resume {thread_id}; worker continues as new thread {replacement}",
+        f"{codex_home_display(workers_home)} refused to resume {thread_id}; worker continues as new thread {replacement}; "
+        + f"no saved rollout found; resume error: {json.dumps(resumed.get('error'))}",
     )
     return _WorkerThreadForHome(replacement, True)
 
@@ -6195,7 +6225,7 @@ def _start_turn(
             for path in cast("list[object]", images) if isinstance(path, str)
         )
     params: dict[str, object] = {"threadId": thread_id, "input": inputs}
-    cwd = _as_str(_attr(args, "turn_cwd"))
+    cwd = _as_str(plan_history.staff_directory({"owner_session": thread_id}, staff.snapshot()).get("working_dir")) or _as_str(_attr(args, "turn_cwd"))
     if cwd:
         params["cwd"] = cwd
     # Every turn names its policy: the app-server keeps a thread's last turn policy, so a
@@ -6975,7 +7005,7 @@ def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllo
             if family != "codex":
                 raise unit_workers.WorkerUnavailable("new persistent worker requires a Codex assignment")
             state = _read_json_object(_session_path(session_dir, plan_history.STATE_FILENAME))
-            cwd = _as_str(state.get("working_dir")) or str(Path.cwd())
+            cwd = _as_str(plan_history.staff_directory({**state, "owner_session": unit_runs.director(Path(session_dir))}, staff.snapshot()).get("working_dir")) or str(Path.cwd())
             home = workers_home()
             port, fresh = ensure_server(session_dir, home, cwd=cwd)
             client = Client(port, name)
@@ -9279,7 +9309,7 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowe
             instructions = instructions_path.read_text(encoding="utf-8")
             params: dict[str, object] = {
                 "developerInstructions": instructions,
-                "cwd": _as_str(_attr(args, "cwd")),
+                "cwd": (_as_str(plan_history.staff_directory({"owner_session": unit_runs.director(Path(_as_str(_attr(args, "session_dir"))))}, staff.snapshot()).get("working_dir")) if _as_str(_attr(args, "session_dir")) else "") or _as_str(_attr(args, "cwd")),
                 "sandbox": _as_str(_attr(args, "sandbox")) or READ_ONLY_SANDBOX,
                 "approvalPolicy": "never",
             }

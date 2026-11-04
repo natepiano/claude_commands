@@ -40,9 +40,10 @@ Each operation is a short list of plain steps. A rerun with nothing to change pr
 3. **Stop all, restart all** (user, 2026-10-08): one loop. Stop each live row, then start each.
 4. **Folder move:** stop the unit and its workers. Run `git worktree move`. Write `worktree`. Start each.
 5. **Rename:** write `name`. Move the folder to `~/worktrees/<name>` (step 4). Run `git branch -m`. Set the displays.
-6. **Transfer:** write `parent`. Move the unit's Units row to the new production doc.
+6. **Transfer:** write `parent`. Move its herdr tab, and its workers' tabs, into the new production's group (a display; step 3 restores the same order).
 7. **`/clear`:** write `current_session`.
 8. **Family switch:** start a session of the other family in the same slot, with the transcript extract. Write `current_session`. `id` and `name` stay.
+9. **Retire:** stop the unit and its workers (step 1). Remove the worktree and the branch. Write `worktree` state `removed`; the row stays, so a resume by `id` still works. Refuse only on refusal 4; an uncommitted `Project started` plan line alone is not work.
 
 ## 4. The only refusals
 
@@ -51,7 +52,7 @@ A check stays only if it prevents a catastrophe:
 1. The target folder exists (git's own error).
 2. A second operation on the same row runs at the same time (one lock for each row).
 3. A second copy of a running session would start.
-4. Uncommitted work would be deleted.
+4. Work would be deleted: uncommitted changes, or commits that the merge branch does not hold.
 5. A signal, keystroke or pane close would reach a process that is not the target (a reused pid, another conversation, a pane with other live work).
 
 Bad input (an unknown or unclear name, a session on the other machine) is an error message, not a refusal.
@@ -62,9 +63,13 @@ Anything else unexpected prints one anomaly line and the operation continues.
 
 | Unit | Deletes |
 |---|---|
-| devtools | every other refusal in `unit_move.py`, `rename_unit.py`, `transfer_unit.py`; their journals; the rename sweep that classifies files; every stored folder-path copy (4v, 4w) |
-| herdr | `production_tree.py` (4b); the Production header and Gates table (4o); the Units table's staff facts (worktree, branch, session) (4c); the seed importer (4d); legacy pane marks (4e); stop, resume and restart refusals |
+| devtools | every other refusal in `unit_move.py`, `rename_unit.py`, `transfer_unit.py`, `retire_unit.py`; their journals; the retired note and saved branch ref; the rename sweep that classifies files; every stored folder-path copy (4v, 4w); the Units tables: every reader reads staff (4d, on main 3ffe2193f), and 4u deletes the writers and the tables (until 4u lands, a retire deletes the unit's row) |
+| herdr | `production_tree.py` (4b); the Production header and Gates table (4o); the plan's `> **Production:**` header, a copy of `parent` (4c; the plan path is in `.unit.toml`); the seed importer (4d); legacy pane marks (4e); stop, resume and restart refusals |
 | models | the worker ledger's adoption journal; repair-roster; the ledger-to-roster check; legacy identity readers (one migration run); per-thread records in `design_roles`; any seat-to-thread map other than staff |
-| shutdown | refusals in `restart.py` and `shutdown_record.py`; `launch_permission.py` and `folder_trust.py` gates; the restore record keeps only the list of row ids that were live |
+| shutdown | refusals in `restart.py` and `shutdown_record.py`; the restore record keeps only the list of row ids that were live. Done: the `launch_permission.py` and `folder_trust.py` gates (deleted in b9fd6ada4) |
 | accounts | `cutover-home` (after the Mac cutover); the Mac session counts fetch; the resume retry loop |
 | phases | wait recovery; unknown-owner states; queue_place cleanup redesign; verify staging recovery; `process_start.py` unless it deletes the `/proc` copies (net negative) |
+
+## 6. Every accessor
+
+`docs/as-built/staff-accessors.md` lists every file that reads or writes the staff file, and each copy the user approved. Use it for a staff migration.

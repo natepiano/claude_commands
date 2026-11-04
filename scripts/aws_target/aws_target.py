@@ -61,6 +61,22 @@ class ControlResult:
     generation: str = ''
 
 
+@dataclass(frozen=True)
+class UnpublishedPermissionSince:
+    generation: str
+    since: int
+
+    @classmethod
+    def read(cls, state: dict[str, object], generation: str, now: int) -> UnpublishedPermissionSince:
+        raw = state.get('unpublished_permission')
+        if isinstance(raw, dict):
+            row = cast(dict[str, object], raw)
+            since = row.get('since')
+            if row.get('generation') == generation and type(since) is int and 0 <= since <= now:
+                return cls(generation, since)
+        return cls(generation, now)
+
+
 @final
 class AwsCli:
     def __init__(self, profile: str, region: str, timeout_s: float,
@@ -267,6 +283,11 @@ class Controller:
                 evidence = api.observe(settings.instance_id, now)
                 previous_generation = state.get('permitted_generation')
                 state['instance_evidence'] = asdict(evidence)
+                unpublished = UnpublishedPermissionSince.read(state, evidence.generation, now)
+                if evidence.state == 'running':
+                    state['unpublished_permission'] = asdict(unpublished)
+                else:
+                    _ = state.pop('unpublished_permission', None)
                 if evidence.state in ('stopped', 'terminated'):
                     self._clear_drain(state)
                 if state.get('stop_generation') == evidence.generation and evidence.state in ('running', 'pending'):
@@ -312,6 +333,12 @@ class Controller:
                         state['publication_error'] = {'at': int(self.clock()), 'reason': str(error)}
                 state['permission_published'] = published
                 now = int(self.clock())
+                if published:
+                    _ = state.pop('unpublished_permission', None)
+                elif evidence.state == 'running':
+                    if (action == 'tick' and now - unpublished.since >= settings.idle_stop_minutes * 60
+                            and not self._active()):
+                        return self._stop(api, state, evidence, 'unpublished_idle')
                 drain_reason = (decision.reason if not isinstance(decision, ledger.SpendingAllowed)
                                 else 'controlled_drain' if state.get('drain_generation') == evidence.generation else '')
                 if drain_reason:

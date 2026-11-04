@@ -18,7 +18,8 @@ from typing import cast
 
 from scripts.lib import atomic_file, git_exclude
 from scripts.production.staff import StaffId
-from scripts.production import unit_table
+from scripts.production import staff
+from scripts.production.production_doc import cell_value
 
 
 class ConfigRefused(ValueError):
@@ -46,6 +47,17 @@ class PermanentPlan:
     pass
 
 
+def plan_arguments(plan: PlanFile | StandbyPlan | PermanentPlan) -> list[str]:
+    """The add_unit launch mode for a plan."""
+    match plan:
+        case PlanFile(path):
+            return ["--plan", str(path)]
+        case StandbyPlan():
+            return ["--standby"]
+        case PermanentPlan():
+            return ["--permanent"]
+
+
 @dataclass(frozen=True)
 class AppPort:
     number: int
@@ -62,7 +74,7 @@ class NoAppPort:
 
 def parse_port_cell(raw: str) -> AppPort | NoAppPort:
     """Read a raw Port cell and keep its text in each refusal."""
-    value = unit_table.cell_value(raw)
+    value = cell_value(raw)
     if value.casefold() in ("", "—", "-", "none"):
         return NoAppPort()
     match = re.fullmatch(r"([0-9]+)(?:\s+\([^()]*\))?", value)
@@ -75,17 +87,8 @@ def parse_port_cell(raw: str) -> AppPort | NoAppPort:
 
 
 @dataclass(frozen=True)
-class RecordedStartFolder:
-    path: Path
-
-    def __post_init__(self) -> None:
-        if not self.path.is_absolute():
-            raise ConfigRefused(f"retired.folder: expected an absolute path, got {self.path}")
-
-
-@dataclass(frozen=True)
-class UnrecordedStartFolder:
-    pass
+class NoFormattingWorktree:
+    """The formatter uses its temporary directory."""
 
 
 @dataclass(frozen=True)
@@ -101,7 +104,6 @@ class Branch:
 class RetiredSession:
     date: str
     session_id: str
-    start_folder: RecordedStartFolder | UnrecordedStartFolder
     branch: Branch
 
     def __post_init__(self) -> None:
@@ -147,9 +149,10 @@ class UnitConfig:
     formatting: RepositoryTaploConfig | DefaultTaploConfig = field(default_factory=DefaultTaploConfig, compare=False)
 
     def __post_init__(self) -> None:
+        # A responsibility is a short name (`nightly-review`) or an owned repository path (the old Owns cell).
         for name in self.responsibilities:
-            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) is None:
-                raise ConfigRefused(f"responsibilities: invalid short name {name!r}")
+            if re.fullmatch(r"[A-Za-z0-9._-][A-Za-z0-9._/-]*", name) is None or ".." in name.split("/"):
+                raise ConfigRefused(f"responsibilities: invalid name or repository path {name!r}")
 
 
 @dataclass(frozen=True)
@@ -249,11 +252,9 @@ def decode(fields: dict[str, object]) -> UnitConfig:
         if not isinstance(raw_retired, dict):
             raise ConfigRefused("retired: expected a table")
         facts = cast(dict[str, object], raw_retired)
-        if set(facts) != {"date", "session", "folder", "branch"}:
-            raise ConfigRefused("retired: expected date, session, folder and branch")
-        folder = _string(facts, "folder")
+        if set(facts) - {"folder"} != {"date", "session", "branch"}:
+            raise ConfigRefused("retired: expected date, session and branch")
         retired = RetiredSession(_string(facts, "date"), _string(facts, "session"),
-                                 RecordedStartFolder(Path(folder)) if folder else UnrecordedStartFolder(),
                                  Branch(_string(facts, "branch")))
     formatting = RepositoryTaploConfig(_string(fields, "taplo_config")) if "taplo_config" in fields else DefaultTaploConfig()
     return UnitConfig(plan, port, tuple(duties), retired, formatting)
@@ -299,8 +300,6 @@ def _fields(config: UnitConfig) -> dict[str, object]:
     if isinstance(config.retired, RetiredSession):
         facts = config.retired
         fields["retired"] = {"date": facts.date, "session": facts.session_id,
-                             "folder": str(facts.start_folder.path)
-                             if isinstance(facts.start_folder, RecordedStartFolder) else "",
                              "branch": facts.branch.value}
     return fields
 
@@ -326,7 +325,7 @@ def repository_formatting(worktree: Path) -> RepositoryTaploConfig | DefaultTapl
     return DefaultTaploConfig()
 
 
-def _formatted(config: UnitConfig, worktree: Path | UnrecordedStartFolder,
+def _formatted(config: UnitConfig, worktree: Path | NoFormattingWorktree,
                formatting: RepositoryTaploConfig | DefaultTaploConfig) -> bytes:
     """Run taplo with explicit configuration and a repository-relative input path."""
     try:
@@ -424,10 +423,9 @@ def place(unit: StaffId, worktree: Path, *, cleanup: bool = True) -> InWorktree 
 
 
 def _parked_config(unit: StaffId, config: UnitConfig) -> UnitConfig:
-    if isinstance(config.retired, RetiredSession) and isinstance(config.retired.start_folder, RecordedStartFolder):
-        worktree = config.retired.start_folder.path
-        if worktree.is_dir():
-            return replace(config, formatting=repository_formatting(worktree))
+    row = staff.snapshot().by_id(unit)
+    if row is not None and not isinstance(row.worktree, staff.WorktreeUnfilled) and row.worktree.path.is_dir():
+        return replace(config, formatting=repository_formatting(row.worktree.path))
     saved = read_parked(unit, cleanup=False)
     formatting = (saved.formatting if isinstance(saved, UnitConfig)
                   and isinstance(saved.formatting, RepositoryTaploConfig) else config.formatting)
@@ -435,9 +433,7 @@ def _parked_config(unit: StaffId, config: UnitConfig) -> UnitConfig:
 
 
 def _parked_text(config: UnitConfig) -> bytes:
-    worktree = (config.retired.start_folder.path if isinstance(config.retired, RetiredSession)
-                and isinstance(config.retired.start_folder, RecordedStartFolder) else UnrecordedStartFolder())
-    return _formatted(config, worktree, config.formatting)
+    return _formatted(config, NoFormattingWorktree(), config.formatting)
 
 
 def parked_needs_write(unit: StaffId, config: UnitConfig) -> bool:
@@ -486,8 +482,6 @@ def repair_port(target: InWorktree | Parked, recorded_old: AppPort | NoAppPort,
         else:
             if not isinstance(source.retired, RetiredSession):
                 raise ConfigRefused(f"{path}: parked configuration requires retirement facts")
-            if isinstance(source.retired.start_folder, RecordedStartFolder) and source.retired.start_folder.path.is_dir():
-                desired = replace(desired, formatting=repository_formatting(source.retired.start_folder.path))
             formatted = _parked_text(desired)
         if path.read_bytes() != previous:
             raise ConfigRefused(f"{path}: configuration changed during port repair; no file was changed")

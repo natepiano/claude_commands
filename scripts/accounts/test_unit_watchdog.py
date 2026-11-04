@@ -133,29 +133,26 @@ class UnitWatchdogTests(unittest.TestCase):
                 {entry["sessionId"] for entry in self.fixture.live} else sessions.SessionNotLive())
 
     def write_doc(self) -> None:
-        rows = ["# Fixture", "- **Production slug:** fixture", "## Units", "| Unit | Plan | Worktree |", "| --- | --- | --- |"]
         for name in self.units:
-            member = unit_membership("fixture", name)
             tree = self.home / name
-            _ = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
+            member = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
             if name in self.retired:
                 _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree), expected=member.worktree)
             tree.mkdir(exist_ok=True)
             _ = run_git([GIT, "init", "-b", "fixture", str(tree)], check=True, capture_output=True)
-            events: list[dict[str, object]] = [{"event_type": "run_started", "working_dir": str(tree), "run_started_at": 1}]
+            events: list[dict[str, object]] = [{"event_type": "run_started", "main_agent": {"session_id": member.current_session},
+                                              "working_dir": str(tree), "run_started_at": 1}]
             if name in self.finished:
                 events.append({"event_type": "run_finished"})
             _ = (self.runs / (name + ".jsonl")).write_text("\n".join(json.dumps(event) for event in events))
-            plan = "(retired)" if name in self.retired else "docs/plan.md"
-            rows.append(f"| {name} | {plan} | {tree} |")
-        _ = self.doc.write_text("\n".join(rows) + "\n")
+        _ = self.doc.write_text("# Fixture\n- **Production slug:** fixture\n")
 
     def add_unit(self, name: str, *, label: str = "claude4") -> inventory.Session:
         owner = self.fixture.owner(name, host="unit", label=label)
-        Path(owner["cwd"]).mkdir(parents=True, exist_ok=True)
+        Path(cast(str, owner["cwd"])).mkdir(parents=True, exist_ok=True)
         self.units[name] = owner
         self.write_doc()
-        entry = pane_record.launch(name, name, owner["cwd"],
+        entry = pane_record.launch(name, name, cast(str, owner["cwd"]),
             {"CLAUDE_CONFIG_DIR": str(accounts.account_dir(label)), "SHOWRUNNER_UNIT": "fixture",
              "SHOWRUNNER_UNIT_ID": name}, ["claude", "-n", owner["name"]])
         pane_record.write("shared", entry)
@@ -196,7 +193,7 @@ class UnitWatchdogTests(unittest.TestCase):
             directory = entry["config_dir"] if entry is not None else owner["config_dir"]
             to = accounts.claude_config_label(Path(directory))
         self.commands.append(["resume", identity, "--to", to, "--only", identity])
-        if not Path(self.units[identity]["cwd"]).is_dir():
+        if not Path(cast(str, self.units[identity]["cwd"])).is_dir():
             return stop_resume.ResumeFailed(identity, "folder no longer exists")
         if to in self.refused:
             return stop_resume.ResumeFailed(identity, "fixture refused")
@@ -326,6 +323,8 @@ class UnitWatchdogTests(unittest.TestCase):
               patch.object(stop_resume, "_tab_of", side_effect=tab),
               patch.object(sessions, "process_start", return_value="fixture-start"),
               patch.object(sessions, "process_liveness", side_effect=process),
+              # This fixture supplies signals; shutdown tests check the workspace guard.
+              patch.object(stop_resume, "_signal_process", side_effect=signal_claude),
               patch.object(os, "kill", side_effect=signal_claude)):
             yield
 
@@ -356,6 +355,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
         owner = self.add_unit("alpha")
+        self.assertEqual(accounts.group_accounts().get("units"), "claude2")
         member = unit_membership("fixture", "alpha")
         record = staff.StaffSnapshot(tuple(
             replace(row, id=staff.StaffId(owner["session_id"]),
@@ -364,7 +364,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
         def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
-            self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude4"))
+            self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude2"))
             environment = {**entry["environment"], "HERDR_ENV": "1", "HERDR_SESSION": "shared",
                            "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["config_dir"]}
             payload = json.dumps({"session_id": "alpha", "cwd": owner["cwd"]})
@@ -379,7 +379,7 @@ class UnitWatchdogTests(unittest.TestCase):
             self.revive("alpha", label)
             return sessions.LiveSessionProcess(owner["pid"])
 
-        config = accounts.account_dir("claude4")
+        config = accounts.account_dir("claude2")
         with self.stop_process_leaves():
             self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("alpha", owner["pid"]))
             self.assertTrue(pane_record.read("shared")["alpha"].get("ended", False))
@@ -388,7 +388,7 @@ class UnitWatchdogTests(unittest.TestCase):
                   patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(stop_resume, "_detach"), patch("unit_runs.held", return_value=[]),
                   patch.object(herdr, "heal_claude_trust", return_value=herdr.Trusted(
-                      Path(owner["cwd"]), config / ".claude.json", Path(owner["cwd"])))):
+                      Path(cast(str, owner["cwd"])), config / ".claude.json", Path(cast(str, owner["cwd"]))))):
                 result = self.shared_resume("alpha", why="maintenance complete")
                 row = record.by_current_session(owner["session_id"])
                 assert row is not None
@@ -401,7 +401,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.die("alpha")
         for minute in (0, 2, 4):
             _ = self.pass_at(minute)
-        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
+        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude2", "--only", "alpha"]])
         self.assertEqual({entry["sessionId"] for entry in self.fixture.live}, {"alpha"})
 
     def test_crashed_unit_without_any_record_resumes_in_its_tab_on_the_launch_account(self) -> None:
@@ -436,7 +436,9 @@ class UnitWatchdogTests(unittest.TestCase):
         owner = self.add_unit("alpha")
         _ = pane_record.forget_unit("alpha")
         self.die("alpha")
-        Path(owner["cwd"]).rmdir()
+        folder = owner["cwd"]
+        assert isinstance(folder, str)
+        Path(folder).rmdir()
         lines: list[str] = []
         for minute in (0, 2, 4):
             lines.extend(self.pass_at(minute))
@@ -921,13 +923,13 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_gone_folder_ends_recovery_and_alerts_once(self) -> None:
         owner = self.add_unit("alpha")
-        Path(owner["cwd"]).rmdir()
+        Path(cast(str, owner["cwd"])).rmdir()
         self.die("alpha")
         with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
             lines: list[str] = []
             for minute in (0, 2, 4):
                 lines.extend(self.pass_at(minute))
-            Path(owner["cwd"]).mkdir()
+            Path(cast(str, owner["cwd"])).mkdir()
             lines.extend(self.pass_at(6))
             phone.assert_not_called()
         self.assertEqual(self.pending, [])
@@ -942,7 +944,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(0)
         _ = self.pass_at(2)
         self.assertEqual(len(self.pending), 1)
-        Path(owner["cwd"]).rmdir()
+        Path(cast(str, owner["cwd"])).rmdir()
         command = self.pending[0]
         offset = command.index("--recover")
 
