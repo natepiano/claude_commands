@@ -105,7 +105,7 @@ def fill(*, dry_run: bool = False) -> int:
         location = sources.locations[(observed.owner.key, observed.name)]
         prefix = f"{location.path}:{location.key} {observed.name}"
         parent = observed.owner.match
-        if not isinstance(parent, staff.StaffRow) or parent.kind not in ("unit", "showrunner"):
+        if parent.kind not in ("unit", "showrunner"):
             problems.append(f"{prefix}: worker has no current staff parent")
             continue
         if parent.id not in active:

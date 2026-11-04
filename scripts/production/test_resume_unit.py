@@ -376,7 +376,7 @@ class ResumeUnitTests(unittest.TestCase):
             finally:
                 child.close()
         process = context.Process(target=run)
-        seed: subprocess.Popen[str] | None = None
+        writer: subprocess.Popen[str] | None = None
         try:
             with self.staff.lock_notice(self.staff.staff_file.parent / "operation.lock") as listener:
                 process.start()
@@ -388,16 +388,16 @@ class ResumeUnitTests(unittest.TestCase):
                 staff_id = staff.StaffId(identity)
                 self.assertTrue(lock_held, "resume released its operation lock before discarding the parked facts")
                 self.assertTrue(unit_config.parked_path(staff_id).exists())
-                seed = self.staff.start_script(CHECKOUT / "scripts/production/staff_sources.py", "seed")
-                self.staff.assert_operation_blocks(seed, listener)
+                writer = self.staff.start_script(CHECKOUT / "scripts/production/staff.py", "rename", identity, "--name", "alpha")
+                self.staff.assert_operation_blocks(writer, listener)
                 parent.send("finish")
                 self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "resume did not discard the parked facts")
                 code, output = cast(tuple[int, str], parent.recv())
                 self.assertEqual(code, 0, output)
                 process.join(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.exitcode, 0)
-                output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(seed.returncode, 0, output + errors)
+                output, errors = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(writer.returncode, 0, output + errors)
             self.assertFalse(unit_config.parked_path(staff_id).exists())
             row = staff.by_id(staff_id)
             self.assertIsNotNone(row)
@@ -411,9 +411,9 @@ class ResumeUnitTests(unittest.TestCase):
                 process.terminate()
                 process.join(timeout=TEST_HANG_GUARD_SECS)
             process.close()
-            if seed is not None and seed.returncode is None:
-                seed.kill()
-                _ = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
+            if writer is not None and writer.returncode is None:
+                writer.kill()
+                _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
         self.assert_resumed(*self.resume())

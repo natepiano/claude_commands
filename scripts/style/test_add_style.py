@@ -52,7 +52,7 @@ elif name == "launch.py":
             "production": doc.read_text(),
             "plans": {path.name: path.read_text() for path in (doc.parent / "style-production/units").glob("*.md")},
         }))
-    destination = next(line for line in doc.read_text().splitlines() if line.startswith("- **Parent production:**"))
+    destination = next(line for line in doc.read_text().splitlines() if line.startswith("- **Proposals:**"))
     with Path(os.environ["TEST_LAUNCH_DESTINATIONS"]).open("a") as destinations:
         destinations.write(destination + "\\n")
     if os.environ.get("TEST_FAIL_LAUNCH") == "1":
@@ -402,7 +402,7 @@ atomic_file.os.replace = interrupted_replace
         lines = self.doc.read_text().splitlines()
         for field, value in {
             "Kind": "style", "Repository": str(self.repo), "Branch point": "main",
-            "Parent production": str(self.parent), "Proposals": str(self.root / "parent-issues"),
+            "Proposals": str(self.root / "parent-issues"),
             "Log": "docs/sample-style-log.md", "Updates": "on demand", "Push": "git",
         }.items():
             self.assertEqual(production_field(lines, field), value)
@@ -516,7 +516,6 @@ atomic_file.os.replace = interrupted_replace
             self.assertEqual({row["checkpoint"]: row["state"] for row in ledger.pending_handoffs()},
                              {self.initial_tip: "pending", second: "sent"})
         fields = self.doc.read_text().splitlines()
-        self.assertEqual(production_field(fields, "Parent production"), str(caller))
         self.assertEqual(production_field(fields, "Proposals"), str(self.root / "next-issues"))
         self.assertEqual(self.calls()[1:], [
             {"command": "showrunners.py", "arguments": ["detach", "sample-style"]},
@@ -571,7 +570,7 @@ atomic_file.os.replace = interrupted_replace
             f"1. read {caller}; repository {self.repo}; Proposals {self.root / 'next-issues'}",
             "2. attach standing sample-style under next; branch point main",
             *(f"{number}. skipped: sample-style already exists" for number in range(3, 7)),
-            "7. update Parent production and Proposals, run style_sync.py resume; synced tip unchanged",
+            "7. update Proposals, run style_sync.py resume; synced tip unchanged",
         ])
         self.assertEqual({path: (path.read_text(), path.stat().st_mtime_ns) for path in paths}, before)
         self.assertEqual((self.git("show-ref"), self.git("worktree", "list", "--porcelain"), self.sync(), self.calls()),
@@ -714,7 +713,6 @@ atomic_file.os.replace = interrupted_replace
         self.env["TEST_PARENT_SLUG"] = "next"
         _ = self.run_bootstrap(parent=caller)
         fields = self.doc.read_text().splitlines()
-        self.assertEqual(production_field(fields, "Parent production"), str(caller))
         self.assertEqual(production_field(fields, "Proposals"), str(self.root / "next-issues"))
         self.assertEqual({path: path.read_bytes() for path in plans}, plans)
         self.assertEqual((self.sync(), (self.repo / ".git/info/exclude").read_bytes()), (sync, excludes))
@@ -723,8 +721,8 @@ atomic_file.os.replace = interrupted_replace
         self.assertIn(str(self.doc), launches[-1]["arguments"])
         destinations = (self.root / "launch-destinations.txt").read_text().splitlines()
         self.assertEqual(len(destinations), 2)
-        self.assertEqual(production_field([destinations[0]], "Parent production"), str(self.parent))
-        self.assertEqual(production_field([destinations[1]], "Parent production"), str(caller))
+        self.assertEqual(production_field([destinations[0]], "Proposals"), str(self.root / "parent-issues"))
+        self.assertEqual(production_field([destinations[1]], "Proposals"), str(self.root / "next-issues"))
         self.assertNotIn(self.resume_call(), self.calls())
 
     def test_check_interrupted_bootstrap_describes_destination_repair_without_writes(self) -> None:
@@ -736,10 +734,10 @@ atomic_file.os.replace = interrupted_replace
         calls, sync = self.calls(), self.sync()
         result = self.run_bootstrap("--check", parent=caller)
         self.assertEqual(result.stdout.splitlines()[3],
-                         f"4. set Parent production and Proposals in existing production doc {self.doc}")
+                         f"4. set Proposals in existing production doc {self.doc}")
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
         self.assertEqual((self.calls(), self.sync()), (calls, sync))
-        self.assertEqual(production_field(self.doc.read_text().splitlines(), "Parent production"), str(self.parent))
+        self.assertEqual(production_field(self.doc.read_text().splitlines(), "Proposals"), str(self.root / "parent-issues"))
 
 
 if __name__ == "__main__":

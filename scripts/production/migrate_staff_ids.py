@@ -180,8 +180,7 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
             if identity in evidence:
                 evidence[identity].update(backend.values())
         for observed in workers.workers:
-            if (not isinstance(observed.owner.match, staff.StaffRow)
-                    or isinstance(observed.identity, staff_sources.BackendUnavailable)):
+            if isinstance(observed.identity, staff_sources.BackendUnavailable):
                 continue
             matches = [row for row in record.find(kind="worker", parent=observed.owner.match.id)
                        if row.name == observed.name]

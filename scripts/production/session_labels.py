@@ -7,16 +7,6 @@ from dataclasses import dataclass
 from scripts.production import staff, showrunners, unit_names
 
 
-def showrunner_owner(record: staff.StaffSnapshot, slug: str, document: str) -> staff.StaffRow | None:
-    """A timer names a staff path or a unique showrunner short name, including nested owners."""
-    name = showrunners.space_from_text(slug, document)
-    row = record.by_path(name)
-    if row is not None and row.kind == "showrunner":
-        return row
-    owners = [owner for owner in record.find(kind="showrunner") if owner.name == name]
-    return owners[0] if len(owners) == 1 else None
-
-
 @dataclass(frozen=True)
 class StaffLabels:
     record: staff.StaffSnapshot

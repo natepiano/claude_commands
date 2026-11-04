@@ -181,7 +181,7 @@ raise SystemExit(1)
         self.fail_file = self.root / "fail-targets.json"
         _ = self.fail_file.write_text("[]")
         _ = (self.root / "stall_watch.conf").write_text("prompt_grace_seconds=0\n")
-        self.config = self.root / "showrunners.json"
+        self.config = self.root / "showrunners.conf"
         self.configure({"showrunner": ["unit-one"]})
         self.addCleanup(self.close_processes)
         executable(self.bin / "ps", "#!/bin/sh\ncat \"$STALL_TEST_PS_FILE\"\n")
@@ -264,10 +264,15 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
 
     def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
         """Give each showrunner an update timer, a production doc and staff rows for its units. The slug is its name."""
-        _ = self.config.write_text(json.dumps({
-            "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": stall_minutes,
-            "faults_to": "natedev", "always": ["natedev"],
-        }))
+        _ = self.config.write_text((f"""# range: 0..
+threshold_percent=1
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes={stall_minutes}
+faults_to=natedev
+always=natedev
+"""))
         for session, units in runners.items():
             parent = showrunner_relationship(session)
             live_units = [unit for unit in units if unit not in self.retired]
@@ -2452,12 +2457,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.assertEqual(len(self.sent()), bumps)
                 _ = self.process_rows.pop()
 
-    def test_detached_work_with_a_former_production_mark_prevents_a_bump(self) -> None:
-        doc = self.root / "showrunner-production.md"
-        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
-        self.panes["unit-one"]["slug"] = "old-showrunner"
+    def test_detached_work_with_a_current_production_mark_prevents_a_bump(self) -> None:
         worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                  env={**self.environment, "SHOWRUNNER_UNIT": "old-showrunner",
+                                  env={**self.environment, "SHOWRUNNER_UNIT": "showrunner",
                                        "SHOWRUNNER_UNIT_ID": "unit-one"})
         self.children.append(worker)
         self.process_rows.append(f"{worker.pid} 1 sleep 60")
@@ -2474,13 +2476,11 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         import stall_watch
         from scripts.production import showrunners
 
-        doc = self.root / "showrunner-production.md"
-        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
         rows = [stall_watch.Process(10, 1, "claude"), stall_watch.Process(20, 1, "build"),
                 stall_watch.Process(21, 1, "build")]
         with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(stall_watch, "staff_marks", return_value=("old-showrunner", "unit-one")),
-              mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads):
+              mock.patch.object(stall_watch, "staff_marks", return_value=("showrunner", "unit-one")),
+              mock.patch.object(showrunners, "canonical_slug", wraps=showrunners.canonical_slug) as reads):
             self.assertFalse(stall_watch.work_running(10, rows, ("unrelated", "unit-one")))
             self.assertEqual(reads.call_count, 1)
             self.assertTrue(stall_watch.work_running(10, rows, ("showrunner", "unit-one")))

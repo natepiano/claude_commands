@@ -67,7 +67,7 @@ class ProfileNotesPassTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"),
             "ROSTER_CODEX_SOCKET": str(self.home / "daemon.sock"),
             "ROSTER_RUN_ROOT": str(self.home / "runs"),
-            "SHOWRUNNERS_CONFIG": str(self.home / "showrunners.json"),
+            "SHOWRUNNERS_CONFIG": str(self.home / "showrunners.conf"),
             "USER_ZONE": "UTC", "PYTHONDONTWRITEBYTECODE": "1",
         }, clear=True))
         _ = self.enterContext(scratch_accounts_config())
@@ -80,7 +80,7 @@ class ProfileNotesPassTests(unittest.TestCase):
                 target = self.home / "fixed" / entry.owner.__name__ / entry.attribute
                 _ = self.enterContext(patch.object(entry.owner, entry.attribute, target))
         paths = (
-            (self.pass_.quota, "CONFIG", self.home / "showrunners.json"),
+            (self.pass_.quota, "CONFIG", self.home / "showrunners.conf"),
             (self.pass_.five, "PROTOCOL", self.home / "quota_alerts.md"),
             (self.pass_.pacer, "SESSIONS", self.home / ".codex/sessions"),
             (self.pass_.pacer, "MODELS_CONF", self.home / "models.conf"),
@@ -94,10 +94,15 @@ class ProfileNotesPassTests(unittest.TestCase):
         for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
             _ = self.enterContext(patch.object(self.pass_.showrunners, attribute, self.home / attribute))
         _ = self.enterContext(patch.object(import_module("scripts.message.process_table"), "PS", [str(self.bin / "ps")]))
-        _ = (self.home / "showrunners.json").write_text(json.dumps({
-            "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5,
-            "faults_to": "fixture", "always": [],
-        }))
+        _ = (self.home / "showrunners.conf").write_text(("""# range: 0..
+threshold_percent=2
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=fixture
+always=
+"""))
 
     @property
     def pass_(self) -> profile.NotesPass:

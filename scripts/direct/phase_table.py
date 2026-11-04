@@ -1779,12 +1779,10 @@ def phase_note_ownership(text: str) -> NoteOwnership | NoteWithoutPhaseTableOwne
 
 
 def production_identity(production: ProductionSlug) -> ProductionIdentity:
-    """Keep historical note names beside the current row identity."""
-    try:
-        history = production.doc.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise Refusal(f"cannot read production history: {error}") from error
-    return ProductionIdentity(production.slug, showrunners.former_slugs(history))
+    """Keep journal names beside the current row identity."""
+    return ProductionIdentity(production.slug, tuple(
+        old for old, new in showrunners.rename_history().items() if new == production.slug
+    ))
 
 
 def _owns_note(

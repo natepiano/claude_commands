@@ -7,7 +7,6 @@ import json
 import math
 from time import monotonic
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -19,10 +18,13 @@ from importlib import import_module
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast, override
 
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
+from scripts.lib import conf as tunables
+
+CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or tunables.path("showrunners"))
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
@@ -150,36 +152,17 @@ class NoCheckedDoc(NamedTuple):
     reason: str
 
 
-def defaults() -> ShowrunnerSettings:
-    return ShowrunnerSettings(threshold_percent=2, repeat_minutes=30, stall_minutes=5,
-                              faults_to="natedev", always=["natedev"])
-
-
 def load_settings() -> ShowrunnerSettings:
     return load_settings_from(CONFIG)
 
 
 def load_settings_from(path: Path) -> ShowrunnerSettings:
-    try:
-        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        if not isinstance(raw, dict):
-            raise ValueError("expected an object")
-        data = cast(dict[str, object], raw)
-        for key in ("threshold_percent", "repeat_minutes", "stall_minutes"):
-            if not isinstance(data.get(key), (int, float)) or isinstance(data[key], bool):
-                raise ValueError(f"invalid {key}")
-        if not isinstance(data.get("faults_to"), str) or not data["faults_to"]:
-            raise ValueError("invalid faults_to")
-        always = data.get("always")
-        if not isinstance(always, list) or not all(isinstance(item, str) for item in cast(list[object], always)):
-            raise ValueError("invalid always")
-        # A file written while showrunners were listed here still has the list; it is not read.
-        return ShowrunnerSettings(threshold_percent=cast(float, data["threshold_percent"]),
-                                  repeat_minutes=cast(float, data["repeat_minutes"]),
-                                  stall_minutes=cast(float, data["stall_minutes"]),
-                                  faults_to=cast(str, data["faults_to"]), always=cast(list[str], always))
-    except (OSError, ValueError, TypeError, KeyError) as error:
-        raise ValueError(f"{path}: {error}") from error
+    settings = tunables.read(path)
+    return ShowrunnerSettings(
+        threshold_percent=settings.number("threshold_percent"),
+        repeat_minutes=settings.number("repeat_minutes"),
+        stall_minutes=settings.number("stall_minutes"),
+        faults_to=settings.text("faults_to"), always=settings.values()["always"].split())
 
 
 def socket_for(target: str, *, deadline: float = math.inf) -> str | None:
@@ -470,24 +453,31 @@ def adopt_session_state(slug: str) -> list[str]:
     return copy_session_state(slug, scratch) if scratch is not None else []
 
 
-def former_slugs(text: str) -> tuple[str, ...]:
-    """Read former names only from the production's Production Context section."""
-    context = re.search(r"^## Production Context\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
-    formerly = re.search(r"^- \*\*Formerly:\*\*(.*)$", context[1] if context else "", re.MULTILINE)
-    return tuple(re.findall(r"`([^`]+)`", formerly[1])) if formerly else ()
-
-
-def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
-    """Map a former production name to its current slug; leave other slugs unchanged."""
-    sources: list[ShowrunnerSource] = []
-    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
+def rename_history() -> dict[str, str]:
+    """Read exact slug changes from recorded rename journals."""
+    history: dict[str, str] = {}
+    for path in sorted(SHOWRUNNER_STATE_DIR.glob("*/rename.json")):
         try:
-            sources.append(_source(instance))
-        except (OSError, KeyError, ValueError, UnicodeError):
-            continue
-    if any(source.timer.slug == slug for source in sources):
-        return slug
-    return next((source.timer.slug for source in sources if slug in former_slugs(source.document)), slug)
+            journal = cast(dict[str, object], json.loads(path.read_text()))
+            old, new = journal["old"], journal["new"]
+            if not isinstance(old, str) or not old or not isinstance(new, str) or not new:
+                raise ValueError("rename journal needs old and new slugs")
+            if old in history and history[old] != new:
+                raise ValueError(f"{old}: no unique renamed showrunner staff entry")
+            history[old] = new
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise staff.StaffUnreadable(f"{path}: {error}") from error
+    return history
+
+
+def canonical_slug(slug: str) -> str:
+    """Resolve a recorded rename after checking current staff documents."""
+    record = staff.initial_snapshot()
+    for row in record.find(kind="showrunner"):
+        if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            if row.doc.path.name.removesuffix("-production.md") == slug:
+                return slug
+    return rename_history().get(slug, slug)
 
 
 def current_name(slug: str) -> str:
@@ -512,11 +502,6 @@ def herdr_space(slug: str, doc: str) -> str:
     row = staff.initial_snapshot().by_doc(remote.local_machine(), Path(doc))
     return row.name if row is not None else slug
 
-
-def space_from_text(slug: str, text: str) -> str:
-    """The workspace name from an already-read production document."""
-    line = re.search(r"^- \*\*Showrunner session:\*\*\s*`?([^`\s]+)`?\s*$", text, re.MULTILINE)
-    return line[1] if line else slug
 
 
 def current_address(slug: str, *, deadline: float = math.inf) -> str:

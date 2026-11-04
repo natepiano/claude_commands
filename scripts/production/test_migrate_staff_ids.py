@@ -407,8 +407,8 @@ class NativeMigrationTests(StaffTestCase):
         self.pane("owner:p1", session_id=self.fixture.native_owner, environment={})
         bad_run = self.worker_run("unrelated", "broken-unit", "unproved-director")
         _ = self.roster_worker(bad_run, "unproved", "impl", fixture_runtime_id("unproved-worker"))
-        unreadable = bad_run / "progress_history_state.json"
-        _ = unreadable.write_text('{"production":')
+        unreadable = bad_run / "mesh_roster.json"
+        _ = unreadable.write_text('{"unproved":')
         record = staff.snapshot()
         sources, _ = staff_sources.migration_sources(record)
         before = self.staff_file.read_bytes()

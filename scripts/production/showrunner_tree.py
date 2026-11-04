@@ -167,20 +167,6 @@ def edges_to_release(slug: str, *, record: staff.StaffSnapshot | None = None) ->
     return WrapRelease(ReportedTo(parent) if parent else Root(), children, ())
 
 
-def release_edges(slug: str, released: WrapRelease, *, record: staff.StaffSnapshot | None = None) -> None:
-    """Remove captured legacy files unless the record has a subsequent attachment."""
-    tree = edges(record=record)
-    captured = [(child, slug) for child in released.former_children]
-    if isinstance(released.former_parent, ReportedTo):
-        captured.insert(0, (slug, released.former_parent.parent))
-    for child, parent in captured:
-        current = tree.get(child, "")
-        if not current or current == parent:
-            (showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE).unlink(missing_ok=True)
-        else:
-            print(f"showrunners: keep {child} -> {current}; captured parent was {parent}", file=sys.stderr)
-
-
 def main(action: str, slug: str) -> int:
     """Answer the reporting-tree verbs parsed by the showrunner command."""
     if action == "tree":

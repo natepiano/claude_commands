@@ -191,7 +191,6 @@ def _production_text(style: StyleProduction) -> str:
         f"- **Merge branch:** {style.merge_branch}",
         "- **Kind:** style",
         f"- **Branch point:** {style.branch_point}",
-        f"- **Parent production:** {style.parent.doc}",
         f"- **Showrunner checkout:** {style.checkout}",
         f"- **Log:** {style.log}",
         f"- **Proposals:** {style.proposals}",
@@ -305,7 +304,7 @@ def _attach(style: StyleProduction) -> None:
 
 
 def _update_destination(style: StyleProduction) -> None:
-    _set_fields(style, {"Parent production": str(style.parent.doc), "Proposals": style.proposals})
+    _set_fields(style, {"Proposals": style.proposals})
 
 
 def _set_fields(style: StyleProduction, replacements: dict[str, str]) -> None:
@@ -330,13 +329,13 @@ def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
             f"read {style.parent.doc}; repository {style.repository}; Proposals {style.proposals}",
             f"attach standing {style.slug} under {style.parent.slug}; branch point {style.branch_point}",
             *((f"skipped: {style.slug} already exists",) * 4),
-            "update Parent production and Proposals, run style_sync.py resume; synced tip unchanged",
+            "update Proposals, run style_sync.py resume; synced tip unchanged",
         )
     return (
         f"read {style.parent.doc}; repository {style.repository}; Proposals {style.proposals}",
         f"find standing {style.slug} under {style.parent.slug}; branch point {style.branch_point}",
         f"ensure {style.merge_branch} from {style.branch_tip} and worktree {style.checkout}",
-        (f"set Parent production and Proposals in existing production doc {style.doc}"
+        (f"set Proposals in existing production doc {style.doc}"
          if style.doc.exists() else f"write missing production doc {style.doc}"),
         f"write four missing standing plans under {style.checkout / PLAN_DIRECTORY}",
         f"exclude docs/style-production/, {style.doc.relative_to(style.checkout)} and {style.log} in shared info/exclude",

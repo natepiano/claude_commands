@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production import showrunners
+
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.atomic_file import write_bytes_atomic
 
@@ -398,7 +400,12 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         worktree = self.session_dir.parent / "repository"
         plan = worktree / "plan.md"
         production_doc = worktree / "production.md"
-        _ = production_doc.write_text("## Production Context\n\n- **Formerly:** `demo`\n")
+        _ = production_doc.write_text("## Production Context\n")
+        state_dir = self.session_dir.parent / "showrunner-state"
+        journal = state_dir / "renamed" / "rename.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "demo", "new": "renamed"}))
+        _ = self.enterContext(patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state_dir))
         _ = recorded_unit("demo", "builders", worktree, production_doc, plan="plan.md")
         notifier = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-renamed"
         notifier.mkdir(parents=True)

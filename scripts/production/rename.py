@@ -23,7 +23,7 @@ import unit_move  # noqa: E402
 from unit_move import PathMove  # noqa: E402
 import rename_checkout  # noqa: E402
 import rename_outside  # noqa: E402
-from rename_state import RenameRefused, write_text  # noqa: E402
+from rename_state import RenameRefused, write_json, write_text  # noqa: E402
 
 from scripts.astra import design_roles  # noqa: E402
 from scripts.herdr import herdr  # noqa: E402
@@ -135,10 +135,7 @@ def _relative(plan: RenamePlan, path: Path) -> str:
 
 
 def plan(old: str, new: str) -> RenamePlan:
-    """Read the production and list its moves, without creating or rewriting anything.
-
-    After the timer moves, `old` resolves to the new name, and the latest former name is the old name.
-    """
+    """Read the production and list its moves. Use the rename journal after the timer moves."""
     _validate_slug(new)
     record = staff.snapshot()
     rows = record.find(kind="showrunner")
@@ -146,26 +143,26 @@ def plan(old: str, new: str) -> RenamePlan:
     if not found:
         raise staff.StaffRefused(f"{old}: no showrunner staff row")
     member = found[0]
+    if any(row.name == new and row.id != member.id for row in rows):
+        raise staff.StaffRefused(f"{new} is already a production")
     if isinstance(member.doc, staff.DocUnfilled):
         raise ValueError(f"{member.name}: the staff document is unfilled")
-    slug = showrunners.canonical_slug(member.doc.path.name.removesuffix("-production.md"))
+    slug = member.doc.path.name.removesuffix("-production.md")
+    if member.name == new:
+        previous = [source for source, target in showrunners.rename_history().items()
+                    if target == new and old in (source, new)]
+        if len(previous) != 1:
+            raise RenameRefused(f"{new}: no unique rename journal for {old}")
+        old = previous[0]
+        slug = new if (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{new}").is_dir() else old
+    else:
+        old = slug
     _validate_slug(slug)
-    known = showrunners.timer_slugs()
-    if slug != new and new in known:
-        raise RenameRefused(f"{new} is already a production")
-    if slug not in known:
-        raise RenameRefused(f"{old} has no update timer")
     instance = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}"
     checked = showrunners.checked_doc(instance)
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise RenameRefused(f"{slug} has no readable update timer: {checked.reason}")
     production = read_production(checked.path)
-    old = slug
-    if slug == new:
-        former = showrunners.former_slugs(production.doc.read_text(encoding="utf-8"))
-        if not former:
-            raise RenameRefused(f"{new} is already the production's name")
-        old = former[0]
     _ = unit_move.git(production.checkout, "check-ref-format", "--branch", new)
     new_doc = production.doc.with_name(f"{new}-production.md")
     old_doc = production.doc.with_name(f"{old}-production.md") if production.doc == new_doc else production.doc
@@ -369,6 +366,8 @@ def apply(old: str, new: str) -> RenamePlan:
         if not _pending(result):
             print("unchanged")
             return result
+        write_json(result.state[-1].source / "rename.json",
+                   {"old": result.old, "new": result.new, "staff_id": result.staff_id})
         _ = staff.rename(result.staff_id, result.new)
         for step in STEPS:
             try:

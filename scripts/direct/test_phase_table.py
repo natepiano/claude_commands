@@ -318,14 +318,12 @@ class PhaseTableTests(unittest.TestCase):
         return path
 
     def record_former_production(self, production: Path) -> None:
-        _ = production.write_text(
-            production.read_text(encoding="utf-8").replace(
-                "## Production Context\n",
-                "## Production Context\n\n- **Formerly:** `old-name`\n",
-                1,
-            ),
-            encoding="utf-8",
-        )
+        state = self.root / "showrunner-state"
+        path = state / "show" / "rename.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"old": "old-name", "new": production.name.removesuffix("-production.md")}))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(state)})))
+        _ = self.enterContext(patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state))
 
     def write_showrunner(self, name: str = "showrunner") -> None:
         self.showrunner_record_number += 1
@@ -3301,7 +3299,7 @@ class PhaseTableTests(unittest.TestCase):
                     self.record_former_production(production)
                 else:
                     with production.open("a", encoding="utf-8") as handle:
-                        _ = handle.write("\n## History\n\n- **Formerly:** `old-name`\n")
+                        _ = handle.write("\n## History\n\n- **Owner:** `old-name`\n")
                 target = self.write_linked_phase_note("showrunner", "table", slug, unit)
                 before = target.read_bytes()
 
@@ -3978,7 +3976,7 @@ class PhaseTableTests(unittest.TestCase):
             ).is_file()
         )
 
-    def test_prune_archives_a_former_slugs_note_when_its_unit_is_gone(self) -> None:
+    def test_prune_archives_a_journal_named_note_when_its_unit_is_gone(self) -> None:
         live_worktree = self.make_live_worktree("former-slug-live")
         _ = (live_worktree / "plan.md").write_text(
             plan_text("### Phase 1 — Live  · status: todo"), encoding="utf-8"

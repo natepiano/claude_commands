@@ -52,21 +52,16 @@ def showrunner_member(record: staff.StaffSnapshot, sources: session_staff.Member
     if isinstance(found, session_staff.MemberFound):
         return found
     matches: dict[staff.StaffId, staff.StaffRow] = {}
-    for path in sorted(showrunners.SHOWRUNNER_STATE_DIR.glob("*/rename.json")):
-        if dependencies is not None:
+    if dependencies is not None:
+        for path in sorted(showrunners.SHOWRUNNER_STATE_DIR.glob("*/rename.json")):
             dependencies(path)
-        try:
-            journal = worker_lifecycle.read_json_object(path)
-            old, new = journal.get("old"), journal.get("new")
-            if not isinstance(old, str) or not old or not isinstance(new, str) or not new:
-                raise ValueError("rename journal needs old and new slugs")
-        except (OSError, ValueError) as error:
-            raise staff.StaffUnreadable(f"{path}: {error}") from error
+    holders = sources.showrunner_members(record)
+    for old, new in showrunners.rename_history().items():
         if slug != old:
             continue
-        current = sources.member(session_staff.ShowrunnerMember(new), record)
-        if isinstance(current, session_staff.MemberFound):
-            matches[current.row.id] = current.row
+        current = holders.get(new)
+        if current is not None:
+            matches[current.id] = current
     if len(matches) > 1:
         raise staff.StaffUnreadable(f"{slug}: no unique renamed showrunner staff entry")
     return session_staff.MemberFound(next(iter(matches.values()))) if matches else found

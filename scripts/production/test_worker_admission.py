@@ -7,7 +7,7 @@ from dataclasses import replace
 from unittest import mock
 
 from scripts.lib import unit_runs
-from scripts.production import staff, worker_admission
+from scripts.production import staff, worker_admission, showrunners
 from scripts.production import session_staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
 
@@ -74,6 +74,18 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
 
 
 class WorkerAdmissionTests(StaffTestCase):
+    def test_rename_journal_cannot_select_a_holder_by_name_alone(self) -> None:
+        owner, _, _ = self.tree()
+        state = self.root / "showrunner-state"
+        journal = state / "new" / "rename.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "old", "new": owner.name}))
+        with mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state):
+            found = worker_admission.showrunner_member(
+                staff.snapshot(), session_staff.MemberSources({}, ()), "old",
+            )
+        self.assertIsInstance(found, session_staff.NoSuchMember)
+
     def test_valid_worker_roles_are_retained_by_read_only_start_permission(self) -> None:
         _, unit, _ = self.tree()
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns

@@ -13,6 +13,7 @@ from git_process import GitExitAnswers, run_git
 
 import style_ledger
 from scripts.production import session_staff, staff, unit_lookup, unit_names
+from scripts.shutdown import remote
 from scripts.production.production_doc import production_field
 
 
@@ -57,10 +58,16 @@ def unit_worktrees(doc: Path, *,
 
 
 def unit_file_holders(repo: Path, doc: Path, ledger: style_ledger.Ledger, own_unit: str = "") -> dict[str, frozenset[str]]:
-    lines = doc.read_text().splitlines()
-    parent = Path(production_field(lines, "Parent production")).expanduser()
     record = staff.snapshot()
-    units = (*unit_worktrees(parent, record=record), *unit_worktrees(doc, record=record))
+    owner = record.by_doc(remote.local_machine(), doc)
+    if owner is None or owner.parent is None:
+        raise staff.StaffRefused(f"{doc}: no style parent staff row")
+    parent_row = record.by_id(owner.parent)
+    assert parent_row is not None
+    parent = session_staff.RowResolver(record).production_doc(parent_row)
+    if not isinstance(parent, session_staff.ProductionDoc):
+        raise staff.StaffRefused(parent.reason)
+    units = (*unit_worktrees(parent.path, record=record), *unit_worktrees(doc, record=record))
     holders: dict[str, frozenset[str]] = {}
     for row in units:
         busy: set[str] = set()

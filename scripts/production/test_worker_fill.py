@@ -12,16 +12,28 @@ from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 from types import FunctionType
-from typing import cast, get_type_hints
+from typing import cast, get_type_hints, override
 
 from scripts.agents import codex_mesh
-from scripts.herdr.herdr import HerdrPlace
 from scripts.production import staff, staff_sources, worker_fill, worker_admission
 import unit_lookup
 from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, production_membership, unit_membership, showrunner_relationship
 
 
 class WorkerFillTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        with mock.patch("tempfile.tempdir", "/tmp"):
+            super().setUp()
+
+    @override
+    def worker_run(self, slug: str, unit: str, director: str) -> Path:
+        from scripts.production import unit_names
+        record = staff.initial_snapshot()
+        owner = record.by_path(f"{slug}/{unit_names.name(unit)}" if unit else slug)
+        native = owner.current_session if owner is not None else fixture_runtime_id(director)
+        return super().worker_run(slug, unit, native)
+
     def recorded_production(self, slug: str, *units: str) -> Path:
         doc = self.production(slug, *units)
         owner = showrunner_relationship(slug)
@@ -36,7 +48,13 @@ class WorkerFillTests(StaffTestCase):
     def pause_ledger(self, path: Path, run: Path) -> None:
         data = cast(dict[str, object], json.loads(path.read_text()))
         entries = cast(dict[str, dict[str, object]], data["workers"])
-        for entry in entries.values():
+        director = staff.snapshot().by_member_reference((run / "director").read_text().strip())
+        for name, entry in entries.items():
+            if director is not None:
+                backend = cast(dict[str, str], entry["backend"])
+                identity = backend["thread_id"] if backend["kind"] == "CodexThread" else backend["session_id"]
+                row = staff.ensure_worker(name, director.id, runtime_id=identity)
+                entry["staff_id"] = row.id
             entry["ownership"] = {"kind": "Paused"}
             entry["events"] = [{"kind": "opened", "cause": "fixture launch", "run": str(run), "at": 1.0}]
         self.write_json(path, data)
@@ -107,7 +125,8 @@ class WorkerFillTests(StaffTestCase):
         roster["impl"]["launcher_pid"] = 0
         self.write_json(run / "mesh_roster.json", roster)
         loaded = mock.MagicMock(return_value={fixture_runtime_id("loaded-thread")})
-        with mock.patch.object(unit_lookup, "marked_unit", side_effect=OSError("unreadable marks")):
+        with mock.patch.object(staff_sources._WorkerSources, "paused_director_live",  # pyright: ignore[reportPrivateUsage]
+                               side_effect=ValueError("director evidence unavailable")):
             with mock.patch.object(codex_mesh, "loaded_threads", loaded):
                 code, output, errors = self.result()
                 self.assertEqual(loaded.call_count, 1)
@@ -122,9 +141,8 @@ class WorkerFillTests(StaffTestCase):
         _ = self.ledger_worker(run, "demo", "gone-unit", "helper", "test", fixture_runtime_id("dead-helper"), family="claude")
         self.pause_ledger(path, run)
         shutil.rmtree(run)
-        with mock.patch.object(unit_lookup, "marked_unit", return_value=None):
-            self.assertEqual(self.result(), (0, "skipped 1 not current\nunchanged\n", ""))
-            self.assertEqual(self.result(), (0, "skipped 1 not current\nunchanged\n", ""))
+        self.assertEqual(self.result(), (0, "skipped 1 not current\nunchanged\n", ""))
+        self.assertEqual(self.result(), (0, "skipped 1 not current\nunchanged\n", ""))
         self.assertEqual(staff.find(kind="worker"), [])
 
     def test_paused_unreadable_or_incomplete_evidence_is_listed_and_never_counted(self) -> None:
@@ -136,46 +154,43 @@ class WorkerFillTests(StaffTestCase):
         _ = self.ledger_worker(run, "demo", "models-unit", "helper", "test", fixture_runtime_id("dead-helper"), family="claude")
         self.pause_ledger(path, run)
         shutil.rmtree(run)
-        with mock.patch.object(unit_lookup, "marked_unit", side_effect=OSError("unreadable marks")):
+        before = self.staff_file.read_bytes()
+        with mock.patch("scripts.message.process_table.snapshot", side_effect=OSError("unreadable Codex scan")):
             code, output, errors = self.result()
         self.assertEqual(code, 1)
-        self.assertIn("unreadable marks", errors)
+        self.assertIn("unreadable Codex scan", errors)
         self.assertNotIn("skipped", output)
         registry = self.source_root / "sessions" / "broken.json"
         _ = registry.write_text("{unreadable")
-        with mock.patch.object(unit_lookup, "marked_unit", return_value=None):
-            code, output, errors = self.result()
+        code, output, errors = self.result()
         self.assertEqual(code, 1)
         self.assertIn("registry is incomplete", errors)
         self.assertNotIn("skipped", output)
-        self.assertEqual(staff.find(kind="worker"), [])
+        self.assertEqual(self.staff_file.read_bytes(), before)
         registry.unlink()
         server = run / "mesh_server.json"
         self.write_json(server, {"pid": "unreadable", "port": 12345})
-        with mock.patch.object(unit_lookup, "marked_unit", return_value=None):
-            code, output, errors = self.result()
+        code, output, errors = self.result()
         self.assertEqual(code, 1)
         self.assertIn(str(server), errors)
         self.assertNotIn("skipped", output)
 
-    def test_paused_director_mark_keeps_live_and_unknown_outcomes_distinct(self) -> None:
-        doc = self.recorded_production("demo", "models-unit")
-        _ = staff.set_doc(showrunner_relationship("demo").id, staff.LiveDoc("natedev", doc))
+    def test_paused_director_identity_keeps_live_and_unknown_outcomes_distinct(self) -> None:
+        _ = self.recorded_production("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
-        run = self.worker_run("demo", "models-unit", "former-director")
+        run = self.worker_run("demo", "models-unit", parent.current_session)
         path = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", fixture_runtime_id("dead-thread"))
         self.pause_ledger(path, run)
         shutil.rmtree(run)
-        place = HerdrPlace("agents", "w1:models")
-        unknown = unit_lookup.MarkedUnit("models-unit", unit_lookup.ClaudeUnknown("unreadable director session"), place)
-        with mock.patch.object(unit_lookup, "marked_unit", return_value=unknown):
-            code, output, errors = self.result()
+        registry = self.source_root / "sessions" / "broken.json"
+        _ = registry.write_text("{unreadable")
+        code, output, errors = self.result()
         self.assertEqual(code, 1)
-        self.assertIn("unreadable director session", errors)
+        self.assertIn("director registry is incomplete", errors)
         self.assertNotIn("skipped", output)
-        live = unit_lookup.MarkedUnit("models-unit", unit_lookup.LiveClaude("models", "new-director", "", os.getpid()), place)
-        with mock.patch.object(unit_lookup, "marked_unit", return_value=live):
-            code, output, errors = self.result()
+        registry.unlink()
+        _ = self.session_record(parent.current_session, parent.name)
+        code, output, errors = self.result()
         self.assertEqual((code, errors), (0, ""), output + errors)
         self.assertEqual([row.name for row in staff.find(kind="worker", parent=parent.id)], ["impl"])
 
@@ -218,6 +233,7 @@ class WorkerFillTests(StaffTestCase):
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         run = self.worker_run("old-production", "models-unit", "director")
+        _ = (run / "director").write_text(parent.current_session + "\n")
         _ = self.session_record(parent.id, "models-unit")
         self.pane("w1:models", session_id=parent.id, environment={
             "STAFF_ID": "sdeleted", "SHOWRUNNER_UNIT": "old-production", "SHOWRUNNER_UNIT_ID": "models-unit"})
@@ -233,10 +249,8 @@ class WorkerFillTests(StaffTestCase):
         production_membership("other", "models-unit")
         with mock.patch.dict(os.environ, {"STAFF_ID": "sdeleted"}):
             with self.assertRaisesRegex(worker_fill.AdmissionRefused, "no unique staff entry"):
-                _ = worker_fill.admit("test", run, role='test')
-        code, _, errors = self.result()
-        self.assertEqual(code, 1)
-        self.assertIn("no unique staff entry", errors)
+                _ = worker_fill.admit("test", run, production="old-production", unit="models-unit", role='test')
+        self.assertEqual(self.result(), (0, "unchanged\n", ""))
 
     def test_fill_ignores_finished_rosters_and_closed_ledger_workers(self) -> None:
         _ = self.recorded_production("demo", "models-unit")
@@ -328,6 +342,15 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(admitted.parent, parent.id)
         self.assertEqual(self.result(), (0, "unchanged\n", ""))
 
+    def test_renamed_holder_without_a_journal_refuses_a_name_only_match(self) -> None:
+        _ = self.recorded_production("natedev")
+        _ = showrunner_relationship("natedev")
+        _ = self.worker_design("build-followups", "held-designer", fixture_runtime_id("thread-held"))
+        code, _, errors = self.result()
+        self.assertEqual(code, 1)
+        self.assertIn("no staff parent for ShowrunnerMember", errors)
+        self.assertEqual(staff.find(kind="worker"), [])
+
     def test_renamed_holder_with_ambiguous_or_unreadable_journals_stays_listed(self) -> None:
         _ = self.recorded_production("first")
         _ = self.recorded_production("second")
@@ -396,7 +419,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertNotIn("skipped", output)
         self.assertEqual(staff.find(kind="worker"), [])
 
-    def test_display_and_seed_use_server_pid_without_opening_a_codex_connection(self) -> None:
+    def test_display_uses_published_worker_and_server_pid_without_opening_a_codex_connection(self) -> None:
         _ = self.recorded_production("demo")
         production_membership("demo")
         parent = showrunner_relationship("demo")
@@ -406,9 +429,8 @@ class WorkerFillTests(StaffTestCase):
         roster = cast(dict[str, dict[str, object]], json.loads((run / "mesh_roster.json").read_text()))
         roster["impl"]["launcher_pid"] = 0
         self.write_json(run / "mesh_roster.json", roster)
-        with mock.patch.object(codex_mesh, "Client", side_effect=AssertionError("display/seed opened RPC")):
-            with redirect_stdout(io.StringIO()):
-                staff_sources.seed()
+        with mock.patch.object(codex_mesh, "Client", side_effect=AssertionError("display opened RPC")):
+            _ = staff.ensure_worker("impl", parent.id, runtime_id="3b08f4bb-fc3c-54e2-8bdc-71bce6417158")
             value = staff_sources.live()
         row = staff.find(kind="worker", parent=parent.id)[0]
         self.assertEqual(row.name, "impl")

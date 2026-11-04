@@ -74,7 +74,7 @@ def fixture_worker(name: str, parent: staff.StaffId, *, runtime_id: str = "") ->
     return staff.ensure_worker(name, parent, runtime_id=identity)
 
 
-def record_fixture_claude_start(arguments: list[str]) -> None:
+def record_fixture_claude_start(arguments: list[str], *, remote_control: bool = True, messaging_socket: str = "") -> None:
     """The private backend records its own native identity before opening work."""
     from scripts.message import sessions
 
@@ -86,7 +86,8 @@ def record_fixture_claude_start(arguments: list[str]) -> None:
     write_text_atomic(path, json.dumps({
         "pid": pid, "procStart": sessions.process_start(pid), "sessionId": identity,
         "name": "fixture Claude", "updatedAt": 1, "formerNames": [], "tmux": "",
-        "entrypoint": "cli", "messagingSocketPath": "",
+        "entrypoint": "cli", "messagingSocketPath": messaging_socket,
+        "bridgeSessionId": "session_bridge" if remote_control else "",
     }) + "\n")
 
 
@@ -145,7 +146,8 @@ def showrunner_relationship(name: str, parent: str = "") -> staff.StaffRow:
 
 def recorded_showrunner(name: str, doc: Path, parent: str = "") -> staff.StaffRow:
     """Record the document that identifies one private production owner."""
-    row = showrunner_relationship(name, parent)
+    rows = [row for row in staff.initial_snapshot().find(kind="showrunner") if row.name == name]
+    row = rows[0] if rows and not parent else showrunner_relationship(name, parent)
     return staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
 
 

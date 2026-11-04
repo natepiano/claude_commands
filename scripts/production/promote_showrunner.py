@@ -311,6 +311,8 @@ def _main(argv: list[str]) -> int:
     was_pending = pending.exists()
     if not was_pending:
         save_promotion(promotion, target_directory)
+        import showrunner_parent
+        showrunner_parent.save_notice(slug, showrunner_parent.PendingParentNotice("attach", promotion.parent.slug))
     try:
         current = unit_lookup.marked_unit(promotion.parent.slug, unit) if was_pending else promotion.marked
         if current is not None and isinstance(current.claude, unit_lookup.ClaudeUnknown):

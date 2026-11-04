@@ -431,8 +431,7 @@ def _ledger_for_run(run: Path) -> UnitWorkerLedger:
     identity = resolve_production_unit({**state, "working_dir": str(worktree)})
     if isinstance(identity, ProductionUnitIdentity):
         from scripts.production import showrunners
-        notifier = Path(os.environ.get("NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier")))
-        production = showrunners.canonical_slug(identity.production, notifier)
+        production = showrunners.canonical_slug(identity.production)
         unit = identity.unit
     else:
         production = "adhoc"

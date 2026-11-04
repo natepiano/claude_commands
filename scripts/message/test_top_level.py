@@ -213,7 +213,7 @@ class TopLevelTests(unittest.TestCase):
                                      f"solo\tuds:{solo}", f"orphaned unit\tuds:{orphaned}"})
         self.assertEqual({session_id for _, session_id in recorded}, {"showrunner", "ordinary", "solo", "orphaned unit"})
 
-    def test_stale_tmux_names_do_not_override_roster_unit_identity(self) -> None:
+    def test_roster_unit_identity_overrides_tmux_labels(self) -> None:
         _ = self.add("renamed unit", tmux="old-name:@3.%7", role="unit director",
                      showrunner=roster.UnderShowrunner("production", "runner", "session:runner"))
         ordinary = self.add("ordinary", tmux="unit-looking-name:@1.%1")

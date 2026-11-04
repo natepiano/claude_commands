@@ -374,12 +374,8 @@ class MemberSources:
     launches: tuple[PaneLaunch, ...]
 
     def canonical_slug(self, slug: str) -> str:
-        """Resolve a former slug from the documents already read for this snapshot."""
-        if slug in self.productions:
-            return slug
-        matches = [name for name, source in self.productions.items()
-                   if slug in showrunners.former_slugs(source.document)]
-        return matches[0] if len(matches) == 1 else slug
+        """Resolve an exact slug change from a recorded journal."""
+        return slug if slug in self.productions else showrunners.rename_history().get(slug, slug)
 
     def member(self, selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
         if isinstance(selector, FolderMember):
@@ -519,7 +515,7 @@ class MarkedProductions:
 
 
 def lookup_slug(slug: str) -> str:
-    # A current notifier name needs no scan of Formerly entries or reread of its doc.
+    # A current notifier name needs no journal read.
     if (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}").is_dir():
         return slug
     return canonical_slug(slug)

@@ -321,6 +321,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
     def test_current_and_former_timer_slugs_are_unavailable_as_destinations(self) -> None:
         taken = self.checkout / "docs/plans/taken-production.md"
         self.write(taken, "# Taken\n\n## Production Context\n\n- **Formerly:** `retired`, `older`\n")
+        _ = fixture_member("showrunner", name="taken", doc=staff.LiveDoc("natedev", taken))
         self.write(self.notifier / "showrunner-taken/conf",
                    "TARGET=session:taken\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh", str(taken)]) + "\n")

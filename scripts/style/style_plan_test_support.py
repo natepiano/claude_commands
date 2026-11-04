@@ -31,7 +31,7 @@ import mechanical_classes
 import rules
 import style_ledger
 import style_rules
-from scripts.production import unit_config
+from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 
@@ -127,8 +127,9 @@ class StylePlanFixture(unittest.TestCase):
             "PATH": str(self.root / "bin") + os.pathsep + os.environ.get("PATH", ""),
         })))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
+        parent = recorded_showrunner("sample", self.repo / "docs/product-production.md")
         owner = recorded_showrunner("sample-style", self.doc)
+        _ = staff.move(owner.id, parent.id)
         _ = fixture_unit_location(owner, "names-unit", self.unit)
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
         _ = self.enterContext(mock.patch.object(berth_board, "read_board", return_value=self.board()))
@@ -208,10 +209,10 @@ class StylePlanFixture(unittest.TestCase):
         showrunner_plan.parent.mkdir(parents=True)
         _ = showrunner_plan.write_text(self.plan_header() + "Showrunner copy differs.\n")
 
-    def production(self, branch: str, checkout: Path, parent: str) -> str:
+    def production(self, branch: str, checkout: Path, _parent: str) -> str:
         return "\n".join([
             "# Production", f"- **Merge branch:** {branch}", f"- **Showrunner checkout:** {checkout}",
-            "- **Log:** docs/log.md", "- **Branch point:** main", f"- **Parent production:** {parent}", "",
+            "- **Log:** docs/log.md", "- **Branch point:** main", "",
         ])
 
     def unit_plan_config(self, worktree: Path, plan_name: str) -> None:

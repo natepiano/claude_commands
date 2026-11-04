@@ -143,7 +143,7 @@ class ProductionTreeTests(StaffTestCase):
         self.assertIn({"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}, edges)
         self.assertEqual(reads.call_count, 1)
 
-    def test_seed_and_json_follow_staff_moves_despite_stale_documents_and_parent_files(self) -> None:
+    def test_json_follows_staff_moves_despite_stale_documents_and_parent_files(self) -> None:
         main, child, gone = (staff_sources.member(staff_sources.ShowrunnerMember(slug), staff.snapshot())
                              for slug in ("main", "child", "gone"))
         assert isinstance(main, staff_sources.MemberFound)
@@ -173,8 +173,6 @@ class ProductionTreeTests(StaffTestCase):
             write_text_atomic(parent_file, "main\n")
             _ = staff.move(child.row.id, gone.row.id)
             _ = staff.move(director.id, gone.row.id)
-            with contextlib.redirect_stdout(io.StringIO()):
-                staff_sources.seed()
             self.assertEqual(showrunner_tree.parent_of("child"), "gone")
             self.assertEqual(showrunner_tree.children_of("gone"), ["child"])
             with contextlib.redirect_stdout(io.StringIO()) as after:

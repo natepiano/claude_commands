@@ -444,9 +444,8 @@ def capture_release(slug: str, *, record: staff.StaffSnapshot | None = None) -> 
 
 
 def release_edges(slug: str, *, record: staff.StaffSnapshot | None = None) -> None:
-    """Release captured edges and persist each completed notice before continuing."""
+    """Send captured wrap notices and save each completed delivery."""
     released = capture_release(slug, record=record)
-    showrunner_tree.release_edges(slug, released, record=record)
     notices: dict[str, str] = {}
     if isinstance(released.former_parent, showrunner_tree.ReportedTo):
         notices[released.former_parent.parent] = f"{slug} wrapped; its recorded parent is retained for history."

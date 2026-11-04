@@ -73,7 +73,7 @@ class ShowrunnerFixture(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.config = self.root / "config" / "showrunners.json"
+        self.config = self.root / "config" / "showrunners.conf"
         self.config.parent.mkdir()
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
@@ -84,6 +84,7 @@ class ShowrunnerFixture(StaffTestCase):
         _ = fake_unit_host.environment(self.root)
         self.doc = self.root / "show-production.md"
         self.state = self.root / "showrunner-state"
+        _ = self.enterContext(mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state))
         self.sent = self.root / "sent.jsonl"
         self.send_script = self.root / "send.py"
         _ = self.send_script.write_text("""import json, os, sys
@@ -173,16 +174,16 @@ raise SystemExit(1)
         self.assertEqual(result.stdout, "")
         return result.stderr
 
-    def showrunner(self, slug: str, *, running: bool = True, formerly: tuple[str, ...] = (), name: str = "") -> None:
+    def showrunner(self, slug: str, *, running: bool = True, previous: tuple[str, ...] = (), name: str = "") -> None:
         """One production with an update timer, its showrunner named `name`, else its slug, when it runs."""
         doc = self.root / f"{slug}-production.md"
         row = fixture_member("showrunner", name=slug)
         self.instance(f"showrunner-{slug}", target=f"session:{row.id}", doc=doc)
         _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
-        if formerly:
-            names = ", ".join(f"`{old}`" for old in formerly)
-            _ = doc.write_text(f"# Production\n\n## Production Context\n\n- **Formerly:** {names}\n",
-                               encoding="utf-8")
+        for old in previous:
+            path = self.state / old / "rename.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(json.dumps({"old": old, "new": slug}))
         if running:
             pid = self.record(name or slug, row.id)
             path = self.sessions / f"{pid}.json"
@@ -535,7 +536,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertIn("show\ton-demand\t", self.successful("list"))
 
     def test_former_slug_reaches_the_current_showrunner_by_name_and_address(self) -> None:
-        self.showrunner("new", formerly=("old",), name="new-name")
+        self.showrunner("new", previous=("old",), name="new-name")
         address = f"uds:{self.root / 'new-id.sock'}"
         self.assertEqual(self.successful("address", "old"), f"{address}\n")
         self.assertEqual(self.successful("name", "old"), "new-name\n")
@@ -546,7 +547,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
             self.assertEqual(showrunners.current_name("old"), "new-name")
 
     def test_named_accepts_a_live_session_name_and_a_former_production_slug(self) -> None:
-        self.showrunner("new", formerly=("old",), name="new-name")
+        self.showrunner("new", previous=("old",), name="new-name")
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
               mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
@@ -557,43 +558,42 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         # The session-named runner sorts first, so a first-match lookup would return it.
         self.instance("showrunner-a-other", target="session:a-other-id", doc=self.root / "a-other-production.md")
         _ = self.record("old", "a-other-id")
-        self.showrunner("z-new", formerly=("old",))
+        self.showrunner("z-new", previous=("old",))
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
               mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
             self.assertEqual(showrunners.named("old")["slug"], "z-new")
 
-    def test_a_formerly_line_outside_production_context_claims_no_slug(self) -> None:
+    def test_a_document_without_a_journal_claims_no_slug(self) -> None:
         self.showrunner("new", running=False)
         _ = (self.root / "new-production.md").write_text(
-            "# Production\n\n## Production Context\n\n- **Owner:** someone\n\n## Notes\n\n```\n- **Formerly:** `old`\n```\n",
+            "# Production\n\n## Production Context\n\n- **Owner:** someone\n\n## Notes\n\n```\n- **Owner:** `old`\n```\n",
             encoding="utf-8")
-        self.assertEqual(showrunners.canonical_slug("old", self.notifier), "old")
+        self.assertEqual(showrunners.canonical_slug("old"), "old")
 
-    def test_formerly_can_name_two_previous_slugs_without_a_running_showrunner(self) -> None:
-        self.showrunner("new", running=False, formerly=("old", "older"))
+    def test_previous_can_name_two_previous_slugs_without_a_running_showrunner(self) -> None:
+        self.showrunner("new", running=False, previous=("old", "older"))
         for slug in ("new", "old", "older"):
             with self.subTest(slug=slug):
-                self.assertEqual(showrunners.canonical_slug(slug, self.notifier), "new")
+                self.assertEqual(showrunners.canonical_slug(slug), "new")
         self.assertEqual(showrunners.production_slug(str(self.root / "new-production.md")), "new")
 
     def test_a_current_slug_takes_precedence_over_another_productions_former_slug(self) -> None:
         # The former owner sorts first, so an alias match cannot win before all current slugs are checked.
-        self.showrunner("a-renamed", formerly=("z-current",))
+        self.showrunner("a-renamed", previous=("z-current",))
         self.showrunner("z-current")
-        self.assertEqual(showrunners.canonical_slug("z-current", self.notifier), "z-current")
+        self.assertEqual(showrunners.canonical_slug("z-current"), "z-current")
         self.assertEqual(self.successful("address", "z-current"), f"uds:{self.root / 'z-current-id.sock'}\n")
 
     def test_an_unknown_slug_passes_through_but_showrunner_commands_refuse_it(self) -> None:
-        self.showrunner("new", running=False, formerly=("old",))
-        self.assertEqual(showrunners.canonical_slug("older", self.notifier), "older")
+        self.showrunner("new", running=False)
+        self.assertEqual(showrunners.canonical_slug("older"), "older")
         for verb in ("name", "address"):
             with self.subTest(verb=verb):
                 self.assertIn("the showrunner of older is not running", self.refused(verb, "older"))
         for arguments in (("attach", "older", "new"), ("parent", "older")):
             with self.subTest(arguments=arguments):
                 self.assertIn("older has no update timer", self.refused(*arguments))
-        self.assertFalse(self.state.exists())
 
     def test_name_and_address_refuse_a_showrunner_that_is_not_running_or_has_no_timer(self) -> None:
         self.instance("showrunner-show", doc=self.doc)
@@ -669,14 +669,16 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
                 self.assertEqual(self.successful(*arguments, pane="w4:p1"), "")
         self.assertEqual((self.root / "herdr-responses.json").read_bytes(), before)
 
-    def test_settings_ignore_a_showrunner_list_stored_before_showrunners_were_looked_up(self) -> None:
-        document = {**showrunners.defaults(), "showrunners": [{
-            "session": "director", "zone": LOS_ANGELES, "units": [{"session": "finished", "status": "run-finished"}]}]}
-        _ = self.config.write_text(json.dumps(document), encoding="utf-8")
-        self.assertEqual(showrunners.load_settings_from(self.config), showrunners.defaults())
+    def test_settings_read_each_file_change(self) -> None:
+        source = Path(__file__).parents[2] / "config/showrunners.conf"
+        text = source.read_text()
+        _ = self.config.write_text(text)
+        self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 5)
+        _ = self.config.write_text(text.replace("stall_minutes=5", "stall_minutes=9"))
+        self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 9)
 
-    def test_an_absent_or_invalid_settings_file_is_one_error_that_names_the_file(self) -> None:
-        for contents in (None, "{invalid json", '{"always": "wrong"}'):
+    def test_an_absent_or_invalid_settings_file_names_the_file(self) -> None:
+        for contents in (None, "invalid configuration", "always=wrong"):
             with self.subTest(contents=contents):
                 self.config.unlink(missing_ok=True)
                 if contents is not None:

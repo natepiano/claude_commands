@@ -980,14 +980,11 @@ def registry_remote_control(claude: unit_lookup.Claude) -> bool:
 
 
 def wait_for_remote_control(request: UnitLaunch) -> unit_lookup.MarkedUnit:
-    from session_pane import HerdrFailure, read_place
-
     found = launched_unit(request)
     if isinstance(found, NoMarkedUnit):
         raise RuntimeError(f"{request.identity.unit}: no session carries its mark")
     launched = found.unit
     deadline = time.monotonic() + request.timeout
-    pane = ""
     while True:
         if not isinstance(launched.claude, unit_lookup.LiveClaude):
             # The session record can lag the pane; look again until the mark names a live Claude.
@@ -999,16 +996,10 @@ def wait_for_remote_control(request: UnitLaunch) -> unit_lookup.MarkedUnit:
                 launched = again.unit
         if registry_remote_control(launched.claude):
             return launched
-        try:
-            pane = read_place(launched.place)
-        except (OSError, HerdrFailure) as error:
-            pane = str(error)
-        if "/remote-control is active" in pane:
-            return launched
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            tail = "\n".join(pane.splitlines()[-15:])
-            raise RuntimeError(f"{request.identity.unit} (herdr {launched.place.session}:{launched.place.pane}): /remote-control did not become active\n{tail}")
+            print(f"anomaly: {request.identity.unit}: registry has no remote-control evidence", file=sys.stderr)
+            raise RuntimeError(f"{request.identity.unit} (herdr {launched.place.session}:{launched.place.pane}): /remote-control did not become active")
         time.sleep(min(0.5, remaining))
 
 

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Match production members and import missing staff once; remove this importer on 2026-11-13."""
+"""Resolve staff membership and observe native worker identities."""
 
 from __future__ import annotations
 
-import argparse
-from contextlib import nullcontext, redirect_stderr
+from contextlib import redirect_stderr
 import io
 import json
 import os
@@ -24,13 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import showrunners  # noqa: E402
-from scripts.production.production_doc import Production, Refusal, WRAPPED, production_field  # noqa: E402
-# The public batch reader drops failures; share its decoder within this repair's
-# two-file boundary instead of copying its timer parser.
-from scripts.production.showrunners import (  # noqa: E402
-    _fields as _timer_fields,  # pyright: ignore[reportPrivateUsage]
-    _source as _source,  # pyright: ignore[reportPrivateUsage]
-)
+from scripts.production.production_doc import Production  # noqa: E402
 import unit_names  # noqa: E402
 from scripts.production import staff, unit_config, session_staff  # noqa: E402
 from scripts.production.worker_admission import UnpublishedWorker, parent as worker_parent, showrunner_member  # noqa: E402
@@ -100,59 +93,13 @@ def unit_parent(unit: str, session_id: str = "") -> UnitProduction:
     return unit_lookup.unit_parent(unit, reference, record=staff.snapshot(), sources=_member_sources())
 
 
-def _showrunner_key(slug: str) -> str:
-    return f"showrunner:{slug}"
-
-
-def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.SeedInput:
-    members: list[staff.SeedMember] = []
-    for slug, source in sources.productions.items():
-        runtime_id = source.timer.target.removeprefix("session:")
-        owner = record.by_member_reference(runtime_id)
-        found = (MemberFound(owner) if owner is not None and owner.kind == "showrunner"
-                 else sources.member(ShowrunnerMember(slug), record))
-        members.append(staff.SeedMember(_showrunner_key(slug), "showrunner",
-                                       found.row.name if isinstance(found, MemberFound) else slug,
-                                       found.row.id if isinstance(found, MemberFound) else staff.NewSeedMember(),
-                                       staff.KeepSeedParent(), runtime_id))
-    return staff.SeedInput(tuple(members), ())
-
-
-def _print_plan(seed_input: staff.SeedInput) -> bool:
-    changed = False
-    for entry in seed_input.members:
-        if isinstance(entry.match, staff.NewSeedMember):
-            action, identity = "add", entry.key
-            changed = True
-        else:
-            action, identity = "keep", entry.match
-        print(f"{action} {identity} {entry.kind} {entry.name}")
-    return changed
-
-
-def seed(*, dry_run: bool = False) -> None:
-    """Import missing local members without moving or deleting any recorded member."""
-    with staff.operation():
-        record = staff.initial_snapshot()
-        dependencies = staff.RecordInputs(set(record.inputs))
-        sources = _member_sources(dependencies=dependencies)
-        seed_input = _worker_seed(record, sources, _collect(record, sources), dependencies)
-        changed = _print_plan(seed_input)
-        if dry_run:
-            if not changed:
-                print("unchanged", file=sys.stderr)
-        else:
-            _ = staff.apply_seed(seed_input)
-
-
-# The source scan is shared by seed and the live handler. It never writes source records.
 LiveRole = Literal["showrunner", "unit", "worker", "agent", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 
 
 @dataclass(frozen=True)
 class WorkerOwner:
     key: str
-    match: staff.StaffRow | staff.NewSeedMember
+    match: staff.StaffRow
 
 
 @dataclass(frozen=True)
@@ -291,14 +238,13 @@ def pending_publication_evidence(run: Path) -> PendingPublicationEvidence:
 
 
 class _WorkerSources:
-    """One command's read evidence, shared by the importer and live projection."""
+    """Read worker evidence for one command."""
 
     def __init__(self, record: staff.StaffSnapshot, sources: _MemberSources,
-                 members: tuple[staff.SeedMember, ...] = (), *,
+                 *,
                  dependencies: staff.RecordInputs | None = None) -> None:
         self.record: staff.StaffSnapshot = record
         self.sources: _MemberSources = sources
-        self.members: dict[str, staff.SeedMember] = {entry.key: entry for entry in members}
         self.objects: dict[Path, dict[str, object]] = {}
         self.unreadable: set[Path] = set()
         self.skipped_runs: set[Path] = set()
@@ -373,12 +319,6 @@ class _WorkerSources:
                  if isinstance(selector, ShowrunnerMember) else self.sources.member(selector, self.record))
         if isinstance(found, MemberFound):
             return WorkerOwner(f"staff:{found.row.id}", found.row)
-        key = (_showrunner_key(selector.slug) if isinstance(selector, ShowrunnerMember)
-               else f"unit:{selector.slug}/{selector.unit}")
-        if key in self.members:
-            entry = self.members[key]
-            row = self.record.by_id(entry.match) if isinstance(entry.match, str) else None
-            return WorkerOwner(key, row if row is not None else staff.NewSeedMember())
         raise ValueError(f"no staff parent for {selector}")
 
     def _owners(self) -> None:
@@ -388,28 +328,15 @@ class _WorkerSources:
             except (ValueError, staff.StaffUnreadable) as error:
                 _problem(source.timer.doc, error)
                 continue
-            session_id = (owner.match.current_session if isinstance(owner.match, staff.StaffRow)
-                          else source.timer.target.removeprefix("session:"))
+            session_id = (source.timer.target.removeprefix("session:")
+                          if isinstance(self.sources, BoundMigrationSources) else owner.match.current_session)
             self.sessions[session_id] = owner
-            if session_id in self.native_running and isinstance(owner.match, staff.StaffRow):
+            if session_id in self.native_running:
                 self.identities[owner.match.id] = self.native_running[session_id]
         for launch in sorted(self.sources.launches, key=lambda launch: launch["written_at"]):
             if launch.get("ended") or launch["session_id"] not in self.native_running:
                 continue
-            environment = launch["environment"]
-            staff_id = launch["session_id"]
-            row = self.record.by_current_session(staff_id) if staff_id else None
-            if row is None and environment.get("SHOWRUNNER_UNIT_ID"):
-                try:
-                    owner = self.recorded_owner(staff_id=staff_id, unit=environment["SHOWRUNNER_UNIT_ID"],
-                                                production=environment.get("SHOWRUNNER_UNIT", ""))
-                except (ValueError, staff.StaffUnreadable) as error:
-                    _problem(f"launch {launch['session_id']}", error)
-                    continue
-                self.sessions[launch["session_id"]] = owner
-                if isinstance(owner.match, staff.StaffRow):
-                    self.identities[owner.match.id] = self.native_running[launch["session_id"]]
-                continue
+            row = self.record.by_current_session(launch["session_id"])
             if row is not None:
                 self.identities[row.id] = self.native_running[launch["session_id"]]
                 if row.kind != "worker":
@@ -422,25 +349,23 @@ class _WorkerSources:
 
     def recorded_owner(self, *, staff_id: str = "", production: str = "", unit: str = "") -> WorkerOwner:
         selected = worker_parent(self.record, self.sources, staff_id=staff_id,
-                                 production=production, unit=unit, pending=tuple(self.members.values()))
-        if isinstance(selected, staff.StaffRow):
-            return WorkerOwner(f"staff:{selected.id}", selected)
-        return WorkerOwner(selected.key, staff.NewSeedMember())
+                                 production=production, unit=unit)
+        assert isinstance(selected, staff.StaffRow)
+        return WorkerOwner(f"staff:{selected.id}", selected)
 
     def _record_run_owner(self, run: Path) -> WorkerOwner:
         director = unit_runs.director(run, dependencies=self.dependencies)
         if director in self.sessions:
             return self.sessions[director]
-        state = self.read(run / workers.STATE)
-        slug, unit = _text(state.get("production")), _text(state.get("unit"))
-        if slug or unit:
-            return self.recorded_owner(production=slug, unit=unit)
+        row = self.record.by_member_reference(director)
+        if row is not None and row.kind in ("unit", "showrunner"):
+            return WorkerOwner(f"staff:{row.id}", row)
         raise ValueError(f"director {director!r} has no staff parent")
 
     def _run_owner(self, run: Path) -> WorkerOwner:
         owner = self._record_run_owner(run)
         director = self.directors.get(run)
-        if isinstance(director, workers.LiveUnitDirector) and isinstance(owner.match, staff.StaffRow):
+        if isinstance(director, workers.LiveUnitDirector):
             self.identities[owner.match.id] = {"claude": director.session_id}
             self.sessions[director.session_id] = owner
         return owner
@@ -469,7 +394,7 @@ class _WorkerSources:
         session = _text(fields.get("worker_id")) or _text(fields.get("session_id"))
         return {"claude": session} if session else BackendUnavailable()
 
-    def ledger_owner(self, path: Path, worker: workers.UnitWorker, fields: Mapping[str, object],
+    def ledger_owner(self, worker: workers.UnitWorker, fields: Mapping[str, object],
                      owner: WorkerOwner | None) -> tuple[str, WorkerOwner]:
         current = self.record.by_member_reference(_text(fields.get("staff_id")) or worker.name)
         if current is None:
@@ -482,59 +407,25 @@ class _WorkerSources:
                 return current.name, WorkerOwner(f"staff:{row.id}", row)
         if owner is not None:
             return worker.name, owner
-        try:
-            return worker.name, self.owner(UnitMember(path.parent.name, path.stem))
-        except ValueError:
-            # An adhoc stem can name a worktree rather than a unit.
-            observed = ObservedUnit(path.stem)
-            found = (self.sources.member(observed, self.record)
-                     if unit_names.NAME.fullmatch(path.stem) else NoSuchMember(observed))
-            if isinstance(found, MemberFound):
-                return worker.name, WorkerOwner(f"staff:{found.row.id}", found.row)
-            if isinstance(worker.ownership, workers.HeldBy):
-                return worker.name, self._run_owner(Path(worker.ownership.run))
-            raise ValueError("worker ledger has no current staff parent")
+        if isinstance(worker.ownership, workers.HeldBy):
+            return worker.name, self._run_owner(Path(worker.ownership.run))
+        raise ValueError("worker ledger has no current staff parent")
 
-    def paused_director_live(self, path: Path, parent: WorkerOwner | None) -> bool:
-        """A cached live identity proves life; negative evidence needs a successful mark lookup."""
-        row = parent.match if parent is not None else staff.NewSeedMember()
-        if isinstance(row, staff.StaffRow):
-            if row.current_session in self.native_running:
-                return True
-            if row.kind == "unit":
-                slug = unit_lookup.row_production(row, self.record, self.sources).slug
-                unit = unit_names.unit_id(row.name)
-            elif row.kind == "showrunner":
-                if self.claude_registry_incomplete:
-                    raise ValueError("director registry is incomplete")
-                if self.codex_scan_incomplete:
-                    raise ValueError("Codex director process scan is incomplete")
-                if any(owner.match == row for owner in self.sessions.values()):
-                    return False
-                raise ValueError("showrunner director identity is unavailable")
-            else:
-                raise ValueError("worker ledger has no director parent")
-        else:
-            slug, unit = path.parent.name, path.stem
-            if not unit_names.NAME.fullmatch(unit):
-                raise ValueError("worker ledger director identity is unavailable")
-        marked = unit_lookup.marked_unit(slug, unit, record=self.record, sources=self.sources,
-                                         running=tuple(self.running.values()))
-        if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
+    def paused_director_live(self, parent: WorkerOwner | None) -> bool:
+        """Use the recorded native identity to check the director process."""
+        if parent is not None and parent.match.current_session in self.native_running:
             return True
-        if marked is not None and isinstance(marked.claude, unit_lookup.ClaudeUnknown):
-            raise ValueError(marked.claude.reason)
         if self.claude_registry_incomplete:
             raise ValueError("director registry is incomplete")
         if self.codex_scan_incomplete:
             raise ValueError("Codex director process scan is incomplete")
         return False
 
-    def paused_current(self, path: Path, worker: workers.UnitWorker, parent: WorkerOwner | None) -> bool:
+    def paused_current(self, worker: workers.UnitWorker, parent: WorkerOwner | None) -> bool:
         """Paused ownership has no run; its director or historical worker processes may still live."""
         failures: list[Exception] = []
         try:
-            if self.paused_director_live(path, parent):
+            if self.paused_director_live(parent):
                 return True
         except (OSError, ValueError, staff.StaffUnreadable) as error:
             failures.append(error)
@@ -585,6 +476,9 @@ class _WorkerSources:
                 name = _text(fields.get("name")) or key
                 # Reuse the ledger's decoder; its public locked reader also writes and recovers.
                 worker = workers._decode_worker(name, fields)  # pyright: ignore[reportPrivateUsage]
+                backend = worker.backend
+                native = backend.thread_id if isinstance(backend, workers.CodexThread) else backend.session_id
+                self.ledger_names.add((native, name))
                 if not isinstance(worker.ownership, (workers.Retired, workers.Adopted)):
                     relevant += 1
                 if isinstance(worker.ownership, workers.HeldBy):
@@ -593,7 +487,6 @@ class _WorkerSources:
                         continue
                     roster = self.checked(run / workers.ROSTER) if (run / workers.ROSTER).exists() else {}
                     entry = _object(roster.get(name, {}))
-                    backend = worker.backend
                     activity: dict[str, object] = {**entry, "family": worker.family}
                     if isinstance(backend, workers.CodexThread):
                         activity["thread_id"] = backend.thread_id
@@ -607,21 +500,19 @@ class _WorkerSources:
                     self.live_worker_runs.add(run)
                 try:
                     name, parent = self.ledger_owner(
-                        path, worker, {**fields, "staff_id": _text(fields.get("staff_id")) or key}, owner)
+                        worker, {**fields, "staff_id": _text(fields.get("staff_id")) or key}, owner)
                 except (ValueError, staff.StaffRefused, staff.StaffUnreadable, OSError):
                     if isinstance(worker.ownership, (workers.Retired, workers.Adopted)):
                         continue
-                    if isinstance(worker.ownership, workers.Paused) and not self.paused_current(path, worker, None):
+                    if isinstance(worker.ownership, workers.Paused) and not self.paused_current(worker, None):
                         inactive += 1
                         continue
                     raise
-                if isinstance(worker.ownership, workers.Paused) and not self.paused_current(path, worker, parent):
+                if isinstance(worker.ownership, workers.Paused) and not self.paused_current(worker, parent):
                     inactive += 1
                     continue
-                self.ledger_names.add((parent.key, name))
                 if isinstance(worker.ownership, (workers.Retired, workers.Adopted)):
                     continue
-                backend = worker.backend
                 identity = ({"codex": backend.thread_id} if isinstance(backend, workers.CodexThread)
                             else {"claude": backend.session_id})
                 self.backend_ids[_text(fields.get("staff_id")) or key] = identity
@@ -680,7 +571,7 @@ class _WorkerSources:
         return thread in self.native_running or self.codex_thread_live(run, thread)
 
     def codex_thread_live(self, run: Path, thread: str) -> bool:
-        # This coarse display/seed check can keep a stale worker while its server lives.
+        # This process check can retain a stale worker while its server lives.
         del thread
         current = run / "mesh_server.json"
         if current.exists() and _alive(self.checked(current).get("pid")):
@@ -793,13 +684,15 @@ class _WorkerSources:
                 ledger = _text(entry.get("unit_ledger"))
                 if ledger:
                     self.ledger(Path(ledger), parent)
-                if (parent.key, name) in self.ledger_names:
+                native = (_text(entry.get("thread_id")) or _text(entry.get("worker_id"))
+                          or _text(entry.get("session_id")))
+                if (native, name) in self.ledger_names:
                     continue
                 identity = self.backend(parent, name, entry)
                 if isinstance(identity, BackendUnavailable):
                     _problem(f"{path} worker {name}", "worker backend is unavailable")
                 role = _text(entry.get("role"))
-                if not role and entry.get("role") in (None, "") and isinstance(parent.match, staff.StaffRow) and isinstance(identity, dict):
+                if not role and entry.get("role") in (None, "") and isinstance(identity, dict):
                     current = next((row for row in self.record.find(kind="worker", parent=parent.match.id)
                                     if row.name == name and len(identity) == 1
                                     and row.current_session in identity.values()), None)
@@ -939,36 +832,6 @@ class _WorkerSources:
                      or entry.identity.get("codex") not in self.blocked_threads)
 
 
-def _worker_seed(record: staff.StaffSnapshot, sources: _MemberSources, base: staff.SeedInput,
-                 dependencies: staff.RecordInputs) -> staff.SeedInput:
-    members = list(base.members)
-    keys = {entry.key for entry in members}
-    parent_keys = {entry.match: entry.key for entry in members if isinstance(entry.match, str)}
-    for observed in _WorkerSources(record, sources, base.members, dependencies=dependencies).collect():
-        owner = observed.owner
-        parent_key = parent_keys.get(owner.match.id, owner.key) if isinstance(owner.match, staff.StaffRow) else owner.key
-        if parent_key not in keys:
-            assert isinstance(owner.match, staff.StaffRow)
-            members.append(staff.SeedMember(parent_key, owner.match.kind, owner.match.name,
-                                            owner.match.id, staff.KeepSeedParent()))
-            keys.add(parent_key)
-        existing = (next((row for row in record.find(kind="worker", parent=owner.match.id)
-                          if row.name == observed.name), None)
-                    if isinstance(owner.match, staff.StaffRow) else None)
-        key = f"worker:{parent_key}/{observed.name}"
-        if isinstance(observed.identity, BackendUnavailable) or len(observed.identity) != 1:
-            _problem(observed.name, "native runtime identity is unavailable or ambiguous")
-            continue
-        native = staff.native_id(next(iter(observed.identity.values())))
-        if existing is not None and existing.current_session != native:
-            _problem(observed.name, f"native runtime identity conflicts with {existing.id}")
-            continue
-        members.append(staff.SeedMember(key, "worker", observed.name,
-                                        existing.id if existing is not None else staff.NewSeedMember(),
-                                        staff.SeedParent(parent_key), native))
-    return staff.SeedInput(tuple(members), base.retire)
-
-
 @dataclass(frozen=True)
 class WorkerEvidence:
     """Raw ownership observations, including workers not yet represented in staff."""
@@ -1067,12 +930,12 @@ def live() -> dict[str, object]:
             members[row.id] = member
     for entry in observed:
         owner = entry.owner.match
-        if not isinstance(owner, staff.StaffRow) or owner.id not in active_ids or isinstance(entry.identity, BackendUnavailable):
+        if owner.id not in active_ids or isinstance(entry.identity, BackendUnavailable):
             continue
         rows = [row for row in record.find(kind="worker", parent=owner.id) if row.name == entry.name]
         if len(rows) != 1:
             incomplete = True
-            _problem(entry.name, "no recorded worker membership; run staff_sources.py seed")
+            _problem(entry.name, "no recorded worker membership; native identity publication is incomplete")
             continue
         row = rows[0]
         if row.current_session not in entry.identity.values():
@@ -1112,78 +975,14 @@ class FillDocument:
         return showrunners.production_slug(str(self.path))
 
 
-def _fill_git(folder: Path, *arguments: str) -> str:
-    done = subprocess.run(["git", "-C", str(folder), *arguments], text=True,
-                          capture_output=True, check=False)
-    if done.returncode:
-        raise ValueError(done.stderr.strip() or f"git {' '.join(arguments)} failed in {folder}")
-    return done.stdout.strip()
-
-
 def source_allowed(path: Path) -> bool:
     """Scratch checkouts never provide production ownership evidence."""
     return not path.expanduser().resolve().is_relative_to(showrunners.SCRATCH_ROOT.expanduser().resolve())
 
 
-class _FillSources:
-    """The fill's manifest and document evidence, collected before any write."""
-
-    def __init__(self, record: staff.StaffSnapshot, sources: _MemberSources,
-                 dependencies: staff.RecordInputs) -> None:
-        self.record: staff.StaffSnapshot = record
-        self.sources: _MemberSources = sources
-        self.dependencies: staff.RecordInputs = dependencies
-        self.manifest: set[str] = set()
-        self.problems: list[str] = []
-        self.excluded_documents: set[Path] = set()
-
-    def problem(self, source: str | Path, unit: str, reason: object) -> None:
-        self.problems.append(f"{source} {unit}: {str(reason).replace(chr(10), ' ')}")
-
-    def source_allowed(self, path: Path) -> bool:
-        resolved = path.expanduser().resolve()
-        if source_allowed(resolved):
-            return True
-        if resolved not in self.excluded_documents:
-            self.excluded_documents.add(resolved)
-            for row in self.record.find(kind="showrunner"):
-                location = row.doc
-                if (isinstance(location, (staff.LiveDoc, staff.WrappedDoc))
-                        and location.machine == _fill_machine() and location.path.resolve() == resolved):
-                    self.problem(row.id, row.name, f"production document is under scratch root: {path}")
-        return False
-
-
-
 def _fill_machine() -> str:
     # Use the same machine names as shutdown records, without a second host rule.
     return remote.local_machine()
-
-
-def _fill_worktree(row: staff.StaffRow) -> staff.PresentWorktree:
-    if isinstance(row.worktree, staff.PresentWorktree):
-        return row.worktree
-    raise ValueError(f"{row.name}: the staff worktree is not present")
-
-
-
-def _fill_doc_location(document: FillDocument, machine: str) -> staff.LiveDoc:
-    lines = document.text.splitlines()
-    checkout = Path(production_field(lines, "Showrunner checkout")).expanduser()
-    if not checkout.is_absolute():
-        raise ValueError("Showrunner checkout must be absolute")
-    root = Path(_fill_git(document.path.parent, "rev-parse", "--show-toplevel"))
-    checkout_root = Path(_fill_git(checkout, "rev-parse", "--show-toplevel"))
-    if checkout_root.resolve() != checkout.resolve():
-        raise ValueError("Showrunner checkout is not a git worktree root")
-    path = checkout / document.path.relative_to(root)
-    branch = production_field(lines, "Merge branch")
-    actual = _fill_git(checkout, "symbolic-ref", "--quiet", "--short", "HEAD")
-    if actual != branch:
-        raise ValueError(f"showrunner checkout is on branch {actual}, expected {branch}")
-    if not path.is_file():
-        raise ValueError(f"live production doc is missing: {path}")
-    return staff.LiveDoc(machine, path)
 
 
 class BoundMigrationSources(_MemberSources):
@@ -1333,175 +1132,6 @@ def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tupl
     return BoundMigrationSources(productions, tuple(permitted)), tuple(problems)
 
 
-class _LiveFillSources(_FillSources):
-    """One live checkout per staff parent; other document copies are not evidence."""
-
-    def __init__(self, record: staff.StaffSnapshot, sources: _MemberSources,
-                 dependencies: staff.RecordInputs) -> None:
-        super().__init__(record, sources, dependencies)
-        registry = sessions.read_registry(dependencies=dependencies)
-        self.running: dict[str, sessions.RegistryObservation] = {
-            item.record["sessionId"]: item for item in registry.entries
-            if sessions.running_session(item.record)
-        }
-        self.row_sessions: dict[staff.StaffId, list[sessions.RegistryObservation]] = {}
-        # Use the same id-first join as every other membership reader.
-        for launch in sources.launches:
-            owner = record.by_member_reference(launch["session_id"])
-            if launch.get("ended") or owner is None or owner.current_session not in self.running:
-                continue
-            environment = launch["environment"]
-            identity = owner.current_session
-            if owner.kind == "showrunner":
-                self.row_sessions.setdefault(owner.id, []).append(self.running[identity])
-                continue
-            try:
-                found = sources.member(ObservedUnit(environment.get("SHOWRUNNER_UNIT_ID", ""),
-                                                   session_staff.LiveSession(identity)), record)
-            except (ValueError, staff.StaffUnreadable):
-                continue
-            if isinstance(found, MemberFound):
-                self.row_sessions.setdefault(found.row.id, []).append(self.running[identity])
-        self.timers: dict[staff.StaffId, list[showrunners.ShowrunnerSource]] = {}
-        self.timer_errors: dict[staff.StaffId, str] = {}
-
-        def timer_owner(slug: str, source: showrunners.ShowrunnerSource) -> MemberFound | NoSuchMember:
-            owner = record.by_member_reference(source.timer.target.removeprefix("session:"))
-            if owner is not None and owner.kind == "showrunner" and isinstance(owner.doc, staff.DocUnfilled):
-                return MemberFound(owner)
-            return _MemberSources({slug: source}, sources.launches).member(ShowrunnerMember(slug), record)
-
-        # The shared membership reader omits unreadable docs. Reuse its timer
-        # decoder for omitted instances so failed evidence still identifies a row.
-        for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
-            slug = instance.name.removeprefix("showrunner-")
-            if not instance.is_dir() or slug in sources.productions:
-                continue
-            # Keep the timer target available to the canonical launch-id join,
-            # even when its document cannot be read. Empty document text supplies
-            # no location evidence; only document_for may admit a live document.
-            conf = instance / "conf"
-            try:
-                target = _timer_fields(conf, dependencies=dependencies).get("TARGET", "")
-            except (OSError, UnicodeError):
-                target = ""
-            timer = showrunners.Timer(slug, target, conf, "")
-            owner = record.by_member_reference(target.removeprefix("session:"))
-            found = (MemberFound(owner) if owner is not None and owner.kind == "showrunner"
-                     else timer_owner(slug, showrunners.ShowrunnerSource(timer, "")))
-            if not isinstance(found, MemberFound):
-                continue
-            attempted: list[Path] = []
-
-            def record_input(path: Path) -> None:
-                dependencies(path)
-                attempted.append(path)
-
-            try:
-                recovered = _source(instance, dependencies=record_input)
-            except (OSError, UnicodeError, KeyError, ValueError) as error:
-                self.timer_errors[found.row.id] = f"{attempted[-1]}: {error}"
-            else:
-                document_owner = timer_owner(slug, recovered)
-                if isinstance(document_owner, MemberFound):
-                    self.timers.setdefault(document_owner.row.id, []).append(recovered)
-        for slug, source in sources.productions.items():
-            found = timer_owner(slug, source)
-            if isinstance(found, MemberFound):
-                self.timers.setdefault(found.row.id, []).append(source)
-                session = self.running.get(found.row.current_session)
-                if session is not None:
-                    self.row_sessions.setdefault(found.row.id, []).append(session)
-
-    def load_document(self, path: Path) -> str:
-        if not self.source_allowed(path):
-            raise ValueError("scratch production document is not evidence")
-        self.dependencies(path)
-        return path.read_text(encoding="utf-8")
-
-    def document_for(self, row: staff.StaffRow) -> FillDocument:
-        candidates = self.timers.get(row.id, [])
-        if row.id in self.timer_errors:
-            raise ValueError(self.timer_errors[row.id])
-        if not candidates:
-            raise ValueError("no timer names its live production document")
-        documents: dict[Path, FillDocument] = {}
-        for source in candidates:
-            pointer = FillDocument(source.timer.doc, source.document, str(source.timer.doc))
-            location = _fill_doc_location(pointer, _fill_machine())
-            document = FillDocument(location.path, self.load_document(location.path), str(location.path))
-            # Validate the actual checkout's fields, rather than an older copy's.
-            if _fill_doc_location(document, _fill_machine()).path != location.path:
-                raise ValueError(f"{location.path}: live document points to another checkout")
-            documents[location.path.resolve()] = document
-        if len(documents) != 1:
-            raise ValueError("timers disagree on the live document: " + ", ".join(map(str, documents)))
-        document = next(iter(documents.values()))
-        common = _fill_git(document.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        self.manifest.add(f"repository {common}")
-        if WRAPPED in document.text or re.search(r"(?im)^- \*\*Status:\*\*\s*wrapped\b", document.text):
-            raise ValueError(f"{document.path}: production is wrapped")
-        return document
-
-def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
-               dependencies: staff.RecordInputs, *, dry_run: bool) -> int:
-    scan = _LiveFillSources(record, sources, dependencies)
-    machine = _fill_machine()
-    documents: dict[staff.StaffId, FillDocument] = {}
-    doc_errors: dict[staff.StaffId, str] = {}
-    changed = False
-    recovery_errors: list[str] = []
-    for row in record.find(kind="showrunner"):
-        if isinstance(row.doc, staff.WrappedDoc):
-            continue
-        if row.id not in scan.timers and row.id not in scan.timer_errors and row.id not in scan.row_sessions:
-            continue
-        try:
-            document = scan.document_for(row)
-            documents[row.id] = document
-            location = staff.LiveDoc(machine, document.path)
-            if isinstance(row.doc, staff.DocUnfilled):
-                if not dry_run:
-                    _ = staff.set_doc(row.id, location)
-                changed = True
-        except (OSError, UnicodeError, ValueError, Refusal, staff.StaffUnreadable, staff.StaffRefused) as error:
-            doc_errors[row.id] = str(error)
-            if isinstance(row.doc, staff.DocUnfilled):
-                scan.problem(row.id, row.name, error)
-    for row in record.find(kind="unit"):
-        if isinstance(row.worktree, staff.RemovedWorktree):
-            continue
-        unfilled = isinstance(row.worktree, staff.WorktreeUnfilled)
-        if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.machine != machine:
-            continue
-        if row.parent not in documents and row.parent not in doc_errors and row.id not in scan.row_sessions:
-            continue
-        # Existing files supply their values. The writer still checks their formatted bytes.
-        try:
-            location = _fill_worktree(row)
-            dependencies(location.path / ".unit.toml")
-            current = unit_config.read(location.path, cleanup=False)
-            if isinstance(current, unit_config.ConfigMissing):
-                raise ValueError(current.reason)
-            if dry_run:
-                changed |= unit_config.needs_write(location.path, current)
-            else:
-                changed |= isinstance(unit_config.write(location.path, current), unit_config.Published)
-        except (OSError, UnicodeError, ValueError, Refusal, staff.StaffUnreadable, staff.StaffRefused) as error:
-            if unfilled:
-                scan.problem(row.id, row.name, error)
-            else:
-                recovery_errors.append(f"recovery {row.id} {row.name}: {str(error).replace(chr(10), ' ')}")
-    if changed or dry_run or scan.problems or recovery_errors:
-        for source in sorted(dependencies.paths | scan.manifest):
-            print(f"source {source}")
-    for problem in (*scan.problems, *recovery_errors):
-        print(problem, file=sys.stderr)
-    if not scan.problems and not recovery_errors:
-        print("changed" if changed else "unchanged")
-    return 1 if scan.problems or recovery_errors else 0
-
-
 def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId) -> None:
     """Refuse removal while worker or peer evidence still names the native id."""
     evidence = observe_workers(record, session_staff.member_sources())
@@ -1531,36 +1161,3 @@ def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId)
                         raise staff.StaffRefused(f"{identity}: native session is live on {entry.machine}; stop it before removing its row")
             break
         row = record.by_id(row.parent) if row.parent else None
-
-
-def fill(*, dry_run: bool = False) -> int:
-    """Fill showrunner docs and rewrite unit configuration from current staff rows."""
-    with nullcontext() if dry_run else staff.operation():
-        record = staff.snapshot()
-        dependencies = staff.RecordInputs(set(record.inputs))
-        return _fill_live(record, _member_sources(dependencies=dependencies), dependencies, dry_run=dry_run)
-
-
-class _Arguments(argparse.Namespace):
-    command: str = ""
-    dry_run: bool = False
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=["seed", "fill"])
-    _ = parser.add_argument("--dry-run", action="store_true")
-    arguments = _Arguments()
-    _ = parser.parse_args(argv, namespace=arguments)
-
-    def run() -> int:
-        if arguments.command == "fill":
-            return fill(dry_run=arguments.dry_run)
-        seed(dry_run=arguments.dry_run)
-        return 0
-
-    return staff.cli_result(run)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
