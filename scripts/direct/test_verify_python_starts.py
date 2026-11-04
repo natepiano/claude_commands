@@ -37,7 +37,8 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assertNotIn("STDIN_PY", counts, rows)
         # The current fixture starts 64 helpers before Phase 9, including 14 tree helpers.
         self.assertEqual(counts["tree_watch.py"], 11, rows)
-        self.assertEqual(len(rows), 59, counts)
+        self.assertEqual(counts["memory_kill.py"], 1, rows)
+        self.assertEqual(len(rows), 60, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"
