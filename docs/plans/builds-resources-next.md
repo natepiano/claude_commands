@@ -29,7 +29,7 @@
 
 - [ ] **Use recorded Cargo output roots for trim matching**
   - Target: `scripts/lint/sweep.py` and its tests.
-  - Dependency: Phase 17 exposes the recorded Cargo roots through the shared step-evidence reader.
+  - Dependency: Phase 17 exposes the recorded Cargo roots through the shared step-evidence reader during predictor measurement, whether it adopts or rejects compile bands.
   - Why needed: trim attribution still uses saved workspace mappings instead of each step's recorded roots (`sweep.py` :3796, :3876).
   - Completion condition: use the shared reader to match trims after copies disappear or mappings change. Keep named unknown states. Test both cases. Add no second mapping, join or recorder.
   - Revealed by: Phase 4 (builds showrunner 2026-10-30: next); narrowed after the Phase 37, Phase 51 and 53, and Phase 11 architect reviews

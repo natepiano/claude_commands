@@ -528,7 +528,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Measured:**
 - The showrunner's figures: the p90 over the "nextest" class mixes 0.5 GiB one-test runs with 29 GiB full compiles (not checked against the log in this Work Order).
-- `steps.crates_compiled` counts `Compiling/Checking/Documenting` lines (`scripts/buildlog/index.py` :100); anon rows join to steps by host, `call_id` and step name in Phase 11's one step-evidence reader (the widened `index_shapes` join, `scripts/lint/build_shape.py` :89; Phase 11 Spec 4). That join returns no worktree or step start time today, and a new copy seeds its own build folder from a source tree's cache (the copies rule picks seed; builds reversed the shared build folder on 2026-10-30 and Phase 34 removes `scratch.shared_build_folder`), so a worktree with no earlier step is not a cold cache, and the history it inherited from its seed is not recorded. `width_trial.py` `anon_by_call` (:171) and `anon_by_step` (:197) pair anon rows with steps. The size of a step's compile is known only after it runs.
+- `steps.crates_compiled` counts `Compiling/Checking/Documenting` lines (`scripts/buildlog/index.py` :100); anon rows join to steps by host, `call_id` and step name in Phase 11's one step-evidence reader (`index_step_evidence`, `scripts/lint/build_shape.py` :125; Phase 11 Spec 4). That join returns no worktree or step start time today, and a new copy seeds its own build folder from a source tree's cache (the copies rule picks seed; builds reversed the shared build folder on 2026-10-30 and Phase 34 removes `scratch.shared_build_folder`), so a worktree with no earlier step is not a cold cache, and the history it inherited from its seed is not recorded. `width_trial.py` `anon_by_call` (:171) and `anon_by_step` (:197) pair anon rows with steps. The size of a step's compile is known only after it runs.
 
 **Spec:**
 
@@ -546,14 +546,19 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
    A lower-bound count selects its band or a larger one, never a smaller one.
    Report promises below half the measured peak, promises above three times the peak and steps above their promise.
    Keep modeled wait savings unavailable until queue calibration succeeds. Report observed waits separately.
-2. **Adopt rule.** Adopt only when the replay shows fewer promises under half the peak in total and none rises for any repository. Otherwise record the table and stop.
+2. **Adopt rule.** Compare against checkpoint `e88fb841d` (Phase 60): 395 under-half and 2,525 over-three, with each historical budget kept apart.
+   Adopt only when all of these hold:
+   - fewer promises under half the peak in total, and none rises for any repository;
+   - over-three in total is 2,525 or lower;
+   - cargo-liner nextest compile runs at 21 GiB keep Phase 60's gate: over-three 101 or lower, under-half 7 or lower.
+   Otherwise record the table and stop. A stop still lands Spec 1's reader fields (worktree, start time, `tree_key`, recorded Cargo roots) and their `test_build_shape.py` tests: a next item and predictor (c) read them. No estimate code changes on a stop.
 3. **If adopted:** `expected_peak` and `filtered_peak` (`memory_admit.py`) take the predicted band and use only history rows of that band, in each tier. Phase 11's compile/no-compile split stays the first split; bands split compile runs only. With fewer than 5 rows in the band, use the next larger band, never a smaller one. Comment each band edge with the measurement that set it. Predictors (a) and (b) read `crates_compiled`, worktree, start time and `tree_key` from the one step-evidence reader (Phase 11 Spec 4; add worktree, start time and `tree_key` to its value), not from a second join. Predictor (c) reads cache-folder attribution as Spec 1 says.
    - **The band in the need's basis.** Add the proposed `CompileBand` variant to the existing `NeedBasis` union.
      Record its band limits, history count and predictor. Give an open upper limit a named state, not `None`.
      Give missing predictor evidence a named unknown state. Keep the existing basis codec as the only codec.
      Carry the basis through the profile, wire request and waiter row to `RecordedNeed`.
      `queue_evidence.need_text()` names the band and predictor.
-   - **The pool limit in the need's basis.** With 1–4 own runs, the pool p90 can lower the promise below the own peak (`memory_admit.py` :1931–1935).
+   - **The pool limit in the need's basis.** With 1–4 own runs, the pool p90 can lower the promise below the own peak (`memory_admit.py` :2060–2064).
      The basis then reads as the measured p90 of one run. Add a named `NeedBasis` variant for the pool limit with the own peak, own count and pool p90.
      `queue_evidence.need_text()` names the pool limit.
    - **One source boundary.** `NeedSource` is currently `str`. It is not a closed union.
@@ -591,7 +596,12 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
   Report observed waits separately. Do not label an estimate comparison as a queue replay.
 - Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
 - Phase 11: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; the compile-run promise wins over `min(filtered, full)`; fresh runs keep `fresh_test_peak`.
-- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :1955–1976). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
+- Phase 60 (`e88fb841d`): apply bands inside the Phase 60 selections, never around them.
+  `expected_peak` keeps only rows whose package and scope match for a full test request with a package (`memory_admit.py` :2023–2026, test steps only).
+  `filtered_peak` returns the larger of the exact-filter p90 and the package p90 from anonymous rows (:2506–2510), before the indexed tiers (exact first, :2544–2546).
+  `history_selection(item, evidence)` (:2091) is the one resolver for package, scope and filters: a recorded field wins; only a missing field is parsed from `StepEvidence.arguments` through `test_selection` (:162).
+  Keep `fresh_test_peak` and the indexed fallback order. Tests: both p90 winners, legacy selection recovery and package isolation keep passing in each band.
+- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :2106). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
   Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
 - Running charge: the band changes `need` and so the ramp promise only; it leaves the running charge as built (`build_charge` :1096, `charge_basis` :1100, `growth_headroom` :1119, `reservation_memory` :1847 at `31c3ee3e`; `docs/as-built/build-memory-admission.md`): a running step charges the largest of its current resident and swap bytes, its observed `.max` peak, its promise during `RAMP_SECONDS` (120 s), and its promise when the peak is unknown. After Phase 24, a release-profile `build` step holds its promise for its whole life (`LifetimePromise`, in the budget charge and the free-memory growth term); nextest steps keep the ramp. The `.max` peak expires `PEAK_DECAY_SECONDS` (1500 s) after the last near-peak time in `.wave`, or after the `.max` mtime when `.wave` is absent. Phase 15 lands before this phase: after report 4c's test-phase mark the running charge is `TestPhaseCharge`, and the band leaves that charge unchanged too.
 - Phase 24: `NeedBasis` and its path to the waiter row, the queue card and the shell are Phase 24's; this phase adds one variant and one source value on that path, and the existing `need_basis` codec and rendering tests and the `LifetimePromise` tests stay gates. `build` steps keep Phase 24's same-shape rule; bands apply to nextest steps only.
@@ -626,7 +636,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
   3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
   4. `test_frozen_pass_keeps_one_window_for_admission_view_explanation_and_wait_text` in `scripts/lint/test_memory_admit.py`.
   5. `test_recovery_release_keeps_required_endings_and_frozen_window` in `scripts/lint/test_memory_admit.py`.
-- The memory admission and the queue card tests pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; the merge gate is green. If Spec 2 stops the phase, no code changes and this item does not apply.
+- The memory admission and the queue card tests pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; the merge gate is green. If Spec 2 stops the phase, only the reader fields and their tests change, and the build-shape tests and `basedpyright` over those files must pass.
 - The notice has an `also touches scripts/build_queue/queue_evidence.py, test_queue_evidence.py (owner queue-unit)` line, tested against `origin/builds-queue`.
 - The `need_basis` codec and rendering tests (Phase 24's, plus `CompileBand` and the pool-limit variant) and the `LifetimePromise` tests pass; an unknown cache-folder history reads as `CacheHistoryUnknown` in admission, the queue card and the shell; the first and refreshed wait lines both name the band.
 - The band table, predictor accuracy and before/after replay are in the checkpoint notice, with modeled wait savings (unavailable until queue calibration succeeds) and steps above their promise.
@@ -675,7 +685,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 6. **Docs.** `docs/as-built/build-memory-admission.md`: the list, the split rule and the replay table.
 
 **Constraints from prior phases:**
-- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :1955–1976). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
+- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :2106). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
   Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
 - Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
   Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
@@ -687,8 +697,10 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
   Report observed waits separately. Do not label an estimate comparison as a queue replay.
 - Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
 - Phase 17's bands and Phase 11's compile split apply inside each side.
-- Build history inside each side: `build_expected_peak` (`memory_admit.py` :2012) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1662). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The split removes rows; it changes none of those values, and Phase 11's lower pool never replaces a same-shape `build` promise.
-- `scripts/lint/build_shape.py` holds the one argv parser and the one anon-to-index join (Phase 24 Part A; Phase 11 widens the join).
+- Build history inside each side: `build_expected_peak` (`memory_admit.py` :2195) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1811). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The split removes rows; it changes none of those values, and Phase 11's lower pool never replaces a same-shape `build` promise.
+- `scripts/lint/build_shape.py` holds the one Cargo shape parser (`build_shape()` :61) and the one anon-to-index join (`index_step_evidence` :125; Phase 24 Part A, Phase 11 widens it). Since Phase 60 the join keeps the decoded argv of test steps in `StepEvidence.arguments` and parses no test selection.
+- Phase 60 (`e88fb841d`): test selection is parsed only by `test_selection()` (`memory_admit.py` :162). `history_selection(item, evidence)` (:2091) is the one resolver of package, scope and filters for an anonymous row: a recorded field wins, and only a missing field is parsed from `arguments`. The side split filters rows after that resolver; add no second selection parser. Keep the tests for recorded-field precedence, missing-field recovery and test-only arguments (`test_indexed_test_arguments_remain_available_for_selection`, `test_missing_test_arguments_keep_the_compile_count`, `test_package_check_keeps_legacy_measured_peaks_without_package_fields`).
+- Phase 60: keep the full-package selection (`memory_admit.py` :2023–2026) and the larger of the exact-filter and package p90 in `filtered_peak` (:2506–2510) on each side of a split.
 - Initial estimates run through `admission_client.step_request()` and `memory_admit.step_estimate()`.
   The service does not run git in its event loop. Phase 8 guards the sole estimate-cache writer before mutation.
   Keep private fixture caches usable and real coordination state inaccessible to tests.
@@ -732,7 +744,8 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Goal:** most admissions use measured anon peaks. The build-log peak times `ANON_SHARE` is a fallback that few admissions take.
 
 **Measured (code, at `a650d945`):**
-- `ANON_SHARE = 0.65` (`memory_admit.py` :71) scales a build-log `peak_mem_bytes` (page cache included) to process memory: in `expected_peak` (:597) when a repository has fewer than 5 measured anon peaks, and in `filtered_peak` (:703, :708) for the index tiers. `ExpectedPeak.source` (:141) is `measured`, `buildlog`, `pooled` or `fallback`.
+- `ANON_SHARE = 0.65` (`memory_admit.py` :70 at `e88fb841d`) scales a build-log `peak_mem_bytes` (page cache included) to process memory: in `expected_peak` (:1993; the tier at :2058–2059 and the 1–4 row tier at :2065–2066) when a repository has fewer than 5 measured anon peaks, and in `filtered_peak` (:2468; index tiers :2544–2550). `ExpectedPeak` (:587) names its source.
+- Phase 60 (`e88fb841d`) already puts package anonymous history before both indexed tiers in `filtered_peak` (:2506–2510), with legacy rows' package, scope and filters recovered from the indexed argv. Its test: `test_legacy_package_selection_recovers_anonymous_peaks_for_an_unseen_filter` (`test_memory_admit.py`). Rows recorded before 2026-10-29 15:05Z lack those fields; they leave the 14-day window about 2026-11-12, which also lowers the `ANON_SHARE` share.
 - Before Phase 20 Spec 0, no record keeps the source of an admitted step's estimate: reservations have no source field, and waiter rows (report Phase 3 adds `need_source`) are deleted at admission. From Spec 0's merge, each `admitted` event in `admission/queue_times.jsonl` records the need source, and Phase 20's one interval reader in `memory_admit.py` rebuilds each step from those events.
 
 **Spec:**
@@ -751,10 +764,13 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
    Keep `shape` and `cap` as distinct source rows. A chosen cap counts in neither fallback nor `ANON_SHARE` shares.
    Report source shares by step kind: full nextest, filtered nextest, clippy, check, build, doc and other.
    Report the `ANON_SHARE` share and compare those estimates with measured anonymous peaks.
+   Split recorded admissions by deployed estimator: before and after the Phase 60 merge, and before and after legacy rows leave the window (about 2026-11-12).
+   Count recovered legacy rows apart from rows with recorded selection fields. The queue card already shows source and count (`queue_evidence.py` :108); test the totals, add no user control.
    Add a measurement test with two intervals, two sources and one logical step.
    The test counts two admissions and one memory wait. Include token return and incomplete evidence.
 2. **Stop rule.** If the `× ANON_SHARE` share is already small, the phase is only this measurement: the table goes in the as-built doc and no code changes. The showrunner sets "small" from the table.
-3. **Otherwise, widen anon matching.** Try repository-and-step anonymous history before any `ANON_SHARE` tier when exact-filter history is absent.
+3. **Otherwise, widen anon matching where the table still shows `ANON_SHARE` tiers.** Filtered estimates already use package anonymous history first (Phase 60). Work only on the measured remaining gaps, for example a full estimate where five or more indexed peaks (:2058–2059) win over one to four anonymous peaks.
+   Keep Phase 60's package selection and the max rule, and Phase 17's bands and Phase 18's splits.
    Keep the scope and every split from Phases 11, 17 and 18.
    Replay the source shares and estimate errors. Report steps above their promise.
    Keep modeled wait savings unavailable until queue calibration succeeds. Report observed waits separately.
@@ -767,7 +783,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 6. **Docs.** `docs/as-built/build-memory-admission.md`: the tier share table; if changed, the `need` paragraph.
 
 **Constraints from prior phases:**
-- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :1955–1976). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
+- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :2106). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
   Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
 - Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
   Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
@@ -778,8 +794,8 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
   Keep the estimate comparisons and adoption conditions. Report modeled wait savings as unavailable until calibration succeeds.
   Report observed waits separately. Do not label an estimate comparison as a queue replay.
 - Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
-- Phases 11, 17 and 18 set which rows match; the widened match keeps every split, and reads rows through the one index join in `scripts/lint/build_shape.py` (no second join or argv parser).
-- Phase 24 owns the `build` promise: `build_expected_peak` (`memory_admit.py` :2012) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1662). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The widened match and the drop of 0.65 change other steps' tiers only.
+- Phases 11, 17 and 18 set which rows match; the widened match keeps every split, and reads rows through the one index join in `scripts/lint/build_shape.py` and the one selection resolver `history_selection` in `memory_admit.py` (no second join or argv parser).
+- Phase 24 owns the `build` promise: `build_expected_peak` (`memory_admit.py` :2195) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1811). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The widened match and the drop of 0.65 change other steps' tiers only.
 - The admission service owns transitions. `admission_client.WaitOutput` writes source text and `admission_protocol.py` carries source values.
   Preserve historical and future-source decoding. Test first, periodic and refreshed wait lines.
   Phase 20 supplies the lifecycle recording prerequisite. This phase still owns the source-share analysis.
@@ -1720,46 +1736,26 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - After the rebuild, each idle runner service shows `memory.swap.current` under 64 MiB.
 
 ### Phase 60 — A filtered compile run's promise comes near what that run uses  · status: done
-**Depends on:** Phase 11 (compile classification, `index_step_evidence`, the replay). Runs next after Phase 11 and before Phase 17 (showrunner ruling 2026-11-04). Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8.
 
-#### Work Order
+#### As-built
 
-**Goal:** a filtered compile run gets a promise near what it uses, so Phase 11's rise in over-promises goes back down.
-
-**Measured (Phase 11 replay, 15,053 runs, 2026-10-21 to 2026-11-04):**
-1. Phase 11 missed its bar: under-half 491 → 430, but over-three 2,605 → 2,620.
-2. The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 → 7, over-three 101 → 166.
-3. Phase 11 Spec 4 removed the full-run cap on a compile promise. The rise follows that change.
-4. `filtered_peak()` already takes the exact filter's compile history first, then the package's, then the check/build peaks (`scripts/lint/memory_admit.py` :2359–2425; tests `scripts/lint/test_memory_admit.py` :631–651). The order is not the cause. The promise source of the over-three rows is not yet known.
-5. The Phase 11 replay (`phases/11/replay.py` in the run folder) uses the pre-Phase-11 tree as its baseline (:64). It classifies each call from one attempt that later attempts overwrite (:69–95), not through the shipped `combine_compile_counts()`.
-
-**Spec:**
-1. **Rebuild the replay.** Copy `phases/11/replay.py` to `phases/60/replay.py` in the run folder.
-   Classify each call through `build_shape.index_step_evidence` and `combine_compile_counts`. Remove the replay's own classification.
-   Read the frozen inputs at `phases/11/replay_inputs`. Run it at `82f5c90d4` (the Phase 11 checkpoint). These are the before numbers.
-2. **Diagnose.** For each cargo-liner nextest compile row above three times its peak, record its promise source: basis, tier, history count, filter key and the history rows used.
-   Write the table to `phases/60/over_three_rows.md`. Name the cause from that table before any code change.
-3. **Fix at the cause** in `memory_admit.py`. If the table shows no fix that meets the bar without a rise in under-half, send the table and the choices to builds before any code change.
-4. **Tests** in `scripts/lint/test_memory_admit.py`: fixtures built from the diagnosed rows that fail before the fix. Each test fakes both memory readings.
-5. Run the rebuilt replay after the fix with the same inputs.
-6. Update `docs/as-built/build-memory-admission.md`: the cause, the changed promise source and the replay result.
-
-**Constraints from prior phases:**
-- Phase 11: compile and no-compile runs never mix; fresh runs keep `fresh_test_peak` and its 1 GiB floor; keyed rows win over unkeyed rows; 1–4 own runs do not take the pool.
-- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :1955–1976). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
-- Phase 11: a positive count beside an unknown attempt gives `CompiledCrates(known count)`. That count is a lower bound.
-- Keep these tests unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result` and `test_unknown_attempt_between_zero_attempts_keeps_the_count_unknown` (`scripts/lint/test_build_shape.py`); `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it` (`scripts/lint/test_memory_admit.py`).
+- `StepEvidence.arguments` (`scripts/lint/build_shape.py`) holds the decoded argv of test steps (`TEST_STEPS` = nextest, test, t). `index_step_evidence` keeps the argv and parses no test selection.
+- `history_selection(item, evidence)` (`memory_admit.py`) is the one resolver of package, scope and filters for a history row. A recorded field wins; only a missing field is parsed from `StepEvidence.arguments` through `test_selection`, once per row.
+- `expected_peak`: a full test request with a package keeps only rows whose package and scope match (test steps only).
+- `filtered_peak`: the larger of the exact-filter p90 and the package p90 from anonymous rows, then the indexed exact and package peaks × `ANON_SHARE`, then check/build peaks, the compile index and `FILTERED_FLOOR`.
+- The rebuilt replay (`phases/60/replay.py` in the run folder) classifies calls through `index_step_evidence` and `combine_compile_counts`. At this checkpoint: 395 under-half and 2,525 over-three over 15,053 runs; cargo-liner nextest compile runs at 21 GiB: over-three 166 → 65, under-half 7 → 0.
 
 **Files:**
-- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `docs/as-built/build-memory-admission.md`
+- `scripts/lint/memory_admit.py` — the selection parsers (`test_selection`, `test_package`, `test_scope`, `test_filters`), `history_selection` and the estimate tiers.
+- `scripts/lint/build_shape.py` — `TEST_STEPS` and `StepEvidence.arguments`.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py` — legacy selection recovery, package isolation, the max rule and the argument tests.
+- `docs/as-built/build-memory-admission.md` — the selection text and the Phase 60 replay comparison.
 
-**Workers:** `1 writer + 1 tester`
-- `test` rebuilds the replay, writes the diagnosis table and owns `test_memory_admit.py`.
-- `impl` owns `memory_admit.py` and the as-built doc. It starts the fix after the table names the cause.
+**Binds later work:** compile bands apply inside these selections, never around them. `history_selection` stays the one place rows get package, scope and filters; a later reader of argv selection uses `test_selection` or `history_selection`, not a new parser. The replay at this checkpoint is the baseline for the compile-band adopt rule.
 
-**Acceptance gate:**
-- The rebuilt replay names its baseline `82f5c90d4` and uses the shared classification.
-- The rebuilt replay brings cargo-liner nextest over-three to 101 or lower. Its under-half is no worse than 7.
-- The new fixtures fail on `82f5c90d4` and pass after the fix. The Phase 11 regression tests above pass unchanged.
-- The memory admission and build-shape tests pass; `basedpyright` over the changed files reports `0 errors, 0 warnings, 0 notes`.
-- Change-Review line: none (no behavior the user sees beyond fewer held starts).
+**Gotchas:**
+- Anonymous rows before 2026-10-29 15:05Z have no package, scope or filter fields. Recovery reads the indexed argv. The effect ends about 2026-11-12 (`HISTORY_DAYS` = 14).
+- Parsing argv for every index row makes `index_step_evidence(nextest)` 3× slower. Parse only rows with a missing field.
+- Each `compiling_history` call decodes the whole `anon_peaks.jsonl`; `filtered_peak` calls it three times.
+
+**Ruled out:** named availability states for `StepEvidence.arguments` — `history_selection` reads an empty argv and a missing one the same way.
