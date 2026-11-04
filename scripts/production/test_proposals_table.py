@@ -23,6 +23,7 @@ from scripts.production import session_staff, showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner
 import showrunner_tree
 from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
+from scripts.lib import conf
 
 # Importable once proposals_table has put scripts/direct on the path.
 import phase_table
@@ -252,8 +253,9 @@ class ProposalsTableTests(StaffTestCase):
         self.assertEqual(lines[2], "| unit \\| one | first second | 2026-10-12 | waiting for your review |")
         cells = lines[3].removesuffix(" |").split(" | ")
         self.assertTrue(cells[1].endswith("…") and cells[3].endswith("…"))
-        self.assertLessEqual(len(cells[1]), 110)
-        self.assertLessEqual(len(cells[3]), 140)
+        settings = conf.read("proposals_table")
+        self.assertLessEqual(len(cells[1]), settings.whole("title_width"))
+        self.assertLessEqual(len(cells[3]), settings.whole("state_width"))
 
     def test_config_widths_change_where_the_table_cuts_cells(self) -> None:
         config = self.write("config/proposals_table.conf", "# whole: 1..\ntitle_width=10\n# whole: 1..\nstate_width=15\n")
