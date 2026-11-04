@@ -72,7 +72,7 @@ def _remote_python(machine: str, script: str, *arguments: str) -> str:
 
 def read_snapshot() -> staff.StaffSnapshot:
     """Read the owner's stored staff page through its existing file reader."""
-    if os.environ.get("STAFF_FILE") or remote.other_machine() != staff.OWNER_MACHINE:
+    if staff.is_owner():
         return staff.local_snapshot()
     script = (
         "import json, pathlib, sys\n"
