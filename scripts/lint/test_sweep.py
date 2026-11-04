@@ -15,9 +15,9 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
@@ -1085,6 +1085,26 @@ class ReclamationTests(SweepCase):
 
 
 class FloorTests(SweepCase):
+    def test_floor_fixture_supports_repeated_capacity_reads_during_the_scan(self) -> None:
+        base = self.base()
+        _, output = cargo_target(base, "repo", APP, time.time() - DAY)
+        original_scan = sweep.scan_floor_roots
+        readings: list[int] = []
+
+        def scan(roots: list[str], trees: dict[str, list[str]], *,
+                 lint_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> sweep.Scan:
+            readings.extend(sweep.free_bytes(str(base)) for _ in range(8))
+            result = original_scan(roots, trees, lint_settings=lint_settings)
+            readings.extend(sweep.free_bytes(str(base)) for _ in range(8))
+            return result
+
+        with mock.patch.object(sweep, "scan_floor_roots", side_effect=scan):
+            status, _ = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+        self.assertEqual(status, 0)
+        self.assertFalse(output.exists())
+        self.assertTrue(sweep.floor_record_path().exists())
+        self.assertEqual(readings, [10 * GIB - 1] * 16)
+
     def paired_output(self, base: Path) -> tuple[CargoOutputRoots, Path, Path]:
         workspace = base / "workspace"
         target = workspace / "target"
@@ -2568,6 +2588,7 @@ with open(sys.argv[1], 'a') as lock:
             "BUILDLOG_DIR": str(base / "buildlog"),
             "BUILD_HOLD_DIR": str(base / "build-hold"),
         }))
+        _ = self.enterContext(mock.patch.object(sweep, "output_device", return_value=base.stat().st_dev))
         _ = self.enterContext(mock.patch.object(build_hold, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", return_value={}))
@@ -2587,15 +2608,27 @@ with open(sys.argv[1], 'a') as lock:
         with self.assertRaisesRegex(AssertionError, "unexpected floor alert send"):
             _ = sweep.send_floor_alert("test", sweep.FloorAlertChannels.NATEDEV)
 
+    @contextmanager
+    def free_space(self, free: list[int], scanned: int | None = None) -> Generator[None]:
+        """Keep each capacity value stable until the scan or removal changes the fixture state."""
+        after_scan = free[0] if scanned is None else scanned
+        with (mock.patch.object(sweep, "scan_floor_roots", wraps=sweep.scan_floor_roots) as scan,
+              mock.patch.object(sweep, "shrink_floor", wraps=sweep.shrink_floor) as removal):
+            def available(*_: str) -> int:
+                if removal.called:
+                    return free[-1]
+                return after_scan if scan.called else free[0]
+
+            with mock.patch.object(sweep, "free_bytes", side_effect=available):
+                yield
+
     def hold(self, base: Path, floor: int, free: list[int], dry_run: bool = False,
              scanned: int | None = None) -> tuple[int, str]:
-        """free is the free space before the sweep and after it; scanned, the free space read once
-        the caches are measured, is the first value unless given."""
-        reads = [free[0], free[0] if scanned is None else scanned, *free[1:]]
+        """Use the fixture capacity before the scan, after the scan, and after removal."""
         output = io.StringIO()
         _ = write_config_fixture(conf.path("lint"),
                                  f"sweep_floor_roots={base}\n")
-        with (mock.patch.object(sweep, "free_bytes", side_effect=reads),
+        with (self.free_space(free, scanned),
               mock.patch.object(sweep.tmp_sweep, "state_dir", return_value=base), redirect_stdout(output)):
             status = sweep.hold_floor(floor, dry_run)
         return status, output.getvalue()
@@ -3632,7 +3665,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         def measure() -> int:
             _ = write_config_fixture(conf.path("lint"),
                                      f"sweep_floor_roots={base}\n")
-            with mock.patch.object(sweep, "free_bytes", side_effect=[2 * GIB, 301 * GIB, 302 * GIB]):
+            with self.free_space([2 * GIB, 302 * GIB], scanned=302 * GIB):
                 return sweep.hold_floor(300 * GIB, False)
 
         with mock.patch.object(time, "time", return_value=now):
