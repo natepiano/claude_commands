@@ -29,10 +29,10 @@ class StaffMoveTests(StaffTestCase):
         self.members = {}
         self.members["source"] = fixture_member("showrunner", name="tools", doc=staff.LiveDoc("natedev", source_doc))
         self.members["destination"] = fixture_member("showrunner", name="new-tools", doc=staff.LiveDoc("natedev", destination_doc))
-        self.members["unit"] = fixture_member("unit", name="panes", parent=self.members["source"].id)
-        self.members["worker"] = fixture_member("worker", name="impl1", parent=self.members["unit"].id)
-        self.pane("w1:p1", session_id=self.members["unit"].id, environment={
-            "CLAUDE_CODE_SESSION_ID": self.members["unit"].id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+        self.members["unit"] = fixture_member("unit", name="panes", parent=staff.ReportsTo(self.members["source"].id))
+        self.members["worker"] = fixture_member("worker", name="impl1", parent=staff.ReportsTo(self.members["unit"].id))
+        self.pane("w1:p1", session_id=self.members["unit"].current_session, environment={
+            "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
         })
         _ = self.place
 
@@ -41,7 +41,7 @@ class StaffMoveTests(StaffTestCase):
         with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot:
             result = staff_move.move_unit("sdlc", "models-unit", "target")
         snapshot.assert_called_once_with()
-        self.assertEqual(result.row, replace(self.members["unit"], parent=self.members["destination"].id))
+        self.assertEqual(result.row, replace(self.members["unit"], parent=staff.ReportsTo(self.members["destination"].id)))
         self.assertTrue(result.changed)
         self.assertEqual(staff.snapshot(), replace(before, rows=tuple(
             result.row if row.id == self.members["unit"].id else row for row in before.rows)))
@@ -60,7 +60,7 @@ class StaffMoveTests(StaffTestCase):
                 self.assertEqual(code, 0, errors.getvalue())
                 self.assertEqual(output.getvalue(), ("unchanged" if repeated else "done") + ": panes under new-tools\n")
                 self.assertEqual(errors.getvalue(), "")
-                self.assertEqual(staff.by_id(self.members["unit"].id), replace(self.members["unit"], parent=self.members["destination"].id))
+                self.assertEqual(staff.by_id(self.members["unit"].id), replace(self.members["unit"], parent=staff.ReportsTo(self.members["destination"].id)))
                 self.assertEqual(self.place.call_args_list, [mock.call(self.members["unit"].id, record=mock.ANY)] * (1 + repeated))
                 if repeated:
                     move.assert_not_called()
@@ -68,7 +68,7 @@ class StaffMoveTests(StaffTestCase):
                     self.assertEqual(self.staff_file.stat().st_mtime_ns, modified)
 
     def test_placement_and_retry_read_the_parent_after_the_staff_write(self) -> None:
-        parents: list[staff.StaffId | None] = []
+        parents: list[staff.ReportsTo | staff.StaffRoot] = []
         def place(row_id: str, *, record: staff.StaffSnapshot) -> bool:
             row = record.by_id(staff.StaffId(row_id))
             assert row is not None
@@ -82,7 +82,7 @@ class StaffMoveTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         result = staff_move.move_unit("sdlc", "models-unit", "target")
         self.assertTrue(result.changed)
-        self.assertEqual(parents, [self.members["destination"].id] * 2)
+        self.assertEqual(parents, [staff.ReportsTo(self.members["destination"].id)] * 2)
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertEqual(self.place.call_args_list, [mock.call(self.members["unit"].id, record=mock.ANY)] * 2)
 
@@ -93,7 +93,7 @@ class StaffMoveTests(StaffTestCase):
             with self.subTest(pinned=pinned):
                 _ = target_doc.write_text(target_text)
                 _ = (self.source_root / "sdlc-production.md").write_text("# Fixture production\n- **Showrunner session:** `tools`\n")
-                _ = staff.move(self.members["unit"].id, self.members["source"].id)
+                _ = staff.move(self.members["unit"].id, staff.ReportsTo(self.members["source"].id))
                 self.members["unit"] = staff.rename(self.members["unit"].id, "models" if not pinned else "panes")
                 identity = staff_move.PinnedUnit(self.members["unit"].id, self.members["destination"].id) if pinned else staff_move.LocateUnit()
                 self.place.reset_mock()
@@ -118,11 +118,11 @@ class StaffMoveTests(StaffTestCase):
         with self.machine("mac"):
             _ = self.production("sdlc", workspace="tools")
             _ = self.production("target", workspace="new-tools")
-            self.pane("w1:p1", session_id=self.members["unit"].id, environment={
-                "CLAUDE_CODE_SESSION_ID": self.members["unit"].id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+            self.pane("w1:p1", session_id=self.members["unit"].current_session, environment={
+                "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
             })
             result = staff_move.move_unit("sdlc", "models-unit", "target")
-            self.assertEqual(result.row, replace(self.members["unit"], parent=self.members["destination"].id))
+            self.assertEqual(result.row, replace(self.members["unit"], parent=staff.ReportsTo(self.members["destination"].id)))
             self.assertFalse(self.mac_file.exists())
         self.assertEqual(self.ssh_commands(), [
             ["show", "--snapshot", "--json"], ["move", self.members["unit"].id, f"--parent={self.members["destination"].id}", "--json"],
@@ -131,7 +131,7 @@ class StaffMoveTests(StaffTestCase):
         self.place.assert_called_once_with(self.members["unit"].id, record=mock.ANY)
 
     def test_invalid_pinned_identity_never_changes_staff_or_selects_a_replacement(self) -> None:
-        replacement = fixture_member("unit", name="models", parent=self.members["destination"].id)
+        replacement = fixture_member("unit", name="models", parent=staff.ReportsTo(self.members["destination"].id))
         before = self.staff_file.read_bytes()
         missing = staff.StaffId("s00000000000")
         for unit, parent, reason in [(missing, self.members["destination"].id, ""),
@@ -168,7 +168,7 @@ class StaffMoveTests(StaffTestCase):
         self.place.assert_not_called()
 
     def test_taken_unit_name_refuses_before_tab_move(self) -> None:
-        _ = fixture_member("unit", name=self.members["unit"].name, parent=self.members["destination"].id)
+        _ = fixture_member("unit", name=self.members["unit"].name, parent=staff.ReportsTo(self.members["destination"].id))
         before = self.staff_file.read_bytes()
         with self.assertRaises(staff.StaffRefused):
             _ = staff_move.move_unit("sdlc", "models-unit", "target")

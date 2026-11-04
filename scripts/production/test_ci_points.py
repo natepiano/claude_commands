@@ -344,7 +344,7 @@ PY
         self.assertEqual(observed["origin"], str(self.origin))
         self.assertEqual(observed["push_origin"], push_origin)
         self.assertEqual(self.git("config", "--local", "--get", "remote.origin.url", cwd=checkout),
-                         str(self.checkout))
+                         str(self.origin))
         for key in ("remote.origin.pushurl", "user.name", "user.email"):
             config = subprocess.run(["git", "config", "--local", "--get", key], cwd=checkout,
                                     env=self.env, capture_output=True, text=True, check=False)

@@ -24,7 +24,7 @@ from unittest.mock import patch
 
 from scripts.production import staff
 from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_member, isolated_staff_file, recorded_showrunner, recorded_unit,
+    StaffTestCase, isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id, recorded_showrunner, recorded_unit,
 )
 from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
 # These regressions check the private verifier's semantic result before wait closure.
@@ -1829,6 +1829,13 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(load_phases(old), phases)
         self.assertEqual((phases[0]["started_at"], phases[0]["finished_at"]), (1010, 1060))
 
+    def wait_worker_roster(self, session: Path, workers: dict[str, str]) -> None:
+        owner = fixture_member("showrunner", name="wait-owner")
+        unit = fixture_member("unit", name="wait-unit", parent=owner.id)
+        entries = {name: {"staff_id": fixture_worker(name, unit.id, runtime_id=native).id}
+                   for name, native in workers.items()}
+        _ = (session / "mesh_roster.json").write_text(json.dumps(entries))
+
     def covered_wait_phase(self, name: str) -> Path:
         session = self.start_run(name, 1000)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
@@ -2050,7 +2057,9 @@ print('two homes isolated; recorder lock retained; caller restored')
     def test_thread_wait_retains_its_own_pass_with_shared_server_and_fix_worker_names(self) -> None:
         for same_phase in (False, True):
             for suffix in ("test", "fix"):
-                with self.subTest(same_phase=same_phase, suffix=suffix):
+                staff_file = self.root / f"staff-{same_phase}-{suffix}.json"
+                with self.subTest(same_phase=same_phase, suffix=suffix), isolated_staff_file(staff_file, {}):
+                    _ = staff_file.write_text(json.dumps({"schema": 2, "rows": []}))
                     name = f"thread-waits-{same_phase}-{suffix}"
                     session = self.covered_wait_phase(name)
                     for slot, phase, worker in (("impl", "6", "unit-impl"),
@@ -2062,11 +2071,11 @@ print('two homes isolated; recorder lock retained; caller restored')
                         _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", phase,
                                              "--pass-kind", "impl", "--activity", "work", "--called-task", "direct.impl",
                                              "--worker-name", worker, "--called-family", "codex", "--called-model", "gpt-called", at=1021)
-                    _ = (session / "mesh_roster.json").write_text(json.dumps(
-                        {"unit-impl": {"thread_id": "impl-thread"}, f"unit-{suffix}": {"thread_id": "test-thread"}}))
+                    self.wait_worker_roster(session, {"unit-impl": fixture_runtime_id("impl-thread"),
+                                                      f"unit-{suffix}": fixture_runtime_id("test-thread")})
                     self.team_slot = "impl"
                     ids: list[str] = []
-                    for thread in ("impl-thread", "test-thread"):
+                    for thread in (fixture_runtime_id("impl-thread"), fixture_runtime_id("test-thread")):
                         ids.append(self.run_command("start-wait", "--session-dir", str(session),
                             "--worker-thread-id", thread, "--owner-session", thread,
                             "--kind", "WaitingForMemoryOrSlot", at=1030))
@@ -2077,7 +2086,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                     passes = {str(event["worker_name"]): event for event in events if event["event_type"] == "pass_started"}
                     report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1060)))
                     waits = {str(wait["owner_session"]): wait for wait in cast(list[dict[str, object]], report["waits"])}
-                    for thread, worker in (("impl-thread", "unit-impl"), ("test-thread", f"unit-{suffix}")):
+                    for thread, worker in ((fixture_runtime_id("impl-thread"), "unit-impl"), (fixture_runtime_id("test-thread"), f"unit-{suffix}")):
                         wait = waits[thread]
                         started = next(event for event in events if event["event_type"] == "wait_started"
                                        and event["owner_session"] == thread)
@@ -2085,9 +2094,9 @@ print('two homes isolated; recorder lock retained; caller restored')
                                          (worker, passes[worker]["pass_instance_id"], passes[worker]["phase_instance_id"]))
                         self.assertEqual((started["worker_name"], started["pass_instance_id"], started["phase_instance_id"]),
                                          (wait["worker_name"], wait["pass_instance_id"], wait["phase_instance_id"]))
-                    completed = cast(dict[str, object], waits["impl-thread"]["wait_end"])
+                    completed = cast(dict[str, object], waits[fixture_runtime_id("impl-thread")]["wait_end"])
                     self.assertEqual((completed["state"], completed["epoch"]), ("Finished", 1040))
-                    self.assertEqual(waits["test-thread"]["wait_end"], {"state": "Unclosed"})
+                    self.assertEqual(waits[fixture_runtime_id("test-thread")]["wait_end"], {"state": "Unclosed"})
 
     def test_thread_attribution_miss_never_reports_candidate_phases_as_covered_zero(self) -> None:
         session = self.covered_wait_phase("thread-miss")
@@ -2112,13 +2121,11 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def test_uncertain_coverage_counts_repeated_reasons_in_first_seen_order(self) -> None:
         session = self.covered_wait_phase("repeated-uncertainty")
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            "unit-impl": {"thread_id": "impl-thread"},
-            "unit-test": {"thread_id": "test-thread"},
-        }))
+        self.wait_worker_roster(session, {"unit-impl": fixture_runtime_id("impl-thread"),
+                                         "unit-test": fixture_runtime_id("test-thread")})
         wait_ids = [self.run_command(
-            "start-wait", "--session-dir", str(session), "--worker-thread-id", thread,
-            "--owner-session", thread, "--kind", "WaitingForMemoryOrSlot", at=1020 + index,
+            "start-wait", "--session-dir", str(session), "--worker-thread-id", fixture_runtime_id(thread),
+            "--owner-session", fixture_runtime_id(thread), "--kind", "WaitingForMemoryOrSlot", at=1020 + index,
         ) for index, thread in enumerate(("impl-thread", "test-thread", *("impl-thread",) * 4))]
         report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1030)))
         phase, = cast(list[dict[str, object]], report["phases"])
@@ -5821,19 +5828,23 @@ with patch.object(fcntl, "flock", admission):
             self.assertEqual(identity, director)
 
     def test_the_directors_window_repairs_a_main_agent_a_worker_overwrote(self) -> None:
-        """Runs started before the check carry a worker's thread; the run folder names the director."""
+        """The staff parent identifies the director after a worker overwrites the run history."""
         started_at = 93_000
         session_dir = self.start_run("repaired", started_at)
         state = self.read_state(session_dir)
         state["main_agent"] = {
             "family": "codex", "model": "gpt-worker", "effort": "medium", "session_id": "worker-thread"}
         _ = (session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
-        _ = (session_dir / "director").write_text("main-repaired\n", encoding="utf-8")
-        self.write_claude_transcript("main-repaired", "sonnet-5", "low")
-        for identity in self.open_pass_and_activity(session_dir, started_at, "main-repaired"):
+        native = fixture_runtime_id("main-repaired")
+        owner = fixture_member("showrunner", name="repair-owner")
+        unit = fixture_member("unit", name="repair-unit", parent=owner.id, runtime_id=native)
+        worker = fixture_worker("repair-worker", unit.id)
+        _ = (session_dir / "mesh_roster.json").write_text(json.dumps({worker.name: {"staff_id": worker.id}}))
+        self.write_claude_transcript(native, "sonnet-5", "low")
+        for identity in self.open_pass_and_activity(session_dir, started_at, native):
             self.assertEqual(
                 (identity["model"], identity["effort"], identity["session_id"]),
-                ("sonnet-5", "low", "main-repaired"),
+                ("sonnet-5", "low", native),
             )
 
     def test_identity_detection_prefers_codex_falls_back_to_claude_and_refuses_unknown(self) -> None:

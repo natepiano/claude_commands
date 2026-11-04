@@ -471,7 +471,7 @@ def unit_worktree(session_id: str) -> staff.PresentWorktree | staff.RemovedWorkt
         return staff.WORKTREE_UNFILLED
     row = record.by_member_reference(session_id)
     if row is not None and row.kind == "worker":
-        row = record.by_id(row.parent) if row.parent is not None else None
+        row = record.parent_of(row)
     if row is None or row.kind != "unit":
         return staff.WORKTREE_UNFILLED
     return row.worktree

@@ -184,13 +184,6 @@ def move_worktree(checkout: Path, old_branch: str, new_branch: str, old: Path, n
     _ = git(new, "switch", new_branch)
 
 
-def config_dirs() -> list[Path]:
-    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
-    override = os.environ.get("CLAUDE_CONFIG_DIR")
-    if override:
-        directories.add(Path(override).expanduser())
-    return sorted(directories)
-
 
 def copy_trust(path: Path, old: str, new: str) -> None:
     config = json_object(read_json(path))
@@ -221,7 +214,7 @@ def project_folder(worktree: str) -> str:
 def move_configs(old: str, new: str) -> None:
     """Move the transcript folders and copy the trust entry in every Claude config dir."""
     old_project, new_project = project_folder(old), project_folder(new)
-    for directory in config_dirs():
+    for directory in sessions.config_dirs():
         move(PathMove(directory / "projects" / old_project, directory / "projects" / new_project))
         config = (Path.home() / ".claude.json" if directory == Path.home() / ".claude"
                   else directory / ".claude.json")
@@ -550,8 +543,9 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
             return
         moved = False
         if not old.exists():
-            owner = record.by_id(row.parent) if row.parent is not None else None
-            if owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            owner = record.parent_of(row)
+            if (owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                    and owner.doc.machine == remote.local_machine()):
                 try:
                     moved = (git(owner.doc.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir")
                              == git(destination, "rev-parse", "--path-format=absolute", "--git-common-dir"))
@@ -578,6 +572,14 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                     except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
                         print(f"unit_move: {error}", file=sys.stderr)
                 raise
+        histories = {Path(history) for run in runs
+                     if isinstance(history := json_object(read_json(run / unit_runs.STATE_FILE)).get("history_file"), str)
+                     and history}
+        for history in sorted(histories):
+            try:
+                move_run(history, old, destination, git(destination, "branch", "--show-current"))
+            except (OSError, ValueError, RenameRefused) as error:
+                print(f"unit_move: {history}: {error}", file=sys.stderr)
         _ = staff.set_worktree(unit, staff.PresentWorktree(row.worktree.machine, destination), expected=row.worktree)
         if isinstance(launch, FolderLaunch):
             try:

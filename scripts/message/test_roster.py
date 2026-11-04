@@ -18,6 +18,7 @@ import unittest
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -25,11 +26,13 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 from scripts.production import staff
+from scripts.usage import agents_log
 from scripts.production.staff_test_support import (
     isolated_staff_file, production_membership, unit_membership, showrunner_relationship, showrunner_launch,
-    fixture_worker, recorded_unit, fixture_member, recorded_showrunner,
+    fixture_worker, fixture_runtime_id, fixture_session, fixture_roster, recorded_unit, fixture_member, recorded_showrunner,
 )
 from scripts.astra import design_roles
+from scripts.astra.design_role_test_support import designer_fixture
 from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import unit_labels
@@ -147,6 +150,7 @@ class RosterTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(config),
             "SHOWRUNNERS_SESSIONS": str(Path(__file__).with_name("sessions.py")),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
+            "USAGE_STATE_DIR": str(self.root / "usage"),
             "ROSTER_RUN_ROOT": str(self.runs),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
@@ -227,6 +231,32 @@ class RosterTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _publish_roster(self, path: Path, entries: dict[str, dict[str, object]],
+                        *, codex_home: Path | None = None) -> None:
+        for entry in entries.values():
+            identity = entry.get("thread_id")
+            if isinstance(identity, str) and identity:
+                try:
+                    _ = staff.native_id(identity)
+                except staff.StaffRefused:
+                    entry["thread_id"] = fixture_runtime_id(identity)
+            native = entry.get("thread_id")
+            if not isinstance(native, str):
+                reference = entry.get("staff_id")
+                member = staff.by_id(staff.native_id(reference)) if isinstance(reference, str) else None
+                native = member.current_session if member is not None else ""
+            for role in agents_log.ROLES:
+                if entry.get("role") == role and native:
+                    lens: agents_log.Lens | None = next(
+                        (lens for lens in agents_log.LENSES if entry.get("lens") == lens), None)
+                    agents_log.append(native, role, lens, datetime.now(UTC))
+                    break
+        parent = (showrunner_relationship("alpha") if path.parent.name == "orphan-run"
+                  else unit_membership("alpha", "unit-one"))
+        published = fixture_roster(cast(dict[str, object], entries), parent.id,
+                                   codex_home or self.root / "codex-home")
+        _ = path.write_text(json.dumps(published), encoding="utf-8")
+
     def _write_mesh(
         self,
         run: Path,
@@ -239,7 +269,7 @@ class RosterTests(unittest.TestCase):
             "port": 45_678,
             "pid": os.getpid() if server_pid is None else server_pid,
         }), encoding="utf-8")
-        _ = (run / "mesh_roster.json").write_text(json.dumps(entries), encoding="utf-8")
+        self._publish_roster(run / "mesh_roster.json", entries)
 
     def _build_complete_roster(self) -> None:
         runner_cwd = self.home / "projects" / "runner"
@@ -253,6 +283,12 @@ class RosterTests(unittest.TestCase):
         )), encoding="utf-8")
         _ = recorded_unit("alpha", "unit-one", director_cwd, self.production_doc, plan="docs/plan.md")
         self._write_showrunner_timer()
+        runner = showrunner_relationship("alpha")
+        _ = staff.update_current_session(runner.current_session,
+            staff.native_id("acd50bad-5afa-5d3d-b155-3766b7d113e0"))
+        unit = unit_membership("alpha", "unit-one")
+        _ = staff.update_current_session(unit.current_session,
+            staff.native_id("17e44ec4-3e24-5ae1-b10d-5cf30de9455b"))
         self._write_session(str(os.getpid()), "runner", "acd50bad-5afa-5d3d-b155-3766b7d113e0", runner_cwd, status="ready")
         self._write_session(
             "director", "director", "17e44ec4-3e24-5ae1-b10d-5cf30de9455b", director_cwd,
@@ -261,6 +297,7 @@ class RosterTests(unittest.TestCase):
         self._write_session(
             "worker", "claude-worker", WORKER_SESSION_ID, worker_cwd, status="idle"
         )
+        _ = fixture_worker("alpha-test", unit.id, runtime_id=WORKER_SESSION_ID)
         self._write_session("solo", "solo-director", "22135b22-7da2-5f04-8840-738da7f248ba", solo_cwd, status="waiting")
         self._write_session("free-old", "old-free-name", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0", free_cwd, updated=1)
         self._write_session("free-new", "free-claude", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0", free_cwd, status="ready", updated=2)
@@ -276,9 +313,9 @@ class RosterTests(unittest.TestCase):
         self._write_mesh(self.director_run, {
             "alpha-impl": {
                 "thread_id": "7aa082fc-e724-5e46-8846-bd68e7eb3f46", "turn_id": "turn-1", "status": "running",
-                "launcher_pid": os.getpid(),
+                "launcher_pid": os.getpid(), "role": "impl",
             },
-            "alpha-fix": {"thread_id": "d6c57ffb-f619-567d-b06c-1a1f7791b8af", "status": "done"},
+            "alpha-fix": {"thread_id": "d6c57ffb-f619-567d-b06c-1a1f7791b8af", "status": "done", "role": "fix"},
             "alpha-failed": {"thread_id": "ea8ee697-99ad-5903-9952-ebc9b68e2eef", "status": "failed"},
             "alpha-start": {
                 "thread_id": "8174bc31-7a95-5fd8-9220-e33314e2cd14", "status": "starting", "launcher_pid": os.getpid(),
@@ -297,7 +334,8 @@ class RosterTests(unittest.TestCase):
                 "launcher_pid": os.getpid(), "role": "review",
             },
             "alpha-ended": {"thread_id": "94e324e8-4161-520a-8910-2efc613382bb", "status": "ended"},
-            "alpha-no-thread": {"status": "starting", "launcher_pid": os.getpid()},
+            "alpha-no-thread": {"thread_id": fixture_runtime_id("alpha-published-start"),
+                                "status": "starting", "launcher_pid": os.getpid()},
         })
 
         solo_run = self.runs / "solo-run"
@@ -455,7 +493,7 @@ class RosterTests(unittest.TestCase):
         unit = next(row for row in membership.rows if row.kind == "unit")
         for parent in (staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), unit.id):
             with self.subTest(parent=parent):
-                rows = [replace(row, parent=parent) if row.id == unit.id else row for row in membership.rows]
+                rows = [replace(row, parent=staff.ReportsTo(parent)) if row.id == unit.id else row for row in membership.rows]
                 _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
                 with self.assertRaises(staff.StaffUnreadable):
                     _ = staff.snapshot()
@@ -494,7 +532,7 @@ class RosterTests(unittest.TestCase):
     def test_codex_unit_row_without_a_parent_claim_is_freestanding_and_lists_successfully(self) -> None:
         record = staff.snapshot()
         row = staff.StaffRow(
-            staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", None,
+            staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", staff.StaffRoot(),
             current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
         )
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
@@ -513,7 +551,7 @@ class RosterTests(unittest.TestCase):
         for parent in (staff.StaffId("missing-owner"), wrong_kind):
             with self.subTest(parent=parent):
                 row = staff.StaffRow(
-                    staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", parent,
+                    staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", staff.ReportsTo(parent),
                     current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
                 )
                 with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
@@ -545,6 +583,24 @@ class RosterTests(unittest.TestCase):
                 registry.assert_called_once_with()
                 relay.assert_not_called()
 
+    def test_mesh_reader_uses_the_current_thread_from_the_staff_backend_record(self) -> None:
+        unit = next(row for row in staff.find(kind="unit") if row.name == "unit-one")
+        worker = fixture_worker("impl2", unit.id,
+                                backend=staff.CodexBackend(self.root / "codex-home"))
+        current = staff.native_id(fixture_runtime_id("roster-replaced-thread"))
+        fixture_session(current, staff.CodexBackend(self.root / "codex-home"))
+        worker = staff.update_current_session(worker.current_session, current)
+        self._write_mesh(self.director_run, {
+            worker.name: {"staff_id": worker.id, "status": "paused", "role": "review"},
+        })
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        entries = self._entries()
+        found = next(entry for entry in entries.values() if entry.name == worker.name)
+        self.assertEqual(found.thread, roster.CodexThread(current))
+        self.assertIsInstance(found.director, roster.UnderDirector)
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertNotIn("thread_id", (self.director_run / "mesh_roster.json").read_text())
+
     def test_fast_labels_agree_with_full_roster_for_live_claude_sessions(self) -> None:
         full = roster.unit_labels(list(self._entries().values()))
         wanted = ["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"]
@@ -561,7 +617,7 @@ class RosterTests(unittest.TestCase):
     def test_transferred_director_keeps_its_new_production_without_a_new_document_row(self) -> None:
         receiving = showrunner_relationship("receiving")
         row = next(row for row in staff.find(kind="unit") if row.name == "unit-one")
-        _ = staff.move(row.id, receiving.id)
+        _ = staff.move(row.id, staff.ReportsTo(receiving.id))
         env_file = self.root / "herdr-proc/991100/environ"
         _ = env_file.write_bytes(env_file.read_bytes() + f"\0CODEX_THREAD_ID={row.id}".encode())
         doc = self.root / "receiving-production.md"
@@ -681,25 +737,26 @@ class RosterTests(unittest.TestCase):
         )
 
     def test_durable_role_roster_uses_holder_reach_after_its_run_folder_is_gone(self) -> None:
+        member = designer_fixture(unit_membership("alpha", "unit-one").id,
+                                  "lasting-astra-designer", self.root / "codex-home")
         design = design_roles.HeldDesign(design_roles.DesignPlacement("00000000-0000-4000-8000-000000000046", "fixture-host", 2),
             "fixture-repo", str(self.root / "checkout"), str(self.root / "checkout/design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("alpha", "unit-one"), design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", "lasting-designer-alias", design_roles.RoleOpen("lasting-thread")),
+            "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
+            (design_roles.RoleInstance("designer", "lasting-astra-designer", design_roles.RoleOpen(member.id)),
              design_roles.RoleInstance("reviewer", "lasting-reviewer-alias", design_roles.RoleNotOpened())))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         mesh = design_roles.mesh_directory(design.placement.design_id)
         mesh.mkdir(parents=True)
-        _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-designer-alias": {
-            "thread_id": "lasting-thread", "status": "done"}}))
-        with mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("17e44ec4-3e24-5ae1-b10d-5cf30de9455b")):
-            found = self._entries()
-        entry = found["lasting-designer-alias"]
-        self.assertEqual(entry.thread, roster.CodexThread("lasting-thread"))
+        _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-astra-designer": {
+            "staff_id": member.id, "status": "done"}}))
+        found = self._entries()
+        entry = found["lasting-astra-designer"]
+        self.assertEqual(entry.thread, roster.CodexThread(member.current_session))
         self.assertEqual(entry.role, "astra-designer")
         self.assertEqual(entry.director, roster.UnderDirector("unit-one", "director", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"))
         self.assertEqual(entry.assignment, roster.HeldDesignRole("designer", str(mesh)))
         self.assertIsInstance(entry.reach, roster.CannotReceiveMessages)
-        self.assertEqual(sum(row.thread == roster.CodexThread("lasting-thread") for row in found.values()), 1)
+        self.assertEqual(sum(row.thread == roster.CodexThread(member.current_session) for row in found.values()), 1)
 
     def test_every_role_and_status_is_returned_with_its_relationships(self) -> None:
         entries = self._entries()
@@ -771,7 +828,7 @@ class RosterTests(unittest.TestCase):
         )
         self.assertEqual(
             entries["alpha-impl"].assignment,
-            roster.WorkerAssignment("no role", str(self.director_run), roster.AssignmentUnrecorded(), "impl"),
+            roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
         self.assertEqual(
             entries["adversary reviewer"].assignment,
@@ -883,31 +940,32 @@ class RosterTests(unittest.TestCase):
                 if arguments:
                     self.assertIn("(context)", runners[0])
 
-    def test_roster_reads_shared_worker_ledger_and_later_old_path_appends(self) -> None:
+    def test_roster_uses_staff_workers_and_leaves_old_ledger_files_unchanged(self) -> None:
         current = self.director_run / "workers"
         previous = self.director_run / "seats"
         _ = current.replace(previous)
         old_time = 1_700_000_000
         os.utime(previous, (old_time, old_time))
+        before = previous.read_bytes(), previous.stat().st_mtime_ns
         worker = self._entries()["claude-worker"]
         self.assertEqual(worker.assignment, roster.WorkerAssignment("test", str(self.director_run), roster.AssignmentUnrecorded(), "test"))
-        self.assertTrue(previous.samefile(current))
-        self.assertEqual(current.stat().st_mtime, old_time)
-        modified = current.stat().st_mtime_ns
+        self.assertFalse(current.exists())
+        self.assertEqual((previous.read_bytes(), previous.stat().st_mtime_ns), before)
         self.assertEqual(self._entries()["claude-worker"].assignment, worker.assignment)
-        self.assertEqual(current.stat().st_mtime_ns, modified)
-        self._write_session("late-worker", "late-worker", "late-worker-id", self.home / "late-project")
+        native = fixture_runtime_id("late-worker")
+        self._write_session("late-worker", "late-worker", native, self.home / "late-project")
         self.assertEqual(self._entries()["late-worker"].role, "freestanding")
         with previous.open("a", encoding="utf-8") as ledger:
-            _ = ledger.write("late-worker-id\talpha-impl\n")
-        self.assertIn("late-worker-id", current.read_text(encoding="utf-8"))
-        modified = current.stat().st_mtime_ns
+            _ = ledger.write(f"{native}\tlate-impl\n")
+        modified = previous.read_bytes(), previous.stat().st_mtime_ns
+        self.assertEqual(self._entries()["late-worker"].role, "freestanding")
+        _ = fixture_worker("late-impl", unit_membership("alpha", "unit-one").id, runtime_id=native)
         late_worker = self._entries()["late-worker"]
         self.assertEqual(late_worker.role, "worker")
         self.assertEqual(late_worker.assignment, roster.WorkerAssignment("impl", str(self.director_run), roster.AssignmentUnrecorded(), "impl"))
         self.assertEqual(late_worker.director, worker.director)
-        self.assertTrue(previous.samefile(current))
-        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self.assertFalse(current.exists())
+        self.assertEqual((previous.read_bytes(), previous.stat().st_mtime_ns), modified)
 
     def test_background_id_prefix_places_claude_worker_in_its_run(self) -> None:
         worker = self._entries()["claude-worker"]
@@ -935,26 +993,33 @@ class RosterTests(unittest.TestCase):
             roster.WorkerAssignment("review", str(self.director_run), "review", "plain"),
         )
 
-    def test_codex_worker_without_recorded_role_has_no_role(self) -> None:
+    def test_unpublished_roster_worker_reports_its_missing_staff_reference(self) -> None:
+        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+            "unpublished": {"status": "starting", "launcher_pid": os.getpid()},
+        }))
+        found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertTrue(any("unpublished" in problem for problem in found.problems), found.problems)
+        self.assertNotIn("unpublished", {entry.name for entry in found.entries})
+
+    def test_codex_worker_reads_its_role_from_staff_without_a_roster_role(self) -> None:
         self.assertEqual(
             self._entries()["alpha-impl"].assignment,
-            roster.WorkerAssignment("no role", str(self.director_run), roster.AssignmentUnrecorded(), "impl"),
+            roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
 
     def test_mesh_assignment_states_come_from_records_and_not_names(self) -> None:
         self._write_mesh(self.director_run, {
             "arbitrary": {"thread_id": "c11994bc-45da-585c-bb8c-b9aa62be4800", "status": "done", "role": "impl"},
             "another": {"thread_id": "78c792af-377b-51b5-8da7-bddbe198f72c", "status": "done", "role": "test"},
-            "repair": {"thread_id": "d6c57ffb-f619-567d-b06c-1a1f7791b8af", "status": "done", "role": "fix"},
-            "arbitrary-reviewer": {"thread_id": "54d79ec8-8609-5bb5-a05d-e1c2476abfbe", "status": "done", "role": "review"},
-            "legacy-impl": {"thread_id": "05a8f984-dd3e-5322-970d-625b046472de", "status": "done"},
-            "invalid-review": {"thread_id": "7bbe483c-1cdc-5127-b1cb-24628c97f2a1", "status": "done", "role": "designer"},
+            "repair": {"thread_id": fixture_runtime_id("assignment-repair"), "status": "done", "role": "fix"},
+            "arbitrary-reviewer": {"thread_id": fixture_runtime_id("assignment-reviewer"), "status": "done", "role": "review"},
+            "legacy-impl": {"thread_id": "05a8f984-dd3e-5322-970d-625b046472de", "status": "done", "role": "impl"},
         })
-        entries = self._entries()
+        found = roster.roster(os.environ, roster.ThisMachine())
+        entries = {entry.name: entry for entry in found.entries}
         for name, expected in (("arbitrary", "impl"), ("another", "test"), ("repair", "fix"),
                                ("arbitrary-reviewer", "review"),
-                               ("legacy-impl", roster.AssignmentUnrecorded()),
-                               ("invalid-review", roster.AssignmentUnreadable("designer"))):
+                               ("legacy-impl", "impl")):
             with self.subTest(name=name):
                 entry = entries[name]
                 self.assertEqual(entry.role, "worker")
@@ -964,8 +1029,7 @@ class RosterTests(unittest.TestCase):
                 restored = roster.RosterSnapshot.decode(roster.RosterSnapshot(roster.Roster([entry], [])).encode()).result.entries[0]
                 self.assertEqual(restored.assignment, entry.assignment)
                 self.assertEqual(restored.thread, entry.thread)
-        self.assertIsInstance(roster.shown_name(entries["legacy-impl"]).job, roster.JobUnassigned)
-        self.assertIsInstance(roster.shown_name(entries["invalid-review"]).job, roster.JobUnassigned)
+        self.assertNotIsInstance(roster.shown_name(entries["legacy-impl"]).job, roster.JobUnassigned)
 
     def test_display_rename_keeps_record_keys_and_adds_a_structured_job(self) -> None:
         entry = replace(self._entry("identity-impl", "worker", "worker:run/identity-impl"),
@@ -1089,15 +1153,16 @@ class RosterTests(unittest.TestCase):
 
 
     def test_bad_durable_binding_warns_once_and_a_named_peer_still_receives_the_send(self) -> None:
-        bad = write_empty_binding_record(self.root, design_roles.UnitHolder('other', 'other-unit'))
+        bad = write_empty_binding_record(self.root)
         peer = self._entry('natedev', 'freestanding', 'session:peer-session')
         os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([peer], [])).encode()
         output, errors = io.StringIO(), io.StringIO()
         doc = self.root / 'peer-production.md'
         _ = doc.write_text('# Peer production\n')
-        membership = staff.StaffSnapshot((staff.StaffRow(staff.StaffId('peer-session'), 'showrunner',
-            'natedev', None, current_session=staff.StaffId('peer-session'),
-            doc=staff.LiveDoc('natedev', doc)),))
+        local = staff.local_snapshot()
+        membership = staff.StaffSnapshot((*local.rows, staff.StaffRow(staff.StaffId('peer-session'), 'showrunner',
+            'natedev', staff.StaffRoot(), current_session=staff.StaffId('peer-session'),
+            doc=staff.LiveDoc('natedev', doc))))
         with mock.patch.object(staff, 'snapshot', return_value=membership), \
                 mock.patch.object(send, 'STATE', self.root / 'send-state'), \
                 mock.patch.object(send, 'remote', return_value=send.Result('sent', 'fixture peer')) as deliver, \
@@ -1114,7 +1179,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(forwarded.text, 'owner update')
 
     def test_durable_warnings_survive_snapshots_and_do_not_change_roster_exit_status(self) -> None:
-        bad = write_empty_binding_record(self.root, design_roles.UnitHolder('other', 'other-unit'))
+        bad = write_empty_binding_record(self.root)
         code, output, errors = self._run_main('--json')
         self.assertEqual(code, 0, errors)
         report = cast(dict[str, object], json.loads('\n'.join(output)))
@@ -1126,20 +1191,23 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(decoded.warnings, result.warnings)
         self.assertEqual(decoded.problems, [])
 
-    def test_mesh_titles_use_held_design_holder_and_fall_back_when_it_is_unreadable(self) -> None:
+    def test_mesh_titles_use_worker_parents_and_fall_back_when_the_design_is_unreadable(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000099"
-        design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
-            "fixture-repo", str(self.root), str(self.root / "design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("sdlc", "roles-unit"), design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", "design-address", design_roles.RoleNotOpened()),
-             design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleNotOpened())))
+        unit = unit_membership("sdlc", "roles-unit")
+        runner = showrunner_relationship("sdlc")
         mesh = str(design_roles.mesh_directory(design_id))
-        for holder, prefix in ((design_roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
-                               (design_roles.ShowrunnerHolder("sdlc"), "sdlc")):
-            design_roles._save(replace(design, holder=holder))  # pyright: ignore[reportPrivateUsage]
+        for parent, prefix in ((unit, "sdlc · roles"), (runner, "sdlc")):
+            designer = fixture_worker("design-address", parent.id)
+            reviewer = fixture_worker("review-address", parent.id)
+            design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
+                "fixture-repo", str(self.root), str(self.root / "design.md"), "design",
+                "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
+                (design_roles.RoleInstance("designer", "design-address", design_roles.RoleOpen(designer.current_session)),
+                 design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleOpen(reviewer.current_session))))
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             for held_role, name, job in (("designer", "design-address", "designer"),
                                          ("reviewer", "review-address", "design reviewer")):
-                with self.subTest(holder=holder, role=held_role):
+                with self.subTest(parent=parent, role=held_role):
                     shown = roster.mesh_shown_name(mesh, name, {"held_design_id": design_id, "held_role": held_role})
                     self.assertEqual(shown.render(), f"{prefix} · {job}")
                     self.assertEqual(shown.address, name)
@@ -1148,25 +1216,28 @@ class RosterTests(unittest.TestCase):
             "held_design_id": design_id, "held_role": "reviewer"}).render(), "review-address")
 
     def test_docless_row_keeps_repeated_mesh_title_reads_silent(self) -> None:
-        _ = fixture_member("showrunner", name="docless")
+        owner = fixture_member("showrunner", name="docless")
+        run = self.root / "unplaced-run"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": owner.name}))
         errors = io.StringIO()
         with redirect_stderr(errors):
             for _ in range(2):
                 self.assertEqual(roster.mesh_shown_name(
-                    str(self.root / "unplaced-run"), "unplaced-worker", {"role": "impl"}).render(),
+                    str(run), "unplaced-worker", {"role": "impl"}).render(),
                     "unplaced-worker")
         self.assertEqual(errors.getvalue(), "")
 
     def test_mesh_worker_slots_keep_full_launch_identity_in_roster_and_titles(self) -> None:
-        _ = (self.director_run / unit_runs.DIRECTOR_FILE).write_text("17e44ec4-3e24-5ae1-b10d-5cf30de9455b\n")
         self._write_mesh(self.director_run, {
             "alpha-render-a": {"thread_id": "render-thread", "status": "done", "role": "impl"},
             "alpha-physics-a": {"thread_id": "physics-thread", "status": "done", "role": "impl"},
             "arbitrary-address": {"thread_id": "explicit-thread", "status": "done", "role": "test", "slot": "test-b"},
         })
+        records = cast(dict[str, dict[str, object]], json.loads((self.director_run / "mesh_roster.json").read_text()))
         for slot in ("render-a", "physics-a"):
             _ = (self.director_run / f"impl_worker_{slot}.json").write_text(json.dumps({
-                "name": f"alpha-{slot}", "slot": slot}))
+                "staff_id": records[f"alpha-{slot}"]["staff_id"], "slot": slot}))
         entries = self._entries()
         for name, slot in (("alpha-render-a", "render-a"), ("alpha-physics-a", "physics-a"),
                            ("arbitrary-address", "test-b")):
@@ -1175,7 +1246,7 @@ class RosterTests(unittest.TestCase):
                 assert isinstance(entry.assignment, roster.WorkerAssignment)
                 self.assertEqual(entry.assignment.slot, slot)
                 self.assertEqual(roster.shown_name(entry).render(), f"alpha · unit-one · worker {slot}")
-                record: dict[str, object] = {"role": entry.assignment.role}
+                record: dict[str, object] = dict(records[name])
                 if name == "arbitrary-address":
                     record["slot"] = slot
                 title = roster.mesh_shown_name(str(self.director_run), name, record)
@@ -1184,18 +1255,18 @@ class RosterTests(unittest.TestCase):
 
 
     def test_named_launch_record_wins_over_another_workers_matching_suffix(self) -> None:
-        _ = (self.director_run / unit_runs.DIRECTOR_FILE).write_text("17e44ec4-3e24-5ae1-b10d-5cf30de9455b\n")
         self._write_mesh(self.director_run, {
             "arbitrary-impl": {"thread_id": "named-thread", "status": "running", "role": "test"}})
+        records = cast(dict[str, dict[str, object]], json.loads((self.director_run / "mesh_roster.json").read_text()))
         for slot, name in (("impl", "another-worker"), ("test", "arbitrary-impl")):
             _ = (self.director_run / f"impl_worker_{slot}.json").write_text(json.dumps({
-                "name": name, "slot": slot}))
+                "staff_id": records[name]["staff_id"] if name in records else fixture_runtime_id(name), "slot": slot}))
         entry = self._entries()["arbitrary-impl"]
         self.assertIsInstance(entry.assignment, roster.WorkerAssignment)
         assert isinstance(entry.assignment, roster.WorkerAssignment)
         self.assertEqual(entry.assignment.slot, "test")
         self.assertEqual(roster.shown_name(entry).render(), "alpha · unit-one · worker test")
-        title = roster.mesh_shown_name(str(self.director_run), "arbitrary-impl", {"role": "test"})
+        title = roster.mesh_shown_name(str(self.director_run), "arbitrary-impl", records["arbitrary-impl"])
         self.assertEqual(title.render(), "alpha · unit-one · worker test")
 
 
@@ -1338,11 +1409,11 @@ class RosterTests(unittest.TestCase):
             "production": "alpha", "unit": "unit-one",
             "working_dir": str(self.home / "projects" / "unit-one"),
         }))
-        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+        self._publish_roster(self.director_run / "mesh_roster.json", {
             "alpha-impl": {"thread_id": "7aa082fc-e724-5e46-8846-bd68e7eb3f46", "status": "running", "role": "impl",
                            "launcher_pid": os.getpid()},
             "alpha-fix": {"thread_id": "d6c57ffb-f619-567d-b06c-1a1f7791b8af", "status": "done", "role": "fix"},
-        }))
+        })
         _ = (self.director_run / "board.log").write_text("2026-10-29T12:00:00Z [test] handoff: role=impl fixture\n")
         before = self._entries()
         (self.sessions / "director.json").unlink()
@@ -1715,7 +1786,7 @@ class RosterTests(unittest.TestCase):
         entries = self._entries()
         self.assertEqual(entries["alpha-impl"].thread, roster.CodexThread("7aa082fc-e724-5e46-8846-bd68e7eb3f46"))
         self.assertEqual(entries["Codex window"].thread, roster.CodexThread("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"))
-        for name in ("runner", "claude-worker", "alpha-no-thread"):
+        for name in ("runner", "claude-worker"):
             self.assertEqual(entries[name].thread, roster.NoCodexThread())
         result, lines, errors = self._run_main("--json")
         self.assertEqual((result, errors), (0, []))
@@ -1724,7 +1795,7 @@ class RosterTests(unittest.TestCase):
         by_name = {cast(str, row["name"]): row for row in rows}
         self.assertEqual(by_name["alpha-impl"]["thread"], "7aa082fc-e724-5e46-8846-bd68e7eb3f46")
         self.assertEqual(by_name["Codex window"]["thread"], "eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539")
-        for name in ("runner", "claude-worker", "alpha-no-thread"):
+        for name in ("runner", "claude-worker"):
             self.assertIsNone(by_name[name]["thread"])
 
     def test_codex_worker_identity_marks_the_worker_and_not_its_inherited_director(self) -> None:
@@ -2118,16 +2189,21 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(agent_accounts, "workers_home", return_value=current))
         _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
             "port": 45678, "pid": os.getpid(), "codex_home": str(current),
+            "previous_servers": [{"port": 45677, "pid": os.getpid(), "codex_home": str(old)}],
         }))
-        _ = (self.director_run / "mesh_retired.json").write_text(json.dumps({"servers": [{
-            "port": 45677, "pid": os.getpid(), "codex_home": str(old),
-        }]}))
-        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+        self._publish_roster(self.director_run / "mesh_roster.json", {
             "old-impl": {"thread_id": "old-thread", "status": "running", "port": 45677, "launcher_pid": os.getpid(), "role": "impl"},
             "new-test": {"thread_id": "new-thread", "status": "running", "port": 45678, "launcher_pid": os.getpid(), "role": "test"},
             "between-turns": {"thread_id": "waiting-thread", "status": "done", "launcher_pid": os.getpid()},
             "missing-server": {"thread_id": "lost-thread", "status": "running", "port": 49999, "launcher_pid": os.getpid()},
-        }))
+        })
+        old_worker = staff.local_snapshot().by_current_session(fixture_runtime_id("old-thread"))
+        assert old_worker is not None
+        fixture_session(old_worker.current_session, staff.CodexBackend(old))
+        for label in ("new-thread", "waiting-thread", "lost-thread"):
+            worker = staff.local_snapshot().by_current_session(fixture_runtime_id(label))
+            assert worker is not None
+            fixture_session(worker.current_session, staff.CodexBackend(current))
         entries = self._entries()
         before_move = {name: entries[name] for name in ("old-impl", "new-test")}
         self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
@@ -2135,7 +2211,10 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["missing-server"].account, roster.AccountLabel("codex2"))
-        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({"port": 45678, "pid": os.getpid()}))
+        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
+            "port": 45678, "pid": os.getpid(),
+            "previous_servers": [{"port": 45677, "pid": os.getpid(), "codex_home": str(old)}],
+        }))
         entries = self._entries()
         self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
@@ -2149,7 +2228,7 @@ class RosterTests(unittest.TestCase):
                 assignment = entries[name].assignment
                 assert isinstance(assignment, roster.WorkerAssignment)
                 self.assertEqual(assignment.role, role)
-                self.assertEqual(entries[name].thread, roster.CodexThread(thread))
+                self.assertEqual(entries[name].thread, roster.CodexThread(fixture_runtime_id(thread)))
                 self.assertEqual(entries[name].reach, before_move[name].reach)
 
     def test_live_workers_keep_their_account_when_idle_stop_deletes_server_metadata(self) -> None:
@@ -2157,10 +2236,10 @@ class RosterTests(unittest.TestCase):
         _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
             "port": 45678, "pid": os.getpid(), "codex_home": str(home),
         }))
-        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+        self._publish_roster(self.director_run / "mesh_roster.json", {
             "idle-worker": {"thread_id": "idle-thread", "status": "done", "port": 45678},
             "legacy-worker": {"thread_id": "legacy-thread", "status": "done"},
-        }))
+        }, codex_home=home)
         with mock.patch.object(agent_accounts, "workers_home", return_value=home):
             before = self._entries()
             (self.director_run / "mesh_server.json").unlink()
@@ -2389,8 +2468,8 @@ class CodexHolderLabelsTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         unit = unit_membership("builds", "report-unit")
         self.director_id = unit.id
-        assert unit.parent is not None
-        self.runner_id = unit.parent
+        assert isinstance(unit.parent, staff.ReportsTo)
+        self.runner_id = unit.parent.id
         # Both registry records are live processes, with real start identities.
         # Only their declared session labels and run metadata come from fixture files.
         for pid, sid, name in ((os.getppid(), self.director_id, "report-director"),
@@ -2433,7 +2512,9 @@ class CodexHolderLabelsTests(unittest.TestCase):
 
     def mesh(self, run: Path, workers: dict[str, dict[str, object]]) -> None:
         run.mkdir(parents=True, exist_ok=True)
-        _ = (run / "mesh_roster.json").write_text(json.dumps(workers))
+        records = fixture_roster(cast(dict[str, object], workers), staff.StaffId(self.director_id),
+                                 self.root / "codex-home")
+        _ = (run / "mesh_roster.json").write_text(json.dumps(records))
 
     def test_codex_thread_labels_equal_full_roster_without_mocking_readers(self) -> None:
         full = roster.unit_labels(roster.roster(self.environment, roster.ThisMachine()).entries)
@@ -2460,12 +2541,12 @@ class CodexHolderLabelsTests(unittest.TestCase):
         self.assertEqual(labels, expected)
         self.assertLess(elapsed, 0.2, f"20-run label lookup took {elapsed:.3f} seconds")
 
-    def test_retired_and_redirected_workers_and_stale_runs_are_not_holders(self) -> None:
+    def test_ended_workers_and_stale_runs_are_not_holders(self) -> None:
         records: dict[str, dict[str, object]] = {
             "report-test2": {"thread_id": self.thread, "status": "done"},
             "ended": {"thread_id": "ended-thread", "status": "ended"},
-            "moved": {"thread_id": "moved-thread", "role_redirect": {"name": "elsewhere"}},
-            "moving": {"thread_id": "moving-thread", "transferring_role": {"name": "elsewhere"}},
+            "moved": {"thread_id": "moved-thread", "status": "ended"},
+            "moving": {"thread_id": "moving-thread", "status": "ended"},
             "held": {"thread_id": "held-thread", "held_design_id": "fixture-design"},
         }
         self.mesh(self.runs / "run-00", records)
@@ -2570,16 +2651,16 @@ class UnitLabelsTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
         unit = unit_membership("cargo-liner-style", "cargo-liner-style-types-unit")
-        assert unit.parent is not None
+        assert isinstance(unit.parent, staff.ReportsTo)
         worker = fixture_worker("types-review", unit.id)
         doc = root / "production.md"
-        _ = staff.set_doc(unit.parent, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(unit.parent.id, staff.LiveDoc("natedev", doc))
         _ = doc.write_text("# cargo-liner\n")
         records: list[sessions.SessionRecord] = [
             {"pid": pid, "sessionId": sid, "name": name, "messagingSocketPath": f"/fixture/{sid}.sock",
              "updatedAt": 1, "tmux": "", "formerNames": []}
             for pid, sid, name in (
-                (101, unit.parent, "cargo-liner"), (102, unit.id, "cargo-liner-style-types"),
+                (101, unit.parent.id, "cargo-liner"), (102, unit.id, "cargo-liner-style-types"),
                 (103, "free-id", "scratch"), (104, worker.id, "types-review"),
             )
         ]
@@ -2597,14 +2678,14 @@ class UnitLabelsTests(unittest.TestCase):
         for record in records:
             _ = (registry / f"{record['pid']}.json").write_text(json.dumps(record))
         registered: list[showrunners.Showrunner] = [{
-            "session": "cargo-liner", "socket": f"/fixture/{unit.parent}.sock", "slug": "cargo-liner-style",
+            "session": "cargo-liner", "socket": f"/fixture/{unit.parent.id}.sock", "slug": "cargo-liner-style",
             "zone": "America/New_York", "doc": str(doc),
         }]
         environment = {"HERDR_PROC": str(root / "proc"), "NOTIFIER_SESSIONS_DIR": str(root / "sessions")}
         notifier = root / "notifier"
         (notifier / "showrunner-cargo-liner-style").mkdir(parents=True)
         _ = (notifier / "showrunner-cargo-liner-style/conf").write_text(
-            f"TARGET=session:{unit.parent}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+            f"TARGET=session:{unit.parent.id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
         with mock.patch.object(unit_labels, "newest_sessions", return_value=records), \
              mock.patch.object(sessions, "sessions_dir", return_value=registry), \
              mock.patch.object(sessions, "running_session", return_value=True), \
@@ -2616,12 +2697,12 @@ class UnitLabelsTests(unittest.TestCase):
              mock.patch.object(process_table, "snapshot", side_effect=AssertionError("no process table")) as processes, \
              mock.patch.object(account, "home_account_state", side_effect=AssertionError("no accounts")) as accounts, \
              mock.patch.object(codex_daemon, "loaded_sessions", side_effect=AssertionError("no daemon")) as daemon:
-            labels = roster.unit_labels_for([unit.id, unit.parent, "free-id", worker.id, "missing-id"],
+            labels = roster.unit_labels_for([unit.id, unit.parent.id, "free-id", worker.id, "missing-id"],
                                             environment)
         self.assertEqual(labels, {
             unit.id: roster.UnitLabels("cargo-liner-style-types", "cargo-liner-style", "cargo-liner-style-types"),
             worker.id: roster.UnitLabels("types-review", "cargo-liner-style", "cargo-liner-style-types"),
-            unit.parent: roster.UnitLabels("cargo-liner", "cargo-liner-style", "—"),
+            unit.parent.id: roster.UnitLabels("cargo-liner", "cargo-liner-style", "—"),
             "free-id": roster.UnitLabels("scratch", "—", "—"),
         })
         meshes.assert_not_called()

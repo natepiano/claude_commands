@@ -1536,7 +1536,7 @@ def staff_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
         live = {item["sessionId"] for item in unit_labels.newest_sessions()}
         running = running_phase_worktrees(unit_lookup.runs_dir(), problems)
         for row in staff.active(record, "unit"):
-            parent = record.by_id(row.parent) if row.parent is not None else None
+            parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
             if parent is None:
                 problems.append(log_records.SourceProblem(row.name, "the staff parent is unavailable", event_source=log_records.SourceNotApplicable.STATE))
                 continue

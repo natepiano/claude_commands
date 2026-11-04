@@ -2,19 +2,76 @@
 from __future__ import annotations
 
 import unittest
+import json
 from pathlib import Path
 from typing import final
 from unittest import mock
 
 from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production import staff, unit_config
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.rename_rerun_test_support import final_files
 from scripts.production.rename_unit_test_support import UnitRenameFixture
 
 
 @final
 class UnitRenameTests(UnitRenameFixture):
+    def test_same_name_repairs_displays_with_an_unfilled_worktree(self) -> None:
+        parent = next(row for row in staff.find(kind="showrunner") if row.name == "demo")
+        row = fixture_member("unit", name="unfilled", parent=parent.id)
+        displays = RenameDisplays(row)
+        with displays.installed():
+            result = self.rename("apply", row.name, row.name)
+        self.assert_ok(result)
+        self.assertEqual((displays.pane, displays.tab), (row.name,) * 2)
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_same_name_repairs_the_current_session_name_without_moving(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("unit-session-after-clear")))
+        record = sessions.SessionRecord(sessionId=row.current_session, name="previous", pid=998041,
+            procStart="probe-generation", updatedAt=1, formerNames=[], tmux="", entrypoint="cli", messagingSocketPath="")
+        path = self.root / "state/sessions/998041.json"
+        self.write(path, json.dumps(record))
+        displays = RenameDisplays(row)
+        displays.pane = displays.tab = row.name
+        before = final_files(self.root)
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+            self.assert_ok(self.rename("apply", row.name, row.name))
+            self.assertEqual(json.loads(path.read_text())["name"], row.name)
+            settled = path.read_bytes(), path.stat().st_mtime_ns
+            rerun = self.rename("apply", row.name, row.name)
+        self.assert_ok(rerun)
+        self.assertEqual(rerun.stdout.strip(), "unchanged")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), settled)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(final_files(self.root), before)
+
+    def test_same_name_repairs_each_display_without_moving_the_worktree(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("unit-after-clear")))
+        for field in ("pane", "tab"):
+            with self.subTest(field=field):
+                displays = RenameDisplays(row)
+                displays.pane = displays.tab = row.name
+                setattr(displays, field, "previous")
+                before = final_files(self.root)
+                with displays.installed():
+                    result = self.rename("apply", row.name, row.name)
+                    self.assert_ok(result)
+                    self.assertNotIn("unchanged", result.stdout)
+                    self.assertEqual((displays.pane, displays.tab), (row.name, row.name))
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(final_files(self.root), before)
+                    commands = list(displays.commands)
+                    rerun = self.rename("apply", row.name, row.name)
+                self.assert_ok(rerun)
+                self.assertEqual(rerun.stdout.strip(), "unchanged")
+                self.assertEqual(displays.commands, commands)
+                self.assertEqual(final_files(self.root), before)
+
     def test_rename_continues_when_the_removed_worktree_is_absent(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         source = self.rust / "claude-demo-alpha"

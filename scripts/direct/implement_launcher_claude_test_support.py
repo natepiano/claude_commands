@@ -62,12 +62,12 @@ class ClaudeLauncherFixture(support.ImplementLauncherFixture):
         original = support.STUB_CLAUDE.replace(
             "    print(f'backgrounded",
             "    for status in ('busy', 'idle'):\n"
-            + "        (root / f'listing-{status}.json').write_text(json.dumps([{'id': 'abc12345', 'name': name, 'status': status}]))\n"
+            + "        (root / f'listing-{status}.json').write_text(json.dumps([{'id': 'abc12345', 'sessionId': 'abc12345-' + str(uuid.uuid5(uuid.NAMESPACE_URL, name))[9:], 'name': name, 'status': status}]))\n"
             + "    print(f'backgrounded",
         )
         _ = (builder.root / "claude-original.py").write_text(original)
         for status in ("busy", "idle", "gone"):
-            rows = [] if status == "gone" else [{"id": "abc12345", "name": "fixture-impl", "status": status}]
+            rows = [] if status == "gone" else [{"id": "abc12345", "sessionId": "abc12345-2222-4333-8444-555555555555", "name": "fixture-impl", "status": status}]
             _ = (builder.root / f"listing-{status}.json").write_text(json.dumps(rows))
         agent_bg = builder.root / "scripts/agents/agent_bg.sh"
         # Both fake transitions happen before their CLI returns. Consume their

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.production import staff
+from scripts.production.staff_test_support import transcript_fixture, switch_backend_stub, isolated_staff_file
+from scripts.lib.test_models_registry import write_registry
+
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -21,12 +25,31 @@ from scripts.direct.wait_for_test_state import wait_for_pid
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    def test_named_claude_slot_uses_codex_start_after_family_selection(self) -> None:
+        run = self.start_phase("switch-named-slot")
+        _ = self.claude_worker(run)
+        _ = write_registry(self.root / ".claude/config/models.conf", base_text=support.MODELS_REGISTRY)
+        old = self.recorded_worker(run)
+        with isolated_staff_file(self.root / "staff.json", {"CLAUDE_CONFIG_DIR": str(self.root / ".claude")}):
+            _ = transcript_fixture(old, staff.ClaudeBackend())
+        mesh = self.root / "scripts/agents/codex_mesh.py"
+        _ = mesh.write_text(mesh.read_text().replace(
+            "worker = fixture_worker(name, staff.native_id(os.environ['CODEX_THREAD_ID']), backend=staff.CodexBackend(pathlib.Path.home() / '.codex'))",
+            f"exec({switch_backend_stub()!r})\n        worker = staff.by_id(row.id)"))
+        result = self.mesh_launch(run, to=old.name)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = self.recorded_worker(run)
+        self.assertNotEqual(current.current_session, old.current_session)
+        self.assertEqual(current.to_json() | {"current_session": old.current_session}, old.to_json())
+        record = cast(dict[str, object], json.loads((run / "impl_worker_impl.json").read_text()))
+        self.assertEqual((record["staff_id"], record["slot"]), (old.id, "impl"))
+
     def test_named_phase_reaches_worker_verification_environment(self) -> None:
+        stub = self.root / "scripts/agents/codex_mesh.py"
+        with stub.open("a") as output:
+            _ = output.write("\n(session / 'wait-context').write_text(os.environ['UNIT_RUN_DIR'] + '|' + os.environ['UNIT_TEAM_ROLE'])\n")
         session = self.start_phase("phase-environment")
         _ = self.prompt_file.write_text("Phase 3 — Retry handling\nWrite the retry path.\n")
-        stub = self.root / "scripts" / "agents" / "agent_exec.sh"
-        with stub.open("a") as output:
-            _ = output.write('printf "%s|%s" "$UNIT_RUN_DIR" "$UNIT_TEAM_ROLE" > "$UNIT_RUN_DIR/wait-context"\n')
         result = self.checked_launch(session, "--phase", "3")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((session / "wait-context").read_text(), f"{session}|impl")
@@ -52,10 +75,9 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertIn("follow", events[events.index("claim"):], events)
 
     def test_a_dispatch_names_its_director_in_the_run_folder(self) -> None:
-        # The production tree reads the director here: its one marker names only one of the runs
-        # it has open side by side, and a run opened by hand has none.
+        # Staff records the director for each worker.
         session_dir = self.start_phase("director")
-        environment = self.environment()
+        environment = self.mesh_environment()
         environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
         result = subprocess.run(
             ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
@@ -63,7 +85,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
             check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((session_dir / "director").read_text(encoding="utf-8"), "sid-director\n")
+        self.assertEqual(self.recorded_worker(session_dir).parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
 
     def test_a_dispatch_with_no_pass_kind_is_refused(self) -> None:
         # What the incident actually looked like on the wire: a worker launched
@@ -231,11 +253,11 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
             "#!/usr/bin/env bash\nprintf 'heartbeat watcher output\\n'\n: > \"$TEST_HEARTBEAT_READY\"\n",
             encoding="utf-8",
         )
-        agent = self.root / "scripts" / "agents" / "agent_exec.sh"
+        agent = self.root / "scripts/agents/codex_mesh.py"
         _ = agent.write_text(
-            agent.read_text(encoding="utf-8").replace(
-                "set -euo pipefail", 'set -euo pipefail\npython3 "$TEST_WAIT_HELPER" "$TEST_HEARTBEAT_READY"'
-            ), encoding="utf-8",
+            agent.read_text(encoding="utf-8")
+            + "\nimport subprocess\nsubprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['TEST_HEARTBEAT_READY']], check=True)\n",
+            encoding="utf-8",
         )
         session_dir = self.start_phase("heartbeat-visible")
 
@@ -309,7 +331,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                         self.assertEqual(identity.get("turn_id"), "turn-2")
                         self.assertEqual(identity.get("pid"), process.pid)
                     else:
-                        self.assertTrue(identity.get("worker_id"), identity)
+                        self.assertEqual(identity.get("staff_id"), self.recorded_worker(session).id)
                 finally:
                     release.touch()
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
