@@ -132,6 +132,9 @@
 #                                          the result replaces the record
 #   … --target <name>                      pin test, check, or doc to a configured SSH target;
 #                                          keep admission and version checks; never run locally
+#   verify.sh test <package> --mac "<why>" [--env NAME …] [--fetch <folder>]
+#                                          Mac only; wait when busy, never fall back;
+#                                          forward named variables and fetch one ignored folder
 #   verify.sh test <package> --local "<why>"   run on natedev; only for a test that cannot pass on macOS.
 #                                          Before CI either machine answers a test,
 #                                          merge gates included; CI is the protection
@@ -167,10 +170,17 @@
 # on top. Shell aliases, validate_ci and release checks use the lint CLI in that
 # directory instead of this script.
 #
-# Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
+# Exit codes: 2 = usage error, missing tooling or a Mac-only refusal; 3 = sandbox failure, re-run
 # the same command unsandboxed; anything else is the underlying tool status.
 
 set -euo pipefail
+# Save exported values before script variables replace caller names.
+# The --env rule refuses the VERIFY_ prefix.
+VERIFY_CALL_ENVIRONMENT=()
+while IFS= read -r VERIFY_ENV_NAME; do
+    case "$VERIFY_ENV_NAME" in VERIFY_*) continue ;; esac
+    VERIFY_CALL_ENVIRONMENT+=("$VERIFY_ENV_NAME=${!VERIFY_ENV_NAME}")
+done < <(compgen -e)
 # Read-only queries run before environment setup and build admission.
 if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final-pass ) ]]; then
     if [[ "$1" == --session-dir ]]; then shift 2; fi
@@ -1008,11 +1018,16 @@ if [[ "$CMD" == example-test ]]; then
     exit 2
 fi
 
-# --no-cache and --local may sit anywhere after the subcommand; nothing below
-# sees them.
+# Remove routing flags before constructing command words and records.
 NO_CACHE=0
 LOCAL_ONLY=0
 LOCAL_REASON=""
+MAC_ONLY=0
+MAC_REASON=""
+MAC_ENV_NAMES=()
+VERIFY_MAC_ENVIRONMENT=()
+MAC_FETCH=""
+MAC_FETCH_GIVEN=0
 PINNED_TARGET=""
 ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -1028,6 +1043,35 @@ while [[ $# -gt 0 ]]; do
         --no-cache)
             NO_CACHE=1
             shift
+            ;;
+        --mac)
+            if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
+                echo 'verify.sh: --mac needs a reason: --mac "<why this test must run on macOS>".' >&2
+                exit 2
+            fi
+            MAC_ONLY=1 MAC_REASON=$2
+            shift 2
+            ;;
+        --env)
+            name=${2:-}
+            if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                printf 'verify.sh: --env %s: not a variable name.\n' "$name" >&2
+                exit 2
+            fi
+            MAC_ENV_NAMES+=("$name")
+            shift 2
+            ;;
+        --fetch)
+            if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then
+                echo 'verify.sh: --fetch is given twice; name one folder.' >&2
+                exit 2
+            fi
+            if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+                echo 'verify.sh: --fetch needs a folder relative to the repository root, such as target/shots.' >&2
+                exit 2
+            fi
+            MAC_FETCH_GIVEN=1 MAC_FETCH=${2%/}
+            shift 2
             ;;
         --local)
             if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
@@ -1052,6 +1096,48 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 set -- "${ARGS[@]}"
+if [[ "$MAC_ONLY" == 1 && "$CMD" != test ]]; then
+    echo 'verify.sh: --mac applies only to test.' >&2
+    exit 2
+fi
+if [[ "$MAC_ONLY" == 1 && "$LOCAL_ONLY" == 1 ]]; then
+    echo 'verify.sh: --mac and --local cannot be used together.' >&2
+    exit 2
+fi
+if [[ "$MAC_ONLY" == 0 && ( ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ) ]]; then
+    echo 'verify.sh: --env and --fetch need --mac "<why>".' >&2
+    exit 2
+fi
+for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do
+    case "$name" in
+        PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
+            printf 'verify.sh: --env %s: the runner sets it, or it changes what Cargo builds; it is not forwarded.\n' "$name" >&2
+            exit 2 ;;
+    esac
+    VERIFY_ENV_FOUND=0
+    for VERIFY_ENV_ENTRY in ${VERIFY_CALL_ENVIRONMENT[@]+"${VERIFY_CALL_ENVIRONMENT[@]}"}; do
+        if [[ "${VERIFY_ENV_ENTRY%%=*}" == "$name" ]]; then
+            VERIFY_MAC_ENVIRONMENT+=("$VERIFY_ENV_ENTRY")
+            VERIFY_ENV_FOUND=1
+            break
+        fi
+    done
+    if [[ "$VERIFY_ENV_FOUND" == 0 ]]; then
+        printf 'verify.sh: --env %s: not set here; set it on the call (NAME=value verify.sh …).\n' "$name" >&2
+        exit 2
+    fi
+done
+if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then
+    if [[ ! "$MAC_FETCH" =~ ^[A-Za-z0-9._/-]+$ || "$MAC_FETCH" == /* || "$MAC_FETCH" == -* \
+          || "/$MAC_FETCH/" == *//* || "/$MAC_FETCH/" == */./* || "/$MAC_FETCH/" == */../* ]]; then
+        printf 'verify.sh: --fetch %s: not a plain relative folder.\n' "$MAC_FETCH" >&2
+        exit 2
+    fi
+    if ! git -C "$(git rev-parse --show-toplevel)" check-ignore -q -- "$MAC_FETCH/"; then
+        printf 'verify.sh: --fetch %s: git does not ignore it; name a folder the tests write, such as one under target/.\n' "$MAC_FETCH" >&2
+        exit 2
+    fi
+fi
 if [[ -n "$PINNED_TARGET" ]]; then
     if [[ "$LOCAL_ONLY" == 1 || ! "$CMD" =~ ^(test|check|doc)$ ]]; then
         echo 'verify.sh: --target supports test, check, and doc without --local.' >&2
@@ -1181,7 +1267,9 @@ CACHE_DIR=""
 if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
     CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
 fi
+if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ]]; then CACHE_DIR=""; fi
 RUN_LOG=""
+RUN_LOG_PIDS=()
 VERDICT_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
 RUN_STARTED=0
@@ -1544,7 +1632,7 @@ try_mac_test() {
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
     local runner_status result_text="" result_word="" result_reason="" mac_owns_watch=0
-    local result_seconds="" result_holder="" mac_words=0 line
+    local result_seconds="" result_holder="" result_fetch=failed mac_words=0 line name
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
     runner_args+=(--target "$selected_target")
@@ -1562,6 +1650,8 @@ try_mac_test() {
     if [[ "${2:-}" == busy || "${2:-}" == blocked ]]; then
         runner_args+=(--last-decline "$2")
     fi
+    for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do runner_args+=(--env "$name"); done
+    if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then runner_args+=(--fetch "$MAC_FETCH"); fi
     MAC_RESULT_FILE="$(mktemp)"
     runner_args+=(--result "$MAC_RESULT_FILE")
     if [[ "$FILTER_RUN" -eq 1 ]]; then
@@ -1587,7 +1677,29 @@ try_mac_test() {
         env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" state --call-id "$BUILDLOG_CALL_ID" \
             --target "$selected_target" on_ssh || exit 2
     fi
-    "$PY" "$MAC_RUNNER" "${runner_args[@]}" > >(tee "$MAC_LOG_FILE") 2> >(tee -a "$MAC_LOG_FILE" >&2) &
+    # Apply forwarded values in Python. Bash can make these names readonly or arrays.
+    # The pipe preserves bytes and keeps values outside argv.
+    local VERIFY_MAC_ENV_PY='
+import os
+import runpy
+import sys
+
+with open(3, "rb") as handoff:
+    for entry in handoff.read().split(b"\0"):
+        if entry:
+            name, value = entry.split(b"=", 1)
+            os.environb[name] = value
+sys.argv = sys.argv[1:]
+sys.path[0] = os.path.dirname(os.path.abspath(sys.argv[0]))
+runpy.run_path(sys.argv[0], run_name="__main__")
+'
+    (
+        if [[ -z ${VERIFY_MAC_ENVIRONMENT[0]+set} ]]; then
+            exec "$PY" "$MAC_RUNNER" "${runner_args[@]}"
+        fi
+        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$MAC_RUNNER" "${runner_args[@]}" \
+            3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
+    ) > >(tee "$MAC_LOG_FILE") 2> >(tee -a "$MAC_LOG_FILE" >&2) &
     MAC_RUNNER_PID=$!
     if wait "$MAC_RUNNER_PID"; then
         runner_status=0
@@ -1617,6 +1729,7 @@ try_mac_test() {
                 reason=*) result_reason="${line#reason=}" ;;
                 seconds=*) result_seconds="${line#seconds=}" ;;
                 holder=*) result_holder="${line#holder=}" ;;
+                fetch=*) result_fetch="${line#fetch=}" ;;
             esac
         done <<< "$result_text"
     fi
@@ -1673,6 +1786,14 @@ try_mac_test() {
             exit "$runner_status"
             ;;
         passed)
+            if [[ "$MAC_FETCH_GIVEN" == 1 && "$result_fetch" != fetched ]]; then
+                if [[ "$FILTER_RUN" == 1 ]]; then BUILDLOG_MAC=passed_filter; else BUILDLOG_MAC=passed_full; fi
+                printf 'verify.sh: FAIL: the tests passed on the Mac, but --fetch %s brought nothing back (%s).\n' "$MAC_FETCH" "$result_fetch" >&2
+                rm -f "$MAC_LOG_FILE"
+                MAC_LOG_FILE=""
+                note_event failed "$SECONDS" 0 "" 0 2
+                exit 2
+            fi
             MAC_PASSED=1
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then
                 rm -f "$MAC_LOG_FILE"
@@ -1794,6 +1915,22 @@ initialize_step_record() {
     fi
     export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
     export BUILDLOG_CALL_ID
+    if [[ "$MAC_ONLY" == 1 ]]; then
+        printf 'verify.sh: Mac only (%s): route this test to the Mac.\n' "$MAC_REASON" >&2
+        local mac_eligible=0 refusal=state
+        while IFS=$'\t' read -r name eligibility reason settings; do
+            [[ "$settings" != - && "$(target_platform "$name")" == macos ]] || continue
+            if [[ "$eligibility" == eligible || "$reason" == busy ]]; then
+                mac_eligible=1
+            else
+                refusal=$reason
+            fi
+        done <<< "$STEP_TARGET_TABLE"
+        if [[ "$mac_eligible" == 0 ]]; then
+            BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=$refusal BUILDLOG_MAC_S=0
+            mac_only_refuse "$refusal"
+        fi
+    fi
     if step_can_retry; then
         while IFS=$'\t' read -r name eligibility reason settings; do
             if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON )
@@ -2015,6 +2152,7 @@ try_reserved_target() {
     fi
     SSH_RETRY_AFTER_SETTINGS=$settings
     try_mac_test "$settings" "$MAC_LEAVE_REASON" || return $?
+    if [[ "$MAC_PASSED" != 1 ]]; then check_mac_only_result; fi
     remember_mac_retry "$settings" || true
 }
 
@@ -2038,13 +2176,44 @@ mac_retry_hook() {
     fi
 }
 
+mac_only_refuse() {
+    local reason=$1 text
+    case "$reason" in
+        blocked) text="the Mac is blocked (/build:status names the holder and when it lifts)" ;;
+        unreachable) text="the Mac cannot be reached (/build:status --probe)" ;;
+        backoff) text="the Mac was unreachable a short time ago (retry backoff)" ;;
+        disk) text="the Mac is below its free-space floor" ;;
+        off) text="Mac offload is off" ;;
+        repo) text="this repository has no Mac setting" ;;
+        linux_only) text="$PKG is Linux only on the Mac" ;;
+        state) text="the Mac claim state cannot be read" ;;
+        copy) text="the tree copy to the Mac failed" ;;
+        no_tests) text="no test matched on the Mac" ;;
+        lost) text="the link to the Mac dropped during the run" ;;
+        runner) text="the Mac runner gave no usable result" ;;
+        *) text=$reason ;;
+    esac
+    export BUILDLOG_TARGET=""
+    printf 'verify.sh: test --mac refused: %s; nothing ran on natedev.\n' "$text" >&2
+    note_event failed "$SECONDS" 0 "" 0 2
+    exit 2
+}
+
+# Only a busy claim can wait on a Mac-only call; every other answer ends it.
+check_mac_only_result() {
+    [[ "$MAC_ONLY" == 1 ]] || return 0
+    if [[ "$BUILDLOG_MAC:$BUILDLOG_MAC_REASON" == declined:busy ]]; then return 0; fi
+    if [[ "$BUILDLOG_MAC" == lost ]]; then mac_only_refuse lost; fi
+    mac_only_refuse "${BUILDLOG_MAC_REASON:-runner}"
+}
+
 route_test() {
     local name eligibility reason settings admission remote_candidates=0 reservation_status
     local announced_reason="" retry=0 retry_ready
     while IFS=$'\t' read -r name eligibility reason settings; do
         if [[ "$eligibility" == excluded && "$settings" != - && "$(target_platform "$name")" == macos ]]; then
             BUILDLOG_MAC=declined
-            if [[ "$LOCAL_ONLY" == 0 ]]; then
+            if [[ "$LOCAL_ONLY" == 0 && "$MAC_ONLY" == 0 ]]; then
                 BUILDLOG_MAC_REASON=$reason
                 export BUILDLOG_LOCAL_REASON="$reason"
             fi
@@ -2058,7 +2227,7 @@ route_test() {
             STEP_TARGET_TABLE=${pinned_answer#*$'\n'}
             step_state waiting_ssh
         fi
-        if [[ "$retry" == 1 && "$STEP_RUNS_ON" != mac_allowed && -z "$PINNED_TARGET" ]]; then
+        if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$STEP_RUNS_ON" != mac_allowed && -z "$PINNED_TARGET" ]]; then
             admission=0
             check_routing_hold || admission=$?
             case "$admission" in
@@ -2069,6 +2238,9 @@ route_test() {
         fi
         remote_candidates=0
         while IFS=$'\t' read -r name eligibility reason settings; do
+            if [[ "$MAC_ONLY" == 1 ]]; then
+                [[ "$settings" != - && "$(target_platform "$name")" == macos ]] || continue
+            fi
             if [[ "$settings" == - ]]; then
                 [[ "$retry" == 0 && "$eligibility" == eligible && "$STEP_FORCE_MAC" == 0 ]] || continue
                 admission=0
@@ -2088,7 +2260,7 @@ route_test() {
             [[ -f "$MAC_RUNNER" ]] || continue
             if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
             remote_candidates=1
-            if [[ "$retry" == 1 && "$STEP_RUNS_ON" == mac_allowed ]]; then
+            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$STEP_RUNS_ON" == mac_allowed ]]; then
                 retry_ready=0
                 eval "$(mac_retry_hook "$settings" "$MAC_RETRY_AFTER" reserve)" >/dev/null 2>&1 || retry_ready=$?
                 if [[ "$retry_ready" != 0 ]]; then
@@ -2108,10 +2280,10 @@ route_test() {
                 echo "verify.sh: target $PINNED_TARGET refused: admission changed." >&2
                 return 2
             fi
-            if [[ "$retry" == 1 && "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ]]; then
+            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ]]; then
                 continue
             fi
-            if [[ "$reservation_status" == 0 || ( "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ) ]]; then
+            if [[ "$reservation_status" == 0 || "$MAC_ONLY" == 1 || ( "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ) ]]; then
                 if [[ "$retry" == 1 ]]; then collect_routing_wait; fi
                 MAC_LEAVE_SETTINGS=$settings
                 try_reserved_target || return $?
@@ -2138,14 +2310,21 @@ route_test() {
             retry=1
             continue
         fi
-        admission=0
-        check_routing_hold || admission=$?
-        case "$admission" in
-            0) collect_routing_wait; return 0 ;;
-            10) ;;
-            *) return "$admission" ;;
-        esac
-        if [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
+        if [[ "$MAC_ONLY" == 0 ]]; then
+            admission=0
+            check_routing_hold || admission=$?
+            case "$admission" in
+                0) collect_routing_wait; return 0 ;;
+                10) ;;
+                *) return "$admission" ;;
+            esac
+        fi
+        if [[ "$MAC_ONLY" == 1 ]]; then
+            if [[ -z "$announced_reason" ]]; then
+                echo 'verify.sh: waiting for the Mac (busy); natedev runs nothing for this call.' >&2
+                announced_reason=busy
+            fi
+        elif [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
             if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
                 echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
                 announced_reason=$BUILDLOG_MAC_REASON
@@ -2154,11 +2333,15 @@ route_test() {
             echo 'verify.sh: waiting for eligible SSH capacity or the local hold release.' >&2
             announced_reason=ssh
         fi
-        phase_wait_start hold "build hold"
+        if [[ "$MAC_ONLY" == 1 ]]; then phase_wait_start hold "Mac busy"; else phase_wait_start hold "build hold"; fi
         if [[ -z "$ROUTING_WAIT_STARTED" ]]; then
             ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
         fi
-        "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
+        if [[ "$MAC_ONLY" == 1 ]]; then
+            sleep "${BUILD_TARGETS_POLL_S:-15}" &
+        else
+            "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
+        fi
         HOLD_WAITER_PID=$!
         admission=0
         wait "$HOLD_WAITER_PID" || admission=$?
@@ -2306,8 +2489,10 @@ cache_lookup() {
     LOOKUP_KEY="$(tree_key)"
     [[ -n "${LOOKUP_KEY}" && "${NO_CACHE}" -eq 0 ]] || return 1
     record="${CACHE_DIR}/${LOOKUP_KEY}"
-    # --local asks for Linux: a pass the Mac ran does not answer it.
-    if [[ -f "${record}.pass" && ! ( "${LOCAL_ONLY}" -eq 1 && "$(sed -n 's/^host=//p' "${record}.pass")" == mac ) ]]; then
+    # --local needs a natedev pass; --mac needs a Mac pass.
+    if [[ -f "${record}.pass" \
+          && ! ( "$LOCAL_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" == mac ) \
+          && ! ( "$MAC_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" != mac ) ]]; then
         record+=.pass outcome=reused word=PASS
     elif [[ -f "${record}.fail" ]]; then
         record+=.fail outcome=replayed word=FAIL
@@ -2472,6 +2657,9 @@ hold_interrupted() {
     local signal_name=$1 code=$2
     trap - INT TERM HUP
     if [[ -n "$HOLD_WAITER_PID" ]]; then
+        # A background Bash sleep inherits ignored INT. End that waiter with
+        # TERM for every caller signal; keep the caller's status in the record.
+        if [[ "$MAC_ONLY" == 1 ]]; then signal_name=TERM; fi
         kill -s "$signal_name" "$HOLD_WAITER_PID" 2>/dev/null || true
         wait "$HOLD_WAITER_PID" 2>/dev/null || true
     fi
@@ -2489,6 +2677,10 @@ fi
 if [[ "$CMD" == test ]]; then
     compose_nextest_args
     route_test || exit $?
+    if [[ "$MAC_ONLY" == 1 ]]; then
+        BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=runner
+        mac_only_refuse runner
+    fi
 fi
 while [[ -z "$PINNED_TARGET" ]] && ! build_hold_nothing_held; do
     step_state waiting_hold
@@ -3059,13 +3251,38 @@ if [[ "$CMD" == test ]]; then
     # The common path calculates once; a later hold refreshes after its wait.
     refresh_test_build_inputs
 fi
+run_log_tee() {
+    # Keep readers alive while verify_interrupted stops the step and records its result.
+    # An early reader exit can cause SIGPIPE during cleanup.
+    trap '' INT TERM HUP
+    exec tee -i -a "$RUN_LOG"
+}
+
+start_run_log() {
+    exec > >(run_log_tee)
+    RUN_LOG_PIDS+=("$!")
+    exec 2> >(run_log_tee >&2)
+    RUN_LOG_PIDS+=("$!")
+}
+
+stop_interrupted_run_log() {
+    # Stop blocked readers after cleanup. They can ignore EOF while their output pipe is full.
+    [[ ${#RUN_LOG_PIDS[@]} -gt 0 ]] || return 0
+    set +x
+    exec >/dev/null 2>&1
+    local pid
+    for pid in "${RUN_LOG_PIDS[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+    for pid in "${RUN_LOG_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    RUN_LOG_PIDS=()
+}
+
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
     if [[ "$CMD" != test ]]; then VERDICT_KEY="$(tree_key)"; fi
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
-    exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
+    start_run_log
 fi
 
 ACTIVITY_ACTIVE=0
@@ -3149,6 +3366,7 @@ verify_interrupted() {
     fi
     verify_cleanup interrupted
     final_pass_finish "$EXIT_STATUS"
+    stop_interrupted_run_log
     exit "$EXIT_STATUS"
 }
 trap 'verify_interrupted 2' INT
