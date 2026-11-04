@@ -86,7 +86,7 @@ class MomentTests(unittest.TestCase):
         # These cases exercise the indexed Hana predicate, including each
         # evidence column in isolation. The index derives these three columns
         # from other source fields, so bind their fixture values after indexing.
-        with closing(sqlite3.connect(self.fixture.root / "index.sqlite")) as fixture_index:
+        with closing(sqlite3.connect(index.index_path_in(self.fixture.root))) as fixture_index:
             with fixture_index:
                 for record in records:
                     if record.get("kind") == "step":
