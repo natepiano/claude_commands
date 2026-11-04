@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 from contextlib import closing
 import importlib
@@ -2688,6 +2689,9 @@ def reservation_lifetime(row: Reservation, owner_live: bool) -> PopulatedStepSco
                     return PopulatedStepScope(scope)
             except FileNotFoundError:
                 pass
+            except OSError as error:
+                if error.errno != errno.ENODEV:
+                    raise
     return LiveOwnerProcess() if owner_live else EndedStep()
 
 

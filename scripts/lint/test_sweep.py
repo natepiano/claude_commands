@@ -710,7 +710,7 @@ class TargetDirTests(SweepCase):
         output = io.StringIO()
         config = target.root.parent / "lint.conf"
         _ = write_config_fixture(config)
-        environ = {sweep.BUDGET_ENV: "0", "CONF_DIR": str(config.parent)}
+        environ = {**config_environment(config.parent), sweep.BUDGET_ENV: "0"}
         with mock.patch.dict(os.environ, environ), redirect_stdout(output):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
         self.assertEqual(status, 0)
