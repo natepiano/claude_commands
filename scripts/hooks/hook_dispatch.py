@@ -108,7 +108,6 @@ POST_TOOL_USE = (
     HookSpec("post-tool-use-sendmessage-miss.py", "SendMessage"),
 )
 STOP = (
-    HookSpec("stop-direct-continue.py", None),
     HookSpec("stop-conversation-pause.py", None),
     HookSpec("stop-assistant-prose-banned-words.py", None),
     HookSpec("herdr_tab_title.py", None),

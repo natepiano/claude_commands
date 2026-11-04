@@ -1471,8 +1471,16 @@ def merge_checkpoint(args: GateArguments) -> int:
         if merged != baseline:
             write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
                               RecordedPush(baseline, merged, checkpoint))
-        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
-                            source="checkpoint", full=args.full)
+        previous_unit = os.environ.get(memory_admit.BUILDLOG_UNIT)
+        os.environ[memory_admit.BUILDLOG_UNIT] = args.unit
+        try:
+            suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
+                                source="checkpoint", full=args.full)
+        finally:
+            if previous_unit is None:
+                _ = os.environ.pop(memory_admit.BUILDLOG_UNIT, None)
+            else:
+                os.environ[memory_admit.BUILDLOG_UNIT] = previous_unit
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         fetch_branches(repo, "main")

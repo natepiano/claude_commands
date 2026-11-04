@@ -207,7 +207,8 @@ class SharedGateAdmissionTests(ServiceGateFixture):
 
     @gate_suites("hooks")
     def test_full_queue_holds_gate_until_the_running_charge_is_released(self) -> None:
-        busy = only_admitted(self.admission.server.handle_request(self.admission.request(need=21 * memory_admit.GIB)))
+        with self.admission.loop_turn():
+            busy = only_admitted(self.admission.server.handle_request(self.admission.request(need=21 * memory_admit.GIB)))
         decisions: list[str] = []
         admit = client.admit
         def acquire(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None], refresh: Callable[[], wire.AdmitRequest], *,

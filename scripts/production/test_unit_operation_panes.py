@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import io
+from contextlib import redirect_stderr
 import math
 import os
 import sys
@@ -103,8 +105,9 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.pane.add_occupant(991551, unit='beta-unit')
         with mock.patch.object(herdr, 'herdr_processes', side_effect=AssertionError('no occupant scan')):
             pane = unit_move.unit_pane(self.pane.found, 'demo')
-            unit_move.close_unit_pane(pane)
-        self.assertEqual(self.pane.close_calls(), [['--session', 'agents', 'pane', 'close', 'w1:p1']])
+            with self.assertRaisesRegex(RenameRefused, 'other live work'):
+                unit_move.close_unit_pane(pane)
+        self.assertEqual(self.pane.close_calls(), [])
 
     def test_close_uses_saved_place_without_record_launch_or_generation_rechecks(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
@@ -123,10 +126,14 @@ class UnitOperationPaneTests(unittest.TestCase):
               mock.patch.object(herdr.Herdr, 'run', side_effect=[
                 json.dumps({"result": {"panes": [
                     {"pane_id": "w1:p1", "terminal_id": "unit-terminal", "tab_id": "w1:t1", "workspace_id": "w1"}]}}),
+                json.dumps({"result": {"process_info": {
+                    "shell_pid": self.pane.shell, "foreground_process_group_id": self.pane.shell,
+                    "foreground_processes": [{"pid": self.pane.shell, "name": "zsh", "argv": ["zsh"]}]}}}),
                 gone]) as close):
             unit_move.close_unit_pane(pane)
         self.assertEqual(close.call_args_list, [
-            mock.call('pane', 'list'), mock.call('pane', 'close', 'w1:p1')])
+            mock.call('pane', 'list'), mock.call('pane', 'process-info', '--pane', 'w1:p1'),
+            mock.call('pane', 'close', 'w1:p1')])
 
     def test_herdr_close_error_is_reported_for_the_units_exact_place(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
@@ -137,7 +144,9 @@ class UnitOperationPaneTests(unittest.TestCase):
                 raise failure
             return run(client, *arguments, deadline=deadline)
         with mock.patch.object(herdr.Herdr, 'run', autospec=True, side_effect=fail_close) as close:
-            with self.assertRaisesRegex(RenameRefused, 'alpha-unit: pane close failed: fixture close failed'):
+            with redirect_stderr(io.StringIO()) as errors:
                 unit_move.close_unit_pane(pane)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn('fixture close failed', errors.getvalue())
         close.assert_called_with(mock.ANY, 'pane', 'close', 'w1:p1')
         self.assertEqual(close.call_args_list.count(mock.call(mock.ANY, 'pane', 'close', 'w1:p1')), 1)

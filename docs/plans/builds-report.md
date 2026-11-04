@@ -241,12 +241,13 @@ Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second la
 ### Phase 10 — Chart labels do not collide  · status: done
 **Depends on:** Phase 8
 
-The fresh design check of the Phase 8 shots (dataviz label rules) found two defects on the `buildlog charts` page:
+#### As-built
 
-1. The moment numbers above each of the six cost panels sit on the panel title (for example "2 1" over "Memory wait · h/day"). Keep the numbers clear of every panel title, at desktop and phone width.
-2. Costs by machine: the mac and CI lines are both 0, so the CI line hides the mac line. The end labels move apart to avoid each other, so "mac" sits beside the natedev line end and "natedev" sits far above it. Each end label must sit beside its own line end, or the chart must name the series in another clear way; a line hidden under another must stay visible (dataviz: 2px surface ring on overlapping marks).
-
-Acceptance: new tests in `scripts/buildlog/test_charts.py` pin both rules (no moment number box overlaps a panel title box; each end label is nearest its own line end). Fresh shots at 1280 px light and dark and at 500 px, judged once more under the dataviz rules.
+- Moment numbers sit in their own rows below each panel title. Numbers closer than 26 px go to the next row, and the plot top moves down to make room.
+- End labels stay at their own line ends. Ends with the same bucket and value share one label, which names each series and the value.
+- A label that does not fit, or that sits on another series' end, is dropped; the legend names that series. Gap notes yield to end labels.
+- Coincident line segments alternate dashed strokes. A point shared by several series shows one sector per series.
+- `test_charts.py` pins both rules: no moment number box overlaps a panel title box, and each end label is nearest its own line end.
 
 **Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/test_charts.py`.
 
@@ -274,3 +275,7 @@ The user unit `buildlog.service` on natedev failed from 21:29 EST. The vault ste
 Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command_failed`. The next hourly `buildlog.service` run ends without failure.
 
 **Files:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.
+
+### Phase 13 — Buildlog tests import their own modules  · status: done
+
+Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHONPATH. test_costs subprocess tests fail with no module cli or costs; test_vault_pull fails to import conf. Each test sets its own import path.

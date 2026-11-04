@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 import fake_unit_host
@@ -92,6 +92,7 @@ class UnitEffortTests(unittest.TestCase):
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(synced)}))
         _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", return_value=True))
+        _ = self.enterContext(fake_unit_host.private_process_registry())
         units = [
             HostedUnit("review", "w1:p1", {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-unit"}, EMPTY),
             HostedUnit("widget", "w2:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "widget-unit"}, screen("❯ my draft")),
@@ -105,11 +106,25 @@ class UnitEffortTests(unittest.TestCase):
                 identities[unit.session] = row.id
         fake_unit_host.write(os.environ, units)
         for index, unit in enumerate(units):
-            _ = (self.records / f"{unit.session}.json").write_text(json.dumps({
-                "pid": 991001 + index * 2,
-                "sessionId": identities.get(unit.session, fixture_runtime_id(unit.session)), "name": unit.session,
-                "messagingSocketPath": str(self.root / f"{unit.session}.sock"), "updatedAt": 1,
-                "tmux": ""}), encoding="utf-8")
+            self.native_target(unit, 991001 + index * 2, 998050 + index,
+                               identities.get(unit.session, fixture_runtime_id(unit.session)))
+
+    def native_target(self, unit: HostedUnit, shell: int, pid: int, identity: str) -> None:
+        fake_unit_host.process(os.environ, pid, shell, ["claude"], {
+            **unit.marks, "HERDR_SESSION": unit.session, "HERDR_PANE_ID": unit.pane})
+        path = self.root / "herdr-responses.json"
+        responses = cast(dict[str, CommandResponse], json.loads(path.read_text()))
+        responses[f"--session {unit.session} pane process-info --pane {unit.pane}"] = {
+            "code": 0, "stdout": json.dumps({"result": {"process_info": {
+                "shell_pid": shell, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}})}
+        responses[f"--session {unit.session} pane read {unit.pane} --source visible --format ansi"] = {
+            "code": 0, "stdout": unit.screen}
+        _ = path.write_text(json.dumps(responses))
+        _ = (self.records / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "procStart": "1", "sessionId": identity, "name": unit.session,
+            "messagingSocketPath": str(self.root / f"{unit.session}.sock"), "updatedAt": 1,
+            "tmux": ""}), encoding="utf-8")
 
     def run_main(self, *arguments: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -155,7 +170,8 @@ class UnitEffortTests(unittest.TestCase):
 
     def test_a_herdr_director_reads_ansi_and_receives_effort_once(self) -> None:
         place = herdr.HerdrPlace("native", "w1:p1")
-        marked = unit_lookup.MarkedUnit("native-unit", unit_lookup.LiveClaude("native", "id", "/sock", 1), place)
+        identity = fixture_runtime_id("native-effort")
+        marked = unit_lookup.MarkedUnit("native-unit", unit_lookup.LiveClaude("native", identity, "/sock", 998060), place)
         responses = self.root / "herdr-responses.json"
         replies: dict[str, CommandResponse] = {
             "--session native pane read w1:p1 --source recent --lines 60 --format ansi": {
@@ -163,6 +179,9 @@ class UnitEffortTests(unittest.TestCase):
             "default": {"code": 0, "stdout": ""},
         }
         _ = responses.write_text(json.dumps(replies))
+        unit = HostedUnit("native", "w1:p1", {}, screen("❯ \x1b[2mtry this\x1b[22m"))
+        fake_unit_host.write(os.environ, [unit])
+        self.native_target(unit, 991001, 998060, identity)
         with mock.patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions(
                 {"show": {"native-unit": marked}}, {})):
             code, out, err = self.run_main("high")
@@ -171,6 +190,9 @@ class UnitEffortTests(unittest.TestCase):
         self.assertEqual((self.root / "herdr.log").read_text().splitlines(), [
             json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60",
                         "--format", "ansi"]),
+            json.dumps(["--session", "native", "pane", "list"]),
+            json.dumps(["--session", "native", "pane", "process-info", "--pane", "w1:p1"]),
+            json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source", "visible", "--format", "ansi"]),
             json.dumps(["--session", "native", "agent", "prompt", "w1:p1", "/effort high"]),
         ])
         self.assertEqual(self.sent(), [["--session", "native", "agent", "prompt", "w1:p1", "/effort high"]])
@@ -179,7 +201,7 @@ class UnitEffortTests(unittest.TestCase):
         refusal: herdr.HerdrRefusal = {"error": {"code": "agent_blocked", "message": "blocked at a prompt"}}
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {
             "code": 1, "stdout": json.dumps(refusal)}}))
-        problem = unit_effort.send(herdr.HerdrPlace("native", "w1:p1"), "high")
+        problem = unit_effort.send(herdr.HerdrPlace("native", "w1:p1"), "high", target="id")
         self.assertIn("agent_blocked", problem)
         self.assertEqual(len((self.root / "herdr.log").read_text().splitlines()), 1)
 

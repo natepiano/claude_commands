@@ -1387,6 +1387,7 @@ def nextest_words_with_skip(
 
 def runner_values(config: OffloadConfig, target: str) -> dict[str, str]:
     return {**config.values, 'selected_target': target,
+            'pinned_target': os.environ.get('BUILDLOG_PINNED_TARGET', ''),
             'selected_settings': str(config.source) if isinstance(config.source, Path) else ''}
 
 
@@ -1442,6 +1443,7 @@ def remote_test_command(
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
+        f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
         f"{sent_tree}"
         "BUILDLOG_SYNC=1 "

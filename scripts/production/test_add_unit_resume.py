@@ -190,14 +190,14 @@ class AddUnitResumeTests(AddUnitTestCase):
                 self.assertEqual(result.stderr, f"add_unit: session 62ccbd64-f22e-5647-b20e-7899aa39d766 already runs as pid {os.getpid()}; "
                                  + "to make it this unit, run add_unit with --attach 62ccbd64-f22e-5647-b20e-7899aa39d766\n")
                 self.assert_no_launch_change(document, head)
-                self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+                self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
                 self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
         # Brief launches must refuse before their stub is written too.
         result = self.cli("alpha", "--brief", "Repair the unit", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
         self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
     def test_resume_with_unreadable_registry_refuses_with_the_reason(self) -> None:
         prior = self.root / "prior-session"
@@ -211,7 +211,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
                          + "unreadable session registry record: broken.json\n")
         self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
     def test_resume_with_unreadable_process_identity_refuses_with_the_reason(self) -> None:
         prior = self.root / "prior-session"
@@ -225,7 +225,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
                          + f"process identity unreadable for pid {os.getpid()}\n")
         self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
     def test_resume_with_stale_registry_identity_still_launches(self) -> None:
         prior = self.root / "prior-session"
@@ -424,7 +424,7 @@ class AddUnitResumeTests(AddUnitTestCase):
 
         self.assertEqual(self.repository_state(), before)
         self.assertEqual([call for call in self.herdr_calls()
-                          if call != ["--session", "default", "session", "list", "--json"]], [])
+                          if call[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
         changed_plan = "docs/as-built/other.md"
         result = self.cli("alpha", "--plan", changed_plan, "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
@@ -433,7 +433,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertIn(f"unit alpha-unit Plan is {plan!r}; expected {changed_plan!r}", result.stderr)
         self.assertEqual(self.repository_state(), before)
         self.assertEqual([call for call in self.herdr_calls()
-                          if call != ["--session", "default", "session", "list", "--json"]], [])
+                          if call[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
     def test_retired_plan_resume_reuses_its_worktree_after_a_failed_launch(self) -> None:
         self.commit_prepared_row(self.unit_row(
