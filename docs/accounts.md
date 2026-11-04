@@ -35,6 +35,8 @@ The terminal status table lists the numbered Claude and Codex accounts.
 The table includes accounts without a login.
 `~/.claude` is the shared config home and has no account row.
 The legacy `~/.codex` has a row only while it holds a login.
+An empty numbered Codex home has no row when `~/.codex` holds its note's login.
+Usage reads use the home that holds the login.
 A noted account without a usable home has a `not set up` row when no home holds its login.
 Each role has a separate row.
 The first role row shows the account's values.
