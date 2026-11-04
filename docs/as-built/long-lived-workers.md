@@ -200,11 +200,9 @@ selects a private root). On first ledger binding, a production unit's run
 saves explicit production and unit fields in `progress_history_state.json`.
 Plan headers accept both Production forms and resolve former production names.
 Later reads use the saved identity, so moving a worktree does not change owners.
-`rename.py unit` also repoints run worktree and plan paths and worker roster
-launch paths, while keeping paused threads and Codex homes. For older moves,
-use `rename.py repair-workers <production> [--dry-run]`. It matches current
-Units rows with saved run or worker paths even without journaled moves, and
-skips ambiguous unit matches; see `production-rename.md`.
+`rename.py unit` uses the folder move (`unit_move.move_folder`): it pauses
+the unit's workers and starts the same threads with a note that names the new
+folder; see `production-rename.md`.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 
