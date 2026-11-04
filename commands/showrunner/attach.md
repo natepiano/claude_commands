@@ -33,7 +33,7 @@ with the sandbox off, and print its output as it comes:
   slug: rename the production first (`/showrunner:rename`).
 
 A child showrunner is never a unit. It keeps its own production doc, update
-timer, merge branch and units, and gets no row in the parent's Units table.
+timer, merge branch and units, and its staff row is a showrunner row.
 What each side does once attached is in `/showrunner:produce` → Nested
 showrunners.
 

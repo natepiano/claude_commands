@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import tidy_wrapped
-from unit_rename_sweep import token_pattern
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file
@@ -50,25 +50,6 @@ def unfinished(path: Path) -> bool:
 
 def production_journal(slug: str) -> Path:
     return tidy_wrapped.owned_paths(slug)[-1] / "rename.json"
-
-
-def unit_journal(slug: str) -> Path:
-    return tidy_wrapped.owned_paths(slug)[-1] / "rename_unit.json"
-
-
-def rename_claim(slug: str) -> frozenset[str]:
-    """Both ids of a unit whose rename is unfinished: only the rename may launch it.
-
-    The claim ends once the unit's shutdown record names the new id, so the rename's own relaunch
-    goes through.
-    """
-    path = unit_journal(slug)
-    if not unfinished(path):
-        return frozenset()
-    fields = _fields(path)
-    if fields.get("claimed") is False:
-        return frozenset()
-    return frozenset(value for value in (fields.get("old"), fields.get("new")) if isinstance(value, str) and value)
 
 
 def write_json(path: Path, value: object) -> None:
@@ -152,7 +133,7 @@ Words = Sequence[tuple[str, str]]
 def _reworded(text: str, words: Words) -> str:
     """`text` with each old name as a whole token taking its new name: `per-unit` stays."""
     for old, new in words:
-        text = token_pattern((old,)).sub(new, text)
+        text = re.sub(rf"(?<![A-Za-z0-9_-]){re.escape(old)}(?![A-Za-z0-9_-])", new, text)
     return text
 
 

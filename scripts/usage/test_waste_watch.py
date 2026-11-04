@@ -65,9 +65,7 @@ class WasteWatchTests(unittest.TestCase):
         self.worktree = self.root / "worktrees/alpha"
         showrunner_doc = self.root / "elsewhere/watch-production.md"
         showrunner_doc.parent.mkdir()
-        _ = showrunner_doc.write_text(
-            "# Watch\n\n## Units\n\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n"
-            + f"| alpha | `{self.worktree}` | docs/alpha.md |\n", encoding="utf-8")
+        _ = showrunner_doc.write_text("# Watch\n", encoding="utf-8")
         environment = source_environment(self.root / "staff-sources")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))

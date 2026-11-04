@@ -1759,7 +1759,9 @@ def _turn_sandbox_policy(mode: str) -> dict[str, object]:
 
 def _resume_params(session_dir: str, name: str, thread_id: str) -> dict[str, object]:
     """Restore a roster thread's standing instructions whenever it is reopened."""
-    params: dict[str, object] = {"threadId": thread_id}
+    params: dict[str, object] = {"threadId": thread_id,
+        **({"cwd": cwd} if (cwd := _as_str(plan_history.staff_directory(
+            {"owner_session": thread_id}, staff.snapshot()).get("working_dir"))) else {})}
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     policy = roster_access_policy(record)
     if isinstance(policy, (ReadOnlyReviewer, PhaseBoundDesigner)):
@@ -4263,7 +4265,7 @@ def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = Fal
 def _thread_start_params(args: argparse.Namespace) -> dict[str, object]:
     """The `thread/start` request for one worker."""
     params: dict[str, object] = {
-        "cwd": _as_str(_attr(args, "cwd")),
+        "cwd": (_as_str(plan_history.staff_directory({"owner_session": unit_runs.director(Path(_as_str(_attr(args, "session_dir"))))}, staff.snapshot()).get("working_dir")) if _as_str(_attr(args, "session_dir")) else "") or _as_str(_attr(args, "cwd")),
         "approvalPolicy": "never",
         # The SandboxMode string, not a SandboxPolicy object: the server rejects
         # {"type": "dangerFullAccess"} with "unknown variant `type`".
@@ -6223,7 +6225,7 @@ def _start_turn(
             for path in cast("list[object]", images) if isinstance(path, str)
         )
     params: dict[str, object] = {"threadId": thread_id, "input": inputs}
-    cwd = _as_str(_attr(args, "turn_cwd"))
+    cwd = _as_str(plan_history.staff_directory({"owner_session": thread_id}, staff.snapshot()).get("working_dir")) or _as_str(_attr(args, "turn_cwd"))
     if cwd:
         params["cwd"] = cwd
     # Every turn names its policy: the app-server keeps a thread's last turn policy, so a
@@ -7003,7 +7005,7 @@ def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllo
             if family != "codex":
                 raise unit_workers.WorkerUnavailable("new persistent worker requires a Codex assignment")
             state = _read_json_object(_session_path(session_dir, plan_history.STATE_FILENAME))
-            cwd = _as_str(state.get("working_dir")) or str(Path.cwd())
+            cwd = _as_str(plan_history.staff_directory({**state, "owner_session": unit_runs.director(Path(session_dir))}, staff.snapshot()).get("working_dir")) or str(Path.cwd())
             home = workers_home()
             port, fresh = ensure_server(session_dir, home, cwd=cwd)
             client = Client(port, name)
@@ -9307,7 +9309,7 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowe
             instructions = instructions_path.read_text(encoding="utf-8")
             params: dict[str, object] = {
                 "developerInstructions": instructions,
-                "cwd": _as_str(_attr(args, "cwd")),
+                "cwd": (_as_str(plan_history.staff_directory({"owner_session": unit_runs.director(Path(_as_str(_attr(args, "session_dir"))))}, staff.snapshot()).get("working_dir")) if _as_str(_attr(args, "session_dir")) else "") or _as_str(_attr(args, "cwd")),
                 "sandbox": _as_str(_attr(args, "sandbox")) or READ_ONLY_SANDBOX,
                 "approvalPolicy": "never",
             }
