@@ -161,6 +161,14 @@ The bootstrap saves the identified lifecycle settings in `/var/lib/aws-build/rem
 Both host configurations expose that file through `/etc/aws-build/remote.conf`.
 The remote service reads this separate file.
 Sender copies cannot disable its idle shutdown through natedev's `offload=off` setting.
+The sender copies every tracked file under `scripts/` and `config/`.
+This includes `config/build_folders.conf`, which the remote service and Linux runner need during import.
+A version refusal names each mismatched tool, both versions, and the file set by `version_pin_file`.
+Move the box pins in that file before you retry the step.
+The controller also stops a running box after `idle_stop_minutes` without published permission when no target claim remains.
+It saves the first unpublished time for each generation in `controller.json`.
+A successful publication or a new generation resets this timer.
+The stop reason is `unpublished_idle`.
 
 ## Private scaler credential file
 
