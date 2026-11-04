@@ -293,7 +293,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Gotchas:**
 - Reading `cgroup.procs` of a cgroup the kernel is removing gives ENODEV, not `FileNotFoundError`. `reservation_lifetime` catches only `FileNotFoundError`; resources-unit owns the fix.
 
-### Phase 10 — Each schema keeps its own build log index file  · status: todo
+### Phase 10 — Each schema keeps its own build log index file  · status: done
 **Depends on:** Phase 8, Phase 9
 
 #### Work Order

@@ -152,7 +152,7 @@ def write_history_rows(root: Path, rows: Iterable[dict[str, object]], *,
         for original in rows:
             row = dict(original)
             if indexed:
-                with closing(sqlite3.connect(root / store.INDEX_NAME)) as db, db:
+                with closing(sqlite3.connect(file_marks.index_path_in(root))) as db, db:
                     _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, "
                                    + "started_at TEXT, peak_mem_bytes INTEGER, argv TEXT, call_id TEXT, "
                                    + "crates_compiled INTEGER DEFAULT 1, repo_identity TEXT)")
@@ -420,7 +420,7 @@ class HistoryTests(unittest.TestCase):
         write_history_rows(self.root, rows, indexed=True)
 
     def add_index(self, *, at: datetime = HISTORY_AT) -> None:
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER, crates_compiled INTEGER DEFAULT 1)")
             for index in range(5):
                 _ = db.execute("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes) VALUES (?, ?, ?, ?, ?)",
@@ -461,7 +461,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.peak().source, "buildlog")
 
     def test_legacy_index_without_compile_counts_keeps_its_clippy_peaks(self) -> None:
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT)")
             _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
@@ -499,7 +499,7 @@ class HistoryTests(unittest.TestCase):
 
     def test_buildlog_tier_keeps_filtered_runs_separate(self) -> None:
         self.add_index()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("ALTER TABLE steps ADD COLUMN argv TEXT")
             _ = db.execute("UPDATE steps SET argv = ?", (json.dumps(["cargo", "nextest", "run"]),))
             for _ in range(5):
@@ -577,7 +577,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak(self) -> None:
         self.samples([7 * GIB], filters=("native_rate",), crates=0)
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             for count in (None, 0):
                 _ = db.execute("INSERT INTO steps(host,repo,step,started_at,call_id,crates_compiled) "
                                + "SELECT host,repo,step,started_at,call_id,? FROM steps LIMIT 1", (count,))
@@ -585,7 +585,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_legacy_index_without_compile_counts_keeps_its_filtered_nextest_peaks(self) -> None:
         arguments = ["cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"]
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT)")
             _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
@@ -604,7 +604,7 @@ class FilteredPromiseTests(unittest.TestCase):
             "filters": ["native_rate"], "anon_peak_bytes": 21 * GIB,
             "call_id": "different-step", "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
         }])
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("INSERT INTO steps(host,repo,step,started_at,call_id,crates_compiled) "
                            + "VALUES (?,?,?,?,?,?)",
                            (self.host, "hana", "check", HISTORY_AT.isoformat(), "different-step", 5))
@@ -674,7 +674,7 @@ class FilteredPromiseTests(unittest.TestCase):
         self.assertEqual(self.promise().bytes, gate.FILTERED_FLOOR)
 
     def test_compile_fallback_can_use_same_package_buildlog_history(self) -> None:
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for package, peak in (("hana", 8 * GIB), ("hana-ui", 20 * GIB)):
@@ -686,7 +686,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_exact_buildlog_filters_precede_broader_filtered_anon_history(self) -> None:
         self.samples([19 * GIB] * 10, filters=("other",))
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for package, names, peaks in (
@@ -769,7 +769,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_negated_index_expression_cannot_supply_a_positive_exact_promise(self) -> None:
         self.samples([9 * GIB] * 5, filters=("other",))
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for expression in ("package(hana) & not test(native_rate)", "package(hana) & !test(native_rate)"):
@@ -810,7 +810,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_build_measurements_precede_compile_index_history(self) -> None:
         self.samples([8 * GIB] * 5, step="build", scope="full")
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)", [
@@ -820,7 +820,7 @@ class FilteredPromiseTests(unittest.TestCase):
         self.assertEqual(self.promise(), gate.ExpectedPeak(8 * GIB, "measured", 5))
 
     def test_no_filtered_history_uses_same_package_build_index_measurements(self) -> None:
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for package, peak in (("hana", 8 * GIB), ("hana-ui", 20 * GIB)):
@@ -832,7 +832,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_indexed_member_compile_promise_can_exceed_the_full_suite(self) -> None:
         self.samples([12 * GIB] * 5, scope="full")
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)", [
@@ -898,7 +898,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         self.state.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(self.state)})))
         (self.root / "admission").mkdir()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "ended_at TEXT, peak_mem_bytes INTEGER, argv TEXT, call_id TEXT, "
                            + "worktree TEXT, tree_key TEXT, status INTEGER, tests_run INTEGER, "
@@ -915,7 +915,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         if scope == "filtered":
             selection = " | ".join(f"test({name})" for name in filters)
             expression += " & " + (selection if len(filters) == 1 else f"({selection})")
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             for peak in peaks:
                 self.sample_id += 1
                 call = f"call-{self.sample_id}"
@@ -939,7 +939,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         timestamp = store.utc_iso(at.timestamp())
         arguments = ["cargo", "nextest", "run", "-E", expression]
         if indexed:
-            with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
                 _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                (self.host, "hana", "nextest", timestamp, timestamp if finished else None, None,
                                 json.dumps(arguments), "last-build", worktree or str(self.worktree),
@@ -963,7 +963,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         with path.open("rb") as handle:
             marks = file_marks.marks(handle, offset)
         source = path.relative_to(self.root).as_posix()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("ALTER TABLE steps ADD COLUMN test_build_key TEXT")
             _ = db.execute("ALTER TABLE steps ADD COLUMN src TEXT")
             _ = db.execute("UPDATE steps SET test_build_key = tree_key, src = ? WHERE worktree = ?",
@@ -1034,7 +1034,7 @@ class FreshTestPromiseTests(unittest.TestCase):
 
     def test_fresh_index_peak_is_scaled_when_no_joined_anon_measurement_exists(self) -> None:
         self.samples([GIB], measured=False)
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("UPDATE steps SET peak_mem_bytes = ? WHERE crates_compiled = 0", (4 * GIB,))
         self.previous_build()
         self.assertEqual(self.promise(), gate.ExpectedPeak(int(4 * GIB * gate.ANON_SHARE), "buildlog", 1))
@@ -1258,7 +1258,7 @@ class FreshTestPromiseTests(unittest.TestCase):
     def test_logged_disk_sweep_since_build_forces_compile_promise(self) -> None:
         self.samples([2 * GIB])
         self.previous_build()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("INSERT INTO steps(host, worktree, step, started_at, sweep_freed_bytes) "
                            + "VALUES (?, ?, 'sweep', ?, ?)",
                            (self.host, str(self.worktree), store.utc_iso((NOW - timedelta(seconds=30)).timestamp()), GIB))
@@ -1361,7 +1361,7 @@ class RepositoryHistoryTests(unittest.TestCase):
         write_history_rows(self.root, rows, indexed=True)
         self.assertEqual(self.estimate(identity), gate.ExpectedPeak(3 * GIB, "measured", 5))
         peaks.unlink()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER, crates_compiled INTEGER DEFAULT 1)")
             _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes) VALUES (?, ?, ?, ?, ?)",
                                [(self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), 4 * GIB)] * 5)
@@ -2424,7 +2424,7 @@ class BuildPromiseFixture(MemoryQueueFixture):
 
     def index_build(self, call_id: str, arguments: list[str], *,
                     at: datetime = HISTORY_AT, crates: int = 1) -> None:
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection, connection:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as connection, connection:
             _ = connection.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, "
                                    + "repo_identity TEXT, step TEXT, started_at TEXT, "
                                    + "call_id TEXT, argv TEXT, peak_mem_bytes INTEGER, crates_compiled INTEGER DEFAULT 1)")
@@ -2567,7 +2567,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
 
     def test_legacy_index_without_compile_counts_keeps_its_build_peak(self) -> None:
         self.index_build("legacy-build", RELEASE_BUILD)
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as connection, connection:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as connection, connection:
             _ = connection.execute("ALTER TABLE steps DROP COLUMN crates_compiled")
         self.sample(5, call_id="legacy-build", record_shape=False)
         peak = self.estimate()
@@ -2685,7 +2685,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
 
     def test_old_history_matches_a_copy_with_a_different_checkout_name(self) -> None:
         self.index_build("copied-build", RELEASE_BUILD)
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection, connection:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as connection, connection:
             _ = connection.execute("UPDATE steps SET repo = 'hana-copy'")
         self.sample(16, record_shape=False, call_id="copied-build")
         peak = self.estimate()
@@ -2697,10 +2697,10 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.sample(5, record_shape=False, call_id="joined")
         for call_id in ("dev", "no-index-match", ""):
             self.sample(20, record_shape=False, call_id=call_id)
-        before = (self.root / "index.sqlite").read_bytes()
+        before = file_marks.index_path_in(self.root).read_bytes()
         peak = self.estimate()
         self.assertEqual((peak.bytes, peak.count), (gate.shape_headroom_bytes(5 * GIB, self.release_headroom), 1))
-        self.assertEqual((self.root / "index.sqlite").read_bytes(), before)
+        self.assertEqual(file_marks.index_path_in(self.root).read_bytes(), before)
 
     def test_rows_without_shape_or_join_cannot_supply_even_a_profile_fallback(self) -> None:
         for _ in range(10):
