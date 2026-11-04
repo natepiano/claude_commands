@@ -4046,7 +4046,7 @@ def _read_failure_problem(row: StatusRow, zone: tzinfo,
     previous = (f"this shows the reading from {stamp(row.read_at)}"
                 if isinstance(row.read_at, datetime) else "no reading is stored yet")
     last_attempt = (f"last read attempted at {stamp(row.attempted_at)}"
-                    if isinstance(row.attempted_at, datetime) else "no usage read has been attempted")
+                    if isinstance(row.attempted_at, datetime) else "the attempt time is not recorded")
     match row.read_outcome:
         case agent_accounts.UsageReadOutcome.STALE_TOKEN | agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN:
             attempt = login_renewal_attempts().get(row.label)

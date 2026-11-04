@@ -219,6 +219,23 @@ describe('build queue pane', () => {
     });
   }
 
+  test('the recorded board paints running grants before numbered waiting rows', async ($, on) => {
+    const fake = queueHost(on);
+    fake.replace(selectedPageFixture as QueueLines);
+    await $.command.run(command());
+    const ui = await mount($, 'terminal');
+    const tree = await ui.drawn();
+    const lines = inspectDrawing(tree).lines;
+    expect(lines).toEqual(selectedPageFixture.lines.map(line => line.map(span => span.text).join('')));
+    const running = lines.findIndex(line => line.startsWith('run'));
+    const waiting = lines.findIndex(line => line.trimStart().startsWith('1 '));
+    expect(running).toBeGreaterThanOrEqual(0);
+    expect(waiting).toBeGreaterThan(running);
+    expect(lines.filter(line => line.startsWith('run'))).toHaveLength(1);
+    expect(lines.filter(line => /^\s+[12] /.test(line))).toHaveLength(2);
+    expect(lines.at(-1)).toContain('(unowned)');
+  });
+
   test('a span with omitted style fields paints with the default foreground, background and weight', async ($, on) => {
     const fake = queueHost(on);
     const data = snapshot();
@@ -342,14 +359,14 @@ describe('build queue pane', () => {
 
   test('the pane paints the same recorded page as the terminal', async ($, on) => {
     const fake = queueHost(on);
-    const data = selectedPageFixture as QueueLines;
+    const data = selectedPage();
     fake.replace(data);
     await $.command.run(command('1'));
     const ui = await mount($, 'terminal', 100);
     const expected = data.lines.map(line => line.map(span => span.text).join(''));
     expect(inspectDrawing(await ui.drawn()).lines).toEqual(expected);
     expect(drawnText(await ui.drawn())).toContain('Frees when:');
-    expect(drawnText(await ui.drawn())).toContain('Need source: source not recorded');
+    expect(drawnText(await ui.drawn())).toContain('Need source: same-shape p90 of 7 runs, last 14 days; failed-build floor 16.0 GiB.');
   });
 
   test('a selector keeps the card below the queue through timer refresh and reload', async ($, on) => {

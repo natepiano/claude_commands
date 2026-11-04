@@ -13,7 +13,7 @@ import herdr  # noqa: E402
 from herdr import AgentBlocked, Herdr  # noqa: E402
 from herdr import HerdrFailure as HerdrFailure  # noqa: E402
 from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from unit_lookup import Place, marked_unit, sessions_dir  # noqa: E402
+from unit_lookup import LiveClaude, Place, marked_unit, sessions_dir  # noqa: E402
 from scripts.lib.script_envelope import script_prompt  # noqa: E402
 
 USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <slug> <unit>|session <id>> "
@@ -37,12 +37,12 @@ def agent_status(place: Place, *, deadline: float = math.inf) -> herdr.AgentStat
                  if agent["pane_id"] == place.pane), herdr.AgentStatus.UNKNOWN)
 
 
-def type_place(place: Place, text: str) -> None:
-    Herdr(place.session).prompt(place.pane, script_prompt(text))
+def type_place(place: Place, text: str, *, target: str) -> None:
+    Herdr(place.session).prompt(place.pane, script_prompt(text), target=target)
 
 
-def keys_place(place: Place, *keys: str) -> None:
-    Herdr(place.session).send_keys(place.pane, *keys)
+def keys_place(place: Place, *keys: str, target: str) -> None:
+    Herdr(place.session).send_keys(place.pane, *keys, target=target)
 
 
 def where_place(place: Place) -> str:
@@ -112,14 +112,16 @@ def main(arguments: list[str]) -> int:
             if unit is None:
                 raise NoSuchTarget(target)
             place = unit.place
+            session_id = unit.claude.session_id if isinstance(unit.claude, LiveClaude) else unit.staff_id
         else:
             place = session_place(name)
+            session_id = name
         if verb == "read":
             print(read_place(place, lines, joined=joined, ansi=ansi), end="")
         elif verb == "type":
-            type_place(place, rest[0])
+            type_place(place, rest[0], target=session_id)
         elif verb == "keys":
-            keys_place(place, *rest)
+            keys_place(place, *rest, target=session_id)
         else:
             print(where_place(place))
     except ValueError as error:

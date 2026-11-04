@@ -613,7 +613,7 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     if isinstance(estimate.profile, gate.ProgramProfile):
         identity["folder"] = estimate.profile.worktree
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,
-        wire.Identity(identity["session_id"], identity["session_name"], identity["step"], identity["folder"]),
+        wire.Identity(identity["session_id"], identity["session_name"], identity["step"], identity["folder"], identity.get("unit", "")),
         gate.CallRecord(call) if call else gate.NoCallRecord(), width_value_typed, estimate.profile,
         isinstance(estimate.cache, gate.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run)
 

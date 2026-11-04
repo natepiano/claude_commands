@@ -21,6 +21,54 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NO
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_unowned_scope_activity_round_trips_and_old_records_remain_readable(self) -> None:
+        from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun
+
+        activity = ScopeProcesses(2, "session", "worker", "/tree", "python3", NOW, False, NoLiveBuildRun())
+        current = gate.UnownedSliceMemory(GIB, owner="scope", activity=activity)
+        self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(current), gate.UnownedSliceMemory), current)
+        old = cast(dict[str, object], gate.snapshot_value(current))
+        del old["activity"]
+        self.assertEqual(gate.parse_snapshot_value(old, gate.UnownedSliceMemory),
+                         gate.UnownedSliceMemory(GIB, owner="scope"))
+
+    def test_main_display_fields_and_diagnostics_remain_readable(self) -> None:
+        from scripts.build_queue.scope_activity import LiveBuildRun
+        from scripts.build_queue.queue_fixture import queue_read_fixture
+
+        view = gate.QueueView((), (), 0, 0, 0, NOW)
+        reading = queue_read_fixture(view, policy=admission_policy_fixture())
+        current = cast(dict[str, object], gate.snapshot_value(reading))
+        del current["diagnostics"]
+        current["diagnostics"] = [{"kind": "ConfigurationDiagnostic", "diagnostic": "service warning"}]
+        parsed = gate.parse_snapshot_value(current, gate.QueueRead)
+        self.assertEqual(parsed, replace(reading, diagnostics=(gate.ConfigurationDiagnostic("service warning"),)))
+        step = gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0),
+                                run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30)
+        self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(step), gate.RunningStep), step)
+        old = cast(dict[str, object], gate.snapshot_value(step))
+        for name in ("unit", "run", "started_at"):
+            del old[name]
+        self.assertEqual(gate.parse_snapshot_value(old, gate.RunningStep),
+                         gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0)))
+
+    def test_unit_override_round_trips_and_main_encoder_omits_it(self) -> None:
+        with AdmissionFixture() as fixture:
+            original = fixture.request()
+            original_launch = fixture.launch()
+            for request in (original, original_launch):
+                with self.subTest(request=type(request).__name__):
+                    current = replace(request, identity=replace(request.identity, unit="queue-unit"))
+                    self.assertEqual(wire.parse_request(wire.encode_request(current)), current)
+                    self.assertEqual(wire.parse_record(wire.encode_record(current), type(current)), current)
+                    compatible = wire.encode_request(current, main_service=True)
+                    self.assertEqual(json.loads(compatible), json.loads(wire.encode_request(request, main_service=True)))
+                    envelope = cast(dict[str, object], json.loads(compatible))
+                    data = cast(dict[str, object], envelope["data"])
+                    self.assertNotIn("unit", cast(dict[str, object], data["identity"]))
+                    restored = wire.parse_request(compatible)
+                    assert isinstance(restored, (wire.AdmitRequest, wire.LaunchRequest))
+                    self.assertEqual(restored.identity, request.identity)
     def test_shell_and_protocol_share_a_version_that_includes_the_version_module(self) -> None:
         with AdmissionFixture() as fixture:
             source = Path(__file__).resolve().parents[1]
