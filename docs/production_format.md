@@ -130,8 +130,8 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   proposed and deferred lines show as `N efficiency` in the `For you:`
   line on the status line and in the dailies footer
 
-The showrunner's session name is not in the doc: a name can change, so it is
-looked up when needed. `~/.claude/scripts/lib/py
+The **Showrunner session** line can be out of date: a name can change, so look
+it up when needed. `~/.claude/scripts/lib/py
 ~/.claude/scripts/production/showrunners.py name <slug>` prints it as it is now.
 A unit sends to the address `showrunners.py address <slug>` prints, not to the
 name: the address is the showrunner's session on this machine, and `SendMessage`

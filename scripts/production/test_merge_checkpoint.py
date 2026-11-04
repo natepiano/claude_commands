@@ -117,7 +117,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
             with mock.patch.object(change_review, "reviewed_merge_refs", return_value=[]):
                 held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/imported.txt, outside/second.txt")
+            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt, outside/second.txt")
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
         self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
@@ -129,7 +129,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         sha = self.checkpoint("outside/imported.txt", "unit changed this\n")
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
             held = self.run_checkpoint(sha)
-        self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/imported.txt\n")
+        self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt\n")
         self.assertNotIn("outside/second.txt", held.process.stdout)
 
     def test_scope_holds_only_unit_outside_paths_then_allows_also(self) -> None:
@@ -137,7 +137,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         sha = self.checkpoint("outside/unit.txt", "unit's outside work\n")
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
             held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/unit.txt\n")
+            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/unit.txt\n")
             self.assertNotIn("outside/imported.txt", held.process.stdout)
             self.assertNotIn("outside/second.txt", held.process.stdout)
             accepted = self.run_checkpoint(sha, "--also", "outside/unit.txt")
@@ -162,7 +162,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         sha = self.checkpoint()
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
             held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/imported.txt, outside/second.txt")
+            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt, outside/second.txt")
             _ = doc.write_text(doc.read_text() + f"- **Change review:** `{self.root / 'other-review.md'}`\n")
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)

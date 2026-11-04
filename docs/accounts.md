@@ -300,6 +300,7 @@ A move stops the session's Claude process, then resumes the same conversation in
 One result line per member names its resumed account and pane, or the failure. The command returns the result directly. There is no move record, ready mark, follow or cancel step. `/showrunner:move` uses this same path and result.
 
 A single session is found by id, then exact name.
+A move outside the group account prints that the member returns to the group account at its next resume or restart.
 Ambiguous or unknown sessions return an error.
 A session already on the target returns success.
 A group move selects its account for future launches, then moves each live member on another account once.

@@ -8,7 +8,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import AbstractContextManager, closing, redirect_stdout
+from contextlib import AbstractContextManager, closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, final, override
@@ -118,6 +118,16 @@ class WasteWatchTests(unittest.TestCase):
     def alert_times(self) -> dict[str, str]:
         path = self.db_path.parent / "waste_watch.json"
         return cast(dict[str, str], json.loads(path.read_text(encoding="utf-8"))) if path.exists() else {}
+
+    def test_docless_row_warns_without_failing_healthy_showrunner_discovery(self) -> None:
+        _ = fixture_member("showrunner", name="docless")
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            found = REAL_DISCOVERY()
+        self.assertIsInstance(found, waste_watch.ShowrunnersFound)
+        assert isinstance(found, waste_watch.ShowrunnersFound)
+        self.assertEqual([runner.slug for runner in found.showrunners], ["watch"])
+        self.assertEqual(errors.getvalue().splitlines(), ["warning: docless: the production document is not recorded"])
 
     def test_partial_discovery_keeps_the_lookup_unknown_instead_of_complete(self) -> None:
         partial = showrunners.ShowrunnerDiscovery([], (

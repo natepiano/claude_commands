@@ -87,6 +87,8 @@ from scripts.message.unit_labels import (
     unit_of as _unit_of,
     short_unit as _short_unit,
     ProductionPlace as _ProductionPlace,
+    StaffDiagnostics as _StaffDiagnostics,
+    StaffRowAnomaly as _StaffRowAnomaly,
     DirectorSession as _DirectorSession,
     NoRunningDirector as _NoRunningDirector,
     LiveRun as _LiveRun,
@@ -369,6 +371,7 @@ class Roster:
     entries: list[RosterEntry]
     problems: list[str]
     warnings: list[str] = field(default_factory=list)
+    row_anomalies: tuple[_StaffRowAnomaly, ...] = ()
 
     @property
     def diagnostics(self) -> list[str]:
@@ -857,7 +860,8 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     records = _newest_sessions()
     membership = staff.initial_snapshot()
     resolver = session_staff.RowResolver(membership)
-    places = _production_places(records, set(), problems,
+    diagnostics = _StaffDiagnostics(problems)
+    places = _production_places(records, set(), diagnostics,
                                 record=membership, resolver=resolver)
     place = places.get(unit_runs.director(run))
     if place is not None:
@@ -1372,8 +1376,9 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
         _problem(problems, "staff membership", error)
         membership = staff.StaffSnapshot(())
     resolver = session_staff.RowResolver(membership)
+    diagnostics = _StaffDiagnostics(problems)
     registered = _registered_showrunners(
-        problems, membership=membership, resolver=resolver,
+        diagnostics, membership=membership, resolver=resolver,
         known_sessions={record["sessionId"]: record for record in records},
     )
     runner_ids = _showrunner_ids(records, registered, membership=membership)
@@ -1383,10 +1388,11 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     production_places: dict[str, _ProductionPlace] = {}
     try:
         production_places = _production_places(
-            records, set(workers), problems, record=membership, resolver=resolver
+            records, set(workers), diagnostics, record=membership, resolver=resolver
         )
     except staff.StaffUnreadable as error:
         _problem(problems, "staff membership", error)
+    warnings.extend(diagnostics.warnings)
     claude = _claude_entries(
         machine, records, details, runner_ids, production_places, runs, workers,
         home_state=home_state, problems=problems,
@@ -1424,8 +1430,11 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
         )
     interactive = _herdr_codex_panes(machine, (runner["slug"] for runner in registered))
     problems.extend(interactive.problems)
-    entries = [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]
-    return Roster(entries, problems, warnings)
+    excluded = diagnostics.excluded_sessions
+    entries = [entry for entry in [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]
+               if not (isinstance(entry.session, ClaudeSession) and entry.session.session_id in excluded
+                       or isinstance(entry.thread, CodexThread) and entry.thread.thread_id in excluded)]
+    return Roster(entries, problems, warnings, tuple(diagnostics.anomalies.values()))
 
 
 @dataclass(frozen=True)
@@ -1478,7 +1487,7 @@ def roster(environment: Mapping[str, str], scope: RosterScope, *,
                 local = _local_roster(environment, membership=membership, records=records)
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
-                          [*local.warnings, *other.warnings])
+                          [*local.warnings, *other.warnings], (*local.row_anomalies, *other.row_anomalies))
 
 
 def _home_shortened(path: str) -> str:
