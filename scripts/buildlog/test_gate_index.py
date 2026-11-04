@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 import index
+from index import GATE_TABLES
 from test_index import Record, point_root_at, rows, table_rows, use_test_log
 
 use_test_log()
@@ -32,7 +33,6 @@ else:
 
 EPOCH = 1_793_700_000.0
 STARTED = "2026-11-03T12:00:00.000Z"
-GATE_TABLES = ("gate_runs", "gate_suites", "gate_modules", "gate_tests")
 
 
 def fixture_run() -> GateRun:
@@ -127,7 +127,11 @@ class GateIndexTests(unittest.TestCase):
                 })
         self.assertCountEqual(table_rows("gate_tests"), expected_tests)
         before = self.snapshot()
-        self.assertEqual(index.update(), 0)
+        with closing(index.read_only()) as connection:
+            version = cast(tuple[int], connection.execute("PRAGMA data_version").fetchone())
+            self.assertEqual(index.update(), 0)
+            self.assertEqual(cast(tuple[int], connection.execute("PRAGMA data_version").fetchone()), version,
+                             "An unchanged update must not write the database")
         self.assertEqual(self.snapshot(), before)
 
     def test_reused_run_has_zero_counts_and_no_child_rows(self) -> None:

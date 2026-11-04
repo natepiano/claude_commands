@@ -18,6 +18,7 @@ from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -74,7 +75,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
             return result
 
         with merge_gate.rollback_signals(), mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
-            with self.assertRaisesRegex(merge_gate.GateRefused, "interrupted by SIGTERM"):
+            with self.assertRaisesRegex(GateRefused, "interrupted by SIGTERM"):
                 merge_gate.reap_gate_job(finished)
         self.assertEqual(finished.process.returncode, 7)
         self.assertGreater(finished.cpu_seconds, 0.0)
@@ -171,7 +172,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         path = Path(self.environment["BUILDLOG_JOBSERVER_FIFO"])
         path.unlink()
         self.write(path, "Q")
-        with mock.patch.dict(os.environ, self.environment), self.assertRaises(merge_gate.GateRefused):
+        with mock.patch.dict(os.environ, self.environment), self.assertRaises(GateRefused):
             with merge_gate.shared_cpu_pool():
                 self.fail("a regular file must not provide CPU slots")
         self.assertEqual(path.read_text(), "Q")

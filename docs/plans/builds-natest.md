@@ -258,7 +258,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Each module's (or group's) after median `wall_s` is at most half its before median, or the phase report names the measured floor and the proposal sent; its `cpu_s` median is not higher
 - The checkpoint gate is green, with the importers of each changed support file in it
 
-### Phase 8 — The test history tool starts without the merge gate module  · status: todo
+### Phase 8 — The test history tool starts without the merge gate module  · status: done
 **Depends on:** Phase 4
 **Blocked by:** devtools 4y — its `merge_gate.py` type-check fix reaches origin/builds (sdlc order, 2026-11-03); the builds showrunner says when.
 
@@ -329,3 +329,72 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/lint/test_memory_admit.py` and `scripts/lint/test_sweep.py` green in the checkpoint gate run
 - `python3 -m unittest discover -s scripts/build_queue` green
 - `basedpyright scripts/lint/memory_admit.py scripts/lint/sweep.py scripts/build_queue/queue_lines.py scripts/build_queue/queue_view.py scripts/build_queue/test_queue_lines.py` prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 10 — Each schema keeps its own build log index file  · status: todo
+**Depends on:** Phase 8, Phase 9
+
+#### Work Order
+
+**Goal:** two trees with different index schemas never rebuild each other's build log index, and the shared row reader holds its lock only while it reads bytes.
+
+**Spec:**
+
+1. Name the index file by a hash of the schema, so each schema has its own file. The hash covers every table, column and index, including the `build_history_group` column and the `steps_build_group_history` index (report-unit P11 e15006b41). Today one file name serves every schema, so a tree with another schema rebuilds the index each time it opens it.
+2. `index.update()` rebuilds when any `TABLES` name is missing from the file, not only on a version change (Phase 8 review F012).
+3. Delete an index file of another schema only after it is unused for an age read from config (`config/` file, no constant in code).
+4. `store.locked_rows` reads the bytes under the shared lock, releases the lock, then decodes and yields the rows (Phase 9 review F014). Writers in `locked_append` then wait only for the read, not for the caller's work.
+
+**Files:**
+- `scripts/buildlog/index.py` — schema hash file name, missing-table rebuild, old-file cleanup
+- `scripts/buildlog/store.py` — `locked_rows` lock span
+- `scripts/buildlog/test_index.py`, `scripts/buildlog/test_gate_index.py`, `scripts/buildlog/test_store.py` — tests
+- a `config/` file for the cleanup age
+
+**Workers:** 1 writer + 1 tester — the index and store changes are one module group
+- `impl` — `index.py`, `store.py`, the config file
+- `test` — the three test files, from the Spec
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 8: `index.GATE_TABLES` is the tuple of gate tables, taken from the `TABLES` keys; `show.py` probes them. `update()` skips the `meta` root write when the stored root is the same.
+- Phase 9: `memory_admit.anonymous_history_rows`, `sweep.build_log_rows`, `sweep.trim_row_recorded` and `sweep.read_sweep_removals` read through `store.locked_rows`. `sweep.build_log_rows` raises `FileNotFoundError` when an enumerated month is absent after the read.
+- Ledger routes: Phase 8 F012, F013; Phase 9 F014.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/buildlog` green
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_sweep.py` and `scripts/test_times` green in the checkpoint gate run
+- `basedpyright scripts/buildlog` prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 11 — Shared test fixtures skip repeated setup  · status: todo
+**Depends on:** Phase 6
+
+#### Work Order
+
+**Goal:** a test with a fresh HOME skips the `lib/py` interpreter probe, and `NixFixture` stops copying the whole `config` folder for each test.
+
+**Spec:**
+
+1. Add one shared helper in `scripts/lib/py_floor_test_support.py` that sets `XDG_CACHE_HOME` to a folder for the test and writes the interpreter cache file there with `cache_file_name()` (`:26`). `recorder_fixture.launcher_environment` (`scripts/direct/recorder_fixture.py:198-208`) and `test_simplify_lens.py` use it; the copy in `recorder_fixture.py` goes. Estimate: 20-40 ms for each test that makes a fresh HOME.
+2. `NixFixture.setUp` (`scripts/lib/nix_env_test_support.py:50`) copies the `config` folder (55 files, 288 KB) once per class, or copies only the files the tests read. Each test keeps its own writable copy of any file it changes.
+3. Measure each changed importer module before and after with `scripts/test_times/module_run.py`, three runs each.
+
+**Files:**
+- `scripts/lib/py_floor_test_support.py`, `scripts/lib/nix_env_test_support.py` — helpers
+- `scripts/direct/recorder_fixture.py`, `scripts/direct/test_simplify_lens.py` — callers
+- every module that imports `nix_env_test_support.py` — run in the gate
+
+**Workers:** 2 writers — one helper each
+- `impl` — `py_floor_test_support.py`, `recorder_fixture.py`, `test_simplify_lens.py`
+- `test` opens as impl — `nix_env_test_support.py`
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 6: `test_simplify_lens.py` seeds one git repository per class and records `start-phase simplify` once per class.
+- Ledger routes: Phase 6 F018, F019. Phase 6 F017 (the `assign.py` exec call) belongs to sdlc devtools, not this phase.
+
+**Acceptance gate:**
+- every importer of the two helpers green in the checkpoint gate run
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+- each changed importer's after median `cpu_s` is not higher than its before median
