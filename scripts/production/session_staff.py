@@ -546,7 +546,7 @@ def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], *,
     return _group_marked_units(marked, record, sources, production_members(record, sources))
 
 
-def retained_unit_marks(marked: Iterable[tuple[str, MarkedUnit]], row: staff.StaffRow, slug: str, *,
+def retained_session_labels(marked: Iterable[tuple[str, MarkedUnit]], row: staff.StaffRow, slug: str, *,
                         record: staff.StaffSnapshot, sources: MemberSources) -> MarkedProductions:
     """Keep pane evidence for a retained identity during stop and cleanup checks."""
     membership = production_members(record, sources)

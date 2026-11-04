@@ -22,11 +22,11 @@ It searches the start directory and then its parents. Resolved `.envrc` files
 under the default trusted roots `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
 `direnv allow <envrc>`. Linked worktrees outside those roots are also approved
 when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
-a repository under a trusted root, using file reads alone. This covers
-style-sync lint snapshots made with `git worktree add` under `/tmp/claude/session`;
-forged links still require explicit approval.
+a repository under a trusted root, using file reads alone.
+Style-sync lint uses `copies.standing` below the trusted `~/worktrees/gates` root.
+Forged links still require explicit approval.
 
-Copies registered by `copies.py` under the configured scratch copies root
+Legacy copies registered under the configured scratch copies root
 (normally `/tmp/claude/copies/<pair>/<copy>`) also qualify when `.envrc` is a
 regular file, not a symlink, at the copy's top level. `registered_copy` uses
 `copy_record.copy_folder` to prove that location and `copy_record.read_record` to

@@ -8,7 +8,7 @@ import sqlite3
 import sys
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from enum import Enum, auto
 from typing import Literal, TypeVar, cast
 
@@ -452,20 +452,12 @@ def mac_report(connection: sqlite3.Connection, now: datetime, hours: float = 24)
 
 
 def main(args: list[str]) -> int:
-    hours = 24.0
-    try:
-        if args:
-            if len(args) != 2 or args[0] != "--hours":
-                raise ValueError
-            hours = float(args[1])
-            if not math.isfinite(hours) or hours <= 0:
-                raise ValueError
-        now = datetime.now(UTC)
-        # Validate the requested range before reading the index.
-        _ = report_windows(now, hours)
-    except (ValueError, OverflowError):
-        print("usage: buildlog mac-report [--hours N] (N must be a positive number)", file=sys.stderr)
+    from number_option import positive_window
+
+    window = positive_window(args, "--hours", 24, "mac-report")
+    if window is None:
         return 2
+    now, hours = window[1:]
     _ = index.update()
     connection = index.read_only()
     try:

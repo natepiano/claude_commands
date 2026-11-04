@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate a user's bumped checkpoint in a detached clone of its pushed tip."""
+"""Gate a bumped checkpoint in a standing checkout of its pushed tip."""
 from __future__ import annotations
 
 import argparse
@@ -10,10 +10,10 @@ from typing import cast
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import build_folders
+from scripts.copies import copies
 
 from merge_checkpoint import (
-    Stop, complete_gate, git, good, read_record, record_lock,
+    Stop, complete_gate, read_record, record_lock,
     run_checkpoint_test_steps, save_record,
 )
 from production_units import Production
@@ -37,21 +37,17 @@ def run_gate(path: Path) -> int:
         record["proc_start"] = proc_start
         save_record(path, record)
     try:
-        with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                build_folders.FOLDER_PREFIXES["bump-gate"], build_folders.ExplicitBuildParent(path.parent))) as temporary:
-            clone = temporary / "checkout"
-            _ = good(git(Path(record["checkout"]), "clone", "--shared", "--no-checkout",
-                         record["checkout"], str(clone)), "clone")
-            _ = good(git(clone, "checkout", "--detach", record["tip"]), "checkout pushed tip")
+        with copies.standing(record["slug"], Path(record["checkout"]), record["tip"]) as clone:
             production = Production(Path(record["production_doc"]), record["slug"], record["merge_branch"],
                                     clone, Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
+            os.environ["BUILDLOG_UNIT"] = record["unit"]
             detail = run_checkpoint_test_steps(
                 production, tuple(record["paths"]), tuple(tuple(command) for command in record["merge_tests"]),
                 frozenset(record["flakes"]), frozenset(record["flaky_tests"]), Path(record["log"]),
             )
         complete_gate(path, record, "green", detail)
         return 0
-    except (Stop, OSError, ValueError, KeyError, TypeError) as error:
+    except (Stop, copies.CopyError, OSError, ValueError, KeyError, TypeError) as error:
         detail = f"{error.step}: {error.detail}" if isinstance(error, Stop) else f"gate failed before completion: {error}"
         print(detail, flush=True)
         complete_gate(path, record, "red", detail)

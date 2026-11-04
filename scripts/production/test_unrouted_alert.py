@@ -21,7 +21,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.production import change_routing, staff, unrouted_alert
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, production_staff_record
 
 
 class UnroutedAlertTests(unittest.TestCase):
@@ -239,6 +239,7 @@ assert 'send' not in sys.modules
         self.assertFalse((self.root / "links").exists())
 
     def test_a_failed_alert_keeps_the_broken_producer_unrouted(self) -> None:
+        _ = self.enterContext(production_staff_record())
         _ = self.enterContext(patch.object(change_routing, "configured_lists_directory", return_value=self.root))
         router, _, unit = self.orphan_router()
         with (patch.object(unrouted_alert, "send_message", side_effect=RuntimeError("not reached")), redirect_stderr(StringIO())):
@@ -247,6 +248,7 @@ assert 'send' not in sys.modules
         self.assertEqual(owner.tab, "unrouted")
 
     def test_an_unrouted_list_in_the_real_folder_sends_once_through_the_fake_sender(self) -> None:
+        _ = self.enterContext(production_staff_record())
         router, _, unit = self.orphan_router()
         with (patch.object(change_routing, "configured_lists_directory", return_value=self.root),
               patch.object(unrouted_alert, "send_message") as send):

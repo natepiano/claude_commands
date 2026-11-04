@@ -35,6 +35,8 @@ The terminal status table lists the numbered Claude and Codex accounts.
 The table includes accounts without a login.
 `~/.claude` is the shared config home and has no account row.
 The legacy `~/.codex` has a row only while it holds a login.
+An empty numbered Codex home has no row when `~/.codex` holds its note's login.
+Usage reads use the home that holds the login.
 A noted account without a usable home has a `not set up` row when no home holds its login.
 Each role has a separate row.
 The first role row shows the account's values.
@@ -157,15 +159,14 @@ A readable credential entry without a token requires a session or manual login.
 
 Natedev's `agent-notes` job runs `scripts/maintenance/agent_notes_job.py`.
 Notes, quota warnings, the Codex pacer, refusal moves, crash recovery, phase-note
-pruning, the hana hierarchy note and the vault commit each run in a separate
-process with a time limit. `config/agent_notes.toml` owns their intervals and
+pruning and the vault commit each run in a separate process.
+Each process has a time limit. `config/agent_notes.toml` owns their intervals and
 limits and is read on each run. A slow or failed part does not stop the other
 parts. Quota warnings and the pacer read after the notes part exits;
 the vault commit runs after the writers exit. A rerun skips completed parts
 until their next interval and retries failed parts.
-A part that leaves its note as it stands is logged as skipped and counts as
-completed for its interval; a source-command failure or timeout still fails
-the job. Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
+A failed or timed-out part fails the job.
+Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
 
 Notes reuse usage reports for less than ten minutes, keeping their original
 reading times. Each notes pass refreshes session counts from the roster. Usage reports without credentials stay in

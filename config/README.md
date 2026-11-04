@@ -169,7 +169,11 @@ The `budget_notice_*_percent` keys set the notice thresholds.
 `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.
 `existing_data_volume_id` selects a retained volume. An empty value requests a new volume.
 `spot_max_usd_per_hour` limits the Spot request price.
-`deployment_price_usd_per_hour` and `deployment_price_at` record the current public price and its Unix timestamp.
+`deployment_price_file` names the price state file outside the repository. Its default path is `~/.config/aws-build/deployment-price`.
+Run `python3 scripts/aws_target/deploy.py price` before `prepare`.
+The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
+It writes the price and its read time atomically with mode `0600`.
+`prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
 `preflight_max_age_s` limits preparation age. `deployment_timeout_s` bounds each deployment command.
 `scaler_user_name` names the IAM user.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.

@@ -430,7 +430,9 @@ the turn and resumes from a task message; Codex applies
   handoff from review intent-to-add and commits.
 - Never stop or delay work for compaction. Claude resumes from a live-dispatch
   notification; Codex remains in <CodexDispatchWait/>.
-- End the turn when only background work remains; the next request can run compaction.
+- A wait you cannot fill is the exception. With nothing left to do but wait on
+  background work, end the turn; the Stop hook stands down there, and the
+  wake-up request compacts on its own.
 - After compaction, re-read this command in full, then the handoff. Restore live
   dispatches and state. Independently read and validate
   each open phase's `${PHASE_DIR}/delegated_phase_reservation_state.json` once coordination has
@@ -440,7 +442,7 @@ the turn and resumes from a task message; Codex applies
   checkpoint and any active release both succeed. A
   dispatch the handoff records as live but that is gone did not survive: resolve
   it per <FixDispatch/> before trusting any state it was supposed to have written.
-- End the turn for a real user decision.
+- A real user decision may still end the turn after the Stop hook's one retry.
 </CompactionContract>
 
 <UserFacingText>
@@ -1712,6 +1714,6 @@ Apply <UserFacingText/> and <RetainPhaseReservation/> for every ending
 that did not complete <CheckpointCommit/>. Then run `progress_history.py finish-run` with
 `completed`, `stopped`, or `error`; it closes active pass/phase as incomplete
 when needed. Finally run `bash ~/.claude/scripts/direct/end_session.sh` on
-every exit. Then run
+every exit so the Stop hook cannot revive a finished run. Then run
 <ReviewPendingAddOns/>; the summary and its commits never wait on it.
 </RunSummary>

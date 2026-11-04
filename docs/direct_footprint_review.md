@@ -145,7 +145,7 @@ would take them. Each is text that looks like rationale and is the only guard fo
 a reachable failure.
 
 - **The stale final-diff story** (`<EarlyReviewArm/>` 1407-1422, 1457-1462, 1477-1485). `review.sh` waits for sentinel *existence* and cannot tell whether the sentinel belongs to this phase. Without the full-glob delete, the proof-of-absence, the diff-before-sentinel ordering and the void-verdict rule, an old `final_diff_*.ready` releases the reviewer immediately onto a previous phase's diff and returns fluent false findings. ~2,270 tempting bytes, zero safe.
-- **Both timer rules** (`<ProgressContract/>` 666-669 and 803-812) require a future request during active work and the report already due.
+- **Both timer absolutes** (`<ProgressContract/>` 666-669 and 803-812). They read as one rule twice and prevent opposite defects: running work with no wake-up, and satisfying the Stop hook by re-arming without giving the report already owed. The hook blocks once and cannot compose a report.
 - **The phase-count story at both sites.** `progress_history.py` corrects the percentage only when called; it cannot stop a *later* report from counting by hand. `<RemainingWorkOutlook/>` runs after phase completion when no live progress call exists — a cross-reference there is not equivalent.
 - **Token self-deadlock and premature-green.** `verify.sh` cannot stop a delegate acquiring the token first, and cannot know whether the peer owning a package has posted `done`.
 - **Provider and transport fallbacks.** `codex_mesh=0` is still supported; Claude `--bg` has no reply redirect, so the summary-as-last-act rule is live; a finished Claude session resumes and a finished Codex thread stays open for `implement.sh --to` follow-ups.

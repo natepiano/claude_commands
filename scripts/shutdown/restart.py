@@ -62,8 +62,14 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr) -> bool:
     panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
-    if panes and (len(panes) != 1 or client.native_session(
-            panes[0]["pane_id"], "claude", herdr.PROGRAM_TIMEOUT_SECONDS) != row.current_session):
+    if len(panes) == 1:
+        try:
+            identity = client.native_session(panes[0]["pane_id"], "claude", herdr.PROGRAM_TIMEOUT_SECONDS)
+        except herdr.HerdrFailure:
+            identity = client.native_session(panes[0]["pane_id"], "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
+    else:
+        identity = row.current_session if not panes else ""
+    if identity != row.current_session:
         _anomaly(row, "pane runs another conversation; no signal sent")
         return False
     result = stop_resume.stop(str(row.current_session))
