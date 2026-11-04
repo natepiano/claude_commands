@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
 import json
 import shlex
@@ -12,11 +12,95 @@ from unittest import mock
 
 from scripts.production import rename_test_support as support
 from scripts.production import staff
+from scripts.message import sessions
+from scripts.herdr import herdr
 from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT_MOVE_INDEX, NEW, OLD, UNITS
 
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def test_same_name_keeps_a_pane_with_another_native_session(self) -> None:
+        row = self.production_row()
+        displays = support.RenameDisplays(row)
+        other = herdr.NativeAgentProcess(fixture_runtime_id("another-live-session"), "probe-generation", {})
+        with (displays.installed(), mock.patch.object(herdr, "native_process", return_value=other)):
+            result = self.run_command("apply", row.name, row.name)
+        self.assert_success(result)
+        self.assertEqual(displays.commands, [])
+        self.assertEqual((displays.pane, displays.tab, displays.workspace), ("previous",) * 3)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("anomaly:", result.stderr)
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_same_name_reports_an_unavailable_display_and_succeeds(self) -> None:
+        row = self.production_row()
+        displays = support.RenameDisplays(row)
+        with (displays.installed(), mock.patch.object(herdr.Herdr, "panes",
+                side_effect=herdr.HerdrFailure("display unavailable"))):
+            result = self.run_command("apply", row.name, row.name)
+        self.assert_success(result)
+        self.assertEqual(result.stderr.strip(), "anomaly: set_displays: display unavailable")
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_same_name_repairs_displays_without_an_update_timer(self) -> None:
+        row = self.production_row()
+        (self.notifier / f"showrunner-{row.name}" / "conf").unlink()
+        displays = support.RenameDisplays(row)
+        with displays.installed():
+            result = self.run_command("apply", row.name, row.name)
+        self.assert_success(result)
+        self.assertEqual((displays.pane, displays.tab, displays.workspace), (row.name,) * 3)
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_same_name_repairs_the_current_session_and_keeps_an_old_session(self) -> None:
+        row = self.production_row()
+        current = staff.native_id(fixture_runtime_id("showrunner-session-after-clear"))
+        row = staff.update_current_session(row.current_session, current)
+        record = sessions.SessionRecord(sessionId=current, name="previous", pid=998041,
+            procStart="probe-generation", updatedAt=1, formerNames=[], tmux="", entrypoint="cli", messagingSocketPath="")
+        path = self.root / "state/sessions/998041.json"
+        old_path = self.root / "state/sessions/998042.json"
+        self.write(path, json.dumps(record))
+        self.write(old_path, json.dumps({**record, "sessionId": row.id, "pid": 998042}))
+        before = old_path.read_bytes(), old_path.stat().st_mtime_ns
+        displays = support.RenameDisplays(row)
+        displays.pane = displays.tab = displays.workspace = row.name
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+            self.assert_success(self.run_command("apply", row.name, row.name))
+            self.assertEqual(json.loads(path.read_text())["name"], row.name)
+            settled = path.read_bytes(), path.stat().st_mtime_ns
+            rerun = self.run_command("apply", row.name, row.name)
+        self.assert_success(rerun)
+        self.assertEqual(rerun.stdout.strip(), "unchanged")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), settled)
+        self.assertEqual((old_path.read_bytes(), old_path.stat().st_mtime_ns), before)
+        self.assertEqual(staff.by_id(row.id), row)
+
+
+    def test_same_name_repairs_each_display_and_keeps_the_current_row(self) -> None:
+        row = self.production_row()
+        row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("showrunner-after-clear")))
+        for field in ("pane", "tab", "workspace"):
+            with self.subTest(field=field):
+                displays = support.RenameDisplays(row)
+                displays.pane = displays.tab = displays.workspace = row.name
+                setattr(displays, field, "previous")
+                before = self.snapshot()
+                with displays.installed():
+                    result = self.run_command("apply", row.name, row.name)
+                    self.assert_success(result)
+                    self.assertNotIn("unchanged", result.stdout)
+                    self.assertEqual((displays.pane, displays.tab, displays.workspace), (row.name,) * 3)
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(self.snapshot(), before)
+                    commands = list(displays.commands)
+                    rerun = self.run_command("apply", row.name, row.name)
+                self.assert_success(rerun)
+                self.assertEqual(rerun.stdout.strip(), "unchanged")
+                self.assertEqual(displays.commands, commands)
+                self.assertEqual(self.snapshot(), before)
+
+
     def test_document_rename_updates_a_wrapped_location_without_reactivating_its_row(self) -> None:
         row = self.production_row()
         _ = staff.set_doc(row.id, staff.WrappedDoc("natedev", self.doc))

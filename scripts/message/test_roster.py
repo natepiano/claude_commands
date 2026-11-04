@@ -639,11 +639,11 @@ class RosterTests(unittest.TestCase):
         )
 
     def test_durable_role_roster_uses_holder_reach_after_its_run_folder_is_gone(self) -> None:
-        member = designer_fixture(design_roles.UnitHolder("alpha", "unit-one"),
+        member = designer_fixture(unit_membership("alpha", "unit-one").id,
                                   "lasting-astra-designer", self.root / "codex-home")
         design = design_roles.HeldDesign(design_roles.DesignPlacement("00000000-0000-4000-8000-000000000046", "fixture-host", 2),
             "fixture-repo", str(self.root / "checkout"), str(self.root / "checkout/design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("alpha", "unit-one"), design_roles.DesignUnbound(),
+            "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
             (design_roles.RoleInstance("designer", "lasting-astra-designer", design_roles.RoleOpen(member.id)),
              design_roles.RoleInstance("reviewer", "lasting-reviewer-alias", design_roles.RoleNotOpened())))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
@@ -651,8 +651,7 @@ class RosterTests(unittest.TestCase):
         mesh.mkdir(parents=True)
         _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-astra-designer": {
             "staff_id": member.id, "status": "done"}}))
-        with mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("17e44ec4-3e24-5ae1-b10d-5cf30de9455b")):
-            found = self._entries()
+        found = self._entries()
         entry = found["lasting-astra-designer"]
         self.assertEqual(entry.thread, roster.CodexThread(member.current_session))
         self.assertEqual(entry.role, "astra-designer")
@@ -1056,7 +1055,7 @@ class RosterTests(unittest.TestCase):
 
 
     def test_bad_durable_binding_warns_once_and_a_named_peer_still_receives_the_send(self) -> None:
-        bad = write_empty_binding_record(self.root, design_roles.UnitHolder('other', 'other-unit'))
+        bad = write_empty_binding_record(self.root)
         peer = self._entry('natedev', 'freestanding', 'session:peer-session')
         os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([peer], [])).encode()
         output, errors = io.StringIO(), io.StringIO()
@@ -1082,7 +1081,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(forwarded.text, 'owner update')
 
     def test_durable_warnings_survive_snapshots_and_do_not_change_roster_exit_status(self) -> None:
-        bad = write_empty_binding_record(self.root, design_roles.UnitHolder('other', 'other-unit'))
+        bad = write_empty_binding_record(self.root)
         code, output, errors = self._run_main('--json')
         self.assertEqual(code, 0, errors)
         report = cast(dict[str, object], json.loads('\n'.join(output)))
@@ -1094,20 +1093,23 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(decoded.warnings, result.warnings)
         self.assertEqual(decoded.problems, [])
 
-    def test_mesh_titles_use_held_design_holder_and_fall_back_when_it_is_unreadable(self) -> None:
+    def test_mesh_titles_use_worker_parents_and_fall_back_when_the_design_is_unreadable(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000099"
-        design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
-            "fixture-repo", str(self.root), str(self.root / "design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("sdlc", "roles-unit"), design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", "design-address", design_roles.RoleNotOpened()),
-             design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleNotOpened())))
+        unit = unit_membership("sdlc", "roles-unit")
+        runner = showrunner_relationship("sdlc")
         mesh = str(design_roles.mesh_directory(design_id))
-        for holder, prefix in ((design_roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
-                               (design_roles.ShowrunnerHolder("sdlc"), "sdlc")):
-            design_roles._save(replace(design, holder=holder))  # pyright: ignore[reportPrivateUsage]
+        for parent, prefix in ((unit, "sdlc · roles"), (runner, "sdlc")):
+            designer = fixture_worker("design-address", parent.id)
+            reviewer = fixture_worker("review-address", parent.id)
+            design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
+                "fixture-repo", str(self.root), str(self.root / "design.md"), "design",
+                "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
+                (design_roles.RoleInstance("designer", "design-address", design_roles.RoleOpen(designer.current_session)),
+                 design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleOpen(reviewer.current_session))))
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             for held_role, name, job in (("designer", "design-address", "designer"),
                                          ("reviewer", "review-address", "design reviewer")):
-                with self.subTest(holder=holder, role=held_role):
+                with self.subTest(parent=parent, role=held_role):
                     shown = roster.mesh_shown_name(mesh, name, {"held_design_id": design_id, "held_role": held_role})
                     self.assertEqual(shown.render(), f"{prefix} · {job}")
                     self.assertEqual(shown.address, name)

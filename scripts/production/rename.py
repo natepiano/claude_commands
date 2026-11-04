@@ -160,12 +160,14 @@ def plan(old: str, new: str) -> RenamePlan:
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise RenameRefused(f"{slug} has no readable update timer: {checked.reason}")
     production = read_production(checked.path)
+    same_name = old == new == member.name
     old = slug
     if slug == new:
         former = showrunners.former_slugs(production.doc.read_text(encoding="utf-8"))
-        if not former:
+        if not former and not same_name:
             raise RenameRefused(f"{new} is already the production's name")
-        old = former[0]
+        # Unit branch moves still need the former production name.
+        old = former[0] if former else new
     _ = unit_move.git(production.checkout, "check-ref-format", "--branch", new)
     new_doc = production.doc.with_name(f"{new}-production.md")
     old_doc = production.doc.with_name(f"{old}-production.md") if production.doc == new_doc else production.doc
@@ -208,7 +210,6 @@ def _describe(plan: RenamePlan) -> list[str]:
             *(f"4. showrunner state {moves(move)}" for move in plan.state),
             f"4. parent files {plan.state[-1].source.parent}/*/parent: {plan.old} -> {plan.new}",
             *(f"4. parent {path}: {plan.old} -> {plan.new}" for path in parents),
-            f"4. held design roles: holder {plan.old} showrunner -> {plan.new} showrunner",
             *rename_outside.describe(plan.old, plan.new, plan.old_doc, plan.new_doc),
             *(stretches or ["5. stall-watch: no units"]),
             (f"6. merge branch {plan.merge_branch} -> {plan.new} (git branch -m); commit {plan.message!r}; "
@@ -285,16 +286,9 @@ def _rename_showrunner_state(plan: RenamePlan) -> None:
         directory.source.rmdir()
     for child in showrunner_tree.stored_children(plan.new):
         write_text(directory.destination.parent / child / "parent", plan.new + "\n")
-    _move_held_roles(design_roles.ShowrunnerHolder(plan.old), design_roles.ShowrunnerHolder(plan.new))
     rename_outside.apply(plan.old, plan.new, plan.old_doc, plan.new_doc)
 
 
-def _move_held_roles(old: design_roles.Holder, new: design_roles.Holder, old_checkout: str = "", new_checkout: str = "") -> None:
-    """Held design roles name the renamed production as holder, so resume, rebind and end accept it."""
-    try:
-        design_roles.move_holder(old, new, old_checkout, new_checkout, reason="production rename")
-    except (OSError, ValueError, SystemExit) as error:
-        raise RenameRefused(f"held roles: {error}") from error
 
 
 def _rename_stall_watch(plan: RenamePlan) -> None:
@@ -324,13 +318,17 @@ def _retarget_phase_notes(plan: RenamePlan) -> None:
     _ = phase_table.retarget_phase_notes(plan.old, plan.new_doc)
 
 
-def _set_displays(plan: RenamePlan) -> None:
-    """Show the new name on the showrunner's herdr tab."""
-    row = staff.by_id(plan.staff_id)
-    client = herdr.Herdr(herdr.shared_session())
-    for pane in client.panes():
-        if row is not None and pane.get("session_id") == row.current_session:
-            _ = client.retitle(pane["pane_id"], row.name)
+def _set_displays(plan: RenamePlan | staff.StaffRow) -> bool:
+    """Repair the showrunner's current session and display names."""
+    from scripts.production.rename_unit import repair_displays
+
+    if isinstance(plan, staff.StaffRow):
+        row = plan
+    else:
+        row = staff.by_id(plan.staff_id)
+        if row is None:
+            raise staff.StaffNotFound(plan.staff_id)
+    return repair_displays(row)
 
 
 STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state, _rename_stall_watch,
@@ -352,17 +350,30 @@ def _pending(plan: RenamePlan) -> bool:
             or unit_move.remote_tip(plan.checkout, plan.branch) != unit_move.branch_tip(plan.checkout, plan.branch))
 
 
-def apply(old: str, new: str) -> RenamePlan:
+def apply(old: str, new: str) -> RenamePlan | staff.StaffRow:
     """Write the name, then do each step; a step that fails prints one anomaly line and the next step runs."""
     with staff.operation(), design_roles.record_operation(), unit_move.production_lock():
-        result = plan(old, new)
-        if not _pending(result):
-            print("unchanged")
+        result: RenamePlan | staff.StaffRow
+        if old == new:
+            found = [row for row in staff.find(kind="showrunner") if row.name == old]
+            if not found:
+                raise staff.StaffRefused(f"{old}: no showrunner staff row")
+            result = found[0]
+        else:
+            result = plan(old, new)
+        if isinstance(result, staff.StaffRow) or not _pending(result):
+            try:
+                changed = _set_displays(result)
+            except (OSError, ValueError, Refusal, tidy_wrapped.TidyRefused,
+                    staff.StaffRefused, herdr.HerdrFailure, WorkerUnavailable) as error:
+                print(f"anomaly: set_displays: {error}", file=sys.stderr)
+                changed = True
+            print("done" if changed else "unchanged")
             return result
         _ = staff.rename(result.staff_id, result.new)
         for step in STEPS:
             try:
-                step(result)
+                _ = step(result)
             except (OSError, ValueError, Refusal, tidy_wrapped.TidyRefused,
                     staff.StaffRefused, herdr.HerdrFailure) as error:
                 print(f"anomaly: {step.__name__.lstrip('_')}: {error}", file=sys.stderr)
@@ -410,8 +421,7 @@ def unit(new: str, name: str) -> None:
         destination = _destination(source, old_branch, new_branch)
         if destination != source:
             unit_move.move_folder(found.row.id, destination)
-            _move_held_roles(design_roles.UnitHolder(result.old, name), design_roles.UnitHolder(result.new, name),
-                             str(source), str(destination))
+            design_roles.move_checkout(str(source), str(destination), reason="production rename")
         renamed = unit_move.git(destination, "branch", "--show-current") == old_branch
         if renamed:
             _ = unit_move.git(destination, "branch", "-m", old_branch, new_branch)

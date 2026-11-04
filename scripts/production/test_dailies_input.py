@@ -891,7 +891,8 @@ class DailiesInputTests(DailiesInputFixture):
         config = self.home / ".claude/config/dailies.conf"
         config.parent.mkdir(parents=True)
         _ = (self.home / "ledger.md").write_text("- a — proposed\n- b — declined\n", encoding="utf-8")
-        _ = config.write_text("example.nightly-queue=lines ~/ledger.md — proposed$\nother.queue=files ~/*.md\n",
+        owner = showrunner_relationship(fixture_showrunner_name("example", self.doc))
+        _ = config.write_text(f"{owner.id}.nightly-queue=lines ~/ledger.md — proposed$\nother.queue=files ~/*.md\n",
                               encoding="utf-8")
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -901,7 +902,8 @@ class DailiesInputTests(DailiesInputFixture):
     def test_a_bad_counts_line_leaves_the_counts_out_and_says_why(self) -> None:
         config = self.home / ".claude/config/dailies.conf"
         config.parent.mkdir(parents=True)
-        _ = config.write_text("example.queue=words ~/ledger.md\n", encoding="utf-8")
+        owner = showrunner_relationship(fixture_showrunner_name("example", self.doc))
+        _ = config.write_text(f"{owner.id}.queue=words ~/ledger.md\n", encoding="utf-8")
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("counts", self.report())

@@ -280,7 +280,7 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
         if "design_context" in record:
             _ = _state_object(path, record["design_context"])
     if path.name == "design.json":
-        for key in ("placement", "holder", "binding"):
+        for key in ("placement", "binding"):
             _ = _state_object(path, record.get(key))
         roles = record.get("roles")
         if not isinstance(roles, list):

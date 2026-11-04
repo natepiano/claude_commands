@@ -289,7 +289,7 @@ MacBlockFooterState = NoMacBlock | PendingMacBlock | ActiveMacBlock | Unreadable
 
 @dataclass(frozen=True)
 class ProductionCount:
-    """One count config/dailies.conf names for this production; `None` when its source is missing."""
+    """One count selected by the fixed showrunner id; `None` means the source is missing."""
 
     label: str
     number: int | None

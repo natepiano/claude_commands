@@ -18,7 +18,6 @@ Nothing offers the proposals: the ledger's queue grows until the user asks for /
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -160,9 +159,7 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
                     print(f"messages: account directory unavailable for {session}", file=sys.stderr)
                     continue
                 directory = setting.path
-                cwd = record.get("cwd", "")
-                candidates = ([directory / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / f"{session}.jsonl"]
-                              if cwd else list((directory / "projects").glob(f"*/{session}.jsonl")))
+                candidates = list((directory / "projects").glob(f"*/{session}.jsonl"))
             for candidate in candidates:
                 if candidate.is_file() and recent_replies(candidate, since):
                     found.add(candidate)

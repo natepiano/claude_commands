@@ -198,6 +198,25 @@ class NightlyReviewTests(unittest.TestCase):
             self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
         directory.assert_called_once_with(42)
 
+    def test_transcript_lookup_uses_session_id_after_the_folder_changes(self) -> None:
+        records = self.root / "sessions"
+        records.mkdir()
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        identity = self.transcript_owner("natedev")
+        config = self.root / "account"
+        path = config / "projects/-previous-folder" / f"{identity}.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(nightly_review.DatedTranscriptRecord(
+            type="assistant", timestamp=since.isoformat())) + "\n")
+        _ = (records / "probe.json").write_text(json.dumps(nightly_review.TranscriptSessionRecord(
+            name="natedev", sessionId=identity, cwd="/current/folder", config_dir=str(config))))
+        unrelated = path.with_name(f"{fixture_runtime_id('unrelated-transcript')}.jsonl")
+        _ = unrelated.write_text(path.read_text())
+        with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              mock.patch.object(nightly_review, "sessions_directory", return_value=records),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
+            self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
+
     def test_live_counts_exclude_dry_runs_and_keep_unreviewed_apart_from_failures(self) -> None:
         since = datetime(2026, 10, 13, tzinfo=timezone.utc)
         records = [nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict=verdict,

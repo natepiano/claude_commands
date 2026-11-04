@@ -118,6 +118,7 @@ class ProposalsTableTests(StaffTestCase):
                          ["unscored", "blocking", "high score", "low score"])
         self.assertEqual(proposals_table.issue_rows(found)[1].state, f"{REVIEW_STATE} · blocks")
         doc = self.write("trunk/docs/plans/demo-production.md", f"- **Proposals:** `{self.root / 'issues'}`\n")
+        _ = recorded_showrunner("demo", doc)
         with mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")}), \
                 mock.patch.object(proposals_table, "owners", return_value=frozenset({"organon-unit"})):
             self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines()[0], "unscored")
@@ -300,6 +301,7 @@ class ProposalsTableTests(StaffTestCase):
 
     def test_main_says_so_when_nothing_is_open(self) -> None:
         doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n")
+        _ = recorded_showrunner("footers", doc)
         with mock.patch.object(phase_table, "show_production", return_value="{}"):
             self.assertEqual(self.run_main(["--production", str(doc)]), (0, "no open proposals\n", ""))
 
