@@ -227,9 +227,9 @@ class QueueViewTests(QueueFixtureTests):
         model = replace(model, reading=replace(model.reading,
             explanation=replace(model.reading.explanation, policy=policy)))
         with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("render read config")):
-            _, full = queue_view.pressure_check(gate.MemoryPressure(10), model)
+            _, full = queue_view.pressure_check(gate.MemoryPressure(10, condition="full"), model)
             _, swap = queue_view.pressure_check(gate.MemoryPressure(0, 15, 80, condition="swap"), model)
-            _, recovery = queue_view.pressure_check(gate.MemoryPressure(0, next_start_at=NOW + 45), model)
+            _, recovery = queue_view.pressure_check(gate.MemoryPressure(0, next_start_at=NOW + 45, condition="full"), model)
         self.assertIn("starts below full avg10 9.0%", full)
         self.assertIn("swap is at most 70% or some avg10 is at most 12.0%", swap)
         self.assertIn("one start per 45 s", recovery)
@@ -711,7 +711,7 @@ class BudgetViewTests(QueueFixtureTests):
         model = self.fixture.budget_model()
         head = model.reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
-        for reason, word in ((gate.NeedsMemory(), "low memory"), (gate.MemoryPressure(7.7), "pressure"),
+        for reason, word in ((gate.NeedsMemory(), "low memory"), (gate.MemoryPressure(7.7, condition="full"), "pressure"),
                              (gate.NeedsBuildBudget(21 * gate.GIB, 16 * gate.GIB, 21 * gate.GIB), "")):
             with self.subTest(reason=reason):
                 step = replace(head.waiter, step="nextest", reason=reason, need=21 * gate.GIB)
