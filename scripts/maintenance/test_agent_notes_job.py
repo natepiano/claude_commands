@@ -67,6 +67,94 @@ class JobTests(unittest.TestCase):
         with patch.object(job, "run_part", side_effect=part):
             self.assertTrue(all(item.exit_code == 0 for item in job.run_job()))
 
+    def vault_git(self, *arguments: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.root / "rust/hanadocs"), *arguments], check=True,
+            capture_output=True, text=True,
+        ).stdout.rstrip("\n")
+
+    def init_vault(self) -> Path:
+        vault = self.root / "rust/hanadocs"
+        vault.mkdir(parents=True)
+        _ = self.vault_git("init", "-q", "-b", "main")
+        _ = self.vault_git("config", "user.name", "Fixture")
+        _ = self.vault_git("config", "user.email", "fixture@example.test")
+        _ = self.vault_git("config", "commit.gpgsign", "false")
+        return vault
+
+    def test_phase_notes_join_an_existing_commit_without_causing_note_only_commits(self) -> None:
+        vault = self.init_vault()
+        git = self.vault_git
+        agent_note = vault / "agents/notes.md"
+        agent_note.parent.mkdir()
+        _ = agent_note.write_text("date_modified: 1\noriginal agent note\n")
+        hand = vault / "hand.md"
+        _ = hand.write_text("original hand note\n")
+        old_note = vault / "showrunners/show/old-unit.md"
+        old_note.parent.mkdir(parents=True)
+        _ = old_note.write_text("---\nphase_table: true\nproduction: show\nunit: old-unit\n---\nold unit\n")
+        _ = git("add", ".")
+        _ = git("commit", "-qm", "Initial notes")
+        original_head = git("rev-parse", "HEAD")
+        old_note.unlink()
+        note = old_note.with_name("new-unit.md")
+        note_text = "---\nphase_table: true\nproduction: show\nunit: new-unit\n---\nnew unit\n"
+        _ = note.write_text(note_text)
+        _ = hand.write_text("unrelated hand change\n")
+        _ = git("add", "hand.md")
+
+        with patch.object(Path, "home", return_value=self.root), patch("builtins.print"):
+            self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(git("rev-parse", "HEAD"), original_head)
+            _ = agent_note.write_text("date_modified: 2\noriginal agent note\n")
+            self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(git("rev-parse", "HEAD"), original_head)
+            _ = agent_note.write_text("date_modified: 3\nchanged agent note\n")
+            self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(git("show", "HEAD:showrunners/show/new-unit.md"), note_text.strip())
+        self.assertNotIn("showrunners/show/old-unit.md", git("ls-tree", "-r", "--name-only", "HEAD").splitlines())
+        self.assertEqual(git("show", "HEAD:hand.md"), "original hand note")
+        self.assertEqual(git("status", "--porcelain"), "M  hand.md")
+
+    def test_content_commit_leaves_unrelated_showrunner_markdown_unchanged(self) -> None:
+        vault = self.init_vault()
+        folder = vault / "showrunners/tools"
+        folder.mkdir(parents=True)
+        agent_note = vault / "agents/notes.md"
+        agent_note.parent.mkdir()
+        _ = agent_note.write_text("original agent note\n")
+        design = folder / "design.md"
+        deleted = folder / "deleted-design.md"
+        _ = design.write_text("original design\n")
+        _ = deleted.write_text("kept design\n")
+        _ = self.vault_git("add", ".")
+        _ = self.vault_git("commit", "-qm", "Initial notes")
+
+        _ = design.write_text("unrelated design edit\n")
+        _ = self.vault_git("add", "showrunners/tools/design.md")
+        deleted.unlink()
+        personal = folder / "personal.md"
+        _ = personal.write_text("# Personal note\nphase_table: true\n")
+        disabled = folder / "disabled.md"
+        _ = disabled.write_text("---\nphase_table: false\nproduction: tools\nunit: disabled\n---\n")
+        phase = folder / "unit.md"
+        phase_text = '---\nphase_table: true\nproduction_file: "[[tools-production]]"\nunit: tools-unit\n---\n'
+        _ = phase.write_text(phase_text)
+        _ = agent_note.write_text("changed agent note\n")
+        with patch.object(Path, "home", return_value=self.root), patch("builtins.print"):
+            self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(self.vault_git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(self.vault_git("show", "HEAD:showrunners/tools/unit.md"), phase_text.strip())
+        self.assertEqual(self.vault_git("show", "HEAD:showrunners/tools/design.md"), "original design")
+        self.assertEqual(self.vault_git("show", "HEAD:showrunners/tools/deleted-design.md"), "kept design")
+        self.assertEqual(set(self.vault_git("status", "--porcelain", "--untracked-files=all").splitlines()), {
+            "M  showrunners/tools/design.md", " D showrunners/tools/deleted-design.md",
+            "?? showrunners/tools/personal.md", "?? showrunners/tools/disabled.md",
+        })
+
     def test_a_hung_part_times_out_without_costing_a_parallel_part(self) -> None:
         script = self.root / "part.py"
         _ = script.write_text("import signal,sys\nif sys.argv[-1] == 'notes': signal.pause()\nprint('completed')\n")
