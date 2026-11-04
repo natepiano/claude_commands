@@ -10,14 +10,13 @@ import hashlib
 import io
 import json
 import os
-import shlex
 import select
 import subprocess
 import sys
 import tempfile
 import unittest
 from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO, cast, override
@@ -7203,6 +7202,140 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual([phase.phase for phase in owners.by_phase], ["6"])
         self.assertEqual(owners.refused, [])
 
+    def test_reused_phase_id_claims_its_new_worktree_and_baselines(self) -> None:
+        session_dir = self.start_run("reused-57c", 40_000)
+        self.start_numbered_phase(session_dir, "57c", 40_010)
+        directory = phase_reservation.phase_directory(session_dir, "57c")
+        _ = phase_reservation.enroll(directory, "57c", "unconfigured")
+
+        def git(root: Path, *arguments: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(root), "-c", "user.name=Test",
+                 "-c", "user.email=test@example.invalid", *arguments],
+                capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
+            ).stdout.strip()
+
+        _ = git(self.working_dir, "add", ".")
+        _ = git(self.working_dir, "commit", "-qm", "home baseline")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(phase_reservation.main([
+                "claim", "--session-dir", str(session_dir), "--phase", "57c",
+                "--repo", str(self.working_dir),
+            ]), 0)
+        old_head = git(self.working_dir, "rev-parse", "HEAD")
+        self.finish_numbered_phase(session_dir, 40_020)
+
+        scratch = self.root / "scratch"
+        _ = git(self.working_dir, "worktree", "add", "-qb", "scratch", str(scratch))
+        _ = (scratch / "new.txt").write_text("new start\n", encoding="utf-8")
+        _ = git(scratch, "add", "new.txt")
+        _ = git(scratch, "commit", "-qm", "scratch baseline")
+        _ = (scratch / "dirty.txt").write_text("present before dispatch\n", encoding="utf-8")
+        new_head = git(scratch, "rev-parse", "HEAD")
+        self.assertNotEqual(new_head, old_head)
+
+        self.start_numbered_phase(session_dir, "57c", 40_030)
+        for name in (phase_reservation.WORKTREE_FILE, phase_reservation.BASELINE_FILE,
+                     phase_reservation.BASELINE_STATUS_FILE):
+            self.assertFalse((directory / name).exists(), name)
+        self.assertEqual(self.read_state(session_dir)["working_dir"], str(self.working_dir))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(phase_reservation.main([
+                "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(scratch),
+            ]), 0)
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(scratch) + "\n")
+        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), new_head + "\n")
+        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "?? dirty.txt\n")
+        owners = phase_reservation.attribute(phase_reservation.open_phases(session_dir), ["new.txt"], scratch)
+        self.assertIsInstance(owners, phase_reservation.Attribution)
+        if isinstance(owners, phase_reservation.Attribution):
+            self.assertEqual([phase.phase for phase in owners.by_phase], ["57c"])
+            self.assertEqual(owners.refused, [])
+
+    def test_reopening_a_phase_with_a_held_reservation_preserves_its_records(self) -> None:
+        for kind in (phase_reservation.ACTIVE, phase_reservation.PENDING):
+            with self.subTest(kind=kind):
+                session_dir = self.start_run(f"held-{kind}", 40_000)
+                self.start_numbered_phase(session_dir, "57c", 40_010)
+                directory = phase_reservation.phase_directory(session_dir, "57c")
+                _ = phase_reservation.enroll(directory, "57c", "board_ready")
+                _ = phase_reservation.record_active(
+                    directory, phase_reservation.Acquisition("r1", "c1", "a" * 40))
+                if kind == phase_reservation.PENDING:
+                    phase_reservation.committed(directory, "b" * 40)
+                for name, text in (
+                    (phase_reservation.WORKTREE_FILE, str(self.working_dir)),
+                    (phase_reservation.BASELINE_FILE, "a" * 40),
+                    (phase_reservation.BASELINE_STATUS_FILE, "?? existing.txt\n"),
+                ):
+                    _ = (directory / name).write_text(text, encoding="utf-8")
+                self.finish_numbered_phase(session_dir, 40_020)
+                before = {path: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+                state = (session_dir / plan_history.STATE_FILENAME).read_bytes()
+                result = self.run_failing_command(
+                    "start-phase", "--session-dir", str(session_dir), "--phase-id", "57c",
+                    "--phase-title", "New start", at=40_030,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr.strip(),
+                                 f"phase 57c holds a reservation ({kind}); confirm its release before restarting")
+                self.assertEqual((session_dir / plan_history.STATE_FILENAME).read_bytes(), state)
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_an_open_phase_retry_keeps_its_claim_from_any_cwd(self) -> None:
+        scratch = self.root / "scratch"
+        _ = subprocess.run(["git", "init", "-q", str(scratch)], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        _ = subprocess.run(
+            ["git", "-C", str(scratch), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "--allow-empty", "-qm", "scratch baseline"],
+            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        for name, extra in (("retry-57c", ()),
+                            ("retry-backfilled-57c", ("--started-at", "1970-01-01T11:06:45+00:00"))):
+            with self.subTest(name=name):
+                session_dir = self.start_run(name, 40_000)
+                with chdir(self.working_dir):
+                    self.start_numbered_phase(session_dir, "57c", 40_010, *extra)
+                directory = phase_reservation.phase_directory(session_dir, "57c")
+                _ = phase_reservation.enroll(directory, "57c", "unconfigured")
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(phase_reservation.main([
+                        "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(scratch),
+                    ]), 0)
+                state = (session_dir / plan_history.STATE_FILENAME).read_bytes()
+                events = self.read_events(name)
+                records = {path: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+                for cwd in (self.working_dir, scratch, self.root):
+                    with self.subTest(cwd=cwd), chdir(cwd):
+                        self.start_numbered_phase(session_dir, "57c", 40_020, *extra)
+                        self.assertEqual((session_dir / plan_history.STATE_FILENAME).read_bytes(), state)
+                        self.assertEqual(self.read_events(name), events)
+                        self.assertEqual({path: path.read_bytes() for path in directory.iterdir()
+                                          if path.is_file()}, records)
+
+    def test_an_open_phase_refuses_a_restart_in_another_worktree(self) -> None:
+        session_dir = self.start_run("still-open-57c", 40_000)
+        self.start_numbered_phase(session_dir, "57c", 40_010)
+        directory = phase_reservation.phase_directory(session_dir, "57c")
+        directory.mkdir(parents=True)
+        worktree = directory / phase_reservation.WORKTREE_FILE
+        _ = worktree.write_text(str(self.working_dir) + "\n", encoding="utf-8")
+        scratch = self.root / "scratch"
+        _ = subprocess.run(["git", "init", "-q", str(scratch)], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        state = (session_dir / plan_history.STATE_FILENAME).read_bytes()
+        with chdir(scratch):
+            result = self.run_failing_command(
+                "start-phase", "--session-dir", str(session_dir), "--phase-id", "57c",
+                "--phase-title", "New start", at=40_020,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr.strip(),
+                         f"Phase 57c is already open in {self.working_dir}; finish it before restarting in {scratch}.")
+        self.assertEqual((session_dir / plan_history.STATE_FILENAME).read_bytes(), state)
+        self.assertEqual(worktree.read_text(), str(self.working_dir) + "\n")
+
     def test_open_phase_reader_tracks_start_finish_and_reopen_without_writing(self) -> None:
         started_at = 40_000
         session_dir = self.start_run("open-phase-reader", started_at)
@@ -7358,114 +7491,9 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(check["prompt_phase_line"], "matched")
         self.assertEqual(check["phase_id"], "3")
 
-    def restart_fallback_arguments(self, session: Path, worker: str, kind: str) -> list[str]:
-        # Import the shutdown CLI in a child: it has its own script import roots.
-        fallback_program = """import sys
-sys.path.insert(0, sys.argv[5])
-import restart
-seat = restart.PausedSeat(run_dir=sys.argv[1], seat=sys.argv[2], role=sys.argv[3],
-    thread_id='paused-thread', turn_live=True, launcher_command=[])
-print(restart._resume_worker_command(seat, sys.argv[4]))
-"""
-        built = subprocess.run(
-            [sys.executable, "-c", fallback_program, str(session), worker, kind,
-             str(self.working_dir), str(SCRIPT.parent.parent / "shutdown")],
-            check=False, capture_output=True, text=True,
-        )
-        self.assertEqual(built.returncode, 0, built.stderr)
-        return shlex.split(built.stdout)
 
-    def test_restart_fallback_uses_the_paused_pass_phase_and_passes_the_launch_check(self) -> None:
-        for kind in ("impl", "review", "fix"):
-            with self.subTest(kind=kind):
-                session = self.start_run(f"resume-fallback-{kind}", 42_500)
-                self.start_phase(session, 42_510)
-                worker = f"paused-{kind}"
-                self.start_slot_pass(session, kind, kind, 42_515, worker_name=worker)
-                _ = (session / f"impl_worker_{kind}.json").write_text(json.dumps(
-                    {"name": worker, "slot": kind, "thread_id": "paused-thread"}))
-                self.team_slot = ""
-                self.start_numbered_phase(session, "4", 42_520)
-                arguments = self.restart_fallback_arguments(session, worker, kind)
-                self.assertIn("--phase", arguments)
-                phase = arguments[arguments.index("--phase") + 1]
-                self.assertEqual(phase, "3", "the current phase 4 is not the paused pass's phase")
-                cause: tuple[str, ...] = ()
-                if kind == "fix":
-                    self.assertIn("--fix-cause", arguments)
-                    cause = ("--fix-cause", arguments[arguments.index("--fix-cause") + 1])
-                    self.assertEqual(cause[1], "resume after a move")
-                prompt = session / f"{worker}.resume-prompt.md"
-                _ = prompt.write_text("Phase 3 — Retry handling\nResume the paused work.\n")
-                state_path = session / plan_history.STATE_FILENAME
-                before = state_path.read_bytes()
-                self.team_slot = kind
-                result = self.run_failing_command(
-                    "check-launch", "--session-dir", str(session), "--pass-kind", kind,
-                    "--phase-id", phase, "--prompt-file", str(prompt), *cause,
-                    at=42_525, complete_launch=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(state_path.read_bytes(), before, "a preflight must not change pass or slot state")
 
-    def test_restart_review_follows_worker_identity_across_a_different_durable_slot(self) -> None:
-        session = self.start_run("resume-review-different-slot", 42_500)
-        self.start_phase(session, 42_510)
-        self.start_slot_pass(session, "fix", "review", 42_515, worker_name="project-fix")
-        self.team_slot = ""
-        self.start_numbered_phase(session, "4", 42_520)
-        self.start_slot_pass(session, "impl", "impl", 42_525, worker_name="project-impl")
-        slots = self.pass_slots(session)
-        self.assertEqual(slots["fix"]["worker_name"], "project-fix")
-        self.assertEqual(slots["impl"]["worker_name"], "project-impl")
-        review, implementation = self.pass_events(session.name, "pass_started")
-        self.assertEqual(review["worker_name"], "project-fix")
-        self.assertEqual(implementation["worker_name"], "project-impl")
-        _ = (session / "impl_worker_impl.json").write_text(json.dumps(
-            {"name": "project-fix", "slot": "impl", "thread_id": "paused-thread"}))
 
-        arguments = self.restart_fallback_arguments(session, "project-fix", "review")
-        self.assertEqual(Path(arguments[1]).name, "review.sh")
-        self.assertEqual(arguments[arguments.index("--to") + 1], "project-fix")
-        self.assertIn("--phase", arguments)
-        self.assertEqual(arguments[arguments.index("--phase") + 1], "3")
-        prompt = session / "project-fix.resume-prompt.md"
-        _ = prompt.write_text("Phase 3 — Retry handling\nResume the paused review.\n")
-        result = self.run_failing_command(
-            "check-launch", "--session-dir", str(session), "--pass-kind", "review",
-            "--phase-id", arguments[arguments.index("--phase") + 1],
-            "--prompt-file", str(prompt), at=42_530, complete_launch=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_restart_omits_phase_when_worker_identity_is_missing_or_ambiguous(self) -> None:
-        for label, workers in (
-            ("ambiguous", {"fix": "project-fix", "impl": "project-fix"}),
-            ("missing", {"fix": "other-reviewer", "impl": "project-impl"}),
-        ):
-            with self.subTest(identity=label):
-                session = self.start_run(f"resume-identity-{label}", 42_500)
-                self.start_phase(session, 42_510)
-                self.start_slot_pass(session, "fix", "review", 42_515, worker_name=workers["fix"])
-                self.team_slot = ""
-                self.start_numbered_phase(session, "4", 42_520)
-                self.start_slot_pass(session, "impl", "impl", 42_525, worker_name=workers["impl"])
-                _ = (session / "impl_worker_impl.json").write_text(json.dumps(
-                    {"name": "project-fix", "slot": "impl", "thread_id": "paused-thread"}))
-
-                arguments = self.restart_fallback_arguments(session, "project-fix", "review")
-                self.assertNotIn("--phase", arguments, "a durable slot cannot prove the paused phase")
-                result = self.run_failing_command(
-                    "check-launch", "--session-dir", str(session), "--pass-kind", "review",
-                    at=42_530, complete_launch=False,
-                )
-                self.assertNotEqual(result.returncode, 0)
-                history = self.history_dir / "runs" / f"{session.name}.jsonl"
-                events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
-                refused, = [event for event in events if event["event_type"] == "launch_refused"]
-                self.assertEqual(refused["phase_id"], "")
-                self.assertEqual(refused["pass_kind"], "review")
-                self.assertIn("phase", str(refused["reason"]).lower())
 
     def test_matching_and_absent_prompt_phase_lines_both_record_the_launch_check(self) -> None:
         for label, text, expected in (

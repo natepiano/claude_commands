@@ -69,6 +69,24 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_guarded_cli_adds_an_agent_without_a_parent_and_reads_its_locations(self) -> None:
+        identity = fixture_runtime_id("morty-agent")
+        for field, state in (("worktree", "present"), ("doc", "live")):
+            with self.subTest(field=field):
+                self.staff_file.unlink(missing_ok=True)
+                result = self.cli("ensure", "agent", "--name", "morty", "--runtime-id", identity,
+                                  "--" + field, "natedev", str(self.root / "morty"), state, "--json")
+                payload = cast(object, json.loads(result.stdout))
+                row = staff.StaffRow.from_json(payload)
+                self.assertEqual((row.id, row.current_session, row.kind, row.name, row.parent),
+                                 (identity, identity, "agent", "morty", None))
+                self.assertEqual(staff.snapshot().rows, (row,))
+                self.assertEqual(staff.by_path("morty"), row)
+                shown = self.cli("show", "--kind", "agent")
+                self.assertIn("morty", shown.stdout)
+                self.assertIn("agent", shown.stdout)
+                self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
+
     def test_repeated_id_lookups_scan_the_staff_rows_at_most_once(self) -> None:
         _, unit, _ = self.tree()
         expected = tuple(replace(unit, id=staff.StaffId(fixture_runtime_id(f"indexed-{number}")))
@@ -1159,6 +1177,23 @@ class StaffTests(StaffTestCase):
         )
         for index, document in enumerate([*malformed, "unparseable"]):
             before = self.write_document(document)
+            if index == 3:
+                child = replace(worker, parent=showrunner.id)
+                unknown = {**valid, "kind": "visitor", "current_session": fixture_runtime_id("unknown-session")}
+                _ = self.write_document({"schema": 2, "rows": [unknown, child.to_json()]})
+                with redirect_stderr(io.StringIO()) as output:
+                    self.assertEqual(staff.snapshot().rows, (child,))
+                    created = staff.ensure("showrunner", name="new", runtime_id=fixture_runtime_id("new"))
+                    self.assertCountEqual(staff.snapshot().rows, (child, created))
+                self.assertEqual(output.getvalue(), f"staff anomaly: row {showrunner.id}: unknown kind visitor; skipped\n" * 3)
+                self.assertEqual(cast(dict[str, object], json.loads(self.staff_file.read_text()))["rows"],
+                    [row.to_json() for row in sorted((child, created), key=lambda row: row.id)] + [unknown])
+                before = self.staff_file.read_bytes()
+                for runtime_id, reason in ((str(showrunner.id), "staff id"), (unknown["current_session"], "current session")):
+                    with redirect_stderr(io.StringIO()), self.assertRaisesRegex(staff.StaffRefused, "duplicate " + reason):
+                        _ = staff.ensure("showrunner", name="duplicate", runtime_id=str(runtime_id))
+                    self.assertEqual(self.staff_file.read_bytes(), before)
+                continue
             if document == "unparseable":
                 before = b"{truncated"
                 _ = self.staff_file.write_bytes(before)

@@ -264,6 +264,9 @@ Sends no longer create holds: in production code, nothing calls `review.hold()`.
 
 Every new phone push requires `--text-id` before review, credentials, claims, or posting.
 Use `decision.choices`, `alert.blocked`, or `nate.adhoc` when no specific template fits.
+
+For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
+Filing a question alone never sends a push.
 Decisions use structured choices. Agent-written values receive live review.
 Both send.py and pushover.py enforce admission.
 A legacy free-text push already kept during silence still releases.
@@ -520,3 +523,13 @@ Registered alerts and delivery footer (2026-11-01):
 
 A decision uses priority 1 only before an explicit deadline within the configured decision window.
 The channel recalculates this priority when it releases a kept push.
+
+A kept decision carries its question path and opening time (`since`).
+At release, a closed question drops its push.
+An open question with a different `since` also drops its push.
+A same-minute reopening keeps `since`, so release sends the push because the question is open again.
+A missing or unreadable question record permits delivery and adds an anomaly to `pushover.jsonl`.
+A kept `review_watch.acknowledge` push drops when `review_regime.acknowledged()` reports acknowledgment.
+Legacy kept pushes without a reference still release.
+The release output counts delivered pushes and dropped pushes separately.
+Immediate delivery does not apply these release checks.

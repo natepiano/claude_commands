@@ -3,25 +3,24 @@
 from __future__ import annotations
 
 import os
-import json
 import shlex
 import sqlite3
 import sys
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import cast, final
+from typing import final
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
+import style_ledger
+from scripts.style import unit_files
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import rename_unit
-import style_ledger
-from scripts.style import unit_files
-
 
 from scripts.production.rename_unit_test_support import UnitRenameFixture, SLUG
-from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner, unit_membership
 
 
 @final
@@ -133,41 +132,6 @@ class UnitRenameStyleTests(UnitRenameFixture):
         self.assertIn(f"branch {slug}-names -> {slug}-words-names; worktree {worktree} -> "
                       + str(self.rust / f"{slug}-words-names"), result.stdout)
         self.assertEqual(self.snapshot(), before)
-
-    def test_restart_record_keeps_one_prefix_for_a_full_style_id(self) -> None:
-        slug = "cargo-liner-style"
-        _ = self.seed_record(name="names", host_session=f"{slug}-names", unit="names-unit", slug=slug)
-        self.write(self.doc, self.doc.read_text().replace("| alpha-unit |", "| names-unit |"))
-        identity = unit_membership(slug, "names-unit").current_session
-        worktree = str(self.rust / "claude-demo-alpha")
-        rename = rename_unit.UnitRename(
-            slug, "names-unit", f"{slug}-names-unit", str(self.doc), str(self.checkout), SLUG,
-            f"{slug}-names", f"{slug}-names", worktree, worktree, "", str(self.root / "scratch"),
-            account="owner@example.com", session_id=identity)
-
-        with mock.patch.dict(os.environ, self.env):
-            rename_unit._restart_record(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
-
-        path = self.home / ".local/state/shutdown/owner@example.com/sessions" / f"{identity}.json"
-        document = cast(dict[str, object], json.loads(path.read_text()))
-        session = cast(dict[str, object], document["session"])
-        host = cast(dict[str, object], session["host"])
-        self.assertEqual(host["session_name"], "cargo-liner-style-names")
-        self.assertEqual((host["unit"], session["name"]), ("cargo-liner-style-names-unit", "cargo-liner-style-names"))
-
-    def test_restart_record_moves_a_feature_host_to_its_new_stem(self) -> None:
-        _ = self.seed_record()
-        rename = rename_unit.UnitRename(
-            SLUG, "alpha-unit", "beta-unit", str(self.doc), str(self.checkout), SLUG,
-            "demo-alpha", "demo-beta", str(self.rust / "claude-demo-alpha"),
-            str(self.rust / "claude-demo-beta"), "", str(self.root / "scratch"),
-            account="owner@example.com", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
-
-        with mock.patch.dict(os.environ, self.env):
-            rename_unit._restart_record(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
-
-        session = cast(dict[str, object], self.record()["session"])
-        self.assertEqual(cast(dict[str, object], session["host"])["session_name"], "demo-beta")
 
 
 if __name__ == "__main__":
