@@ -31,7 +31,7 @@ class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
 
     def test_local_fmt_takes_the_token_after_a_memory_wait_leaves_for_the_mac(self) -> None:
         _ = self.prepare_memory_lint()
-        process = self.start_verify("lint", "sample", "--no-cache")
+        process = self.start_verify("lint", "--workspace", "--check", "--no-cache")
         self.addCleanup(self.stop_verify, process)
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
@@ -42,7 +42,7 @@ class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
         self.assertEqual(len(runners), 1)
         self.assertFalse(runners[0]["token_held"])
         formats = [event for event in self.cargo_events()
-                   if event["args"] == ["+nightly", "fmt", "-p", "sample"]]
+                   if event["args"] == ["+nightly", "fmt", "--all", "--check"]]
         self.assertEqual(len(formats), 1)
         self.assertTrue(formats[0]["token_held"])
         self.assertNotIn("lost the cargo token", output + errors)
@@ -67,7 +67,7 @@ class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
             + "Path(os.environ['TEST_BLOCK_PROBE']).write_text(str(result.returncode))\n"
             + "raise SystemExit(result.returncode)\n")
         observed = self.runner_state / "block-probe"
-        process = self.start_verify("lint", "sample", "--no-cache", extra={
+        process = self.start_verify("lint", "--workspace", "--check", "--no-cache", extra={
             "VERIFY_MAC_TEST_SCRIPT": str(probe),
             "TEST_REAL_FREE_NOW": str(Path(mac_test.__file__)), "TEST_BLOCK_PROBE": str(observed),
         })
@@ -83,10 +83,11 @@ class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertNotIn("leaving the memory wait", output + errors)
         self.assertEqual(self.runner_events(), [])
-        self.assertTrue(any(event["args"][:1] == ["mend"] for event in self.cargo_events()))
+        self.assertTrue(any(event["args"][:1] == ["mend"] and "--fail-on-warn" in event["args"]
+                            and "--fix" not in event["args"] for event in self.cargo_events()))
         self.assertTrue((state / "block.json").exists())
 
-    def test_local_fmt_starts_after_mend_passes_on_the_mac(self) -> None:
+    def test_local_fmt_check_starts_after_mend_check_passes_on_the_mac(self) -> None:
         holders = Path(self.environment["BUILD_HOLD_DIR"])
         holders.mkdir()
         targets = self.root / "targets.py"
@@ -95,23 +96,23 @@ class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
         _ = reader.write_text(
             'lint_config_enabled() { [[ "$1" == mend || "$1" == fmt ]]; }\n'
             + 'lint_config_skip_notice() { :; }\n')
-        shell = self.root / "hold-before-mend.sh"
+        shell = self.root / "hold-before-mend-check.sh"
         _ = shell.write_text('''
-hold_before_mend() {
+hold_before_mend_check() {
     case "$BASH_COMMAND" in
-        'invoke_mend --workspace --fix '*)
+        'invoke_mend --workspace --fail-on-warn '*)
             printf held > "$BUILD_HOLD_DIR/other"
             ;;
     esac
 }
-trap hold_before_mend DEBUG
+trap hold_before_mend_check DEBUG
 ''')
         self.write_executable(self.runner, RUNNER_STUB.replace(
             'raise SystemExit(runner_status)',
             'for hold in Path(os.environ["BUILD_HOLD_DIR"]).iterdir():\n'
             + '    hold.unlink()\n'
             + 'raise SystemExit(runner_status)'))
-        result = self.verify("lint", "sample", "--no-cache", extra={
+        result = self.verify("lint", "--workspace", "--check", "--no-cache", extra={
             "BUILD_TARGETS_SCRIPT": str(targets), "BASH_ENV": str(shell),
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
@@ -123,7 +124,7 @@ trap hold_before_mend DEBUG
         self.assertEqual(arguments[arguments.index("--verb") + 1], "mend-check")
         self.assertFalse(runners[0]["token_held"])
         formats = [event for event in self.cargo_events()
-                   if event["args"] == ["+nightly", "fmt", "-p", "sample"]]
+                   if event["args"] == ["+nightly", "fmt", "--all", "--check"]]
         self.assertEqual(len(formats), 1)
         self.assertTrue(formats[0]["token_held"])
         self.assertNotIn("lost the cargo token", result.stderr)

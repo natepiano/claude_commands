@@ -1,4 +1,4 @@
-"""Terminal cell widths shared by queue, build-why and production reports."""
+"""Terminal cell widths shared by queue lines and production reports."""
 import unittest
 
 from scripts.lib.terminal_cells import terminal_width

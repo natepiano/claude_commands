@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, override
@@ -18,6 +19,7 @@ import inventory
 import herdr
 import sessions
 import restart
+import shutdown
 from unit_staff_test_support import unit_host
 from scripts.production import staff
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
@@ -83,6 +85,26 @@ def worker_session(session_id: str, *, owner: str | None, run_dirs: list[str] | 
 
 
 class SessionLaunchTests(ShutdownTestCase):
+    def test_restart_reads_a_claude_transcript_without_a_pane_launch_record(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        identity = "saved"
+        records = root / "panes"
+        records.mkdir()
+        config = root / "config"
+        project = config / "projects" / "project"
+        project.mkdir(parents=True)
+        (project / f"{identity}.jsonl").touch()
+        output = io.StringIO()
+        with (patch.object(pane_record, "RECORD_DIR", records),
+              patch("restart.unit_move.config_dirs", return_value=[config]),
+              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
+              redirect_stderr(output)):
+            kind, environment, arguments = restart.session_launch(identity)
+        self.assertEqual(kind, "claude")
+        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
+        self.assertEqual(arguments, ["--resume", identity])
+        self.assertEqual(output.getvalue(), "")
+
     def test_restart_reads_plugin_directories_from_the_shutdown_pane_record(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         directories = [str(root / "postmaster"), str(root / "second plugin")]
@@ -194,6 +216,40 @@ class RestartTests(ShutdownTestCase):
         self.running.add(str(row.current_session))
         return herdr.AgentLaunched(f"w1:p{self.rows.index(row)}", herdr.PromptSubmissionNotRequired())
 
+    def test_start_row_uses_the_target_account_environment(self) -> None:
+        self.running.clear()
+        source, target = self.root / ".claude3", self.root / ".claude4"
+        environment = {"CLAUDE_CONFIG_DIR": str(self.root / ".claude4"), "ACCOUNT_SETTING": "target"}
+        with (patch.object(restart, "named_account_environment", return_value=environment) as account,
+              patch.object(restart, "session_launch", return_value=("claude", {"CLAUDE_CONFIG_DIR": str(source)},
+                  ["--resume", str(self.rows[0].current_session)])),
+              patch("scripts.accounts.accounts.trust_sources", return_value=[("claude3", source / ".claude.json")]) as sources,
+              patch.object(herdr, "heal_claude_trust", return_value=herdr.TrustCopied(self.root,
+                  target / ".claude.json", "claude3")) as trust,
+              patch.object(herdr, "prepare_session_environment",
+                  return_value=herdr.PreparedAgentEnvironment(self.root, environment)) as prepare,
+              patch("scripts.accounts.accounts.account_dir", return_value=target)):
+            pane = restart.start_row(self.rows[0], staff.StaffSnapshot(self.rows),
+                                     herdr.Herdr("agents"), target_account="claude4")
+        account.assert_called_once_with(target)
+        sources.assert_called_once_with(target, source)
+        trust.assert_called_once_with(self.root, target / ".claude.json",
+                                      [("claude3", source / ".claude.json")], dry_run=False)
+        prepare.assert_called_once_with(str(self.rows[0].current_session), str(self.root),
+                                        environment, herdr.NO_ENVIRONMENT_REMOVALS)
+        self.assertEqual(pane, "w1:p0")
+
+    def test_account_trust_reports_anomalies_and_returns_the_result(self) -> None:
+        target = self.root / ".claude4"
+        for result in (herdr.Untrusted(self.root, target / ".claude.json", (self.root,)),
+                       herdr.UnreadableTrustFile(self.root, target / ".claude.json", "ValueError")):
+            with (patch.object(herdr, "heal_claude_trust", return_value=result),
+                  patch("scripts.accounts.accounts.trust_sources", return_value=[]),
+                  redirect_stderr(io.StringIO()) as output):
+                self.assertIs(stop_resume.heal_account_trust(self.root, target, self.root, "test"), result)
+            reason = str(result) if isinstance(result, herdr.UnreadableTrustFile) else f"Claude has not trusted {self.root}"
+            self.assertEqual(output.getvalue(), f"test: trust anomaly: {reason}\n")
+
     def test_restart_all_dry_run_lists_every_live_row_with_its_tab_position(self) -> None:
         self.rows = (replace(self.rows[0], name="unit"),
             replace(self.rows[1], kind="worker", name="codex-worker", parent=self.rows[0].id,
@@ -282,8 +338,8 @@ class RestartTests(ShutdownTestCase):
             if arguments == ("tab", "list"):
                 return {"tabs": [{"workspace_id": "w1", "tab_id": "t1", "label": "unit-0"}]}
             if arguments == ("pane", "list"):
-                return {"panes": [{"pane_id": "w1:sibling", "tab_id": "t1", "terminal_id": "sibling-terminal"},
-                                  {"pane_id": "w1:own", "tab_id": "t1", "terminal_id": "own-terminal"}]}
+                return {"panes": [{"pane_id": "w1:sibling", "workspace_id": "w1", "tab_id": "t1", "terminal_id": "sibling-terminal"},
+                                  {"pane_id": "w1:own", "workspace_id": "w1", "tab_id": "t1", "terminal_id": "own-terminal"}]}
             raise AssertionError(arguments)
 
         client = herdr.Herdr("fixture")
@@ -299,8 +355,59 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(client.saved_row_tab("row-0", "unit-0"), herdr.SplitPane("w1:sibling", "right", 0.5, "unit-0"))
             activity.assert_not_called()
 
+    def test_held_sessions_saves_live_rows_and_tabs_and_keeps_pending_rows(self) -> None:
+        shutdown_record.save(["earlier"])
+        self.running.remove(str(self.rows[2].current_session))
+        with (patch.object(shutdown, "restart", restart), patch.object(shutdown, "wait_for_workers") as wait,
+              patch.object(herdr.Herdr, "save_layout") as save,
+              patch.object(herdr.Herdr, "remember_row_tab") as remember,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["held-sessions"]), 0)
+        self.assertEqual(shutdown_record.read(), ["earlier", "row-0", "row-1"])
+        save.assert_called_once()
+        self.assertEqual([call.args for call in remember.call_args_list], [("row-0", "w1:p0"), ("row-1", "w1:p1")])
+        wait.assert_called_once()
+        self.assertRegex(output.getvalue(), r"^saved 2 rows for restart at \d{2}:\d{2}\n$")
+        self.assertEqual(self.stops, [])
+
+    def test_staff_read_error_keeps_pending_rows_and_reports_one_anomaly(self) -> None:
+        shutdown_record.save(["earlier"])
+        with (patch.object(shutdown, "restart", restart), patch.object(shutdown, "wait_for_workers") as wait,
+              patch.object(staff, "initial_snapshot", side_effect=OSError("staff unavailable")),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(shutdown.main(["held-sessions"]), 0)
+        self.assertEqual(shutdown_record.read(), ["earlier"])
+        wait.assert_called_once_with(staff.StaffSnapshot(()))
+        self.assertTrue(output.getvalue().startswith("saved 0 rows for restart at "))
+        self.assertEqual(errors.getvalue(), "restart: save anomaly: staff unavailable\n")
+
+    def test_bare_dry_run_reports_record_time_and_missing_rows(self) -> None:
+        shutdown_record.save(["row-0", "gone"])
+        saved_at = time.strftime("%H:%M", time.localtime(shutdown_record.record_path().stat().st_mtime))
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(restart.restart(dry_run=True), 0)
+        self.assertEqual(output.getvalue().splitlines(), [f"restart record: 2 rows saved at {saved_at}",
+            "unit-1: live, not in the restart record", "unit-2: live, not in the restart record",
+            "unit-0: row-0, unit, workspace live, tab 1 (unit-0)"])
+        self.assertEqual(errors.getvalue(), "gone: in the restart record, no staff row\n")
+        self.assertEqual(shutdown_record.read(), ["row-0", "gone"])
+
+    def test_layout_error_keeps_the_live_rows_and_other_tab_saves(self) -> None:
+        with (patch.object(herdr.Herdr, "save_layout", side_effect=herdr.HerdrFailure("layout unavailable")),
+              patch.object(herdr.Herdr, "remember_row_tab") as remember,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("fixture"), save_tabs=True),
+                             list(self.rows))
+        self.assertEqual(remember.call_count, 3)
+        self.assertEqual(errors.getvalue(), "restart: layout anomaly: layout unavailable\n")
+
     def test_restart_all_starts_each_row_in_its_saved_tab(self) -> None:
-        self.assertEqual(restart.restart(stop_all=True), 0)
+        with (patch.object(herdr.Herdr, "save_layout") as save,
+              patch.object(herdr.Herdr, "remember_row_tab") as remember):
+            self.assertEqual(restart.restart(stop_all=True), 0)
+        save.assert_called_once()
+        self.assertEqual([call.args for call in remember.call_args_list[:3]],
+                         [(str(row.id), f"w1:p{n}") for n, row in enumerate(self.rows)])
         self.assertEqual(self.stops, [str(row.id) for row in self.rows])
         self.assertEqual(self.launches, [(row.name, herdr.NewTab("saved", row.name)) for row in self.rows])
         self.assertEqual(self.running, {str(row.current_session) for row in self.rows})

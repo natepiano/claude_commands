@@ -37,6 +37,7 @@ from datetime import UTC, datetime
 from enum import Enum, auto
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.copies import copies
 from scripts.lib import build_folders
 from scripts.production import change_review  # noqa: E402
 from scripts.production.affected_modules import (  # noqa: E402
@@ -1137,39 +1139,39 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     return run
 
 
-# Use a fresh index for the file comparison. The live index can hide edits
-# with assume-unchanged or skip-worktree flags. Never change that index.
-PROMOTION_TRACKED_CHECK = '''import json, os, subprocess, tempfile
-from pathlib import Path
+def promotion_edit_conflict(repo: Path, target: str) -> str:
+    """Name local edits on paths that the promotion changes."""
+    environment = dict(os.environ)
+    _ = environment.pop("GIT_INDEX_FILE", None)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
 
-environment = dict(os.environ)
-environment.pop("GIT_INDEX_FILE", None)
-environment["GIT_OPTIONAL_LOCKS"] = "0"
+    def git(*arguments: str, index: str = "") -> bytes:
+        return subprocess.run(["git", *arguments], cwd=repo,
+                              env={**environment, **({"GIT_INDEX_FILE": index} if index else {})},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
 
-def git(*arguments, env=environment):
-    return subprocess.run(["git", *arguments], env=env, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, check=True).stdout
-
-try:
-    staged = git("diff", "--cached", "--no-ext-diff", "--name-only", "-z", "HEAD", "--")
-    with tempfile.TemporaryDirectory(prefix="promotion-index-") as temporary:
-        private = {**environment, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
-        git("read-tree", "HEAD", env=private)
-        files = git("diff", "--no-ext-diff", "--name-only", "-z", "HEAD", "--", env=private)
-    changed = sorted({os.fsdecode(path) for path in (staged + files).split(b"\\0") if path})
-    if changed:
-        print("tracked edits differ from HEAD: " + "; ".join(json.dumps(path) for path in changed))
-        raise SystemExit(1)
-except (OSError, subprocess.SubprocessError) as error:
-    print("tracked edit check failed: " + str(error))
-    raise SystemExit(1)
-'''
+    try:
+        staged = git("diff", "--cached", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--")
+        # A fresh index exposes edits hidden by the live index flags.
+        with tempfile.TemporaryDirectory(prefix="promotion-index-") as temporary:
+            index = str(Path(temporary) / "index")
+            _ = git("read-tree", "HEAD", index=index)
+            files = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--", index=index)
+        promoted = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", target, "--")
+        conflicts = sorted(set((staged + files).split(b"\0")) & set(promoted.split(b"\0")) - {b""})
+        if conflicts:
+            return "promotion refused: tracked edits overlap promotion: " + "; ".join(
+                json.dumps(os.fsdecode(path)) for path in conflicts)
+    except (OSError, subprocess.SubprocessError) as error:
+        return "promotion refused: tracked edit check failed: " + str(error)
+    return ""
 
 
-def require_clean_promotion(repo: Path) -> None:
-    result = command([sys.executable, "-c", PROMOTION_TRACKED_CHECK], repo)
-    if result.returncode:
-        raise GateRefused("promotion refused: " + failure_detail(result))
+# Send the same function to a Mac without repository Python modules.
+PROMOTION_TRACKED_CHECK = ("import json, os, subprocess, sys, tempfile\nfrom pathlib import Path\n"
+                           + inspect.getsource(promotion_edit_conflict)
+                           + "reason = promotion_edit_conflict(Path.cwd(), sys.argv[1])\n"
+                           + "if reason: print(reason)\nraise SystemExit(bool(reason))\n")
 
 
 @dataclass(frozen=True)
@@ -1240,7 +1242,6 @@ def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
-    require_clean_promotion(main_repo)
     hold = BuildHoldWait()
     hold.wait_until_free()
     wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
@@ -1262,7 +1263,8 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
         raise GateRefused("main is not an ancestor of the merge branch")
     hold.wait_until_free()
-    require_clean_promotion(main_repo)
+    if conflict := promotion_edit_conflict(main_repo, target):
+        raise GateRefused(conflict)
     write_push_record(path, RecordedPush(origin, target, target))
     _ = checked_git(main_repo, "merge", "--ff-only", target)
     _ = checked_git(main_repo, "push", "origin", "main")
@@ -1270,8 +1272,8 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK)
-    remote = (f"(cd {remote_path} && {remote_check} && "
+    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
               f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
@@ -1388,8 +1390,16 @@ def merge_checkpoint(args: GateArguments) -> int:
         if merged != baseline:
             write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
                               RecordedPush(baseline, merged, checkpoint))
-        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
-                            source="checkpoint", full=args.full)
+        previous_unit = os.environ.get(memory_admit.BUILDLOG_UNIT)
+        os.environ[memory_admit.BUILDLOG_UNIT] = args.unit
+        try:
+            suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
+                                source="checkpoint", full=args.full)
+        finally:
+            if previous_unit is None:
+                _ = os.environ.pop(memory_admit.BUILDLOG_UNIT, None)
+            else:
+                os.environ[memory_admit.BUILDLOG_UNIT] = previous_unit
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         fetch_branches(repo, "main")
@@ -1452,34 +1462,37 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
         print(f"Change review drift: {line}", file=sys.stderr, flush=True)
 
 
-def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> None:
+def nightly_owner(args: GateArguments) -> str:
     from scripts.production import showrunners
     from scripts.production.production_units import Refusal, production_field
 
     try:
-        try:
-            doc = change_review.production_doc(args.production)
-        except change_review.ChangeReviewError:
-            # A user timer has no calling Claude session. Its merge branch
-            # identifies a registered production without assuming slug == branch.
-            matching: list[Path] = []
-            for candidate in showrunners.timer_docs().values():
-                try:
-                    branch = production_field(candidate.read_text().splitlines(), "Merge branch")
-                except Refusal:
-                    continue
-                if branch == args.merge_branch:
-                    matching.append(candidate)
-            if len(matching) != 1:
-                raise ValueError(f"cannot identify one production for {args.merge_branch}; pass --production <doc>")
-            doc = matching[0]
-        slug = showrunners.production_slug(str(doc))
-        outcome = showrunners.tell(slug, f"merge-gate-nightly:{tree}",
+        doc = change_review.production_doc(args.production)
+    except change_review.ChangeReviewError:
+        matching: list[Path] = []
+        for candidate in showrunners.timer_docs().values():
+            try:
+                branch = production_field(candidate.read_text().splitlines(), "Merge branch")
+            except Refusal:
+                continue
+            if branch == args.merge_branch:
+                matching.append(candidate)
+        if len(matching) != 1:
+            return copies.fallback_owner("nightly")
+        doc = matching[0]
+    return showrunners.production_slug(str(doc))
+
+
+def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> None:
+    from scripts.production import showrunners
+
+    try:
+        outcome = showrunners.tell(nightly_owner(args), f"merge-gate-nightly:{tree}",
                                    f"Nightly merge gate is red: {args.merge_branch} tree {tree}. "
                                    + f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
                                    + "Every gate now requires the full suite until a full run passes.")
         print(f"Nightly notice: {outcome}", flush=True)
-    except (change_review.ChangeReviewError, OSError, ValueError) as error:
+    except (GateRefused, change_review.ChangeReviewError, OSError, ValueError) as error:
         print(f"Nightly notice could not be sent: {error}; full-required marker kept", flush=True)
 
 
@@ -1499,10 +1512,7 @@ def nightly(args: GateArguments) -> int:
     _ = nightly_git(repo, "fetch", "origin",
                     f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
     commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["merge-gate-nightly"])) as temporary:
-        clone = temporary / "checkout"
-        _ = nightly_git(repo, "clone", "--shared", "--no-checkout", "--", str(repo), str(clone))
-        _ = nightly_git(clone, "checkout", "--detach", commit)
+    with copies.standing(nightly_owner(args), repo, commit) as clone:
         tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
         try:
             run = run_suites(clone, args.memory_cap_mib, args.type_dirs,
@@ -1577,7 +1587,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 promote(args)
                 return 0
             return merge_checkpoint(args)
-    except (GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+    except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
 

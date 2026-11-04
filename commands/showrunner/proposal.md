@@ -103,7 +103,7 @@ For other proposals, send the approved issue to the unit that builds it.
 The unit adds phases that cite it and puts it on the plan's `> **Issues:**`
 line. Record that plan and its phases with the same `approve` command.
 `--showrunner` is the session name from `showrunners.py name <slug>`;
-`--unit` is the full name in the production's Units table. Approve sets the
+`--unit` is the unit's full staff row name (`web-unit`). Approve sets the
 stage active: the proposal is in progress and leaves the waiting count. Other
 declined proposals close through `/close_issue`.
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import shutil
 import sys
 import tempfile
 import unittest
@@ -17,23 +16,17 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
-import production_units
-from unit_lookup import ProductionMembers, unit_is_retired
 from scripts.production import staff, unit_config
 import unit_lookup
 import sessions
 from scripts.shutdown import stop_resume
 import herdr
 from herdr import HerdrPlace
-from production_units import cell_value, plan_cell_is_retired
-from unit_lookup import live_unit_table, retired_units
 from test_support import ShutdownTestCase
 
 
-from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT, OLD_HEADER
-from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_showrunner_name, showrunner_relationship, unit_membership,
-)
+from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
+from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
 
 
 def setUpModule() -> None:
@@ -43,7 +36,6 @@ def setUpModule() -> None:
 @final
 class AddUnitResumeTests(AddUnitTestCase):
     def test_resume_preserves_existing_config_settings_and_launches_with_the_same_staff_id(self) -> None:
-        self.commit_prepared_row(self.unit_row())
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
         row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
@@ -110,10 +102,9 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(order.mock_calls[1][0], "start")
         waited.assert_called_once()
         self.assertIn("alpha-unit started:", result.stdout)
-        self.assertIn("| alpha-unit |", self.doc.read_text().replace("`", ""))
-        self.assertNotEqual(self.git("rev-parse", "build-followups"), old_head)
-        self.assertEqual(self.git("log", "-1", "--format=%s", "build-followups"),
-                         "production(build-followups): add unit alpha-unit (plan)")
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
+        self.assertEqual(self.git("rev-parse", "build-followups"), old_head)
         self.assertTrue((self.root / "project-alpha").is_dir())
         self.assertEqual(self.git("rev-parse", "build-followups-alpha"),
                          self.git("rev-parse", "build-followups"))
@@ -132,49 +123,6 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertIn("alpha-unit started:", result.stdout)
         self.assertEqual(self.opened()[7], str(prior))
 
-    def test_retired_marker_only_applies_at_start_of_plan_cell(self) -> None:
-        cases = (
-            ("retired by the user", True),
-            ("(retired by the user)", True),
-            ("docs/plan.md; retired by the user", False),
-            ("(run done; retired by the user)", False),
-            ("retiredness", False),
-            ("Retired by the user", False),
-        )
-        for plan_cell, expected in cases:
-            with self.subTest(plan_cell=plan_cell):
-                self.assertEqual(plan_cell_is_retired(plan_cell), expected)
-
-    def test_retired_readers_use_marker_on_production_rows(self) -> None:
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "stalls-unit")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "retired-stalls"), expected=row.worktree)
-        lines = [
-            "## Units",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            "| stalls-unit | (retired by the user 2026-10-07; run done, worktree removed) follow-up: `/unit:report` shows the same sections every time, the last recorded tables when no window is open (the user, 2026-10-06 22:5x); earlier follow-up: showrunner replies end with the agent usage lines, checked by a hook (the user, 2026-10-06 08:1x), then `docs/as-built/build-followups-fn-length-hook.md (run done; as-built 4ab5e4c)` (follow-up `commands/unit/eta_breakdown.md` merged as a9f35af) (earlier runs' as-builts `docs/as-built/screen-record.md`, merged as b3c069f, `docs/as-built/build-memory-admission.md`, merged as 35151e5, and `docs/as-built/buildlog-memory-stalls.md`) | `/home/natepiano/worktrees/claude-build-followups-stalls` | `build-followups-stalls` | `hook` (resumed in `/etc/nixos`; renamed from `nightly-config` 2026-10-04, then `stalls` → `footer` → `hook` by the user 2026-10-06, herdr session too; its own herdr session `stalls` since 22:13 PDT, after the nightly review's launcher closed the `nightly-config` session it ran in) | — | memory stall recording and its report section; then memory admission, which edited `scripts/buildlog/`, `scripts/lint/` (`invoke.sh`, `memory_gate.sh`, `sweep.py`), `scripts/direct/verify.sh` and `board.sh`, `scripts/build_hold/build_hold.py`, `scripts/hooks/pre-tool-use-brp-launch-gate.sh`, `scripts/agents/codex_mesh.py`, `scripts/message/` (`send.py`, `top_level.py`), `scripts/notify/pushover.py`, `scripts/whoami/agent_notes.py`, `scripts/production/dailies_render.py`, `settings.json`, `config/lint.conf`, `pyrightconfig.json`, and `commands/` (`build_hold.md`, `lint_config.md`, `notify_top_level.md`, `showrunner/dailies.md`, `showrunner/produce.md`); promoted by the user 2026-10-04; then the screen recording skill: `commands/screen_record.md`, `scripts/screen_record/`; and the `/unit:report` timer fixes: `scripts/production/unit_status.sh`, `scripts/direct/progress_history.py`; then the Codex `systemError` fix: `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`; then the kill order: `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `docs/as-built/build-memory-admission.md`; then `/unit:eta_breakdown`: `commands/unit/eta_breakdown.md`; then the function-length hook: `scripts/hooks/fn_length_lib.py`, `scripts/hooks/post-tool-use-fn-length.py`, `scripts/hooks/test_fn_length.py`, `scripts/hooks/codex_hooks.py`, `scripts/hooks/test_codex_hooks.py`, `settings.json`; then the footer: `scripts/production/dailies_render.py`, a showrunner-only Stop hook under `scripts/hooks/`, `settings.json`, `commands/showrunner/produce.md`; `commands/unit/report.md` (the report follow-up) |",
-            "| enh-showrunner-unit | `docs/plans/build-followups-enh-showrunner-dailies.md` (follow-up: retired units drop out of the status and a simple dailies groups idle units; the user, 2026-10-07; the earlier run's as-built is `docs/as-built/showrunner-automation.md`) (Phases 7 and 8 of stalls-unit's plan, moved by the user 2026-10-06 14:2x PDT) | `/home/natepiano/worktrees/claude-build-followups-enh-showrunner` | `build-followups-enh-showrunner` | `enh-showrunner` | — | `docs/as-built/showrunner-automation.md`; `scripts/production/add_unit.py`, `test_add_unit.py`, `merge_checkpoint.py`, `test_merge_checkpoint.py`; `commands/showrunner/add_unit.md`; after stalls-unit Phase 6 merges: `commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, `scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests (hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): `commands/unit/direct.md`, `commands/unit/checkpoint.md`, `docs/direct/run_phase_review.md`, `docs/production_format.md`, `commands/unit/add_ons.md`, `commands/plan/shrink.md`, `commands/plan/phase_review.md`, `docs/direct/phase_end.md`, `docs/direct_plan_format.md`, `commands/unit/eta_breakdown.md`, `docs/direct/final_gate_commit.md` |",
-            "| model-study-unit | `docs/as-built/director-model-study.md` (run done; as-built 16e5ac6) | `/home/natepiano/worktrees/claude-build-followups-model-study` | `build-followups-model-study` | `model-study` | — | `docs/plans/build-followups-model-study.md`; `scripts/model_study/`; `docs/as-built/director-model-study-results.md` |",
-        ]
-        for unit in ("enh-showrunner-unit", "model-study-unit"):
-            _ = unit_membership(fixture_showrunner_name("build-followups", self.doc), unit)
-        self.assertEqual(retired_units(lines, "build-followups"), {"stalls-unit"})
-        self.assertEqual([cell_value(cells["Unit"]) for cells in live_unit_table(lines, "build-followups")],
-                         ["enh-showrunner-unit", "model-study-unit"])
-
-    def test_retired_units_include_retired_name_and_exclude_live_name(self) -> None:
-        row = unit_membership("show", "old-unit")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "retired-old"), expected=row.worktree)
-        lines = [
-            "## Units",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            "| `old-unit` | retired after completion | /tmp/old | old | old | — | — |",
-            "| `live-unit` | docs/live.md | /tmp/live | live | live | — | — |",
-        ]
-        _ = unit_membership("show", "live-unit")
-        self.assertEqual(retired_units(lines, "show"), {"old-unit"})
-
     def test_running_resume_refuses_before_any_launch_write(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -190,14 +138,14 @@ class AddUnitResumeTests(AddUnitTestCase):
                 self.assertEqual(result.stderr, f"add_unit: session 62ccbd64-f22e-5647-b20e-7899aa39d766 already runs as pid {os.getpid()}; "
                                  + "to make it this unit, run add_unit with --attach 62ccbd64-f22e-5647-b20e-7899aa39d766\n")
                 self.assert_no_launch_change(document, head)
-                self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+                self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
                 self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
         # Brief launches must refuse before their stub is written too.
         result = self.cli("alpha", "--brief", "Repair the unit", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
         self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
     def test_resume_with_unreadable_registry_refuses_with_the_reason(self) -> None:
         prior = self.root / "prior-session"
@@ -211,7 +159,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
                          + "unreadable session registry record: broken.json\n")
         self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
     def test_resume_with_unreadable_process_identity_refuses_with_the_reason(self) -> None:
         prior = self.root / "prior-session"
@@ -225,7 +173,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
                          + f"process identity unreadable for pid {os.getpid()}\n")
         self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
     def test_resume_with_stale_registry_identity_still_launches(self) -> None:
         prior = self.root / "prior-session"
@@ -343,9 +291,6 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_retired_plan_resume_cannot_bypass_the_retained_row_restore(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        self.commit_prepared_row(self.unit_row(
-            plan=f"(retired 2026-10-28, worktree removed, session 62ccbd64-f22e-5647-b20e-7899aa39d766, folder {prior}) "
-                 + "`docs/plans/given.md` (run done)"))
         row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         before = self.repository_state()
@@ -369,8 +314,6 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_retired_permanent_resume_keeps_the_existing_branch_and_refuses_admission(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        self.commit_prepared_row(self.unit_row(
-            plan="(retired 2026-10-28, worktree removed, session 62ccbd64-f22e-5647-b20e-7899aa39d766) permanent"))
         _ = self.git("branch", "build-followups-alpha")
         row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
@@ -392,12 +335,10 @@ class AddUnitResumeTests(AddUnitTestCase):
         path.parent.mkdir(parents=True)
         _ = path.write_text("# Alpha as built\n\nThe plan is complete.\n", encoding="utf-8")
         _ = self.git("add", plan)
-        self.commit_prepared_row(self.unit_row(
-            plan=f"(retired 2026-10-28, worktree removed, session 62ccbd64-f22e-5647-b20e-7899aa39d766) `{plan}` (run done)"))
+        _ = self.git("commit", "-m", "add the as-built plan")
+        _ = self.git("push", "origin", "build-followups")
         worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
-        member = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
-        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
+        _ = self.prepare_restored_worktree("alpha", worktree, plan=plan)
         document = self.doc.read_bytes()
 
         _ = self.successful("alpha", "--plan", plan, "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(worktree))
@@ -414,9 +355,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         path.parent.mkdir(parents=True)
         _ = path.write_text("# Alpha as built\n", encoding="utf-8")
         _ = self.git("add", plan)
-        self.commit_prepared_row(self.unit_row(plan=plan))
         worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        _ = self.prepare_restored_worktree("alpha", worktree, plan=plan)
         before = self.repository_state()
 
         _ = self.successful("alpha", "--plan", plan, "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
@@ -424,7 +364,7 @@ class AddUnitResumeTests(AddUnitTestCase):
 
         self.assertEqual(self.repository_state(), before)
         self.assertEqual([call for call in self.herdr_calls()
-                          if call != ["--session", "default", "session", "list", "--json"]], [])
+                          if call[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
         changed_plan = "docs/as-built/other.md"
         result = self.cli("alpha", "--plan", changed_plan, "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
@@ -433,15 +373,11 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertIn(f"unit alpha-unit Plan is {plan!r}; expected {changed_plan!r}", result.stderr)
         self.assertEqual(self.repository_state(), before)
         self.assertEqual([call for call in self.herdr_calls()
-                          if call != ["--session", "default", "session", "list", "--json"]], [])
+                          if call[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
     def test_retired_plan_resume_reuses_its_worktree_after_a_failed_launch(self) -> None:
-        self.commit_prepared_row(self.unit_row(
-            plan="(retired 2026-10-28, worktree removed, session 62ccbd64-f22e-5647-b20e-7899aa39d766) docs/plans/given.md"))
         worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
-        member = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
-        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
+        _ = self.prepare_restored_worktree("alpha", worktree)
         before = self.repository_state()
 
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
@@ -456,9 +392,7 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_rerun_keeps_marked_herdr_and_prints_its_herdr_attach_command(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
-            result, error, commands, launches, writes = self.run_with_marked_unit(
-                add_unit.NewWorkLaunch(), unit_lookup.ClaudeNotRunning()
-            )
+            result, error, commands, launches, writes = self.run_with_marked_unit(unit_lookup.ClaudeNotRunning())
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)
@@ -627,87 +561,6 @@ class UnitLaunchProtocolTests(ShutdownTestCase):
             (root / search_path / "scripts/accounts/accounts.py").is_file()
             for search_path in [environment["root"], *environment["extraPaths"]]
         ))
-
-
-class RetiredRowTests(ShutdownTestCase):
-    """Staff membership outlives stale Plan, worktree and pane observations."""
-
-    root: Path = Path()
-    linked: Path = Path()
-    main: Path = Path()
-    missing: Path = Path()
-
-    @override
-    def setUp(self) -> None:
-        fixture = StaffTestCase()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
-        super().setUp()
-        _ = showrunner_relationship("show")
-        self.root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.root)
-        home_context = cast(object, self.enterContext(
-            patch.dict(os.environ, {"HOME": str(self.root / "home")})
-        ))
-        del home_context
-        self.linked = self.root / "linked"
-        self.linked.mkdir()
-        _ = (self.linked / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
-        self.main = self.root / "main"
-        (self.main / ".git").mkdir(parents=True)
-        self.missing = self.root / "missing"
-
-    def row(self, unit: str, worktree: Path, plan: str = "`docs/plan.md`") -> str:
-        return f"| `{unit}-unit` | {plan} | `{worktree}` | `branch` | `{unit}` (resumed elsewhere) | — | — |"
-
-    def session(self, unit: str) -> unit_lookup.MarkedUnit:
-        return unit_lookup.MarkedUnit(unit, unit_lookup.ClaudeNotRunning(), HerdrPlace("fixture", "w1:p1"))
-
-    def retired(self, worktree: Path, *, gone: bool, plan: str = "`docs/plan.md`") -> tuple[bool, int]:
-        """Whether the row is retired, and how many times herdr was asked."""
-        found = {} if gone else {"some-unit": self.session("some-unit")}
-        cells = production_units.unit_table([*OLD_HEADER, self.row("some", worktree, plan)])[0]
-        with patch.object(unit_lookup, "marked_units", return_value=found) as asked:
-            return unit_is_retired(cells, ProductionMembers("show")), asked.call_count
-
-    def test_membership_lasts_until_the_staff_row_is_retired(self) -> None:
-        self.assertEqual(self.retired(self.linked, gone=False), (False, 0))
-        row = unit_membership("show", "some-unit")
-        for worktree in (self.missing, self.linked, self.main):
-            for gone in (True, False):
-                with self.subTest(worktree=worktree, gone=gone):
-                    self.assertEqual(self.retired(worktree, gone=gone), (False, 0))
-        self.assertEqual(self.retired(self.linked, gone=False, plan="retired after completion"), (False, 0))
-        staff.defer_retire((row.id,))
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.linked), expected=row.worktree)
-        self.assertEqual(staff.retire_pending(), ())
-        self.assertEqual(self.retired(self.linked, gone=False), (True, 0))
-
-    def test_a_whole_table_reads_one_snapshot_and_no_herdr_membership(self) -> None:
-        lines = [*OLD_HEADER, self.row("first", self.missing), self.row("second", self.missing)]
-        _ = unit_membership("show", "second-unit")
-        first = unit_membership("show", "first-unit")
-        _ = staff.set_worktree(first.id, staff.RemovedWorktree("natedev", self.missing), expected=first.worktree)
-        with (patch.object(unit_lookup, "marked_units", side_effect=OSError("herdr could not list sessions")) as asked,
-              patch.object(staff, "snapshot", wraps=staff.snapshot) as reads):
-            self.assertEqual(retired_units(lines, "show"), {"first-unit"})
-        asked.assert_not_called()
-        reads.assert_called_once_with()
-
-    def test_every_list_drops_a_unit_that_is_gone(self) -> None:
-        _ = unit_membership("show", "parked-unit")
-        for name in ("marked-unit", "gone-unit"):
-            row = unit_membership("show", name)
-            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.missing), expected=row.worktree)
-        lines = [
-            *OLD_HEADER,
-            self.row("marked", self.linked, "retired after completion"),
-            self.row("gone", self.missing),
-            self.row("parked", self.linked),
-        ]
-        with patch.object(unit_lookup, "marked_units", return_value={}):
-            self.assertEqual(retired_units(lines, "show"), {"marked-unit", "gone-unit"})
-            self.assertEqual([cell_value(cells["Unit"]) for cells in live_unit_table(lines, "show")], ["parked-unit"])
 
 
 if __name__ == "__main__":

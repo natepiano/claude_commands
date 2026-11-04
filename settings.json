@@ -256,16 +256,6 @@
         ]
       }
     ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/showrunner-compaction.py\""
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
         "matcher": "Bash|Write|NotebookEdit",
@@ -394,7 +384,14 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" stop",
-            "timeout": 2430
+            "timeout": 1830
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-direct-continue.py\"",
+            "asyncRewake": true,
+            "rewakeSummary": "Continuing the unit run",
+            "timeout": 60
           }
         ]
       }

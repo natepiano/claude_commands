@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Change a unit's staff parent and move its Units row."""
+"""Change a unit's staff parent."""
 from __future__ import annotations
 
 import argparse
@@ -11,8 +11,8 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.production import production_units, showrunners, staff, staff_sources, unit_move, unit_names
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import showrunners, staff, staff_move, staff_sources, unit_move, unit_names
+from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused
 
 
@@ -20,21 +20,20 @@ from scripts.production.rename_state import RenameRefused
 class UnitTransfer:
     member: staff.StaffRow
     parent: staff.StaffRow
-    giving: production_units.Production
-    receiving: production_units.Production
+    receiving: Production
     unit: str
 
 
-def _production(slug: str) -> production_units.Production:
+def _production(slug: str) -> Production:
     checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise ValueError(f"{slug}: {checked.reason}")
-    return production_units.read_production(checked.path)
+    return read_production(checked.path)
 
 
 def build(from_slug: str, given: str, to_doc: Path) -> UnitTransfer:
     giving = _production(from_slug)
-    receiving = production_units.read_production(to_doc.expanduser().resolve())
+    receiving = read_production(to_doc.expanduser().resolve())
     record = staff.snapshot()
     found = staff_sources.member(staff_sources.UnitMember(giving.slug, given), record)
     if isinstance(found, staff_sources.NoSuchMember):
@@ -42,47 +41,17 @@ def build(from_slug: str, given: str, to_doc: Path) -> UnitTransfer:
     parent = staff_sources.member(staff_sources.ShowrunnerMember(receiving.slug), record)
     if isinstance(found, staff_sources.NoSuchMember) or isinstance(parent, staff_sources.NoSuchMember):
         raise ValueError(f"{given}: no unit or destination staff row")
-    return UnitTransfer(found.row, parent.row, giving, receiving, unit_names.unit_id(found.row.name))
-
-
-def _row(lines: list[str], unit: str) -> tuple[int, dict[str, str]] | None:
-    rows = production_units.unit_table(lines)
-    row = next((row for row in rows if production_units.cell_value(row.get("Unit", "")) == unit), None)
-    if row is None:
-        return None
-    end, _ = production_units.unit_rows(lines)
-    for index in range(lines.index("## Units") + 1, end):
-        if lines[index].startswith("|") and production_units.cell_value(
-                production_units.row_cells(lines[index])[0]) == unit:
-            return index, row
-    return None
+    return UnitTransfer(found.row, parent.row, receiving, unit_names.unit_id(found.row.name))
 
 
 def apply(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
     request = build(from_slug, unit, to_doc)
     with unit_move.folder_move_lock(request.member.id), staff.operation():
-        source = request.giving.doc.read_text(encoding="utf-8").splitlines()
-        target = request.receiving.doc.read_text(encoding="utf-8").splitlines()
-        original = _row(source, request.unit)
-        existing = _row(target, request.unit)
-        if original is None and existing is None:
-            raise ValueError(f"{request.unit}: no Units row in either production")
         changed = request.member.parent != request.parent.id
         if changed:
             _ = staff.move(request.member.id, request.parent.id)
-        if request.giving.doc != request.receiving.doc:
-            if original is not None and existing is None:
-                headings = production_units.unit_headings(target)
-                line = "| " + " | ".join(
-                    "—" if heading == "Worktree" else original[1].get(heading, "—") for heading in headings) + " |"
-                position, _ = production_units.unit_rows(target)
-                target.insert(position, line)
-                write_text_atomic(request.receiving.doc, "\n".join(target) + "\n")
-                changed = True
-            if original is not None:
-                del source[original[0]]
-                write_text_atomic(request.giving.doc, "\n".join(source) + "\n")
-                changed = True
+        _ = staff_move.move_unit(from_slug, request.unit, request.receiving.slug,
+                                 identity=staff_move.PinnedUnit(request.member.id, request.parent.id))
         print("done" if changed else "unchanged")
         return request
 
@@ -103,7 +72,7 @@ def main(argv: list[str]) -> int:
             else:
                 _ = apply(cast(str, args.from_slug), cast(str, args.unit), cast(Path, args.to_doc))
             return 0
-        except (ValueError, OSError, RenameRefused, production_units.Refusal) as error:
+        except (ValueError, OSError, RenameRefused, Refusal) as error:
             print(f"transfer_unit: {error}", file=sys.stderr)
             return 1
     return staff.cli_result(run)

@@ -28,6 +28,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import memory_admit
 from scripts.mac_test import mac_test, offload
 from scripts.buildlog import store
+from scripts.direct import step_record
 
 
 class AwsExecutor(Protocol):
@@ -58,6 +59,22 @@ class ControlResult:
     reason: str
     at: int
     generation: str = ''
+
+
+@dataclass(frozen=True)
+class UnpublishedPermissionSince:
+    generation: str
+    since: int
+
+    @classmethod
+    def read(cls, state: dict[str, object], generation: str, now: int) -> UnpublishedPermissionSince:
+        raw = state.get('unpublished_permission')
+        if isinstance(raw, dict):
+            row = cast(dict[str, object], raw)
+            since = row.get('since')
+            if row.get('generation') == generation and type(since) is int and 0 <= since <= now:
+                return cls(generation, since)
+        return cls(generation, now)
 
 
 @final
@@ -171,6 +188,16 @@ class Controller:
                    and row.get('repository_name') and 'token_left_at' not in row
                    and now - row['since'] >= settings.start_after_wait_s)
 
+    def _pinned_work(self, configuration: conf.ConfigRead) -> bool:
+        values = configuration.values()
+        return any(isinstance(record.selection, step_record.Pinned)
+                   and record.selection.target == self.target
+                   and record.state in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_SSH)
+                   and self.target in record.eligible_targets
+                   and offload.linux_kind_permitted(values, record.kind)
+                   and isinstance(offload.repository_identity(record.repo), offload.KnownRepository)
+                   for record in step_record.live_records())
+
     def _prices(self, api: AwsCli, settings: ControlSettings, now: int) -> None:
         def fetch(_now: int) -> Sequence[ledger.PriceSample]:
             raw = api.call('describe-spot-price-history', '--instance-types', settings.instance_type,
@@ -256,6 +283,11 @@ class Controller:
                 evidence = api.observe(settings.instance_id, now)
                 previous_generation = state.get('permitted_generation')
                 state['instance_evidence'] = asdict(evidence)
+                unpublished = UnpublishedPermissionSince.read(state, evidence.generation, now)
+                if evidence.state == 'running':
+                    state['unpublished_permission'] = asdict(unpublished)
+                else:
+                    _ = state.pop('unpublished_permission', None)
                 if evidence.state in ('stopped', 'terminated'):
                     self._clear_drain(state)
                 if state.get('stop_generation') == evidence.generation and evidence.state in ('running', 'pending'):
@@ -301,6 +333,12 @@ class Controller:
                         state['publication_error'] = {'at': int(self.clock()), 'reason': str(error)}
                 state['permission_published'] = published
                 now = int(self.clock())
+                if published:
+                    _ = state.pop('unpublished_permission', None)
+                elif evidence.state == 'running':
+                    if (action == 'tick' and now - unpublished.since >= settings.idle_stop_minutes * 60
+                            and not self._active()):
+                        return self._stop(api, state, evidence, 'unpublished_idle')
                 drain_reason = (decision.reason if not isinstance(decision, ledger.SpendingAllowed)
                                 else 'controlled_drain' if state.get('drain_generation') == evidence.generation else '')
                 if drain_reason:
@@ -319,7 +357,8 @@ class Controller:
                 if evidence.state != 'stopped':
                     return self._save(state, ControlResult('starting' if evidence.state == 'pending' else evidence.state,
                                                            '' if published else 'permission_unpublished', now, evidence.generation))
-                if action == 'tick' and self._queued(settings, now, configuration) < settings.start_min_waiting:
+                if (action == 'tick' and not self._pinned_work(configuration)
+                        and self._queued(settings, now, configuration) < settings.start_min_waiting):
                     return self._save(state, ControlResult('stopped', 'no_eligible_work', now, evidence.generation))
                 backoff = state.get('capacity_retry_after', 0)
                 if type(backoff) is not int or backoff > now:

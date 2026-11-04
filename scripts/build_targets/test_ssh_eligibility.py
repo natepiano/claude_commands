@@ -143,6 +143,39 @@ class SshEligibilityTests(unittest.TestCase):
         args.recover_only = recover_only
         return build_targets.command_reserve(args)
 
+    def test_pinned_stopped_aws_defers_reachability_until_the_controller_starts_it(self) -> None:
+        paths = mac_test.state_paths("aws")
+        paths.directory.mkdir(parents=True, exist_ok=True)
+        _ = (paths.directory / "controller.json").write_text('{"state":"stopped"}')
+        args = build_targets.CliArguments()
+        args.target, args.kind, args.repo_root, args.package = "aws", "test", str(self.root), "linux-part"
+        output = io.StringIO()
+        self.reachable = False
+        with redirect_stdout(output):
+            self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 0)
+        self.assertIn("aws\texcluded\tstarting\t", output.getvalue())
+        self.assertEqual(self.commands, [])
+        _ = (paths.directory / "controller.json").write_text('{"state":"running"}')
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 2)
+        self.assertTrue(self.commands)
+
+    def test_pinned_stopped_aws_still_refuses_a_spending_limit(self) -> None:
+        paths = mac_test.state_paths("aws")
+        paths.directory.mkdir(parents=True, exist_ok=True)
+        _ = (paths.directory / "controller.json").write_text('{"state":"stopped"}')
+        numeric_settings(self.root / "aws_target.conf", {"monthly_limit_usd": "0.001"})
+        book = ledger.CostLedger(paths.directory)
+        book.record_inventory(ledger.ResourceInventory(self.now - 86400,
+            (ledger.PricedResource("retained-storage", Decimal("1")),), "fixture inventory"))
+        args = build_targets.CliArguments()
+        args.target, args.kind, args.repo_root, args.package = "aws", "test", str(self.root), "linux-part"
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 2)
+        self.assertIn("spending", errors.getvalue())
+        self.assertEqual(self.commands, [])
+
     def test_a_mac_block_stops_a_memory_wait_from_reusing_its_reservation(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
         self.assertEqual(self.reserve("mac"), 0)
@@ -423,7 +456,7 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(self.reserve("mac", recover_only=True), 11)
         self.assertFalse((self.root / "reservation.tsv").exists())
 
-    def test_spending_limits_exclude_aws_without_capacity_retries_or_reservations(self) -> None:
+    def test_spending_limits_exclude_aws_and_keep_retries_without_reservations(self) -> None:
         for key in ("daily_limit_usd", "monthly_limit_usd"):
             with self.subTest(key=key):
                 settings = self.root / "aws_target.conf"
@@ -431,7 +464,7 @@ class SshEligibilityTests(unittest.TestCase):
                 numeric_settings(settings, {key: "3"})
                 with redirect_stderr(io.StringIO()) as errors:
                     self.assertEqual(self.aws()[1:3], ["excluded", "spending_limit"])
-                    self.assertEqual(self.decision(), "natedev_only spending_limit")
+                    self.assertEqual(self.decision(), "ssh_allowed")
                     self.assertEqual(self.reserve(), 1)
                 self.assertIn("spending refused", errors.getvalue())
                 self.assertEqual(self.commands, [])
@@ -471,7 +504,7 @@ class SshEligibilityTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             self.assertEqual(self.aws()[1:3], ["excluded", "spending_unavailable"])
             self.assertEqual(self.reserve(), 1)
-            self.assertEqual(self.decision(), "natedev_only spending_unavailable")
+            self.assertEqual(self.decision(), "ssh_allowed")
         self.assertEqual(self.commands, [])
         self.assertEqual(mac_test.read_claims(mac_test.state_paths("aws")), ())
         self.assertEqual(book.path.read_bytes(), b"{unfinished ledger")
@@ -500,17 +533,17 @@ class SshEligibilityTests(unittest.TestCase):
                     self.assertEqual(self.commands, [])
                     self.assertEqual(mac_test.read_claims(mac_test.state_paths("aws")), ())
 
-    def test_linux_backoff_disables_the_memory_leave_route(self) -> None:
+    def test_linux_backoff_keeps_the_memory_leave_route(self) -> None:
         offload.write_backoff(10**12, "aws")
-        self.assertEqual(self.decision(), "natedev_only backoff")
+        self.assertEqual(self.decision(), "ssh_allowed")
         self.assertEqual(self.commands, [])
 
-    def test_unreachable_linux_target_disables_the_memory_leave_route(self) -> None:
+    def test_unreachable_linux_target_keeps_the_memory_leave_route(self) -> None:
         self.reachable = False
-        self.assertEqual(self.decision(), "natedev_only unreachable")
+        self.assertEqual(self.decision(), "ssh_allowed")
         self.assertTrue(self.commands)
 
-    def test_disk_refusal_disables_the_memory_leave_route(self) -> None:
+    def test_disk_refusal_keeps_the_memory_leave_route(self) -> None:
         with mock.patch.object(mac_test, "free_now", return_value="disk"):
             self.assertEqual(self.decision(), "natedev_only disk")
         self.assertEqual(self.commands, [])

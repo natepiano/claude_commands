@@ -12,8 +12,8 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 from git_process import GitExitAnswers, run_git
 
 import style_ledger
-from scripts.production import staff, staff_sources, unit_lookup, session_staff
-from production_units import cell_value, production_field, unit_table
+from scripts.production import session_staff, staff, unit_lookup, unit_names
+from scripts.production.production_doc import production_field
 
 
 @dataclass(frozen=True)
@@ -36,22 +36,23 @@ def file_text(repo: Path, commit: str, path: str) -> str:
 def unit_worktrees(doc: Path, *,
                    record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitWorktree, ...]:
     record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
-    lines = doc.read_text().splitlines()
-    sources = unit_lookup.member_sources()
-    slug = unit_lookup.production_slug_for_document(doc, record, sources)
-    branch = production_field(lines, "Merge branch")
+    branch = production_field(doc.read_text().splitlines(), "Merge branch")
+    resolver = session_staff.RowResolver(record)
     result: list[UnitWorktree] = []
-    for row in unit_table(lines):
-        unit = cell_value(row["Unit"])
+    for row in unit_lookup.doc_units(doc, record):
+        unit = unit_names.unit_id(row.name)
         try:
-            selected = sources.member(staff_sources.UnitMember(slug, unit), record)
-            location = unit_lookup.local_worktree(selected)
-            if isinstance(location, staff.RemovedWorktree):
-                continue
-            result.append(UnitWorktree(unit, cell_value(row["Branch"]),
-                                       unit_lookup.plan_worktree(row, selected), branch))
-        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+            location = unit_lookup.local_worktree(session_staff.MemberFound(row))
+        except staff.StaffUnreadable as error:
             print(f"style: {unit}: {error}", file=sys.stderr)
+            continue
+        if isinstance(location, staff.RemovedWorktree):
+            continue
+        match resolver.unit_branch(row):
+            case session_staff.Branch(name):
+                result.append(UnitWorktree(unit, name, location.path, branch))
+            case problem:
+                print(f"style: {unit}: {problem.reason}", file=sys.stderr)
     return tuple(result)
 
 

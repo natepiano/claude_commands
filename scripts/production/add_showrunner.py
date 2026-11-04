@@ -37,8 +37,7 @@ from scripts.production.staff_sources import ensure_staff_showrunner as ensure_s
 
 from scripts.production import showrunners
 import showrunner_tree
-from production_units import Production, read_production
-from production_units import Refusal
+from scripts.production.production_doc import Production, Refusal, read_production
 import herdr
 
 if TYPE_CHECKING:

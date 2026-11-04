@@ -250,7 +250,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:**
 - A launcher that never exits keeps its subscription to the worker thread and records the next compaction turn as work, so the worker reads busy and refuses follow-ups. End only the stale launcher pids.
-- A merge in a `git clone --shared` scratch copy must fetch from the GitHub URL: the copy's `origin` is the worktree, so its `origin/sdlc` is the local ref.
+- Run a merge gate through `python3 ~/.claude/scripts/copies/copies.py run --owner <unit-or-production> --repo <source> --commit HEAD --merge origin/sdlc -- <gate command>`. For `--merge origin/<branch>`, `copies.py` first fetches the branch from the source's origin into the standing tree, then merges it; it does not update the source's refs.
 
 **Ruled out:** the slot taken from a variable fixed at app-server start; the newest phase instance for an ambiguous checkpoint; checking a postmaster-forwarded reply against its log before the log exists (removed as containment).
 

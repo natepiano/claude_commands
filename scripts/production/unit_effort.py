@@ -147,10 +147,10 @@ def verdict(capture: str) -> Ready | Skipped:
     return Ready()
 
 
-def send(place: unit_lookup.Place, level: str) -> str:
+def send(place: unit_lookup.Place, level: str, *, target: str) -> str:
     """Type `/effort <level>` into the pane, then Enter; the empty string when both took, else why not."""
     try:
-        type_place(place, f"/effort {level}")
+        type_place(place, f"/effort {level}", target=target)
     except (OSError, HerdrFailure) as error:
         return str(error)
     return ""
@@ -170,7 +170,8 @@ def _director_line(marked: unit_lookup.MarkedUnit, level: str, check: bool) -> s
         return f"{name}: skipped — {judged.reason}"
     if check:
         return f"{name}: would send"
-    problem = send(marked.place, level)
+    problem = send(marked.place, level,
+                   target=claude.session_id if isinstance(claude, unit_lookup.LiveClaude) else marked.staff_id)
     return f"{name}: NOT sent — {problem}" if problem else f"{name}: sent"
 
 

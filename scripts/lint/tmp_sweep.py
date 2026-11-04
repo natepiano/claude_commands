@@ -32,7 +32,7 @@ systemd-tmpfiles-clean moves it each day when it sets the folder's times back. I
 and the Mac's per-user temp folder) only a tempfile folder is an entry, the
 name a tempfile maker gives (TEMPFILE_NAME: Rust's tempfile crate, mktemp and
 Python's tempfile), which test runs leave behind, and a lint/invoke.sh log
-file (INVOKE_TEMP_NAME). A direct/verify.sh run folder (VERIFY_TEMP_NAME) is an entry
+file (INVOKE_TEMP_NAME). A direct/verify.sh run folder (verify_temp_name()) is an entry
 too: it stays while the run whose pid it names runs, and goes at once after. In /tmp alone (the
 wide root) every other empty folder this user owns, also one that holds only folders, is an entry
 too, whatever its name, and goes after WIDE_IDLE_SECONDS instead. A folder a system tool owns (SYSTEM_TEMP_NAMES,
@@ -156,11 +156,15 @@ TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}|tmp\.[A-Za-z0-9]{8,10}|tmp" + b
 # trap removes it, but a killed run leaves it (47 hold and 6 copy folders in natedev /tmp, 2026-10-27).
 # A named pid that is no verify.sh run started before the folder ends the folder at once; an old name
 # with no pid waits out the 4 h rule.
-VERIFY_TEMP_NAME = re.compile(
-    "(?:" + "|".join(re.escape(build_folders.FOLDER_PREFIXES[kind].split("{owner}")[0])
-                    for kind in ("verify-hold", "verify-copy"))
-    + r")(?:(\d+)\.)?(?:" + build_folders.LEGACY_MKTEMP_SUFFIX_PATTERN
-    + "|" + build_folders.MKDTEMP_SUFFIX_PATTERN + ")")
+def verify_temp_name() -> re.Pattern[str]:
+    """Read the current prefixes for verify run folders."""
+    return re.compile(
+        "(?:" + "|".join(re.escape(build_folders.FOLDER_PREFIXES[kind].split("{owner}")[0])
+                        for kind in ("verify-hold", "verify-copy"))
+        + r")(?:(\d+)\.)?(?:" + build_folders.LEGACY_MKTEMP_SUFFIX_PATTERN
+        + "|" + build_folders.MKDTEMP_SUFFIX_PATTERN + ")")
+
+
 VERIFY_SCRIPT = "verify.sh"
 # ps prints elapsed time to the second, so a run's start can read up to this late.
 START_SLACK_SECONDS = 2.0
@@ -242,6 +246,7 @@ class Roots:
     wide: tuple[str, ...] = ()
     sessions: tuple[str, ...] = ()
     copies: tuple[str, ...] = ()
+    verify_temp_name: re.Pattern[str] = field(default_factory=verify_temp_name, kw_only=True)
 
     def all(self) -> tuple[str, ...]:
         return self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions + self.copies
@@ -271,7 +276,7 @@ class Roots:
             if entry.is_file():
                 return INVOKE_TEMP_NAME.fullmatch(entry.name) is not None
             return entry.is_dir() and (TEMPFILE_NAME.fullmatch(entry.name) is not None
-                                       or VERIFY_TEMP_NAME.fullmatch(entry.name) is not None
+                                       or self.verify_temp_name.fullmatch(entry.name) is not None
                                        or self.judged_empty(root, entry))
         except OSError:
             return False
@@ -280,11 +285,11 @@ class Roots:
         """Whether entry goes only after WIDE_IDLE_SECONDS: an empty folder in a wide root that is
         no tempfile folder."""
         name = entry.name
-        return root in self.wide and not any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, VERIFY_TEMP_NAME))
+        return root in self.wide and not any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, self.verify_temp_name))
 
     def limit(self, root: str, entry: os.DirEntry[str], now: float, proc: str = PROC_DIR) -> Limit:
         """How long entry must be idle to go, and how a change in it counts."""
-        verify = VERIFY_TEMP_NAME.fullmatch(entry.name) if root in self.temp else None
+        verify = self.verify_temp_name.fullmatch(entry.name) if root in self.temp else None
         if verify is not None and verify.group(1):
             try:
                 made = entry.stat(follow_symlinks=False).st_mtime
@@ -1034,9 +1039,22 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bo
 def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Sweep:
     """Delete every idle entry no process uses, and record why each other entry stays."""
     result = Sweep()
+    resumed: set[str] = set()
+    if not dry_run:
+        pending = {str(path) for root in roots.copies for path in scratch.pending_copy_paths(Path(root))}
+        if pending:
+            interrupted = [entry for entry in timed_entries(roots, now, proc)
+                           if isinstance(entry, RemovableEntry) and entry.path in pending]
+            # Finish interrupted removals before judging their borrowed parents.
+            # A failed removal keeps its parent protected during the normal scan.
+            for entry in interrupted:
+                resumed.add(entry.path)
+                _ = remove_entry(entry, result, False)
     emptied: set[str] = set()
     removals: list[RemovableEntry] = []
     for entry in timed_entries(roots, now, proc):
+        if entry.path in resumed:
+            continue
         if isinstance(entry, KeptEntry):
             path = f"{entry.path}: {entry.use}" if entry.use else entry.path
             result.keep(path, entry.reason)
@@ -1087,7 +1105,7 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
                 return CleanupEndReason.TASK_ENDED
         if entry.root in roots.copies and isinstance(scratch.lifetime(Path(entry.path), now), scratch.Ended):
             return CleanupEndReason.TASK_ENDED
-        verify = VERIFY_TEMP_NAME.fullmatch(Path(entry.path).name) if entry.root in roots.temp else None
+        verify = roots.verify_temp_name.fullmatch(Path(entry.path).name) if entry.root in roots.temp else None
         if verify is not None and verify.group(1):
             made = os.stat(entry.path, follow_symlinks=False).st_mtime
             if not verify_running(int(verify.group(1)), made, now, proc):
@@ -1104,7 +1122,7 @@ def timed_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | R
             yield entry
             continue
         name = Path(entry.path).name
-        if any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, VERIFY_TEMP_NAME)):
+        if any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, roots.verify_temp_name)):
             yield entry
             continue
         ended = cleanup_end_reason(entry, roots, now, proc)

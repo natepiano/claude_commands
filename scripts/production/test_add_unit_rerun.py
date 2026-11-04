@@ -20,7 +20,7 @@ import resume_unit
 import unit_lookup as script_unit_lookup
 import retire_unit
 import atomic_file
-from production_units import Refusal, read_production
+from scripts.production.production_doc import Refusal, read_production
 from scripts.production import staff, unit_config
 
 
@@ -31,15 +31,13 @@ def setUpModule() -> None:
 class AddUnitRerunTests(AddUnitTestCase):
     def dead_pending_resume(self) -> tuple[add_unit.RequestedUnitLaunch, Path]:
         worktree = self.root / "project-alpha"
-        self.commit_prepared_row(self.unit_row())
         owner = self.prepare_restored_worktree("alpha", worktree)
         request = add_unit.RequestedUnitLaunch(
             production=read_production(self.doc), requested_name="alpha", unit="alpha-unit",
             branch="build-followups-alpha", worktree=worktree,
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
-            port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
-            session=add_unit.ResumedSession(owner.current_session, worktree),
-            launch_kind=add_unit.NewWorkLaunch(), timeout=5,
+            port=add_unit.OmittedCell(),
+            session=add_unit.ResumedSession(owner.current_session, worktree), timeout=5,
         )
         pending = add_unit.opening_record(request.production, request.unit)
         pending.parent.mkdir(parents=True, exist_ok=True)
@@ -134,7 +132,6 @@ class AddUnitRerunTests(AddUnitTestCase):
         assert isinstance(config, unit_config.UnitConfig)
         assert isinstance(config.plan, unit_config.PlanFile)
         self.assertFalse((worktree / config.plan.path).exists())
-        self.assertEqual(self.doc.read_text().count("| alpha-unit |"), 1)
         _ = self.successful("alpha", "--brief", "Keep the committed brief in the unit worktree.")
         self.assertEqual((worktree / config.plan.path).read_bytes(), (self.checkout / config.plan.path).read_bytes())
         self.assertEqual(self.git("-C", str(worktree), "rev-parse", "HEAD"),
@@ -174,7 +171,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             assert row is not None
             self.assertEqual((row.name, row.worktree), ("alpha", staff.PresentWorktree("natedev", path.parent)))
             submitted.append(row.id)
-            client.prompt(pane, opening.text)
+            client.prompt(pane, opening.text, target=opening.transcript.session_id)
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
 
         with patch.object(herdr.Herdr, "submit_opening_prompt", submit):
@@ -203,7 +200,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"))
         unit = resume_unit.RetiredUnit(read_production(self.doc), "alpha-unit", self.root / "project-alpha",
-            "build-followups-alpha", "docs/plans/given.md", "62ccbd64-f22e-5647-b20e-7899aa39d766", True)
+            "build-followups-alpha", unit_config.PlanFile(Path("docs/plans/given.md")), "62ccbd64-f22e-5647-b20e-7899aa39d766", True)
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         output = io.StringIO()
 
@@ -317,26 +314,6 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertEqual(len(stubs), 1)
         self.assertIn("## Source\n\n", stubs[0].read_text())
         self.assertEqual(self.git("status", "--porcelain", "--", str(self.doc), str(stubs[0])), "")
-
-    def test_interrupted_row_publish_preserves_other_units_and_rerun_commits_row(self) -> None:
-        original = self.doc.read_bytes()
-        write = atomic_file.write_text_atomic
-
-        def interrupted_row(path: Path, text: str) -> None:
-            if path == self.doc:
-                with patch("atomic_file.os.replace", side_effect=OSError("stopped before publish")):
-                    write(path, text)
-            else:
-                write(path, text)
-
-        with patch.object(add_unit, "write_text_atomic", side_effect=interrupted_row):
-            stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(stopped.returncode, 1, stopped.stderr)
-        self.assertEqual(self.doc.read_bytes(), original)
-        finished = self.successful("alpha", "--plan", "docs/plans/given.md")
-        self.assertIn("alpha-unit started:", finished.stdout)
-        self.assertEqual(self.doc.read_text().count("| alpha-unit |"), 1)
-        self.assertEqual(self.git("status", "--porcelain", "--", str(self.doc)), "")
 
     def test_started_session_without_opening_gets_its_prompt_on_rerun_without_second_start(self) -> None:
         with (patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()),

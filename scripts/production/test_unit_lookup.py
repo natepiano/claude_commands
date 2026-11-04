@@ -70,30 +70,6 @@ class UnitLookupTests(unittest.TestCase):
     records: Path = Path()
     environment: dict[str, str] = {}
 
-    def test_staff_folder_ignores_a_missing_absolute_plan_folder(self) -> None:
-        repository = self.root / "repository"
-        repository.mkdir()
-        _ = subprocess.run(["git", "init", str(repository)], check=True, capture_output=True,
-                           timeout=TEST_HANG_GUARD_SECS)
-        row = unit_membership("show", "alpha-unit")
-        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", repository), expected=row.worktree)
-        cells = {"Unit": "alpha-unit", "Plan": str(repository / "removed/docs/plan.md")}
-        self.assertEqual(unit_lookup.plan_worktree(cells, unit_lookup.MemberFound(row)), repository)
-
-    def test_retirement_follows_the_retained_worktree_mark_and_restore_clears_it(self) -> None:
-        row = unit_membership("show", "marked-unit")
-        location = staff.PresentWorktree("natedev", self.root / "not-on-disk")
-        row = staff.set_worktree(row.id, location, expected=row.worktree)
-        cells = {"Unit": "marked-unit", "Plan": "retired in an old document", "Worktree": "/stale"}
-        self.assertFalse(unit_lookup.unit_is_retired(cells, unit_lookup.ProductionMembers("show")))
-        removed = staff.set_worktree(row.id, staff.RemovedWorktree(location.machine, location.path), expected=row.worktree)
-        cells["Plan"] = "docs/live-looking-plan.md"
-        self.assertTrue(unit_lookup.unit_is_retired(cells, unit_lookup.ProductionMembers("show")))
-        self.assertEqual(staff.by_id(row.id), removed)
-        restored = staff.restore_unit(row.id, location)
-        self.assertEqual((restored.id, restored.parent), (row.id, row.parent))
-        self.assertFalse(unit_lookup.unit_is_retired(cells, unit_lookup.ProductionMembers("show")))
-
     def test_production_members_excludes_removed_children_and_wrapped_parents_but_keeps_raw_identity(self) -> None:
         live = unit_membership("current", "live-unit")
         retired = unit_membership("current", "retired-unit")
@@ -200,16 +176,6 @@ class UnitLookupTests(unittest.TestCase):
             _ = unit_lookup.marked_unit("show", "retired-unit", record=staff.snapshot())
         self.assertIn("herdr:first:w1:p1", str(caught.exception))
         self.assertIn("herdr:second:w2:p1", str(caught.exception))
-
-    def test_retired_names_are_explicitly_listed_while_active_membership_excludes_the_retained_row(self) -> None:
-        retired = unit_membership("show", "retired-unit")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
-        lines = ["## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                 "| --- | --- | --- | --- | --- | --- |",
-                 "| retired-unit | old.md | /missing | old | — | scripts |"]
-        with mock.patch.object(unit_lookup, "member_sources", return_value=unit_lookup.MemberSources({}, ())):
-            self.assertFalse(unit_lookup.ProductionMembers("show", record=staff.snapshot()).has("retired-unit"))
-            self.assertEqual(unit_lookup.retired_units(lines, "show", record=staff.snapshot()), {"retired-unit"})
 
     def test_removed_same_name_does_not_make_an_active_units_orphan_metadata_ambiguous(self) -> None:
         live = unit_membership("receiving", "alpha-unit")

@@ -1,3 +1,7 @@
+> Phase 10b supersedes the separate build-why instructions below.
+> Use `/build:queue <position|session|folder>` for the queue and its evidence on one page.
+> The old command has no alias.
+
 # Build queue service: design and migration
 
 > **Status: DESIGN for user review. No code is written until the user approves it.**
@@ -110,7 +114,7 @@ A service that gets an unknown `v` answers `refused {"reason": "client version N
 | Command | Today | With the service | Who may call |
 | --- | --- | --- | --- |
 | View (`/build:queue`, Phase 1 card) | Lock plus `/proc` scan, or Phase 1's `queue.json` | `view` from the last pass. Labels from `roster.unit_labels_for` (Phase 1). | Anyone |
-| Why (`build_why.py`) | `explain_queue` under the lock | `explain` | Anyone |
+| Selected queue evidence (`queue_evidence.py`) | The queue page uses one `QueueRead` | `view` | Anyone |
 | Mine (where am I, who is ahead) | Phase 1 per-step answer | `mine {session id}` | Anyone |
 | Override: admit the head (resources Phase 32) | Locked file write | `admit_head` | The user only: from `/showrunner:bump` or `/build:queue bump`, which pass the user's command as the actor. The service records the actor. |
 | Priority (resources Phase 26/30, `/showrunner:bump`) | `bump_waiter` (`:2211`) | `bump {selector, actor, minutes}` | Same as the override |

@@ -27,7 +27,7 @@ from urllib.parse import urlencode, urljoin, urlsplit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
 from scripts.production import change_routing, change_review, footer_counts, next_item, showrunners, staff, unrouted_alert
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve
 
@@ -230,10 +230,6 @@ class ChangePageTests(unittest.TestCase):
 - **Showrunner checkout:** `{self.repo}`
 - **Showrunner session:** fallback-owner
 - **Change review:** `{self.review_list}`
-## Units
-| Unit | Plan | Worktree | Branch |
-| --- | --- | --- | --- |
-| builder-unit | plan.md | /unused/feature | feature |
 """, encoding="utf-8")
         runner = fixture_member("showrunner", name="page-owner", doc=staff.LiveDoc("natedev", self.production))
         self.unit = fixture_member("unit", name="builder-unit", parent=runner.id,
@@ -616,6 +612,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
 
     def test_an_unrouted_row_with_a_missing_alert_setting_still_renders(self) -> None:
+        _ = self.enterContext(production_staff_record())
         _ = self.enterContext(patch.object(change_routing, "configured_lists_directory", return_value=self.temporary))
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Conflict", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")])
@@ -990,14 +987,13 @@ class ChangePageTests(unittest.TestCase):
         refreshed.feed(self.request(path, {}).body)
         self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
 
-    def test_a_units_table_name_does_not_replace_its_current_staff_session(self) -> None:
+    def test_a_renamed_unit_gets_its_current_staff_session(self) -> None:
         from scripts.production.staff_test_support import fixture_runtime_id
 
         _ = staff.rename(self.unit.id, "x")
         current = staff.update_current_session(self.unit.id, staff.native_id(fixture_runtime_id("session-x")))
         self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
         self.assertEqual(self.raw_messages[0][0], f"session:{current.current_session}")
-        self.assertIn("builder-unit", self.production.read_text())
         self.assertEqual(self.messages[0][0], "x")
 
     def test_a_delivery_resolves_the_staff_session_after_an_account_move(self) -> None:

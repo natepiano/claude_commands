@@ -165,7 +165,6 @@ import stat
 import subprocess
 import sys
 import time
-import tomllib
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
@@ -180,11 +179,19 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload,
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget
+from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS, PROC_LOCKS_READS as PROC_LOCKS_READS, lock_holder as lock_holder
 import conf
+from cargo_target_config import (
+    CargoFolderSetting,
+    cargo_folder_settings,
+    cargo_home_folder,
+    cargo_workspace_manifest,
+)
 from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from . import tmp_sweep
+    from ..copies import copies
     from ..lib import scratch
     from ..lib.atomic_file import write_text_atomic
     from ..buildlog import record, store
@@ -193,6 +200,7 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.copies import copies
     from scripts.lint import tmp_sweep
     import scratch
     from atomic_file import write_text_atomic
@@ -218,15 +226,10 @@ MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
 TARGET_DIR_FLAG = "--target-dir"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
-PROC_LOCKS = "/proc/locks"
-# The kernel writes /proc/locks one page per read and drops its lock between pages; a lock freed earlier in the
-# list moves the next page past one line. Each extra read gives a skipped line another chance to show.
-PROC_LOCKS_READS = 3
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
 NEXTEST_ARG = "nextest"
-CARGO_TARGET_DIR_ENV = "CARGO_TARGET_DIR"
 HASHED_DIRS = (".fingerprint", "build", "deps", "examples")
 FINGERPRINT_DIR = ".fingerprint"
 INCREMENTAL_DIR = "incremental"
@@ -808,30 +811,6 @@ def process_use(target: str, owners: TargetOwnerIndex, proc: str = PROC_DIR) -> 
     return process_uses(check) if proc == PROC_DIR else process_uses(check, proc)
 
 
-def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
-    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder.
-
-    A read under load can skip a line (PROC_LOCKS_READS), so no holder is the answer only after every read agrees.
-    """
-    try:
-        stat = os.stat(lock)
-    except OSError:
-        return None
-    # "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF"; a waiter's line has "->".
-    device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
-    for _ in range(PROC_LOCKS_READS):
-        try:
-            with open(locks, encoding="ascii", errors="replace") as handle:
-                lines = handle.read().splitlines()
-        except OSError:
-            return None
-        for line in lines:
-            fields = line.split()
-            if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
-                return int(fields[4])
-    return None
-
-
 def floor_lock_holder(path: str) -> KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder:
     """Match the durable hold identity to the pid that currently owns the flock."""
     pid = lock_holder(path)
@@ -998,71 +977,6 @@ def cargo_workspace_path_hash(manifest: Path) -> str:
     return os.path.join(hashed[:2], hashed[2:])
 
 
-def cargo_path_argument(argv: list[str], flag: str) -> str:
-    for index, arg in enumerate(argv):
-        if arg.startswith(flag + "="):
-            return arg.split("=", 1)[1]
-        if arg == flag and index + 1 < len(argv):
-            return argv[index + 1]
-    return ""
-
-
-def cargo_workspace_manifest(argv: list[str], cwd: str, cargo_home: str = "") -> Path:
-    """Find the workspace manifest without starting Cargo or reading its cache.
-
-    Cargo core/workspace.rs at 58bab51c: find_root_iter and is_excluded.
-    """
-    directory = Path(cwd)
-    named = cargo_path_argument(argv, "--manifest-path")
-    if named:
-        manifest = Path(os.path.abspath(directory / named))
-    else:
-        manifest = next((parent / "Cargo.toml" for parent in (directory, *directory.parents)
-                         if (parent / "Cargo.toml").is_file()), directory / "Cargo.toml")
-    table = cast(dict[str, object], tomllib.loads(manifest.read_text()))
-    if isinstance(table.get("workspace"), dict):
-        return manifest
-    package = table.get("package")
-    if isinstance(package, dict):
-        workspace = cast(dict[str, object], package).get("workspace")
-        if isinstance(workspace, str):
-            root = manifest.parent / workspace / "Cargo.toml"
-            root_table = cast(dict[str, object], tomllib.loads(root.read_text()))
-            if isinstance(root_table.get("workspace"), dict):
-                return root
-            raise ValueError("Cargo package.workspace does not name a workspace")
-    for parent in manifest.parent.parents:
-        if parent.parts[-2:] == ("target", "package"):
-            break
-        if cargo_home and manifest.is_relative_to(cargo_home) and not parent.is_relative_to(cargo_home):
-            break
-        root = parent / "Cargo.toml"
-        if not root.is_file():
-            continue
-        table = cast(dict[str, object], tomllib.loads(root.read_text()))
-        workspace = table.get("workspace")
-        if isinstance(workspace, dict):
-            matches: dict[str, bool] = {}
-            for key in ("exclude", "members"):
-                paths = cast(dict[str, object], workspace).get(key, [])
-                if not isinstance(paths, list) or any(not isinstance(path, str) for path in cast(list[object], paths)):
-                    raise ValueError("Cargo workspace membership cannot be read")
-                matches[key] = any(manifest.is_relative_to(parent / path) for path in cast(list[str], paths))
-            if matches["exclude"] and not matches["members"]:
-                continue
-            return root
-        package = table.get("package")
-        if isinstance(package, dict) and "workspace" in package:
-            raise ValueError("An ancestor Cargo manifest redirects workspace discovery")
-    return manifest
-
-
-@dataclass(frozen=True)
-class CargoFolderSetting:
-    value: str
-    base: Path
-
-
 def cargo_build_folder(setting: CargoFolderSetting, argv: list[str], cwd: str, cargo_home: str) -> str:
     """Expand build.build-dir before resolving it against its configuration root.
 
@@ -1093,51 +1007,8 @@ def nextest_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[s
     except OSError:
         entries = []
     environment = dict(entry.split("=", 1) for entry in entries if "=" in entry)
-    settings: dict[str, CargoFolderSetting] = {}
-
-    def read_settings(contents: str, base: Path) -> None:
-        try:
-            table = cast(dict[str, object], tomllib.loads(contents)).get("build")
-        except tomllib.TOMLDecodeError:
-            return
-        if isinstance(table, dict):
-            for key in ("target-dir", "build-dir"):
-                value = cast(dict[str, object], table).get(key)
-                if isinstance(value, str) and value:
-                    settings[key] = CargoFolderSetting(value, base)
-
-    def read_config(path: Path) -> None:
-        try:
-            read_settings(path.read_text(), path.parent.parent)
-        except (OSError, UnicodeError):
-            pass
-
-    cargo_home = environment.get("CARGO_HOME")
-    if not cargo_home and environment.get("HOME"):
-        cargo_home = os.path.join(environment["HOME"], ".cargo")
-    cargo_home = os.path.realpath(os.path.join(cwd, cargo_home)) if cargo_home else ""
-    configs = [Path(cargo_home)] if cargo_home else []
-    directory = Path(cwd)
-    configs.extend(parent / ".cargo" for parent in reversed((directory, *directory.parents)))
-    for config in configs:
-        legacy = config / "config"
-        read_config(legacy if legacy.is_file() else config / "config.toml")
-    for key, variables in (("target-dir", ("CARGO_BUILD_TARGET_DIR", CARGO_TARGET_DIR_ENV)),
-                           ("build-dir", ("CARGO_BUILD_BUILD_DIR",))):
-        for variable in variables:
-            if environment.get(variable):
-                settings[key] = CargoFolderSetting(environment[variable], directory)
-    for index, arg in enumerate(argv):
-        setting = arg.split("=", 1)[1] if arg.startswith("--config=") else (
-            argv[index + 1] if arg == "--config" and index + 1 < len(argv) else "")
-        if setting:
-            if "=" in setting:
-                read_settings(setting, directory)
-            else:
-                read_config(directory / setting)
-    named = cargo_path_argument(argv, TARGET_DIR_FLAG)
-    if named:
-        settings["target-dir"] = CargoFolderSetting(named, directory)
+    settings = cargo_folder_settings(argv, cwd, environment)
+    cargo_home = cargo_home_folder(cwd, environment)
     try:
         chosen = {cargo_build_folder(setting, argv, cwd, cargo_home) if key == "build-dir"
                   else os.path.realpath(setting.base / setting.value) for key, setting in settings.items()}
@@ -2661,6 +2532,11 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
     return protected
 
 
+def floor_roots() -> tuple[str, ...]:
+    """Include the standing pool wherever copies configuration places it."""
+    return (*FLOOR_ROOTS, str(copies.gates_root()))
+
+
 def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, float],
                        tree_targets: dict[str, str]) -> list[record.IdleFloorTarget]:
     """Estimate each target independently of the shortfall and all other takes."""
@@ -2695,7 +2571,7 @@ def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, f
 def hold_floor(
     floor: int,
     dry_run: bool,
-    roots: Sequence[str] = FLOOR_ROOTS,
+    roots: Sequence[str] = (),
     lock: str = "",
 ) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
@@ -2723,7 +2599,7 @@ def hold_floor(
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
         busy: dict[str, TargetUse | LockHeld | BuildHoldTarget] = {}
-        targets = target_dirs(roots)
+        targets = target_dirs(roots or floor_roots())
         owners = TargetOwnerIndex(targets)
         known_trees: dict[str, list[str]] = {}
         hold_targets = build_hold_targets(targets, known_trees)

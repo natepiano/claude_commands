@@ -169,7 +169,11 @@ The `budget_notice_*_percent` keys set the notice thresholds.
 `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.
 `existing_data_volume_id` selects a retained volume. An empty value requests a new volume.
 `spot_max_usd_per_hour` limits the Spot request price.
-`deployment_price_usd_per_hour` and `deployment_price_at` record the current public price and its Unix timestamp.
+`deployment_price_file` names the price state file outside the repository. Its default path is `~/.config/aws-build/deployment-price`.
+Run `python3 scripts/aws_target/deploy.py price` before `prepare`.
+The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
+It writes the price and its read time atomically with mode `0600`.
+`prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
 `preflight_max_age_s` limits preparation age. `deployment_timeout_s` bounds each deployment command.
 `scaler_user_name` names the IAM user.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
@@ -410,7 +414,10 @@ Missing store paths force a new evaluation. Each claimed slot retains its own wa
 
 `parity.rustc`, `parity.nextest`, `parity.mend`, and `parity.scripts_commit` can pin the public tool versions and script commit.
 An empty pin uses the sender's version. A mismatch prevents execution.
-The sender transfers clean tracked scripts and named public configuration before the probe.
+`aws_target.conf` sets `version_pin_file=nixos hosts/aws-build.nix`.
+A version refusal names each mismatched tool, both versions, and this file.
+The verify output and the step attempt record keep this reason.
+The sender transfers every tracked file under `scripts/` and `config/` before the probe.
 It checks their contents and commit before and after transfer. A dirty script set prevents execution.
 Source transfers include untracked files and omit ignored paths, Git metadata, and the target folder.
 Directory transfers delete removed source files from warm mirrors.

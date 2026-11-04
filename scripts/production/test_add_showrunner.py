@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
-import production_units
+from scripts.production.production_doc import Production, read_production
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.whoami import usage_store
@@ -39,6 +39,7 @@ from scripts.production.add_showrunner_test_support import AddShowrunnerFixture,
 
 from scripts.production import staff
 from scripts.production import completion_receipt
+from scripts.production.fake_unit_host import process as write_process
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -55,7 +56,7 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         _ = fixture_member("showrunner", name="demo", runtime_id=fixture_runtime_id("decoy-showrunner"))
         with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", return_value=
               runtime.AgentLaunched("w1:p1", runtime.PromptSubmitted(datetime.now(timezone.utc)))) as launch):
-            _ = add_showrunner.launch(production_units.read_production(document), "fixture", "high", current,
+            _ = add_showrunner.launch(read_production(document), "fixture", "high", current,
                                       self.root, accounts.NamedAccount("claude1", self.root))
         arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
         self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
@@ -67,7 +68,7 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         document = self.production("demo")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
                                 + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
-        child = production_units.read_production(document)
+        child = read_production(document)
         identity = fixture_runtime_id("fresh-Claude-showrunner")
         backend = ClaudeBackendFixture(identity, self.root / "claude-account")
         with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", side_effect=backend.launch)):
@@ -130,7 +131,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             self.assertGreater(showrunner_admit.call_count, 0)
             with (patch.dict(os.environ, self.env),
                   patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
-                unit = add_unit.ensure_staff_unit(production_units.read_production(self.doc("kid")), "probe-unit",
+                unit = add_unit.ensure_staff_unit(read_production(self.doc("kid")), "probe-unit",
                     worktree=staff.PresentWorktree("natedev", self.root / "probe"),
                     runtime_id=fixture_runtime_id("probe-unit-backend"))
             unit_admit.assert_called_once()
@@ -150,7 +151,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         before = self.staff.staff_file.read_bytes(), path.read_bytes()
         with (patch.dict(os.environ, self.env),
               patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
-            ensured = add_showrunner.ensure_staff_showrunner(production_units.read_production(self.doc("kid")), "top")
+            ensured = add_showrunner.ensure_staff_showrunner(read_production(self.doc("kid")), "top")
         self.assertEqual(ensured, child)
         self.assertEqual((self.staff.staff_file.read_bytes(), path.read_bytes()), before)
 
@@ -159,7 +160,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         class NativeCallbackInterrupted(BaseException):
             """The backend was observed before this launcher process ended."""
 
-        def interrupted(child: production_units.Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
+        def interrupted(child: Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
             self.assertEqual((child.slug, caller), ("kid", "top"))
             self.assertEqual(runtime_id, "cfc4564d-fed3-5803-9a4c-e3119733bb53")
             raise NativeCallbackInterrupted("stopped after saving launch")
@@ -260,7 +261,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         class NativeCallbackInterrupted(BaseException):
             """Process loss after native observation leaves the launch available for recovery."""
 
-        def interrupted(child: production_units.Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
+        def interrupted(child: Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
             self.assertEqual(runtime_id, native)
             if after_publication:
                 _ = original(child, caller, runtime_id=runtime_id)
@@ -386,11 +387,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertIn("--resume and --cwd go together", alone.stderr)
 
     def test_showrunner_shared_tab_retries_enter_with_the_selected_session_transcript(self) -> None:
-        child = production_units.read_production(self.doc("kid"))
+        child = read_production(self.doc("kid"))
         selected = accounts.NamedAccount("claude3", self.root / "selected")
         native = fixture_runtime_id("shared-tab-resumed-showrunner")
         path, record = self.record(native, "kid")
-        _ = Path(path).write_text(record)
         pid = cast(dict[str, object], json.loads(record))["pid"]
         transcript = selected.dir / "projects/fixture" / f"{native}.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -402,9 +402,17 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             nonlocal elapsed
             elapsed += seconds
 
-        def visible(*_args: str, deadline: float = math.inf) -> str:
+        def visible(*args: str, deadline: float = math.inf) -> str:
             del deadline
+            if args[:2] == ("pane", "process-info"):
+                return json.dumps({"result": {"process_info": {
+                    "shell_pid": 998040, "foreground_process_group_id": pid,
+                    "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}})
             return screen
+
+        def started(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            _ = Path(path).write_text(record)
+            return subprocess.CompletedProcess([], 0, "", "")
 
         def turn(*, meta: bool) -> None:
             with transcript.open("a") as output:
@@ -436,12 +444,12 @@ class AddShowrunnerTests(AddShowrunnerFixture):
               patch.object(runtime, "start_server"),
               patch.object(runtime, "open_tab", return_value="destination:p1") as tab,
               patch.object(runtime, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
-              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "label": "kid"}]),
-              patch.object(runtime.Herdr, "start_command", return_value=subprocess.CompletedProcess([], 0, "", "")),
+              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "workspace_id": "destination", "label": "kid"}]),
+              patch.object(runtime.Herdr, "start_command", side_effect=started),
               patch.object(runtime.Herdr, "readiness", return_value={"agent_status": "idle", "interactive_ready": True}) as readiness,
-              patch.object(runtime.Herdr, "prompt", autospec=True, side_effect=typed) as prompt,
+              patch.object(runtime.Herdr, "_prompt", autospec=True, side_effect=typed) as prompt,
               patch.object(runtime.Herdr, "run", side_effect=visible),
-              patch.object(runtime.Herdr, "send_keys", autospec=True, side_effect=enter) as keys):
+              patch.object(runtime.Herdr, "_send_keys", autospec=True, side_effect=enter) as keys):
             outcome = add_showrunner.launch(child, "opus", "high", native, self.root, selected)
         self.assertIsInstance(outcome, runtime.PromptSubmitted)
         self.assertEqual(prompt.call_count, 1)
@@ -627,7 +635,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
 
     def test_resume_uses_the_configured_showrunners_account(self) -> None:
         directory = self.named_account()
-        child = production_units.read_production(self.doc("kid"))
+        child = read_production(self.doc("kid"))
         self.resume_record()
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
@@ -636,7 +644,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         role.assert_called_once_with("showrunner")
 
     def test_check_validates_the_destination_without_returning_a_binary(self) -> None:
-        child = production_units.read_production(self.doc("kid"))
+        child = read_production(self.doc("kid"))
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(add_showrunner, "running", return_value=False), \
                 patch.object(showrunner_tree, "descendants_of", return_value=[]), \
@@ -651,13 +659,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             (991000, 0, ["herdr", "--session", "kid", "server"], {}),
             (991001, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1"}),
         ):
-            process = Path(self.env["HERDR_PROC"]) / str(pid)
-            process.mkdir(parents=True)
-            _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
-            _ = (process / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
-            _ = (process / "environ").write_bytes(
-                ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
-            )
+            write_process(self.env, pid, parent, argv, environment)
         result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--check")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("check: ok", result.stdout)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import errno
 import hashlib
 import json
 import os
@@ -512,6 +513,12 @@ class FastTrackTests(MergeCheckpointFixture):
                 stdout, stderr = beta.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(beta.returncode, 2, stdout + stderr)
             finally:
+                try:
+                    with os.fdopen(os.open(release, os.O_WRONLY | os.O_NONBLOCK), "w") as output:
+                        _ = output.write("continue\n")
+                except OSError as error:
+                    if error.errno != errno.ENXIO:
+                        raise
                 if beta.poll() is None:
                     beta.kill()
                     _ = beta.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -702,6 +709,39 @@ class FastTrackTests(MergeCheckpointFixture):
         again = self.fast_track()
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertEqual(self.records(), [row])
+
+    def test_unpublished_candidate_survives_checkout_reset_and_source_pruning(self) -> None:
+        self.change_module()
+        self.interrupt_git("before-push")
+        stopped = self.fast_track()
+        self.assertEqual(stopped.returncode, -9, stopped.stdout + stopped.stderr)
+        attempt, = (self.records_dir / "attempts").glob("*.json")
+        state = fast_track.read_attempt(attempt)
+        candidate = state["restore"]["record"]["commit"]
+        reference = f"refs/fast-track/attempts/{attempt.stem}/commit"
+        self.assertEqual(self.git("rev-parse", reference, cwd=self.unit), candidate)
+        tree = Path((self.control / "stopped-copy").read_text())
+        _ = self.git("checkout", "--force", "--detach", self.initial, cwd=tree)
+        _ = self.git("reflog", "expire", "--expire=now", "--all", cwd=tree)
+        _ = self.git("gc", "--prune=now", cwd=tree)
+        _ = self.git("reflog", "expire", "--expire=now", "--all", cwd=self.unit)
+        _ = self.git("gc", "--prune=now", cwd=self.unit)
+        self.assertEqual(self.git("cat-file", "-t", candidate, cwd=self.unit), "commit")
+        self.assertIn('VALUE = "after"', self.git("show", f"{candidate}:scripts/sample/item.py", cwd=self.unit))
+
+    def test_repeated_checks_reuse_checkout_and_keep_ignored_target(self) -> None:
+        self.change_module()
+        first = self.fast_track()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        tree = Path(str(self.observations("types")[0]["cwd"]))
+        cache = tree / "target" / "warm-cache"
+        cache.parent.mkdir(exist_ok=True)
+        _ = cache.write_text("keep")
+        self.write(self.unit, "scripts/sample/note.txt", "new note\n")
+        second = self.fast_track("scripts/sample/note.txt")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(Path(str(self.observations("types")[-1]["cwd"])), tree)
+        self.assertEqual(cache.read_text(), "keep")
 
     def test_rerun_recovers_a_push_that_stopped_before_the_review_record(self) -> None:
         self.change_module()
@@ -907,7 +947,7 @@ class FastTrackTests(MergeCheckpointFixture):
         for row in [*tests, *checks]:
             clone = Path(str(row["cwd"]))
             self.assertNotIn(clone, (self.unit, self.checkout, self.promote))
-            self.assertFalse(clone.exists(), "the temporary clone must be removed")
+            self.assertTrue((clone / ".git").is_dir(), "the standing checkout must remain")
         row, = self.records()
         self.assertEqual((row["unit"], row["commit"], row["why"], row["review"]),
                          ("alpha-unit", tip, "repair the sample", "pending"))

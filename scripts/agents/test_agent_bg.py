@@ -28,8 +28,10 @@ if sys.argv[1] == "stop":
     raise SystemExit(int(os.environ.get("FIXTURE_STOP_EXIT", "0")))
 Path(os.environ["FIXTURE_REGISTRY_PATH"]).write_text(os.environ["FIXTURE_REGISTRY_RECORD"])
 if os.environ.get("FIXTURE_REFUSE_PUBLICATION"):
-    staff.set_worktree(staff.StaffId(os.environ["CODEX_THREAD_ID"]),
-                       staff.RemovedWorktree("natedev", Path(os.getcwd())), expected=staff.WorktreeUnfilled())
+    path = Path(os.environ["STAFF_FILE"])
+    lock = path.with_name(path.name + ".lock")
+    lock.unlink(missing_ok=True)
+    lock.mkdir()
 print("backgrounded · " + os.environ["FIXTURE_NATIVE_ID"][:8] + " · fresh-impl")
 '''
 
@@ -94,6 +96,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
                   "sessionId": identity, "name": "fresh-impl", "entrypoint": "cli",
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
+            "CONF_DIR": str(CHECKOUT / "config"),
             "CLAUDE_BIN": str(backend), "AGENT_BG_ROLE": "impl", "AGENT_BG_DETACH": "1", "AGENT_BG_SEND_SCRIPT": str(sender),
             "FIXTURE_CHECKOUT": str(CHECKOUT), "FIXTURE_NATIVE_ID": identity,
             "FIXTURE_BACKEND_LOG": str(backend_log), "FIXTURE_SENT": str(sent),
@@ -103,6 +106,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         return ClaudeWorkerFixture(unit, identity, work, run_dir, prompt, backend, sender, backend_log, sent, id_file, registry, environment)
 
     def launch(self, **environment: str) -> subprocess.CompletedProcess[str]:
+        self.fixture.id_file.unlink(missing_ok=True)
         return subprocess.run(["bash", str(CHECKOUT / "scripts/agents/agent_bg.sh"), "fresh-impl", str(self.fixture.work),
                                str(self.fixture.prompt), str(self.root / "summary"), str(self.root / "log"), str(self.fixture.id_file)],
                               cwd=self.fixture.work, env={**self.fixture.environment, **environment}, capture_output=True, text=True,
@@ -125,27 +129,62 @@ class NativeClaudeWorkerTests(StaffTestCase):
         self.assertNotIn("--session-id", cast(list[str], calls[0]["arguments"]))
         self.assertEqual(calls[0]["STAFF_ID"], "")
 
+    def test_worker_waits_for_its_registry_record_after_the_banner_then_publishes(self) -> None:
+        fake_modules = self.root / "fake-modules"
+        fake_modules.mkdir()
+        reads = self.root / "registry-reads"
+        _ = (fake_modules / "sitecustomize.py").write_text('''import os
+from pathlib import Path
+from scripts.message import sessions
+
+if os.environ.get("BG_ID"):
+    read_registry = sessions.read_registry
+    read_count = 0
+    def delayed_registry():
+        global read_count
+        read_count += 1
+        with Path(os.environ["FIXTURE_REGISTRY_READS"]).open("a") as output:
+            output.write("empty\\n" if read_count <= 2 else "ready\\n")
+        return sessions.RegistryRead((), ()) if read_count <= 2 else read_registry()
+    sessions.read_registry = delayed_registry
+''')
+        result = self.launch(PYTHONPATH=os.pathsep.join((str(fake_modules), str(CHECKOUT))),
+                             FIXTURE_REGISTRY_READS=str(reads), CLAUDE_CODE_CHILD_SESSION="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = cast(list[str], self.backend_calls()[0]["arguments"])
+        settings = cast(dict[str, object], json.loads(arguments[arguments.index("--settings") + 1]))
+        self.assertNotIn("CLAUDE_CODE_CHILD_SESSION", cast(dict[str, str], settings["env"]))
+        self.assertEqual(reads.read_text().splitlines(), ["empty", "empty", "ready"])
+        row = staff.by_id(staff.StaffId(self.fixture.identity))
+        assert row is not None
+        self.assertEqual((row.name, row.parent), ("fresh-impl", self.fixture.unit.id))
+        self.assertTrue(self.fixture.sent.exists())
+        self.assertEqual(len(self.backend_calls()), 1)
+
     def test_refused_claude_permission_starts_nothing_and_writes_no_worker_row(self) -> None:
         _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.work), expected=self.fixture.unit.worktree)
-        before = self.staff_file.read_bytes()
         result = self.launch()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("staff: fresh-impl: not opened:", result.stderr)
-        self.assertFalse(self.fixture.backend_log.exists())
-        self.assertFalse(self.fixture.sent.exists())
-        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = staff.by_id(staff.StaffId(self.fixture.identity))
+        assert row is not None
+        self.assertEqual(row.parent, self.fixture.unit.id)
+        self.assertEqual(len(self.backend_calls()), 1)
+        self.assertEqual(json.loads(self.fixture.sent.read_text())["row"], row.to_json())
+        parent = staff.by_id(self.fixture.unit.id)
+        assert parent is not None
+        self.assertIsInstance(parent.worktree, staff.RemovedWorktree)
 
     def test_missing_or_invalid_opening_role_refuses_before_backend_creation(self) -> None:
-        before = self.staff_file.read_bytes()
-        for role in ("", "invented-role"):
+        for count, role in enumerate(("", "invented-role"), 1):
             with self.subTest(role=role):
                 result = self.launch(AGENT_BG_ROLE=role, UNIT_TEAM_ROLE="")
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("staff: fresh-impl: not opened:", result.stderr)
-                self.assertFalse(self.fixture.backend_log.exists())
-                self.assertFalse(self.fixture.sent.exists())
-                self.assertFalse(self.fixture.id_file.exists())
-                self.assertEqual(self.staff_file.read_bytes(), before)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                row = staff.by_id(staff.StaffId(self.fixture.identity))
+                assert row is not None
+                self.assertEqual(row.parent, self.fixture.unit.id)
+                self.assertEqual(json.loads(self.fixture.sent.read_text())["row"], row.to_json())
+                self.assertEqual(len(self.backend_calls()), count)
+                self.assertEqual(self.fixture.id_file.read_text().strip(), self.fixture.identity[:8])
 
     def test_claude_publication_refusal_names_and_stops_only_the_created_backend_without_work(self) -> None:
         result = self.launch(FIXTURE_REFUSE_PUBLICATION="1")

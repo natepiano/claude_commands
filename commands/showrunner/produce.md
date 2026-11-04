@@ -95,7 +95,7 @@ State:
   edit files there.
 - **A unit's pane** is looked up each time it is needed, never remembered:
   `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py where unit <slug> <unit>`
-  prints its host and pane (`<unit>` is the Units row's Unit value). No tool finds a pane by a
+  prints its host and pane (`<unit>` is the unit's staff row name). No tool finds a pane by a
   session name; the user may rename a session at any time.
 - **The user's words for a unit director** go into its terminal. Send
   `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py type unit <slug> <unit> "From the user (via the showrunner): <words>"`.
@@ -129,7 +129,7 @@ State:
   - packaging;
   - cargo-berth overlap answers, incursion resolves, orphan retirement and
     releases (<Dependencies/> rule 3);
-  - whether a unit edits files outside its **Owns**, another unit's crate
+  - whether a unit edits files outside its `.unit.toml` duties, another unit's crate
     included: settle it by who holds the files on the berth board and when
     each holder merges, as <Dependencies/> rule 3 settles a file wait. No
     rule needs the user's OK for this (user, 2026-10-04).
@@ -148,7 +148,7 @@ State:
   User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
   2026-10-12: "have them available for direct interaction from me but also
   have a natural home under an L1".
-  - **A child showrunner is never a unit.** It has no Units row. Never type
+  - **A child showrunner is never a unit.** Never type
     into its pane or its units' panes. One merge exception: a same-repository
     child with `**Kind:** style` sends
     `From the showrunner of <style slug>: hand-off <hash>`. Correctness-review
@@ -213,8 +213,8 @@ State:
   - **Turn a unit into a lower showrunner only with
     `/showrunner:promote_showrunner <unit> <production doc>`**, once the unit
     has committed the new production's doc. The unit keeps its conversation,
-    restarts on the showrunner account and reports to you, and its Units row
-    retires.
+    restarts on the showrunner account and reports to you, and its staff row
+    becomes a showrunner row.
   - **Start a lower showrunner only with `/showrunner:add_showrunner
     <production doc>`**, never in your own pane and never as a unit. It gets
     its own herdr session on the selected account and is attached to you
@@ -416,7 +416,7 @@ phases and plans; unit pause, move and end apply to them too.
 
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
-`<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
+`<name>` is the unit's staff row name without `-unit`; the existing row is adopted.
 Use `--standby` for a unit waiting for an assignment. Tell the user one line
 per unit director: its session name and the place add_unit printed (its tab in `agents`).
 
@@ -686,8 +686,7 @@ message.
    ~/.claude/scripts/production/ci_points.py watch --production PRODUCTION_DOC
    --state-dir DAILIES_STATE_DIR` after each code checkpoint. Give the user its
    table on the first alert. A shrink adds no review-ledger row or CI count. While the
-   watch exits 3, the dailies `Review watch` topic needs the user, and every
-   build report (`/build:report`) carries it and pushes again. Run
+   watch exits 3, the dailies `Review watch` topic needs the user. Run
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
 </MergeCheckpoint>
@@ -1150,7 +1149,7 @@ and its existing workers. See `commands/shutdown.md`.
 <Wrap>
 When every unit's final-gate and as-built checkpoints are merged:
 
-A unit whose Plan cell is `permanent` (the nightly review) is outside that
+A unit whose `.unit.toml` plan is `permanent` (the nightly review) is outside that
 condition: wrap neither waits on it nor retires its worktree or branch.
 
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:

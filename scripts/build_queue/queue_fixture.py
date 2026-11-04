@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import roster
 from scripts.build_queue import head_facts, queue_view
@@ -68,9 +68,11 @@ STEPS = (
 
 def write_memory_config(path: Path, **changes: str | None) -> None:
     """Write one complete, private memory configuration for admission consumers."""
-    _ = write_config_fixture(path, template="lint")
+    _ = write_config_fixture(path, template="build_admission")
     lines = [line for line in path.read_text().splitlines()
-             if not line.startswith(("program_first_peak_gib.", "peak_hold_seconds."))]
+             if not line.startswith("peak_hold_seconds.")
+             and (not line.startswith("program_first_peak_gib.")
+                  or line.startswith("program_first_peak_gib.cargo="))]
     for key, value in changes.items():
         indices = [index for index, line in enumerate(lines) if line.partition("=")[0].strip() == key]
         if indices:
@@ -186,7 +188,14 @@ def queue_read_fixture(view: gate.QueueView, policy: gate.AdmissionPolicy) -> ga
         {"pid": step.pid, "start_time": str(step.pid), "need": step.need, "since": step.since,
          "session_id": step.session_id, "session_name": step.session_name,
          "step": step.step, "folder": step.folder}) for step in view.waiting]
-    inputs = gate.QueueInputs(ordered, view.running, (),
+    reservations: tuple[gate.Reservation, ...] = tuple({
+        "pid": index, "start_time": str(index), "need": step.promise,
+        "repo": "fixture", "step": step.step, "worktree": step.folder,
+        "admitted_at": "", "sidecar": "", "test_threads": gate.NoTestWidth(),
+        "call_id": gate.NoCallRecord(),
+    } for index, step in enumerate(view.running, 1)
+        if gate.running_has_reservation(step))
+    inputs = gate.QueueInputs(ordered, view.running, reservations,
         gate.HostMemory(view.available, gate.UnknownHostTotal()), gate.NoPressureHold(),
         gate.NoRecoverySpacing(),
         gate.NoHeadAdmissionOverride(), view.now)
@@ -203,7 +212,7 @@ def head_reading(*, since: float = HEAD_NOW - 600, now: float = HEAD_NOW,
                  fields: dict[str, object] | None = None, step_name: str = "nextest") -> gate.QueueRead:
     step = gate.WaitingStep(123, "head-session", "head", step_name, "/tmp/head", since,
                             gate.GIB, gate.ReadyForAdmission())
-    reading = queue_read_fixture(gate.QueueView((step,), (), 30 * gate.GIB, 0, 3 * gate.GIB, now), policy=gate.DEFAULT_ADMISSION_POLICY)
+    reading = queue_read_fixture(gate.QueueView((step,), (), 30 * gate.GIB, 0, 3 * gate.GIB, now), policy=admission_policy_fixture())
     row = cast(gate.Waiter, cast(object, {"pid": step.pid, "start_time": "123", "need": step.need,
                             "since": since, "session_id": step.session_id,
                             "session_name": step.session_name, "step": step.step,
@@ -266,7 +275,7 @@ class QueueFixture(ExitStack):
                             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
                             "BUILDLOG_BUILD_BUDGET_GIB": "21", "USER_ZONE": "America/New_York"})
         self.enter_context(mock.patch.dict(os.environ, environment))
-        config = self.root / "lint.conf"
+        config = self.root / "build_admission.conf"
         write_memory_config(config)
         self.enter_context(mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}))
         self.labels: dict[str, UnitLabels] = {}
@@ -354,7 +363,9 @@ class QueueFixture(ExitStack):
     def model(self) -> queue_view.QueueModel:
         reading = self.read()
         return queue_view.QueueModel(reading, self.labels, head_facts.read_head_facts(reading),
-                                     head_facts.read_pace(NOW), ZONE)
+                                     head_facts.read_pace(NOW), ZONE, queue_view.HostLoadUnavailable(),
+                                     gate.smallest_head_release(reading.explanation),
+                                     ci_memory_slice=gate.read_memory_config().ci_memory_slice)
 
     def budget_model(self) -> queue_view.QueueModel:
         """The compact page uses the captured rows and the drawing's budget split."""
@@ -375,7 +386,8 @@ class QueueFixture(ExitStack):
         reading = replace(model.reading, explanation=explanation,
             view=replace(model.reading.view, waiting=(step, *model.reading.view.waiting[1:])),
             ordered=cast(list[tuple[Path, gate.Waiter]], ordered))
-        return replace(model, reading=reading)
+        return replace(model, reading=reading, release=gate.smallest_head_release(reading.explanation),
+                                     ci_memory_slice=gate.read_memory_config().ci_memory_slice)
 
 
 class QueueFixtureTests(unittest.TestCase):

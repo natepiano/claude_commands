@@ -27,9 +27,6 @@ import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
 from sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
 from scripts.production import staff, showrunners, session_staff, unit_config  # noqa: E402
-import unit_names  # noqa: E402
-from production_units import cell_value, order_unit_names  # noqa: E402
-from scripts.production.unit_table import unit_spellings  # noqa: E402
 from scripts.shutdown import remote
 from scripts.lib import unit_runs  # noqa: E402
 
@@ -60,16 +57,27 @@ from scripts.production.session_staff import (
     lookup_slug as _lookup_slug,
     production_members as production_members,
     group_marked_units as group_marked_units,
-    retained_unit_marks,
+    retained_session_labels,
     session_staff_and_directors as session_staff_and_directors,
 )
 
 
-def production_slug_for_document(doc: Path, record: staff.StaffSnapshot, sources: MemberSources) -> str:
-    """Resolve a production through its registered document and fixed owner."""
+def doc_owner(doc: Path, record: staff.StaffSnapshot) -> staff.StaffRow:
+    """The showrunner row whose staff `doc` is this local production document."""
     owner = record.by_doc(remote.local_machine(), doc.resolve())
     if owner is None or owner.kind != "showrunner":
         raise staff.StaffUnreadable(f"{doc}: no showrunner staff row")
+    return owner
+
+
+def doc_units(doc: Path, record: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """The production's unit rows in staff.json row order; a retired row has a RemovedWorktree."""
+    return tuple(record.find(kind="unit", parent=doc_owner(doc, record).id))
+
+
+def production_slug_for_document(doc: Path, record: staff.StaffSnapshot, sources: MemberSources) -> str:
+    """Resolve a production through its registered document and fixed owner."""
+    owner = doc_owner(doc, record)
     slugs = [slug for slug, row in sources.showrunner_members(record).items() if row.id == owner.id]
     if len(slugs) == 1:
         return slugs[0]
@@ -88,50 +96,6 @@ def local_worktree(selected: MemberFound | NoSuchMember) -> staff.PresentWorktre
     if location.machine != remote.local_machine():
         raise staff.StaffUnreadable(f"{selected.row.name}: staff worktree is on {location.machine}: {location.path}")
     return location
-
-
-def plan_worktree(cells: dict[str, str], selected: MemberFound | NoSuchMember) -> Path:
-    """Read the unit folder from staff, regardless of the Plan cell."""
-    location = local_worktree(selected)
-    if isinstance(location, staff.RemovedWorktree):
-        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: staff worktree is removed")
-    return location.path
-
-
-class ProductionMembers:
-    """Recorded membership of a production, read once without probing live panes."""
-
-    def __init__(self, slug: str, *, record: staff.StaffSnapshot | None = None) -> None:
-        self._slug: str = slug
-        self._record: staff.StaffSnapshot | None = record
-        self._units: set[str] | None = None
-        self._retired: set[str] = set()
-
-    def has(self, unit: str) -> bool:
-        """Whether the unit is a current staff child, including an offline child."""
-        if self._units is None:
-            record = self._record if self._record is not None else staff.snapshot()
-            sources = member_sources()
-            members = production_members(record, sources)
-            self._units = {row.name for row in members.get(sources.canonical_slug(self._slug), ())}
-            parent = sources.member(ShowrunnerMember(self._slug), record)
-            if isinstance(parent, MemberFound):
-                resolver = session_staff.RowResolver(record)
-                self._retired = {row.name for row in record.find(kind="unit", parent=parent.row.id)
-                                 if isinstance(resolver.unit_state(row), session_staff.RetiredUnit)}
-        return unit_names.name(unit) in self._units
-
-
-    def is_retired(self, unit: str) -> bool:
-        """Only a retained row's removed worktree marks retirement."""
-        _ = self.has(unit)
-        return unit_names.name(unit) in self._retired
-
-
-def unit_is_retired(cells: dict[str, str], marks: ProductionMembers) -> bool:
-    """Read retirement from the retained row, never from a missing membership."""
-    unit = cell_value(cells.get("Unit", ""))
-    return bool(unit) and marks.is_retired(unit)
 
 
 @dataclass(frozen=True)
@@ -199,40 +163,6 @@ def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
             issues.append(UnitProblem(row.id, row.name, "; ".join(causes)))
         metadata[row.id] = cells
     return UnitMetadata(metadata, tuple(issues))
-
-
-def live_unit_table(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None,
-                    sources: MemberSources | None = None) -> list[dict[str, str]]:
-    """Staff members with metadata bound by identity; a table cannot change a parent."""
-    record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources()
-    slug = sources.canonical_slug(slug)
-    members = production_members(record, sources).get(slug, ())
-    metadata = unit_metadata(record, sources, slug=slug)
-    for problem in metadata.problems:
-        print(f"production_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
-    rows: dict[str, dict[str, str]] = {}
-    spellings = unit_spellings(lines)
-    for row in members:
-        rendered = {key: "—" if value.startswith("unavailable: ") else value
-                    for key, value in metadata.cells[row.id].items()}
-        rendered["Unit"] = spellings.get(row.name, unit_names.unit_id(row.name))
-        rows[rendered["Unit"]] = rendered
-    return [rows[name] for name in order_unit_names(lines, rows)]
-
-
-def retired_units(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None,
-                  sources: MemberSources | None = None) -> set[str]:
-    """List retained removed children, including members absent from the table."""
-    record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources()
-    parent = sources.member(ShowrunnerMember(slug), record)
-    if isinstance(parent, NoSuchMember):
-        return set()
-    resolver = session_staff.RowResolver(record)
-    names = {unit_names.unit_id(row.name) for row in record.find(kind="unit", parent=parent.row.id)
-             if isinstance(resolver.unit_state(row), session_staff.RetiredUnit)}
-    return set(order_unit_names(lines, names, offline=names))
 
 
 @dataclass(frozen=True)
@@ -602,7 +532,7 @@ def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = No
     marked = observed_staff_marks(running=running)
     if isinstance(selected, MemberFound):
         # A retained row still needs pane liveness checks when cleanup is retried.
-        found = retained_unit_marks(marked, selected.row, slug, record=record, sources=sources)
+        found = retained_session_labels(marked, selected.row, slug, record=record, sources=sources)
     else:
         found = group_marked_units(marked, record=record, sources=sources)
     if fault := found.faults.get(slug, {}).get(name):

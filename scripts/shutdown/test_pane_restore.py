@@ -5,6 +5,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -34,6 +35,22 @@ EXACT_RUNTIME_ID = staff.runtime_id
 NATIVE_SESSION_READER = herdr.Herdr.native_session
 
 
+@contextmanager
+def mac_process_commands(root: Path, responses: Mapping[str, object]) -> Generator[None]:
+    """Read private Mac process replies through the existing command fake."""
+    executable = root / "mac-process-tools"
+    source = Path(__file__).resolve().parents[1] / "herdr/fake_herdr.py"
+    _ = executable.write_text(f"#!{sys.executable}\nimport runpy\nrunpy.run_path({str(source)!r}, run_name='__main__')\n")
+    executable.chmod(0o755)
+    response_path = root / "mac-process-responses.json"
+    _ = response_path.write_text(json.dumps(responses))
+    with (mock.patch.object(herdr, "_PLATFORM", "darwin"),
+          mock.patch.dict(os.environ, {"HERDR_LSOF": str(executable), "HERDR_PS": str(executable),
+              "HERDR_PLATFORM": "darwin", "FAKE_HERDR_RESPONSES": str(response_path),
+              "FAKE_HERDR_LOG": str(root / "mac-process-log")})):
+        yield
+
+
 @final
 class FakeClient(herdr.Herdr):
     """The herdr calls a restore makes, on a layout the test sets."""
@@ -42,6 +59,10 @@ class FakeClient(herdr.Herdr):
         with mock.patch.object(herdr, "herdr_binary", return_value="fixture-herdr"):
             super().__init__("agents")
         self.rows = rows
+        for row in self.rows:
+            _ = row.setdefault("terminal_id", str(row["pane_id"]) + "-terminal")
+        self.process_info: dict[str, object] = {"shell_pid": 998042, "foreground_process_group_id": 998042,
+            "foreground_processes": [{"argv": ["zsh"], "name": "zsh", "pid": 998042}]}
         self.started: list[tuple[str, str, list[str]]] = []
         self.closed: list[str] = []
         self.start_error: herdr.HerdrFailure | None = None
@@ -61,9 +82,36 @@ class FakeClient(herdr.Herdr):
             return {"tabs": [{"tab_id": row.get("tab_id", str(row["pane_id"]) + ":tab"),
                               "label": row["label"], "pane_count": 1} for row in self.rows]}
         if arguments[:2] == ("pane", "process-info"):
-            return {"process_info": {"foreground_processes": [
-                {"argv": ["claude", "-n", "alpha", "--model", "opus"], "pid": 4242, "cwd": "/work/alpha"}]}}
+            return {"process_info": self.process_info}
         raise AssertionError(arguments)
+
+    @contextmanager
+    def empty_shell(self, pid: int, cwd: Path) -> Generator[None]:
+        """Supply the private shell at both process observation boundaries."""
+        from scripts.production.fake_unit_host import process
+
+        process(os.environ, pid, 1, ["zsh"], {}, cwd=cwd)
+        result = self.result
+        program = herdr.run_program
+        reply: dict[str, object] = {"process_info": {"shell_pid": pid,
+            "foreground_process_group_id": pid,
+            "foreground_processes": [{"pid": pid, "name": "zsh", "argv": ["zsh"]}]}}
+
+        def observe(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[:2] == ("pane", "process-info"):
+                return reply
+            return result(*arguments, deadline=deadline)
+
+        def run(argv: list[str], timeout: float = herdr.PROGRAM_TIMEOUT_SECONDS, *,
+                environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if argv[:5] == self.argv("pane", "process-info"):
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"result": reply}), "")
+            return program(argv, timeout, environment=environment)
+
+        with (mock.patch.object(self, "result", side_effect=observe),
+              mock.patch.object(herdr, "run_program", side_effect=run),
+              mock.patch.object(herdr, "_PLATFORM", "linux")):
+            yield
 
     @override
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
@@ -75,7 +123,8 @@ class FakeClient(herdr.Herdr):
                     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
         _ = (kind, opening, timeout_ms)
         if not any(row["pane_id"] == pane for row in self.rows):
-            self.rows.append({"pane_id": pane, "label": name, "workspace_id": "w1"})
+            self.rows.append({"pane_id": pane, "label": name, "workspace_id": "w1",
+                              "terminal_id": pane + "-terminal"})
         if self.start_error is not None:
             raise self.start_error
         self.started.append((name, pane, agent_arguments))
@@ -94,6 +143,8 @@ class FakeClient(herdr.Herdr):
     @override
     def native_session(self, pane: str, kind: str, timeout: float) -> str:
         del kind, timeout
+        if self.start_error is not None:
+            raise self.start_error
         if pane not in self.native_ids:
             raise herdr.HerdrFailure(f"{pane}: fixture has no native process observation")
         return self.native_ids[pane]
@@ -104,6 +155,11 @@ class FakeClient(herdr.Herdr):
         del timeout_ms
         self.prompts.append((pane, opening))
         return herdr.PromptSubmitted(launched_at)
+
+    @override
+    def _close_pane(self, pane: str) -> bool:
+        self.close_tab_of(pane)
+        return True
 
     @override
     def close_tab_of(self, pane: str) -> None:
@@ -126,6 +182,10 @@ class PaneRestoreTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.config = self.root / ".claude3"
+        from scripts.production.fake_unit_host import process
+        process({"HERDR_PROC": str(self.root / "proc")}, 998042, 1, ["zsh"], {})
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})))
+        _ = self.enterContext(mock.patch.object(herdr, "_PLATFORM", "linux"))
         (self.config / "projects/work").mkdir(parents=True)
         _ = (self.config / "projects/work/019b3a40-4250-7000-8000-000000000102.jsonl").write_text("{}\n")
         def no_envrc(directory: Path, environment: Mapping[str, str]) -> herdr.nix_env.NoEnvrc:
@@ -140,8 +200,7 @@ class PaneRestoreTests(unittest.TestCase):
                         mock.patch.object(sessions, "live_sessions", self.live_sessions),
                         mock.patch.object(sessions, "running_sessions", list),
                         mock.patch.object(herdr, "open_tab", self.open_tab)):
-            _ = patcher.start()
-            self.addCleanup(patcher.stop)
+            _ = cast(object, self.enterContext(patcher))
 
     def live_sessions(self) -> list[dict[str, str]]:
         return [{"sessionId": session_id} for session_id in self.live]
@@ -210,6 +269,9 @@ class PaneRestoreTests(unittest.TestCase):
         (self.config / "sessions").mkdir()
         _ = (self.config / "sessions/4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "019b3a40-4250-7000-8000-000000000102"}))
         client = FakeClient([{"pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1"}])
+        client.process_info = {"shell_pid": 998042, "foreground_process_group_id": 4242,
+            "foreground_processes": [{"pid": 4242, "name": "claude",
+                "argv": ["claude", "-n", "alpha", "--model", "opus"], "cwd": "/work/alpha"}]}
         with (mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(sessions, "process_start", return_value="fixture-generation"),
               redirect_stdout(io.StringIO())):
@@ -341,7 +403,8 @@ class RestoreStaffNamesTests(StaffTestCase):
         client.session = "agents"
         client.spaces = [("w1", "demo")]
         client.tabs = [{"tab_id": f"saved-t{index}", "pane_id": str(row["pane_id"]),
-                        "workspace_id": "w1", "label": str(row["label"])}
+                        "workspace_id": "w1", "label": str(row["label"]),
+                        "session_id": cast(dict[str, str], row["agent_session"])["value"]}
                        for index, row in enumerate(saved_client.rows)]
         client.count = 20
         record = staff.snapshot()
@@ -374,12 +437,36 @@ class RestoreStaffNamesTests(StaffTestCase):
             _ = directory
             return herdr.nix_env.NoEnvrc(dict(environment))
 
+        assign_session = client.assign_session
+
+        def assign_local_session(tab: dict[str, str], name: str) -> None:
+            with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.staff_file)}):
+                assign_session(tab, name)
+
+        run_command = client.run
+
+        def run(*arguments: str, deadline: float = math.inf) -> str:
+            if arguments[:2] == ("pane", "close"):
+                client.tabs[:] = [tab for tab in client.tabs if tab["pane_id"] != arguments[2]]
+                return "{}"
+            return run_command(*arguments, deadline=deadline)
+
         output = io.StringIO()
+        uid = os.getuid()
+        process_responses = {
+            "-axo pid=,ppid=,state=,lstart=": {"stdout": "42 1 S Mon Nov 2 10:00:00 2026", "code": 0},
+            f"-U {uid} -o pid=,ppid=,uid=,comm=": {"stdout": f"42 1 {uid} zsh", "code": 0},
+            f"-U {uid} -o pid=,command=": {"stdout": "42 zsh", "code": 0},
+            "-o tpgid= -p 42": {"stdout": "42", "code": 0},
+        }
         with (self.machine("mac"), mock.patch.object(pane_record, "RECORD_DIR", directory),
               mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(directory)}),
+              mac_process_commands(self.root, process_responses),
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(herdr, "herdr_processes", return_value=[]),
               mock.patch.object(client, "order_tabs", wraps=client.order_tabs) as order,
+              mock.patch.object(client, "assign_session", side_effect=assign_local_session),
+              mock.patch.object(client, "run", side_effect=run),
               mock.patch.object(herdr.nix_env, "ensure", side_effect=no_envrc),
               mock.patch.object(client, "start_agent", side_effect=start),
               mock.patch.object(client, "native_session", side_effect=native),
@@ -485,9 +572,9 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             pane = arguments[-1]
             kind = backend.kind if pane == current_pane and not stopped else (
                 "claude" if stale_agent and pane == "w1:p1" else "zsh")
-            pid = backend.pid if pane == current_pane else backend.pid + 1
-            return {"process_info": {"shell_pid": backend.shell_pid,
-                "foreground_processes": [{"pid": pid, "argv": [kind], "cwd": str(self.new_folder)}]}}
+            pid = backend.shell_pid if kind == "zsh" else backend.pid if pane == current_pane else backend.pid + 1
+            return {"process_info": {"shell_pid": backend.shell_pid, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": kind, "argv": [kind], "cwd": str(self.new_folder)}]}}
 
         def activity(pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
             if (pane == current_pane and not stopped) or (pane == "w1:p1" and stale_agent):
@@ -691,6 +778,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                               "agent_session": {"kind": "id", "value": self.owner.current_session}}])
         proc = self.root / "restore-proc"
         proc.mkdir(exist_ok=True)
+        from scripts.production.fake_unit_host import process
+        process({"HERDR_PROC": str(proc)}, 998042, 1, ["zsh"], {})
         proof: list[str] = []
         published = False
         publishing = False
@@ -718,7 +807,9 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                 publishing = True
                 try:
                     with mock.patch.object(client, "result", return_value=info):
-                        super(FakeClient, client).record_codex_start(pane, name, agent_arguments)
+                        launch = client.codex_launch(pane, agent_arguments)
+                        launch["name"] = name
+                        pane_launch.write(pane_record.record_path(client.session), launch)
                 finally:
                     publishing = False
                 published = True
@@ -795,6 +886,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         self.assertEqual((launches[0]["pane_id"], pane_record.resume_launch(launches[0])["cwd"]), ("w1:p3", str(destination)))
         self.assertTrue((destination / ".git").is_file())
 
+
+
     def test_codex_restore_publication_allows_a_second_folder_move(self) -> None:
         backend, _transcript = self.moved_codex()
         with self.codex_restore(backend, publish=True) as (client, _proof), redirect_stdout(io.StringIO()):
@@ -802,12 +895,13 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         self.assertEqual(client.closed, ["w1:p1"])
         self.second_move(backend)
 
-
     def test_claude_restore_requires_publication_and_then_allows_a_second_folder_move(self) -> None:
         backend = self.folder_backend("claude", live=False)
         arguments = ["move-folder", "--unit", self.owner.id, "--to", str(self.new_folder)]
         moved = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments, dict(os.environ), self.checkout)
         self.assertEqual(moved.returncode, 0, moved.stderr)
+        backend.live = False
+        backend.publish_process_state()
         entry = pane_record.read("agents")["w1:p1"]
         entry["ended"] = False
         pane_record.write("agents", entry)
@@ -836,6 +930,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                       mock.patch.object(sessions, "live_sessions", return_value=[]),
                       mock.patch.object(sessions, "running_sessions", return_value=[]),
                       mock.patch.object(client, "start_agent", side_effect=start),
+                      client.empty_shell(backend.shell_pid, self.root),
                       redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
                     code = pane_restore.restore("agents", dry_run=False)
                 if not publish:

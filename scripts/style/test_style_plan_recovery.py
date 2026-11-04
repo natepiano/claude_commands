@@ -123,11 +123,8 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         for path in self.sources:
             self.record(structure, path, self.tip)
+        plan = self.modules_unit()
         worktree = self.root / "modules"
-        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
-        plan = worktree / "docs/style-production/units/modules-unit.md"
-        plan.parent.mkdir(parents=True)
-        _ = plan.write_text(self.plan_header())
         output = io.StringIO()
         with redirect_stdout(output):
             code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(worktree)])
@@ -413,7 +410,7 @@ class StylePlanTests(StylePlanFixture):
         ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
                              + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        self.proposals_field(folder)
         unit_change = self.unit_commit(self.sources[0], "pub fn value() { unit(); }\n")
         with mock.patch.object(style_proposals, "proposal_command") as start:
             code, output, _ = self.run_next()

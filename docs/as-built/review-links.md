@@ -116,6 +116,7 @@ The `lists_directory` setting names this folder.
 `CHANGE_REVIEW_DIR` is a test override for the reader folder.
 This override never makes a list real.
 Lists outside this folder print the routing note without sending an alert or writing an alert record.
+It alerts only from the production staff record; a `STAFF_FILE` override never alerts.
 `unrouted_alert_recipient` starts at `natedev` in `config/review_links.conf`.
 A change goes to this root showrunner when its list has no staff showrunner or its production document is gone.
 The page, the verdict and the footer counts use the same owner.
@@ -148,31 +149,13 @@ In that case, its owner remains unrouted and receives no message.
 An unreadable staff record stops either run before anything is pushed.
 `merge_checkpoint` also undoes its unpushed local merge.
 One read supplies the rows for each run.
-Each writer matches the branch to its Units row and finds the staff unit by the Worktree path.
+Each writer matches the branch to a unit staff row through its worktree branch.
 An exact Branch name wins over a Plan, Unit, or worktree alias.
 The staff lookup prefers present worktrees, then the latest row within each worktree state.
 An unregistered unit writes an empty cell and one named note.
 `change_review.py add --repo <directory>` stores the unit id of that worktree.
 A showrunner directory or an unowned directory stores an empty cell.
 A verdict retains the Producer cell in Reviewed.
-
-Use `change_review.py backfill-producer [--list <path>]` to report older rows with no Producer id.
-Add `--write` to fill mapped rows in To review and Reviewed.
-The command copies each changed list to `<name>.backup-<timestamp>` before the locked write.
-It finds historical checkpoints in the production repositories.
-For a merge with several units, an exact Change-Review text selects the checkpoint.
-If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
-It maps the old Branch, Plan, or Unit name through the Units Worktree path to the retained staff id.
-When that lookup fails, the command removes `build-followups-` from the checkpoint name.
-Exactly one staff unit with the remaining name supplies the id. Retired units count.
-Zero or several matches leave Producer empty. A valid Worktree result wins.
-It reports each unmapped row by list, row id, and old name.
-A failed list prints its name and error; the command continues and returns 1 after all lists.
-A rerun retries an unfinished commit.
-A completed list keeps its bytes and commit.
-After the lists are filled, remove `scripts/production/producer_backfill.py`, including its adapter.
-Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
-Remove `scripts/production/test_producer_backfill.py`.
 Delivery records store fixed staff ids.
 Each send reads `staff.snapshot()` and sends to `session:<current_session>` from the saved staff row.
 An account move changes the next recipient address without changing the stored staff id.

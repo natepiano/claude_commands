@@ -19,8 +19,20 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import roles_audit as audit
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
 from scripts.lib.test_names import NAMES_TOML
+from scripts.shutdown import remote
+
+
+def owned_units(doc: Path, *names: str, retired: tuple[str, ...] = ()) -> staff.StaffSnapshot:
+    """The showrunner row that owns `doc`, then its unit rows in row order."""
+    machine = remote.local_machine()
+    owner = staff.StaffRow(staff.StaffId("s-owner"), "showrunner", "alpha", None,
+                           current_session=staff.StaffId("s-owner"), doc=staff.LiveDoc(machine, doc.resolve()))
+    units = (staff.StaffRow(staff.StaffId(f"s-{name}"), "unit", name, owner.id, current_session=staff.StaffId(f"s-{name}"),
+                            worktree=(staff.RemovedWorktree if name in retired else staff.PresentWorktree)(machine, Path("/fixture", name)))
+             for name in names)
+    return staff.StaffSnapshot((owner, *units))
 
 
 def term(name: str, *others: str, defined_in: tuple[str, ...] = ("docs/words.md#Words",),
@@ -756,23 +768,14 @@ class SourceCheckTests(unittest.TestCase):
 
 
 class ProductionNameTests(unittest.TestCase):
-    def test_reads_only_units_and_finds_format_and_cross_role_collisions(self) -> None:
-        text = '''# A
-- **Showrunner session:** alpha
-## Units
-| Unit | Plan | Worktree | Branch |
-| --- | --- | --- | --- |
-| `render-unit` | a.md | /tmp/a | a |
-| old | (retired) | /tmp/b | b |
-## Other
-| not-a-unit | ignored |
-'''
-        first = audit.parse_production("one", "/fixture/one.md", text)
+    def test_reads_staff_units_and_finds_cross_role_collisions(self) -> None:
+        doc = Path("/fixture/one.md")
+        first = audit.parse_production("one", doc, "# A\n- **Showrunner session:** alpha\n",
+                                       owned_units(doc, "render", "old", retired=("old",)))
         second = audit.ProductionNames("two", "/fixture/two.md", "render-unit", ("tools-unit",))
         rows = audit.measure_production_names((first, second))
-        self.assertEqual(first.units, ("render-unit", "old"))
+        self.assertEqual(first.units, ("render-unit", "old-unit"))
         self.assertEqual(rows, (
-            audit.ProductionNameFinding("unit format", "old", ("one",), ("/fixture/one.md",)),
             audit.ProductionNameFinding("shared name", "render-unit", ("one", "two"), ("/fixture/one.md", "/fixture/two.md")),
         ))
 
@@ -843,14 +846,14 @@ defined_in = "none"
 other_names = ["seat"]
 ''', encoding="utf-8")
             doc = root / "fixture-production.md"
-            _ = doc.write_text("## Units\n| Unit | Plan |\n| --- | --- |\n| bad | a.md |\n", encoding="utf-8")
+            _ = doc.write_text("# Fixture\n", encoding="utf-8")
             at = datetime(2026, 10, 1, tzinfo=timezone.utc)
             with patch.object(showrunners, "timer_docs", return_value={"fixture": doc}), \
+                    patch.object(staff, "snapshot", return_value=owned_units(doc, "render")), \
                     patch.object(Path, "home", return_value=root), \
                     patch.dict("os.environ", {"USER_ZONE": "America/New_York"}):
                 result = audit.baseline(root, audit.AuditWindow(at, at + timedelta(days=1)))
-            self.assertIn("invalid unit format", result)
-            self.assertIn("bad", result)
+            self.assertIn("n=0 findings across n=1 production docs", result)
             self.assertIn("has no declared definition", result)
             self.assertIn("unavailable:", result)
             self.assertIn("Sent contacts: unknown (n=0)", result)
@@ -874,7 +877,7 @@ other_names = []
 ''',
             "docs/words.md": "# Words\nworker seat seat delegate\n",
             "scripts/output.py": 'print("worker")\n',
-            "fixture-production.md": "## Units\n| Unit | Plan |\n| --- | --- |\n| bad | a.md |\n",
+            "fixture-production.md": "# Fixture\n",
         }
         at = datetime(2026, 10, 1, tzinfo=timezone.utc)
         paths[".local/state/message/log.jsonl"] = message(at)
@@ -882,6 +885,7 @@ other_names = []
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_text(text, encoding="utf-8")
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=owned_units(root / "fixture-production.md")))
         return audit.AuditWindow(at, at + timedelta(days=1))
 
     def test_report_rejects_omitted_source_check_evidence(self) -> None:
@@ -971,7 +975,6 @@ other_names = []
                 "Most used other names: 'seat' n=2 (worker); 'delegate' n=1 (worker) (live: n=2 files).",
             ])
             self.assertIn("Definition: 'gate' has no declared definition.", result)
-            self.assertIn("Name: 'bad' has an invalid unit format in fixture.", result)
             self.assertIn("Fixed display labels: n=1 to fix; role words in sentences: n=0", result)
             self.assertIn("Fix: scripts/output.py:1: fixed display name 'worker'; read config/names.toml", result)
             self.assertIn(f"Message window: {window.label()} (natedev only).", result)

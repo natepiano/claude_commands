@@ -6,7 +6,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 import io
 from pathlib import Path
-from typing import cast
+import sys
 
 from scripts.agents import worker_lifecycle
 from scripts.lib import unit_runs
@@ -41,23 +41,6 @@ class UnpublishedWorker:
     inbox: Path
     identity: staff.StaffId
     parent: staff.StaffId
-
-
-def pending_publications(run: Path) -> tuple[UnpublishedWorker, ...]:
-    pending: list[UnpublishedWorker] = []
-    for path in sorted(run.glob("*.pending.json")):
-        record = worker_lifecycle.validate_worker_state(path, worker_lifecycle.read_json_object(path))
-        raw = record.get("unpublished_thread")
-        if raw is None:
-            continue
-        if not isinstance(raw, dict):
-            raise staff.StaffUnreadable(f"{path}: invalid unfinished backend evidence")
-        fields = cast(dict[str, object], raw)
-        native, parent_id = fields.get("id"), fields.get("parent")
-        if not isinstance(native, str) or not isinstance(parent_id, str):
-            raise staff.StaffUnreadable(f"{path}: unfinished backend needs native identity and parent")
-        pending.append(UnpublishedWorker(path, staff.native_id(native), staff.native_id(parent_id)))
-    return tuple(pending)
 
 
 def showrunner_member(record: staff.StaffSnapshot, sources: session_staff.MemberSources,
@@ -132,16 +115,14 @@ def admit(name: str, run: Path, *, role: str, production: str = "", unit: str = 
     try:
         if role in ("designer", "reviewer"):
             role = "astra-" + role
-        if role not in ("impl", "test", "review", "fix", "astra-designer", "astra-reviewer"):
-            raise ValueError(f"invalid worker role: {role!r}")
         record = staff.snapshot()
         explicit = bool(production or unit)
         owner = parent(record, staff_id="" if explicit else staff.runtime_id(),
                        production=production, unit=unit, run=None if explicit else run)
         assert isinstance(owner, staff.StaffRow)
-        if isinstance(owner.worktree, staff.RemovedWorktree) or isinstance(owner.doc, staff.WrappedDoc):
-            raise ValueError(f"parent {owner.id} is retired")
         _ = staff.WorkerName.parse(name)
+        if isinstance(owner.worktree, staff.RemovedWorktree):
+            print(f"staff: {name}: parent {owner.id} is retired; admission continues", file=sys.stderr)
         return WorkerStartAllowed(name, owner.id, run, role)
     except (staff.StaffRefused, staff.StaffUnreadable, staff.StaffNotFound, OSError, ValueError) as error:
         raise AdmissionRefused(f"staff: {name}: not opened: {error}".replace("\n", " ")) from error

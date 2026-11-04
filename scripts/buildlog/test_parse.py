@@ -19,7 +19,6 @@ from unittest import mock
 import index
 import parse
 import test_record as record_tests
-from record import TARGET_DIR_UNSET
 from store import UNKNOWN_IDENTITY
 from test_index import use_test_log
 
@@ -233,17 +232,20 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
         if "CARGO_TARGET_DIR" in os.environ:
             del os.environ["CARGO_TARGET_DIR"]
 
-    def test_target_dir_is_resolved_from_step_cwd_and_unset_is_explicit(self) -> None:
+    def test_target_dir_is_resolved_from_step_cwd_and_the_workspace_default(self) -> None:
+        _ = (self.fixture.repo / "Cargo.toml").write_text("[workspace]\n")
         absolute = str(self.fixture.base / "shared-target")
         cases: tuple[tuple[dict[str, str], str], ...] = (
             ({"CARGO_TARGET_DIR": "../shared-target"}, absolute),
             ({"CARGO_TARGET_DIR": absolute}, absolute),
-            ({"CARGO_TARGET_DIR": ""}, str(self.fixture.repo)),
-            ({}, TARGET_DIR_UNSET),
+            ({"CARGO_TARGET_DIR": ""}, str(self.fixture.repo / "target")),
+            ({}, str(self.fixture.repo / "target")),
         )
         for environment, expected in cases:
             with self.subTest(environment=environment):
-                row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST, environment)
+                folder = self.fixture.folder_context(record_tests.NEXTEST, extra=environment)
+                row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST,
+                                        {**environment, "BUILDLOG_TARGET_FOLDER": folder})
                 self.assertEqual(row["cwd"], str(self.fixture.repo))
                 self.assertEqual(row["target_dir"], expected)
 
@@ -266,12 +268,12 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
         row = self.fixture.records()[-1]
         self.assertEqual(row["cwd"], str(directory))
         self.assertEqual(row["repo_identity"], UNKNOWN_IDENTITY)
-        self.assertEqual(row["target_dir"], TARGET_DIR_UNSET)
+        self.assertEqual(row["target_dir"], "unresolved")
         self.assertEqual(index.update(), 1)
         with closing(index.read_only()) as connection:
-            indexed = cast(list[tuple[str, str, str]], connection.execute(
+            indexed = cast(list[tuple[str, str, str | None]], connection.execute(
                 "SELECT target_dir, repo_identity, target_folder FROM steps").fetchall())
-        self.assertEqual(indexed, [(TARGET_DIR_UNSET, UNKNOWN_IDENTITY, str(directory))])
+        self.assertEqual(indexed, [("unresolved", UNKNOWN_IDENTITY, None)])
 
     def test_scoped_step_keeps_the_recorder_repository_instead_of_phase_context(self) -> None:
         self.assertEqual(self.fixture.git("remote", "add", "origin", "https://example.com/actual/hana.git", cwd=self.fixture.repo), "")
