@@ -9,6 +9,7 @@ from scripts.production.staff_test_support import fixture_member
 
 import io
 import json
+import math
 import os
 import subprocess
 import sys
@@ -40,6 +41,7 @@ from scripts.whoami import account
 
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.production import staff, staff_sources
+from scripts.production.fake_unit_host import process, private_process_registry
 
 CHILD_PREFLIGHT = add_showrunner.checked
 
@@ -158,7 +160,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         session_records = self.root / "sessions"
         session_records.mkdir()
         _ = (session_records / f"{PID}.json").write_text(json.dumps({"pid": PID, "sessionId": SESSION, "name": "demo",
-            "messagingSocketPath": "", "updatedAt": 1, "status": "idle"}))
+            "messagingSocketPath": "", "updatedAt": 1, "status": "idle", "procStart": "1"}))
         self.events, self.alive, self.started = [], [True, True, False], 0
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -183,6 +185,21 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(session_records), "UNIT_ACTIVE_DIR": str(self.root / "active")}))
         self.assertEqual(accounts.setup("claude2"), [])
         _ = self.enterContext(mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})))
+        _ = self.enterContext(private_process_registry())
+        process(os.environ, PID, 998040, ["claude"], {}, cwd=self.worktree)
+        def pane_result(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            del client, deadline
+            if arguments[:2] == ("pane", "list"):
+                place = self.marked["demo-unit"].place
+                assert isinstance(place, herdr.HerdrPlace)
+                return {"panes": [{"pane_id": place.pane, "workspace_id": place.pane.split(":")[0]}]}
+            if arguments[:2] == ("pane", "process-info"):
+                return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": PID,
+                    "foreground_processes": [{"pid": PID, "name": "claude", "argv": ["claude"]}]}}
+            raise AssertionError(arguments)
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", pane_result))
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")))
         for module, name, stand_in in (
                 (showrunners, "production_of", self.production_of), (unit_lookup, "marked_unit", self.marked_unit),
                 (herdr, "stop_session", self.stop_host), (promote_showrunner, "type_place", self.type_pane), (promote_showrunner, "_alive", self.is_alive),
@@ -216,8 +233,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def stop_host(self, session: str) -> None:
         self.events.append(f"stop herdr {session}")
 
-    def type_pane(self, place: herdr.HerdrPlace, text: str) -> None:
-        herdr.Herdr(place.session).prompt(place.pane, text)
+    def type_pane(self, place: herdr.HerdrPlace, text: str, *, target: str) -> None:
+        herdr.Herdr(place.session).prompt(place.pane, text, target=target)
         self.events.append(f"prompt herdr {place.session} {text}")
 
     def is_alive(self, pid: int) -> bool:

@@ -10,9 +10,28 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lint.memory_test_support import config_environment
 
 
 class ShortSocketDirectoryTests(unittest.TestCase):
+    def test_socket_parent_uses_current_build_folder_configuration(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            config = root / "build_folders.conf"
+            _ = config_environment(root)
+            original = config.read_text()
+            with patch.dict(os.environ, {"CONF_DIR": str(root)}):
+                for name in ("first", "second"):
+                    parent = root / name
+                    parent.mkdir()
+                    _ = config.write_text(original.replace("roots.system=/tmp", f"roots.system={parent}"))
+                    with short_socket_directory() as socket_directory:
+                        path = Path(socket_directory)
+                        self.assertEqual(path.parent, parent)
+                        with socket.socket(socket.AF_UNIX) as listener:
+                            listener.bind(str(path / "s"))
+                    self.assertFalse(path.exists())
+
     def test_socket_binds_with_long_tmpdir_and_private_folder_is_removed(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as root:
             long_tmpdir = Path(root) / ("long-session-" * 8)

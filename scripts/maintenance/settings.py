@@ -17,7 +17,6 @@ class Part(str, Enum):
     REFUSALS = "refusals"
     WATCHDOG = "watchdog"
     PRUNE = "prune"
-    HIERARCHY = "hierarchy"
     VAULT = "vault"
 
 
@@ -31,8 +30,6 @@ class Schedule:
 class Settings:
     job: Schedule
     parts: dict[Part, Schedule]
-    hierarchy_git_seconds: float
-    hierarchy_read_seconds: float
     vault_git_seconds: float
     vault_named_paths: int
     dispatch_seconds: float
@@ -78,12 +75,11 @@ def usage_only_interval() -> float:
 def settings() -> Settings:
     values = configuration()
     parts = table(values.get("parts"))
-    hierarchy, vault = table(values.get("hierarchy")), table(values.get("vault"))
+    vault = table(values.get("vault"))
     named = vault.get("named_paths")
     if isinstance(named, bool) or not isinstance(named, int) or named <= 0:
         raise ValueError("agent-notes config: named_paths must be a positive integer")
     return Settings(schedule(values.get("job")), {part: schedule(parts.get(part.value)) for part in Part},
-                    positive(hierarchy, "git_seconds"), positive(hierarchy, "read_seconds"),
                     positive(vault, "git_seconds"), named, positive(table(values.get("watchdog")), "dispatch_seconds"),
                     positive(table(values.get("watchdog")), "recovery_seconds"),
                     positive(table(values.get("watchdog")), "pass_dispatch_seconds"),

@@ -83,6 +83,26 @@ def worker_session(session_id: str, *, owner: str | None, run_dirs: list[str] | 
 
 
 class SessionLaunchTests(ShutdownTestCase):
+    def test_restart_reads_a_claude_transcript_without_a_pane_launch_record(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        identity = "saved"
+        records = root / "panes"
+        records.mkdir()
+        config = root / "config"
+        project = config / "projects" / "project"
+        project.mkdir(parents=True)
+        (project / f"{identity}.jsonl").touch()
+        output = io.StringIO()
+        with (patch.object(pane_record, "RECORD_DIR", records),
+              patch("restart.unit_move.config_dirs", return_value=[config]),
+              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
+              redirect_stderr(output)):
+            kind, environment, arguments = restart.session_launch(identity)
+        self.assertEqual(kind, "claude")
+        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
+        self.assertEqual(arguments, ["--resume", identity])
+        self.assertEqual(output.getvalue(), "")
+
     def test_restart_reads_plugin_directories_from_the_shutdown_pane_record(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         directories = [str(root / "postmaster"), str(root / "second plugin")]
@@ -194,6 +214,40 @@ class RestartTests(ShutdownTestCase):
         self.running.add(str(row.current_session))
         return herdr.AgentLaunched(f"w1:p{self.rows.index(row)}", herdr.PromptSubmissionNotRequired())
 
+    def test_start_row_uses_the_target_account_environment(self) -> None:
+        self.running.clear()
+        source, target = self.root / ".claude3", self.root / ".claude4"
+        environment = {"CLAUDE_CONFIG_DIR": str(self.root / ".claude4"), "ACCOUNT_SETTING": "target"}
+        with (patch.object(restart, "named_account_environment", return_value=environment) as account,
+              patch.object(restart, "session_launch", return_value=("claude", {"CLAUDE_CONFIG_DIR": str(source)},
+                  ["--resume", str(self.rows[0].current_session)])),
+              patch("scripts.accounts.accounts.trust_sources", return_value=[("claude3", source / ".claude.json")]) as sources,
+              patch.object(herdr, "heal_claude_trust", return_value=herdr.TrustCopied(self.root,
+                  target / ".claude.json", "claude3")) as trust,
+              patch.object(herdr, "prepare_session_environment",
+                  return_value=herdr.PreparedAgentEnvironment(self.root, environment)) as prepare,
+              patch("scripts.accounts.accounts.account_dir", return_value=target)):
+            pane = restart.start_row(self.rows[0], staff.StaffSnapshot(self.rows),
+                                     herdr.Herdr("agents"), target_account="claude4")
+        account.assert_called_once_with(target)
+        sources.assert_called_once_with(target, source)
+        trust.assert_called_once_with(self.root, target / ".claude.json",
+                                      [("claude3", source / ".claude.json")], dry_run=False)
+        prepare.assert_called_once_with(str(self.rows[0].current_session), str(self.root),
+                                        environment, herdr.NO_ENVIRONMENT_REMOVALS)
+        self.assertEqual(pane, "w1:p0")
+
+    def test_account_trust_reports_anomalies_and_returns_the_result(self) -> None:
+        target = self.root / ".claude4"
+        for result in (herdr.Untrusted(self.root, target / ".claude.json", (self.root,)),
+                       herdr.UnreadableTrustFile(self.root, target / ".claude.json", "ValueError")):
+            with (patch.object(herdr, "heal_claude_trust", return_value=result),
+                  patch("scripts.accounts.accounts.trust_sources", return_value=[]),
+                  redirect_stderr(io.StringIO()) as output):
+                self.assertIs(stop_resume.heal_account_trust(self.root, target, self.root, "test"), result)
+            reason = str(result) if isinstance(result, herdr.UnreadableTrustFile) else f"Claude has not trusted {self.root}"
+            self.assertEqual(output.getvalue(), f"test: trust anomaly: {reason}\n")
+
     def test_restart_all_dry_run_lists_every_live_row_with_its_tab_position(self) -> None:
         self.rows = (replace(self.rows[0], name="unit"),
             replace(self.rows[1], kind="worker", name="codex-worker", parent=self.rows[0].id,
@@ -282,8 +336,8 @@ class RestartTests(ShutdownTestCase):
             if arguments == ("tab", "list"):
                 return {"tabs": [{"workspace_id": "w1", "tab_id": "t1", "label": "unit-0"}]}
             if arguments == ("pane", "list"):
-                return {"panes": [{"pane_id": "w1:sibling", "tab_id": "t1", "terminal_id": "sibling-terminal"},
-                                  {"pane_id": "w1:own", "tab_id": "t1", "terminal_id": "own-terminal"}]}
+                return {"panes": [{"pane_id": "w1:sibling", "workspace_id": "w1", "tab_id": "t1", "terminal_id": "sibling-terminal"},
+                                  {"pane_id": "w1:own", "workspace_id": "w1", "tab_id": "t1", "terminal_id": "own-terminal"}]}
             raise AssertionError(arguments)
 
         client = herdr.Herdr("fixture")

@@ -62,8 +62,14 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr) -> bool:
     panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
-    if panes and (len(panes) != 1 or client.native_session(
-            panes[0]["pane_id"], "claude", herdr.PROGRAM_TIMEOUT_SECONDS) != row.current_session):
+    if len(panes) == 1:
+        try:
+            identity = client.native_session(panes[0]["pane_id"], "claude", herdr.PROGRAM_TIMEOUT_SECONDS)
+        except herdr.HerdrFailure:
+            identity = client.native_session(panes[0]["pane_id"], "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
+    else:
+        identity = row.current_session if not panes else ""
+    if identity != row.current_session:
         _anomaly(row, "pane runs another conversation; no signal sent")
         return False
     result = stop_resume.stop(str(row.current_session))
@@ -100,11 +106,12 @@ def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str,
     raise OSError(f"no transcript for {identity}")
 
 
-def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *, present: bool = False) -> None:
+def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
+              present: bool = False, target_account: str = "") -> str:
     live = sessions.session_liveness(str(row.current_session))
     if isinstance(live, sessions.LiveSessionProcess):
         print(f"{row.name}: unchanged")
-        return
+        return ""
     if isinstance(live, sessions.SessionLivenessUnknown):
         raise OSError(live.reason)
     machine, folder = row_folder(row, record)
@@ -112,9 +119,16 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
     if machine != remote.local_machine():
         raise ValueError(f"{row.name}: session is on {machine}")
     kind, environment, arguments = session_launch(str(row.current_session))
+    if target_account and kind == "claude":
+        from scripts.accounts import accounts
+
+        target_dir = accounts.account_dir(target_account)
+        _ = stop_resume.heal_account_trust(folder, target_dir,
+            Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
+        environment = named_account_environment(target_dir)
     if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=lambda _arguments: False):
         print(f"{row.name}: unchanged")
-        return
+        return ""
     destination = client.saved_row_tab(str(row.id), row.name)
     prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
                                                   herdr.NO_ENVIRONMENT_REMOVALS)
@@ -132,11 +146,11 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
     if not isinstance(live, sessions.SessionNotLive):
         if isinstance(live, sessions.LiveSessionProcess):
             print(f"{row.name}: unchanged")
-            return
+            return ""
         raise OSError(live.reason)
     if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=lambda _arguments: False):
         print(f"{row.name}: unchanged")
-        return
+        return ""
     if kind == "claude":
         arguments.extend(["--name", row.name])
     result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
@@ -150,6 +164,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
     except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         _anomaly(row, error)
     print(f"{row.name}: restarted")
+    return result.pane
 
 
 def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
@@ -251,7 +266,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 current = record.by_id(row.id)
                 if current is None:
                     raise ValueError("staff row no longer exists")
-                start_row(current, record, client, present=present)
+                _ = start_row(current, record, client, present=present)
                 started.append(str(row.id))
                 present = False
             except errors as error:

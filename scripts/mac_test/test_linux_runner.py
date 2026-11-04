@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
@@ -291,6 +291,12 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(evaluations[0]["inputs"], ["flake.lock", "flake.nix", "nix/shell.nix"])
         self.assertTrue(any(argument.endswith("#ci") for argument in evaluations[0]["args"]))
         self.assertEqual(event["environment"].get("TEST_SHELL_PROOF"), "loaded")
+
+    def test_pinned_selection_reaches_the_remote_step_environment(self) -> None:
+        with mock.patch.dict(os.environ, {"BUILDLOG_PINNED_TARGET": "aws"}):
+            event = self.assert_ran(self.request())
+        self.assertEqual(event["environment"]["BUILDLOG_TARGET"], "aws")
+        self.assertEqual(event["environment"]["BUILDLOG_PINNED_TARGET"], "aws")
         self.assertEqual(event["cwd"], str(self.mirror))
 
     def test_sigterm_prints_one_interruption_marker_and_preserves_the_child_status(self) -> None:
@@ -642,10 +648,11 @@ class LinuxShellTests(unittest.TestCase):
         self.environment.update({"FAKE_LINT_STATUS": "75", "FAKE_FREE_GIB": "1"})
         remove_tree = shutil.rmtree
 
-        def remove(path: str | Path, **_options: object) -> None:
+        def remove(path: str | Path, *, dir_fd: int | None = None,
+                   onexc: Callable[[object, str, BaseException], object] | None = None) -> None:
             if Path(path) == self.mirror / "target":
                 raise PermissionError("fixture denies cleanup")
-            remove_tree(path)
+            remove_tree(path, dir_fd=dir_fd, onexc=onexc)
 
         with mock.patch("shutil.rmtree", side_effect=remove):
             result = self.execute(self.request("check"))

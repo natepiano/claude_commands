@@ -13,8 +13,9 @@ The user approved these spending and capacity values on 2026-11-03, all in `conf
 5. `slots=2`, `slots.hana=4`, `slots.cargo-liner=4` and `build_budget_gib=32`: the slots per repository and the build space.
 
 The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws-unit wrote that private file on natedev (mode 0600) from the address the user gave.
+The user approved `deployment_price_file=~/.config/aws-build/deployment-price` on 2026-11-03. `deploy.py price` writes the Spot price and its read time there (mode 0600), outside the repository.
 
-The target is built and disabled. `offload=off`, and `targets=mac,natedev` does not list AWS. No AWS resource exists. The user's go-live gate creates the resources and turns the target on, with [the runbook](../plans/builds-aws-runbook.md). The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
+The target is live. The user approved go-live on 2026-11-03. The stacks exist in `us-east-2`, and the box is instance `i-0216cf933a26bd1ea`. `offload=on`, and `targets=mac,natedev,aws` lists AWS after natedev. [The runbook](../plans/builds-aws-runbook.md) gives the steps. The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
 
 ## How it works
 
@@ -36,6 +37,9 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 
 ### Routing: `scripts/direct/verify.sh`, `scripts/build_targets/build_targets.py`
 
+- `verify.sh test PACKAGE --target aws` pins one step to AWS. `check` and staged `doc` also accept `--target`.
+  A pin keeps admission, spending, and version checks. It takes no natedev grant or cargo token.
+  A refusal ends the step with a nonzero status. Remote step records include `target=aws`, `host=aws-build`, and `pinned=true`.
 - Queued `test`, `check` and staged `doc` steps try eligible SSH targets in configured order. `ssh_target_eligibility` checks configuration, backoff, capacity and reachability, with no shell evaluation.
 - `build_targets.py reserve` returns 0 (reserved or recovered), 11 (busy macOS target) or 1 (no reservation). `--recover-only` recovers only an existing claim. `MacClaimFromWait` moves ownership from the wait to the claim with no unclaimed interval.
 - `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE` keep the first queue time across remote loss and local fallback. Local fallback needs admission. A confirmed remote failure does not cause a local rerun.
@@ -55,7 +59,8 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 ### Control: `aws_target.py`, `remote.py`
 
 - `aws_target.py tick|start|stop|serve` runs `Controller` under `control_lock`. `AwsCli` is the one AWS CLI adapter. `controller.json` holds the state (`off`, `refused`, `stopped`, `starting`, `running`, `draining`, `stopping`), `generation`, `permitted_generation`, the drain deadline and the capacity backoff.
-- `tick` reads `admission/queue.json` and starts the box only for enough eligible waiting rows, guard permission and an ended backoff. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
+- `tick` starts the box for one live pinned waiting step or enough eligible rows in `admission/queue.json`.
+  Both paths require guard permission and an ended backoff. Unpinned steps keep their queue thresholds. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
 - `remote.py` publishes an `AdmissionEnvelope` (target, purpose, generation, decision time, expiry) only after a confirmed guard write. The runner checks it before and after shell preparation. Other Linux targets use `IndependentLinuxExecution` and need no AWS permission.
 - On the box, `RemoteAgent` stops the instance after `idle_stop_minutes` idle and polls IMDSv2 every `interruption_poll_s`. An interrupted slot prints `aws_interrupted=<generation>` once, after `mac_exit` and `mac_cleanup`, and exits with the child status. Offload reads it as `InterruptedTargetRun` and records `ON_NATEDEV` before local work.
 - `release_stopped_claims` releases only claims bound to the stopped host and generation, and writes `release-evidence/`.
@@ -66,6 +71,11 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 - `report.py` renders `### AWS`: uptime, steps, estimated queue wait saved and cost. `aws_report.estimate_wait_saved` compares same-day natedev steps of the same kind and repository. AWS rows appear only when an AWS `SshTarget` is configured.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
+
+- `deploy.py price` reads the current Spot price through the deployment profile.
+  It writes the price and its read time to the state file named by `deployment_price_file`.
+  The default path is `~/.config/aws-build/deployment-price`. The file stays outside the repository and has mode `0600`.
+  `prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
 
 - `prepare` and `apply` read the Budget address from the private file named by `notification_email_file`.
   The default path is `~/.config/aws-build/notification-email`.

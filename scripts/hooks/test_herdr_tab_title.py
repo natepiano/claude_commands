@@ -112,7 +112,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
-    def test_showrunner_titles_keep_the_row_name_despite_inherited_unit_marks(self) -> None:
+    def test_showrunner_titles_keep_the_row_name_despite_inherited_session_labels(self) -> None:
         runner = fixture_member("showrunner", name="tools")
         runner = staff.update_current_session(runner.current_session, staff.native_id(fixture_runtime_id("runner-after-clear")))
         self.record(41, runner.current_session, "typed-production")
