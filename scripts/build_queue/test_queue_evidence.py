@@ -99,6 +99,7 @@ class QueueEvidenceTests(unittest.TestCase):
         entries = [self.entry(name) for name in ("widget", "demo", "organon", "frame-cost", "inspectors-fix")]
         labels = roster.unit_labels(entries)
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value=labels))
+        _ = self.enterContext(mock.patch.object(gate, "priority_labels", return_value=labels))
 
     def entry(self, name: str) -> roster.RosterEntry:
         return roster.RosterEntry(

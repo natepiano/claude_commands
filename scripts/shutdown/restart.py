@@ -145,8 +145,6 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
     target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
     if len(panes) == 1:
         pane = panes[0]
-        if not isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
-            raise OSError("pane has other work; no keystroke sent")
         target = herdr.ExistingPane(pane["pane_id"], pane.get("terminal_id", ""))
     # Read liveness again immediately before the launch.
     live = sessions.session_liveness(str(row.current_session))
