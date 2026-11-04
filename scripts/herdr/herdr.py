@@ -957,7 +957,8 @@ def json_items(value: object, context: str) -> list[object]:
 def child_environment(environment: dict[str, str]) -> dict[str, str]:
     """Keep launch proofs and retired identity hints out of child processes."""
     return {key: value for key, value in environment.items()
-            if key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV, "STAFF_ID")}
+            if not key.startswith("STAFF_ROW_FD_")
+            and key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV, "STAFF_ID")}
 
 
 def unmarked_environment() -> dict[str, str]:
@@ -4309,8 +4310,8 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                 "STAFF_ID", "SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
                 "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
             }
-            script = (f"cd -- {shlex.quote(str(prepared.directory))} && "
-                      f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_')))} && export {exports}")
+            script = (f"unalias {kind} 2>/dev/null; cd -- {shlex.quote(str(prepared.directory))} && "
+                      f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
             client.run_in_pane(pane, ["eval", script])
         start_requested = True
         outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
