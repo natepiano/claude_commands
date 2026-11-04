@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import os
 import subprocess
@@ -139,6 +140,86 @@ class RecordTests(unittest.TestCase):
         self.assertFalse(source.exists())
         self.assertFalse(job.exists())
         self.assertEqual(len(staff.snapshot().rows), 1)
+
+    def rename_production_document(self) -> Path:
+        previous = self.production.doc
+        renamed = previous.with_name("renamed-demo-production.md")
+        _ = previous.rename(renamed)
+        _ = renamed.write_text(renamed.read_text() + "\n## Production Context\n- **Formerly:** `demo`\n")
+        _ = staff.rename(self.owner.id, "renamed-demo")
+        _ = staff.set_doc(self.owner.id, staff.LiveDoc("natedev", renamed))
+        return renamed
+
+    def test_watch_migration_resolves_former_document_for_record_archive_and_job(self) -> None:
+        import migrate_bevy_watch
+
+        source, job = self.legacy_watch()
+        archive = source.with_name("demo.0.20.closed.json")
+        closed = cast(dict[str, object], json.loads(source.read_text()))
+        closed["closed"] = LATER.isoformat()
+        _ = archive.write_text(json.dumps(closed))
+        _ = self.rename_production_document()
+        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}):
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertFalse(source.exists())
+            self.assertFalse(archive.exists())
+            self.assertFalse(job.exists())
+            for name in (f"{self.owner.id}.json", f"{self.owner.id}.0.20.closed.json"):
+                fields = cast(dict[str, object], json.loads((source.parent / name).read_text()))
+                self.assertEqual(fields["staff_id"], self.owner.id)
+                self.assertNotIn("slug", fields)
+            target = job.with_name(f"bevy-upgrade-{self.owner.id}")
+            self.assertIn(f"--staff-id {self.owner.id}", (target / "conf").read_text())
+            self.assertNotIn("--production", (target / "conf").read_text())
+            self.assertEqual((target / "state").read_text(), "NEXT_DUE=123\n")
+            paths = [*source.parent.glob("*.json"), *target.iterdir()]
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_finished_watch_migration_after_rename_needs_no_document_resolution(self) -> None:
+        import migrate_bevy_watch
+
+        current = self.begin()
+        archive = upgrade_record.record_path(self.owner.id).with_name(f"{self.owner.id}.0.20.closed.json")
+        closed = {**current, "closed": LATER.isoformat()}
+        _ = archive.write_text(json.dumps(closed))
+        _ = self.rename_production_document()
+        paths = [upgrade_record.record_path(self.owner.id), archive]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        with (mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.root / "notifier")}),
+              mock.patch.object(migrate_bevy_watch, "_owner", side_effect=staff.StaffRefused("old document")) as owner):
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+        owner.assert_not_called()
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_watch_migration_reports_ambiguous_former_document_and_continues(self) -> None:
+        import migrate_bevy_watch
+
+        source, job = self.legacy_watch()
+        renamed = self.rename_production_document()
+        other_doc = renamed.with_name("other-production.md")
+        _ = other_doc.write_text(renamed.read_text())
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other_doc))
+        unaffected_doc = renamed.with_name("unaffected-production.md")
+        _ = unaffected_doc.write_text("# Unaffected\n")
+        unaffected = fixture_member("showrunner", name="unaffected", doc=staff.LiveDoc("natedev", unaffected_doc))
+        fields = cast(dict[str, object], json.loads(source.read_text()))
+        fields["production"] = str(unaffected_doc)
+        fields["slug"] = "unaffected"
+        unaffected_source = source.with_name("unaffected.json")
+        _ = unaffected_source.write_text(json.dumps(fields))
+        paths = [source, job / "conf", job / "state"]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        with (mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}),
+              mock.patch("sys.stderr", new_callable=io.StringIO) as errors):
+            self.assertEqual(migrate_bevy_watch.migrate(), 1)
+        self.assertIn("anomaly:", errors.getvalue())
+        self.assertIn("ambiguous", errors.getvalue())
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+        self.assertFalse(unaffected_source.exists())
+        self.assertTrue(upgrade_record.record_path(unaffected.id).exists())
 
     def test_watch_migration_reconciles_job_created_by_status(self) -> None:
         import bevy_upgrade

@@ -141,6 +141,99 @@ class NextItemTests(unittest.TestCase):
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}, before)
         self.assertEqual(len(staff.snapshot().rows), 1)
 
+    def test_pin_migration_resolves_renamed_question_files_and_aggregate_sources(self) -> None:
+        import json
+        from scripts.production import migrate_next_pins, session_staff
+
+        owner = staff.snapshot().rows[0]
+        old_doc = self.root / "old-production.md"
+        document = "# Production\n\n## Production Context\n\n- **Formerly:** `old`\n"
+        _ = old_doc.write_text(document)
+        _ = staff.rename(owner.id, "old")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", old_doc))
+        new_doc = old_doc.rename(self.root / "new-production.md")
+        _ = staff.rename(owner.id, "new")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", new_doc))
+        sources = session_staff.MemberSources({
+            "new": showrunners.ShowrunnerSource(showrunners.Timer("new", "", new_doc, "UTC"), new_doc.read_text()),
+        }, ())
+        directory = self.root / "next"
+        directory.mkdir()
+        values: dict[str, dict[str, object]] = {
+            "question-old": {"current": "old: Choose", "ended": {"old: Later": 1}},
+            "next-old-all-below": {"source": "question-old-all-below", "current": "old: Choose"},
+            "next-new": {"source": "question-old", "current": "old: Choose"},
+        }
+        for name, fields in values.items():
+            _ = (directory / f"{name}.json").write_text(json.dumps(fields))
+        with mock.patch.object(session_staff, "member_sources", return_value=sources):
+            self.assertEqual(migrate_next_pins.migrate(stop_after=1), 75)
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+            expected: dict[str, dict[str, object]] = {
+                f"question-{owner.id}.json": {"current": f"{owner.id}: Choose", "ended": {f"{owner.id}: Later": 1}},
+                f"next-{owner.id}-all-below.json": {"source": f"question-{owner.id}-all-below",
+                                                       "current": f"{owner.id}: Choose"},
+                f"next-{owner.id}.json": {"source": f"question-{owner.id}", "current": f"{owner.id}: Choose"},
+            }
+            self.assertEqual({path.name: json.loads(path.read_text()) for path in directory.glob("*.json")}, expected)
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}, before)
+
+    def test_pin_migration_keeps_ambiguous_former_names_and_moves_other_files(self) -> None:
+        from scripts.production import migrate_next_pins, session_staff
+
+        productions: dict[str, showrunners.ShowrunnerSource] = {}
+        owners: dict[str, staff.StaffRow] = {}
+        for name in ("first", "second"):
+            doc = self.root / f"{name}-production.md"
+            text = "# Production\n\n## Production Context\n\n- **Formerly:** `old`\n"
+            _ = doc.write_text(text)
+            owners[name] = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+            productions[name] = showrunners.ShowrunnerSource(showrunners.Timer(name, "", doc, "UTC"), doc.read_text())
+        sources = session_staff.MemberSources(productions, ())
+        directory = self.root / "next"
+        directory.mkdir()
+        unchanged = {"question-old.json": '{"current":"old: Choose"}',
+                     "next-first.json": '{"source":"question-old","current":"old: Choose"}'}
+        for name, text in unchanged.items():
+            _ = (directory / name).write_text(text)
+        before = {directory / name: ((directory / name).read_bytes(), (directory / name).stat().st_mtime_ns)
+                  for name in unchanged}
+        _ = (directory / "proposal-second.json").write_text('{"current":"P1"}')
+        error = io.StringIO()
+        with mock.patch.object(session_staff, "member_sources", return_value=sources), contextlib.redirect_stderr(error):
+            self.assertEqual(migrate_next_pins.migrate(), 1)
+        self.assertEqual(error.getvalue().splitlines(), [
+            "unavailable: old: showrunner ownership evidence is unavailable",
+            "unavailable: old: showrunner ownership evidence is unavailable",
+        ])
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before}, before)
+        self.assertEqual({path.name for path in directory.glob("*.json")},
+                         {*unchanged, f"proposal-{owners['second'].id}.json"})
+
+    def test_pin_migration_prefers_a_fixed_id_over_a_former_slug(self) -> None:
+        from scripts.production import migrate_next_pins, session_staff
+
+        owner = staff.snapshot().rows[0]
+        doc = self.root / "other-production.md"
+        text = f"# Production\n\n## Production Context\n\n- **Formerly:** `{owner.id}`\n"
+        _ = doc.write_text(text)
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", doc))
+        sources = session_staff.MemberSources({
+            "other": showrunners.ShowrunnerSource(showrunners.Timer("other", "", doc, "UTC"), doc.read_text()),
+        }, ())
+        directory = self.root / "next"
+        directory.mkdir()
+        path = directory / f"question-{owner.id}.json"
+        _ = path.write_text(f'{{"current":"{owner.id}: Choose"}}')
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with mock.patch.object(session_staff, "member_sources", return_value=sources) as read_sources:
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+        read_sources.assert_not_called()
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(list(directory.glob("*.json")), [path])
+
     def test_pin_migration_refuses_missing_ownership_and_unequal_destination(self) -> None:
         from scripts.production import migrate_next_pins
 
