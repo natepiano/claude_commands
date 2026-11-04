@@ -104,17 +104,8 @@ FILTERED_FLOOR = GIB
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
-# Option C, 126 builds over 14 days to 2026-10-30: 1.314 covered every
-# replayed release step (including the 15.76 GiB incident).
-RELEASE_HEADROOM = 1.314
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
-# Phase 39 replay, 2026-11-04: the original 126 builds and 64 recent builds.
-# Cargo-berth used 1.412826538 GiB after 0.336112976 GiB; its increase sets
-# the 1.1 GiB margin. S2 used 7.8 GiB after 6.3 GiB; it sets the 1.1 factor.
-# Each value rounds upward to one decimal place.
-DEV_SIZE_FACTOR = 1.1
-DEV_SIZE_MARGIN_BYTES = math.ceil(1.1 * GIB)
 
 
 @dataclass(frozen=True)
@@ -199,7 +190,7 @@ class NoHeadroom:
 
 @dataclass(frozen=True)
 class ReleaseHeadroom:
-    factor: float = RELEASE_HEADROOM
+    factor: float
 
 
 @dataclass(frozen=True)
@@ -211,8 +202,8 @@ class DevHeadroom:
 
 @dataclass(frozen=True)
 class DevSizeHeadroom:
-    factor: float = DEV_SIZE_FACTOR
-    margin_bytes: int = DEV_SIZE_MARGIN_BYTES
+    factor: float
+    margin_bytes: int
 
 
 HeadroomRule = ReleaseHeadroom | DevHeadroom | DevSizeHeadroom | NoHeadroom
@@ -1636,6 +1627,9 @@ class MemoryConfig:
     ci_memory_margin_bytes: int
     test_phase_margin: float
     build_budget_bytes: int
+    dev_size_factor: float
+    dev_size_margin_bytes: int
+    release_headroom: float
     running_pass_seconds: float
     waiting_pass_seconds: float
     wait_reply_seconds: float
@@ -1715,6 +1709,9 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_memory_margin_bytes=int(number("ci_memory_margin_gib") * GIB),
                 test_phase_margin=number("test_phase_margin"), build_budget_bytes=gib("build_budget_gib"),
+                dev_size_factor=number("dev_size_factor"),
+                dev_size_margin_bytes=value("dev_size_margin_gib", lambda raw: math.ceil(float(raw) * GIB)),
+                release_headroom=number("release_headroom"),
                 running_pass_seconds=running_interval, waiting_pass_seconds=number("waiting_pass_seconds"),
                 wait_reply_seconds=number("wait_reply_seconds"), query_timeout_seconds=number("query_timeout_seconds"),
                 replay_retention_seconds=number("replay_retention_seconds"),
@@ -2038,10 +2035,11 @@ def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape
             base = max(base, floor.peak)
         factor: HeadroomRule = NoHeadroom()
         if isinstance(shape, BuildShape):
+            config = memory_config()
             if shape.profile == "release":
-                factor = ReleaseHeadroom()
+                factor = ReleaseHeadroom(config.release_headroom)
             elif shape.profile == "dev":
-                factor = DevSizeHeadroom()
+                factor = DevSizeHeadroom(config.dev_size_factor, config.dev_size_margin_bytes)
         uncapped = shape_headroom_bytes(base, factor)
         basis = replace(basis, floor=floor, factor=factor)
     else:
@@ -2160,12 +2158,13 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
                 return BasisNotRecorded()
             if not math.isfinite(value) or value < 1:
                 return BasisNotRecorded()
-            factor = factor_class(value)
-            if isinstance(factor, DevSizeHeadroom):
+            if factor_class is DevSizeHeadroom:
                 margin = factor_row.get("margin_bytes")
                 if type(margin) is not int or margin < 0:
                     return BasisNotRecorded()
-                factor = replace(factor, margin_bytes=margin)
+                factor = DevSizeHeadroom(value, margin)
+            else:
+                factor = cast(type[ReleaseHeadroom | DevHeadroom], factor_class)(value)
         elif factor_kind != "none":
             return BasisNotRecorded()
         runs = row["runs"]

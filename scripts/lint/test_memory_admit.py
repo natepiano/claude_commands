@@ -1740,7 +1740,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
             "measured", "buildlog", "pooled", "fallback", gate.BasisNotRecorded(),
             gate.ShapeP90(10, gate.FailedPeakFloor(4 * GIB, HISTORY_AT.isoformat()),
                           gate.DevHeadroom(), gate.CappedAtBudget(25 * GIB, gate.CapNotRecorded())),
-            gate.ShapeLargest(2, factor=gate.ReleaseHeadroom()), gate.ShapeFallback())
+            gate.ShapeLargest(2, factor=gate.ReleaseHeadroom(gate.read_memory_config(report=False).release_headroom)), gate.ShapeFallback())
         for basis in bases:
             with self.subTest(basis=basis):
                 encoded = gate.need_basis_record(basis)
@@ -2117,6 +2117,9 @@ class ServicePriorityRepairTests(unittest.TestCase):
 class BuildPromiseFixture(MemoryQueueFixture):
     """One private history, index and ledger for the build-promise regressions."""
 
+    release_headroom: gate.ReleaseHeadroom = gate.ReleaseHeadroom(1.0)
+    dev_size_headroom: gate.DevSizeHeadroom = gate.DevSizeHeadroom(1.0, 0)
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -2126,6 +2129,9 @@ class BuildPromiseFixture(MemoryQueueFixture):
         _ = self.enterContext(patch.object(gate, "git_identity", return_value=(HANA, "hana-clone")))
         _ = self.enterContext(patch.object(store, "host_name", return_value="test-host"))
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+        config = gate.read_memory_config(report=False)
+        self.release_headroom = gate.ReleaseHeadroom(config.release_headroom)
+        self.dev_size_headroom = gate.DevSizeHeadroom(config.dev_size_factor, config.dev_size_margin_bytes)
 
     def sample(self, peak: float, *, shape: BuildShape = RELEASE_SHAPE,
                at: datetime = HISTORY_AT, outcome: str = "completed", need: float = 21,
@@ -2189,15 +2195,31 @@ class BuildShapePromiseTests(BuildPromiseFixture):
                     self.assertIsInstance(basis, gate.ShapeLargest)
                     self.assertIsInstance(basis.cap, gate.UnderBudget)
                     self.assertIsInstance(basis.factor, gate.DevSizeHeadroom)
-                    self.assertEqual(basis.factor, gate.DevSizeHeadroom())
-                    self.assertEqual(peak.bytes, gate.shape_headroom_bytes(int(base * GIB), gate.DevSizeHeadroom()))
+                    self.assertEqual(basis.factor, self.dev_size_headroom)
+                    self.assertEqual(peak.bytes, gate.shape_headroom_bytes(int(base * GIB), self.dev_size_headroom))
                     if base == 6.3:
                         self.assertGreaterEqual(peak.bytes, int(7.8 * GIB))
                         self.assertLess(peak.bytes, 21 * GIB)
                     self.assertEqual(gate.read_need_basis(gate.need_basis_record(basis)), basis)
 
     def test_dev_size_headroom_fits_the_s2_build(self) -> None:
-        self.assertEqual(gate.shape_headroom_bytes(int(6.3 * GIB), gate.DevSizeHeadroom()), 8_622_146_848)
+        self.assertEqual(gate.shape_headroom_bytes(int(6.3 * GIB), self.dev_size_headroom), 8_622_146_848)
+
+    def test_changed_dev_factor_changes_the_next_estimate(self) -> None:
+        shape = build_shape(["cargo", "build", "--bin", "hana"])
+        self.sample(6.3, shape=shape)
+        before = self.estimate(shape)
+        saved_basis = gate.need_basis_record(before.basis)
+        write_memory_config(self.root / "build_admission.conf", dev_size_factor="1.2")
+        config = gate.read_memory_config(report=False)
+        rule = gate.DevSizeHeadroom(config.dev_size_factor, config.dev_size_margin_bytes)
+        after = self.estimate(shape)
+        self.assertGreater(after.bytes, before.bytes)
+        self.assertEqual(after.count, before.count)
+        self.assertEqual(after.bytes, gate.shape_headroom_bytes(int(6.3 * GIB), rule))
+        self.assertEqual(self.same_shape_basis(after).factor, rule)
+        self.assertIsInstance(self.same_shape_basis(after).cap, gate.UnderBudget)
+        self.assertEqual(gate.read_need_basis(saved_basis), before.basis)
 
     def test_small_dev_history_still_covers_the_limiting_build(self) -> None:
         shape = build_shape(["cargo", "build", "--bin", "cargo-berth"])
@@ -2250,14 +2272,14 @@ class BuildShapePromiseTests(BuildPromiseFixture):
                 self.sample(20, shape=build_shape(arguments))
         self.sample(20, repository=gate.RepositoryIdentity("https://example.org/other/hana", "hana"))
         peak = self.estimate()
-        self.assertEqual((peak.bytes, peak.source, peak.count), (math.ceil(3 * GIB * 1.314), "shape", 2))
-        self.assertEqual(peak.basis, gate.ShapeLargest(2, gate.NoFloor(), gate.ReleaseHeadroom(), gate.UnderBudget()))
+        self.assertEqual((peak.bytes, peak.source, peak.count), (gate.shape_headroom_bytes(3 * GIB, self.release_headroom), "shape", 2))
+        self.assertEqual(peak.basis, gate.ShapeLargest(2, gate.NoFloor(), self.release_headroom, gate.UnderBudget()))
 
     def test_fewer_than_ten_same_shape_runs_use_the_largest(self) -> None:
         for value in range(1, 10):
             self.sample(value)
         peak = self.estimate()
-        self.assertEqual((peak.bytes, peak.count), (math.ceil(9 * GIB * 1.314), 9))
+        self.assertEqual((peak.bytes, peak.count), (gate.shape_headroom_bytes(9 * GIB, self.release_headroom), 9))
         self.assertIsInstance(peak.basis, gate.ShapeLargest)
 
     def test_ten_same_shape_runs_use_p90(self) -> None:
@@ -2265,8 +2287,8 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             self.sample(3)
         self.sample(10)
         peak = self.estimate()
-        self.assertEqual((peak.bytes, peak.count), (math.ceil(3 * GIB * 1.314), 10))
-        self.assertEqual(peak.basis, gate.ShapeP90(10, gate.NoFloor(), gate.ReleaseHeadroom(), gate.UnderBudget()))
+        self.assertEqual((peak.bytes, peak.count), (gate.shape_headroom_bytes(3 * GIB, self.release_headroom), 10))
+        self.assertEqual(peak.basis, gate.ShapeP90(10, gate.NoFloor(), self.release_headroom, gate.UnderBudget()))
 
     def test_profile_fallback_uses_release_builds_and_never_the_dev_pool(self) -> None:
         self.sample(13, shape=build_shape(["cargo", "build", "--release", "--lib"]))
@@ -2283,9 +2305,9 @@ class BuildShapePromiseTests(BuildPromiseFixture):
 
     def test_each_build_profile_uses_its_headroom_rule(self) -> None:
         for arguments, rule in (
-            (RELEASE_BUILD, gate.ReleaseHeadroom()),
-            (["cargo", "build", "--profile", "release", "--bin", "hana"], gate.ReleaseHeadroom()),
-            (["cargo", "build"], gate.DevSizeHeadroom()),
+            (RELEASE_BUILD, self.release_headroom),
+            (["cargo", "build", "--profile", "release", "--bin", "hana"], self.release_headroom),
+            (["cargo", "build"], self.dev_size_headroom),
             (["cargo", "build", "--profile", "small"], gate.NoHeadroom()),
         ):
             shape = build_shape(arguments)
@@ -2304,7 +2326,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             with self.subTest(profile=shape.profile):
                 peak = self.estimate(shape)
                 self.assertEqual(peak.bytes, 21 * GIB)
-                rule = gate.ReleaseHeadroom() if shape.profile == "release" else gate.DevSizeHeadroom()
+                rule = self.release_headroom if shape.profile == "release" else self.dev_size_headroom
                 self.assertEqual(self.same_shape_basis(peak).cap,
                                  gate.CappedAtBudget(gate.shape_headroom_bytes(30 * GIB, rule), 21 * GIB))
 
@@ -2324,7 +2346,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             self.sample(20, record_shape=False, call_id=call_id)
         before = (self.root / "index.sqlite").read_bytes()
         peak = self.estimate()
-        self.assertEqual((peak.bytes, peak.count), (math.ceil(5 * GIB * 1.314), 1))
+        self.assertEqual((peak.bytes, peak.count), (gate.shape_headroom_bytes(5 * GIB, self.release_headroom), 1))
         self.assertEqual((self.root / "index.sqlite").read_bytes(), before)
 
     def test_rows_without_shape_or_join_cannot_supply_even_a_profile_fallback(self) -> None:
@@ -2339,12 +2361,12 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             self.sample(20, host="other-host")
             self.sample(20, at=NOW + timedelta(seconds=1))
             self.sample(20, at=NOW - timedelta(days=14, seconds=1))
-        self.assertEqual((self.estimate().bytes, self.estimate().count), (math.ceil(3 * GIB * 1.314), 1))
+        self.assertEqual((self.estimate().bytes, self.estimate().count), (gate.shape_headroom_bytes(3 * GIB, self.release_headroom), 1))
 
     def test_shape_history_includes_a_peak_that_ends_at_the_estimate_time(self) -> None:
         self.sample(10, at=NOW)
         peak = self.estimate(now=NOW)
-        self.assertEqual((peak.bytes, peak.count), (math.ceil(10 * GIB * 1.314), 1))
+        self.assertEqual((peak.bytes, peak.count), (gate.shape_headroom_bytes(10 * GIB, self.release_headroom), 1))
         self.assertIsInstance(peak.basis, gate.ShapeLargest)
 
     def test_killed_peak_sets_a_floor_even_when_p90_is_lower(self) -> None:
@@ -2352,7 +2374,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             self.sample(10)
         self.sample(15.76, outcome="killed", need=16)
         peak = self.estimate()
-        self.assertEqual(peak.bytes, math.ceil(int(15.76 * GIB) * 1.314))
+        self.assertEqual(peak.bytes, gate.shape_headroom_bytes(int(15.76 * GIB), self.release_headroom))
         self.assertEqual(self.same_shape_basis(peak).floor, gate.FailedPeakFloor(int(15.76 * GIB), store.utc_iso(HISTORY_AT.timestamp())))
         self.assertAlmostEqual(peak.bytes / GIB, 20.70864, places=6)
 
@@ -2363,7 +2385,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.sample(15.76, outcome="owner_gone", at=ended)
         self.sample(1, at=HISTORY_AT)
         peak = self.estimate()
-        self.assertEqual(peak.bytes, math.ceil(int(15.76 * GIB) * 1.314))
+        self.assertEqual(peak.bytes, gate.shape_headroom_bytes(int(15.76 * GIB), self.release_headroom))
         self.assertEqual(self.same_shape_basis(peak).floor, gate.FailedPeakFloor(int(15.76 * GIB), store.utc_iso(ended.timestamp())))
 
     def test_completed_run_above_its_need_also_sets_the_floor(self) -> None:
@@ -2371,7 +2393,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             self.sample(10)
         self.sample(15.76, need=12, outcome="completed")
         peak = self.estimate()
-        self.assertEqual(peak.bytes, math.ceil(int(15.76 * GIB) * 1.314))
+        self.assertEqual(peak.bytes, gate.shape_headroom_bytes(int(15.76 * GIB), self.release_headroom))
         self.assertIsInstance(self.same_shape_basis(peak).floor, gate.FailedPeakFloor)
 
     def test_newest_failed_row_replaces_the_floor_in_time_order(self) -> None:
@@ -2381,7 +2403,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         # Append the older and larger failure last: file order is not time order.
         self.sample(15.76, outcome="owner_gone", at=NOW - timedelta(hours=1))
         peak = self.estimate()
-        self.assertEqual(peak.bytes, math.ceil(11 * GIB * 1.314))
+        self.assertEqual(peak.bytes, gate.shape_headroom_bytes(11 * GIB, self.release_headroom))
         self.assertEqual(self.same_shape_basis(peak).floor, gate.FailedPeakFloor(11 * GIB, store.utc_iso(HISTORY_AT.timestamp())))
 
     def test_failed_floor_expires_after_fourteen_days(self) -> None:
@@ -2389,7 +2411,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             self.sample(10)
         self.sample(15.76, outcome="killed", at=NOW - timedelta(days=14, seconds=1))
         peak = self.estimate()
-        self.assertEqual(peak.bytes, math.ceil(10 * GIB * 1.314))
+        self.assertEqual(peak.bytes, gate.shape_headroom_bytes(10 * GIB, self.release_headroom))
         self.assertEqual(self.same_shape_basis(peak).floor, gate.NoFloor())
 
     def test_old_row_with_no_outcome_never_sets_a_failed_floor(self) -> None:
@@ -2397,7 +2419,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             self.sample(10)
         self.sample(15.76, need=1, outcome="")
         peak = self.estimate()
-        self.assertEqual(peak.bytes, math.ceil(10 * GIB * 1.314))
+        self.assertEqual(peak.bytes, gate.shape_headroom_bytes(10 * GIB, self.release_headroom))
         self.assertEqual(self.same_shape_basis(peak).floor, gate.NoFloor())
 
 
@@ -2759,7 +2781,7 @@ class BuildNeedBasisTests(BuildPromiseFixture):
             basis = row.get("need_basis")
             self.assertIsInstance(basis, dict)
             serialized = wire.encode_record(basis)
-            for value in ("1.314", str(int(15.76 * GIB)), HISTORY_AT.strftime("%Y-%m-%d")):
+            for value in (str(self.release_headroom.factor), str(int(15.76 * GIB)), HISTORY_AT.strftime("%Y-%m-%d")):
                 self.assertIn(value, serialized)
             before = fixture.state_text()
             explanation = fixture.server.handle_request(wire.ExplainRequest())[0]
@@ -2784,8 +2806,8 @@ class BuildNeedBasisTests(BuildPromiseFixture):
 
     def test_every_shape_tier_round_trips_with_floor_factor_and_cap(self) -> None:
         floor = gate.FailedPeakFloor(16 * GIB, "2026-10-05T12:00:00Z")
-        for basis in (gate.ShapeP90(10, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(24 * GIB, 21 * GIB)),
-                      gate.ShapeLargest(2, floor, gate.ReleaseHeadroom(), gate.UnderBudget()),
+        for basis in (gate.ShapeP90(10, floor, self.release_headroom, gate.CappedAtBudget(24 * GIB, 21 * GIB)),
+                      gate.ShapeLargest(2, floor, self.release_headroom, gate.UnderBudget()),
                       gate.ShapeLargest(2, factor=gate.DevSizeHeadroom(1.25, 2 * GIB)),
                       gate.ShapeFallback(gate.CappedAtBudget(24 * GIB, 21 * GIB)),
                       gate.ShapeFallback(gate.CappedAtBudget(24 * GIB, gate.CapNotRecorded()))):

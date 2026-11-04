@@ -223,12 +223,13 @@ Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
 Build estimates use completed same-shape history from the last 14 days.
 Ten or more earlier runs supply p90. One to nine earlier runs supply their largest peak.
 The newest failed-build floor can raise that base.
-A dev build uses `ceil(base × DEV_SIZE_FACTOR + DEV_SIZE_MARGIN_BYTES)`.
-`memory_admit.py` defines the factor as 1.1 and the margin as 1.1 GiB, rounded upward to bytes.
+Each new estimate reads `[memory]` in `config/build_admission.conf` through `memory_config()`.
+A dev build uses `ceil(base × dev_size_factor + margin_bytes)`.
+`dev_size_factor` is 1.1. `dev_size_margin_gib` is 1.1 GiB, rounded upward to bytes.
 The Phase 39 replay uses the original 126-build cohort and the 64 measured builds from the latest three days.
 The cargo-berth increase sets the margin. The measured S2 build sets the factor.
 The S2 history peak of 6.3 GiB gives a promise of 8.03 GiB before the budget cap.
-Release builds retain their 1.314 factor. A build without same-shape history retains the same-profile fallback without headroom.
+Release builds use `release_headroom`, currently 1.314. A build without same-shape history retains the same-profile fallback without headroom.
 The retry after a memory kill stays unchanged.
 
 Each estimate stores its rule and the budget cap it applies.

@@ -2030,7 +2030,7 @@ class CutoverServiceTests(unittest.TestCase):
             shape = build_shape(list(argv))
             profile = gate.StepProfile("fixture", "build", str(fixture.root),
                 gate.ExpectedPeak(12 * GIB, "shape", 9,
-                    gate.ShapeP90(9, gate.NoFloor(), gate.ReleaseHeadroom(), gate.UnderBudget())),
+                    gate.ShapeP90(9, gate.NoFloor(), gate.ReleaseHeadroom(gate.read_memory_config(report=False).release_headroom), gate.UnderBudget())),
                 repository, "full", fixture.clock.now())
             owner_request = fixture.request(need=12 * GIB, step="build")
             assert isinstance(owner_request.profile, gate.StepProfile)
@@ -2101,7 +2101,7 @@ class CutoverServiceTests(unittest.TestCase):
         profile = replace(request.profile, worktree=str(fixture.root),
             repository=gate.RepositoryIdentity("https://example.org/fixture", "fixture"),
             peak=gate.ExpectedPeak(12 * GIB, "shape", 9,
-                gate.ShapeP90(9, gate.NoFloor(), gate.ReleaseHeadroom(), gate.UnderBudget())))
+                gate.ShapeP90(9, gate.NoFloor(), gate.ReleaseHeadroom(gate.read_memory_config(report=False).release_headroom), gate.UnderBudget())))
         return replace(request, argv=("cargo", "build", "--release", "--bin", "fixture"), profile=profile)
 
     def assert_unregistered_build_is_expired(self, *, restart: bool = False,
