@@ -27,11 +27,12 @@
   - Completion condition: the call uses fewer imports or a lighter entry path; the change reports before and after CPU figures for the same call, and the build_targets and verify tests pass.
   - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
 
-- [ ] **Use recorded Cargo output roots for trim matching and Phase 17**
-  - Target: `scripts/lint/sweep.py`, Phase 11's shared step-evidence reader in `scripts/lint/build_shape.py`, and their tests
-  - Why needed: Phase 51 records both Cargo output roots for each step (`record.py` :935, `index.py` :118). Trim attribution still uses saved workspace mappings instead of each step's recorded roots (`sweep.py` :3796, :3876).
-  - Completion condition: match trims through recorded output roots after copies disappear or mappings change. Expose both roots through Phase 11's shared reader for Phase 17. Keep named unknown states for missing historical evidence. Add no second mapping or recorder.
-  - Revealed by: Phase 4 (builds showrunner 2026-10-30: next); narrowed after the Phase 37 architect review and again after the Phase 51 and 53 architect review
+- [ ] **Use recorded Cargo output roots for trim matching**
+  - Target: `scripts/lint/sweep.py` and its tests.
+  - Dependency: Phase 17 exposes the recorded Cargo roots through the shared step-evidence reader.
+  - Why needed: trim attribution still uses saved workspace mappings instead of each step's recorded roots (`sweep.py` :3796, :3876).
+  - Completion condition: use the shared reader to match trims after copies disappear or mappings change. Keep named unknown states. Test both cases. Add no second mapping, join or recorder.
+  - Revealed by: Phase 4 (builds showrunner 2026-10-30: next); narrowed after the Phase 37, Phase 51 and 53, and Phase 11 architect reviews
 
 - [ ] **The working-set summary tells a Node script apart from a Node task or one-line program**
   - Target: `scripts/build_targets/working_set.py`, `scripts/build_targets/test_working_set.py`

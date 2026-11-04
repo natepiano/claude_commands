@@ -190,7 +190,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Binds later work:** A new script whose owner must show in the table needs an Owns entry in its production doc. Regenerate `working_set_owners.json` from the production docs after an Owns cell changes.
 
 ### Phase 8 — Shared build state is written only by the installed copy  · status: todo
-**Depends on:** Phases 2, 10, 12 and 19. Phase 56 lands before Phase 11. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
+**Depends on:** Phases 2, 10, 12 and 19. Phase 56 lands before Phase 11. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its Spec 7 import repair lands before Phase 8, because both change `build_hold.py`. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29. The edit to `docs/plans/builds-production.md` is approved.
 
@@ -296,6 +296,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   4. `test_release_recovers_recipient_notices_from_a_damaged_referenced_cycle`.
   5. `test_status_names_unreadable_pending_records_and_cycles_without_hiding_them`.
 - Every changed module and caller passes its tests. Basedpyright reports `0 errors, 0 warnings, 0 notes` for those modules.
+- The client tests cover installed-copy refusal of the estimate cache writer (moved from Phase 18).
 - After installation, query the service and inspect its saved state. Repository and step fields remain separate.
   A checkout mutation attempt refuses before state changes. A private-state attempt still works.
 - Name queue-unit files as `also touches`, tested against `origin/builds-queue`.
@@ -337,65 +338,29 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Gotchas:** Releasing a measured reservation frees only its resident bytes. Its swap bytes stay part of the build charge but do not count as freed RAM.
 
 ### Phase 11 — Memory admission promises what each repository's steps really use  · status: done
-**Depends on:** Phases 10, 12 and 56, plus verify-unit's freshness change on `origin/builds`. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
 
-**Approved:** showrunner 2026-10-29 (ETA 22:00 EDT, after Phase 12), from the widget wait study (07:09–11:43 EDT): a measured floor per repository for filtered test runs, and the promises that are 3x or more too high.
+#### As-built
 
-#### Work Order
-
-**Goal:** each step's memory promise is close to what that repository's steps use: not so low that a filtered run starts small and then compiles, and not so high that a small repository holds back other builds.
-
-**Measured 2026-10-29 (natedev, 14 days, anon peaks):**
-- cargo-liner clippy: keyed rows (repository URL) p90 1.94 GiB over 56 runs; old rows with no key (folder name `cargo-liner`) p90 3.04 GiB over 2061 runs. `expected_peak` mixes both, so the promise is about 3.0 GiB.
-- bevy_brp nextest: 5 keyed runs, p90 1.78 GiB. With fewer than 5 own runs, `expected_peak` uses the all-repository pool, p90 10.83 GiB (mostly hana). That gave the 10.9 GiB promise.
-- `FILTERED_FLOOR` is one value (1 GiB) for all repositories.
-
-**Spec:**
-
-1. Replay first: for every step in the 14-day history, compute the promise that today's `expected_peak` gives from the history before that step, and compare it to the step's measured anon peak. Report, per repository and step, the count of promises under half the measured peak and over 3x the measured peak. Fresh runs and compile runs (Spec 4's rule) are separate rows. Save the table in the as-built doc. The replay runs again on the result: neither count rises for any repository, and each count falls in total.
-2. `expected_peak` (`scripts/lint/memory_admit.py`): when a repository has 5 or more keyed rows, use only keyed rows; old unkeyed rows count only when keyed rows are fewer than 5.
-3. A repository with 1 to 4 own runs does not take the all-repository pool p90. Use the largest of its own runs, or the pool when that is lower. A repository with no own runs keeps today's rule. This rule does not apply to `build` steps: Phase 24 Spec 3 owns their promise.
-4. A promise does not mix compile runs and no-compile runs (showrunner 2026-10-29 17:11 EDT, from the user's rule). Spec 4 applies to every step. A history row is a compile run when its index step has `crates_compiled > 0` (index rows: their own column). Anon rows get it through the one index join in `scripts/lint/build_shape.py`: `index_shapes(index_path, host, step, cutoff, before)` (:89, Phase 24) joins anon rows to `steps` by host, `call_id` and step name, with no repository argument, because `steps.repo` is the checkout folder; it drops rows without usable argv, which fits a shape lookup only. Widen the existing host/call-id/step join into one frozen step-evidence value whose shape and compile count have independent known/unknown states, and rename it to say what it returns. Missing argv must not erase a recorded compile count, and a stored shape must not bypass compile classification; keep the no-repository-argument contract and repository filtering at the history-row boundary. Open no second `steps` join and parse no argv outside `build_shape` (:59). A row with no match counts as neither. The step being admitted is a compile run unless verify Phase 4's `is_fresh_test` proves it fresh. A compile run's promise comes only from earlier compile runs; for a filtered run the order is the same as `filtered_peak` today: the exact filter set, then the package's filtered runs, then the check/build peaks. The 1 GiB floor stays only for fresh runs and for a repository with no compile history; do not raise the fresh floor. Fresh runs keep verify Phase 4's `fresh_test_peak` unchanged. `expected_peak()` returns `min(filtered, full)` today, so a compile-run promise above the full-run estimate would not hold: the compile-run promise wins over that minimum, and a test covers a promise above the full estimate; the replay includes that case (Phase 3 architect review, F11). Comment each new constant with the measurement that set it, as the current constants are.
-5. Tests in `scripts/lint/test_memory_admit.py`: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; a `build` step with 1–4 same-shape rows keeps Phase 24's same-shape promise, not Spec 3's lower pool; a compile run's promise uses only compile runs; an anon row with no `call_id` and step match counts as neither; a fresh run keeps the `fresh_test_peak` promise; a `merge-gate` row with no index match stays in `anon_peaks.jsonl` and goes into no Cargo step's compile or no-compile history; each test fakes both memory readings. In `scripts/lint/test_build_shape.py`: the widened join returns known shape with known count, known count with unknown shape (no usable argv), known shape with unknown count, and the unmatched-row state. The existing `BuildShapePromiseTests` (same-shape promise and failed-peak floor) and the `need_basis` codec and rendering tests pass unchanged.
-6. Docs: `docs/as-built/build-memory-admission.md` gets the replay table before and after, and the new rules. The replay script lives in the session folder and is not committed.
-7. Rename `DevHeadroom` to `LegacyDevMultiplierHeadroom` (`memory_admit.py`, `queue_evidence.py` and their tests). It names the old saved multiplier, not a current rule. The wire tag stays `"dev"`, so old saved rows decode unchanged.
-8. Tests in `scripts/lint/test_memory_admit.py`, beside `test_changed_dev_factor_changes_the_next_estimate`: a changed `dev_size_margin_gib` and a changed `release_headroom` each change the next estimate. Each test keeps the earlier saved basis unchanged and checks the next estimate's `need_text` explanation.
-
-**Constraints from prior phases:**
-- Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
-  Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
-  `NoQueuedHead` means no eligible head. A first mark uses the active window from the same pass.
-  Keep an explicit inactive window for an old head without priority. Do not derive a deadline from the current time.
-  Use `head_policy` for the deployed policy. Add no separate window rule in a reader.
-- Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
-- Phase 12: Phase 11 changes estimates (`need`) only. It keeps the running charge as Phase 12 built it: current memory, the ramp and unknown-peak promises, the observed peak with its `.wave` decay after 1500 s, the missing-`.wave` fallback to the `.max` mtime, the recovery start spacing, and the estimate-expiry checks after the lock.
-- Phase 16: merge gates write `anon_peaks.jsonl` rows under step `merge-gate`, and those rows have no Cargo index step to join. Spec 4's "every step" classifier does not drop them as "neither": `merge-gate` rows stay a class of their own, and report-unit's merge-gate history rows stay written. Phase 27 sizes the gate row by its cap and removes `gate_estimate`, so no admission estimate reads `merge-gate` rows. The compile and no-compile split applies to Cargo steps only (Spec 5 tests it).
-- Phase 24: `scripts/lint/build_shape.py` holds the one argv parser (`build_shape`) and the one anon-to-index join (`index_shapes`); Spec 4 widens that join and adds no other. For `build` steps, `build_expected_peak` (`memory_admit.py` :2012) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1662). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. Specs 2 and 4 split rows inside each shape; they change none of those tiers, and Spec 3's lower pool never replaces a same-shape `build` promise.
-- Phase 51: freshness proves that both Cargo output roots survived. `is_fresh_test` (`memory_admit.py` :2350) takes `CargoOutputRoots | CargoOutputUnavailable` (`scripts/lib/cargo_output.py`) and is never fresh on `CargoOutputUnavailable` or when either root is gone or swept. `verify.sh`'s build key prints three lines. Spec 4's fresh/compile split keeps this contract. `test_intermediate_deletion_ends_warm_promise_with_artifacts_present` and `test_missing_intermediates_end_warm_promise_and_equal_roots_stay_warm` (`test_memory_admit.py`) stay green unchanged.
+- `build_shape.py` holds the one anon-to-index join, `index_step_evidence(index_path, host, step, cutoff, before)` (formerly `index_shapes`). It has no repository argument; repository filtering stays at the history-row boundary. Each `(call_id, step)` key maps to a frozen `StepEvidence(shape, compilation)`, and shape and compile count have independent known and unknown states.
+- The compile state is `CompiledCrates(count) | NoCratesCompiled | CompileCountUnknown`. `combine_compile_counts()` merges repeated attempts in any order: a positive count means compiled (counts summed), zero only when every attempt reports zero, otherwise unknown. A matching row with a missing or bad `started_at` is an unknown attempt. A key with no matching row is absent and counts as neither.
+- `expected_peak()`: with 5 or more keyed rows (repository URL), only keyed rows count. A repository with 1 to 4 own runs takes its largest own run, or the pool p90 when that is lower; a repository with none keeps the pool. `build` steps keep the same-shape rule.
+- Compile runs and no-compile runs never mix, for every Cargo step. The admitted step is a compile run unless `is_fresh_test` proves it fresh. A compile run's promise comes only from earlier compile runs, in the order exact filter set, package filtered runs, check/build peaks, and it is not capped by the full-run estimate. Fresh runs keep `fresh_test_peak` and its 1 GiB floor. `merge-gate` rows stay their own class.
+- An index without a `crates_compiled` column keeps every legacy peak in `expected_peak()` and `filtered_peak()`.
+- `DevHeadroom` is `LegacyDevMultiplierHeadroom`; its wire tag stays `"dev"`.
+- Replay over 15,053 runs (2026-10-21 to 2026-11-04): under-half 491 → 430, over-three 2,605 → 2,620. The bar was missed; the showrunner accepted the miss on 2026-11-04. The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 → 7, over-three 101 → 166. The replay script and its full grouped table stay in the run folder (`phases/11/replay.py`, `replay_groups.md`, `replay_inputs/`).
 
 **Files:**
-- `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_queue_view.py` — unchanged Phase 20 regression verification.
-- `scripts/lint/memory_admit.py` — items 2–4 and 7.
-- `scripts/lint/build_shape.py` — item 4, the widened join.
-- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py` — items 5, 7 and 8.
-- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/test_queue_evidence.py` — item 7, the rename only (owner queue-unit; name them as `also touches` in the notice).
-- `docs/as-built/build-memory-admission.md` — items 1 and 6.
+- `scripts/lint/build_shape.py` — `index_step_evidence`, `StepEvidence`, the compile states and `combine_compile_counts`.
+- `scripts/lint/memory_admit.py` — keyed rows, the own-run rule, the compile/no-compile split, `compiling_history()` and the rename.
+- `scripts/build_queue/queue_evidence.py` — the rename.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py`, `scripts/build_queue/test_queue_evidence.py` — tests for each rule.
+- `docs/as-built/build-memory-admission.md` — the rules and the replay summary.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `memory_admit.py`, `build_shape.py`, `queue_evidence.py` (item 7), the as-built doc and the replay (run folder).
-- `test` — `test_memory_admit.py`, `test_build_shape.py` and `test_queue_evidence.py` (Specs 5, 7 and 8).
-- `test` also runs the unchanged service and overview regressions named in the Acceptance gate.
+**Binds later work:** History readers use `index_step_evidence`; add no second `steps` join and parse no argv outside `build_shape`. An unknown compile count keeps the peak and never reads as zero. `CompiledCrates` beside an unknown attempt is a lower bound, not an exact size. `compiling_history()` keeps a peak with no index row and selects by completion time. These tests stay unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_the_count_unknown`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
 
-**Acceptance gate:**
-- Preserve these existing tests unchanged:
-  1. `test_first_priority_mark_agrees_in_the_card_overview_and_shell` in `scripts/build_queue/test_queue_view.py`.
-  2. `test_token_wait_preserves_backfill_and_strict_windows_until_its_next_admission` in `scripts/build_queue/test_admission_service.py`.
-  3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
-  4. `test_frozen_pass_keeps_one_window_for_admission_view_explanation_and_wait_text` in `scripts/lint/test_memory_admit.py`.
-  5. `test_recovery_release_keeps_required_endings_and_frozen_window` in `scripts/lint/test_memory_admit.py`.
-- The memory admission and build-shape tests pass; `basedpyright` over `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py`, `scripts/lint/test_memory_admit.py` and `scripts/lint/test_build_shape.py` reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
-- The replay after the change: neither count rises for any repository, and each count falls in total. The before and after table goes in the checkpoint notice.
-- Change-Review line: memory promises match each repository's real use | on natedev run `cargo clippy` in `~/rust/cargo-liner` and read its reservation in `~/.local/state/buildlog/admission` | its `need` is near the compile-only keyed p90 that the replay measures (the phase report gives the figure), not 3.0 GiB.
+**Gotchas:** A release publishes its failed peak before `invoke.sh` writes the index row, so a peak with no index row is a normal transient state, not a run with no compile.
+
+**Ruled out:** capping a compile promise at the full-run estimate — a filtered run that compiles can use more than the full suite's no-compile runs.
 
 ### Phase 12 — Memory admission counts host swap, sccache compiles and each step's peak  · status: done
 
@@ -553,7 +518,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Ruled out:** a split of cargo waits by gate presence from old logs (no gate recorded its start); the 24 h check after `queue_times.jsonl` reaches main makes it.
 
 ### Phase 17 — The nextest promise splits by compile size  · status: todo
-**Depends on:** Phase 11, including its compile classification and shared step-evidence reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
+**Depends on:** Phase 11, including its compile classification and shared step-evidence reader; Phase 60, its rebuilt replay and its adopted promise rule. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its Spec 7 import repair lands before Phase 8, because both change `build_hold.py`. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).
 
@@ -576,7 +541,9 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
    Extend Phase 11's shared step-evidence reader with worktree, start time and `tree_key`. Add no second index join.
    Read recorded output roots for predictor (c). A missing folder history uses the proposed `CacheHistoryUnknown` state.
    Missing history does not prove a cold cache. Report each predictor's accuracy and choose the best.
-   Replay band estimates against the rule after Phase 11.
+   Replay band estimates against the rule Phase 60 adopted. Use Phase 60's rebuilt replay (`phases/60/replay.py`) and its shared classification.
+   A positive count beside an unknown attempt is a lower bound. Give it a named state, for example `CompiledAtLeast`, apart from an exact `CompiledCrates`.
+   A lower-bound count selects its band or a larger one, never a smaller one.
    Report promises below half the measured peak, promises above three times the peak and steps above their promise.
    Keep modeled wait savings unavailable until queue calibration succeeds. Report observed waits separately.
 2. **Adopt rule.** Adopt only when the replay shows fewer promises under half the peak in total and none rises for any repository. Otherwise record the table and stop.
@@ -586,6 +553,9 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
      Give missing predictor evidence a named unknown state. Keep the existing basis codec as the only codec.
      Carry the basis through the profile, wire request and waiter row to `RecordedNeed`.
      `queue_evidence.need_text()` names the band and predictor.
+   - **The pool limit in the need's basis.** With 1–4 own runs, the pool p90 can lower the promise below the own peak (`memory_admit.py` :1931–1935).
+     The basis then reads as the measured p90 of one run. Add a named `NeedBasis` variant for the pool limit with the own peak, own count and pool p90.
+     `queue_evidence.need_text()` names the pool limit.
    - **One source boundary.** `NeedSource` is currently `str`. It is not a closed union.
      Define named known-source and unknown-source states at the decode boundary. The unknown state retains the original source text.
      Keep historical source values and `future-source` readable. Preserve their wire text during forwarding and refresh.
@@ -595,7 +565,9 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
      `admission_protocol.py` carries the profile and source. Add band text and decoding in the same change as the producer.
      Do not modify a removed shell source switch or cached CLI reader.
 4. **Tests:** cover each predictor input, band selection and the next-larger-band fallback in `scripts/lint/test_memory_admit.py`.
-   Keep the no-compile rule. Round-trip the proposed `CompileBand` through the existing basis codec.
+   Keep the no-compile rule. Round-trip the proposed `CompileBand` and the pool-limit variant through the existing basis codec.
+   Test that an unknown attempt beside a small positive count cannot place a large compile in a small band.
+   Render the pool-limit basis in `scripts/build_queue/test_queue_evidence.py`.
    Test every basis variant through the producer's source map.
    Test first, periodic and refreshed wait lines in `scripts/build_queue/test_admission_client_wait.py`.
    Test known, historical and unknown source decoding in `scripts/build_queue/test_admission_protocol.py`.
@@ -619,6 +591,8 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
   Report observed waits separately. Do not label an estimate comparison as a queue replay.
 - Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
 - Phase 11: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; the compile-run promise wins over `min(filtered, full)`; fresh runs keep `fresh_test_peak`.
+- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :1955–1976). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
+  Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
 - Running charge: the band changes `need` and so the ramp promise only; it leaves the running charge as built (`build_charge` :1096, `charge_basis` :1100, `growth_headroom` :1119, `reservation_memory` :1847 at `31c3ee3e`; `docs/as-built/build-memory-admission.md`): a running step charges the largest of its current resident and swap bytes, its observed `.max` peak, its promise during `RAMP_SECONDS` (120 s), and its promise when the peak is unknown. After Phase 24, a release-profile `build` step holds its promise for its whole life (`LifetimePromise`, in the budget charge and the free-memory growth term); nextest steps keep the ramp. The `.max` peak expires `PEAK_DECAY_SECONDS` (1500 s) after the last near-peak time in `.wave`, or after the `.max` mtime when `.wave` is absent. Phase 15 lands before this phase: after report 4c's test-phase mark the running charge is `TestPhaseCharge`, and the band leaves that charge unchanged too.
 - Phase 24: `NeedBasis` and its path to the waiter row, the queue card and the shell are Phase 24's; this phase adds one variant and one source value on that path, and the existing `need_basis` codec and rendering tests and the `LifetimePromise` tests stay gates. `build` steps keep Phase 24's same-shape rule; bands apply to nextest steps only.
 - The admission service owns transitions. `admission_client.step_request()` calls `step_estimate()` before connecting.
@@ -654,13 +628,13 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
   5. `test_recovery_release_keeps_required_endings_and_frozen_window` in `scripts/lint/test_memory_admit.py`.
 - The memory admission and the queue card tests pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; the merge gate is green. If Spec 2 stops the phase, no code changes and this item does not apply.
 - The notice has an `also touches scripts/build_queue/queue_evidence.py, test_queue_evidence.py (owner queue-unit)` line, tested against `origin/builds-queue`.
-- The `need_basis` codec and rendering tests (Phase 24's, plus `CompileBand`) and the `LifetimePromise` tests pass; an unknown cache-folder history reads as `CacheHistoryUnknown` in admission, the queue card and the shell; the first and refreshed wait lines both name the band.
+- The `need_basis` codec and rendering tests (Phase 24's, plus `CompileBand` and the pool-limit variant) and the `LifetimePromise` tests pass; an unknown cache-folder history reads as `CacheHistoryUnknown` in admission, the queue card and the shell; the first and refreshed wait lines both name the band.
 - The band table, predictor accuracy and before/after replay are in the checkpoint notice, with modeled wait savings (unavailable until queue calibration succeeds) and steps above their promise.
 - Post-merge check, 24 h after the merge reaches main: per band, steps above their promise and wait minutes against the 24 h before.
 - Change-Review line: a small-compile test run on a warm tree gets a small promise | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic --filter <one test>` once, then add a comment line to one source file of that crate (a small compile that is not zero; an unchanged tree takes the freshness path instead), run it again and read that run's memory wait line | its need is near the small band's p90 that the replay gives, and its basis names the compile band it picked.
 
 ### Phase 18 — History splits on the dylib feature and each step's commit, not on a time  · status: todo
-**Depends on:** Phase 17, including its compile bands. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
+**Depends on:** Phase 17, including its compile bands. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its Spec 7 import repair lands before Phase 8, because both change `build_hold.py`. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).
 
@@ -678,6 +652,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 1. **Measure first.** Measure fourteen days of natedev hana steps on each side of each change.
    Report step counts, anonymous peak p90 and rows without a usable sha or index match.
    Rows without usable evidence count on neither side. Confirm that sha ancestry separates the opt-level peaks.
+   A failed peak published before its index row has no sha yet. Keep it on the admitted step's side until its index row arrives; never drop it.
    Omit the opt-level split if the peaks do not separate. Report that result.
    Compare current and split estimates by step.
    Report promises below half the peak, promises above three times the peak and steps above their promise.
@@ -700,6 +675,8 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 6. **Docs.** `docs/as-built/build-memory-admission.md`: the list, the split rule and the replay table.
 
 **Constraints from prior phases:**
+- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :1955–1976). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
+  Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
 - Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
   Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
   `NoQueuedHead` means no eligible head. A first mark uses the active window from the same pass.
@@ -732,7 +709,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - `test` also runs the unchanged service and overview regressions named in the Acceptance gate.
 
 **Acceptance gate:**
-- The client tests cover the sole cache writer, initial estimates, refreshed estimates and installed-copy refusal.
+- The client tests cover the sole cache writer, initial estimates and refreshed estimates. The installed-copy refusal is Phase 8's gate.
   Basedpyright covers the changed client modules and their callers, with `0 errors, 0 warnings, 0 notes`.
 - Preserve these existing tests unchanged:
   1. `test_first_priority_mark_agrees_in_the_card_overview_and_shell` in `scripts/build_queue/test_queue_view.py`.
@@ -746,7 +723,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Change-Review line: a dylib hana test is promised only from dylib history | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` and read its first memory wait line | the need and its source match the dylib-side p90 that the replay gives.
 
 ### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: todo
-**Depends on:** Phases 18 and 20. Phase 20 records the lifecycle events and supplies their reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
+**Depends on:** Phases 18 and 20. Phase 20 records the lifecycle events and supplies their reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its Spec 7 import repair lands before Phase 8, because both change `build_hold.py`. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29, rescoped (no ETA given).
 
@@ -790,6 +767,8 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 6. **Docs.** `docs/as-built/build-memory-admission.md`: the tier share table; if changed, the `need` paragraph.
 
 **Constraints from prior phases:**
+- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :1955–1976). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
+  Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
 - Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
   Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
   `NoQueuedHead` means no eligible head. A first mark uses the active window from the same pass.
@@ -1603,7 +1582,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Ruled out:** caller-side `store` imports in six files, replaced by the one re-export.
 
 ### Phase 57 — The gate comparison shows Cargo waits with and without running gates  · status: todo
-**Depends on:** Phase 20 on `origin/main` for 24 hours. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its run-folder files do not overlap the chain files.
+**Depends on:** Phase 20 on `origin/main` for 24 hours. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its measurement files are in the run folder. Its Spec 7 import repair shares `scripts/build_hold/build_hold.py` and `test_build_hold.py` with Phase 8: land that repair before Phase 8 starts.
 
 #### Work Order
 
@@ -1667,11 +1646,11 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Spec 7: the build hold, head facts and memory admission tests pass on this branch and with `origin/builds-queue` merged in a copy. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the four Spec 7 files.
 
 ### Phase 58 — The disk floor alert stays silent during a live sweep, and the floor pass finishes quickly  · status: todo
-**Depends on:** none. Runs beside Phase 11 (showrunner request 2026-11-04 09:45 EST). Its files do not overlap the Phase 11 files.
+**Depends on:** none. Runs beside Phase 60 (showrunner request 2026-11-04 09:45 EST). Its files do not overlap the Phase 60 files.
 
 #### Work Order
 
-**Goal:** the floor lock alert reports only a real block, and a floor-only sweep finishes within its 2-minute timer.
+**Goal:** the floor lock alert reports only a real block, an unreadable holder included. (The 2-minute floor pass is done.)
 
 **Measured:**
 1. At 09:45 EST on 2026-11-04, natedev had 291.5 GiB free, under the 300 GiB floor.
@@ -1680,31 +1659,26 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 4. `py-spy dump` is refused: `kernel.yama.ptrace_scope=1`, and sudo is not available to the unit.
 5. Only a sweep writes the floor.lock identity, so every `KnownFloorLockHolder` is a sweep. An `UnreadableFloorLockHolder` gets no alert today.
 
+**Done:**
+- Part A, `2925d6453`: `alert_floor_lock()` sends nothing while the holder is a live `sweep.py` process.
+- Part B, `a5722fd4d`: output discovery reads Cargo metadata by depth in parallel, and the floor pass precomputes the unresolved sets. A floor-only dry run on natedev took 99.7 s.
+
 **Spec:**
-1. `alert_floor_lock()` sends nothing while the holder is a live `sweep.py` process.
-   Any other holder of floor.lock gets the alert after `floor_lock_alert_minutes`, `UnreadableFloorLockHolder` included. The message names its pid and command.
-2. Find where the floor-only pass spends its time.
-   Profile `python3 -m cProfile -s cumtime scripts/lint/sweep.py --floor-only --dry-run` on natedev. A dry run deletes nothing and takes no lock.
-   Save the top 30 cumulative rows to `phases/58/profile_before.txt` in the unit run folder.
-3. Fix the costliest work at its cause. Remove repeated scans, repeated reads of one file and per-file work that a directory total can replace.
-   Keep every safety check: build holds, process uses, Mac claims and the 300 GiB floor arithmetic.
-4. Profile again after the fix into `phases/58/profile_after.txt`. Report both wall times in the notice.
+1. An `UnreadableFloorLockHolder` gets the alert after `floor_lock_alert_minutes`, like any holder that is not a live sweep. The message names its pid and command when they are readable.
 
 **Constraints from prior phases:**
 - Phase 50 and Phase 53 own the floor rules, Mac claims and outside caches. Keep their behavior.
 - Do not kill or signal a live sweep. Do not delete a target to test the fix; use `--dry-run` or private fixtures.
 
 **Files:**
-- `scripts/lint/sweep.py` — the alert condition and the speed fix.
-- `scripts/lint/test_sweep.py` — tests for both specs.
+- `scripts/lint/sweep.py` — the alert condition.
+- `scripts/lint/test_sweep.py` — its tests.
 
 **Workers:** `1 writer`
-- `impl` owns the code, the tests and the two profiles (fix2 has no durable worker identity).
+- `impl` owns the code and the tests.
 
 **Acceptance gate:**
-- A test proves the alert is silent for a live sweep holder and fires for another holder after the configured minutes.
-- A test proves the speed fix keeps each removed repeat at one call (call count, not wall time).
-- `profile_after.txt` shows a floor-only dry run on natedev under 120 seconds wall time.
+- A test proves an unreadable holder gets the alert after the configured minutes, and a live sweep holder gets none.
 - `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the two changed files.
 
 ### Phase 59 — Idle hana runners hold no swap: the runner home moves from tmpfs to disk  · status: todo
@@ -1745,32 +1719,47 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - The runner home, `_actions` and `_diag` resolve to paths under `/var/lib/hana-ci` in the built unit files.
 - After the rebuild, each idle runner service shows `memory.swap.current` under 64 MiB.
 
-### Phase 60 — A filtered compile run's promise comes from that filter's own compile history  · status: todo
+### Phase 60 — A filtered compile run's promise comes near what that run uses  · status: todo
 **Depends on:** Phase 11 (compile classification, `index_step_evidence`, the replay). Runs next after Phase 11 and before Phase 17 (showrunner ruling 2026-11-04). Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8.
 
 #### Work Order
 
-**Goal:** a filtered compile run gets a promise near what that filter's compile runs use, so Phase 11's rise in over-promises goes back down.
+**Goal:** a filtered compile run gets a promise near what it uses, so Phase 11's rise in over-promises goes back down.
 
 **Measured (Phase 11 replay, 15,053 runs, 2026-10-21 to 2026-11-04):**
 1. Phase 11 missed its bar: under-half 491 → 430, but over-three 2,605 → 2,620.
 2. The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 → 7, over-three 101 → 166.
-3. Cause: a filtered compile run takes its promise from compile history, and the full-run estimate no longer caps it. The package pool and the check/build peaks are larger than one filter's compile runs.
+3. Phase 11 Spec 4 removed the full-run cap on a compile promise. The rise follows that change.
+4. `filtered_peak()` already takes the exact filter's compile history first, then the package's, then the check/build peaks (`scripts/lint/memory_admit.py` :2359–2425; tests `scripts/lint/test_memory_admit.py` :631–651). The order is not the cause. The promise source of the over-three rows is not yet known.
+5. The Phase 11 replay (`phases/11/replay.py` in the run folder) uses the pre-Phase-11 tree as its baseline (:64). It classifies each call from one attempt that later attempts overwrite (:69–95), not through the shipped `combine_compile_counts()`.
 
 **Spec:**
-1. In `filtered_peak` (`scripts/lint/memory_admit.py`), a filtered compile run uses the compile runs of its exact filter set first. Only when that set has no compile history does it use the package's filtered compile runs, then the check/build compile peaks.
-2. Keep Phase 11's rules: compile and no-compile runs never mix; fresh runs keep `fresh_test_peak` and its 1 GiB floor; the full-run estimate does not cap a compile promise.
-3. Rerun the Phase 11 replay (`phases/11/replay.py` in the run folder) before and after, with the same frozen inputs.
-4. Tests in `scripts/lint/test_memory_admit.py`: a filter with its own compile history ignores a larger package pool; a filter with none falls back in the stated order. Each test fakes both memory readings.
-5. Update `docs/as-built/build-memory-admission.md`: the new order and the replay result.
+1. **Rebuild the replay.** Copy `phases/11/replay.py` to `phases/60/replay.py` in the run folder.
+   Classify each call through `build_shape.index_step_evidence` and `combine_compile_counts`. Remove the replay's own classification.
+   Read the frozen inputs at `phases/11/replay_inputs`. Run it at `82f5c90d4` (the Phase 11 checkpoint). These are the before numbers.
+2. **Diagnose.** For each cargo-liner nextest compile row above three times its peak, record its promise source: basis, tier, history count, filter key and the history rows used.
+   Write the table to `phases/60/over_three_rows.md`. Name the cause from that table before any code change.
+3. **Fix at the cause** in `memory_admit.py`. If the table shows no fix that meets the bar without a rise in under-half, send the table and the choices to builds before any code change.
+4. **Tests** in `scripts/lint/test_memory_admit.py`: fixtures built from the diagnosed rows that fail before the fix. Each test fakes both memory readings.
+5. Run the rebuilt replay after the fix with the same inputs.
+6. Update `docs/as-built/build-memory-admission.md`: the cause, the changed promise source and the replay result.
+
+**Constraints from prior phases:**
+- Phase 11: compile and no-compile runs never mix; fresh runs keep `fresh_test_peak` and its 1 GiB floor; keyed rows win over unkeyed rows; 1–4 own runs do not take the pool.
+- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :1955–1976). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
+- Phase 11: a positive count beside an unknown attempt gives `CompiledCrates(known count)`. That count is a lower bound.
+- Keep these tests unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result` and `test_unknown_attempt_between_zero_attempts_keeps_the_count_unknown` (`scripts/lint/test_build_shape.py`); `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it` (`scripts/lint/test_memory_admit.py`).
 
 **Files:**
-- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `docs/as-built/build-memory-admission.md`.
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `docs/as-built/build-memory-admission.md`
 
-**Workers:** `2 writers`
-- `impl` owns `memory_admit.py` and the as-built doc; `test` owns `test_memory_admit.py`.
+**Workers:** `1 writer + 1 tester`
+- `test` rebuilds the replay, writes the diagnosis table and owns `test_memory_admit.py`.
+- `impl` owns `memory_admit.py` and the as-built doc. It starts the fix after the table names the cause.
 
 **Acceptance gate:**
-- The replay brings cargo-liner nextest over-three back to 101 or lower, and its under-half is no worse than Phase 11's 7.
-- The memory admission tests pass; `basedpyright` over the changed files reports `0 errors, 0 warnings, 0 notes`.
+- The rebuilt replay names its baseline `82f5c90d4` and uses the shared classification.
+- The rebuilt replay brings cargo-liner nextest over-three to 101 or lower. Its under-half is no worse than 7.
+- The new fixtures fail on `82f5c90d4` and pass after the fix. The Phase 11 regression tests above pass unchanged.
+- The memory admission and build-shape tests pass; `basedpyright` over the changed files reports `0 errors, 0 warnings, 0 notes`.
 - Change-Review line: none (no behavior the user sees beyond fewer held starts).
