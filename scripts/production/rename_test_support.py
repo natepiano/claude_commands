@@ -720,7 +720,7 @@ class ProductionRenameFixture(StaffTestCase):
     def held_design(self, repository_id: str, checkout: Path, holder: design_roles.Holder) -> design_roles.HeldDesign:
         """A design `holder` holds, with an open designer whose roster entry runs in `checkout`."""
         with mock.patch.dict(os.environ, self.env):
-            design_roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
+            design_roles.register_repository(repository_id, {"fixture-host": str(checkout)})
             placement = design_roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
                                                             "host": "fixture-host", "request_id": repository_id})
             row = designer_fixture(holder, f"old-{repository_id}-astra-designer", self.root / "codex-home")

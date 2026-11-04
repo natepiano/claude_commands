@@ -140,8 +140,7 @@ class DurableRolesTests(unittest.TestCase):
         _ = self.enterContext(patch.object(agent_accounts, "codex_account_home", return_value=
             agent_accounts.CodexHomeHoldingLogin("codex1", self.root / "codex-home", "fixture@example.invalid")))
         design_roles.register_repository("fixture-repo", {"natedev": str(self.repository),
-                                                    "macbook": str(self.root / "mac-checkout")},
-                                  inventory_complete=True)
+                                                    "macbook": str(self.root / "mac-checkout")})
         self.run_a = self.phase("run-a", "instance-a")
         self.run_b = self.phase("run-b", "instance-b")
 
@@ -250,8 +249,7 @@ class DurableRolesTests(unittest.TestCase):
         _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.repository), expected=unit.worktree)
         self.holder_session = os.environ["CODEX_THREAD_ID"]
         design_roles.register_repository("fixture-repo", {"natedev": str(self.repository),
-                                                        "macbook": str(self.root / "mac-checkout")},
-                                        inventory_complete=True)
+                                                        "macbook": str(self.root / "mac-checkout")})
         commands: list[list[str]] = []
 
         def prime(arguments: list[str], *, capture_output: bool, text: bool,
@@ -332,8 +330,15 @@ class DurableRolesTests(unittest.TestCase):
                 self.assertIn(str(path), str(refused.exception))
                 self.assertEqual(path.read_text(), damaged)
 
-    def test_open_retry_and_normalized_document_alias_keep_one_pair_and_thread(self) -> None:
+    def test_old_repository_record_opens_and_retries_keep_one_pair_and_thread(self) -> None:
+        store = self.root / "ownership/repositories.json"
+        record = {"repository_id": "fixture-repo", "checkouts": {"natedev": str(self.repository)}}
+        _ = store.write_text(json.dumps({"fixture-repo": record}))
         design = self.open_designer()
+        for complete in (False, True):
+            _ = store.write_text(json.dumps({"fixture-repo": {**record, "inventory_complete": complete}}))
+            self.assertEqual(self.open_designer(), design)
+        self.assertIn('"inventory_complete": true', store.read_text())
         retried = self.open_designer(document=str(self.repository / "sub/../design.md"), request_id="retry")
         self.assertEqual(retried.placement.design_id, design.placement.design_id)
         self.assertEqual(self.launches, [("designer", "9309c903-5894-501a-8aa7-f33ea912e074")])
@@ -500,7 +505,7 @@ class DurableRolesTests(unittest.TestCase):
                         self.assertEqual(str(refused.exception),
                                          "repository fixture-repo is not registered; run design_roles.py register "
                                          + f"--repository fixture-repo --host {host or '<host>'} "
-                                         + "--checkout <absolute path> --inventory-complete")
+                                         + "--checkout <absolute path>")
         self.assertEqual(self.launches, [])
 
     def test_malformed_repository_record_keeps_the_object_refusal(self) -> None:
