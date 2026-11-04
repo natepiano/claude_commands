@@ -170,6 +170,7 @@ class RemoteAgentTests(ControlFixture):
         process.mkdir(parents=True)
         fields = ["S", "1", "321", *(["0"] * 16), "999"]
         _ = (process / "stat").write_text("321 (new cargo) " + " ".join(fields))
+        _ = (process / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
         environment = process / "environ"
         _ = environment.write_bytes(b"BUILD_TARGET_RUN_TOKEN=new-run\0")
         read_bytes = Path.read_bytes
@@ -614,6 +615,7 @@ class RetainedMarkerTests(ControlFixture):
         _ = boot_file.write_text(boot + "\n")
         fields = ["S", "1", "321", *(["0"] * 16), "123"]
         _ = (process / "stat").write_text("321 (new cargo) " + " ".join(fields))
+        _ = (process / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
         _ = (process / "cmdline").write_bytes(b"cargo\0check\0")
         _ = (process / "environ").write_bytes(b"BUILD_TARGET_RUN_TOKEN=new-run\0")
         (process / "cwd").symlink_to(mirror)
@@ -661,6 +663,7 @@ class RetainedMarkerTests(ControlFixture):
         self.assertEqual(selected, (321,))
         self.assertTrue(marker.exists())
         (proc / "321/stat").unlink()
+        (proc / "321/status").unlink()
         (proc / "321/environ").unlink()
         (proc / "321/cmdline").unlink()
         (proc / "321/cwd").unlink()

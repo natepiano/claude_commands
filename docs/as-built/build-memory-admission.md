@@ -6,6 +6,12 @@ Every build on natedev, CI's and the sessions', is admitted so that it fits in m
 
 ## How it works
 
+Linux target steps set `BUILDLOG_CALLER=verify-linux`.
+`memory_gate.sh` grants these steps without a local admission socket or a natedev hold check.
+Target slots and the target build budget provide admission there.
+AWS admission still requires the spending guard.
+Other Linux callers keep the local admission and hold checks.
+
 ### Temporary build folders
 
 `scripts.lib.build_folders.create_build_folder(request) -> Path` allocates temporary build folders.
