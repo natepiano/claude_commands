@@ -477,55 +477,30 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 **Ruled out:** A `build-why` alias; separate `head_since` state; live configuration reads for recorded evidence.
 
 ### Phase 10c — The admission settings live in config/build_admission.conf, and the code keeps no copy of them  · status: done
-**Depends on:** Phase 10 (scripts/lib/conf.py reads in memory_admit.py); Phase 10b (same memory_admit.py and build_queue files)
-**Config reader (builds showrunner, 2026-11-02):** devtools Phase 4r replaces `conf.text`, `number`, `whole`, `words` and `values` with `conf.read(file) -> ConfigRead`. If 4r is on main when this phase starts, use `conf.read`.
 
-**Why.** Showrunner request, 2026-11-02 (builds): config phase 2 gets a place in this plan. The `[memory]` admission keys sit in `config/lint.conf`, and `scripts/lint/memory_admit.py` keeps copies of their values (`FALLBACK = 12 * GIB` for `program_first_peak_gib.cargo`, `FALLBACK_BUILD_BUDGET_BYTES = 21 * GIB`, `FALLBACK_TEST_PHASE_MARGIN = 1.2`, `DEFAULT_MEMORY_CONFIG`). User rule 2026-10-31: tunables live in config, read at use; no hard-coded copy. The External note in Phase 10 holds this move until now.
+#### As-built
 
-#### Work Order
-
-**Goal:** The admission settings live in `config/build_admission.conf`, the code keeps no copy of them, and an unusable key stops grants but never a release or cleanup.
-
-**Spec:**
-1. Move every `[memory]` key from `config/lint.conf` to `config/build_admission.conf`, with its comments. Add `program_first_peak_gib.cargo=12`. Read the file through `scripts/lib/conf.py`, the approved reader on main.
-2. Remove the value copies from `memory_admit.py`: `FALLBACK` as a config value, `FALLBACK_BUILD_BUDGET_BYTES`, `FALLBACK_TEST_PHASE_MARGIN` and the default policy values. A missing or invalid key refuses with one line that names the file and the key: the service holds the queue and says why; a client exits with its checker-failure status. No silent default.
-3. Measured constants that are not tunables stay in code with their evidence comments (`RELEASE_HEADROOM`, `ANON_SHARE`, `FILTERED_FLOOR`, `HISTORY_DAYS`).
-4. The `ConfigFallback` warning path goes with the fallbacks. The views and `explain` show a config refusal in its place.
-5. Tests read a fixture `build_admission.conf` through `CONF_DIR`; no test depends on the live file. The fixture pins test values, so a tuning change in the live file does not change a test.
-6. Update `docs/as-built/build-memory-admission.md` and every doc that names `config/lint.conf` `[memory]`.
-
-**Constraints from the Phase 10 architect review (2026-11-03):**
-- Correct Work Order item 2 against the code now on the branch: `program_first_peak_gib.cargo=12` already exists in the config, and `FALLBACK_BUILD_BUDGET_BYTES`, `FALLBACK_TEST_PHASE_MARGIN` and `DEFAULT_MEMORY_CONFIG` are gone. At phase start, list the policy defaults that remain in code, their reader functions, the protocol diagnostics that carry config fallbacks, the config fixtures and their consumers. Remove each default from that list.
-- Config result: a named result type, usable or unusable. `conf.value_origin()` tells a live value from a recovered value. A recovered value (the repository file or the committed file, through `conf.read`) is usable and prints its warning once. An unavailable value is unusable: the service grants nothing while a key it needs is unusable, and it says why in the view.
-- Release and cleanup never need config: `persist()` in `admission_service.py` and `QueuePlace.finish()` in `queue_place.py` read config today. A config refusal must not stop a release, a reservation end or a scope cleanup.
-- A test edits a key to a bad value, sees grants stop with the refusal line, then edits it back and sees the next pass grant again. No grant uses the rejected value.
-- Use `conf.read` (devtools 4r is on builds at 92ce5f38a). One `ConfigRead` per pass.
-
-**Constraints from the Phase 10b and 11 architect review (2026-11-03):**
-- Items 2 and 4 and the acceptance gate mean an unavailable key: a key that is missing or invalid after recovery. A recovered value is usable and warns once. Tell the two apart with `ConfigRead.origin()` (`scripts/lib/conf.py:138`); `conf.value_origin()` does not exist.
-- Startup and recovery: `AdmissionServer.__init__` (`admission_service.py:482`) reads config before it listens, and queries need a completed pass. The service listens with unusable config, answers views and releases, grants nothing, shows the refusal in the view, and reads the config again on each pass. Tests: start with an unusable key, see the refusal and a working cleanup, repair the key, see the next pass grant.
-- Keep the Phase 10b and 11 guarantees: a run exit and a service restart while config is unusable keep the run place, the queue order, each step's arrival time, and one reservation per replay. Keep the tests that read memory pressure through the supplied policy, and the recorded-evidence tests.
-- drain-check (`admission_service.py` `drain_check`) counts each `verify.sh`, `invoke.sh` and `merge_gate.py` process by name. After a cut-over, new-code callers that wait for the socket keep it undrained for good (seen 2026-11-03). Count only callers that run admission code older than the service: compare the script a caller runs with the code the service runs. Test: a new-code caller that waits for the socket does not stop a drain.
-- First item: `/build:queue` lists no running row for a merge-gate reservation, so three admitted gates looked like 18.9 GiB taken by nothing (2026-11-03 11:21). Every live reservation shows as a running row with its owner and memory. Test: a merge-gate reservation shows as a running row. Done in fd09c7d44 (Phase 10b follow-up); keep its tests.
-- `admission_service.py` `main()` must leave argparse defaults to argparse: a namespace class attribute hides the default (hotfix 955d7949b). Keep `test_serve_without_state_dir_uses_the_buildlog_admission_folder`.
+- `config/build_admission.conf` holds every admission key (the old `config/lint.conf` `[memory]` section, with `program_first_peak_gib.cargo=12`). `memory_admit.py` keeps no default copy of a value. Measured constants (`RELEASE_HEADROOM`, `ANON_SHARE`, `FILTERED_FLOOR`, `HISTORY_DAYS`) stay in code.
+- Each pass makes one `conf.read` and gets a usable or an unusable `MemoryConfig`. A recovered value is usable and warns once per process at the client boundary (`ConfigurationDiagnostic`). An unusable key stops grants with one refusal line that names the file, the key and the value.
+- Release and cleanup need no config: each grant saves its cleanup timing, and the service serves releases and cleanup while the config is unusable. Old ledger grants without cleanup timing restore after an upgrade.
+- The service listens with unusable config, answers views with the refusal, and watches the nearest existing config folder through `scripts/lib/inotify.py`; it re-arms the watch on each event and retries a failed watch.
+- Each request carries one hash of the loaded admission code (`scripts/build_queue/admission_code.py`), so `drain_check` counts only callers that run older code. Dead and reused caller records are pruned.
+- `ExplainReply` carries `ConfigurationDiagnostic` diagnostics; `ConfigFallback` is gone, with no alias.
+- Tests read fixture settings through `CONF_DIR`; no test depends on the live file.
 
 **Files:**
-- `config/build_admission.conf` — every `[memory]` admission key, with comments
-- `config/lint.conf` — the `[memory]` section goes
-- `scripts/lint/memory_admit.py` — no config value copies; one `ConfigRead` per pass; usable/unusable result
-- `scripts/build_queue/admission_service.py` — listens with unusable config, grants nothing, says why; release and cleanup need no config; drain-check counts only old-code callers
-- `scripts/build_queue/admission_client.py`, `scripts/build_queue/queue_place.py`, `scripts/build_queue/queue_view.py` — config consumers and the refusal line in the view
-- `scripts/build_queue/admission_protocol.py` — `ExplainReply` carries `ConfigurationDiagnostic` diagnostics instead of `ConfigFallback`; no alias
-- `scripts/mac_test/loopback_proof.py` — reads `cargo_first_peak_bytes()` instead of the removed `FALLBACK` copy
-- `docs/as-built/build-memory-admission.md` — the settings now live in `config/build_admission.conf`; update every other doc that names the `[memory]` section too
-- `scripts/build_queue/` — tests use a fixture config through `CONF_DIR`
-- `scripts/lint/test_memory_admit.py` — tests use a fixture config through `CONF_DIR`
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `config/build_admission.conf`, `config/lint.conf`, `memory_admit.py`, the service and client consumers, `queue_place.py`, the docs; hub: `scripts/lint/memory_admit.py`
-- `test` — the config fixtures through `CONF_DIR`, the usable and unusable config tests, the protocol diagnostic tests and the release and cleanup regressions
+- `config/build_admission.conf`, `config/lint.conf` — the admission keys and their move.
+- `scripts/lint/memory_admit.py` — `MemoryConfig`, one read per pass, the refusal line.
+- `scripts/build_queue/admission_service.py`, `admission_client.py`, `admission_protocol.py`, `admission_code.py`, `queue_place.py`, `queue_view.py` — consumers, the config watch, the code hash, diagnostics and the refusal in the view.
+- `scripts/lib/inotify.py` — the shared folder watch.
+- `scripts/mac_test/loopback_proof.py` — reads `cargo_first_peak_bytes()`.
+- `scripts/lint/fixtures/build_admission.conf` and the build_queue, lint, hooks and production admission tests — fixture settings through `CONF_DIR`.
+- `docs/as-built/build-memory-admission.md` — the settings file and the refusal.
 
-**Acceptance.** `config/lint.conf` has no `[memory]` section; `memory_admit.py` holds no copy of a config value; a test with the key removed sees the refusal line; a release and a scope cleanup succeed while the config is unusable. Change-Review: open the Build queue pane; it reads as before; `config/build_admission.conf` holds the admission keys.
+**Gotchas:** A step loads the admission code without an extra Python start (gate fix). `admission_service.py` `main()` leaves argparse defaults to argparse; a namespace class attribute hides the default.
+
+**Ruled out:** Optional profile fields for a missing key; an alias for `ConfigFallback`; config reads in release or cleanup.
 
 ### Phase 10d — hana CI builds wait in the build admission queue  · status: todo
 **Depends on:** Phase 10 (the admission client); Phase 10c (the CI admission reads build_admission.conf)
@@ -574,7 +549,13 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 2. F044: move the `struct` import in `admission_service.py` `_record_caller_version` to the module imports.
 
 ### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
-**Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The showrunner asks first for a naming map of every build folder on every host, with the user's naming requirements and the gaps. The user approves the map; 10f builds to it. The Work Order follows the approved map.
+**Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The naming map is a design call that the builds showrunner settles. The showrunner approved it on 2026-11-03 (map and rulings: the 10f design in the unit's phase folder), with one change: a remote mirror ends when its copies.py remote lease from verify P35 ends.
+
+**Scope (showrunner limits, 2026-11-03).** 10f does not change the callers that verify P18 moves to copies.py (merge_gate, bump_gate, fast_track, waiting, the style runs, rust_release). Its sweep never touches copies.py standing checkouts. Two checkpoints:
+1. A: `build_folder_path` is the one name rule; `build_folders.py run --owner O --name N -- CMD` makes a folder, runs CMD in it and deletes it when CMD and its descendants end; `scratch.target` uses the name rule; the scratch guard refuses a clone under a unit or session tmp root and names the command.
+2. B: `build_folders.py sweep` removes a marked folder only when its owner is gone (pid, start time, boot id; a read error keeps it); `tmp_sweep` calls it; one writer makes each removal record below, also for `linux_runner` floor and trim.
+
+**Progress (2026-11-04):** checkpoint A is on main, with the test fixes for a `CONF_DIR` that lacks `build_folders.conf` (`build_folders._settings` then reads the repository file) and config read at use in `tmp_sweep`, `style_sync` and `folder_audit`. Checkpoint B is open.
 
 **Removal record (aws-unit ask via the builds showrunner, 2026-11-03):** each folder removal writes one record with: time, target, host, repository key, slot, folder path, bytes freed, free GiB before and after, and the reason (`floor` or `trim`). Source today: `scripts/mac_test/linux_runner.py:601-658` removes or trims a slot build folder after each step and prints only `mac_cleanup=0|1|kept` (`offload.py:765` parses it); no record names the folder or the bytes freed. aws-unit's weekly report (cold steps after a floor removal, time lost) reads this record.
 
@@ -588,6 +569,32 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 4. `build_targets.py` eligibility, slot reserve and the spending-guard exclusion move behind the queue decision.
 5. Owners: queue-unit switches every caller; verify-unit owns `verify.sh` routing and offload today, aws-unit owns target selection; the edits are agreed with both at phase start.
 6. Runs beside 10e and 10f where the file sets are disjoint.
+
+### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
+
+#### As-built
+
+- The snapshot record parser in `scripts/lint/memory_admit.py` ignores unknown fields and fills a missing field from its dataclass default, at every nesting level. A missing field with no default and a wrong tag are still refused. A step that waits across a service restart (older client code) reads the new records.
+- The four single-field shims are gone. The `fallbacks` to `diagnostics` conversion stays because it renames a field.
+
+**Files:** `scripts/lint/memory_admit.py`; `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_admission_service.py`, `test_build_queue.py`, `test_queue_view.py` — added, removed and missing field regressions.
+
+**Ruled out:** A version field on each record; per-field shims.
+
+### Phase 10i — A local cargo step takes its token first, then asks for memory once  · status: todo
+**Why.** Builds showrunner, 2026-11-03: fastest's clippy was admitted at 20:11 EST, gave its grant back to wait 24 min for the cargo token, then waited 5 min for memory again. Cause: `verify.sh` gives back the memory grant before a busy-token wait (the `TokenWaiting` end), then asks again. Showrunner ruling: queue owns the whole change as one phase.
+
+**Outline:**
+1. A local cargo step takes its board token first. Then it makes one memory request and holds both until it ends.
+2. A step with no token makes no memory request, so no idle grant blocks the token holder.
+3. Every local cargo path uses the same order, the steps after Mac routing included. Nested work reuses the held token.
+4. Cancel, failed admission and Mac departure give the token back.
+5. Files: `scripts/direct/verify.sh` 2833-2850, `scripts/lint/memory_gate.sh`, `test_verify_token_wait.py`, `test_verify_token_reservation.py`, `test_verify_token_memory_history.py`. verify-unit holds its edits there until queue merges.
+6. Evidence and proposed tests: `token_wait_findings.md` in the 10f session folder.
+7. Separate defect, sent to verify-unit: the call's own cargo token stayed held for 1 h after its sweep. verify Phase 36 fixes it; 10i builds on Phase 36 after it lands on builds.
+8. Design: `design.md` in the 10i session folder, with the director rulings at its end. Showrunner approved it 2026-11-03.
+9. **Removal, temporary path (showrunner condition, 2026-11-03).** The service keeps serving main's old two-pass shell only until 10i reaches main. **Trigger:** the first queue checkpoint after 10i is on origin/main. That checkpoint deletes `admission_client.token_wait` and the `token-wait` command, `TokenWaitRequest` and its codec and fixture row, the service `TokenWaiting` end and handler, `AdmitRequest.token_back_at` and the token-gap writer, and their tests. After it, one way remains.
+10. **True wait cause (cargo-liner defect, 2026-11-03).** `token_wait_note` in `scripts/direct/verify.sh` reads `locks/cargo.d/holder` with `read -r ... || holder=""`. board.sh writes that file with no newline, so `read` fails and the holder is cleared; every token wait then says "it came free just now". Run 20261103T220514-274283-ecf4 (handler-unit) printed that for 35 min while its own call held the token from 22:12:06 to 22:50:14. Read the whole file, name the holder agent and pid, and say "this call holds it" when `holder_pid` is the call. A memory wait prints the memory line, never a token line. Test: a holder file with no newline names its holder.
 
 ### Phase 11 — Every later step of one verify.sh run keeps the queue place of the run's first step  · status: done
 
