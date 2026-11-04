@@ -771,7 +771,7 @@
         },
         "Definition": {
           "SsmActionDefinition": {
-            "ActionSubType": "STOP_EC2_INSTANCES",
+            "Subtype": "STOP_EC2_INSTANCES",
             "Region": {
               "Ref": "AWS::Region"
             },
