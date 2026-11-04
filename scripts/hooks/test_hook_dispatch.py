@@ -21,7 +21,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 HOOKS = Path(__file__).resolve().parent
 DISPATCH = HOOKS / "hook_dispatch.py"
 ROOT = HOOKS.parents[1]
-# The registrations before dispatch was introduced: order, matcher, timeout.
+# The synchronous hooks: order, matcher, timeout.
 LEGACY: dict[str, tuple[tuple[str, str, float], ...]] = {
     "pre_tool_use": (
         ("pre-tool-use-heredoc-guard.py", "Bash", 600),
@@ -38,7 +38,6 @@ LEGACY: dict[str, tuple[tuple[str, str, float], ...]] = {
         ("post-tool-use-banned-words.py", "", 600),
     ),
     "stop": (
-        ("stop-direct-continue.py", "", 600),
         ("stop-conversation-pause.py", "", 600),
         ("stop-assistant-prose-banned-words.py", "", 600),
         ("herdr_tab_title.py", "", 600),
@@ -283,7 +282,7 @@ class RealHookEquivalenceTests(IsolatedHookTests):
                 else:
                     self.assertEqual(outcome.output, {})
 
-    def test_stop_direct_continue_blocks_active_run_near_compaction(self) -> None:
+    def test_dispatcher_allows_stop_during_an_active_run_near_compaction(self) -> None:
         session_id = "dispatcher-active-director"
         run = self.root / "unit-run"
         run.mkdir()
@@ -307,8 +306,7 @@ class RealHookEquivalenceTests(IsolatedHookTests):
             "session_id": session_id, "transcript_path": str(transcript),
             "last_assistant_message": "The checks passed.",
         })
-        self.assertEqual(outcome.output["decision"], "block")
-        self.assertIn("/unit:direct run active, 170,000", str(outcome.output["reason"]))
+        self.assertEqual(outcome, EventOutcome(0, {}, ""))
 
     def test_stop_matches_separate_hooks_and_logs_last_assistant_prose(self) -> None:
         transcript = self.root / "transcript.jsonl"
@@ -599,6 +597,18 @@ class SettingsRegistrationTests(IsolatedHookTests):
                             self.assertEqual(group.get("matcher", ""), matcher)
                             dispatchers.append(hook)
                 self.assertEqual(len(dispatchers), 1)
+
+    def test_direct_continuation_has_one_separate_async_rewake_entry(self) -> None:
+        settings = object_fields(cast(object, json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))))
+        registrations = object_fields(settings["hooks"])
+        hooks = [object_fields(hook) for group in cast(list[object], registrations["Stop"])
+                 for hook in cast(list[object], object_fields(group)["hooks"])]
+        continuation = [hook for hook in hooks if "stop-direct-continue.py" in str(hook.get("command", ""))]
+        self.assertEqual(continuation, [{
+            "type": "command",
+            "command": '\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-direct-continue.py\"',
+            "asyncRewake": True, "rewakeSummary": "Continuing the unit run", "timeout": 60,
+        }])
 
 
 class DispatcherRepairTests(IsolatedHookTests):
