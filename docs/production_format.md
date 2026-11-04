@@ -12,8 +12,7 @@ must not drift from it:
 - `/showrunner:produce` — runs the production from the showrunner session.
 - `/showrunner:dailies` — reports the production to the executive producer.
 - `/showrunner:report_interval` — changes how often the scheduled updates come.
-- `/showrunner:accounts` — shows every Claude and Codex account in one table; sets up a
-  Claude folder or swaps the unit account.
+- `/showrunner:accounts` — opens the accounts board.
 - `/unit:direct` — a unit's run; it applies <ProductionUnit/> below.
 
 ---

@@ -42,7 +42,6 @@ def wait_for_confirmation(session_ids: frozenset[str], timeout: float) -> Regist
         time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
-
 def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[str, Path]:
     member = row
     while True:
@@ -153,6 +152,15 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
     print(f"{row.name}: restarted")
 
 
+def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
+    try:
+        panes = client.panes()
+        return [(row, pane["pane_id"]) for row in rows for pane in panes if pane["session_id"] == row.current_session]
+    except (OSError, ValueError, herdr.HerdrFailure) as error:
+        print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+        return []
+
+
 def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = ()) -> int:
     import remote
 
@@ -160,17 +168,21 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     client = herdr.Herdr(herdr.shared_session())
     selected: list[staff.StaffRow] = []
     if stop_all:
+        live = {session["sessionId"]: (session["name"] or session["sessionId"]) +
+                (f" in {folder}" if (folder := session.get("cwd")) else "") for session in sessions.running_sessions()}
         try:
             codex_live = herdr.running_codex_threads(thread_host=lambda _arguments: False)
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             print(f"restart: Codex liveness anomaly: {error}", file=sys.stderr)
             codex_live = set[str]()
+        for identity in codex_live:
+            _ = live.setdefault(identity, identity)
+        for identity in sorted(live.keys() - {row.current_session for row in record.rows}):
+            print(f"{' '.join(live[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
         for row in record.rows:
             try:
                 machine, _folder = row_folder(row, record)
-                if machine == remote.local_machine() and (isinstance(
-                        sessions.session_liveness(str(row.current_session)), sessions.LiveSessionProcess)
-                        or row.current_session in codex_live):
+                if machine == remote.local_machine() and row.current_session in live:
                     selected.append(row)
             except (OSError, ValueError) as error:
                 _anomaly(row, error)
@@ -188,8 +200,14 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         positions = {tab.get("row_id"): f"workspace {space['name']}, tab {index} ({tab['name']})"
                      for space in herdr.saved_layout(client.session)["workspaces"]
                      for index, tab in enumerate(space["tabs"], 1) if tab.get("row_id")}
+        for row, pane in row_panes(selected, client):
+            try:
+                workspace, index, tab = client.pane_tab(pane)
+                positions[str(row.id)] = f"workspace {workspace}, tab {index} ({tab['name']})"
+            except (OSError, ValueError, herdr.HerdrFailure) as error:
+                _anomaly(row, error)
         for row in selected:
-            print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no saved tab')}")
+            print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}")
         return 0
     errors = (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError)
     pending: list[str] = []
@@ -207,11 +225,11 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         if stop_all:
             try:
                 client.save_layout()
-                panes = client.panes()
-                for row in locked:
-                    for pane in panes:
-                        if pane["session_id"] == row.current_session:
-                            client.remember_row_tab(str(row.id), pane["pane_id"])
+                for row, pane in row_panes(locked, client):
+                    try:
+                        client.remember_row_tab(str(row.id), pane)
+                    except errors as error:
+                        _anomaly(row, error)
             except errors as error:
                 print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
             for row in locked:
