@@ -18,12 +18,14 @@ from unittest import mock
 
 import rust_release
 if TYPE_CHECKING:
-    from ..lib import scratch
+    from ..lib import cargo_output, scratch
+    from ..lib.cargo_output_test_support import fake_cargo_output_roots
     from ..notify import review
     from ..notify.push_texts import RenderedPush, render, user_send_argv
     from ..notify.user_action import ActionRequired
 else:
-    from scripts.lib import scratch
+    from scripts.lib import cargo_output, scratch
+    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
     import review
     from push_texts import RenderedPush, render, user_send_argv
     from user_action import ActionRequired
@@ -90,6 +92,7 @@ class RustReleaseTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         self.scratch = Path(temporary) / "scratch"
@@ -110,6 +113,52 @@ class RustReleaseTests(unittest.TestCase):
         _ = subprocess.run(["git", "-C", str(source), "commit", "-qm", "trial source"], check=True, capture_output=True)
         _ = self.enterContext(mock.patch.object(rust_release, "HANA", source))
 
+
+    def test_free_space_checks_each_output_filesystem_once(self) -> None:
+        checkout = self.scratch / "checkout"
+        checkout.mkdir()
+        external = self.scratch / "external-drive"
+        external.mkdir()
+        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", external)
+        real_stat = Path.stat
+        probes: list[Path] = []
+        def device_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            value = real_stat(path, follow_symlinks=follow_symlinks)
+            fields = list(value)
+            if path == external:
+                fields[2] = value.st_dev + 1
+            return os.stat_result(fields)
+        def space(path: Path) -> os.statvfs_result:
+            probes.append(path)
+            return os.statvfs_result((1, 1, 0, 0, 30 * rust_release.GIB if path == external else 90 * rust_release.GIB,
+                                     0, 0, 0, 0, 0))
+        with (mock.patch.object(rust_release, "HANA", checkout),
+              mock.patch.object(Path, "home", return_value=self.scratch),
+              mock.patch.object(Path, "stat", device_stat),
+              mock.patch.object(os, "statvfs", side_effect=space),
+              mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots)):
+            self.assertEqual(rust_release.free_space_gib(), 30)
+        self.assertEqual(len(probes), 2)
+        self.assertIn(external, probes)
+
+    def test_trial_sizes_count_external_output_once_and_keep_mend_separate(self) -> None:
+        clone = self.scratch / "trial"
+        (clone / "target" / "debug").mkdir(parents=True)
+        external = self.scratch / "external"
+        external.mkdir()
+        (clone / "mend-target").mkdir()
+        _ = (clone / "target/debug/artifact").write_bytes(b"a" * 5)
+        _ = (external / "intermediate").write_bytes(b"b" * 7)
+        _ = (clone / "mend-target/output").write_bytes(b"c" * 3)
+        roots = cargo_output.CargoOutputRoots(clone, clone / "target", external)
+        saved = (scratch.SavedCargoOutput(roots, ()),)
+        with mock.patch.object(scratch, "save_cargo_outputs", return_value=saved):
+            artifact, mend = rust_release.trial_output_gib(clone)
+        self.assertEqual(artifact, 12 / rust_release.GIB)
+        self.assertEqual(mend, 3 / rust_release.GIB)
+        contained = cargo_output.CargoOutputRoots(clone, clone / "target", clone / "target/debug")
+        with mock.patch.object(scratch, "save_cargo_outputs", return_value=(scratch.SavedCargoOutput(contained, ()),)):
+            self.assertEqual(rust_release.trial_output_gib(clone)[0], 5 / rust_release.GIB)
 
     def invoke(
         self,
@@ -351,6 +400,7 @@ class RustReleaseTests(unittest.TestCase):
         mend = runner.calls[-1]
         self.assertEqual("1", mend[2]["RUSTC_BOOTSTRAP"])
         self.assertEqual(str(clone / "mend-target"), mend[2]["CARGO_TARGET_DIR"])
+        self.assertEqual(str(clone / "mend-target/intermediates"), mend[2]["CARGO_BUILD_BUILD_DIR"])
         self.assertEqual(1, len(texts))
         self.assertIn("Errors: 1; new warnings: 2", texts[0][1])
         self.assertIn("Hana still uses Rust 1.99.0", texts[0][1])

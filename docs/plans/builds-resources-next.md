@@ -15,20 +15,23 @@
   - Revealed by: Phase 25 review (Phase 4 Spec 6; builds showrunner 2026-10-30: next, dated on or after 2026-12-05)
 
 - [ ] **Measure EASY backfill against the deployed Rule A queue policy**
-  - Start after Phase 31 has run on main for a day; bound the cohort at any later queue-priority or head-policy change.
-  - Compare EASY with the deployed ordered walk, including Rule A and recovery spacing, and report additional wait savings and head delay using the same admission function.
-  - Revealed by: Phase 30; baseline corrected after Phase 31's Work Order.
+  - Start after both Phase 39 checkpoints reach main and one day of observations exists.
+  - Bound the cohort at changes to queue priority, head policy, estimation, running charge, budget, or headroom settings.
+  - Compare EASY with the deployed ordered walk, including Rule A and recovery spacing.
+  - Use the same admission function and cohort settings for both policies.
+  - Report additional wait savings and head delay.
+  - Revealed by: Phase 30; baseline corrected after Phase 31's Work Order and Phase 39.
 
 - [ ] **Make the build_targets.py call from verify.sh cheap: it costs 199 ms of CPU on every step**
   - Why needed: verify measured `build_targets.py` at 199 ms of CPU each time `verify.sh` starts it, on every step; it is the most costly helper.
   - Completion condition: the call uses fewer imports or a lighter entry path; the change reports before and after CPU figures for the same call, and the build_targets and verify tests pass.
   - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
 
-- [ ] **Complete Cargo-folder attribution for trim matching and Phase 17**
-  - Target: report-unit's existing step recorder and index, `scripts/lint/sweep.py`, and their tests
-  - Why needed: step records already carry repository identity and an environment-selected target directory (`record.py` :822; the index's `target_dir` and `target_folder`), but do not durably identify every actual artifact and intermediate build folder
-  - Completion condition: extend the existing record and index contract to cover both actual folders, including Cargo configuration and default selection; keep explicit unknowns for missing evidence; match trims through those recorded folders after copies disappear; Phase 17 reads this same attribution without a second mapping
-  - Revealed by: Phase 4 (builds showrunner 2026-10-30: next; waits on report-unit 4f); amended after the shared-folder reversal (Phase 31 review); narrowed after the Phase 37 architect review
+- [ ] **Use recorded Cargo output roots for trim matching and Phase 17**
+  - Target: `scripts/lint/sweep.py`, Phase 11's shared step-evidence reader in `scripts/lint/build_shape.py`, and their tests
+  - Why needed: Phase 51 records both Cargo output roots for each step (`record.py` :935, `index.py` :118). Trim attribution still uses saved workspace mappings instead of each step's recorded roots (`sweep.py` :3796, :3876).
+  - Completion condition: match trims through recorded output roots after copies disappear or mappings change. Expose both roots through Phase 11's shared reader for Phase 17. Keep named unknown states for missing historical evidence. Add no second mapping or recorder.
+  - Revealed by: Phase 4 (builds showrunner 2026-10-30: next); narrowed after the Phase 37 architect review and again after the Phase 51 and 53 architect review
 
 - [ ] **The working-set summary tells a Node script apart from a Node task or one-line program**
   - Target: `scripts/build_targets/working_set.py`, `scripts/build_targets/test_working_set.py`

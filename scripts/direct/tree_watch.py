@@ -20,6 +20,9 @@ import sys
 import time
 from typing import NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
+
 
 class Dependency(TypedDict, total=False):
     path: str | None
@@ -121,10 +124,8 @@ class TreeInputs:
         )
         self.workspace_root: bytes = b""
         self.watch_entries: dict[str, str] = {}
-        self.test_target_directory: str = ""
         try:
             meta: Metadata = cast(Metadata, json.loads(metadata)) if metadata.strip() else {"workspace_root": "", "packages": [], "workspace_members": []}
-            self.test_target_directory = meta.get("target_directory", "")
             workspace_root = meta.get("workspace_root", "")
             if workspace_root:
                 self.workspace_root = os.fsencode(os.path.realpath(workspace_root))
@@ -234,9 +235,13 @@ class TreeInputs:
             # Cargo resolves config, environment and workspace target paths.
             # An unknown destination proves no fresh build.
             output = os.environ.get("VERIFY_TEST_BUILD_INPUTS_FILE", "")
-            if output and os.path.isabs(self.test_target_directory):
-                build_key.update(b"\0target=" + os.fsencode(self.test_target_directory))
-                _ = Path(output).write_text(build_key.hexdigest() + "\n" + self.test_target_directory + "\n")
+            if output and self.workspace_root:
+                roots = read_cargo_output_roots(Path(os.fsdecode(self.workspace_root)))
+                if isinstance(roots, CargoOutputRoots):
+                    build_key.update(b"\0target=" + os.fsencode(roots.target_directory))
+                    build_key.update(b"\0build=" + os.fsencode(roots.build_directory))
+                    _ = Path(output).write_text("\n".join((build_key.hexdigest(),
+                        str(roots.target_directory), str(roots.build_directory), "")))
         return key.hexdigest(), watch_key
 
 

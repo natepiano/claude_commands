@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import json
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -9,18 +11,58 @@ import unittest
 from unittest import mock
 from typing import final
 
+from scripts.direct import tree_watch
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
+
 from scripts.direct.tree_watch_test_support import (
     EventWatcher,
     TreeWatchFixture,
     WATCH_DEADLINE,
     write_workspace as write_workspace,
 )
-from scripts.direct import tree_watch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class TreeWatchTests(TreeWatchFixture):
+    def test_nested_workspace_build_identity_uses_its_own_output_roots(self) -> None:
+        workspace = self.nested_workspace()
+        output = self.root / "build-inputs"
+        outer = CargoOutputRoots(self.root, self.root / "target", self.root / "build")
+        nested = CargoOutputRoots(workspace, workspace / "target", workspace / "build")
+
+        def resolve(checkout: Path) -> CargoOutputRoots:
+            return nested if checkout == workspace else outer
+
+        with mock.patch.dict(os.environ, {"VERIFY_COMPUTE_TEST_BUILD": "1",
+                                         "VERIFY_TEST_BUILD_INPUTS_FILE": str(output)}), \
+                mock.patch.object(tree_watch, "read_cargo_output_roots", side_effect=resolve):
+            _ = tree_watch.TreeInputs(self.key_arguments(), json.dumps(self.metadata)).keys()
+        self.assertEqual(output.read_text().splitlines()[1:],
+                         [str(nested.target_directory), str(nested.build_directory)])
+
+    def test_build_identity_saves_both_resolved_output_roots(self) -> None:
+        output = self.root / "build-inputs"
+        target = self.root / "target"
+        build = self.root / "intermediates"
+        with mock.patch.dict(os.environ, {"VERIFY_COMPUTE_TEST_BUILD": "1",
+                                         "VERIFY_TEST_BUILD_INPUTS_FILE": str(output)}):
+            def calculate(roots: CargoOutputRoots | CargoOutputUnavailable) -> list[str]:
+                with mock.patch.object(tree_watch, "read_cargo_output_roots", return_value=roots):
+                    _ = tree_watch.TreeInputs(self.key_arguments(), json.dumps(self.metadata)).keys()
+                return output.read_text().splitlines()
+
+            split = calculate(CargoOutputRoots(self.root, target, build))
+            self.assertEqual(split[1:], [str(target), str(build)])
+            same = calculate(CargoOutputRoots(self.root, target, target))
+            self.assertEqual(same[1:], [str(target), str(target)])
+            self.assertNotEqual(split[0], same[0])
+            output.unlink()
+            with mock.patch.object(tree_watch, "read_cargo_output_roots",
+                                   return_value=CargoOutputUnavailable("metadata failed")):
+                _ = tree_watch.TreeInputs(self.key_arguments(), json.dumps(self.metadata)).keys()
+            self.assertFalse(output.exists())
+
     def test_lint_versions_reuse_the_call_reading_and_keep_failed_reads_disabled(self) -> None:
         saved = self.root / "lint-versions"
         formatter = self.root / "rustfmt-version"

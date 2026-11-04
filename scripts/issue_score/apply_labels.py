@@ -19,7 +19,7 @@ if __package__ in (None, ""):
 
 from scripts.issue_score import questions, vault
 from scripts.issue_score.score_issues import content_hash
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
 
 @dataclass(frozen=True)
