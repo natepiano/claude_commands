@@ -54,6 +54,7 @@
 | postmaster-unit | permanent | `/home/natepiano/worktrees/claude-natedev-postmaster` | `natedev-postmaster` | — | board-free |
 | ups-unit | (retired 2026-10-30, worktree removed, session 097e0938-66d3-4f01-a8e8-96feb3675493, folder /etc/nixos) permanent | `/home/natepiano/worktrees/claude-natedev-ups` | `natedev-ups` | — | — |
 | security-unit | standby | /home/natepiano/worktrees/claude-natedev-security | natedev-security | — | board-free |
+| spacetime-unit | `docs/plans/natedev-spacetime.md` | `/home/natepiano/worktrees/claude-natedev-spacetime` | `natedev-spacetime` | — | `docs/plans/natedev-spacetime.md` |
 
 ## Hub files
 
