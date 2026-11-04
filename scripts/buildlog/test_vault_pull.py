@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -15,6 +16,8 @@ from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 import cli
 import conf
