@@ -276,6 +276,14 @@ def started_ago(started: float, now: float) -> str:
     raise AssertionError("the seconds scale always matches")
 
 
+def leftover_age(minutes: int) -> str:
+    if minutes < 120:
+        return f"{minutes} min"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} h"
+    return f"{minutes // (24 * 60)} d"
+
+
 def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: str = "",
                 selector: str = "") -> list[Line]:
     explanation = model.reading.explanation
@@ -402,6 +410,6 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         for step, memory, activity in ended:
             identity = model.labels.get(activity.session_id)
             owner = field(identity.session if identity else "") or field(activity.session_name) or "unlabelled session"
-            minutes = str(age(activity.started_at, explanation.now)) if activity.started_at else "—"
-            lines.append((Span(f"   {owner} · {field(activity.program)} · {minutes} min · {memory.bytes / gate.GIB:.1f} GiB"),))
+            elapsed = leftover_age(age(activity.started_at, explanation.now)) if activity.started_at else "—"
+            lines.append((Span(f"   {owner} · {field(activity.program)} · {elapsed} · {memory.bytes / gate.GIB:.1f} GiB"),))
     return [clip(line, columns) for line in lines]
