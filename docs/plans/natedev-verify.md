@@ -941,18 +941,21 @@ Checkpoint `3a005d504` on `verify-token-keep`.
 
 **Ruled out:** Blaming the original local-only token policy; the later direct Mac release introduced the missing evidence.
 
-### Phase 29 — A lint step that writes the tree stays on natedev, and a lost token is never cached  · status: todo
+### Phase 29 — A lint step that writes the tree stays on natedev, and a lost token is never cached  · status: done
 
-**Origin:** builds showrunner, 2026-11-03 17:5x EST, hotfix. (a) When natedev is short of memory, `verify.sh lint` moves its `cargo mend --fix` step to the Mac, which runs `cargo mend --fail-on-warn` on a copy; the fixes never reach the local tree and lint fails "cargo mend --fix failed" (`/tmp/claude/unit/be6481c9-047e-4add-83c1-870d55a33343/mesh_runs/20261103T173621-1891872-f3b0.log`). (b) verify.sh caches status 125 (lost cargo token) as a tree failure, and the rerun replays it in 3 s (`.../mesh_runs/20261103T174215-2221502-c1fd.log`, `20261103T174635-2374268-0980.log`).
+#### As-built
 
-**Depends on:** none (hotfix from origin/builds).
+Checkpoint `1a2800ef6`, merged to builds as `d1d655a94`.
 
-#### Work Order
+- A lint step that writes the tree (`cargo mend --fix`, fmt, `clippy --fix`) never moves to the Mac. verify.sh `step_writes_tree` keeps it on natedev, where it waits in the natedev queue. A read-only step (`mend --fail-on-warn`, `fmt --check`) can still go to the Mac.
+- The lint result cache never records status 125 (a lost cargo token). The next run does the step again.
 
-1. A step that writes to the tree (mend `--fix`, fmt, clippy `--fix`) never moves to the Mac; it waits in the natedev queue. Fix it where the offload decision lives (verify.sh near line 1747 maps `mend-check:--fail-on-warn`). Say whether Phase 20's Mac-allowed lint made this route.
-2. The result cache never records status 125. Fix it where the cache writes a result.
+**Files:**
+- `scripts/direct/verify.sh` — `step_writes_tree` routing and the 125 cache rule.
+- `scripts/direct/test_verify_lint_local_writes.py`, `test_verify_lint_cache_token_loss.py` — the two regressions.
+- `scripts/direct/test_verify_token_mac_step.py` — the Mac step in its fixtures is `mend --fail-on-warn`, not `mend --fix`.
 
-**Acceptance gate:** one test each that fails on the old code; the lint, routing and cache suites pass; merge gate `--tests-only` green on the hotfix tree.
+**Binds later work:** a tree-writing step stays on natedev with both remote hooks off.
 
 ### Phase 31 — A lint step that leaves the memory wait for the Mac keeps the token for its next local step · status: done
 
@@ -1017,22 +1020,29 @@ Checkpoint `d8b1b0c3c` on `verify-red-tests`.
 
 **Ruled out:** Changing production memory-kill behavior or changing offload expectations for an unrelated branch.
 
-### Phase 34 — Remove an owner's standing checkouts when the owner retires or wraps · status: todo
+### Phase 34 — Remove an owner's standing checkouts when the owner retires or wraps · status: done
 
-> Current work (builds ruling, 2026-11-03 21:0x EST). Branch verify-copies-owner-end from origin/verify-copies eee1e500f; it merges after Phase 18.
+#### As-built
 
-**Defect.** Only a hand `copies.py remove --owner O --repo R` deletes standing checkouts. `scripts/production/retire_unit.py` removes the unit worktree and branch but not the unit's checkouts under `~/worktrees/gates/<repo>/<unit>-gate[-2]`. `scripts/production/tidy_wrapped.py` deletes a wrapped production's state but not the production's checkouts or its units' checkouts. Each one keeps a full tree and its `target/` with no owner.
+Checkpoint `ce12a797f` on `verify-copies-owner-end` (with Phase 18), merged to builds as `d1fc65123`.
 
-**Depends on:** Phase 18.
+- `copies.py remove --owner O` with no `--repo` removes every tree the owner holds, in every repository and kind; `--repo` narrows it. The Python API takes a `RepositoryScope` with the same two forms.
+- `retire_unit.py` removes the unit's standing checkouts after it stops the unit's processes and before it writes the retired note. A busy tree refuses the retirement and names the holder's session (a pid only when no name exists) and the tree path.
+- `tidy_wrapped.py` removes the standing checkouts of the wrapped production and of each of its units.
+- A retry finishes an interrupted removal; a rerun after a full removal changes nothing and exits 0. An adopted borrower keeps its source.
+- `lock_holder` lives in `scripts/lib/file_lock.py`, shared by `copies.py` and `sweep.py`.
+- `bump_gate.py` sets `BUILDLOG_UNIT` from the bump record, so the build queue names the unit of a bump gate.
 
-#### Work Order
+**Files:**
+- `scripts/copies/copies.py`, `test_copies.py` — owner-wide removal and `RepositoryScope`.
+- `scripts/production/retire_unit.py`, `tidy_wrapped.py` and their tests — removal at retire and at wrap.
+- `scripts/lib/file_lock.py`, `scripts/lib/scratch.py`, `scripts/lint/sweep.py` — the shared lock holder reader.
+- `scripts/production/bump_gate.py` — the unit name for a bump gate.
+- `docs/as-built/gate-checkouts.md` — the removal rules.
 
-1. `copies.py remove --owner O` with no `--repo` removes that owner's trees in every repository. The Python API gets the same form. One implementation; `--repo` narrows it.
-2. `retire_unit.py` removes the retired unit's standing checkouts after it stops the unit's processes and before it writes the retired note. A busy tree refuses the retirement. The refusal names the holder by its session name (a pid only when no name exists) and the tree path, like the other running-process refusals.
-3. `tidy_wrapped.py` removes the standing checkouts of the wrapped production and of each of its units.
-4. A retry after a refusal finishes the removal. A rerun after a full removal changes nothing and exits 0.
+**Binds later work:** owner removal covers local trees only. Remote mirrors carry no owner yet; the owner removal for remote mirrors uses the same `RepositoryScope` and order.
 
-**Acceptance gate:** one test each for items 1-4 that fails on the old code; the copies, retire and tidy suites pass; merge gate `--tests-only` green.
+**Gotchas:** a test that mocks the holder's line read patches `file_lock.open`, not `sweep.open`.
 
 ### Phase 35 — Every build copy maker left outside copies.py moves onto it · status: todo
 
@@ -1040,7 +1050,16 @@ Checkpoint `d8b1b0c3c` on `verify-red-tests`.
 
 **Today.** `config/copies.conf` allows three build copy makers outside copies.py: `mac_test/offload.py` and `production/mac_run.sh` (Mac mirrors, including `~/.local/state/mac-test/mirror`) and `direct/verify.sh` (its documentation checkout). The copy guard also misses some import forms (next item "Copy guard: refuse tree-making git calls through every import form", F037), so a copy maker can pass the guard unseen.
 
-**Depends on:** Phase 18; Phase 25 (one mirror root key in mac_test.conf).
+**Depends on:** Phase 18; Phase 25 (one mirror root key in mac_test.conf); resources Phase 50 (checkpoint `d70f1dedf`, owner resources-unit) landed in origin/builds. That checkpoint adds `scripts/mac_test/floor_claims.py` and changes `offload.py`, `mac_run.sh` and `retire_unit.py`, the files this phase changes. On 2026-11-04 it is on origin/builds-resources only. `offload.remote_mirror` still builds the legacy Mac path in code until Phase 25 item 2 lands.
+
+**Workers:** one integration writer for the copies API and its callers (`copies.py`, `offload.py`, `mac_run.sh`, `linux_runner.py`, `verify.sh`, `retire_unit.py`, `tidy_wrapped.py` and their tests). One guard writer for `scripts/copies/copy_guard.py` and its tests. The integration writer fixes the copies API (items 1, 7 and 9) before it moves a caller. An independent test lane runs the acceptance tests before the hand-over in item 8.
+
+**Constraints from the phase 29, 34, 36 and 37 review:**
+
+- Keep the Phase 36 token boundary: verify.sh `run()` wraps `run_step` and releases each token it takes when the step ends; the sweep in invoke.sh `sweep_after_step` takes no board token. Keep pre-held tokens, the `.given_back` mark, the memory re-acquire, retry attempt 2 and the pipeline EXIT trap.
+- Keep the Phase 29 local repair rule and the Phase 37 step record: a tree-writing step stays on natedev with both remote hooks off, records `natedev_only` for its lifetime, and gives the call its own decision back before the next read-only step.
+- The acceptance run adds the verify token, memory-kill and Mac-step suites, `test_verify_lint_local_writes.py`, `scripts/buildlog/test_mac_idle.py` and the Phase 23 cancellation tests (`test_verify_tree_cancel_lint.py`).
+- One lock order for remote mirrors: the mirror lease first, then the floor claim lock, then the copy-record lock. Mirror refresh, claim adoption, owner removal and the sweep take them in that order. No sweep starts while a process holds an admission or claim lock.
 
 #### Work Order
 
@@ -1048,36 +1067,45 @@ Checkpoint `d8b1b0c3c` on `verify-red-tests`.
 2. `verify.sh` makes its documentation checkout through `copies.standing`. Remove its allow-list entry.
 3. Fold the F037 next item into this phase: the guard finds tree-making git calls through every import form named there. Remove the item from `docs/plans/natedev-verify-next.md`.
 4. The allow list keeps only original work trees (`add_unit.py`, `resume_unit.py`, `add_style.py`, `make_worktree.sh`, `berth_fix/launch.sh`), the external upstream clone (`bevy_migration_ensure_repo.sh`) and copies.py.
-5. The remote mirror kind covers every configured remote target, not only the Mac. `offload.remote_mirror` (offload.py:1028) and `copy_tree` (offload.py:1323) also serve Linux and AWS slots, and `linux_runner.probe_script` (linux_runner.py:168) makes their folders.
+5. The remote mirror kind covers every configured remote target, not only the Mac. `offload.remote_mirror` and `offload.copy_tree` also serve Linux and AWS slots, and `linux_runner.probe_script` makes their folders.
 6. A remote copy has a lease for its lifetime. `copy_tree --delete` and the sweep never remove a mirror that a live remote run uses, and they keep its metadata.
-7. The documentation checkout is a staged tree: verify.sh:1237 writes the index tree, and `copies.commit_at` (copies.py:158) needs a commit. Add a staged-source form to `copies.standing`. It copies only staged content and leaves the source index and file mtimes unchanged.
+7. The documentation checkout is a staged tree: verify.sh `doc_tree` writes the index tree, and `copies.commit_at` needs a commit. Add a staged-source form to `copies.standing`. It copies only staged content and leaves the source index and file mtimes unchanged. Name the source and merge policies with types first (architect review finding 7; this replaces the next item "Name copies.py source and merge policies with semantic types"): `CommittedSource`, `WorktreeSource`, `StagedSource`, `NoMerge` and `MergeRevision`. Convert the CLI flags at the boundary; callers and tests change in the same edit. No bare `None` policy argument stays in the copies API. Remove that item from `docs/plans/natedev-verify-next.md`.
 8. Hand-over: queue-unit takes ownership of copies.py, its cleanup and the floor interfaces. Queue-unit's separate warm-target copy work is removed.
+9. Owner removal reaches remote mirrors. Each remote mirror records its owner (the `RepositoryScope` and owner that Phase 34 uses for local trees); `OffloadRequest` carries it. `copies.py remove --owner O` and the retire and tidy paths remove that owner's remote mirrors in the same order as its local trees. A mirror that a live run holds refuses the removal and names the holder's session and the mirror path.
 
-**Acceptance gate:** the repository scan test finds no build copy maker outside copies.py; one test per item that fails on the old code; tests for a cancelled remote copy, a surviving remote child, kept metadata and a sweep of a busy mirror; tests for staged-only content, an unchanged source index, kept mtimes and correct pass records; queue-unit confirms the hand-over; the copies, offload, Mac run, Linux runner and verify suites pass.
+**Acceptance gate:** the repository scan test finds no build copy maker outside copies.py; one test per item that fails on the old code; tests for a cancelled remote copy, a surviving remote child, kept metadata and a sweep of a busy mirror; concurrent sweep, admission and owner-removal tests in the lock order above, with a cancelled sweep; retire and tidy tests that keep another owner's mirrors and refuse a busy mirror with the holder named; tests for staged-only content, an unchanged source index, kept mtimes, target reuse, recovery and correct pass records. `test_verify_doc_checkout.py` (the `target/verify-doc` path) and `test_verify_doc_recovery.py` (the private index beside the checkout) change only their layout assertions, each named by an `Assertion-Change:` line. Queue-unit confirms the hand-over; the copies, offload, Mac run, Linux runner and verify suites pass.
 
-### Phase 36 — A verify call never waits on its own cargo token · status: todo
+### Phase 36 — A verify call never waits on its own cargo token · status: done
 
-**Hotfix, bump from origin/builds `4fa5dfac1`.** Builds asked for it ahead of Phase 34.
+#### As-built
 
-**Defect.** Call `v20261103T235801-3831445-6666` (lint hana) waited 23 min 48 s for its own token. `sweep_after_step` (`scripts/lint/invoke.sh:442`) starts the sweep in a detached shell with `TOKEN_HELD=0`. That sweep goes through verify.sh `run()`. `sweep.py` is not a compiling step, so `run()` calls `acquire_token local`, which takes the board token with `--pid $$`, the pid of the call. Nothing releases that hold, and its `token_acquired` removes the `.given_back` mark. The call's shell still has `TOKEN_HELD=0`. Clippy's memory wait then releases nothing, finds the board busy, and waits until the 3600 s hold expires.
+Checkpoint `272005ed6` on `verify-token-self`, merged to builds as `d79fe5488`.
 
-#### Work Order
+- invoke.sh `sweep_after_step` runs the detached sweep with `run() { run_once "$@"; }`, so the sweep never takes the board token. Cargo's own locks protect its scan.
+- verify.sh `run()` wraps `run_step` and `finish_step_token`. Each token that `run()` takes for a step is released when the step ends: on success, failure, each early return and the check-failed exit. A hold the call had before the step stays.
 
-1. The detached sweep never takes the board token. Cargo's own locks protect its scan.
-2. Each acquire in `run()` is released on the same path when its step ends, so no hold outlives its step. A hold the call had before the step stays. Builds ruled out a self-hold take-over: it hides a leak instead of removing it.
-3. Stay out of the regions queue-unit holds until its merge: `buildlog_wait_for_memory` in verify.sh, `test_verify_token_wait.py`, `test_verify_token_reservation.py`, `test_verify_token_memory_history.py` and `scripts/lint/memory_gate.sh`.
+**Files:**
+- `scripts/direct/verify.sh` — the `run()` / `run_step` split and `finish_step_token`.
+- `scripts/lint/invoke.sh` — the token-free sweep.
+- `scripts/direct/test_verify_token_self_hold.py` — the next local step starts at once after a sweep; no step leaves a hold behind.
 
-**Acceptance gate:** a test where the call's next local step starts at once after the sweep; a test where, after any step ends, the call holds no board token that the step took; both fail on the old code; the verify token, lint and memory-kill suites pass.
+**Binds later work:** keep pre-held tokens, the `.given_back` mark, the memory re-acquire, retry attempt 2 and the pipeline EXIT trap across the `run()` boundary.
 
-### Phase 37 — A tree-writing lint step that stays on natedev is not counted as a waiting Mac step · status: todo
+**Gotchas:** `test_verify_memory_kill.py` copies verify.sh functions into its fixture by name; a new helper that `run()` calls goes on that copy list.
 
-**Origin:** architect review of phases 18, 28, 31, 32 and 33, 2026-11-03, findings 1 and 2. A defect in the shipped Phase 29.
+**Ruled out:** a take-over of a hold the call already has (it hides a leak instead of removing it).
 
-**Defect.** `run()` (verify.sh:293) turns off the remote hooks for a tree-writing step, but the step record keeps the lint call's `mac_allowed` decision (verify.sh:1717). `mac_idle.py:235` counts that record while the step waits, so a local repair can raise a false Mac idle alert.
+### Phase 37 — A tree-writing lint step that stays on natedev is not counted as a waiting Mac step · status: done
 
-#### Work Order
+#### As-built
 
-1. A tree-writing step records that it runs on natedev for its lifetime. A read-only step after it gets the call's decision back.
-2. `mac_idle.py` does not count a tree-writing step as a waiting Mac step.
+Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`.
 
-**Acceptance gate:** a test where a waiting tree-writing step raises no idle alert, and a later read-only step counts again; both fail on the old code. The Phase 23 cancellation tests pass on the merged tree, with repeated TERM and no process, queue place or step record left. The verify, lint and Mac idle suites pass.
+- A tree-writing step records `natedev_only` ("step writes the tree") before routing, token and memory waits, and keeps it for its whole lifetime. verify.sh `STEP_RECORD_ARGS` saves the call's record arguments; after the step, `run()` gives the call its own decision back, so a later read-only step can go to the Mac again.
+- `mac_idle.py` already skips `natedev_only` records, so a local repair raises no false Mac idle alert. `mac_idle.py` has no change.
+
+**Files:**
+- `scripts/direct/verify.sh` — `STEP_RECORD_ARGS` and the record restore after `run_step`.
+- `scripts/buildlog/test_mac_idle.py` — `test_tree_writing_lint_wait_is_local_and_next_judgment_counts_again`.
+
+**Binds later work:** a tree-writing step records `natedev_only` for its lifetime; the call's decision comes back before the next read-only step.

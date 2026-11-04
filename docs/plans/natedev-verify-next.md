@@ -65,14 +65,16 @@
 
 **Acceptance:** one regression test per binding form, each fails on the old guard; valid shadowed-name cases stay clean; the copies and guard suites pass.
 
-**Due:** the next verify-unit checkpoint after phase 18.
+**Due:** Phase 35 item 3. Remove this item after its binding-form and valid-shadowing tests pass.
 
 ## Name copies.py source and merge policies with semantic types
 
 **Source:** phase 20, 23 and 24 architect review, finding 11, routed out of phase 18 under the round-3 landing rule.
 
-**Today:** the copies API (`scripts/copies/copies.py` near line 539) takes `apply_uncommitted=None` and `merge=None`. These values are a source policy and an integration policy, not missing input.
+**Today:** `copies.standing` (`scripts/copies/copies.py`) takes `apply_uncommitted=None` and `merge=None`. These values are a source policy and an integration policy, not missing input. Phase 35 adds a third source, the staged tree.
 
-**Needed:** semantic variants for a committed source versus a worktree source, and for merge versus no merge, with conversion from the CLI flags at the boundary. Callers and tests switch in the same change.
+**Needed:** Phase 35 item 7 introduces `CommittedSource`, `WorktreeSource`, `StagedSource`, `NoMerge` and `MergeRevision`. Convert the CLI flags at the boundary, and change callers and tests before queue-unit takes ownership.
+
+**Due:** Phase 35 item 7. Remove this item when that item lands.
 
 **Acceptance:** copies, copy guard and style suites pass; basedpyright 0/0/0; no bare `None` policy argument remains in the copies API.
