@@ -94,7 +94,7 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
             elif isinstance(basis.factor, gate.DevSizeHeadroom):
                 text += (f"; dev size headroom × {basis.factor.factor:.3f}"
                          + f" + margin {gib(basis.factor.margin_bytes)}")
-            elif isinstance(basis.factor, gate.DevHeadroom):
+            elif isinstance(basis.factor, gate.LegacyDevMultiplierHeadroom):
                 text += f"; dev promise factor × {basis.factor.factor:.3f}"
             else:
                 text += "; no headroom factor"

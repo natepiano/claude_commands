@@ -205,6 +205,48 @@ The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.
 Queue views continue to use the service.
 
+### Queue lifecycle and calibration
+
+The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
+The same record holds Cargo steps and `merge-gate` steps.
+The append function locks the file and removes incomplete rows before an append.
+At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
+
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, applied budget, and head window.
+2. `left` records a cancelled waiter or a waiter whose owner is gone.
+3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+
+Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
+Each admission and end also identifies its reservation interval by `reservation_id`.
+A token wait ends an interval with `TokenReturn`. It does not complete the step.
+A normal end uses `StepEnd`. An exit before a positive sample records `NoPositiveSample`.
+The saved finalization intent retains the facts for the end event across retries.
+The event identity prevents a retry from publishing the same end twice.
+The service saves pending admission and cancellation facts with each durable state transition.
+One lifecycle outbox publishes these facts after the state write and during restart.
+Reservation removal and removal of its non-token place use the same state write.
+
+`read_queue_lifetimes` joins these events into `QueueStepLifetime` records.
+Each record retains its reservation intervals, token gaps, and final end state.
+Memory wait includes the first wait and each wait after a token returns.
+It excludes the token gaps and running time.
+A missing return time gives `MemoryWaitIncomplete`; an unfinished step gives `StepStillOpen`.
+The Phase 16 comparison is due 24 hours after these lifecycle records reach main.
+It compares Cargo waits and pressure holds with and without overlapping gate intervals.
+
+`head_policy` resolves the deployed head rule and ordered walk from one frozen snapshot.
+Admission, queue readers, blocker searches, and release searches use that result.
+The active window supplies the shell wait text and admission records.
+The queue card preserves captured window evidence until the service saves its first priority mark.
+The deployed rule keeps the recovery slot, queue priority, and the head-admission override.
+
+The Phase 20 calibration has insufficient evidence.
+The calibration requires seven days under the deployed Phase 39 configuration.
+The phase review found no eligible days or cohort budget after that deployment boundary.
+Recorded wait minutes, replayed wait minutes, and their ratio are unavailable.
+The main reference has a 24 GiB build budget; this is not a calibration cohort.
+The comparative replay does not run. The capacity rule is not adopted.
+
 ### Estimates and charges
 
 The client calls `step_estimate` before admission and after `EstimateExpired`.
@@ -226,6 +268,65 @@ Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory 
 Both the budget charge and free-memory growth term use that promise.
 
 Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
+Cargo estimates separate compile history from no-compile history.
+`index_step_evidence` joins each anonymous peak by host, call id, and step.
+`StepEvidence` keeps its shape and compile count independent.
+Missing argv does not remove a compile count. A saved shape does not prove compilation.
+`CompiledCrates` identifies a compile run. `NoCratesCompiled` identifies known zero-count attempts.
+The join combines repeated attempts. Any positive count keeps the call in compile history.
+An unknown count or a missing join keeps the peak usable until the index supplies a known count.
+The peak's completion time controls its history window, including failed-build floors.
+Merge-gate peaks keep their separate class and remain in the anonymous history.
+The gate uses its own cap, so Cargo estimates do not use those peaks.
+
+Five keyed rows exclude the older unkeyed rows for the same repository.
+With one to four own rows, a non-build estimate uses their largest peak or a lower pool p90.
+A repository without own history keeps the pool and fallback order.
+Filtered compile estimates use exact filters, then package filters, then check or build compile peaks.
+A full-suite estimate does not cap a filtered compile estimate.
+The 1 GiB filtered floor applies when the repository has no usable compile history.
+Fresh nextest estimates retain `fresh_test_peak` and its 1 GiB floor.
+Freshness still requires both Cargo output roots to survive.
+
+#### Phase 11 replay comparison
+
+The replay covers 2026-10-21 through 2026-11-04 with the same frozen inputs.
+It evaluates 15,053 runs and omits 195 runs without an index match.
+Another 617 merge-gate rows retain their separate cap class.
+Each estimate uses its historical budget: 21 GiB or 24 GiB.
+Under-half means below half the measured peak. Over-three means above three times the measured peak.
+
+| Compile class | Budget GiB | Runs | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|---:|---:|
+| compile | 21 | 11,360 | 458 | 402 | 1,162 | 1,152 |
+| compile | 24 | 2,300 | 18 | 12 | 332 | 358 |
+| no compile | 21 | 1,185 | 12 | 12 | 937 | 937 |
+| no compile | 24 | 208 | 3 | 4 | 174 | 173 |
+| **Total** | | **15,053** | **491** | **430** | **2,605** | **2,620** |
+
+These repositories have a higher count. Each row combines their steps, compile classes, and budgets.
+
+| Repository | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|
+| cargo-liner | 27 | 8 | 1,754 | 1,804 |
+| check-only | 1 | 2 | 5 | 3 |
+| clone | 1 | 2 | 15 | 14 |
+| clone85 | 1 | 2 | 0 | 0 |
+| fix | 3 | 3 | 20 | 22 |
+| hana | 71 | 31 | 592 | 595 |
+| lintproof_fix | 0 | 1 | 6 | 1 |
+| p31-gates-834aebb04-8015c7caf3 | 1 | 2 | 3 | 1 |
+| src | 0 | 2 | 46 | 40 |
+| work | 1 | 2 | 0 | 0 |
+
+Bar missed: under-half falls by 61, but over-three rises by 15.
+At least one count rises in 10 repositories and 19 repository, step, and compile-class groups.
+The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 to 7, over-three 101 to 166.
+A filtered compile run takes its estimate from compile history, and the full-run estimate no longer caps it.
+The showrunner accepted the miss (2026-11-04): an under-promise risks an out-of-memory kill; an over-promise only delays parallel starts.
+The next phase makes a filtered compile estimate use that filter's own compile history before the package pool.
+Run `phases/11/replay.py before` and `after` in the session folder to regenerate the full grouped data for `replay_groups.md`.
+
 Build estimates use completed same-shape history from the last 14 days.
 Ten or more earlier runs supply p90. One to nine earlier runs supply their largest peak.
 The newest failed-build floor can raise that base.
@@ -239,7 +340,7 @@ Release builds use `release_headroom`, currently 1.314. A build without same-sha
 The retry after a memory kill stays unchanged.
 
 Each estimate stores its rule and the budget cap it applies.
-`DevSizeHeadroom` stores its factor and margin. `DevHeadroom` retains the older multiplier for saved records.
+`DevSizeHeadroom` stores its factor and margin. `LegacyDevMultiplierHeadroom` retains the older multiplier for saved records.
 `CappedAtBudget` stores the uncapped need and the applied cap.
 The reader checks those saved values without reading today's budget.
 An older record without a saved cap becomes `CapNotRecorded`.

@@ -779,7 +779,7 @@ class QueueEvidenceTests(unittest.TestCase):
 
     def test_dev_shape_names_its_measured_promise_factor(self) -> None:
         source = gate.RecordedNeed("shape", 2, 14, "full", "", (), gate.WidthNotRecorded(),
-                                   gate.ShapeLargest(2, factor=gate.DevHeadroom()))
+                                   gate.ShapeLargest(2, factor=gate.LegacyDevMultiplierHeadroom()))
         text = queue_evidence.need_text(source, zone=user_zone())
         self.assertEqual(text.split("; ")[2], "dev promise factor × 4.203")
         self.assertNotIn("release headroom", text)

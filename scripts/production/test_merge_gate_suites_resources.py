@@ -181,11 +181,18 @@ class MergeGateResourcesTests(GateSuitesFixture):
         metadata = Path(self.environment["BUILDLOG_JOBSERVER_FIFO"]).stat()
         mode = os.stat_result((stat.S_IFCHR | 0o600, *metadata[1:]))
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(os, "fstat", return_value=mode), merge_gate.shared_cpu_pool() as pool, \
-                mock.patch.object(os, "read", side_effect=AssertionError("read before the pool was ready")):
+                mock.patch.object(os, "fstat", return_value=mode), merge_gate.shared_cpu_pool() as pool:
             if not isinstance(pool, merge_gate.SharedCPUPool):
                 self.fail("the private pool was not opened")
-            self.assertIsInstance(pool.try_acquire(), merge_gate.WaitingForCPU)
+            pool_descriptor = pool.descriptor
+            read = os.read
+
+            def read_other_descriptor(descriptor: int, count: int) -> bytes:
+                self.assertNotEqual(descriptor, pool_descriptor, "read before the pool was ready")
+                return read(descriptor, count)
+
+            with mock.patch.object(os, "read", side_effect=read_other_descriptor):
+                self.assertIsInstance(pool.try_acquire(), merge_gate.WaitingForCPU)
 
     @gate_suites("lib")
     def test_one_shared_slot_serializes_modules_and_is_returned_after_each(self) -> None:
