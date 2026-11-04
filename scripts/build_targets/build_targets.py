@@ -338,9 +338,11 @@ def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> boo
         return False
     scope = mac_test.target_claim_scope(paths, repo_root)
     with mac_test.locked(paths.lock):
+        block = mac_test.blocking_claim_block(paths)
         return any(mac_test.scopes_overlap(claim.scope, scope)
                    and claim.record["pid"] == pid and claim.record["proc_start"] == start
                    and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+                   and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)
                    for claim in mac_test.read_claims(paths))
 
 

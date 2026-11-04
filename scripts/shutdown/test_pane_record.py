@@ -68,6 +68,51 @@ class PaneRecordTests(unittest.TestCase):
     def entries(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], json.loads((self.records / "agents.json").read_text()))
 
+    def test_plugin_directories_survive_hook_capture_and_resume(self) -> None:
+        directories = ["/fixture/postmaster", "/fixture/second plugin"]
+        started = self.start("w1:p2", "plugin-session", "--plugin-dir", directories[0],
+                             "--plugin-dir=" + directories[1], "-n", "postmaster")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+            entry = pane_record.read_strict("agents")["w1:p2"]
+        self.assertEqual(entry.get("plugin_directories"), directories)
+        arguments = pane_record.resume_arguments(entry)
+        parsed = pane_record.parse_claude_arguments(["claude", *arguments])
+        self.assertEqual(parsed.plugin_directories, tuple(directories))
+        self.assertFalse(parsed.has_prompt)
+        self.assertEqual(arguments.count("--plugin-dir"), 2)
+
+    def test_relative_plugin_paths_keep_their_target_after_a_folder_move(self) -> None:
+        original = self.root / "work/unit"
+        moved = self.root / "elsewhere/unit"
+        entry = pane_record.launch("w1:p2", "plugin-session", str(original), {},
+                                   ["claude", "--plugin-dir", "../shared/postmaster"])
+        entry["cwd"] = str(moved)
+        arguments = pane_record.resume_arguments(entry)
+        self.assertEqual(arguments[arguments.index("--plugin-dir") + 1],
+                         str(self.root / "work/shared/postmaster"))
+        self.assertEqual(entry.get("plugin_directories"), [str(self.root / "work/shared/postmaster")])
+
+    def test_plugin_options_after_the_terminator_are_only_prompt_text(self) -> None:
+        arguments = ["claude", "--plugin-dir", "/wanted", "--", "--plugin-dir=/unwanted"]
+        parsed = pane_record.parse_claude_arguments(arguments)
+        self.assertTrue(parsed.has_prompt)
+        self.assertEqual(parsed.plugin_directories, ("/wanted",))
+        entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, arguments)
+        self.assertEqual(entry.get("plugin_directories"), ["/wanted"])
+        self.assertNotIn("/unwanted", pane_record.resume_arguments(entry))
+
+    def test_plugin_directories_require_nonempty_paths_in_launch_records(self) -> None:
+        entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, ["claude"])
+        self.records.mkdir()
+        for invalid in ("/not-a-list", [""], [1]):
+            with self.subTest(invalid=invalid):
+                document: dict[str, object] = {**entry, "plugin_directories": invalid}
+                _ = (self.records / "agents.json").write_text(json.dumps({"w1:p2": document}))
+                with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+                    with self.assertRaisesRegex(ValueError, "plugin_directories"):
+                        _ = pane_record.read_strict("agents")
+
     def test_moved_session_uses_newest_launch_across_accounts_and_record_files(self) -> None:
         old = pane_record.launch("old-pane", "moved", "/old", {"CLAUDE_CONFIG_DIR": "/accounts/.claude4"},
                                  ["claude", "-n", "old", "--model", "opus"])

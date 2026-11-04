@@ -20,126 +20,84 @@ import sessions
 import restart
 from unit_staff_test_support import unit_host
 from scripts.production import staff
-from scripts.shutdown import shutdown_record, stop_resume
-from test_support import ShutdownTestCase
+from scripts.shutdown import shutdown_record, stop_resume, pane_record
+from test_support import ShutdownTestCase, registry_confirmation
 
 
 def checkout() -> inventory.GitCheckout:
     return inventory.GitCheckout(
-        kind="git",
-        path="/tmp/checkout",
-        head=inventory.OnBranch(kind="branch", name="work"),
-        upstream=inventory.Tracking(kind="tracking", ahead=0),
-        dirty=[],
-    )
+        kind="git", path="/tmp/checkout", head=inventory.OnBranch(kind="branch", name="work"),
+        upstream=inventory.Tracking(kind="tracking", ahead=0), dirty=[])
 
 
-def common_session(
-    session_id: str,
-    name: str | None = None,
-    *,
-    cwd: str | None = None,
-    model: inventory.LastModel | None = None,
-    run_dirs: list[str] | None = None,
+def common_session(session_id: str, name: str | None = None, *, cwd: str | None = None,
+    model: inventory.LastModel | None = None, run_dirs: list[str] | None = None,
 ) -> inventory.SessionFields:
     return {
-        "session_id": session_id,
-        "config_dir": str(Path.home() / ".claude2"),
-        "pid": 1000 + len(session_id),
-        "proc_start": f"start-{session_id}",
-        "name": name or session_id,
-        "cwd": cwd or f"/tmp/{session_id}",
-        "status": "idle",
-        "updated_at": 0,
-        "probe": False,
+        "session_id": session_id, "config_dir": str(Path.home() / ".claude2"),
+        "pid": 1000 + len(session_id), "proc_start": f"start-{session_id}",
+        "name": name or session_id, "cwd": cwd or f"/tmp/{session_id}",
+        "status": "idle", "updated_at": 0, "probe": False,
         "model": model or inventory.NoReplyYet(kind="no reply yet"),
-        "checkout": checkout(),
-        "run_dirs": list(run_dirs or []),
-        "codex_servers": [],
-        "timers": [],
+        "checkout": checkout(), "run_dirs": list(run_dirs or []), "codex_servers": [], "timers": [],
     }
 
 
-def top_level(
-    session_id: str,
-    *,
-    name: str | None = None,
-    cwd: str | None = None,
-    model: inventory.LastModel | None = None,
-    host: inventory.SessionHost | None = None,
-    run_dirs: list[str] | None = None,
-    status: str = "idle",
+def top_level(session_id: str, *, name: str | None = None, cwd: str | None = None,
+    model: inventory.LastModel | None = None, host: inventory.SessionHost | None = None,
+    run_dirs: list[str] | None = None, status: str = "idle",
 ) -> inventory.TopLevelSession:
     result = inventory.TopLevelSession(
-        **common_session(
-            session_id,
-            name,
-            cwd=cwd,
-            model=model,
-            run_dirs=run_dirs,
-        ),
-        kind="top-level",
-        host=host or inventory.UnknownHost(kind="unknown"),
-    )
+        **common_session(session_id, name, cwd=cwd, model=model, run_dirs=run_dirs),
+        kind="top-level", host=host or inventory.UnknownHost(kind="unknown"))
     result["status"] = status
     return result
 
 
-def showrunner(
-    session_id: str,
-    *,
-    host: inventory.SessionHost | None = None,
-) -> inventory.ShowrunnerSession:
+def showrunner(session_id: str, *, host: inventory.SessionHost | None = None) -> inventory.ShowrunnerSession:
     return inventory.ShowrunnerSession(
-        **common_session(session_id),
-        kind="showrunner",
+        **common_session(session_id), kind="showrunner",
         host=host or inventory.HerdrHost(kind="herdr", herdr_session=f"herdr-{session_id}", pane_id="w1:p1", presentation="detached"),
-        production="demo",
-        doc="/tmp/demo-production.md",
-    )
+        production="demo", doc="/tmp/demo-production.md")
 
 
-def unit(
-    session_id: str,
-    *,
-    plan: inventory.UnitPlan | None = None,
-    session_name: str | None = None,
-    session_host: Literal["herdr"] = "herdr",
-    run_dirs: list[str] | None = None,
-    doc: str = "/tmp/demo production.md",
+def unit(session_id: str, *, plan: inventory.UnitPlan | None = None, session_name: str | None = None,
+    session_host: Literal["herdr"] = "herdr", run_dirs: list[str] | None = None, doc: str = "/tmp/demo production.md",
 ) -> inventory.UnitSession:
     return inventory.UnitSession(
-        **common_session(session_id, run_dirs=run_dirs),
-        kind="unit",
-        host=unit_host(
-            kind="unit",
-            production="demo",
-            unit=f"{session_id}-unit",
-            doc=doc,
-            session_name=session_name or f"herdr-{session_id}",
-            session_host=session_host,
-            plan=plan or inventory.PlanFromRunRecord(kind="plan", path=f"/tmp/{session_id} plan.md"),
-        ),
-    )
+        **common_session(session_id, run_dirs=run_dirs), kind="unit",
+        host=unit_host(kind="unit", production="demo", unit=f"{session_id}-unit", doc=doc,
+            session_name=session_name or f"herdr-{session_id}", session_host=session_host,
+            plan=plan or inventory.PlanFromRunRecord(kind="plan", path=f"/tmp/{session_id} plan.md")))
 
 
-def worker_session(
-    session_id: str,
-    *,
-    owner: str | None,
-    run_dirs: list[str] | None = None,
-) -> inventory.WorkerSession:
+def worker_session(session_id: str, *, owner: str | None, run_dirs: list[str] | None = None) -> inventory.WorkerSession:
     worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
     )
     return inventory.WorkerSession(
-        **common_session(session_id, run_dirs=run_dirs),
-        kind="worker",
-        host=inventory.UnknownHost(kind="unknown"),
-        owner=worker_owner,
-    )
+        **common_session(session_id, run_dirs=run_dirs), kind="worker",
+        host=inventory.UnknownHost(kind="unknown"), owner=worker_owner)
+
+
+class SessionLaunchTests(ShutdownTestCase):
+    def test_restart_reads_plugin_directories_from_the_shutdown_pane_record(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        directories = [str(root / "postmaster"), str(root / "second plugin")]
+        entry = pane_record.launch("w1:p2", "saved", str(root), {},
+            ["claude", "--plugin-dir", directories[0], "--plugin-dir=" + directories[1]])
+        with (patch.object(pane_record, "RECORD_DIR", root / "panes"),
+              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"})):
+            pane_record.write("agents", entry)
+            kind, environment, arguments = restart.session_launch("saved")
+        self.assertEqual(kind, "claude")
+        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
+        parsed = pane_record.parse_claude_arguments(["claude", *arguments])
+        self.assertEqual(parsed.plugin_directories, tuple(directories))
+        self.assertEqual(parsed.values["--resume"], "saved")
+        self.assertEqual(arguments.count("--plugin-dir"), 2)
 
 
 class RestartTests(ShutdownTestCase):
@@ -148,6 +106,7 @@ class RestartTests(ShutdownTestCase):
     running: set[str] = set()
     launches: list[tuple[str, herdr.NewTab | herdr.SplitPane | herdr.ExistingPane]] = []
     stops: list[str] = []
+    workspace_label: str | None = "live"
 
     @override
     def setUp(self) -> None:
@@ -163,6 +122,7 @@ class RestartTests(ShutdownTestCase):
         self.stops = []
         record = staff.StaffSnapshot(self.rows)
         _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=record))
+        _ = self.enterContext(patch.object(sessions, "_readable_records", side_effect=self.records))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop))
         _ = self.enterContext(patch.object(restart, "session_launch", side_effect=self.session_launch))
@@ -183,14 +143,27 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(herdr, "saved_layout", return_value=layout))
 
     @staticmethod
+    def records_for(identities: set[str]) -> list[sessions.SessionRecord]:
+        records = list(registry_confirmation(frozenset(identities)).records)
+        for record in records:
+            record.update(pid=os.getpid(), procStart=sessions.process_start(os.getpid()) or "")
+        return records
+
+    def records(self) -> list[sessions.SessionRecord]:
+        return self.records_for(self.running)
+
+    @staticmethod
     def session_launch(identity: str) -> tuple[Literal["claude"], dict[str, str], list[str]]:
         return "claude", {}, ["--resume", identity]
 
     def layout_result(self, *arguments: str) -> dict[str, object]:
         if arguments == ("workspace", "list"):
-            return {"workspaces": [{"workspace_id": "saved", "label": "saved"}]}
+            return {"workspaces": [{"workspace_id": "saved", "label": "saved"}, {"workspace_id": "w1", "label": self.workspace_label}]}
         if arguments == ("tab", "list"):
-            return {"tabs": []}
+            return {"tabs": [{"tab_id": f"w1:t{n}", "workspace_id": "w1", "label": row.name}
+                             for n, row in enumerate(self.rows)]}
+        if arguments == ("pane", "list"):
+            return {"panes": [{**pane, "tab_id": f"w1:t{pane['pane_id'].rsplit('p', 1)[1]}"} for pane in self.panes()]}
         raise AssertionError(arguments)
 
     def liveness(self, identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
@@ -222,41 +195,39 @@ class RestartTests(ShutdownTestCase):
         return herdr.AgentLaunched(f"w1:p{self.rows.index(row)}", herdr.PromptSubmissionNotRequired())
 
     def test_restart_all_dry_run_lists_every_live_row_with_its_tab_position(self) -> None:
-        self.rows = (
-            replace(self.rows[0], name="unit"),
+        self.rows = (replace(self.rows[0], name="unit"),
             replace(self.rows[1], kind="worker", name="codex-worker", parent=self.rows[0].id,
                     worktree=staff.WORKTREE_UNFILLED),
             replace(self.rows[2], kind="agent", name="morty", parent=None,
-                    worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc("natedev", self.root / "morty.md")),
-        )
-        record = staff.StaffSnapshot(self.rows)
-        layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "agents", "seen": 1,
-            "tabs": [{"name": row.name, "seen": 1, "row_id": str(row.id)} for row in self.rows]}]}
-        self.running.remove(str(self.rows[1].current_session))
+                    worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc("natedev", self.root / "morty.md")))
+        layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
+            "tabs": [{"name": "old", "seen": 1, "row_id": str(self.rows[1].id)}]}]}
         shutdown_record.save([str(self.rows[2].id)])
         before = shutdown_record.record_path().read_bytes()
-        for saved in (True, False):
-            with self.subTest(saved=saved):
-                with (patch.object(staff, "initial_snapshot", return_value=record),
-                      patch.object(herdr, "running_codex_threads", return_value={str(self.rows[1].current_session)}),
-                      patch.object(herdr, "saved_layout", return_value=layout if saved else {"at": 1, "workspaces": []}),
-                      patch.object(staff, "row_operation") as lock,
-                      patch.object(herdr.Herdr, "save_layout") as save,
-                      redirect_stdout(io.StringIO()) as output):
-                    self.assertEqual(restart.restart(stop_all=True, dry_run=True), 0)
-                self.assertEqual(output.getvalue().splitlines(), [
-                    f"{row.name}: {row.id}, {row.kind}, " + (
-                        f"workspace agents, tab {index} ({row.name})" if saved else "no saved tab")
-                    for index, row in enumerate(self.rows, 1)])
-                lock.assert_not_called()
-                save.assert_not_called()
-                self.assertEqual(shutdown_record.record_path().read_bytes(), before)
-                self.assertEqual(self.stops, [])
-                self.assertEqual(self.launches, [])
-                self.assertEqual(restart.row_folder(self.rows[2], record), ("natedev", self.root))
-                self.assertEqual(restart.row_folder(replace(self.rows[2],
-                    worktree=staff.PresentWorktree("natedev", self.root / "own")), record),
-                    ("natedev", self.root / "own"))
+        for identity, label, unavailable in ((str(self.rows[0].current_session), "live", False), (None, "live", False),
+                                           (str(self.rows[0].current_session), None, False), (None, "live", True)):
+            with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)),
+                  patch.object(herdr.Herdr, "panes", return_value=[{**self.panes()[0], "session_id": identity}],
+                               side_effect=herdr.HerdrFailure("socket unavailable") if unavailable else None),
+                  patch.object(herdr, "saved_layout", return_value=layout),
+                  patch.object(self, "workspace_label", label),
+                  redirect_stderr(io.StringIO()) as errors,
+                  patch.object(staff, "row_operation") as lock, patch.object(herdr, "_write_layout") as write,
+                  patch.object(herdr.Herdr, "save_layout") as save, redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(restart.restart(stop_all=True, dry_run=True), 0)
+            self.assertEqual(output.getvalue().splitlines(), [
+                f"{row.name}: {row.id}, {row.kind}, {position}" for row, position in zip(self.rows,
+                    ("workspace live, tab 1 (unit)" if identity and label else "no tab", "workspace saved, tab 1 (old)", "no tab"))])
+            self.assertEqual(len(errors.getvalue().splitlines()), int(unavailable or (identity is not None and label is None)))
+            if unavailable:
+                self.assertEqual(errors.getvalue(), "restart: layout anomaly: socket unavailable\n")
+            for unused in (lock, save, write):
+                unused.assert_not_called()
+            self.assertEqual(shutdown_record.record_path().read_bytes(), before)
+            self.assertEqual((self.stops, self.launches), ([], []))
+            self.assertEqual(restart.row_folder(self.rows[2], staff.StaffSnapshot(self.rows)), ("natedev", self.root))
+            self.assertEqual(restart.row_folder(replace(self.rows[2], worktree=staff.PresentWorktree("natedev", self.root / "own")),
+                staff.StaffSnapshot(self.rows)), ("natedev", self.root / "own"))
 
     def test_restart_lock_refusal_leaves_the_record_unchanged(self) -> None:
         reference = str(self.rows[0].id)
@@ -372,6 +343,31 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(errors.getvalue().splitlines(), [
             "unit-0: restart anomaly: unit-0: the staff worktree is unavailable"])
         self.assertEqual(shutdown_record.read(), [str(self.rows[0].id)])
+
+    def test_socketless_running_sessions_restart_or_print_and_unassigned_sessions_print_once(self) -> None:
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                records = self.records_for(self.running | {"orphan"})
+                records = [record for record in records if record["sessionId"] != self.rows[0].current_session]
+                orphan = next(record for record in records if record["sessionId"] == "orphan")
+                orphan.update(name="unassigned", cwd="/tmp/orphan")
+                with (patch.object(sessions, "_readable_records", return_value=records) as claude,
+                      patch.object(herdr, "running_codex_threads",
+                                   return_value={str(self.rows[0].current_session), "orphan", "codex-orphan"}) as codex,
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(sessions.live_sessions(), [])
+                    claude.reset_mock()
+                    self.assertEqual(restart.restart(stop_all=True, dry_run=dry_run), 0)
+                self.assertEqual(errors.getvalue().splitlines(), [
+                    "codex-orphan: restart anomaly: unassigned live session",
+                    "unassigned in /tmp/orphan: restart anomaly: unassigned live session"])
+                claude.assert_called_once_with()
+                codex.assert_called_once()
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f"{row.name}: {row.id}, {row.kind}, workspace live, tab {index} ({row.name})"
+                    if dry_run else f"{row.name}: restarted" for index, row in enumerate(self.rows, 1)])
+                self.assertEqual(self.stops, [] if dry_run else [str(row.id) for row in self.rows])
+                self.assertEqual([name for name, _place in self.launches], [] if dry_run else [row.name for row in self.rows])
 
     def test_restart_all_rerun_starts_only_the_rows_that_failed(self) -> None:
         launch = self.launch
