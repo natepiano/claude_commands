@@ -1383,24 +1383,29 @@ class LaunchDestinationTests(unittest.TestCase):
             started.assert_not_called()
             cast(Mock, client.close_retained_pane).assert_called_once_with("worker")
 
-    def test_existing_shell_removes_credentials_excluded_by_preparation(self) -> None:
+    def test_existing_shell_exports_account_environment_with_a_staff_row_lock(self) -> None:
         client = Mock(spec=herdr.Herdr)
         cast(Mock, client.panes).return_value = [{"pane_id": "worker", "terminal_id": "terminal-one"}]
         cast(Mock, client.pane_activity).return_value = herdr.PaneAtShell()
-        with (patch.object(herdr, "Herdr", return_value=client), patch.object(herdr.nix_env, "ensure", return_value=herdr.nix_env.NoEnvrc({"PATH": "/bin"})), patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
+        lock = "STAFF_ROW_FD_0e8d7a1b-61d3-464c-98df-92de4ec0114c"
+        with (patch.dict(os.environ, {lock: "99"}), patch.object(herdr, "Herdr", return_value=client), patch.object(herdr.nix_env, "ensure", return_value=herdr.nix_env.NoEnvrc({"PATH": "/bin", "CLAUDE_CONFIG_DIR": "/account", lock: "99"})), patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
             prepared = herdr.prepare_agent_environment("/tmp", {}, frozenset({"EXCLUDED_TOKEN"}))
             self.assertIsInstance(prepared, herdr.PreparedAgentEnvironment)
             _ = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
-                cast(herdr.PreparedAgentEnvironment, prepared), "codex", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
+                cast(herdr.PreparedAgentEnvironment, prepared), "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
         command = cast(list[str], cast(Mock, client.run_in_pane).call_args.args[1])
         removed = command[1].split("unset ", 1)[1].split(" && export", 1)[0].split()
+        self.assertNotIn(lock, removed)
+        self.assertNotIn(lock, herdr.child_environment({lock: "99"}))
         self.assertIn("EXCLUDED_TOKEN", removed)
         self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", removed)
-        check = "import os; print(os.environ.get('EXCLUDED_TOKEN', 'absent'), os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', 'absent'), os.environ.get('HERDR_PANE_ID', 'absent'))"
-        shell = subprocess.run(["/bin/sh", "-c", command[1] + "; " + shlex.join([sys.executable, "-c", check])],
+        check = "import os; print(os.environ.get('EXCLUDED_TOKEN', 'absent'), os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', 'absent'), os.environ.get('HERDR_PANE_ID', 'absent'), os.environ.get('CLAUDE_CONFIG_DIR', 'absent'))"
+        probe = shlex.join([sys.executable, "-c", check])
+        script = "claude() { " + probe + "; }\nalias claude=" + shlex.quote("CLAUDE_CONFIG_DIR=/wrong " + probe) + "\n" + command[1] + "\nclaude\n"
+        shell = subprocess.run(["zsh", "-c", script],
             env={**os.environ, "EXCLUDED_TOKEN": "stale", "CLAUDE_CODE_OAUTH_TOKEN": "stale", "HERDR_PANE_ID": "worker"},
             capture_output=True, text=True, check=True)
-        self.assertEqual(shell.stdout.strip(), "absent absent worker")
+        self.assertEqual(shell.stdout.strip(), "absent absent worker /account")
 
     def test_agent_exit_or_pid_reuse_before_cleanup_never_signals_the_shell(self) -> None:
         identity = herdr.AgentProcessIdentity(456, 789)

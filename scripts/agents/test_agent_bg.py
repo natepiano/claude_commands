@@ -94,6 +94,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
                   "sessionId": identity, "name": "fresh-impl", "entrypoint": "cli",
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
+            "CONF_DIR": str(CHECKOUT / "config"),
             "CLAUDE_BIN": str(backend), "AGENT_BG_ROLE": "impl", "AGENT_BG_DETACH": "1", "AGENT_BG_SEND_SCRIPT": str(sender),
             "FIXTURE_CHECKOUT": str(CHECKOUT), "FIXTURE_NATIVE_ID": identity,
             "FIXTURE_BACKEND_LOG": str(backend_log), "FIXTURE_SENT": str(sent),
@@ -124,6 +125,38 @@ class NativeClaudeWorkerTests(StaffTestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn("--session-id", cast(list[str], calls[0]["arguments"]))
         self.assertEqual(calls[0]["STAFF_ID"], "")
+
+    def test_worker_waits_for_its_registry_record_after_the_banner_then_publishes(self) -> None:
+        fake_modules = self.root / "fake-modules"
+        fake_modules.mkdir()
+        reads = self.root / "registry-reads"
+        _ = (fake_modules / "sitecustomize.py").write_text('''import os
+from pathlib import Path
+from scripts.message import sessions
+
+if os.environ.get("BG_ID"):
+    read_registry = sessions.read_registry
+    read_count = 0
+    def delayed_registry():
+        global read_count
+        read_count += 1
+        with Path(os.environ["FIXTURE_REGISTRY_READS"]).open("a") as output:
+            output.write("empty\\n" if read_count <= 2 else "ready\\n")
+        return sessions.RegistryRead((), ()) if read_count <= 2 else read_registry()
+    sessions.read_registry = delayed_registry
+''')
+        result = self.launch(PYTHONPATH=os.pathsep.join((str(fake_modules), str(CHECKOUT))),
+                             FIXTURE_REGISTRY_READS=str(reads), CLAUDE_CODE_CHILD_SESSION="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = cast(list[str], self.backend_calls()[0]["arguments"])
+        settings = cast(dict[str, object], json.loads(arguments[arguments.index("--settings") + 1]))
+        self.assertNotIn("CLAUDE_CODE_CHILD_SESSION", cast(dict[str, str], settings["env"]))
+        self.assertEqual(reads.read_text().splitlines(), ["empty", "empty", "ready"])
+        row = staff.by_id(staff.StaffId(self.fixture.identity))
+        assert row is not None
+        self.assertEqual((row.name, row.parent), ("fresh-impl", self.fixture.unit.id))
+        self.assertTrue(self.fixture.sent.exists())
+        self.assertEqual(len(self.backend_calls()), 1)
 
     def test_refused_claude_permission_starts_nothing_and_writes_no_worker_row(self) -> None:
         _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.work), expected=self.fixture.unit.worktree)
