@@ -85,6 +85,25 @@ class ShowrunnerRecord(TypedDict):
 
 
 class ColorTests(unittest.TestCase):
+    def test_direct_jq_without_a_label_shows_only_the_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            colors = Path(directory) / "statusline.conf"
+            _ = colors.write_text("role.showrunner=purple\n", encoding="utf-8")
+            for arguments in ([], ["--arg", "assignment", ""]):
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(
+                        ["jq", "-r", "--arg", "pwd", "/tmp/fallback",
+                         "--arg", "role", "showrunner", *arguments,
+                         "--rawfile", "colors", str(colors), "-f", str(PROGRAM)],
+                        input=json.dumps({"workspace": {"current_dir": "/tmp/project"}}),
+                        capture_output=True, text=True, check=True,
+                        env={"PATH": os.environ["PATH"]},
+                    )
+                    line = result.stdout.splitlines()[0]
+                    self.assertEqual(line, "/tmp/project")
+                    self.assertNotIn(" | ", line)
+                    self.assertNotIn("\x1b", line)
+
     def test_direct_jq_colors_the_entire_staff_assignment(self) -> None:
         line = status_lines({"session_id": UNIT.id}, colors=SHIPPED_COLORS, staff_text=staff_text(OWNER, UNIT))[0]
         self.assertEqual(line.split(" | ")[0], "\x1b[33munit for show\x1b[0m")
