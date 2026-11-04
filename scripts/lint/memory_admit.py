@@ -54,7 +54,6 @@ if TYPE_CHECKING:
     from ..buildlog import record as record
     from ..buildlog import store as store
     from ..buildlog import index
-
     file_marks = index
 else:
     import parse
@@ -1688,14 +1687,9 @@ class ProgramProfile:
         return "full"
 
 
-def anonymous_history_rows(source: Path | BinaryIO) -> Iterator[dict[str, object]]:
-    """Read whole anonymous-history rows; an open handle must already be locked."""
-    if isinstance(source, Path):
-        with source.open("rb") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            yield from anonymous_history_rows(handle)
-        return
-    yield from store.whole_rows(source, 0)
+def anonymous_history_rows(path: Path) -> Iterator[dict[str, object]]:
+    """Read complete anonymous-history rows under a shared lock."""
+    return store.locked_rows(path)
 
 
 def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
@@ -1703,20 +1697,17 @@ def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
     """Read one program's peak history, without using cargo estimates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []
-    try:
-        for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
-            try:
-                if row.get("host") != host or row.get("step") != program:
-                    continue
-                peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
-                if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
-                    continue
-                if cutoff <= datetime.fromisoformat(ended.replace("Z", "+00:00")) <= now:
-                    peaks.append(peak)
-            except (ValueError, TypeError, AttributeError):
+    for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+        try:
+            if row.get("host") != host or row.get("step") != program:
                 continue
-    except FileNotFoundError:
-        pass
+            peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
+            if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
+                continue
+            if cutoff <= datetime.fromisoformat(ended.replace("Z", "+00:00")) <= now:
+                peaks.append(peak)
+        except (ValueError, TypeError, AttributeError):
+            continue
     return MeasuredProgramPeak(percentile(peaks), len(peaks)) if peaks else FirstProgramPeak(first_peak_bytes)
 
 
@@ -2571,6 +2562,7 @@ def current_worktree_steps(root: Path, host: str, worktree: str,
     The index is only an acceleration: missing, replaced or incompatible data
     makes us read the canonical file instead. Partial or corrupt tails refuse
     freshness rather than hiding a more recent build.
+    This reader holds one lock for os.fstat and file_marks.marks and rejects partial tails that whole_rows skips.
     """
     prefixes: dict[str, tuple[int, str]] = {}
     indexed: dict[str, list[dict[str, object]]] = {}
