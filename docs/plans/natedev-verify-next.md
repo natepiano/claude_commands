@@ -6,7 +6,7 @@
 
 **Today:** the Mac takes one claim per repository (`docs/as-built/mac-test-offload.md`), because two runs of one repository share one mirror and one build folder.
 
-**Needed:** a second cargo-liner claim with its own mirror and build folder, kept inside the Mac free-space floor (`free_floor_gib=100`; cargo-liner build budget default 24 GiB). Hana stays at one. The memory rule "max one hana + one cargo-liner job" changes with it. Use the existing slot allocation and claim adoption code. Enable two cargo-liner slots on the Mac with separate mirrors and build folders. Keep Hana at one slot. Test `claim-wait`, `--from-pid`, memory limits, and disk limits for both slots.
+**Needed:** a second cargo-liner claim with its own mirror and build folder, kept inside the Mac free-space floor (`free_floor_gib=100`; cargo-liner build budget default 24 GiB). Hana stays at one. The memory rule "max one hana + one cargo-liner job" changes with it. Make each mirror and build folder through copies.py (after Phase 35 in natedev-verify). Reuse the slot allocation and claim adoption code, with no other copy maker. Enable two cargo-liner slots on the Mac with separate mirrors and build folders. Keep Hana at one slot. Test `claim-wait`, `--from-pid`, memory limits, and disk limits for both slots.
 
 ## Pair a literal with an imported crate constant
 
@@ -61,9 +61,9 @@
 2. `from scripts.style import bulk_run as run`, then `run.git(...)`.
 3. An import inside a function.
 
-**Needed:** the guard refuses a tree-making git call through each form above, with the local-shadowing rule from phase 18 kept.
+**Needed:** the guard refuses a tree-making git call through each form above, through alias reimports, and through `global` and `nonlocal` bindings. The local-shadowing rule from phase 18 stays.
 
-**Acceptance:** one regression test per form, each fails on the old guard; one shadowed-name test stays clean; the copies and guard suites pass.
+**Acceptance:** one regression test per binding form, each fails on the old guard; valid shadowed-name cases stay clean; the copies and guard suites pass.
 
 **Due:** the next verify-unit checkpoint after phase 18.
 

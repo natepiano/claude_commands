@@ -632,9 +632,7 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 - `docs/as-built/mac-test-offload.md` — the idle Mac watch section
 - `docs/as-built/build-targets.md` — idle watch lines
 
-**Workers:** 2 writers (no test lane: Python tests sit beside their modules).
-- `impl` — `scripts/buildlog/mac_idle.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/buildlog/index.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/test_mac_test.py`, `scripts/notify/push_texts.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, both as-built docs; hub: `scripts/buildlog/mac_idle_alert.py` (both views read it; `impl` writes it first, from Spec 6, and the other writer asks for any change).
-- `test` — opens as impl — `scripts/build_queue/build_queue.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_targets/build_targets.py`, `scripts/build_targets/test_build_targets.py`, `commands/build/queue.md`, `commands/build/status.md`; codes against the Spec 6 API and writes a fixture `alert.json` for its tests.
+**Workers:** 1 writer, `impl`, for the closure checks: compare the shipped code with the acceptance gate, then add the two view checks and the admission-error recovery check. The Spec and Files above describe the code that shipped on the Phase 20 branch.
 
 **State:** `~/.local/state/mac-idle/alert.json` (rewritten each pass), `idle.json` (outage `since`), the `messaged`/`pushed` marks, the send keys `mac-idle-showrunner-<since>` and `mac-idle-<since>` in send.py state, and the `emergencies.json` record that `--clears-when` adds. A rerun of a pass with the same files sends nothing more and writes the same result.
 
@@ -715,9 +713,7 @@ Start reasons, by class (evidence at e6f8540f):
 - `docs/as-built/mac-test-offload.md` — the decision point text
 - `docs/as-built/build-targets.md` — the routing and leave lines
 
-**Workers:** 2 writers (no test lane: Python tests sit beside their modules; shell tests are `scripts/direct/test_verify_*.py`). No hub file: the Spec 3 row form is the interface.
-- `impl` — `scripts/build_targets/build_targets.py`, `scripts/build_targets/test_build_targets.py`, `docs/as-built/mac-test-offload.md`, `docs/as-built/build-targets.md`.
-- `test` — opens as impl — `scripts/direct/verify.sh`, `scripts/direct/test_verify_mac_start_decline.py`; codes against the Spec 3 row form. Its tests use the real `build_targets.py`, so they pass only when `impl` is done.
+**Workers:** 1 integration writer (`impl`) and 1 tester (`test`). Before dispatch, cut Spec 2-5 to the start declines that Phase 27 does not cover. Phase 27 removes the 180 s delay for a disk decline, so `RetryTarget` and the 180 s start deadline are not built unless a case still needs them.
 
 **State:** the step record `runs_on` in `~/.local/state/verify-steps/<call>.json` (now `mac_allowed` for a short-term decline) and the `mac_idle.py register` record with its retry deadline. Each is written once per call, as for an `eligible` row now. No new file, lock or mark. A rerun is a new call with a new record.
 
@@ -738,91 +734,57 @@ Start reasons, by class (evidence at e6f8540f):
 - basedpyright `0 errors, 0 warnings, 0 notes` on every changed Python file and its callers (`scripts/build_hold/hold_applies.py`, `scripts/direct/local_release_wait.py`, `scripts/production/merge_gate.py`); `bash -n scripts/direct/verify.sh`; `shellcheck scripts/direct/verify.sh` with no new findings.
 - Merge gate `--tests-only` green on a tree merged with `origin/natedev`. The checkpoint notice names the also-touches paths `scripts/build_targets/build_targets.py` and `scripts/build_targets/test_build_targets.py`, owner queue-unit.
 
-### Phase 18 — One standing gate checkout per unit, made only by copies.py  · status: todo
+### Phase 18 — One standing gate checkout per unit, made only by copies.py  · status: done
 
-**Origin:** builds showrunner ruling, 2026-10-31 08:2x EDT, after the user: "i asked for this change days ago - i need an accelerated plan for this feature - i have waited too long - if we were single threaded you would have already updated the script and it would just be running", and before that: "why would we have copies of anything didn't you get my message about duplication?". The ruling replaces the six-phase copies plan (`docs/plans/verify-copies.md`) and the old Phases 18 and 19 (named frozen copies, seeded targets). One script, one checkpoint. Seed3 and the seed rule are dropped: a standing tree builds cold once and stays warm. Mac mirrors are a later checkpoint. Builds approves every outside path under `--also`. Built on branch `verify-copies`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-copies`.
+#### As-built
 
-**Why.** Today agents make a new tree for each gate, review, merge and land by hand (memory notes `gate-copy-needs-own-git`, `shared-module-full-gate`), and six scripts make their own. In 2026-10-24..31 the build log shows 513 new build folders whose first builds took 93.7 h; 401 of them (89.9 h) are gate-type copies one standing tree serves. `/tmp/claude*` holds 628 git copies (172 GiB) and 107 targets (150 GiB); `/` is under its 300 GiB floor.
+Checkpoint `f8a20f368` on `verify-copies`.
 
-**Spec.**
+- `copies.standing(owner, repo, commit, *, apply_uncommitted=None, merge=None)` supplies two checkouts with separate Git directories and retained targets.
+- The configured root contains `<repo>/<owner>-gate` and `<owner>-gate-2`. A third caller waits; linked sources use the canonical repository name.
+- Each use fetches, detaches and cleans untracked files without deleting ignored output. Uncommitted changes precede the optional merge.
+- `run`, `list` and `remove` share this implementation. Commands receive `{tree}` substitution; refusals exit 2, apply or merge failures exit 3.
+- Existing busy flocks protect preparation and use. Commands inherit their descriptors, so wrapper death cannot release a surviving command's lock.
+- Atomic `.gate.json` publication and `.removing` directories permit retries. A replacement source rebuilds Git metadata without deleting the target.
+- `PostUseError` preserves a caller's error separately from cache or record failures. Applied untracked files receive current modification times.
+- `config/copies.conf`, read through `scripts.lib.conf`, supplies `root`, `wait_seconds`, `git_timeout_seconds`, `guard_timeout_seconds`, fallback owners and creator exceptions.
+- The shipped secondary recheck interval is one second. Primary release wakes acquisition immediately; the checkout count is fixed at two.
+- CI, nightly, scratch, style and toolchain callers use the service. Both agent hook fronts and the repository scanner use the copy guard.
+- Crate frozen bases and integration proofs use standing checkouts. Editable package workers use `copies.workspace()` and caller-owned `gate:` tasks.
+- Worker names are `crate-<run>.<package>`. One canonical owner reaches nested proofs; initialized workers retain edits during resume.
+- Legacy manifest paths remain authoritative. Adoption validates source, branch and base; terminal cleanup preserves busy or unsaved workers and external result evidence.
 
-1. **Place and name.** A standing checkout lives at `~/worktrees/gates/<repo>/<owner>-gate`, and a second one at `<owner>-gate-2`. `<repo>` is the source repository's folder name (`.claude`, `hana`, `cargo-liner`). `<owner>` is a unit or production name (`verify-unit`, `builds`), never a phase, run or session id; copies.py refuses an owner that is not `[a-z0-9][a-z0-9-]*`. `~/worktrees` is already a trusted direnv root (`nix_env.py` `trusted_root`), so `.envrc` loads.
-2. **Own git.** The first use makes the tree with `git clone --shared --no-checkout <source> <path>`, so it has its own `.git` and never moves a source branch. Later uses reuse it.
-3. **Reset to a commit, keep the build files.** Each use: `git -C <tree> fetch -q <source> <rev>`; `git checkout -q --force --detach <commit>`; `git clean -ffdq` (no `-x`, so ignored `target/` stays). Git rewrites only changed files, so the next cargo build is incremental. The tree's `target/` is marked with `scratch.mark_cargo_cache` after each use, so the floor sweep may take an idle standing target (a cold rebuild, never a broken tree) and never a busy one.
-4. **Busy lock.** A use holds the existing busy mark (`scratch.busy_locks`, `.claude-busy`, flock) on the tree for its whole life. A caller tries `<owner>-gate`, then `<owner>-gate-2`, without waiting; when both are busy it waits for the first to free and prints one line saying which tree it waits on and who holds it. No third tree.
-5. **Optional steps in the tree, in this order:** `--apply-uncommitted <worktree>` commits that worktree's staged, unstaged and untracked (not ignored) changes on top of the commit (`--no-verify`, subject `gate: uncommitted <worktree> at <short sha>`); `--merge <ref>` fetches the ref from the source and merges it `--no-ff --no-edit`. A failed apply or a merge conflict exits 3, names the files, and leaves the lock released and the tree to be reset on next use.
-6. **Commands.**
-   - `copies.py run --owner O --repo R --commit C [--apply-uncommitted W] [--merge REF] -- <cmd> ...`: take the tree, do steps 3 and 5, run the command in it with `{tree}` in any argument replaced by the tree path, release, exit with the command's code. This one line replaces every hand gate recipe, e.g. `copies.py run --owner verify-unit --repo ~/worktrees/claude-build-followups-verify --commit HEAD --apply-uncommitted ~/worktrees/claude-build-followups-verify --merge origin/builds -- python3 ~/.claude/scripts/production/merge_gate.py --checkout {tree} --tests-only`.
-   - `copies.py list`: one row per standing tree: path, owner, repo, commit, busy or idle and holder pid, target size.
-   - `copies.py remove --owner O --repo R`: delete that owner's trees when idle; a busy tree is refused with exit 2.
-   - Python API for script callers: `with copies.standing(owner, repo, commit, *, apply_uncommitted=None, merge=None) as tree:`. `run` uses it; there is one implementation.
-   - A rerun of any command with the same inputs changes nothing more and exits 0.
-7. **Record.** Each tree has one small record (`.gate.json` in the tree, ignored by git through `info/exclude`): owner, repo, source, last commit, last use time, last holder pid. `list` reads it. No central registry.
-8. **Callers switched in this checkpoint** (all in this repo; builds approves the paths):
-   - `scripts/production/ci_points.py:162` (CI point), `scripts/production/merge_gate.py:1572` (nightly gate), `scripts/production/waiting.py:277` (scratch test): owner = the production name.
-   - `scripts/style/bulk_run.py:622`, `scripts/style/style_sync.py:364`: owner = the unit or production that runs them, from the caller's existing context.
-   - `scripts/buildlog/rust_release.py:333` (toolchain trial): owner `toolchain-trial`; its target stays its own.
-   - Hand recipes: every doc, command and prompt text under `docs/`, `commands/` and `scripts/` that tells an agent to `git clone --shared`, `git worktree add`, `cp -a` a repo, or make a `gate_tree`/`review_copy`, is rewritten to the `copies.py run` form. The unit director rewrites the two memory notes.
-9. **Guard.** One module, `scripts/copies/copy_guard.py`, holds the rule and the allow list. (a) A PreToolUse Bash hook refuses a command that makes a repository tree (`git clone`, `git worktree add`, `cp -a`/`cp -r`/`rsync -a` whose source holds a `.git`) unless the command runs `copies.py`; the refusal names `copies.py run` and one example. (b) A repository test scans `scripts/` for `git clone`, `worktree add`, `copytree` of a repo and `cp -a` of a repo, and fails outside the allow list. Allow list: `copies.py`, `add_unit.py`, `resume_unit.py` (unit worktrees, the originals), `mac_test/offload.py` and `production/mac_run.sh` (Mac mirrors, later checkpoint), `direct/verify.sh` doc checkout (already standing). Each entry has a one-line reason.
-10. **Doc.** `docs/as-built/frozen-copies.md` is renamed `docs/as-built/gate-checkouts.md` and rewritten: place and name, reset, lock and the second tree, the commands and exits, the guard and its allow list, and the cases left out (below).
+**Files:**
 
-**Left out, named in the notice.** Before/after pairs side by side (they run in turn in one tree, or use the second tree); the Mac (later checkpoint); more than two builds at once in one unit (the third waits). Old copies under `/tmp` are not deleted by this checkpoint; the floor sweep takes them.
+- `scripts/copies/{copies,copy_guard,shell_syntax}.py`, their tests and `config/copies.conf` — checkout lifetimes, creation policy and configuration.
+- `scripts/lib/scratch.py`, `scripts/lint/sweep.py` and their tests — inherited busy descriptors, task cleanup and configured cache discovery.
+- `scripts/production/{ci_points,merge_gate,waiting}.py`, `scripts/buildlog/rust_release.py` and tests — standing callers and verdict preservation.
+- `scripts/style/{bulk_run,style_sync,crate_run}.py` and tests — retained targets, canonical ownership and editable worker recovery.
+- `scripts/hooks/{hook_dispatch,codex_hooks}.py` and tests — the combined copy and scratch guard.
+- `docs/as-built/gate-checkouts.md`, caller documentation and command recipes — checkout use, original-worktree exceptions and non-Git reproduction.
 
-**Assertion changes (director rulings after review pass 1).** Each line below is approved: the old assertion checked the old copy mechanism, and the new one checks the same behavior through the standing checkout. Two changes were not approved as first written: the scratch-test verdict when the post-use step fails (`test_waiting.py`), and the style lint holding its own tree busy and freeing it after (`test_style_sync.py`). Fix round 1 restored both protections in new tests (`test_scratch_post_use_failure_preserves_green_and_red_verdicts`; explicit busy and released checks in the style tests), and the closure rulings below approve the migrated tests.
+**Binds later work:** The checkout APIs own repository creation. Broader guard import coverage remains in `docs/plans/natedev-verify-next.md`.
 
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_finished_trial_records_counts_sizes_and_one_result_text — old: assertFalse(clone.exists()) — new: assertTrue((clone / ".git").is_dir()) at worktrees/gates/hana/toolchain-trial-gate — why: the standing checkout stays with its own git after a trial (Spec 2, 3).
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_finished_trial_records_counts_sizes_and_one_result_text — old: calls == [rustup, git, git, git, nix, cargo] — new: calls == [rustup, git, nix, cargo] — why: clone and checkout moved into copies.standing; rev-parse still runs, and clippy still runs in the checkout (assertEqual(clone, clippy[1]) kept).
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_stale_trial_clone_is_removed_before_commands_and_after_success -> test_next_trial_resets_sources_and_keeps_its_build_cache — old: stale clone absent before rustup — new: second trial passes and untracked stale-output is gone — why: a reset to the commit replaces deletion as the guard against leftover state (Spec 3).
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_stale_trial_clone_is_removed_before_commands_and_after_success -> test_next_trial_resets_sources_and_keeps_its_build_cache — old: assertFalse(clone.exists()) after success — new: target/warm reads "retained" after the second trial — why: Spec 3 keeps ignored target/ across uses.
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_mend_nonzero_finishes_and_text_says_does_not_build — old: assertFalse(clone.exists()) — new: assertTrue((clone / ".git").is_dir()) — why: the standing checkout stays after every outcome.
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_failed_clippy_step_records_first_error_and_is_not_retried — old: assertFalse(clone.exists()) — new: assertTrue((clone / ".git").is_dir()) — why: the standing checkout stays after every outcome; the no-retry check is kept.
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_killed_trial_waits_and_retries_next_night — old: assertFalse(clone.exists()) — new: assertTrue((clone / ".git").is_dir()) — why: the standing checkout stays after every outcome; the wait and retry checks are kept.
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_hold_arriving_mid_trial_deletes_clone_and_leaves_pending -> test_hold_arriving_mid_trial_leaves_pending_before_checkout — old: assertFalse(clone.exists()); calls == [rustup, git(clone)] — new: same text; git is now rev-parse and the hold stops the trial before copies.standing — why: no per-run clone exists to delete; waiting state and reason checks are kept.
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_timeout_deletes_clone_and_records_failed_step -> test_timeout_releases_checkout_and_records_failed_step — old: assertFalse(clone.exists()) — new: assertTrue((clone / ".git").is_dir()) plus assertGreater(target_gib, 0) — why: the checkout stays; the added size check makes the test stronger.
-- Assertion-Change: scripts/buildlog/test_rust_release.py::RustReleaseTests.test_hold_after_nonzero_clippy_keeps_trial_waiting_and_deletes_clone -> test_hold_after_nonzero_clippy_keeps_trial_waiting_and_checkout — old: assertFalse(clone.exists()) — new: assertTrue((clone / ".git").is_dir()) — why: the standing checkout stays; the waiting-state and last-call checks are kept.
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_a_contained_validated_commit_passes_after_the_branch_moves_without_pushing — old: assertFalse(Path(observed["directory"]).exists()) — new: assertTrue((Path(observed["directory"]) / ".git").is_dir()) — why: validation runs in a standing checkout that stays; the push and source checks are kept.
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_a_validation_fix_fast_forwards_an_unchanged_remote_branch — old: assertFalse(Path(observed["directory"]).exists()) — new: assertTrue((Path(observed["directory"]) / ".git").is_dir()) — why: same; the fast-forward and publish checks are kept.
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_rerun_after_a_pushed_fix_with_no_handoff_reuses_the_fix_commit — old: assertFalse(Path(validation_observation()["directory"]).exists()) — new: assertTrue((... / ".git").is_dir()) — why: the standing checkout stays between attempts.
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_rerun_after_a_pushed_fix_with_no_handoff_reuses_the_fix_commit — old: no attempt directory exists — new: every attempt directory has its own .git and all attempts use one path — why: the one-path check proves reuse, which is stronger than deletion (Spec 2).
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_retry_after_a_failed_push_publishes_the_existing_fix_without_a_sibling_commit — old: assertFalse(Path(validation_observation()["directory"]).exists()) — new: assertTrue((... / ".git").is_dir()) — why: the standing checkout stays between attempts.
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_retry_after_a_failed_push_publishes_the_existing_fix_without_a_sibling_commit — old: no attempt directory exists — new: every attempt directory has its own .git and all attempts use one path — why: same reuse proof as the rerun test.
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_a_merge_landing_while_ci_publish_waits_for_the_lock_is_preserved — old: assertFalse(Path(observed["directory"]).exists()) — new: assertTrue((Path(observed["directory"]) / ".git").is_dir()) — why: the checkout stays; the merge-lock and push checks are kept.
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_a_validation_fix_cannot_overwrite_a_branch_that_moves_during_validation — old: assertFalse(Path(observed["directory"]).exists()) — new: assertTrue((Path(observed["directory"]) / ".git").is_dir()) — why: the checkout stays; the branch-movement checks are kept.
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_validation_uses_a_private_copy_and_leaves_the_production_checkout_unchanged — old: assertFalse(Path(observed["directory"]).exists()) — new: assertTrue((Path(observed["directory"]) / ".git").is_dir()) — why: the checkout stays; the source HEAD, status and file checks are kept.
-- Assertion-Change: scripts/production/test_ci_points.py::CiPointsTests.test_a_failed_validation_removes_its_private_copy_without_pushing -> test_a_failed_validation_keeps_its_private_checkout_without_pushing — old: assertFalse(Path(observed["directory"]).exists()) — new: assertTrue((Path(observed["directory"]) / ".git").is_dir()) — why: a failed use leaves the tree for the next reset (Spec 3); the no-push checks are kept.
-- Assertion-Change: scripts/production/test_merge_gate_ledger.py::MergeGateLedgerTests.test_nightly_uses_a_disposable_shared_clone_and_marks_and_notifies_only_red -> test_nightly_reuses_a_standing_checkout_and_marks_and_notifies_only_red — old: no nightly copy exists after the run — new: every copy has its own .git and both runs use one path — why: nightly reuses one standing checkout; the alternates, clean-HEAD, source, marker and notice checks are kept.
-- Assertion-Change: scripts/style/test_bulk_run.py::WorkspaceRunTests.test_workspace_validation_runs_once_and_one_clean_test_commit_merges_all_decisions — old: assertFalse(runner.test_checkout.exists()) — new: assertTrue((runner.test_checkout / ".git").is_dir()) — why: the gate checkout stays; the tested-tree and one-commit checks are kept.
-- Assertion-Change: scripts/style/test_bulk_run.py::WorkspaceRunTests.test_tested_tree_proof_rejects_drift_after_each_command — old: assertFalse(runner.test_checkout.exists()) — new: assertTrue((runner.test_checkout / ".git").is_dir()) — why: a drifted tree stays and is reset on the next use; the drift refusal per stage is kept.
-- Assertion-Change: scripts/style/test_bulk_run.py::WorkspaceRunTests.test_hidden_untracked_test_output_never_publishes_or_keeps_the_batch_commit — old: assertFalse(runner.test_checkout.exists()) — new: assertTrue((runner.test_checkout / ".git").is_dir()) — why: the checkout stays; require_test_tree forces status.showUntrackedFiles=all, so the hidden-output config left in the standing .git cannot hide a later drift; the publish refusal checks are kept.
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_clean_check_mode_records_all_tools_passing_and_returns_zero — old: verifier probes ../owner.json and ../VERIFIER_FILE — new: verifier probes <lint-temp>/<LINT_PREFIX>*/owner.json and VERIFIER_FILE — why: the checkout is no longer inside the metadata dir; the owner pid, repo and verifier pid checks are unchanged.
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_shared_target_survives_task_end_and_reuses_artifacts -> test_standing_target_survives_task_end_and_reuses_artifacts — old: target from style_sync.lint_target(common) — new: target from standing_target(); assertions unchanged — why: the target now belongs to the standing checkout.
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_lint_links_a_warm_target_and_cleanup_keeps_it_until_the_production_ends -> test_lint_keeps_its_own_warm_target_after_metadata_cleanup — old: shell [[ -L target ]] — new: shell [[ -d target && ! -L target ]] — why: the standing checkout owns a real target dir; the later read of standing_target()/artifact proves it is that dir.
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_lint_links_a_warm_target_and_cleanup_keeps_it_until_the_production_ends -> test_lint_keeps_its_own_warm_target_after_metadata_cleanup — old: shell [[ -L target && artifact == warm && CARGO_TARGET_DIR == inherited-value ]] — new: same with -d target && ! -L target — why: the warm artifact and no-override checks are kept.
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_a_missing_or_swept_target_runs_cold — old: shell [[ -L target && -d target && ! -e target/artifact ]] — new: shell [[ -d target && ! -L target && ! -e target/artifact ]] — why: cold state and the fresh artifact in standing_target() are still proved; note the new clean_verify fixture runs mkdir -p target first, so the -d part no longer tests the code.
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_replacing_the_target_link_cannot_grant_successful_lint_coverage -> test_redirecting_the_target_cannot_grant_successful_lint_coverage — old: mutation rm target; mkdir target — new: mutation rm -rf target; ln -s <outside> target — why: the forbidden change is now a redirected target; exit 1, the rewrite diagnostic and failed coverage rows are unchanged.
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_the_owner_record_exists_before_the_checkout_is_added — old: owner record equals (pid, common_dir) at git worktree add; exit 0 — new: test deleted — why: no worktree add on the source remains; the record is still written before the checkout link, and test_clean_check_mode pins owner pid and repo at verifier start.
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_a_locked_checkout_is_removed_with_its_registration -> test_standing_checkout_has_no_registration_in_the_source — old: verifier runs git worktree lock; registration list unchanged after cleanup — new: plain run; checkout has its own .git; registration list unchanged — why: a standing clone never registers in the source, so a locked registration cannot occur.
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_a_git_failure_in_cleanup_keeps_the_record_and_the_next_sweep_removes_the_registration -> test_a_git_failure_in_cleanup_keeps_metadata_until_the_next_sweep — old: assertNotEqual(worktree list, original) before sweep — new: assertEqual(worktree list, original) plus standing .git exists — why: no source registration exists; the kept-metadata line and next-sweep removal checks are kept.
-- Assertion-Change: scripts/lib/test_scratch.py::ScratchTests.test_style_build_folder_helper_creates_a_stamped_cache_the_sweep_accepts -> test_standing_checkout_creates_a_stamped_cache_the_sweep_accepts — old: sweep accepts lint_target cache ("helper's cache") — new: sweep accepts copies.standing target ("standing cache"); same predicate — why: copies now supplies the cache marks; the no-rustc-info and fresh use-stamp checks are kept.
-- Assertion-Change: scripts/lint/test_sweep.py::FloorTests.test_floor_keeps_a_style_target_only_while_its_sync_lock_is_held -> test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy — old: holder.stdout not None; holder prints "locked"; holder exit 0 — new: removed with the helper process; copies.standing holds the real busy flock — why: the checks were harness sanity for the removed sync.lock driver; flock conflicts across open files in one process, so the busy proof is real.
-- Assertion-Change: scripts/lint/test_sweep.py::FloorTests.test_floor_keeps_a_style_target_only_while_its_sync_lock_is_held -> test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy — old: assertTrue(lock.is_file()) for sync.lock — new: assertTrue((checkout / scratch.BUSY).is_file()) — why: the busy mark replaces sync.lock (Spec 4).
-- Assertion-Change: scripts/lint/test_sweep.py::FloorTests.test_floor_keeps_a_style_target_only_while_its_sync_lock_is_held -> test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy — old: assertTrue(output.exists()) while held, "style target" message — new: same predicate, "standing target" message — why: the floor still keeps a busy target.
-- Assertion-Change: scripts/lint/test_sweep.py::FloorTests.test_floor_keeps_a_style_target_only_while_its_sync_lock_is_held -> test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy — old: assertFalse(output.exists()) after release, "unlocked sync.lock" message — new: same predicate, "idle standing checkout" message — why: the floor still takes an idle target (Spec 3).
-- Assertion-Change: scripts/lint/test_sweep.py::FloorTests.test_floor_finds_and_reclaims_an_idle_retained_style_target -> test_floor_finds_and_reclaims_an_idle_retained_standing_target — old: target from style_sync.lint_target — new: target from copies.standing; assertions unchanged — why: discovery, no-rustc-info, reclaim and trim-row checks are unchanged.
-- Assertion-Change: scripts/copies/test_copies.py::test_configured_root_and_pool_size_are_used_without_code_changes — old: a configured pool size makes a third checkout `-gate-3` — new: the configured root is used and only `-gate` and `-gate-2` exist; the pool-size setting is removed — why: the design fixes the count at two (F008), so a knob for it is removed, not refused.
-- Assertion-Change: scripts/hooks/test_codex_hooks.py (GUARD_COMMAND, GUARD_GROUP) — old: the scratch guard script is the Bash guard command — new: `scripts/copies/copy_guard.py` is the one combined Bash guard front (copy rule, then the existing scratch rule), with the same trust count, RPC order and configured time limit — why: Codex must run the copy guard (F007) inside the fixed hook time budget (F013).
-- Assertion-Change: scripts/hooks/test_hook_dispatch.py (registration equality) — old: last PreToolUse row runs the scratch guard file — new: same matcher and time limit, file `../copies/copy_guard.py` — why: same combined front as above.
-- Assertion-Change: scripts/production/test_waiting.py::WaitingTests.test_scratch_cleanup_failure_prints_verdict_before_cleanup_failure -> test_scratch_uses_no_worktree_cleanup_and_reuses_the_checkout — old: exit 2, two lines, the second "failed — temporary worktree cleanup" — new: exit 0, one line, both runs use the same checkout path — why: the standing checkout has no worktree to clean up; the post-use failure verdict is checked in test_scratch_post_use_failure_preserves_green_and_red_verdicts (closure ruling).
-- Assertion-Change: scripts/style/test_style_sync.py::StyleSyncTests.test_a_sync_waits_for_the_target_lock_before_creating_its_checkout -> test_lint_takes_second_checkout_when_first_is_busy — old: the sync waits on the shared target lock (LOCK_EX) and lint temp stays empty — new: a busy first checkout sends lint to <owner>-style-gate-2, the two checkouts differ, exit 0 — why: two standing checkouts replace the shared target lock (closure ruling).
-- Assertion-Change: scripts/copies/test_copies.py::StandingTests.test_missing_or_invalid_required_configuration_refuses_before_clone — old: cases include standing_trees missing, "0" and "bad" — new: standing_trees cases removed; git_timeout_seconds "0"/"nan" and guard_timeout_seconds "inf" cases added; each case still exits 2 and makes no gates folder — why: F008 removes the pool-size setting (closure ruling).
-- Assertion-Change: scripts/copies/test_copy_guard.py::CopyGuardTests.test_scan_resolves_keyword_variable_and_multiline_argv_without_losing_git_options — old: the expected set of flagged files — new: the expected set also holds copy_attribute.py — why: the scan now resolves keyword, variable and multi-line argv forms and catches one more real copy; the test is stronger (closure 2 ruling).
-- Assertion-Change: scripts/copies/test_copy_guard.py (scanner equality assertion near :312, fed by the shared paired-policy case table) — old: expected set from the 35 earlier pairs — new: 17 more file/operation entries from the 29 round-3 pairs; the assertion expression is unchanged — why: the new pairs test the round-3 interpreter, heredoc, case and post-block cases; coverage is stronger (closure 3 ruling, F032).
+**Gotchas:** Standing targets can be swept while idle. Run workers need task completion evidence, not a fixed deadline. Guard coverage has documented syntax limits.
 
-**Acceptance.**
-- `test_copies.py`: first use makes the tree with its own `.git` (a source branch never moves); a second use at a new commit keeps unchanged file times and `target/`; a held tree sends the second caller to `-gate-2`; both held makes the third wait and then succeed; apply and merge steps; a conflict exits 3 and the next use resets clean; `list`, `remove` (busy refused); owner name refusal; `{tree}` substitution; a rerun changes nothing.
-- Guard tests: the hook refuses each tree-making form and passes `copies.py run`; the scan test passes on the tree and fails on a planted `git clone` outside the allow list.
-- Each switched caller's existing tests pass unchanged.
-- Live: the director runs this phase's own gate with `copies.py run` (verify-unit, this repo), twice: the second run builds nothing new and the tree path is `~/worktrees/gates/.claude/verify-unit-gate`.
+**Ruled out:** Named frozen gate copies, seeded targets, shared target directories, a third standing checkout, and a creator exception for crate runs.
+
+**Assertion-Change:** Checkout-retention, target-ownership, registration and cleanup assertions use the new lifetimes. The changed tests are:
+
+- `scripts/buildlog/test_rust_release.py`: `test_finished_trial_records_counts_sizes_and_one_result_text`, `test_next_trial_resets_sources_and_keeps_its_build_cache`, `test_mend_nonzero_finishes_and_text_says_does_not_build`, `test_failed_clippy_step_records_first_error_and_is_not_retried`, `test_killed_trial_waits_and_retries_next_night`, `test_hold_arriving_mid_trial_leaves_pending_before_checkout`, `test_timeout_releases_checkout_and_records_failed_step`, `test_hold_after_nonzero_clippy_keeps_trial_waiting_and_checkout`.
+- `scripts/production/test_ci_points.py`: `test_a_contained_validated_commit_passes_after_the_branch_moves_without_pushing`, `test_a_validation_fix_fast_forwards_an_unchanged_remote_branch`, `test_rerun_after_a_pushed_fix_with_no_handoff_reuses_the_fix_commit`, `test_retry_after_a_failed_push_publishes_the_existing_fix_without_a_sibling_commit`, `test_a_merge_landing_while_ci_publish_waits_for_the_lock_is_preserved`, `test_a_validation_fix_cannot_overwrite_a_branch_that_moves_during_validation`, `test_validation_uses_a_private_copy_and_leaves_the_production_checkout_unchanged`, `test_a_failed_validation_keeps_its_private_checkout_without_pushing`.
+- `scripts/production/test_merge_gate_ledger.py`: `test_nightly_reuses_a_standing_checkout_and_marks_and_notifies_only_red`.
+- `scripts/style/test_bulk_run.py`: `test_workspace_validation_runs_once_and_one_clean_test_commit_merges_all_decisions`, `test_tested_tree_proof_rejects_drift_after_each_command`, `test_hidden_untracked_test_output_never_publishes_or_keeps_the_batch_commit`.
+- `scripts/style/test_style_sync.py`: `test_clean_check_mode_records_all_tools_passing_and_returns_zero`, `test_standing_target_survives_task_end_and_reuses_artifacts`, `test_lint_keeps_its_own_warm_target_after_metadata_cleanup`, `test_a_missing_or_swept_target_runs_cold`, `test_redirecting_the_target_cannot_grant_successful_lint_coverage`, `test_the_owner_record_exists_before_the_checkout_is_added` (removed), `test_standing_checkout_has_no_registration_in_the_source`, `test_a_git_failure_in_cleanup_keeps_metadata_until_the_next_sweep`, `test_lint_takes_second_checkout_when_first_is_busy`.
+- `scripts/lib/test_scratch.py`: `test_standing_checkout_creates_a_stamped_cache_the_sweep_accepts`.
+- `scripts/lint/test_sweep.py`: `test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy`, `test_floor_finds_and_reclaims_an_idle_retained_standing_target`.
+- `scripts/copies/test_copies.py`: `test_configured_root_contains_only_the_two_standing_checkouts`, `test_missing_or_invalid_required_configuration_refuses_before_clone`, `test_legacy_workspace_keeps_commits_index_and_journal_and_ends_through_holds`.
+- `scripts/hooks/test_codex_hooks.py`: installation tests using `GUARD_COMMAND` and `GUARD_GROUP`.
+- `scripts/hooks/test_hook_dispatch.py`: `test_dispatch_tables_equal_legacy_files_matchers_and_timeouts`.
+- `scripts/production/test_waiting.py`: `test_scratch_uses_no_worktree_cleanup_and_reuses_the_checkout`.
+- `scripts/copies/test_copy_guard.py`: `test_scan_resolves_keyword_variable_and_multiline_argv_without_losing_git_options`, `test_shell_script_scan_retains_the_same_literal_and_executable_distinction`.
+- `scripts/style/test_crate_run.py`: `test_combined_test_failure_retains_pending_claims_for_resume`, `test_moved_destination_invalidates_prepared_combined_proof`, `test_other_crate_refresh_cannot_publish_stale_tested_candidate`.
+
 ### Phase 20 — Run clippy judgment first, fix only on a finding, and send Mac-allowed lint to a free Mac  · status: done
 
 #### As-built
@@ -957,3 +919,165 @@ Checkpoint 23aa6712f on `verify-idle-disk`.
 2. Every other decline reason is checked for the same gap. Each reason that can clear while a step waits gets the hook; each that cannot is named with its reason in the summary.
 
 **Acceptance gate:** a test that declines a step for disk, then frees the Mac, and sees the step leave for the Mac; it fails on the old code; the verify suites that cover routing pass; merge gate `--tests-only` green on the hotfix tree.
+
+### Phase 28 — Keep the cargo token from a Mac step to the next local step  · status: done
+
+#### As-built
+
+Checkpoint `3a005d504` on `verify-token-keep`.
+
+- `release_token()` writes `.given_back` when a shell releases the token. The parent formatter reads the mark and acquires the token again.
+- `acquire_token local` prevents a local formatter from entering remote routing.
+- `test_local_fmt_starts_after_mend_passes_on_the_mac` covers mend on the Mac followed by local fmt through the build-hold route.
+
+**Files:**
+
+- `scripts/direct/verify.sh` — shared release evidence and local formatter acquisition.
+- `scripts/direct/test_verify_token_mac_step.py` — Mac-to-local ownership through a build hold.
+
+**Binds later work:** Every release must remain visible across shells until acquisition succeeds.
+
+**Gotchas:** This checkpoint still consumes an existing release mark during a second release. The memory-wait route can still exit 125 at fmt.
+
+**Ruled out:** Blaming the original local-only token policy; the later direct Mac release introduced the missing evidence.
+
+### Phase 29 — A lint step that writes the tree stays on natedev, and a lost token is never cached  · status: todo
+
+**Origin:** builds showrunner, 2026-11-03 17:5x EST, hotfix. (a) When natedev is short of memory, `verify.sh lint` moves its `cargo mend --fix` step to the Mac, which runs `cargo mend --fail-on-warn` on a copy; the fixes never reach the local tree and lint fails "cargo mend --fix failed" (`/tmp/claude/unit/be6481c9-047e-4add-83c1-870d55a33343/mesh_runs/20261103T173621-1891872-f3b0.log`). (b) verify.sh caches status 125 (lost cargo token) as a tree failure, and the rerun replays it in 3 s (`.../mesh_runs/20261103T174215-2221502-c1fd.log`, `20261103T174635-2374268-0980.log`).
+
+**Depends on:** none (hotfix from origin/builds).
+
+#### Work Order
+
+1. A step that writes to the tree (mend `--fix`, fmt, clippy `--fix`) never moves to the Mac; it waits in the natedev queue. Fix it where the offload decision lives (verify.sh near line 1747 maps `mend-check:--fail-on-warn`). Say whether Phase 20's Mac-allowed lint made this route.
+2. The result cache never records status 125. Fix it where the cache writes a result.
+
+**Acceptance gate:** one test each that fails on the old code; the lint, routing and cache suites pass; merge gate `--tests-only` green on the hotfix tree.
+
+### Phase 31 — A lint step that leaves the memory wait for the Mac keeps the token for its next local step · status: done
+
+#### As-built
+
+Checkpoint `b076a291e` on `verify-token-mac-wait`.
+
+- `release_token()` keeps `.given_back` across repeated releases. `sync_token_state()` updates shell ownership before both acquisition paths.
+- Only `token_acquired()` removes the mark after successful acquisition. Memory and build-hold waits use the same release rule.
+- A memory wait can leave for the Mac, record its retry note, and then run local fmt with the token.
+- `blocking_claim_block()` reuses the existing Mac block reader. Foreign blocks prevent local reservation reuse and transfer under the existing locks.
+- Existing remote work retains its cleanup route. A reservation does not override a later block.
+
+**Files:**
+
+- `scripts/direct/verify.sh` and `test_verify_token_mac_step.py` — shared ownership state and memory-to-Mac regressions.
+- `scripts/mac_test/mac_test.py` and `test_mac_test.py` — one block ownership rule and transfer refusal.
+- `scripts/build_targets/build_targets.py` and `test_ssh_eligibility.py` — block checks for published and unpublished reservation reuse.
+
+**Binds later work:** A release mark persists until acquisition succeeds. All new Mac work observes the shared block rule.
+
+**Gotchas:** Pipeline shells do not share variable changes. Both reservation reuse and transfer need block checks; ordinary free-now routing alone cannot protect them.
+
+**Ruled out:** A formatter-only workaround, separate release marks in wait wrappers, and a second Mac block reader.
+
+### Phase 32 — The cargo token wait line reads the user zone without an unset variable · status: done
+
+#### As-built
+
+Checkpoint `ce0d0cc6b` on `verify-zone-token`; builds integration `647ae6bbb`.
+
+- `token_wait_note()` calls `scripts/lib/user_zone.py` directly through `python3 -S` for its first wait timestamp.
+- The wait no longer requires `USER_ZONE_SCRIPT`. The handoff test removes that variable and checks the UTC wait line and successful continuation.
+
+**Files:**
+
+- `scripts/direct/verify.sh` — direct user-zone lookup for the token wait timestamp.
+- `scripts/direct/test_verify_token_handoff.py` — unset-variable coverage and the visible wait line.
+
+**Binds later work:** Token wait timestamps use the user-zone helper without a variable supplied by the memory module.
+
+**Gotchas:** An inherited test variable can hide a production failure under `set -u`. `fast_track.py` refuses changes to `verify.sh`.
+
+**Ruled out:** Restoring a dependency on `memory_gate.sh` to define `USER_ZONE_SCRIPT`.
+
+### Phase 33 — Two verify test files pass on the builds tip again · status: done
+
+#### As-built
+
+Checkpoint `d8b1b0c3c` on `verify-red-tests`.
+
+- The memory-kill fixture extracts `buildlog_step_compiles()` from `scripts/lint/invoke.sh` with the functions it extracts from `verify.sh`.
+- The fixture supplies routing and hold helpers outside its classification scope. Token tests cover admission; existing memory-kill assertions remain unchanged.
+
+**Files:**
+
+- `scripts/direct/test_verify_memory_kill.py` — complete dependencies for the extracted shell functions.
+
+**Binds later work:** Fixtures that extract `run()` must provide its current helper dependencies from their owning modules.
+
+**Gotchas:** Missing fixture helpers produce shell status 127. The offload exclusion mismatch belongs to builds-resources `d70f1dedf`; this checkpoint changes no offload code.
+
+**Ruled out:** Changing production memory-kill behavior or changing offload expectations for an unrelated branch.
+
+### Phase 34 — Remove an owner's standing checkouts when the owner retires or wraps · status: todo
+
+> Current work (builds ruling, 2026-11-03 21:0x EST). Branch verify-copies-owner-end from origin/verify-copies eee1e500f; it merges after Phase 18.
+
+**Defect.** Only a hand `copies.py remove --owner O --repo R` deletes standing checkouts. `scripts/production/retire_unit.py` removes the unit worktree and branch but not the unit's checkouts under `~/worktrees/gates/<repo>/<unit>-gate[-2]`. `scripts/production/tidy_wrapped.py` deletes a wrapped production's state but not the production's checkouts or its units' checkouts. Each one keeps a full tree and its `target/` with no owner.
+
+**Depends on:** Phase 18.
+
+#### Work Order
+
+1. `copies.py remove --owner O` with no `--repo` removes that owner's trees in every repository. The Python API gets the same form. One implementation; `--repo` narrows it.
+2. `retire_unit.py` removes the retired unit's standing checkouts after it stops the unit's processes and before it writes the retired note. A busy tree refuses the retirement. The refusal names the holder by its session name (a pid only when no name exists) and the tree path, like the other running-process refusals.
+3. `tidy_wrapped.py` removes the standing checkouts of the wrapped production and of each of its units.
+4. A retry after a refusal finishes the removal. A rerun after a full removal changes nothing and exits 0.
+
+**Acceptance gate:** one test each for items 1-4 that fails on the old code; the copies, retire and tidy suites pass; merge gate `--tests-only` green.
+
+### Phase 35 — Every build copy maker left outside copies.py moves onto it · status: todo
+
+> Builds ruling, 2026-11-03 21:0x EST: copies.py is the one way to copy a repository for a build. When this plan ends, copies.py passes to queue-unit as the build-folder owner.
+
+**Today.** `config/copies.conf` allows three build copy makers outside copies.py: `mac_test/offload.py` and `production/mac_run.sh` (Mac mirrors, including `~/.local/state/mac-test/mirror`) and `direct/verify.sh` (its documentation checkout). The copy guard also misses some import forms (next item "Copy guard: refuse tree-making git calls through every import form", F037), so a copy maker can pass the guard unseen.
+
+**Depends on:** Phase 18; Phase 25 (one mirror root key in mac_test.conf).
+
+#### Work Order
+
+1. Add a copies.py kind for a Mac mirror (named, registered, swept like the others). `offload.py` and `mac_run.sh` make and reuse Mac mirrors only through it. Remove their allow-list entries.
+2. `verify.sh` makes its documentation checkout through `copies.standing`. Remove its allow-list entry.
+3. Fold the F037 next item into this phase: the guard finds tree-making git calls through every import form named there. Remove the item from `docs/plans/natedev-verify-next.md`.
+4. The allow list keeps only original work trees (`add_unit.py`, `resume_unit.py`, `add_style.py`, `make_worktree.sh`, `berth_fix/launch.sh`), the external upstream clone (`bevy_migration_ensure_repo.sh`) and copies.py.
+5. The remote mirror kind covers every configured remote target, not only the Mac. `offload.remote_mirror` (offload.py:1028) and `copy_tree` (offload.py:1323) also serve Linux and AWS slots, and `linux_runner.probe_script` (linux_runner.py:168) makes their folders.
+6. A remote copy has a lease for its lifetime. `copy_tree --delete` and the sweep never remove a mirror that a live remote run uses, and they keep its metadata.
+7. The documentation checkout is a staged tree: verify.sh:1237 writes the index tree, and `copies.commit_at` (copies.py:158) needs a commit. Add a staged-source form to `copies.standing`. It copies only staged content and leaves the source index and file mtimes unchanged.
+8. Hand-over: queue-unit takes ownership of copies.py, its cleanup and the floor interfaces. Queue-unit's separate warm-target copy work is removed.
+
+**Acceptance gate:** the repository scan test finds no build copy maker outside copies.py; one test per item that fails on the old code; tests for a cancelled remote copy, a surviving remote child, kept metadata and a sweep of a busy mirror; tests for staged-only content, an unchanged source index, kept mtimes and correct pass records; queue-unit confirms the hand-over; the copies, offload, Mac run, Linux runner and verify suites pass.
+
+### Phase 36 — A verify call never waits on its own cargo token · status: todo
+
+**Hotfix, bump from origin/builds `4fa5dfac1`.** Builds asked for it ahead of Phase 34.
+
+**Defect.** Call `v20261103T235801-3831445-6666` (lint hana) waited 23 min 48 s for its own token. `sweep_after_step` (`scripts/lint/invoke.sh:442`) starts the sweep in a detached shell with `TOKEN_HELD=0`. That sweep goes through verify.sh `run()`. `sweep.py` is not a compiling step, so `run()` calls `acquire_token local`, which takes the board token with `--pid $$`, the pid of the call. Nothing releases that hold, and its `token_acquired` removes the `.given_back` mark. The call's shell still has `TOKEN_HELD=0`. Clippy's memory wait then releases nothing, finds the board busy, and waits until the 3600 s hold expires.
+
+#### Work Order
+
+1. The detached sweep never takes the board token. Cargo's own locks protect its scan.
+2. Each acquire in `run()` is released on the same path when its step ends, so no hold outlives its step. A hold the call had before the step stays. Builds ruled out a self-hold take-over: it hides a leak instead of removing it.
+3. Stay out of the regions queue-unit holds until its merge: `buildlog_wait_for_memory` in verify.sh, `test_verify_token_wait.py`, `test_verify_token_reservation.py`, `test_verify_token_memory_history.py` and `scripts/lint/memory_gate.sh`.
+
+**Acceptance gate:** a test where the call's next local step starts at once after the sweep; a test where, after any step ends, the call holds no board token that the step took; both fail on the old code; the verify token, lint and memory-kill suites pass.
+
+### Phase 37 — A tree-writing lint step that stays on natedev is not counted as a waiting Mac step · status: todo
+
+**Origin:** architect review of phases 18, 28, 31, 32 and 33, 2026-11-03, findings 1 and 2. A defect in the shipped Phase 29.
+
+**Defect.** `run()` (verify.sh:293) turns off the remote hooks for a tree-writing step, but the step record keeps the lint call's `mac_allowed` decision (verify.sh:1717). `mac_idle.py:235` counts that record while the step waits, so a local repair can raise a false Mac idle alert.
+
+#### Work Order
+
+1. A tree-writing step records that it runs on natedev for its lifetime. A read-only step after it gets the call's decision back.
+2. `mac_idle.py` does not count a tree-writing step as a waiting Mac step.
+
+**Acceptance gate:** a test where a waiting tree-writing step raises no idle alert, and a later read-only step counts again; both fail on the old code. The Phase 23 cancellation tests pass on the merged tree, with repeated TERM and no process, queue place or step record left. The verify, lint and Mac idle suites pass.
