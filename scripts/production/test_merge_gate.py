@@ -16,6 +16,7 @@ from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch
 from scripts.production import change_review, merge_gate, staff
+from scripts.production.gate_modules import GateRefused
 from scripts.lint import memory_admit
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
@@ -62,7 +63,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(contender, fcntl.LOCK_SH | fcntl.LOCK_NB)
             observed.append(repo)
-            raise merge_gate.GateRefused("injected suite stop")
+            raise GateRefused("injected suite stop")
 
         with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
             result = self.run_gate("--tests-only", "--checkout", str(checkout))
@@ -101,7 +102,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
                         self.assertEqual(os.environ.get(memory_admit.BUILDLOG_UNIT), "fixture-unit")
                         if outcome == "exception":
-                            raise merge_gate.GateRefused("injected suite failure")
+                            raise GateRefused("injected suite failure")
                         return merge_gate.GateRun((), 0, 0, memory_within_cap=outcome != "red", tests_reused=True)
 
                     def merge(arguments: merge_gate.GateArguments) -> int:
@@ -121,7 +122,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "integration"):
-                raise merge_gate.GateRefused("injected stop before push")
+                raise GateRefused("injected stop before push")
             return checked(repo, *arguments)
 
         with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
@@ -146,7 +147,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "integration"):
-                raise merge_gate.GateRefused("injected stop before push")
+                raise GateRefused("injected stop before push")
             return checked(repo, *arguments)
 
         with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
@@ -169,7 +170,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "integration"):
-                raise merge_gate.GateRefused("injected push failure")
+                raise GateRefused("injected push failure")
             return checked(repo, *arguments)
 
         with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
