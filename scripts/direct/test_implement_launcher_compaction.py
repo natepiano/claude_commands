@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 import socket
+import tempfile
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct import implement_launcher_test_support as support
@@ -21,18 +23,19 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
             (session / "mesh_roster.json").read_text()))
         first, second = roster
         self.set_mesh_context(session, first, 100001)
+        socket_path = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp"))) / "compact.sock"
         mesh = self.root / "scripts/agents/codex_mesh.py"
         _ = mesh.write_text(mesh.read_text().replace(
             "elif verb == 'compact':",
             "elif verb == 'compact':\n"
             + "    import socket\n"
             + "    with socket.socket(socket.AF_UNIX) as gate:\n"
-            + "        gate.connect(str(session / 'compact.sock'))\n"
+            + f"        gate.connect({str(socket_path)!r})\n"
             + "        gate.sendall(b'r')\n"
             + "        gate.recv(1)\n"
             + "    roster = json.loads(roster_path.read_text())"))
         with socket.socket(socket.AF_UNIX) as gate, ThreadPoolExecutor() as dispatches:
-            gate.bind(str(session / "compact.sock"))
+            gate.bind(str(socket_path))
             gate.listen()
             gate.settimeout(TEST_HANG_GUARD_SECS)
             pending = dispatches.submit(self.mesh_launch, session, to=first)
