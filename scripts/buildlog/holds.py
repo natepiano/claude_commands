@@ -12,10 +12,8 @@ from typing import Literal, TypedDict, cast
 
 import store
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
-import targets as targets  # Adds the shared script directories to sys.path.
-import build_hold
-import mac_test
+for directory in ("build_targets", "build_hold", "mac_test", "lint", "lib"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / directory))
 from user_zone import user_zone
 
 HoldTarget = Literal["mac", "natedev"]
@@ -52,6 +50,12 @@ class CurrentHolds:
 
 
 def read_current_holds() -> CurrentHolds:
+    # Historical reads need no live coordination modules.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
+    import targets as targets  # Adds the shared script directories to sys.path.
+    import build_hold
+    import mac_test
+
     natedev: NatedevHoldsNow | HoldStateUnreadable
     mac: MacHoldsNow | HoldStateUnreadable
     try:

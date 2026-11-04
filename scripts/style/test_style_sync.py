@@ -14,7 +14,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from collections.abc import Callable
@@ -27,6 +26,8 @@ from typing import TypedDict, cast, final, override
 from unittest import mock
 
 import style_sync
+from add_style import NoStyleProduction
+from scripts.copies import copies
 import scratch
 import style_ledger
 import style_rules
@@ -71,6 +72,7 @@ import style_sync
 style_sync.VERIFY = Path(sys.argv[1])
 style_sync.LINT_TEMP_PARENT = Path(sys.argv[2])
 style_sync.CHILD_STOP_SECONDS = 0.5
+style_sync.gate_owner = lambda repo: "sample-style"
 raise SystemExit(style_sync.main(sys.argv[3:]))
 '''
 
@@ -116,6 +118,7 @@ class StyleSyncTests(unittest.TestCase):
     doc: Path = Path()
     tip: str = ""
     lint_temp: Path = Path()
+    resolve_owner = staticmethod(style_sync.gate_owner)
 
     @override
     def setUp(self) -> None:
@@ -138,6 +141,7 @@ class StyleSyncTests(unittest.TestCase):
         for tool in ("mend", "clippy", "rustfmt"):
             _ = (rule_root / "rust" / f"{tool}.md").write_text(f"---\ntier: A\nmechanism: {tool}\n---\n# {tool}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root / "gate-home"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
@@ -160,6 +164,7 @@ class StyleSyncTests(unittest.TestCase):
         self.lint_temp = self.root / "tmp"
         self.lint_temp.mkdir()
         _ = self.enterContext(mock.patch.object(style_sync, "LINT_TEMP_PARENT", self.lint_temp))
+        _ = self.enterContext(mock.patch.object(style_sync, "gate_owner", return_value="sample-style"))
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],
@@ -610,8 +615,9 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
     def test_clean_check_mode_records_all_tools_passing_and_returns_zero(self) -> None:
         verify = self.root / "verify.sh"
-        _ = verify.write_text(f"#!/bin/bash\ncp ../owner.json {self.root / 'owner-seen'}\n"
-                              + f"cp ../{style_sync.VERIFIER_FILE} {self.root / 'verifier-seen'}\n"
+        metadata = self.lint_temp / f"{style_sync.LINT_PREFIX}*"
+        _ = verify.write_text(f"#!/bin/bash\ncp {metadata}/owner.json {self.root / 'owner-seen'}\n"
+                              + f"cp {metadata}/{style_sync.VERIFIER_FILE} {self.root / 'verifier-seen'}\n"
                               + f"echo $$ > {self.root / 'verify-pid'}\ncat <<'OUTPUT'\n" + CLEAN_LINT + "OUTPUT\n")
         with mock.patch.object(style_sync, "VERIFY", verify), redirect_stdout(io.StringIO()):
             self.assertEqual(style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo),
@@ -641,7 +647,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
     def clean_verify(self, before: str = "") -> Path:
         verify = self.root / "verify.sh"
-        _ = verify.write_text(f"#!/bin/bash\n{before}cat <<'OUTPUT'\n" + CLEAN_LINT + "OUTPUT\n")
+        _ = verify.write_text(f"#!/bin/bash\nmkdir -p target\n{before}cat <<'OUTPUT'\n" + CLEAN_LINT + "OUTPUT\n")
         return verify
 
     def run_lint(self, before: str = "") -> tuple[int, str]:
@@ -663,9 +669,11 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             _ = self.git("worktree", "add", "--detach", str(directory / "checkout"), self.tip)
         return directory
 
-    def test_shared_target_survives_task_end_and_reuses_artifacts(self) -> None:
-        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
-        target = style_sync.lint_target(common)
+    def standing_target(self) -> Path:
+        return self.root / "gate-home/worktrees/gates/sample/sample-style-gate/target"
+
+    def test_standing_target_survives_task_end_and_reuses_artifacts(self) -> None:
+        target = self.standing_target()
         code, output = self.run_lint('printf previous > target/artifact\n')
         self.assertEqual(code, 0, output)
         self.assertEqual(scratch.end("run:sample-style"), [])
@@ -675,9 +683,9 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertEqual(code, 0, output)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
-    def test_lint_links_a_warm_target_and_cleanup_keeps_it_until_the_production_ends(self) -> None:
-        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / scratch.STYLE_TARGET_NAME
-        code, output = self.run_lint('[[ -L target ]] || exit 2\nprintf warm > target/artifact\n')
+    def test_lint_keeps_its_own_warm_target_after_metadata_cleanup(self) -> None:
+        target = self.standing_target()
+        code, output = self.run_lint('[[ -d target && ! -L target ]] || exit 2\nprintf warm > target/artifact\n')
         self.assertEqual(code, 0, output)
         self.assertEqual((target / "artifact").read_text(), "warm")
         self.assertEqual(list(self.lint_temp.iterdir()), [])
@@ -685,7 +693,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         # A later checkout uses the same artifacts. No Cargo environment variable is overridden.
         with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "inherited-value"}):
             code, output = self.run_lint(
-                '[[ -L target && $(cat target/artifact) == warm && $CARGO_TARGET_DIR == inherited-value ]] || exit 2\n'
+                '[[ -d target && ! -L target && $(cat target/artifact) == warm && $CARGO_TARGET_DIR == inherited-value ]] || exit 2\n'
             )
         self.assertEqual(code, 0, output)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
@@ -694,78 +702,62 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertEqual(scratch.holds(), {})
 
     def test_a_missing_or_swept_target_runs_cold(self) -> None:
-        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / scratch.STYLE_TARGET_NAME
+        target = self.standing_target()
         for state in ("missing", "swept"):
             with self.subTest(state=state):
                 self.assertFalse(target.exists())
                 code, output = self.run_lint(
-                    '[[ -L target && -d target && ! -e target/artifact ]] || exit 2\nprintf fresh > target/artifact\n'
+                    '[[ -d target && ! -L target && ! -e target/artifact ]] || exit 2\nprintf fresh > target/artifact\n'
                 )
                 self.assertEqual(code, 0, output)
                 self.assertEqual((target / "artifact").read_text(), "fresh")
                 self.assertEqual(list(self.lint_temp.iterdir()), [])
                 shutil.rmtree(target)
 
-    def test_a_sync_waits_for_the_target_lock_before_creating_its_checkout(self) -> None:
-        common_dir = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
-        target = style_sync.lint_target(common_dir)
-        locked, attempted = threading.Event(), threading.Event()
-        real_flock = fcntl.flock
-
-        def first_sync() -> None:
-            with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
-                real_flock(lock, fcntl.LOCK_EX)
-                locked.set()
-                _ = attempted.wait(TEST_HANG_GUARD_SECS)
-
-        holder = threading.Thread(target=first_sync)
-        holder.start()
-        self.addCleanup(holder.join, TEST_HANG_GUARD_SECS)
-        self.addCleanup(attempted.set)
-        self.assertTrue(locked.wait(TEST_HANG_GUARD_SECS))
-
-        def second_sync_lock(fd: int, operation: int) -> None:
-            self.assertEqual(operation, fcntl.LOCK_EX)
-            self.assertEqual(list(self.lint_temp.iterdir()), [])
-            with self.assertRaises(BlockingIOError):
-                real_flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            attempted.set()
-            real_flock(fd, operation)
-            # No thread remains when verify_lint uses preexec_fn.
-            holder.join(TEST_HANG_GUARD_SECS)
-            self.assertFalse(holder.is_alive())
-
-        real_git = style_sync.git
-        real_cleanup = style_sync.remove_lint_dir
-
-        def assert_locked() -> None:
-            with (target / scratch.STYLE_LOCK_NAME).open("a") as lock, self.assertRaises(BlockingIOError):
-                real_flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-        def git(repo: Path, *arguments: str) -> str:
-            if arguments[:2] == ("worktree", "add"):
-                assert_locked()
-            return real_git(repo, *arguments)
-
-        def cleanup(repo: Path, directory: Path) -> bool:
-            assert_locked()
-            removed = real_cleanup(repo, directory)
-            assert_locked()
-            return removed
-
-        with mock.patch.object(fcntl, "flock", side_effect=second_sync_lock), \
-                mock.patch.object(style_sync, "git", side_effect=git), \
-                mock.patch.object(style_sync, "remove_lint_dir", side_effect=cleanup):
-            code, output = self.run_lint()
+    def test_lint_without_a_production_runs_in_the_configured_role_pool(self) -> None:
+        observed = self.root / "fallback-checkout"
+        with (mock.patch.object(style_sync, "gate_owner", self.resolve_owner),
+              mock.patch.object(style_sync, "standing_style_production", return_value=NoStyleProduction(self.repo, "sample-style")),
+              mock.patch.object(showrunners, "own_slug", return_value=None),
+              mock.patch.object(copies, "fallback_owner", return_value="configured-style")):
+            code, output = self.run_lint(f"pwd -P > {observed}\n")
         self.assertEqual(code, 0, output)
-        self.assertTrue(attempted.is_set())
+        checkout = Path(observed.read_text().strip())
+        self.assertEqual(checkout.name, "configured-style-gate")
+        self.assertTrue((checkout / ".git").is_dir())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
-        # Cleanup has completed and the next sync can acquire the same lock.
-        with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
-            real_flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-    def test_replacing_the_target_link_cannot_grant_successful_lint_coverage(self) -> None:
-        code, output = self.run_lint('rm target\nmkdir target\n')
+    def test_lint_takes_second_checkout_when_first_is_busy(self) -> None:
+        observed = self.root / "checked-directory"
+        with copies.standing("sample-style", self.repo, self.tip) as first:
+            probe = """import fcntl
+from pathlib import Path
+with Path('.claude-busy').open('r+') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise SystemExit('lint released its checkout while verifying')
+"""
+            code, output = self.run_lint(
+                f"pwd -P > {observed}\n{shlex.quote(sys.executable)} -c {shlex.quote(probe)} || exit $?\n")
+            self.assertEqual(code, 0, output)
+            second = Path(observed.read_text().strip())
+            self.assertNotEqual(first, second)
+            self.assertEqual(second.name, "sample-style-gate-2")
+            self.assertTrue((first / ".git").is_dir())
+            with (second / ".claude-busy").open("r+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        with copies.standing("sample-style", self.repo, self.tip) as reused:
+            self.assertEqual(reused, first)
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
+
+    def test_redirecting_the_target_cannot_grant_successful_lint_coverage(self) -> None:
+        outside = self.root / "outside-target"
+        outside.mkdir()
+        code, output = self.run_lint(f'rm -rf target\nln -s {outside} target\n')
         self.assertEqual(code, 1, output)
         self.assertIn("lint rewrote the checked tree", output)
         with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
@@ -838,27 +830,14 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertEqual(code, 128 + signal.SIGTERM, output.getvalue())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
-    def test_the_owner_record_exists_before_the_checkout_is_added(self) -> None:
-        real_git = style_sync.git
-        at_add: list[style_sync.OwnerRecord] = []
-
-        def read_record_at_add(repo: Path, *arguments: str) -> str:
-            if arguments[:2] == ("worktree", "add"):
-                at_add.append(style_sync.OwnerRecord.read(Path(arguments[3]).parent))
-            return real_git(repo, *arguments)
-
-        with mock.patch.object(style_sync, "git", read_record_at_add):
-            code, output = self.run_lint()
-        self.assertEqual(code, 0, output)
-        common_dir = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
-        self.assertEqual(at_add, [style_sync.OwnerRecord(os.getpid(), common_dir)])
-
-    def test_a_locked_checkout_is_removed_with_its_registration(self) -> None:
+    def test_standing_checkout_has_no_registration_in_the_source(self) -> None:
         original_worktrees = self.git("worktree", "list", "--porcelain")
-        code, output = self.run_lint('git worktree lock --reason initializing "$PWD"\n')
+        code, output = self.run_lint()
         self.assertEqual(code, 0, output)
-        self.assertEqual(list(self.lint_temp.iterdir()), [])
+        checkout = self.standing_target().parent
+        self.assertTrue((checkout / ".git").is_dir())
         self.assertEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
 
     def test_sweep_removes_only_dead_runs_dirs_with_their_registrations(self) -> None:
         dead = ended_pid()
@@ -916,7 +895,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                       + "[Errno 2] No such file or directory: 'git'", output.splitlines())
         self.assertEqual(style_sync.OwnerRecord.read(stale).repo, stale_repo)
 
-    def test_a_git_failure_in_cleanup_keeps_the_record_and_the_next_sweep_removes_the_registration(self) -> None:
+    def test_a_git_failure_in_cleanup_keeps_metadata_until_the_next_sweep(self) -> None:
         original_worktrees = self.git("worktree", "list", "--porcelain")
         real_git = style_sync.git
 
@@ -932,7 +911,8 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertIn(f"style_sync: kept {kept} for the next lint run; worktree registration: "
                       + f"[Errno {errno.EAGAIN}] {os.strerror(errno.EAGAIN)}: 'git'", output.splitlines())
         self.assertFalse((kept / "checkout").exists())
-        self.assertNotEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
+        self.assertEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
+        self.assertTrue((self.standing_target().parent / ".git").is_dir())
         # The next lint run starts after this one's owner has exited.
         style_sync.OwnerRecord(ended_pid(), style_sync.OwnerRecord.read(kept).repo).write(kept)
         sweep_output = io.StringIO()

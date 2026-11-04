@@ -39,7 +39,8 @@ There is no separate charge timer.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
 6. Select one available zone in `us-east-2` from those reads.
 7. Read the standard Spot vCPU quota. Request an increase if it is below 16.
-8. Record the Spot price and its read time just before `deploy.py prepare`. Deployment refuses a price older than `price_max_age_seconds`.
+8. Run `python3 scripts/aws_target/deploy.py price` just before `deploy.py prepare`.
+   Deployment refuses a price older than `price_max_age_seconds`.
    Confirm that `notification_email_file` names an existing private file before `deploy.py prepare`.
 9. Confirm that the fixed components sum to `fixed_usd_per_month`.
 10. Confirm that `limit_reserve_usd` covers the configured drain and idle intervals.
@@ -83,6 +84,10 @@ aws --profile build-admin service-quotas request-service-quota-increase \
 Run the increase request only when the quota is below 16. The value 32 also covers a later move to `m7a.8xlarge`. A quota request has no charge.
 
 Read gp3, root storage and public IPv4 prices for `us-east-2` from the public [EC2](https://aws.amazon.com/ec2/pricing/on-demand/) and [EBS](https://aws.amazon.com/ebs/pricing/) price pages.
+Use the price history to select the zone.
+Run `python3 scripts/aws_target/deploy.py price` before each `deploy.py prepare` command.
+The command saves the price and its read time outside the repository.
+Do not edit tracked files to record the price.
 Price-list and placement reads do not launch capacity.
 Cost Explorer reads have the configured query fee.
 
@@ -186,10 +191,13 @@ Never delete its ledger, inventory, charges, claims, or deployment evidence to p
 ```sh
 cd "$HOME/.claude"
 export AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials"
+python3 scripts/aws_target/deploy.py price
 python3 scripts/aws_target/deploy.py prepare
 ```
 
-Preparation runs locally.
+The price command reads AWS through the deployment profile.
+It requires the private credential file.
+Preparation reads the saved price locally.
 It records priced inventory, current price evidence, generated parameters, and a deployment-purpose guard decision.
 Inspect the generated public template, parameters, and preflight evidence.
 Confirm the monthly Budget amount equals `monthly_limit_usd`.
@@ -248,6 +256,7 @@ Restart the instance for the next setup interval:
 2. Run preparation again.
 
 ```sh
+python3 scripts/aws_target/deploy.py price
 python3 scripts/aws_target/deploy.py prepare
 ```
 
@@ -466,7 +475,10 @@ Use this replacement procedure from the deployment owner:
 2. Keep its retained Budget and DataVolumeId.
 3. Set a new stack_name and existing_data_volume_id to the saved DataVolumeId.
 4. Preserve the ledger directory.
-5. Render bootstrap, run prepare, then apply --approve-resources.
+5. Render bootstrap.
+6. Run `deploy.py price`.
+7. Run `deploy.py prepare`.
+8. Run `deploy.py apply --approve-resources`.
 
 Confirm the old instance stops before deleting its stack.
 Use your administrator profile for these user-run commands:
@@ -487,6 +499,7 @@ After recording the new stack name and saved volume ID, run these commands:
 
 ```sh
 python3 scripts/aws_target/deploy.py bootstrap
+python3 scripts/aws_target/deploy.py price
 python3 scripts/aws_target/deploy.py prepare
 python3 scripts/aws_target/deploy.py apply --approve-resources
 ```

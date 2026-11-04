@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import io
 import sqlite3
+import shutil
 import os
 import sys
 import tempfile
@@ -19,6 +20,7 @@ import bulk_rename as bulk
 import berth_board
 import bulk_run as run
 import crate_run as crates
+import coverage_report
 import rules
 import style_ledger as ledger_api
 from approved_renames import BindingRename
@@ -26,6 +28,8 @@ from ledger_test_support import machine_rename_fixture
 from test_bulk_rename import ScriptedServer, word_edits, CargoProjectTests
 from style_child_test_support import install_refusal_tools
 from scripts.build_queue import queue_place
+from scripts.copies import copies
+from scripts.lib import copy_record, scratch
 
 
 class Commands:
@@ -91,6 +95,11 @@ class CrateRunTests(CargoProjectTests):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root / "gate-home"),
+            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
+            "SCRATCH_HOLDS": str(self.root / "holds.json"),
+        }))
         _ = (self.repo / "Cargo.toml").write_text((self.repo / "Cargo.toml").read_text()
                                                  + '\n[workspace]\nmembers=[".", "beta"]\n')
         (self.repo / "beta/src").mkdir(parents=True)
@@ -151,6 +160,330 @@ class CrateRunTests(CargoProjectTests):
 
     def advance(self, package: str) -> crates.Manifest:
         return self.batch.advance(package, renamed, self.commands, available, fixture_execute)
+
+    def test_legacy_manifest_adopts_existing_worker_and_creates_missing_worker(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        for existing in (True, False):
+            with self.subTest(existing=existing):
+                batch = crates.CrateRun(self.authority, "legacy-" + str(existing))
+                batch.create(self.definition, self.tree, self.destination)
+                manifest = batch.read()
+                record = manifest["crates"]["bulk_sample"]
+                legacy = batch.folder / "workers/bulk_sample"
+                record["checkout"] = str(legacy)
+                record["intent"] = str(legacy / ".git/style-batch-intent.json")
+                batch.save(manifest)
+                if existing:
+                    legacy.mkdir(parents=True)
+                    copies.initialize_git(legacy, self.repo)
+                    _ = run.git(legacy, "checkout", "-q", "-B", record["branch"].removeprefix("refs/heads/"), self.base)
+                    _ = (legacy / "src/lib.rs").write_text("staged legacy edit\n")
+                    _ = run.git(legacy, "add", "src/lib.rs")
+                    _ = (legacy / "pending.txt").write_text("untracked legacy edit\n")
+                    _ = Path(record["intent"]).write_text("legacy recovery journal\n")
+                with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after adoption")):
+                    with self.assertRaisesRegex(RuntimeError, "after adoption"):
+                        _ = batch.advance("bulk_sample", renamed, self.commands, available, fixture_execute)
+                worker = Path(batch.read()["crates"]["bulk_sample"]["checkout"])
+                if existing:
+                    self.assertEqual(worker, legacy)
+                    self.assertEqual(run.git(worker, "diff", "--cached", "--name-only"), "src/lib.rs")
+                    self.assertEqual((worker / "pending.txt").read_text(), "untracked legacy edit\n")
+                    self.assertEqual(Path(record["intent"]).read_text(), "legacy recovery journal\n")
+                    self.assertEqual(scratch.holds()[str(worker)]["task"], batch.task)
+                else:
+                    self.assertNotEqual(worker, legacy)
+                    self.assertIn(worker, list(scratch.copy_paths()))
+
+    def legacy_worker(self) -> Path:
+        self.freeze(paths=("src/lib.rs",))
+        manifest = self.batch.read()
+        record = manifest["crates"]["bulk_sample"]
+        worker = self.batch.folder / "workers/bulk_sample"
+        record["checkout"] = str(worker)
+        record["intent"] = str(worker / ".git/style-batch-intent.json")
+        self.batch.save(manifest)
+        self.initialize_legacy_worker(worker)
+        return worker
+
+    def initialize_legacy_worker(self, worker: Path) -> None:
+        worker.mkdir(parents=True)
+        copies.initialize_git(worker, self.repo)
+        branch = self.batch.read()["crates"]["bulk_sample"]["branch"].removeprefix("refs/heads/")
+        _ = run.git(worker, "checkout", "-q", "-B", branch, self.base)
+        for key in ("user.name", "user.email"):
+            _ = run.git(worker, "config", key, self.git("config", key))
+
+    def finish_run(self) -> crates.Manifest:
+        for package in self.batch.read()["crates"]:
+            _ = self.advance(package)
+        manifest = self.batch.read()
+        record = manifest["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED, record.get("error", ""))
+        return manifest
+
+    def test_owner_removal_preserves_each_nonterminal_crate_worker(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        for kind in ("native", "adopted", "changed-task", "interrupted-removal"):
+            with self.subTest(kind=kind):
+                batch = crates.CrateRun(self.authority, "owner-" + kind)
+                batch.create(self.definition, self.tree, self.destination)
+                manifest = batch.read()
+                record = manifest["crates"]["bulk_sample"]
+                worker = Path(record["checkout"])
+                if kind == "adopted":
+                    worker = batch.folder / "workers/bulk_sample"
+                    record["checkout"] = str(worker)
+                    record["intent"] = str(worker / ".git/style-batch-intent.json")
+                    batch.save(manifest)
+                    worker.mkdir(parents=True)
+                    copies.initialize_git(worker, self.repo)
+                    _ = run.git(worker, "checkout", "-q", "-B", record["branch"].removeprefix("refs/heads/"), self.base)
+                with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after registration")):
+                    with self.assertRaisesRegex(RuntimeError, "after registration"):
+                        _ = batch.advance("bulk_sample", renamed, self.commands, available, fixture_execute)
+                if kind == "changed-task":
+                    scratch.hand_over(worker, batch.owner, "gate:another-task")
+                if kind == "interrupted-removal":
+                    with scratch.removal_lock(worker) as idle:
+                        self.assertTrue(idle)
+                        with mock.patch.object(scratch, "remove", side_effect=RuntimeError("before deletion")):
+                            with self.assertRaisesRegex(RuntimeError, "before deletion"):
+                                scratch.remove_marked(worker, scratch.remove)
+                with self.assertRaisesRegex(copies.CopyError, "crate run") as refusal:
+                    copies.remove_trees(batch.owner)
+                self.assertIn(str(batch.path), str(refusal.exception))
+                self.assertTrue(worker.exists())
+                self.assertEqual(batch.read(), manifest)
+                current = scratch.task_of(worker)
+                assert isinstance(current, copy_record.Registered)
+                self.assertNotIn("ended_task", current.fields)
+                if kind == "adopted":
+                    self.assertIn(str(worker), scratch.holds())
+                # Keep earlier workers outside the next owner's selection.
+                if kind != "interrupted-removal":
+                    scratch.hand_over(worker, "kept_" + kind.replace("-", "_"), current.task)
+
+    def test_owner_removal_refuses_a_legacy_worker_without_its_run_link_after_hand_over(self) -> None:
+        worker = self.legacy_worker()
+        with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after registration")):
+            with self.assertRaisesRegex(RuntimeError, "after registration"):
+                _ = self.advance("bulk_sample")
+        scratch.hand_over(worker, self.batch.owner, "gate:changed-task")
+        record = scratch.task_of(worker)
+        assert isinstance(record, copy_record.Registered)
+        _ = scratch.update_record(worker, lambda _: {**record.fields, "crate_run": ""})
+        manifest = self.batch.read()
+        with self.assertRaisesRegex(copies.CopyError, "repair crate run link"):
+            copies.remove_trees(self.batch.owner)
+        self.assertTrue(worker.exists())
+        self.assertEqual(self.batch.read(), manifest)
+        self.assertIn(str(worker), scratch.holds())
+
+    def test_owner_removal_requires_readable_run_evidence_after_git_or_folder_deletion(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after registration")):
+            with self.assertRaisesRegex(RuntimeError, "after registration"):
+                _ = self.advance("bulk_sample")
+        worker = Path(self.batch.read()["crates"]["bulk_sample"]["checkout"])
+        manifest = self.batch.path.read_text()
+        for evidence in ("missing", "damaged"):
+            with self.subTest(evidence=evidence):
+                if evidence == "missing":
+                    self.batch.path.unlink()
+                else:
+                    _ = self.batch.path.write_text("{invalid")
+                with self.assertRaisesRegex(copies.CopyError, "repair crate run"):
+                    copies.remove_trees(self.batch.owner)
+                self.assertTrue(worker.exists())
+                _ = self.batch.path.write_text(manifest)
+        with scratch.removal_lock(worker) as idle:
+            self.assertTrue(idle)
+            with mock.patch.object(scratch, "remove", side_effect=RuntimeError("before deletion")):
+                with self.assertRaisesRegex(RuntimeError, "before deletion"):
+                    scratch.remove_marked(worker, scratch.remove)
+        shutil.rmtree(worker / ".git")
+        with self.assertRaisesRegex(copies.CopyError, "not terminal"):
+            copies.remove_trees(self.batch.owner)
+        self.assertTrue(worker.exists())
+        shutil.rmtree(worker)
+        with self.assertRaisesRegex(copies.CopyError, "not terminal"):
+            copies.remove_trees(self.batch.owner)
+        self.assertTrue(scratch.removal_mark(worker).exists())
+        self.assertEqual(self.batch.path.read_text(), manifest)
+
+    def test_owner_removal_removes_only_workers_with_terminal_run_evidence(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with mock.patch.object(copies, "end_workspaces"):
+            manifest = self.finish_run()
+        worker = Path(manifest["crates"]["bulk_sample"]["checkout"])
+        self.assertTrue(worker.exists())
+        copies.remove_trees(self.batch.owner)
+        self.assertFalse(worker.exists())
+        self.assertEqual(self.batch.read(), manifest)
+        self.assertTrue(Path(manifest["crates"]["bulk_sample"]["result_path"]).exists())
+
+    def test_terminal_run_removes_adopted_worker_and_keeps_result_evidence(self) -> None:
+        worker = self.legacy_worker()
+        manifest = self.finish_run()
+        self.assertFalse(worker.exists())
+        self.assertNotIn(str(worker), scratch.holds())
+        self.assertEqual(self.batch.read(), manifest)
+        result = Path(manifest["crates"]["bulk_sample"]["result_path"])
+        self.assertTrue(result.is_file())
+        self.assertFalse(scratch.removal_mark(worker).exists())
+
+    def test_terminal_recovery_finishes_each_adopted_worker_removal_boundary(self) -> None:
+        worker = self.legacy_worker()
+        original_remove = scratch.remove
+        original_release = scratch.release
+        original_end = copies.end_workspaces
+        for boundary in ("before cleanup", "after git deletion", "after folder deletion", "before hold release"):
+            with self.subTest(boundary=boundary):
+                # Restore only the legacy worker between terminal recovery attempts.
+                if not worker.exists():
+                    self.initialize_legacy_worker(worker)
+                with copies.workspace(self.batch.owner, self.repo, self.base, name=worker.name,
+                                      branch=self.batch.read()["crates"]["bulk_sample"]["branch"],
+                                      task=self.batch.task, path=worker):
+                    pass
+                def remove(path: Path) -> None:
+                    if path == worker and boundary == "after git deletion":
+                        import shutil
+                        shutil.rmtree(path / ".git")
+                        raise RuntimeError(boundary)
+                    original_remove(path)
+                    if path == worker and boundary == "after folder deletion":
+                        raise RuntimeError(boundary)
+                def release(path: Path) -> bool:
+                    if path == worker and boundary == "before hold release":
+                        raise RuntimeError(boundary)
+                    return original_release(path)
+                def end(task: str, paths: list[Path]) -> None:
+                    if boundary == "before cleanup":
+                        raise RuntimeError(boundary)
+                    original_end(task, paths)
+                with (mock.patch.object(scratch, "remove", side_effect=remove),
+                      mock.patch.object(scratch, "release", side_effect=release),
+                      mock.patch.object(copies, "end_workspaces", side_effect=end)):
+                    with self.assertRaisesRegex(RuntimeError, boundary):
+                        _ = self.finish_run()
+                self.assertIn(str(worker), scratch.holds())
+                _ = self.finish_run()
+                self.assertFalse(worker.exists())
+                self.assertNotIn(str(worker), scratch.holds())
+                self.assertFalse(scratch.removal_mark(worker).exists())
+                self.assertTrue(Path(self.batch.read()["crates"]["bulk_sample"]["result_path"]).is_file())
+
+    def test_terminal_cleanup_keeps_locked_or_unsaved_adopted_workers(self) -> None:
+        worker = self.legacy_worker()
+        with mock.patch.object(copies, "end_workspaces"):
+            manifest = self.finish_run()
+        with scratch.busy_locks(worker, create=True) as idle:
+            self.assertTrue(idle)
+            copies.end_workspaces(self.batch.task, [worker])
+            self.assertTrue(worker.exists())
+            self.assertIn(str(worker), scratch.holds())
+        _ = (worker / "pending.txt").write_text("keep unsaved work\n")
+        _ = self.finish_run()
+        self.assertTrue(worker.exists())
+        self.assertGreater(scratch.holds()[str(worker)]["ended"], 0)
+        self.assertEqual((worker / "pending.txt").read_text(), "keep unsaved work\n")
+        self.assertEqual(self.batch.read(), manifest)
+        (worker / "pending.txt").unlink()
+        _ = self.finish_run()
+        self.assertFalse(worker.exists())
+
+    def test_pending_run_survives_expiry_and_terminal_resume_ends_its_task(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            manifest = self.reservation_advance()
+        worker = Path(manifest["crates"]["bulk_sample"]["checkout"])
+        record = scratch.task_of(worker)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.task, self.batch.task)
+        _ = scratch.update_record(worker, lambda current: scratch.fields_for_task(
+            current.fields if isinstance(current, copy_record.Registered) else {}, "until:2000-01-01T0000Z"))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            _ = self.reservation_advance()
+        recovered = scratch.task_of(worker)
+        assert isinstance(recovered, copy_record.Registered)
+        self.assertEqual(recovered.task, self.batch.task)
+        self.assertIsInstance(scratch.lifetime(worker, now=10**12), scratch.Live)
+        with mock.patch.object(copies, "end_workspaces", side_effect=RuntimeError("before task end")):
+            with self.assertRaisesRegex(RuntimeError, "before task end"):
+                _ = self.advance("bulk_sample")
+                _ = self.advance("beta")
+        self.assertTrue(worker.exists())
+        _ = self.advance("beta")
+        self.assertIsInstance(scratch.lifetime(worker), scratch.Ended)
+        self.assertIn(worker, scratch.end(self.batch.task))
+        self.assertFalse(worker.exists())
+
+    def test_nested_proof_keeps_the_canonical_owner_with_the_real_resolver(self) -> None:
+        import style_sync as owner_resolver
+        self.freeze(paths=("src/lib.rs",))
+        observed: set[Path] = set()
+        resolver = owner_resolver.gate_owner
+        with mock.patch.object(owner_resolver, "gate_owner", side_effect=resolver) as calls:
+            batch = crates.CrateRun(self.authority, self.batch.run_id)
+            def commands(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+                observed.add(repo)
+                return self.commands(repo, arguments)
+            _ = batch.advance("bulk_sample", renamed, commands, available, fixture_execute)
+        self.assertEqual([call.args for call in calls.call_args_list], [(self.repo,)])
+        gates = list((copies.gates_root() / self.repo.name).iterdir())
+        self.assertEqual({path.name for path in gates}, {batch.owner + "-gate", batch.owner + "-gate-2"})
+        self.assertTrue(any(path in observed for path in gates))
+
+    def test_worker_names_separate_run_and_package_at_the_last_dot(self) -> None:
+        self.freeze()
+        # Reuse the real package metadata with only its validated package name changed.
+        original = coverage_report.workspace(self.authority, self.base)
+        members = tuple(replace(member, package_name=name)
+                        for member, name in zip(original, ("gamma", "beta-gamma")))
+        paths: list[str] = []
+        for identity, package in (("first-beta", "gamma"), ("first", "beta-gamma")):
+            batch = crates.CrateRun(self.authority, identity)
+            with mock.patch.object(coverage_report, "workspace", return_value=members):
+                batch.create(self.definition, self.tree, self.destination)
+            paths.append(batch.read()["crates"][package]["checkout"])
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertEqual([Path(path).name for path in paths], ["crate-first-beta.gamma", "crate-first.beta-gamma"])
+
+    def test_crate_trees_have_registered_ownership_and_use_two_standing_checkouts(self) -> None:
+        self.freeze()
+        original = self.git("rev-parse", "HEAD")
+        manifest = self.batch.read()
+        with self.batch.frozen_checkout(manifest) as frozen:
+            self.assertEqual(copies.read_record(frozen).source, str(self.repo))
+            with scratch.busy_locks(frozen, create=False) as idle:
+                self.assertFalse(idle)
+        observed: set[Path] = set()
+
+        def registered(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+            observed.add(repo)
+            if repo.is_relative_to(copies.gates_root()):
+                self.assertEqual(copies.read_record(repo).owner, copies.read_record(frozen).owner)
+            else:
+                record = scratch.task_of(repo)
+                self.assertIsInstance(record, copy_record.Registered)
+                assert isinstance(record, copy_record.Registered)
+                self.assertEqual(record.fields["source_path"], str(self.repo))
+            with scratch.busy_locks(repo, create=False) as idle:
+                self.assertFalse(idle)
+            return self.commands(repo, arguments)
+
+        for package in manifest["crates"]:
+            result = self.batch.advance(package, renamed, registered, available, fixture_execute)
+            worker = Path(result["crates"][package]["checkout"])
+            self.assertIn(worker, list(scratch.copy_paths()))
+            self.assertIsInstance(scratch.task_of(worker), copy_record.Registered)
+            self.assertIsNone(scratch.unsaved_work(worker))
+        gates = list(frozen.parent.iterdir())
+        self.assertEqual(sorted(tree.name for tree in gates), [frozen.name, frozen.name + "-2"])
+        self.assertIn(frozen.with_name(frozen.name + "-2"), observed)
+        self.assertEqual(self.git("rev-parse", "HEAD"), original)
 
     @property
     def other_writer(self) -> berth_board.Reservation:
@@ -867,10 +1200,10 @@ class CrateRunTests(CargoProjectTests):
         proof = run.test_tree
         calls = 0
         def testing(repo: Path, commit: str, tree: str, runner: run.Runner,
-                    times: dict[str, float]) -> run.CommandResult:
+                    times: dict[str, float], *, owner: str = "") -> run.CommandResult:
             nonlocal calls
             calls += 1
-            result = proof(repo, commit, tree, runner, times)
+            result = proof(repo, commit, tree, runner, times, owner=owner)
             if calls == 2:
                 _ = self.git("update-ref", self.destination, moved, self.base)
             return result
@@ -1692,10 +2025,11 @@ class CrateRunTests(CargoProjectTests):
         self.freeze()
         proof = run.test_tree
         def failed(repo: Path, commit: str, tree: str, runner: run.Runner,
-                   times: dict[str, float]) -> run.CommandResult:
-            if repo.name.startswith("integration-"):
+                   times: dict[str, float], *, owner: str = "") -> run.CommandResult:
+            if any(record.get("integration", {}).get("stage") == crates.IntegrationStage.PREPARED
+                   for record in self.batch.read()["crates"].values()):
                 return run.CommandResult(1, "combined proof failure")
-            return proof(repo, commit, tree, runner, times)
+            return proof(repo, commit, tree, runner, times, owner=owner)
         with mock.patch.object(run, "test_tree", side_effect=failed):
             with self.assertRaisesRegex(bulk.BulkRenameError, "combined-tree proof failed"):
                 _ = self.advance("bulk_sample")
@@ -1835,10 +2169,11 @@ class CrateRunTests(CargoProjectTests):
         self.freeze()
         proof = run.test_tree
         def interrupted(repo: Path, commit: str, tree: str, runner: run.Runner,
-                        times: dict[str, float]) -> run.CommandResult:
-            if repo.name.startswith("integration-"):
+                        times: dict[str, float], *, owner: str = "") -> run.CommandResult:
+            if any(record.get("integration", {}).get("stage") == crates.IntegrationStage.PREPARED
+                   for record in self.batch.read()["crates"].values()):
                 raise RuntimeError("combined interrupted")
-            return proof(repo, commit, tree, runner, times)
+            return proof(repo, commit, tree, runner, times, owner=owner)
         with mock.patch.object(run, "test_tree", side_effect=interrupted):
             with self.assertRaisesRegex(RuntimeError, "combined interrupted"):
                 _ = self.advance("bulk_sample")
@@ -1877,10 +2212,11 @@ class CrateRunTests(CargoProjectTests):
         _ = self.git("update-ref", self.destination, moved, self.base)
         proof = run.test_tree
         def failed(repo: Path, commit: str, tree: str, runner: run.Runner,
-                   times: dict[str, float]) -> run.CommandResult:
-            if repo.name.startswith("integration-"):
+                   times: dict[str, float], *, owner: str = "") -> run.CommandResult:
+            if any(record.get("integration", {}).get("stage") == crates.IntegrationStage.PREPARED
+                   for record in self.batch.read()["crates"].values()):
                 return run.CommandResult(1, "combined proof failure")
-            return proof(repo, commit, tree, runner, times)
+            return proof(repo, commit, tree, runner, times, owner=owner)
         with mock.patch.object(run, "test_tree", side_effect=failed):
             with self.assertRaisesRegex(bulk.BulkRenameError, "combined-tree proof failed"):
                 _ = self.advance("beta")

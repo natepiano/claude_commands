@@ -1,14 +1,10 @@
-# Build report session
+# Build cost analysis
 
-## What it is
+The user retired `/build:report` on 2026-11-03. The command file is removed.
+Run `buildlog costs [--days N]` on demand to rank build costs and show phase time.
+The default window is seven days. The command reads the index and progress history without changing them.
 
-The build report (`/build:report` with no argument) runs only on demand: a session shows it when the user or a teammate asks. No notifier schedules it. The build-report session is the usual place to ask, and its model is set on the session itself; no command selects it.
+The round record is [builds-report-rounds.md](../plans/builds-report-rounds.md).
 
-## Invariants
-
-- No session creates a `report-builds` notifier instance, and `/watcher` reads no build report schedule.
-- `commands/build/report.md` says the report is on demand only, under "On demand only".
-
-## Why
-
-From 2026-10-06 a `report-builds` notifier sent the report prompt to the build-report session every 240 minutes, and `/watcher` STEP 5 read its status. On 2026-10-16 the user asked: "stop having the builder report be automatic - i want to only have it called on demand". The instance was removed, the Owner session command that created it was dropped from `commands/build/report.md`, and the watcher step and the conversation pause's "build report" wording went with it.
+Use the `buildlog` CLI for detail. `buildlog report`, the index, and all collectors remain available.
+No notifier schedules a build report.
