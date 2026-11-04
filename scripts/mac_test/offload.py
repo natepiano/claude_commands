@@ -1698,6 +1698,7 @@ def claimed_run(
     started: float,
 ) -> MacOffloadResult:
     release_allowed = True
+    sync_after_release = False
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
     try:
@@ -1802,6 +1803,7 @@ def claimed_run(
             report_leftover_check(checked, request)
         else:
             release_allowed = True
+        sync_after_release = linux
         if linux and remote_status.status == 75:
             return declined("state", started)
         if remote_status.status == 0:
@@ -1823,6 +1825,12 @@ def claimed_run(
             evidence.unresolved_count = 0
         if release_allowed:
             release_claim(controller, request.target)
+            if sync_after_release:
+                if TYPE_CHECKING:
+                    from ..buildlog import sync as buildlog_sync
+                else:
+                    import sync as buildlog_sync
+                buildlog_sync.sync_target(request.target)
 
 
 @dataclass(frozen=True)
