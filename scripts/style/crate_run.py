@@ -973,7 +973,8 @@ class CrateRun:
                     legacy = checkout if checkout.exists() else None
                     worker = workers.enter_context(copies.workspace(
                         self.owner, self.repo, base,
-                        name=checkout.name, branch=record["branch"], task=self.task, path=legacy))
+                        name=checkout.name, branch=record["branch"], task=self.task, path=legacy,
+                        run_manifest=self.path))
                     if worker != checkout and stage == CrateStage.SELECTED and not checkout.exists():
                         record["checkout"] = str(worker)
                         record["intent"] = str(worker / ".git/style-batch-intent.json")
@@ -1145,7 +1146,7 @@ class CrateRun:
                     path = Path(record["checkout"])
                     if path.exists() and isinstance(scratch.pending_removal(path), copy_record.NotRegistered):
                         with copies.workspace(self.owner, self.repo, manifest["base"], name=path.name,
-                                              branch=record["branch"], task=self.task, path=path):
+                                              branch=record["branch"], task=self.task, path=path, run_manifest=self.path):
                             pass
                 copies.end_workspaces(self.task, paths)
 

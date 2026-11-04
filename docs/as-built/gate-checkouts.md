@@ -126,9 +126,23 @@ python3 ~/.claude/scripts/copies/copies.py remove \
 ```
 
 `list` prints one row per tree: path, owner, repo, commit, busy or idle, last
-holder pid, and target size. `remove` acquires all the owner's existing trees
-before deleting any. A busy tree refuses with exit 2 and a holder pid. Repeating
-removal succeeds when the trees are already gone.
+holder pid, and target size. `remove --owner O` removes the owner's trees
+across all repositories. An optional `--repo R` limits removal to that repository.
+The Python API accepts only a `RepositoryScope` value for `repo`.
+`copies.remove_trees(owner)` uses `AllRepositories()` by default.
+`copies.remove_trees(owner, SelectedRepository(name))` limits removal to one canonical repository name.
+The API refuses raw strings and paths, including an empty string.
+Removal includes standing checkouts, registered editable copies, and adopted
+legacy workers. Editable copies retain scratch's checks for unsaved work and
+active tasks. A busy tree refuses with exit 2. A retry completes interrupted
+removal, including a standing tree's `.removing` directory. Repeated removal
+succeeds when the trees are gone.
+
+`retire_unit.py` removes the unit's checkouts after its processes stop and before
+it writes the retired note. A busy checkout refuses retirement. The refusal
+names the session when available and otherwise gives the recorded pid.
+`tidy_wrapped.py` removes the production's checkouts and its units' checkouts
+before it deletes production state. A refusal keeps the state for a retry.
 
 Success exits 0; invalid owners, invalid configuration, and other refused
 operations exit 2. Apply and merge failures exit 3. `run` returns its command's

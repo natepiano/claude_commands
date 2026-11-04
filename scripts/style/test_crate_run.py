@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import io
 import sqlite3
+import shutil
 import os
 import sys
 import tempfile
@@ -220,6 +221,107 @@ class CrateRunTests(CargoProjectTests):
         record = manifest["crates"]["bulk_sample"]
         self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED, record.get("error", ""))
         return manifest
+
+    def test_owner_removal_preserves_each_nonterminal_crate_worker(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        for kind in ("native", "adopted", "changed-task", "interrupted-removal"):
+            with self.subTest(kind=kind):
+                batch = crates.CrateRun(self.authority, "owner-" + kind)
+                batch.create(self.definition, self.tree, self.destination)
+                manifest = batch.read()
+                record = manifest["crates"]["bulk_sample"]
+                worker = Path(record["checkout"])
+                if kind == "adopted":
+                    worker = batch.folder / "workers/bulk_sample"
+                    record["checkout"] = str(worker)
+                    record["intent"] = str(worker / ".git/style-batch-intent.json")
+                    batch.save(manifest)
+                    worker.mkdir(parents=True)
+                    copies.initialize_git(worker, self.repo)
+                    _ = run.git(worker, "checkout", "-q", "-B", record["branch"].removeprefix("refs/heads/"), self.base)
+                with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after registration")):
+                    with self.assertRaisesRegex(RuntimeError, "after registration"):
+                        _ = batch.advance("bulk_sample", renamed, self.commands, available, fixture_execute)
+                if kind == "changed-task":
+                    scratch.hand_over(worker, batch.owner, "gate:another-task")
+                if kind == "interrupted-removal":
+                    with scratch.removal_lock(worker) as idle:
+                        self.assertTrue(idle)
+                        with mock.patch.object(scratch, "remove", side_effect=RuntimeError("before deletion")):
+                            with self.assertRaisesRegex(RuntimeError, "before deletion"):
+                                scratch.remove_marked(worker, scratch.remove)
+                with self.assertRaisesRegex(copies.CopyError, "crate run") as refusal:
+                    copies.remove_trees(batch.owner)
+                self.assertIn(str(batch.path), str(refusal.exception))
+                self.assertTrue(worker.exists())
+                self.assertEqual(batch.read(), manifest)
+                current = scratch.task_of(worker)
+                assert isinstance(current, copy_record.Registered)
+                self.assertNotIn("ended_task", current.fields)
+                if kind == "adopted":
+                    self.assertIn(str(worker), scratch.holds())
+                # Keep earlier workers outside the next owner's selection.
+                if kind != "interrupted-removal":
+                    scratch.hand_over(worker, "kept_" + kind.replace("-", "_"), current.task)
+
+    def test_owner_removal_refuses_a_legacy_worker_without_its_run_link_after_hand_over(self) -> None:
+        worker = self.legacy_worker()
+        with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after registration")):
+            with self.assertRaisesRegex(RuntimeError, "after registration"):
+                _ = self.advance("bulk_sample")
+        scratch.hand_over(worker, self.batch.owner, "gate:changed-task")
+        record = scratch.task_of(worker)
+        assert isinstance(record, copy_record.Registered)
+        _ = scratch.update_record(worker, lambda _: {**record.fields, "crate_run": ""})
+        manifest = self.batch.read()
+        with self.assertRaisesRegex(copies.CopyError, "repair crate run link"):
+            copies.remove_trees(self.batch.owner)
+        self.assertTrue(worker.exists())
+        self.assertEqual(self.batch.read(), manifest)
+        self.assertIn(str(worker), scratch.holds())
+
+    def test_owner_removal_requires_readable_run_evidence_after_git_or_folder_deletion(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after registration")):
+            with self.assertRaisesRegex(RuntimeError, "after registration"):
+                _ = self.advance("bulk_sample")
+        worker = Path(self.batch.read()["crates"]["bulk_sample"]["checkout"])
+        manifest = self.batch.path.read_text()
+        for evidence in ("missing", "damaged"):
+            with self.subTest(evidence=evidence):
+                if evidence == "missing":
+                    self.batch.path.unlink()
+                else:
+                    _ = self.batch.path.write_text("{invalid")
+                with self.assertRaisesRegex(copies.CopyError, "repair crate run"):
+                    copies.remove_trees(self.batch.owner)
+                self.assertTrue(worker.exists())
+                _ = self.batch.path.write_text(manifest)
+        with scratch.removal_lock(worker) as idle:
+            self.assertTrue(idle)
+            with mock.patch.object(scratch, "remove", side_effect=RuntimeError("before deletion")):
+                with self.assertRaisesRegex(RuntimeError, "before deletion"):
+                    scratch.remove_marked(worker, scratch.remove)
+        shutil.rmtree(worker / ".git")
+        with self.assertRaisesRegex(copies.CopyError, "not terminal"):
+            copies.remove_trees(self.batch.owner)
+        self.assertTrue(worker.exists())
+        shutil.rmtree(worker)
+        with self.assertRaisesRegex(copies.CopyError, "not terminal"):
+            copies.remove_trees(self.batch.owner)
+        self.assertTrue(scratch.removal_mark(worker).exists())
+        self.assertEqual(self.batch.path.read_text(), manifest)
+
+    def test_owner_removal_removes_only_workers_with_terminal_run_evidence(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with mock.patch.object(copies, "end_workspaces"):
+            manifest = self.finish_run()
+        worker = Path(manifest["crates"]["bulk_sample"]["checkout"])
+        self.assertTrue(worker.exists())
+        copies.remove_trees(self.batch.owner)
+        self.assertFalse(worker.exists())
+        self.assertEqual(self.batch.read(), manifest)
+        self.assertTrue(Path(manifest["crates"]["bulk_sample"]["result_path"]).exists())
 
     def test_terminal_run_removes_adopted_worker_and_keeps_result_evidence(self) -> None:
         worker = self.legacy_worker()

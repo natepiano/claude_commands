@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sweep
+from scripts.lib import file_lock
 import conf
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from memory_test_support import write_config_fixture
@@ -4102,9 +4103,9 @@ class LockHolderTests(unittest.TestCase):
         def never_held(*_args: object, **_kwargs: object) -> io.StringIO:
             return io.StringIO(other)
 
-        with mock.patch.object(sweep, "open", create=True, side_effect=skip_once):
+        with mock.patch.object(file_lock, "open", create=True, side_effect=skip_once):
             self.assertEqual(sweep.lock_holder(str(lock), "locks"), 4242)
-        with mock.patch.object(sweep, "open", create=True, side_effect=never_held) as opened:
+        with mock.patch.object(file_lock, "open", create=True, side_effect=never_held) as opened:
             self.assertIsNone(sweep.lock_holder(str(lock), "locks"))
         self.assertEqual(opened.call_count, sweep.PROC_LOCKS_READS)
 

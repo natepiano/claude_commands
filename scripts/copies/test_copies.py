@@ -21,6 +21,7 @@ from unittest import mock
 
 from scripts.copies import copies
 from scripts.lib import copy_record, scratch
+from scripts.message import sessions
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 
 
@@ -469,6 +470,248 @@ class StandingTests(unittest.TestCase):
         self.assertFalse(first.exists())
         self.assertFalse(second.exists())
         self.assertEqual(self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source)).returncode, 0)
+
+    def test_owner_removal_covers_repositories_and_editable_copies(self) -> None:
+        other = ImmutableGitSeed.create(self.base / "other", "main", "Gate Tests",
+                                        "gate-tests@example.invalid", {"other.txt": "content"}).checkout
+        other = other.rename(other.with_name("other-repository"))
+        with copies.standing("verify-unit", self.source, self.head) as first:
+            pass
+        with copies.standing("verify-unit", other, "HEAD") as second:
+            pass
+        with copies.workspace("verify-unit", self.source, self.head,
+                              name="worker", branch="worker") as worker:
+            pass
+        legacy = self.base / "legacy-run/worker"
+        legacy.mkdir(parents=True)
+        copies.initialize_git(legacy, self.source)
+        _ = self.git(legacy, "checkout", "-q", "-B", "legacy", self.head)
+        with copies.workspace("verify-unit", self.source, self.head, name="legacy", branch="legacy",
+                              task="gate:legacy-run", path=legacy):
+            pass
+        with copies.standing("other-unit", self.source, self.head) as kept:
+            pass
+        narrowed = self.cli("remove", "--owner", "verify-unit", "--repo", str(other))
+        self.assertEqual(narrowed.returncode, 0, narrowed.stderr)
+        self.assertFalse(second.exists())
+        self.assertTrue(first.exists())
+        result = self.cli("remove", "--owner", "verify-unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(first.exists())
+        self.assertFalse(worker.exists())
+        self.assertFalse(legacy.exists())
+        self.assertNotIn(str(legacy), scratch.holds())
+        self.assertTrue(kept.exists())
+        copies.remove_trees("verify-unit")
+
+    def test_owner_removal_retries_busy_and_interrupted_trees_without_a_source(self) -> None:
+        with copies.standing("verify-unit", self.source, self.head) as tree:
+            result = self.cli("remove", "--owner", "verify-unit")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("busy", result.stderr)
+            self.assertTrue(tree.exists())
+        def interrupt(path: Path) -> None:
+            (path / ".gate.json").unlink()
+            raise OSError("interrupted owner removal")
+
+        with mock.patch.object(shutil, "rmtree", side_effect=interrupt):
+            result = self.cli("remove", "--owner", "verify-unit")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(copies.removing_path(tree).exists())
+        shutil.rmtree(self.source)
+        result = self.cli("remove", "--owner", "verify-unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(copies.removing_path(tree).exists())
+        self.assertEqual(self.cli("remove", "--owner", "verify-unit").returncode, 0)
+
+    def test_owner_removal_finishes_a_deleted_editable_copy(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.head,
+                              name="deleted-worker", branch="worker") as tree:
+            pass
+        record = scratch.task_of(tree)
+        assert isinstance(record, copy_record.Registered)
+        _ = scratch.hold(tree, record.task, "keep the worker during its run")
+        delete = scratch.remove
+
+        def interrupt(path: Path) -> None:
+            delete(path)
+            raise OSError("interrupted after folder deletion")
+
+        with mock.patch.object(scratch, "remove", side_effect=interrupt):
+            result = self.cli("remove", "--owner", "verify-unit")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(tree.exists())
+        self.assertTrue(scratch.removal_mark(tree).exists())
+        result = self.cli("remove", "--owner", "verify-unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(scratch.removal_mark(tree).exists())
+        self.assertNotIn(str(tree), scratch.holds())
+        self.assertEqual(self.cli("remove", "--owner", "verify-unit").returncode, 0)
+
+    def test_owner_removal_accepts_names_that_cannot_create_copies(self) -> None:
+        for owner in ("Verify", "unit_name"):
+            with self.subTest(owner=owner):
+                result = self.cli("remove", "--owner", owner)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(self.gates.exists())
+
+    def test_busy_editable_copy_identifies_its_holder(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.head,
+                              name="busy-worker", branch="worker") as tree:
+            with mock.patch.object(sessions, "running_sessions", return_value=[]):
+                result = self.cli("remove", "--owner", "verify-unit")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn(str(tree), result.stderr)
+            self.assertIn(f"pid {os.getpid()}", result.stderr)
+
+    def test_repository_removal_skips_a_workspace_with_a_deleted_source(self) -> None:
+        other = ImmutableGitSeed.create(self.base / "other", "main", "Gate Tests",
+                                        "gate-tests@example.invalid", {"other.txt": "content"}).checkout
+        other = other.rename(other.with_name("unrelated-repository"))
+        with copies.workspace("verify-unit", other, "HEAD", name="other-worker", branch="worker") as kept:
+            pass
+        with copies.standing("verify-unit", self.source, self.head) as tree:
+            pass
+        shutil.rmtree(other)
+        result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(tree.exists())
+        self.assertTrue(kept.exists())
+
+    def test_explicit_repository_scopes_select_only_the_requested_repository(self) -> None:
+        with copies.standing("verify-unit", self.source, self.head) as tree:
+            pass
+        copies.remove_trees("verify-unit", copies.SelectedRepository(self.source.name))
+        self.assertFalse(tree.exists())
+        copies.remove_trees("verify-unit", copies.AllRepositories())
+
+    def test_owner_removal_requires_a_repository_scope_in_the_python_api(self) -> None:
+        with copies.standing("verify-unit", self.source, self.head) as tree:
+            pass
+        for value in ("", str(self.source), self.source):
+            with self.subTest(value=value), self.assertRaisesRegex(copies.CopyError, "repository scope"):
+                copies.remove_trees("verify-unit", cast(copies.RepositoryScope, cast(object, value)))
+            self.assertTrue(tree.exists())
+        copies.remove_trees("verify-unit", copies.AllRepositories())
+        self.assertFalse(tree.exists())
+
+    def test_owner_removal_allows_an_ordinary_copy_with_a_crate_name(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.head, name="crate-notes", branch="notes") as tree:
+            pass
+        copies.remove_trees("verify-unit")
+        self.assertFalse(tree.exists())
+
+    def test_owner_removal_preserves_a_source_with_an_adopted_borrower(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.head, name="parent", branch="worker") as parent:
+            pass
+        child = self.base / "adopted/borrower"
+        child.mkdir(parents=True)
+        copies.initialize_git(child, parent)
+        _ = self.git(child, "checkout", "-q", "-B", "borrower", self.head)
+        with copies.workspace("other-unit", parent, self.head, name="borrower", branch="borrower", path=child):
+            pass
+        with self.assertRaisesRegex(copies.CopyError, "borrowed") as refusal:
+            copies.remove_trees("verify-unit")
+        self.assertIn(str(child), str(refusal.exception))
+        self.assertTrue(parent.exists())
+        self.assertEqual(self.git(child, "cat-file", "-p", self.head), self.git(parent, "cat-file", "-p", self.head))
+        for pending in (child, parent):
+            with self.subTest(pending=pending):
+                with self.assertRaisesRegex(RuntimeError, "interrupted removal"):
+                    scratch.remove_marked(pending, mock.Mock(side_effect=RuntimeError("interrupted removal")))
+                with self.assertRaisesRegex(copies.CopyError, "borrowed"):
+                    copies.remove_trees("verify-unit")
+                self.assertTrue(parent.exists())
+                self.assertEqual(self.git(child, "rev-parse", "HEAD"), self.head)
+        copies.remove_trees("other-unit")
+        copies.remove_trees("verify-unit")
+        self.assertFalse(child.exists())
+        self.assertFalse(parent.exists())
+
+    def test_owner_removal_matches_transferred_names_without_constructing_unsafe_paths(self) -> None:
+        for owner in ("Verify", "unit_name"):
+            with self.subTest(owner=owner):
+                with copies.workspace("verify-unit", self.source, self.head, name=owner, branch="worker") as tree:
+                    pass
+                record = scratch.task_of(tree)
+                assert isinstance(record, copy_record.Registered)
+                scratch.hand_over(tree, owner, record.task)
+                copies.remove_trees(owner)
+                self.assertFalse(tree.exists())
+        for owner in ("../escape", str(self.base / "outside")):
+            with self.subTest(owner=owner), mock.patch.object(copies, "tree_paths", side_effect=AssertionError("unsafe path")):
+                copies.remove_trees(owner)
+
+    def test_owner_removal_finds_adopted_copies_with_a_changed_hold_reason(self) -> None:
+        tree = self.base / "adopted/worker"
+        tree.mkdir(parents=True)
+        copies.initialize_git(tree, self.source)
+        _ = self.git(tree, "checkout", "-q", "-B", "worker", self.head)
+        with copies.workspace("verify-unit", self.source, self.head, name="adopted", branch="worker", path=tree):
+            pass
+        record = scratch.task_of(tree)
+        assert isinstance(record, copy_record.Registered)
+        scratch.hand_over(tree, "Next_unit", record.task)
+        _ = scratch.hold(tree, record.task, "a different hold reason")
+        copies.remove_trees("Next_unit")
+        self.assertFalse(tree.exists())
+        self.assertNotIn(str(tree), scratch.holds())
+
+    def test_owner_transfer_after_selection_preserves_the_new_owners_copy(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.head, name="transfer", branch="worker") as tree:
+            pass
+        select_workspaces = copies.owned_workspaces
+
+        def transfer(owner: str, repo: copies.RepositoryScope) -> list[tuple[Path, copy_record.Registered]]:
+            selected = select_workspaces(owner, repo)
+            scratch.hand_over(tree, "next-unit", selected[0][1].task)
+            return selected
+
+        with mock.patch.object(copies, "owned_workspaces", side_effect=transfer):
+            with self.assertRaisesRegex(copies.CopyError, "changed"):
+                copies.remove_trees("verify-unit")
+        self.assertTrue(tree.exists())
+        record = scratch.task_of(tree)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.fields["owner_unit"], "next-unit")
+        self.assertNotIn("ended_task", record.fields)
+
+    def test_owner_removal_deletes_borrowers_before_their_sources(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.head, name="a-parent", branch="worker") as parent:
+            pass
+        with copies.workspace("verify-unit", parent, self.head, name="z-child", branch="worker") as child:
+            pass
+        copies.remove_trees("verify-unit")
+        self.assertFalse(child.exists())
+        self.assertFalse(parent.exists())
+
+    def test_owner_removal_preserves_an_external_borrower_and_does_not_end_a_busy_copy(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.head, name="a-source", branch="worker") as parent:
+            with self.assertRaisesRegex(copies.CopyError, "busy"):
+                copies.remove_trees("verify-unit")
+            record = scratch.task_of(parent)
+            assert isinstance(record, copy_record.Registered)
+            self.assertNotIn("ended_task", record.fields)
+        with copies.workspace("other-unit", parent, self.head, name="borrower", branch="worker") as child:
+            pass
+        with self.assertRaisesRegex(copies.CopyError, "borrowed"):
+            copies.remove_trees("verify-unit")
+        self.assertTrue(parent.exists())
+        self.assertTrue(child.exists())
+
+    def test_owner_removal_refuses_a_damaged_record_until_repaired(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.head, name="damaged", branch="worker") as tree:
+            pass
+        path = tree / copy_record.RECORD
+        record = path.read_text()
+        _ = path.write_text("{invalid")
+        with self.assertRaisesRegex(copies.CopyError, "repair record") as refusal:
+            copies.remove_trees("verify-unit")
+        self.assertIn(str(path), str(refusal.exception))
+        self.assertTrue(tree.exists())
+        _ = path.write_text(record)
+        copies.remove_trees("verify-unit")
+        self.assertFalse(tree.exists())
 
     def test_invalid_owner_refuses_without_creating_a_tree(self) -> None:
         for owner in ("../escape", "Verify", "unit/name", "-unit", "unit_name", ""):

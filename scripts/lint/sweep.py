@@ -180,6 +180,7 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload,
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget
+from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS, PROC_LOCKS_READS as PROC_LOCKS_READS, lock_holder as lock_holder
 import conf
 from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
@@ -220,10 +221,6 @@ MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
 TARGET_DIR_FLAG = "--target-dir"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
-PROC_LOCKS = "/proc/locks"
-# The kernel writes /proc/locks one page per read and drops its lock between pages; a lock freed earlier in the
-# list moves the next page past one line. Each extra read gives a skipped line another chance to show.
-PROC_LOCKS_READS = 3
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
@@ -808,30 +805,6 @@ def process_use(target: str, owners: TargetOwnerIndex, proc: str = PROC_DIR) -> 
     check.checked_targets = (target,)
     check.rechecking = True
     return process_uses(check) if proc == PROC_DIR else process_uses(check, proc)
-
-
-def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
-    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder.
-
-    A read under load can skip a line (PROC_LOCKS_READS), so no holder is the answer only after every read agrees.
-    """
-    try:
-        stat = os.stat(lock)
-    except OSError:
-        return None
-    # "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF"; a waiter's line has "->".
-    device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
-    for _ in range(PROC_LOCKS_READS):
-        try:
-            with open(locks, encoding="ascii", errors="replace") as handle:
-                lines = handle.read().splitlines()
-        except OSError:
-            return None
-        for line in lines:
-            fields = line.split()
-            if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
-                return int(fields[4])
-    return None
 
 
 def floor_lock_holder(path: str) -> KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder:
