@@ -99,11 +99,20 @@ def wrapped_slug(doc: Path) -> str:
     slug = doc.name.removesuffix("-production.md")
     if slug == doc.name:
         raise TidyRefused(f"{doc}: production doc name must end in -production.md")
+    _ = outstanding_path(slug)
     lines = doc.read_text(encoding="utf-8").splitlines()
     status = next((line for line in lines if line.startswith("> **Status:")), "")
     if not status.startswith(WRAPPED):
         raise TidyRefused(f"{doc}: not wrapped")
-    if (NOTIFIER_STATE_DIR / showrunners.timer_name(slug)).exists():
+    record = staff.snapshot()
+    timers = [f"showrunner-{slug}"]
+    try:
+        owner = showrunners.owner_for(slug, record)
+    except ValueError:
+        pass
+    else:
+        timers.append(f"showrunner-{owner.id}")
+    if any((NOTIFIER_STATE_DIR / name).exists() for name in timers):
         raise TidyRefused(f"{doc}: {slug} still has an update timer")
     return slug
 
