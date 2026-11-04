@@ -434,6 +434,32 @@ def _state_path(session_dir: Path) -> Path:
     return session_dir / plan_history.STATE_FILENAME
 
 
+def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> dict[str, object]:
+    """Omit folder copies from state, events, and nested wait attribution."""
+    identity = _object_dict(fields.get("main_agent")) or {}
+    session_id = _string(identity.get("session_id")) or _string(fields.get("owner_session"))
+    if not unit_owned and session_id:
+        record = staff.initial_snapshot()
+        row = record.by_member_reference(session_id)
+        if row is not None and row.kind == "worker":
+            row = record.parent_of(row)
+        unit_owned = row is not None and row.kind == "unit"
+    result: dict[str, object] = {}
+    directory = _string(fields.get("working_dir"))
+    for key, value in fields.items():
+        if unit_owned and key in ("working_dir", "worktree"):
+            continue
+        if unit_owned and key in ("plan_doc", "project_plan_doc") and isinstance(value, str) and directory and value.startswith(directory + "/"):
+            value = str(Path(value).relative_to(directory))
+        if isinstance(value, dict):
+            value = _stored_fields(cast(dict[str, object], value), unit_owned=unit_owned)
+        elif isinstance(value, list):
+            value = [_stored_fields(cast(dict[str, object], item), unit_owned=unit_owned) if isinstance(item, dict) else item
+                     for item in cast(list[object], value)]
+        result[key] = value
+    return result
+
+
 def _read_state(session_dir: Path) -> dict[str, object]:
     path = _state_path(session_dir)
     try:
@@ -442,7 +468,9 @@ def _read_state(session_dir: Path) -> dict[str, object]:
         raise SystemExit(f"Unable to read progress state {path}: {error}") from error
     if state is None:
         raise SystemExit(f"Invalid progress state: {path}")
-    return state
+    if not state.get("main_agent") and not state.get("owner_session"):
+        state["owner_session"] = unit_runs.director(session_dir)
+    return plan_history.staff_directory(state, staff.initial_snapshot())
 
 
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
@@ -455,7 +483,7 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
         prefix=f".{plan_history.STATE_FILENAME}.",
         delete=False,
     ) as handle:
-        json.dump(state, handle, indent=2, sort_keys=True)
+        json.dump(_stored_fields(state), handle, indent=2, sort_keys=True)
         _ = handle.write("\n")
         temporary = Path(handle.name)
     os.replace(temporary, target)
@@ -471,20 +499,16 @@ SESSION_ROOTS = tuple(
 def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: str) -> bool:
     if fields.get("worktree") not in (old.name, new.name):
         return False
-    fields.update({"working_dir": str(new), "worktree": new.name, "branch": new_branch})
-    for key in ("plan_doc", "project_plan_doc"):
-        value = fields.get(key)
-        if isinstance(value, str) and (value == str(old) or value.startswith(f"{old}/")):
-            fields[key] = str(new) + value[len(str(old)):]
+    fields["branch"] = new_branch
+    fields.update(_stored_fields(fields))
+    del fields["working_dir"]
+    if "worktree" in fields:
+        del fields["worktree"]
     return True
 
 
 def move_run(history_file: Path, old: Path, new: Path, new_branch: str) -> list[Path]:
-    """Point a run at its unit's moved worktree and new branch: its record and its live state.
-
-    A unit rename calls this while the unit is stopped, so no recorder writes meanwhile. Each
-    event and the state keep their run and phase ids; only the location fields change.
-    """
+    """Remove legacy folder copies when an older caller requests relocation."""
     lines: list[str] = []
     for line in history_file.read_text(encoding="utf-8").splitlines(keepends=True):
         event = _json_object(line)
@@ -561,7 +585,7 @@ def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
         raise SystemExit("Progress state has no history_file")
     history_file = Path(history_file_value)
     history_file.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n"
+    line = json.dumps(_stored_fields(event), separators=(",", ":"), sort_keys=True) + "\n"
     with history_file.open("a", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.write(line)
@@ -887,10 +911,12 @@ def _historical_project_timing(
         history_paths = runs_dir.glob("*.jsonl")
     except OSError:
         return None
+    record = staff.initial_snapshot()
     for history_path in history_paths:
         event = plan_history.run_started_event(history_path)
         if event is None:
             continue
+        event = plan_history.staff_directory(event, record)
         if (
             _string(event.get("working_dir")) != str(working_dir)
             or _string(event.get("branch")) != branch
@@ -1337,6 +1363,13 @@ def _start_run(args: argparse.Namespace) -> None:
     working_dir_value = _arg_string(args, "working_dir")
     if not working_dir_value:
         raise SystemExit("--working-dir is required")
+    main_agent = _detect_main_identity(args)
+    if main_agent["model"] == "unknown":
+        raise SystemExit(
+            "Unable to detect the unit director's model and effort; pass explicit --main-* values"
+        )
+    current = plan_history.staff_directory({"main_agent": main_agent}, staff.initial_snapshot())
+    working_dir_value = _string(current.get("working_dir")) or working_dir_value
     working_dir = Path(working_dir_value).expanduser().resolve()
     now = plan_history.now_epoch()
     run_id = session_dir.name
@@ -1347,11 +1380,6 @@ def _start_run(args: argparse.Namespace) -> None:
     plan_doc = _arg_string(args, "plan_doc")
     project_timing = _resolve_project_timing(working_dir, branch, plan_doc, now)
     history_file = plan_history.history_root() / "runs" / f"{run_id}.jsonl"
-    main_agent = _detect_main_identity(args)
-    if main_agent["model"] == "unknown":
-        raise SystemExit(
-            "Unable to detect the unit director's model and effort; pass explicit --main-* values"
-        )
     state: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -1600,7 +1628,11 @@ def _checked_launch(
 
 def _check_launch(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
-    state = _read_state(session_dir)
+    try:
+        state = _read_state(session_dir)
+    except staff.StaffUnreadable as error:
+        print(f"staff: {_arg_string(args, 'pass_kind')}: not opened: {error}", file=sys.stderr)
+        raise SystemExit(3) from error
     phase, launch_check = _checked_launch(args, state, session_dir)
     if _optional_arg(args, "lens") == "ux":
         event = _event(state, "launch_checked", plan_history.now_epoch(), phase_record=phase)
@@ -1816,6 +1848,7 @@ def _disarm_review(args: argparse.Namespace) -> None:
 
 def _load_events() -> tuple[list[dict[str, object]], int]:
     events: list[dict[str, object]] = []
+    record = staff.initial_snapshot()
     ignored = 0
     runs_dir = plan_history.history_root() / "runs"
     if not runs_dir.exists():
@@ -1834,7 +1867,7 @@ def _load_events() -> tuple[list[dict[str, object]], int]:
             if event is None or _integer(event.get("schema_version")) != SCHEMA_VERSION:
                 ignored += 1
                 continue
-            events.append(event)
+            events.append(plan_history.staff_directory(event, record))
     return events, ignored
 
 
@@ -2461,10 +2494,11 @@ def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
     except OSError:
         return []
     events: list[dict[str, object]] = []
+    record = staff.initial_snapshot()
     for line in lines:
         event = _json_object(line)
         if event is not None and _integer(event.get("schema_version")) == SCHEMA_VERSION:
-            events.append(event)
+            events.append(plan_history.staff_directory(event, record))
     return events
 
 
@@ -5042,10 +5076,14 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
         record = resolver.record
-        identity = _string(state.get("director_session"))
+        identity = _string(state.get("director_session")) or _string(state.get("owner_session"))
+        main_agent = state.get("main_agent")
+        if not identity and isinstance(main_agent, dict):
+            identity = _string(cast(dict[str, object], main_agent).get("session_id"))
         row = record.by_current_session(identity) if identity else None
         if row is None:
-            folder = _string(state.get("working_dir"))
+            current = plan_history.staff_directory(dict(state), record)
+            folder = _string(current.get("working_dir"))
             if folder:
                 member = resolver.member_by_folder(remote.local_machine(), Path(folder).expanduser().resolve())
                 row = member.row if isinstance(member, session_staff.MemberFound) else None
@@ -5780,7 +5818,7 @@ def write_merge_receipt(*, project: str, phase_id: str, merge_commit: str,
                    "merge_commit": merge_commit, "source_checkpoint": source_checkpoint,
                    "target_branch": target_branch, "merged_at": _iso_time(merged_at),
                    "timestamp_epoch": merged_at}
-        _ = handle.write(json.dumps(record, sort_keys=True) + "\n")
+        _ = handle.write(json.dumps(_stored_fields(record), sort_keys=True) + "\n")
         handle.flush()
         if (os.environ.get("UNIT_SYNC_WRITES") or os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1")) != "0":
             os.fsync(handle.fileno())

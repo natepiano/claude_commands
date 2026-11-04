@@ -50,27 +50,6 @@ def production_staff_record() -> Generator[None, None, None]:
         yield
 
 
-def without_worktree_column(document: Path) -> None:
-    """Remove only the Units Worktree cell from a private fixture document."""
-    lines = document.read_text().splitlines()
-    in_units = False
-    column = -1
-    for index, line in enumerate(lines):
-        if line.startswith("## "):
-            in_units = line.strip() == "## Units"
-            column = -1
-        if not in_units or not line.lstrip().startswith("|"):
-            continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if column < 0:
-            if "Worktree" not in cells:
-                continue
-            column = cells.index("Worktree")
-        del cells[column]
-        lines[index] = "| " + " | ".join(cells) + " |"
-    _ = document.write_text("\n".join(lines) + "\n")
-
-
 def fixture_runtime_id(label: str) -> str:
     """A fake backend returns one repeatable native id for this fixture label."""
     return str(uuid5(NAMESPACE_URL, "staff-test-backend:" + label))
@@ -308,9 +287,10 @@ def production_membership(showrunner: str, *units: str) -> None:
 
 def fixture_showrunner_name(slug: str, doc: Path) -> str:
     """Keep the real doc's workspace name; extra fixture productions use their slugs."""
-    from scripts.production import showrunners, production_units
+    from scripts.production import showrunners
+    from scripts.production.production_doc import read_production
 
-    return showrunners.herdr_space(slug, str(doc)) if slug == production_units.read_production(doc).slug else slug
+    return showrunners.herdr_space(slug, str(doc)) if slug == read_production(doc).slug else slug
 
 
 def source_environment(source: Path) -> dict[str, str]:
@@ -440,7 +420,7 @@ with isolated_source_readers():
 
 @dataclass(frozen=True)
 class RowProductionFixture:
-    """The row locations differ from the timer name and the Units table."""
+    """The row locations differ from the timer name."""
 
     runner: staff.StaffRow
     unit: staff.StaffRow
@@ -568,9 +548,9 @@ class StaffTestCase(unittest.TestCase):
         write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
     def production(self, slug: str, *units: str, workspace: str = "", parent: str = "") -> Path:
-        """Write real timer/doc sources; each listed unit initially has a worktree."""
+        """Write real timer/doc sources; each listed unit has a staff row and a folder."""
         doc = self.source_root / f"{slug}-production.md"
-        self.units_doc(doc, units, workspace=workspace or slug)
+        self.write_production_doc(doc, workspace=workspace or slug)
         self.register_production(slug, doc)
         for unit in units:
             _ = self.worktree(unit)
@@ -578,6 +558,9 @@ class StaffTestCase(unittest.TestCase):
             from scripts.production import unit_names
 
             identity = fixture_runtime_id("unit:" + owner + ":" + unit_names.name(unit))
+            # A test can make or rename the row first; keep that row.
+            if staff.initial_snapshot().by_id(staff.StaffId(identity)) is None:
+                _ = unit_membership(workspace or slug, unit)
             self.pane(f"fixture:{slug}/{unit}", session_id=identity,
                       environment={"SHOWRUNNER_UNIT": slug, "SHOWRUNNER_UNIT_ID": unit},
                       written_at="2026-10-01T00:00:00+00:00")
@@ -602,12 +585,8 @@ class StaffTestCase(unittest.TestCase):
         self.register_production(slug, doc)
         return recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
 
-    def units_doc(self, doc: Path, units: tuple[str, ...], *, workspace: str, retired: tuple[str, ...] = ()) -> None:
-        rows = [f"| `{unit}` | `{self.source_root / 'worktrees' / unit}` | {'retired' if unit in retired else 'active'} |" for unit in units]
-        write_text_atomic(doc, "\n".join([
-            "# Fixture production", f"- **Showrunner session:** `{workspace}`", "", "## Units", "",
-            "| Unit | Worktree | Plan |", "| --- | --- | --- |", *rows, "",
-        ]))
+    def write_production_doc(self, doc: Path, *, workspace: str) -> None:
+        write_text_atomic(doc, f"# Fixture production\n- **Showrunner session:** `{workspace}`\n")
 
     def worktree(self, unit: str) -> Path:
         folder = self.source_root / "worktrees" / unit
@@ -636,16 +615,16 @@ class StaffTestCase(unittest.TestCase):
             folder = self.source_root / "worktrees" / unit
             folder.parent.mkdir(parents=True, exist_ok=True)
             _ = self.fixture_git(repository, "worktree", "add", "-b", unit, str(folder))
+            write_text_atomic(folder / ".unit.toml", 'plan = "standby"\nresponsibilities = []\n')
         doc = repository / "docs" / f"{slug}-production.md"
         doc.parent.mkdir()
-        rows = [f"| `{unit}` | `{self.source_root / 'worktrees' / unit}` | `{unit}` | `standby` | — |"
-                for unit in units]
-        write_text_atomic(doc, "\n".join([
-            "# Fixture production", f"- **Showrunner session:** `{slug}`", "", "## Units", "",
-            "| Unit | Worktree | Branch | Plan | Port |", "| --- | --- | --- | --- | --- |", *rows, "",
-        ]))
+        self.write_production_doc(doc, workspace=slug)
         self.register_production(slug, doc)
         production_membership(slug, *units)
+        for unit in units:
+            row = unit_membership(slug, unit)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.source_root / "worktrees" / unit),
+                                   expected=row.worktree)
         # Do not import the checkout's real showrunner registry into the fill.
         registry = self.source_root / "showrunners.json"
         self.write_json(registry, {"always": []})
@@ -668,12 +647,7 @@ class StaffTestCase(unittest.TestCase):
                           + 'port = 4317\nresponsibilities = ["shared-fixture"]\n')
         doc = repository / "docs" / "row-production.md"
         doc.parent.mkdir()
-        write_text_atomic(doc, "\n".join((
-            "# Production", "- **Showrunner session:** `row-owner`", "",
-            "## Units", "| Unit | Worktree | Branch | Plan | Port |",
-            "| --- | --- | --- | --- | --- |",
-            "| member-unit | /wrong/table-folder | wrong-table-branch | wrong-plan.md | 9999 |", "",
-        )))
+        write_text_atomic(doc, "# Production\n- **Showrunner session:** `row-owner`\n")
         runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc("natedev", doc))
         unit = fixture_member("unit", name="member", parent=runner.id,
                               worktree=staff.PresentWorktree("natedev", folder))
@@ -690,42 +664,16 @@ class StaffTestCase(unittest.TestCase):
         return RowProductionFixture(runner, unit, worker, doc, folder, slug)
 
     def separated_unit_folders(self) -> RowProductionFixture:
-        """Give the director and the branch distinct private folders."""
+        """Give the production doc its checkout fields beside the unit's own folder."""
         fixture = self.row_production()
-        plan = fixture.worktree / "docs/plans/branch-plan.md"
-        plan.parent.mkdir(parents=True)
-        _ = plan.write_text("# Unit plan\n")
         repository = fixture.doc.parents[1]
-        text = fixture.doc.read_text().replace("wrong-plan.md", str(plan))
-        text = text.replace("# Production\n", "# Production\n"
+        text = fixture.doc.read_text().replace("# Production\n", "# Production\n"
                             + f"- **Repository:** `{repository}`\n"
                             + f"- **Showrunner checkout:** `{repository}`\n"
                             + "- **Merge branch:** `merge-from-git`\n"
                             + "- **Log:** `production.log`\n")
         _ = fixture.doc.write_text(text)
-        director = self.source_root / "director"
-        director.mkdir()
-        _ = staff.set_worktree(fixture.unit.id, staff.PresentWorktree("natedev", director), expected=fixture.unit.worktree)
         return fixture
-
-    def retired_fill_production(self, slug: str, *units: str, wrapped: bool = False) -> Path:
-        """Keep the live fill's repository, but replace its units with complete retired evidence."""
-        doc = self.fill_production(slug, *units)
-        repository = doc.parents[1]
-        text = doc.read_text()
-        for unit in units:
-            worktree = self.source_root / "worktrees" / unit
-            _ = self.fixture_git(repository, "worktree", "remove", str(worktree))
-            folder = self.root / "original" / unit
-            note = f"(retired 2026-10-31, worktree removed, session session-{unit}, folder {folder}) standby"
-            text = "\n".join(line.replace("`standby`", note) if line.startswith(f"| `{unit}` |") else line
-                             for line in text.splitlines()) + "\n"
-        if wrapped:
-            from scripts.production.production_units import WRAPPED
-
-            text = f"{WRAPPED}\n{text}"
-        write_text_atomic(doc, text)
-        return doc
 
     def pane(self, pane_id: str, *, session_id: str, environment: dict[str, str], written_at: str = "2026-10-30T09:00:00+00:00") -> None:
         path = Path(os.environ["HERDR_PANE_RECORD_DIR"]) / "agents.json"

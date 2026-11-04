@@ -3341,6 +3341,31 @@ class RecordedTurnSettingsTests(unittest.TestCase):
                 self.assertEqual((settings.model, settings.effort), expected)
 
 
+class StaffFolderTurnTests(unittest.TestCase):
+    def test_follow_up_turn_uses_the_changed_staff_folder_without_a_cwd_argument(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
+
+        with tempfile.TemporaryDirectory() as scratch, isolated_staff_file(Path(scratch) / "staff.json", {}):
+            old, new = Path(scratch) / "old", Path(scratch) / "new"
+            parent = fixture_member("showrunner", name="folder-production")
+            unit = fixture_member("unit", name="folder-unit", parent=parent.id,
+                                  worktree=staff.PresentWorktree("natedev", old))
+            worker = fixture_worker("impl1", unit.id)
+            args = argparse.Namespace(session_dir=scratch, name="impl1", turn_cwd="")
+            client = cast(codex_mesh.Client, cast(object, MagicMock()))
+            with (patch.object(codex_mesh, "_turn_model_effort", return_value=("fixture-model", "high")),
+                  patch.object(codex_mesh, "_turn_service_tier", return_value="default"),
+                  patch.object(codex_mesh, "_serving_request", return_value={"turn": {"id": "turn"}}) as request):
+                start = codex_mesh._start_turn  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(start(client, args, worker.current_session, codex_mesh.WORKER_SANDBOX, "First task"), "turn")
+                self.assertEqual(request.call_args.args[2]["cwd"], str(old))
+                _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", new), expected=unit.worktree)
+                self.assertEqual(start(client, args, worker.current_session, codex_mesh.WORKER_SANDBOX, "Next task"), "turn")
+                self.assertEqual(request.call_args.args[2]["cwd"], str(new))
+                self.assertEqual(request.call_args.args[2]["threadId"], worker.current_session)
+
+
 @final
 class QueueGraceSettingsTests(unittest.TestCase):
     def test_unset_or_empty_grace_keeps_the_production_window(self) -> None:

@@ -97,7 +97,7 @@ class UnitStatusFixture(unittest.TestCase):
         hooks = root / "scripts/hooks"
         hooks.mkdir()
         _ = (hooks / "direct_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
-        for name in ("production_units.py", "unit_table.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py", "unit_config.py"):
+        for name in ("production_doc.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py", "unit_config.py"):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
         (root / "scripts/agents").mkdir()
         _ = shutil.copy2(SCRIPT.parents[1] / "agents/worker_lifecycle.py", root / "scripts/agents/worker_lifecycle.py")
@@ -168,7 +168,6 @@ class UnitStatusFixture(unittest.TestCase):
                     _ = unit_membership("example", unit)
             pids: dict[str, int] = {}
             _ = responses_file.write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
-            rows: list[str] = []
             for unit in units:
                 worktree = root / "worktrees" / unit
                 worktree.mkdir(parents=True)
@@ -184,8 +183,6 @@ class UnitStatusFixture(unittest.TestCase):
                     member = unit_membership("example", unit)
                     _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
                     write_text_atomic(worktree / ".unit.toml", 'plan = "docs/plan.md"\nresponsibilities = []\n')
-                plan = "(retired by the user)" if unit in retired_units else "docs/plan.md"
-                rows.append(f"| {unit} | {plan} | {worktree} | {unit} | — | — |")
                 if unit in missing_units:
                     continue
                 if unit not in stopped_units:
@@ -209,9 +206,7 @@ class UnitStatusFixture(unittest.TestCase):
                     _ = (records / f"{unit}.json").write_text(
                         "{" if unit in unreadable_units else json.dumps(record))
             production_doc = root / "example-production.md"
-            _ = production_doc.write_text("\n".join((
-                "# Production", "## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                "| --- | --- | --- | --- | --- | --- |", *rows)), encoding="utf-8")
+            _ = production_doc.write_text("# Production\n", encoding="utf-8")
             owner = showrunner_relationship("example")
             _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", production_doc))
             zsh = shutil.which("zsh")
@@ -248,6 +243,17 @@ class UnitStatusFixture(unittest.TestCase):
             panes=({"hook": "— holding: waiting on x\n"},), stopped_units=stopped_units,
         )
         return outputs[0], calls
+
+    def unit_text(self, output: str, unit: str) -> str:
+        """One unit's status text, from its `== unit` line to the next unit; units print in staff row order."""
+        self.assertIn(f"\n== {unit}\n", output)
+        return f"== {unit}\n" + output.partition(f"\n== {unit}\n")[2].partition("\n== ")[0]
+
+    def status_block(self, output: str, unit: str, units: tuple[str, ...]) -> StatusBlock:
+        """The parsed block of one unit; units print in staff row order."""
+        blocks = [block for block in self.parse_status(output, units) if block.session == unit]
+        self.assertEqual(len(blocks), 1, output)
+        return blocks[0]
 
     def parse_status(self, output: str, units: tuple[str, ...] = ("hook",)) -> tuple[StatusBlock, ...]:
         with tempfile.TemporaryDirectory() as temporary:

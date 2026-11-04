@@ -230,10 +230,6 @@ class ChangePageTests(unittest.TestCase):
 - **Showrunner checkout:** `{self.repo}`
 - **Showrunner session:** fallback-owner
 - **Change review:** `{self.review_list}`
-## Units
-| Unit | Plan | Worktree | Branch |
-| --- | --- | --- | --- |
-| builder-unit | plan.md | /unused/feature | feature |
 """, encoding="utf-8")
         runner = fixture_member("showrunner", name="page-owner", doc=staff.LiveDoc("natedev", self.production))
         self.unit = fixture_member("unit", name="builder-unit", parent=runner.id,
@@ -991,14 +987,13 @@ class ChangePageTests(unittest.TestCase):
         refreshed.feed(self.request(path, {}).body)
         self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
 
-    def test_a_units_table_name_does_not_replace_its_current_staff_session(self) -> None:
+    def test_a_renamed_unit_gets_its_current_staff_session(self) -> None:
         from scripts.production.staff_test_support import fixture_runtime_id
 
         _ = staff.rename(self.unit.id, "x")
         current = staff.update_current_session(self.unit.id, staff.native_id(fixture_runtime_id("session-x")))
         self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
         self.assertEqual(self.raw_messages[0][0], f"session:{current.current_session}")
-        self.assertIn("builder-unit", self.production.read_text())
         self.assertEqual(self.messages[0][0], "x")
 
     def test_a_delivery_resolves_the_staff_session_after_an_account_move(self) -> None:

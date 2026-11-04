@@ -9,7 +9,8 @@ from typing import override
 import unittest
 from unittest.mock import patch
 
-from scripts.production import unit_config
+from scripts.production import staff, unit_config
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.staff import StaffId
 
 
@@ -36,6 +37,11 @@ class UnitConfigFixture(unittest.TestCase):
         _ = self.git("init", "-q", "--initial-branch=main")
         _ = self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                      "commit", "-q", "--allow-empty", "-m", "Initial commit")
+        _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))
+        owner = fixture_member("showrunner", name="configuration")
+        row = fixture_member("unit", name="worker", parent=owner.id,
+                             worktree=staff.PresentWorktree("natedev", self.worktree))
+        self.unit = row.id
         self.source = self.worktree / ".unit.toml"
         self.parked = self.home / ".local/state/staff/units" / f"{self.unit}.toml"
         self.exclude = self.worktree / ".git/info/exclude"
@@ -49,9 +55,7 @@ class UnitConfigFixture(unittest.TestCase):
                                       unit_config.AppPort(8123), ("nightly-review", "build-check"))
 
     def retirement(self) -> unit_config.RetiredSession:
-        return unit_config.RetiredSession("2026-10-31", "session-before-retire",
-                                         unit_config.RecordedStartFolder(self.worktree),
-                                         unit_config.Branch("feature/worker"))
+        return unit_config.RetiredSession("2026-10-31", "session-before-retire", unit_config.Branch("feature/worker"))
 
     def park_config(self) -> None:
         _ = unit_config.write(self.worktree, self.config())

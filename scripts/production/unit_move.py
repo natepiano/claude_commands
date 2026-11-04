@@ -19,6 +19,7 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from subprocess import Popen
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -35,9 +36,8 @@ from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.herdr.pane_launch import agent_kind  # noqa: E402
-from scripts.production import staff, worker_admission  # noqa: E402
+from scripts.production import staff  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
-from scripts.agents import worker_lifecycle  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
 
@@ -84,7 +84,7 @@ def json_object(value: object) -> dict[str, object]:
 
 
 def plan_paths(cell: str, checkout: Path) -> tuple[Path, ...]:
-    """The tracked plan files under docs/plans that a Units Plan cell names."""
+    """The tracked plan files under docs/plans that a unit's plan value names."""
     names = [match[1] for match in re.finditer(r"`([^`]+)`", cell)]
     if not names:
         if re.search(r"\s", cell.strip()):
@@ -392,9 +392,9 @@ def folder_launch(row: staff.StaffRow) -> FolderLaunch | NoFolderLaunch:
     if not matches:
         print(f"unit_move: {row.id}: no retained launch", file=sys.stderr)
         return NoFolderLaunch()
-    if len(matches) > 1:
-        raise ValueError(f"{row.id}: several retained launches match")
-    return matches[0]
+    current = [launch for launch in matches if launch.entry["session_id"] == row.current_session]
+    return next((launch for launch in reversed(current or matches) if not launch.entry.get("ended")),
+                (current or matches)[-1])
 
 
 def _folder_resume_notice(row: staff.StaffRow, launch: FolderLaunch) -> str:
@@ -407,13 +407,15 @@ def stop_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> bool:
     """Signal only the registered session process in the retained pane."""
     client = herdr.Herdr(launch.session)
     pane = launch.entry["pane_id"]
-    if isinstance(client.pane_activity(pane), herdr.PaneAtShell):
+    live = sessions.session_liveness(row.current_session)
+    if isinstance(live, sessions.SessionNotLive):
         return False
     if agent_kind(launch.entry) != "claude":
         raise ValueError(f"{row.id}: target process is not proved; resume with {_folder_resume_notice(row, launch)}")
-    live = sessions.session_liveness(row.current_session)
     if not isinstance(live, sessions.LiveSessionProcess):
         raise ValueError(f"{row.id}: target process is not proved; resume with {_folder_resume_notice(row, launch)}")
+    if not any(current["pane_id"] == pane for current in client.panes()):
+        raise ValueError(f"{row.id}: target pane is absent; no signal sent")
     info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
                              "folder move process info")
     if not any(herdr.json_object(raw, "foreground process").get("pid") == live.pid
@@ -421,28 +423,23 @@ def stop_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> bool:
         raise ValueError(f"{row.id}: target process is outside the retained pane; no signal sent")
     pane_record.end(launch.session, pane, row.current_session, record=staff.StaffSnapshot((row,)))
     os.kill(live.pid, signal.SIGTERM)
-    if not isinstance(client.pane_activity(pane), herdr.PaneAtShell):
-        raise ValueError(f"{row.id}: session stop is incomplete; resume with {_folder_resume_notice(row, launch)}")
+    deadline = time.monotonic() + 5
+    while not isinstance(sessions.session_liveness(row.current_session), sessions.SessionNotLive):
+        if time.monotonic() >= deadline:
+            raise ValueError(f"{row.id}: session stop is incomplete; resume with {_folder_resume_notice(row, launch)}")
+        time.sleep(0.05)
     return True
 
 
 def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch,
                           old: Path, new: Path, runs: tuple[Path, ...]) -> None:
     """Resume the unit with the commands for its existing workers."""
-    from scripts.lib.resume_message import ResumeWorkers, resume_message
-    from scripts.shutdown.inventory import codex_seats
+    from scripts.lib.resume_message import resume_message
 
     entry = launch.entry
     projected = entry.copy()
     projected["session_id"] = row.current_session
-    seats = codex_seats(list(runs))
-    for seat in seats:
-        prompt = Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md"
-        text = prompt.read_text(encoding="utf-8") if prompt.exists() else ""
-        if (note := f"Your unit folder moved from {old} to {new}. Use {new} for commands. Continue your current task.") not in text:
-            _ = prompt.write_text(f"{text}{note}\n", encoding="utf-8")
-    message = resume_message("the unit folder moved", moved_from=str(old), moved_to=str(new),
-                             workers=ResumeWorkers(seats, str(new)))
+    message = resume_message("the unit folder moved", moved_from=str(old), moved_to=str(new))
     environment = {key: value for key, value in entry["environment"].items()
                    if key not in {"STAFF_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "HERDR_TAB_ID"}}
     command = ["env", "-u", "STAFF_ID", "-u", "CODEX_THREAD_ID", "-u", "CLAUDE_CODE_SESSION_ID", "-u", "HERDR_TAB_ID",
@@ -453,10 +450,12 @@ def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch,
                *pane_record.resume_arguments(projected), message]
     client = herdr.Herdr(launch.session)
     if (agent_kind(entry) != "claude"
+            or not any(pane["pane_id"] == entry["pane_id"] for pane in client.panes())
             or not isinstance(sessions.session_liveness(row.current_session), sessions.SessionNotLive)
             or not isinstance(client.pane_activity(entry["pane_id"]), herdr.PaneAtShell)):
-        print(f"unit_move: {row.id}: resume is not safe; run {shlex.join(command)}", file=sys.stderr)
+        print(f"unit_move: {row.id}: {_folder_resume_notice(row, launch)}: resume is not safe; run {shlex.join(command)}", file=sys.stderr)
         return
+    resume_folder_workers(row, runs, old, new)
     client.run_in_pane(entry["pane_id"], command)
     with pane_record.locked(launch.session):
         entries = pane_record.read_strict(launch.session)
@@ -466,20 +465,11 @@ def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch,
             pane_record.save(launch.session, entries)
 
 
-def folder_runs(folder: Path) -> tuple[Path, ...]:
-    """Find run folders through the unit staff location."""
-    record = staff.local_snapshot()
-    owners = {row.id for row in record.rows
-              if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.path == folder}
-    runs: set[Path] = set()
-    for root in progress_history.SESSION_ROOTS:
-        for path in root.glob(f"*/{unit_runs.STATE_FILE}"):
-            try:
-                if worker_admission.parent(record, run=path.parent).id in owners:
-                    runs.add(path.parent)
-            except ValueError as error:
-                print(f"anomaly: {path.parent}: {error}", file=sys.stderr)
-    return tuple(sorted(runs))
+def folder_runs(row: staff.StaffRow) -> tuple[Path, ...]:
+    """Find run folders by the unit's session identity."""
+    return tuple(sorted({path.parent for root in progress_history.SESSION_ROOTS
+                         for path in root.glob(f"*/{unit_runs.STATE_FILE}")
+                         if unit_runs.director(path.parent) == row.current_session}))
 
 
 def pause_folder_workers(runs: tuple[Path, ...]) -> None:
@@ -493,6 +483,27 @@ def pause_folder_workers(runs: tuple[Path, ...]) -> None:
                     print(f"unit_move: cannot pause run {run}", file=sys.stderr)
             except (SystemExit, OSError, ValueError) as error:
                 print(f"unit_move: cannot pause run {run}: {error}", file=sys.stderr)
+
+
+def resume_folder_workers(row: staff.StaffRow, runs: tuple[Path, ...], old: Path, new: Path) -> None:
+    """Start the existing worker threads through their launchers."""
+    from scripts.lib.resume_message import resume_worker_command
+    from scripts.shutdown.inventory import codex_seats
+
+    environment = dict(os.environ)
+    for key in ("CODEX_THREAD_ID", "STAFF_ID"):
+        _ = environment.pop(key, None)
+    environment["CLAUDE_CODE_SESSION_ID"] = row.current_session
+    for seat in codex_seats(list(runs)):
+        prompt = Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md"
+        text = prompt.read_text(encoding="utf-8") if prompt.exists() else ""
+        note = f"Your unit folder moved from {old} to {new}. Use {new} for commands. Continue your current task."
+        if note not in text:
+            _ = prompt.write_text(f"{text}{note}\n", encoding="utf-8")
+        command = shlex.split(resume_worker_command(seat, str(new)))
+        with prompt.with_suffix(".log").open("a") as log:
+            _ = Popen(command, cwd=new, env=environment, start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
 
 @contextmanager
@@ -515,15 +526,21 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
         record = staff.snapshot()
         row = record.by_id(unit)
         if row is None or row.kind != "unit" or not isinstance(row.worktree, staff.PresentWorktree):
-            raise RenameRefused(f"{unit}: move-folder requires a unit with a present worktree")
+            print(f"{unit}: move-folder requires a unit with a present worktree", file=sys.stderr)
+            return
         if row.worktree.machine != remote.local_machine():
-            raise RenameRefused(f"{unit}: run move-folder on {row.worktree.machine}")
+            print(f"{unit}: run move-folder on {row.worktree.machine}", file=sys.stderr)
         old = row.worktree.path
         if old == destination:
-            print("unchanged")
+            resumed = False
+            launch = folder_launch(row)
+            if (isinstance(launch, FolderLaunch)
+                    and isinstance(sessions.session_liveness(row.current_session), sessions.SessionNotLive)
+                    and isinstance(herdr.Herdr(launch.session).pane_activity(launch.entry["pane_id"]), herdr.PaneAtShell)):
+                resume_folder_session(row, launch, old, destination, ())
+                resumed = True
+            print(f"resumed {unit} in {destination}" if resumed else "unchanged")
             return
-        if destination.is_relative_to(old):
-            raise RenameRefused("destination is inside the unit worktree")
         moved = False
         if not old.exists():
             owner = record.parent_of(row)
@@ -534,17 +551,13 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                              == git(destination, "rev-parse", "--path-format=absolute", "--git-common-dir"))
                 except RenameRefused:
                     pass
-        runs = (folder_runs(old) or folder_runs(destination)) if moved else folder_runs(old)
+        runs = folder_runs(row)
+        was_live = isinstance(sessions.session_liveness(row.current_session), sessions.LiveSessionProcess)
         launch: FolderLaunch | NoFolderLaunch = NoFolderLaunch()
-        stopped = False
         try:
             launch = folder_launch(row)
             if isinstance(launch, FolderLaunch):
-                if moved:
-                    print(f"unit_move: {row.id}: crash recovery starts no session; resume with {_folder_resume_notice(row, launch)}",
-                          file=sys.stderr)
-                else:
-                    stopped = stop_folder_session(row, launch)
+                _ = stop_folder_session(row, launch)
         except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
             print(f"unit_move: {error}", file=sys.stderr)
         pause_folder_workers(runs)
@@ -553,18 +566,14 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
             try:
                 _ = git(old, "worktree", "move", str(old), str(destination))
             except RenameRefused:
-                if stopped and isinstance(launch, FolderLaunch):
+                if was_live and isinstance(launch, FolderLaunch):
                     try:
                         resume_folder_session(row, launch, old, old, runs)
                     except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
                         print(f"unit_move: {error}", file=sys.stderr)
                 raise
-        try:
-            pane_record.move_cwd(unit, old, destination, record)
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
-            print(f"unit_move: {error}", file=sys.stderr)
         histories = {Path(history) for run in runs
-                     if isinstance(history := worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE).get("history_file"), str)
+                     if isinstance(history := json_object(read_json(run / unit_runs.STATE_FILE)).get("history_file"), str)
                      and history}
         for history in sorted(histories):
             try:
@@ -575,11 +584,13 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
             _ = staff.set_worktree(unit, staff.PresentWorktree(row.worktree.machine, destination), expected=row.worktree)
         except (staff.StaffRefused, staff.StaffNotFound, OSError, ValueError) as error:
             print(f"unit_move: {error}", file=sys.stderr)
-        if stopped and isinstance(launch, FolderLaunch):
+        if isinstance(launch, FolderLaunch):
             try:
                 resume_folder_session(row, launch, old, destination, runs)
             except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
                 print(f"unit_move: {error}", file=sys.stderr)
+        else:
+            resume_folder_workers(row, runs, old, destination)
         print(f"moved {unit}: {old} -> {destination}")
 
 

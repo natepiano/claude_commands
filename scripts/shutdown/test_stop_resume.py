@@ -441,6 +441,18 @@ class StopResumeTests(unittest.TestCase):
         return (sessions.LiveSessionProcess(123) if call(123, signal.SIGKILL) not in self.kill.call_args_list
                 else sessions.SessionNotLive())
 
+    def test_review_resume_keeps_the_lens_and_task_with_the_current_folder(self) -> None:
+        run = str(self.root / "worker run")
+        old, current = str(self.root / "old folder"), str(self.root / "staff folder")
+        command = ["bash", str(stop_resume.SCRIPTS / "direct/review.sh"), "--lens", "contract",
+                   "--phase", "4w", run, old, "old prompt.md", "review", "check the contract", "reviewing", "3"]
+        seat = PausedSeat(run_dir=run, seat="review2", role="review", thread_id="same-thread",
+                          turn_live=True, launcher_command=command)
+        rebuilt = shlex.split(stop_resume.resume_worker_command(seat, current))
+        self.assertEqual(rebuilt, [*command[:6], "--to", "review2", run, current,
+                                  str(Path(run) / "review2.resume-prompt.md"), *command[9:]])
+        self.assertEqual(seat["launcher_command"], command)
+
     def test_saved_review_resumes_without_retired_allocation_options(self) -> None:
         run, cwd = str(self.root / "worker run"), str(self.root / "working tree")
         task = [run, cwd, "old prompt.md", "review", "check this change", "reviewing", "2"]
@@ -585,6 +597,8 @@ class StopResumeTests(unittest.TestCase):
             owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id=self.entry["session_id"])
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
+            folder = self.root / "staff-folder"
+            _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", folder), expected=owner.worktree)
             self.client.rows[0]["agent_session"] = {"kind": "id", "value": current}
             pane_record.write("agents", self.entry)
             record = pane_record.record_path("agents")
@@ -597,6 +611,7 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(arguments[arguments.index("--resume") + 1], current)
             self.assertNotIn(owner.id, arguments)
             self.assertEqual(self.launched, {current})
+            self.assertIn(str(folder), arguments)
             self.assertEqual((path.read_bytes(), record.read_bytes(), record.stat().st_mtime_ns), before)
 
     def test_stop_returns_as_soon_as_term_takes_effect(self) -> None:

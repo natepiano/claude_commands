@@ -273,7 +273,7 @@ class ReviewLauncherFixture(LauncherFixture):
         """
         direct_dir, agents, lib = prepare_launcher_runtime(self.root)
         for name in ("showrunners.py", "session_staff.py", "staff.py", "session_labels.py",
-                     "unit_config.py", "unit_names.py", "unit_table.py"):
+                     "unit_config.py", "unit_names.py"):
             _ = shutil.copy2(DIRECT_DIR.parent / "production" / name,
                              self.root / "scripts/production" / name)
         for directory, names in (("herdr", ("place.py", "pane_launch.py")),

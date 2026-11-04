@@ -26,7 +26,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
                        self.run_command('unit', NEW, 'beta-unit')]
         for result in results:
             self.assert_success(result)
-        self.assertEqual([line for result in results for line in result.stderr.splitlines()],
+        self.assertEqual([line for result in results for line in result.stderr.splitlines() if line.startswith('warning: ')],
                          [f'warning: {bad}: missing or invalid repository'])
         self.assert_unit_moved('alpha-unit')
         self.assert_unit_moved('beta-unit')

@@ -644,7 +644,9 @@ def main() -> int:
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
     if args.lens:
         check += ["--lens", args.lens]
-    _ = call(check, env)
+    checked = call(check, env, check=False)
+    if checked.returncode:
+        return 3 if checked.returncode == 3 else 2
     family, model, effort, tier = resolve_model(args, role, env)
     worker = args.to
     reservation: dict[str, object] = {}

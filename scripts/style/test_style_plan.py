@@ -26,7 +26,7 @@ import style_ledger
 
 from style_plan_test_support import StylePlanFixture
 from scripts.production import staff, unit_names
-from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner, recorded_unit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -54,9 +54,8 @@ class StylePlanTests(StylePlanFixture):
             with self.subTest(unit=unit):
                 self.assertIsInstance(rules.style_family(unit), rules.NotStyleUnit)
 
-    def test_family_plans_use_each_units_plan_cell_for_old_and_full_ids(self) -> None:
+    def test_family_plans_use_each_units_config_plan_for_old_and_full_ids(self) -> None:
         expected: dict[rules.Family, str] = {}
-        rows: list[str] = []
         owner = recorded_showrunner("sample-style", self.doc)
         families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
         for index, family in enumerate(families):
@@ -68,28 +67,21 @@ class StylePlanTests(StylePlanFixture):
             expected[family] = f"# {family} unit settings\n"
             _ = plan.write_text(expected[family])
             _ = (plan.parent / f"{unit}.md").write_text("Do not read this path.\n")
-            _ = fixture_unit_location(owner, unit, worktree)
-            rows.append(f"| {unit} | {relative} | {worktree} | demo-style-{family} |")
-        rows.append(f"| feature-unit | missing.md | {self.root / 'feature'} | feature |")
+            _ = recorded_unit("sample-style", unit, worktree, self.doc, plan=relative)
         _ = fixture_unit_location(owner, "feature-unit", self.root / "feature")
-        prefix = self.doc.read_text().split("## Units", 1)[0]
-        _ = self.doc.write_text(prefix + "## Units\n\n| Unit | Plan | Worktree | Branch |\n"
-                                + "| --- | --- | --- | --- |\n" + "\n".join(rows) + "\n")
 
         self.assertEqual(dict(unit_plans.family_plan_texts(self.doc)), expected)
 
     def test_next_phase_keeps_the_declared_plan_path_for_old_and_full_ids(self) -> None:
         _ = self.rule("read")
         self.sync()
-        original_doc = self.doc.read_text()
         retained = self.plan.with_name("retained-names-plan.md")
         _ = self.plan.rename(retained)
+        self.unit_plan_config(self.unit, retained.name)
         member = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "names-unit", self.unit)
         for unit in ("names-unit", "sample-style-names-unit"):
             with self.subTest(unit=unit):
                 member = staff.rename(member.id, unit_names.name(unit))
-                _ = self.doc.write_text(original_doc.replace("| names-unit |", f"| {unit} |")
-                                        .replace("units/names-unit.md", "units/retained-names-plan.md"))
                 _ = retained.write_text(self.plan_header().replace("`names-unit`", f"`{unit}`"))
                 result = style_plan.next_phase(unit, retained, self.repo)
                 self.assertEqual(result, style_plan.PhaseWritten(f"{unit}-1"))
@@ -107,14 +99,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.enterContext(mock.patch.object(rules, "FAMILY_RANKS", ()))
         _ = self.rule("read")
         _ = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
-        types = self.root / "types"
-        _ = self.git("worktree", "add", "-q", "-b", "demo-style-types", str(types))
-        types_plan = types / "docs/style-production/units/types-unit.md"
-        types_plan.parent.mkdir(parents=True)
-        _ = types_plan.write_text(self.plan_header().replace("names-unit", "types-unit"))
-        _ = self.doc.write_text(self.doc.read_text() +
-                                f"| types-unit | docs/style-production/units/types-unit.md | {types} | demo-style-types |\n")
-        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "types-unit", types)
+        types_plan = self.types_unit()
         self.sync()
         names_candidates = self.candidates("names")
         types_candidates = self.candidates("types")
@@ -240,8 +225,7 @@ class StylePlanTests(StylePlanFixture):
         first = self.sources[-1]
         _ = retained.write_text(self.plan_header().replace("`names-unit`", f"`{unit}`").replace(
             "## Phases", f"- **First files:** {first}\n\n## Phases"))
-        _ = self.doc.write_text(self.doc.read_text().replace("| names-unit |", f"| {unit} |")
-                                .replace("units/names-unit.md", "units/retained-names-plan.md"))
+        self.unit_plan_config(self.unit, retained.name)
         for selected in ([], ["--unit", unit]):
             with self.subTest(selected=selected):
                 output = io.StringIO()
@@ -307,11 +291,7 @@ class StylePlanTests(StylePlanFixture):
         other_blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == other_rule)
         other = ledger.hold(other_rule, self.sources[0], 3, "Other rule", "rename", "before", "after", other_blob, "outside")
         ledger.waive_held(other.finding_id, style_ledger.WaiveByPerson("nate"))
-        worktree = self.root / "modules"
-        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
-        plan = worktree / "docs/style-production/units/modules-unit.md"
-        plan.parent.mkdir(parents=True)
-        _ = plan.write_text(self.plan_header())
+        plan = self.modules_unit()
         self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
         text = plan.read_text()
         self.assertIn(f"{held.finding_id} · {rule} · {self.sources[0]}:1 · Split this module", text)
@@ -444,9 +424,7 @@ class StylePlanTests(StylePlanFixture):
         types_plan.parent.mkdir(parents=True)
         _ = types_plan.write_text(self.plan_header().replace(
             "## Phases", "- **First files:** a.rs, a.rs\n\n## Phases"))
-        _ = self.doc.write_text(self.doc.read_text() +
-                                f"| types-unit | docs/style-production/units/types-unit.md | {types} | types |\n")
-        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "types-unit", types)
+        _ = recorded_unit("sample-style", "types-unit", types, self.doc, plan="docs/style-production/units/types-unit.md")
 
         with self.subTest(selection="names queue"):
             output = io.StringIO()
@@ -570,7 +548,7 @@ class StylePlanTests(StylePlanFixture):
         ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
                              + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        self.proposals_field(folder)
         before = issue.read_bytes()
         with mock.patch.object(style_proposals, "proposal_command") as start:
             result = self.run_next()

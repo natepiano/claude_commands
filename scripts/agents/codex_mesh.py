@@ -1754,7 +1754,9 @@ def _turn_sandbox_policy(mode: str) -> dict[str, object]:
 
 def _resume_params(session_dir: str, name: str, thread_id: str) -> dict[str, object]:
     """Restore a roster thread's standing instructions whenever it is reopened."""
-    params: dict[str, object] = {"threadId": thread_id}
+    params: dict[str, object] = {"threadId": thread_id,
+        **({"cwd": cwd} if (cwd := _as_str(plan_history.staff_directory(
+            {"owner_session": thread_id}, staff.snapshot()).get("working_dir"))) else {})}
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     policy = roster_access_policy(record)
     if isinstance(policy, (ReadOnlyReviewer, PhaseBoundDesigner)):
@@ -6105,7 +6107,7 @@ def _start_turn(
             for path in cast("list[object]", images) if isinstance(path, str)
         )
     params: dict[str, object] = {"threadId": thread_id, "input": inputs}
-    cwd = _as_str(_attr(args, "turn_cwd"))
+    cwd = _as_str(plan_history.staff_directory({"owner_session": thread_id}, staff.snapshot()).get("working_dir")) or _as_str(_attr(args, "turn_cwd"))
     if cwd:
         params["cwd"] = cwd
     # Every turn names its policy: the app-server keeps a thread's last turn policy, so a

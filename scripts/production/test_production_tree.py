@@ -183,7 +183,7 @@ class ProductionTreeTests(StaffTestCase):
         assert isinstance(gone, staff_sources.MemberFound)
         _ = staff.rename(main.row.id, "tools")
         document = self.source_root / "main-production.md"
-        self.units_doc(document, ("one",), workspace="tools")
+        write_text_atomic(document, "# Fixture production\n- **Showrunner session:** `tools`\n")
         _ = self.worktree("one")
         director = fixture_member("unit", name="one", parent=main.row.id, runtime_id=DIRECTOR)
         self.pane("w1:p1", session_id=DIRECTOR, environment={
@@ -214,7 +214,6 @@ class ProductionTreeTests(StaffTestCase):
             self.assertEqual(after.getvalue(), expected.replace('"manager":"17058649-2f0a-5cbf-b652-118ad9afdcf5"', '"manager":"da46e5c2-e05e-5af0-b745-29e7288c841f"'))
         self.assertEqual(staff.by_id(director.id), staff.StaffRow(director.id, "unit", "one", staff.ReportsTo(gone.row.id), current_session=director.id))
         self.assertEqual(parent_file.read_text(), "main\n")
-        self.assertIn("| `one` |", document.read_text())
 
     def test_astra_designer_and_reviewer_edges_carry_their_account_and_live_state(self) -> None:
         run = self.run_folder("unit", DIRECTOR, {

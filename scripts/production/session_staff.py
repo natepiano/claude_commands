@@ -20,7 +20,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr", SCRIPTS.parent):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
-from scripts.production import staff, showrunners, unit_table
+from scripts.production import staff, showrunners
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
 from scripts.shutdown import remote
@@ -113,7 +113,7 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
     if row is not None:
         owner = record.parent_of(row) if row.kind == "worker" else row
         if owner is not None and owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
-            from scripts.production.production_units import read_production
+            from scripts.production.production_doc import read_production
             return read_production(owner.doc.path).checkout
         tree = RowResolver(record).unit_worktree(row)
         if isinstance(tree, PresentWorktree):
@@ -502,19 +502,7 @@ class MemberSources:
                 return next(iter(identities.values()))
             if references:
                 return NoSuchMember(selector)
-            found = unit_match(selector, record, parent=RequiredParent(parent.row))
-            if isinstance(found, MemberFound) or source is None:
-                return found
-            try:
-                cells_by_unit = unit_table.unit_table(source.document.splitlines())
-            except unit_table.Refusal:
-                return found
-            for cells in cells_by_unit:
-                if unit_table.cell_value(cells.get("Unit", "")) == selector.unit:
-                    identity = unit_table.retired_session(cells.get("Plan", ""))
-                    if identity:
-                        return unit_match(selector, record, StoredReference(identity), parent=RequiredParent(parent.row))
-            return found
+            return unit_match(selector, record, parent=RequiredParent(parent.row))
         if source is None:
             row = record.by_path(selector.slug)
             return MemberFound(row) if row is not None and row.kind == "showrunner" else NoSuchMember(selector)

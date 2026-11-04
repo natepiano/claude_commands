@@ -13,7 +13,7 @@ from pathlib import Path
 
 from scripts.lib import conf
 from scripts.production import delivery_state, staff, unrouted_alert
-from scripts.production.production_units import Refusal, production_field
+from scripts.production.production_doc import Refusal, production_field
 from scripts.production.proposals_folder import slug_of
 
 PREFIX = "change-review - "

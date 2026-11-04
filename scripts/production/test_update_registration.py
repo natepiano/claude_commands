@@ -166,11 +166,6 @@ class QuestionIdentityTests(RegistrationFixture):
         super().setUp()
         self.issues = self.root / "issues"
         self.issues.mkdir(exist_ok=True)
-        text = self.doc.read_text(encoding="utf-8")
-        if "- **Proposals:**" not in text:
-            _ = self.doc.write_text(text.replace("## Units", f"- **Proposals:** `{self.issues}`\n\n## Units"),
-                                    encoding="utf-8")
-            _ = self.git("commit", "-qam", "Set the private proposals folder")
         self.timer("example")
         parent = showrunner_relationship(fixture_showrunner_name("example", self.doc))
         self.asker_id = fixture_member("unit", name="alpha", parent=parent.id,

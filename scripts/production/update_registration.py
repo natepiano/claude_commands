@@ -24,11 +24,10 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production.production_units import Production, read_production
-from production_units import Refusal, cell_value, unit_table
+from scripts.production.production_doc import Production, Refusal, read_production
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
-from scripts.production import showrunners, session_staff, showrunner_tree, staff
+from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup, unit_names
 from scripts.production.session_labels import StaffLabels
 from proposals_folder import issues_folder, slug_of
 from issues import Issue, frontmatter
@@ -1296,8 +1295,8 @@ def state_block(production: Production, state: ShowrunnerState, timestamp: str) 
     history = merge_branch_history(production.checkout, production.merge_branch)
     judgments = {unit.unit: unit for unit in state.units}
     unit_lines: list[str] = []
-    for cells in unit_table(production.doc.read_text(encoding="utf-8").splitlines()):
-        name = cell_value(cells.get("Unit", ""))
+    for row in unit_lookup.doc_units(production.doc, staff.snapshot()):
+        name = unit_names.unit_id(row.name)
         judgment = judgments.get(name)
         merged = history.last_code_for_unit(name)
         last = "none" if isinstance(merged, NoMerge) else f"phase {merged.phase} ({merged.short})"

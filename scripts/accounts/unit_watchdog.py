@@ -33,14 +33,13 @@ for directory in ("production", "shutdown", "herdr", "message", "whoami"):
 from scripts.shutdown.remote import local_machine
 
 if TYPE_CHECKING:
-    from scripts.production import live_units, production_units, unit_lookup
+    from scripts.production import live_units, unit_lookup
     from scripts.herdr import herdr
     from scripts.shutdown import pane_record
     from scripts.message import sessions
 else:
     herdr = import_module("herdr")
     live_units = import_module("live_units")
-    production_units = import_module("production_units")
     unit_lookup = import_module("unit_lookup")
     pane_record = import_module("pane_record")
     sessions = import_module("sessions")
@@ -309,14 +308,9 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
         for runner in runners:
             doc = Path(runner["doc"])
             try:
-                rows = unit_lookup.live_unit_table(doc.read_text(encoding="utf-8").splitlines(), runner["slug"])
-                for row in rows:
-                    unit = production_units.cell_value(row.get("Unit", ""))
+                for found in live_units.units_in(doc, unit_observations()):
+                    unit = found.unit
                     try:
-                        observed = {item.unit: item for item in live_units.units_in(doc, unit_observations())}
-                        found = observed.get(unit)
-                        if found is None:
-                            raise OSError(f"{unit}: unit liveness is unavailable")
                         claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
                         if not isinstance(claude, unit_lookup.LiveClaude):
                             # One fresh recovery observation for all absent units.
@@ -426,7 +420,7 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                         # Preserve incomplete observations, then continue with the next unit.
                         retained.update({key: value for key, value in state.items() if key not in retained})
                         lines.append(f"watchdog: {runner['slug']}/{unit}: {error}")
-            except (OSError, ValueError) as error:
+            except (OSError, ValueError, herdr.HerdrFailure) as error:
                 # Keep pending recovery evidence when discovery is incomplete.
                 retained.update({key: value for key, value in state.items() if key not in retained})
                 lines.append(f"watchdog: {runner['slug']}: {error}")

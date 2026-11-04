@@ -29,10 +29,8 @@ sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, session_staff, staff, unit_config, unit_names
-from scripts.production.unit_table import Refusal, cell_value
-from scripts.production.production_units import production_field
+from scripts.production.production_doc import PromoteTo, Refusal, cell_value, production_field, promotion_from_doc
 from scripts.shutdown import remote
-from scripts.production.production_doc import PromoteTo, promotion_from_doc
 
 # The finding_opened event schema uses these severities. Importing findings to
 # read its SEVERITIES also validates command-only convergence configuration.
@@ -1114,7 +1112,7 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
-    run_events = [_events(path) for path in plan_history.plan_runs(plan_path)]
+    run_events = [_events(path) for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
     open_instance = _newest_open_instance(run_events)
     return _build_phase_record(

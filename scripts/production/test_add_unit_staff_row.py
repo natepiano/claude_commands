@@ -9,7 +9,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import unit_membership, fixture_runtime_id
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
 import add_unit
-import production_units
+from scripts.production.production_doc import read_production
 
 
 def setUpModule() -> None:
@@ -36,7 +36,7 @@ class AddUnitStaffRowTests(AddUnitTestCase):
 
     def test_same_showrunner_returns_the_existing_unit_without_writing(self) -> None:
         with patch.dict(os.environ, self.env):
-            production = production_units.read_production(self.doc)
+            production = read_production(self.doc)
             row = unit_membership("director", "alpha")
             before = self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns
             with patch.object(staff, "ensure", wraps=staff.ensure) as ensure:
@@ -48,7 +48,7 @@ class AddUnitStaffRowTests(AddUnitTestCase):
 
     def test_missing_unit_is_added_under_the_requested_showrunner(self) -> None:
         with patch.dict(os.environ, self.env):
-            production = production_units.read_production(self.doc)
+            production = read_production(self.doc)
             _ = add_unit.ensure_staff_showrunner(production)
             before = staff.snapshot()
             worktree = self.root / "project-alpha"

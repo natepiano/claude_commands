@@ -668,6 +668,25 @@ class TempParentTests(TmpSweepCase):
 
 
 class TempFolderTests(TmpSweepCase):
+    def test_verify_prefix_changes_after_import(self) -> None:
+        config = self.tmp / "config"
+        config.mkdir()
+        source = Path(build_folders.__file__).resolve().parents[2] / "config/build_folders.conf"
+        settings = source.read_text()
+        name = "changed-hold.123.abcdefgh"
+        folder = self.tmp / name
+        _ = write(folder / "content")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), os.scandir(self.tmp) as entries:
+            entry = next(entry for entry in entries if entry.name == name)
+            _ = write(config / "build_folders.conf", settings)
+            roots = self.roots()
+            self.assertFalse(roots.judged_temp(str(self.tmp), entry))
+            _ = write(config / "build_folders.conf", settings.replace(
+                "prefixes.verify-hold=verify-hold.{owner}.",
+                "prefixes.verify-hold=changed-hold.{owner}."))
+            self.assertFalse(roots.judged_temp(str(self.tmp), entry))
+            self.assertTrue(self.roots().judged_temp(str(self.tmp), entry))
+
     def test_every_common_prefix_keeps_its_sweep_classification(self) -> None:
         pairs: list[tuple[str, Path, Path]] = []
         parents: list[str] = []
