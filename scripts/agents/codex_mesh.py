@@ -1398,7 +1398,8 @@ def _session_path(session_dir: str, filename: str) -> Path:
 def _read_json_object(path: Path) -> dict[str, object]:
     if path.name == ROSTER_FILE or path.name.endswith(".pending.json"):
         with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as state:
-            return state.read_object()
+            records = state.read_object()
+        return worker_admission.resolve_roster(path.parent, records) if path.name == ROSTER_FILE else records
     return worker_lifecycle.read_worker_state(path)
 
 
@@ -1563,8 +1564,7 @@ def _store_reviewer_policy(entry: dict[str, object], *, new_reviewer: bool = Fal
 
 
 def _load_roster_for_write(handle: worker_lifecycle.WorkerStateFile) -> dict[str, object]:
-    records = handle.read_object()
-    return records
+    return worker_admission.resolve_roster(handle.path.parent, handle.read_object())
 
 
 def _write_roster_record(handle: worker_lifecycle.WorkerStateFile, roster: dict[str, object], name: str,
