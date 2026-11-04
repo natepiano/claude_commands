@@ -31,6 +31,7 @@ from scripts.copies import copies
 import scratch
 import style_ledger
 import style_rules
+from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners
 from scripts.message import send_budget
@@ -615,7 +616,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
     def test_clean_check_mode_records_all_tools_passing_and_returns_zero(self) -> None:
         verify = self.root / "verify.sh"
-        metadata = self.lint_temp / f"{style_sync.LINT_PREFIX}*"
+        metadata = self.lint_temp / f"{style_sync.lint_prefix()}*"
         _ = verify.write_text(f"#!/bin/bash\ncp {metadata}/owner.json {self.root / 'owner-seen'}\n"
                               + f"cp {metadata}/{style_sync.VERIFIER_FILE} {self.root / 'verifier-seen'}\n"
                               + f"echo $$ > {self.root / 'verify-pid'}\ncat <<'OUTPUT'\n" + CLEAN_LINT + "OUTPUT\n")
@@ -658,7 +659,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         return code, output.getvalue()
 
     def stale_dir(self, name: str, owner: int | None, *, registered: bool, verifier_group: int = 0) -> Path:
-        directory = self.lint_temp / f"{style_sync.LINT_PREFIX}{name}"
+        directory = self.lint_temp / f"{style_sync.lint_prefix()}{name}"
         directory.mkdir()
         if owner is not None:
             common_dir = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
@@ -815,15 +816,15 @@ with Path('.claude-busy').open('r+') as lock:
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
     def test_a_stop_signal_right_after_the_dir_is_made_still_removes_it(self) -> None:
-        make_dir = tempfile.mkdtemp
+        make_dir = build_folders.create_build_folder
 
-        def make_dir_then_signal(prefix: str, dir: Path) -> str:
-            made = make_dir(prefix=prefix, dir=dir)
+        def make_dir_then_signal(request: build_folders.BuildFolderRequest) -> Path:
+            made = make_dir(request)
             os.kill(os.getpid(), signal.SIGTERM)
             return made
 
         output = io.StringIO()
-        with mock.patch.object(tempfile, "mkdtemp", make_dir_then_signal), \
+        with mock.patch.object(build_folders, "create_build_folder", make_dir_then_signal), \
                 mock.patch.object(style_sync, "VERIFY", self.clean_verify()), \
                 redirect_stdout(output), redirect_stderr(output):
             code = style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip])
@@ -1002,7 +1003,7 @@ with Path('.claude-busy').open('r+') as lock:
         common_dir = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
         style_sync.OwnerRecord(dead, common_dir).write(planted_target)
         _ = (planted_target / "kept").write_text("kept\n")
-        planted = self.lint_temp / f"{style_sync.LINT_PREFIX}planted"
+        planted = self.lint_temp / f"{style_sync.lint_prefix()}planted"
         planted.symlink_to(planted_target)
         with redirect_stdout(io.StringIO()):
             style_sync.sweep_stale_lint_dirs()

@@ -15,12 +15,12 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import showrunners
+from scripts.production import showrunners, staff, unit_lookup, unit_names
 import showrunner_tree
 from issues import Issue, open_issues
 # Callers such as rename_unit read the tag here.
 from issues import PROPOSAL_TAG as PROPOSAL_TAG
-from production_units import Refusal, production_field, unit_table
+from scripts.production.production_doc import Refusal, production_field
 
 PROPOSALS_FIELD = "Proposals"
 IMPROVEMENT_QUEUE_FIELD = "Improvement queue"
@@ -73,15 +73,15 @@ def scope_docs(doc: Path, below: bool = False) -> list[Path]:
 
 
 def owners(doc: Path, below: bool = False) -> frozenset[str]:
-    """The proposer names whose proposals are this production's: each production and unit its docs name."""
+    """The proposer names whose proposals are this production's: each production and its staff units."""
+    record = staff.initial_snapshot()
     names: set[str] = set()
     for production in scope_docs(doc, below):
         names.add(slug_of(production))
         try:
-            rows = unit_table(production.read_text(encoding="utf-8").splitlines())
-        except (OSError, UnicodeError, Refusal):
+            names.update(unit_names.unit_id(row.name) for row in unit_lookup.doc_units(production, record))
+        except staff.StaffUnreadable:
             continue
-        names.update(row["Unit"] for row in rows if row.get("Unit"))
     return frozenset(names)
 
 
@@ -92,11 +92,16 @@ def proposer(issue: Issue) -> str:
     return found["production"].strip() if found else named
 
 
-def open_proposals(doc: Path, names: frozenset[str] | None = None) -> list[Issue]:
-    """The open proposal issues in the production's folder that are its own, or that `names` own."""
+def proposal_issues(doc: Path) -> list[Issue]:
+    """The open proposal issues in the production's folder, of any proposer."""
     folder = issues_folder(doc)
     if folder is None or not folder.is_dir():
         return []
-    names = owners(doc) if names is None else names
-    return [issue for issue in open_issues(folder, PROPOSAL_TAG)
-            if issue.value("record_type") != "question" and proposer(issue) in names]
+    return [issue for issue in open_issues(folder, PROPOSAL_TAG) if issue.value("record_type") != "question"]
+
+
+def open_proposals(doc: Path) -> list[Issue]:
+    """The open proposal issues in the production's folder that are its own. Staff is read only when issues exist."""
+    found = proposal_issues(doc)
+    names = owners(doc) if found else frozenset[str]()
+    return [issue for issue in found if proposer(issue) in names]

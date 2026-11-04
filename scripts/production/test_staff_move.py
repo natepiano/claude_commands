@@ -24,7 +24,7 @@ class StaffMoveTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        source_doc = self.production("sdlc", "models-unit", workspace="tools")
+        source_doc = self.production("sdlc", workspace="tools")
         destination_doc = self.production("target", workspace="new-tools")
         self.members = {}
         self.members["source"] = fixture_member("showrunner", name="tools", doc=staff.LiveDoc("natedev", source_doc))
@@ -92,14 +92,14 @@ class StaffMoveTests(StaffTestCase):
         for pinned in (True, False):
             with self.subTest(pinned=pinned):
                 _ = target_doc.write_text(target_text)
-                self.units_doc(self.source_root / "sdlc-production.md", ("models-unit",), workspace="tools")
+                _ = (self.source_root / "sdlc-production.md").write_text("# Fixture production\n- **Showrunner session:** `tools`\n")
                 _ = staff.move(self.members["unit"].id, self.members["source"].id)
                 self.members["unit"] = staff.rename(self.members["unit"].id, "models" if not pinned else "panes")
                 identity = staff_move.PinnedUnit(self.members["unit"].id, self.members["destination"].id) if pinned else staff_move.LocateUnit()
                 self.place.reset_mock()
                 self.place.return_value = True
                 first = staff_move.move_unit("sdlc", "models-unit", "target", identity=identity)
-                self.units_doc(self.source_root / "sdlc-production.md", (), workspace="tools")
+                _ = (self.source_root / "sdlc-production.md").write_text("# Fixture production\n- **Showrunner session:** `tools`\n")
                 if pinned:
                     (self.source_root / "target-production.md").unlink()
                 before = self.staff_file.read_bytes()
@@ -116,7 +116,7 @@ class StaffMoveTests(StaffTestCase):
             self.members[key] = staff.set_doc(self.members[key].id, staff.LiveDoc(
                 "mac", self.root / "mac-sources" / f"{slug}-production.md"))
         with self.machine("mac"):
-            _ = self.production("sdlc", "models-unit", workspace="tools")
+            _ = self.production("sdlc", workspace="tools")
             _ = self.production("target", workspace="new-tools")
             self.pane("w1:p1", session_id=self.members["unit"].id, environment={
                 "CLAUDE_CODE_SESSION_ID": self.members["unit"].id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",

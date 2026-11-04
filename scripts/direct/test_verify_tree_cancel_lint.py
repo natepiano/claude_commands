@@ -29,7 +29,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.wait_for_running(self.control / "running", process)
         self.assert_resources_held()
         self.edit_source()
-        self.assert_cancelled(process, "lint")
+        _ = self.assert_cancelled(process, "lint")
         judgments = [args for args in self.cargo_calls() if args[:1] == ["clippy"] and "--fix" not in args]
         self.assertEqual(len(judgments), 1, "cancelled call restarted clippy")
 

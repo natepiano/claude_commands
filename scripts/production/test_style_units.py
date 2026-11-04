@@ -17,7 +17,7 @@ import proposal_issue
 import style_units
 import style_ledger
 import unit_lookup
-import unit_table_cells
+import display_cells
 from herdr import HerdrPlace
 from scripts.direct import plan_history
 
@@ -513,7 +513,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.assertIn("| names\\|worker | idle |", output)
         self.assertIn("| gone | idle |", output)
         self.assertNotIn("| names-unit |", output)
-        self.assertEqual(unit_table_cells.session_cell(units[0]), "names|worker")
+        self.assertEqual(display_cells.session_cell(units[0]), "names|worker")
 
 
 if __name__ == "__main__":

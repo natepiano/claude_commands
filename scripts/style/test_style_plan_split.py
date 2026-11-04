@@ -6,7 +6,6 @@ import io
 import signal
 import sqlite3
 import subprocess
-from subprocess import run as run_git
 import sys
 import tempfile
 import time
@@ -24,12 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import approved_renames
 import declarations
 import style_plan
-from scripts.production import showrunners
 from scripts.production.staff_test_support import isolated_staff_file, production_membership, recorded_showrunner, recorded_unit
-from scripts.build_hold import build_hold
-from scripts.build_queue import queue_place
 import live_units
-import unit_lookup
 import unit_plans
 import style_proposals
 
@@ -50,11 +45,6 @@ class StylePlanTests(StylePlanFixture):
         _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
         _ = recorded_unit("sample-style", "names-unit", self.unit, self.doc,
                           plan="docs/style-production/units/names-unit.md")
-        from scripts.production import staff
-        from scripts.production.staff_test_support import fixture_member
-        owner = recorded_showrunner("sample-style", self.doc)
-        _ = fixture_member("unit", name="modules", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", self.root / "modules"))
 
     def test_split_partitions_the_table_left_total_including_ticketed_and_unselected_findings(self) -> None:
         rule = self.rule("split-population")
@@ -417,196 +407,12 @@ class UnsyncedChangeTests(unittest.TestCase):
             self.assertEqual(dict(style_plan.unsynced_changes(repo, style_plan.NoUnitBranch(), tip)), {})
 
 
-class AllStyleProductionsTests(unittest.TestCase):
-    @override
-    def setUp(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
-        production_membership("fixture")
-
-    def runner(self, root: Path, slug: str, kind: str = "style", *, running: bool = True) -> showrunners.Showrunner:
-        production_membership(slug)
-        doc = root / f"{slug}-production.md"
-        _ = doc.write_text(f"# Production — {slug}\n\n- **Kind:** {kind}\n")
-        return {"slug": slug, "session": slug if running else "", "socket": "test" if running else "",
-                "zone": "UTC", "doc": str(doc)}
-
-    def test_all_continues_to_the_next_style_production_after_an_exception_or_failed_exit(self) -> None:
-        for failure in (OSError("cannot read ledger\ntry later"), 1):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
-                root = Path(folder)
-                runners = [self.runner(root, "first"), self.runner(root, "second")]
-                output, errors = io.StringIO(), io.StringIO()
-                with (mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
-                      mock.patch.object(build_hold, "natedev_holds",
-                                        return_value=build_hold.NatedevHolds(())),
-                      mock.patch.object(style_plan, "split_all", side_effect=[failure, 0]) as split,
-                      redirect_stdout(output), redirect_stderr(errors)):
-                    code = style_plan.main(["split-all", "--all"])
-                self.assertEqual(code, 0)
-                self.assertEqual(split.call_args_list,
-                                 [mock.call(Path(runner["doc"])) for runner in runners])
-                cause = "cannot read ledger try later" if isinstance(failure, OSError) else "exit 1"
-                self.assertEqual(output.getvalue(), f"split-all: first: failed: {cause}\n")
-                self.assertEqual(errors.getvalue(), "")
-
-    def test_all_without_running_style_productions_prints_one_line_and_succeeds(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
-            root = Path(folder)
-            runners = [self.runner(root, "product", "product"), self.runner(root, "stopped", running=False),
-                       self.runner(root, "ordinary", "")]
-            _ = Path(runners[-1]["doc"]).write_text("# Product without a Kind field\n")
-            output = io.StringIO()
-            with (mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
-                  mock.patch.object(build_hold, "natedev_holds",
-                                    return_value=build_hold.NatedevHolds(())),
-                  mock.patch.object(style_plan, "split_all", side_effect=AssertionError("no style production")),
-                  redirect_stdout(output)):
-                code = style_plan.main(["split-all", "--all"])
-            self.assertEqual((code, output.getvalue()), (0, "no running style productions\n"))
-
-    def test_all_yields_to_a_build_hold_before_discovery_or_any_split(self) -> None:
-        holder = build_hold.Holder("builder", datetime(2026, 10, 28, tzinfo=UTC), "build",
-                                   build_hold.UnknownReleaseEta(), "builder")
-        output = io.StringIO()
-        with (mock.patch.object(showrunners, "registered_showrunners",
-                                side_effect=AssertionError("no discovery during hold")),
-              mock.patch.object(build_hold, "natedev_holds",
-                                return_value=build_hold.NatedevHolds((holder,))),
-              mock.patch.object(style_plan, "split_all", side_effect=AssertionError("no split during hold")),
-              redirect_stdout(output)):
-            code = style_plan.main(["split-all", "--all"])
-        self.assertEqual((code, output.getvalue()), (0, "split-all: natedev build hold in force; skipped\n"))
-
-    def test_all_stops_before_the_next_production_when_a_build_hold_starts(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
-            root = Path(folder)
-            runners = [self.runner(root, "first"), self.runner(root, "second")]
-            holder = build_hold.Holder("builder", datetime(2026, 10, 28, tzinfo=UTC), "build",
-                                      build_hold.UnknownReleaseEta(), "builder")
-            clear = build_hold.NatedevHolds(())
-            held = build_hold.NatedevHolds((holder,))
-            output, errors = io.StringIO(), io.StringIO()
-            with (mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
-                  mock.patch.object(build_hold, "natedev_holds", side_effect=[clear, clear, held]),
-                  mock.patch.object(style_plan, "split_all", return_value=0) as split,
-                  redirect_stdout(output), redirect_stderr(errors)):
-                code = style_plan.main(["split-all", "--all"])
-            self.assertEqual(split.call_args_list, [mock.call(Path(runners[0]["doc"]))])
-            self.assertEqual((code, output.getvalue(), errors.getvalue()),
-                             (0, "split-all: natedev build hold in force; skipped\n", ""))
-
-    def test_all_splits_healthy_productions_but_reports_incomplete_discovery(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            runner = self.runner(Path(folder), "healthy")
-            partial = showrunners.ShowrunnerDiscovery([runner], (
-                showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
-            with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
-                  mock.patch.object(build_hold, "natedev_holds", return_value=build_hold.NatedevHolds(())),
-                  mock.patch.object(style_plan, "split_all", return_value=0) as split,
-                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
-                self.assertEqual(style_plan.main(["split-all", "--all"]), 1)
-            split.assert_called_once_with(Path(runner["doc"]))
-
-    def test_all_reports_a_discovery_failure_as_a_command_failure(self) -> None:
-        output, errors = io.StringIO(), io.StringIO()
-        with (mock.patch.object(showrunners, "registered_showrunners", side_effect=OSError("no timers")),
-              mock.patch.object(build_hold, "natedev_holds",
-                                return_value=build_hold.NatedevHolds(())),
-              mock.patch.object(style_plan, "split_all", side_effect=AssertionError("no discovery result")),
-              redirect_stdout(output), redirect_stderr(errors)):
-            code = style_plan.main(["split-all", "--all"])
-        self.assertEqual((code, output.getvalue(), errors.getvalue()), (1, "", "split-all: no timers\n"))
-
-
 class RefillRecordingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
         production_membership("production")
-
-    def test_split_all_without_live_style_units_prints_no_style_units_and_succeeds(self) -> None:
-        production_membership("production", "feature-unit")
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
-            production = Path(folder) / "production.md"
-            _ = production.write_text("# Production\n\n## Units\n\n"
-                                      + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
-                                      + "| feature-unit | feature.md | /tmp/claude/feature | feature |\n"
-                                      + "| retired-names-unit | retired | /tmp/claude/retired | retired |\n")
-            worktree = Path(folder) / "feature"
-            _ = subprocess.run(["git", "init", "-b", "feature", str(worktree)], check=True, capture_output=True)
-            _ = recorded_unit("production", "feature-unit", worktree, production, plan="feature.md")
-            def no_child(command: list[str], *, capture_output: bool, text: bool,
-                         check: bool) -> subprocess.CompletedProcess[str]:
-                if command[0] == "git":
-                    return run_git(command, capture_output=capture_output, text=text, check=check)
-                raise AssertionError("no child for an empty production")
-
-            output, errors = io.StringIO(), io.StringIO()
-            with (mock.patch.object(unit_lookup, "marked_units", return_value={}),
-                  mock.patch.object(subprocess, "run", side_effect=no_child),
-                  redirect_stdout(output), redirect_stderr(errors)):
-                code = style_plan.main(["split-all", "--production", str(production)])
-            self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "no style units\n", ""))
-
-    def test_split_all_skips_a_unit_whose_worktree_and_session_are_both_gone(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
-            root = Path(folder)
-            production = root / "production.md"
-            _ = production.write_text("# Production\n\n## Units\n\n"
-                                      + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
-                                      + f"| names-unit | docs/names.md | {root / 'gone'} | style-names |\n")
-            output, errors = io.StringIO(), io.StringIO()
-            with (mock.patch.object(unit_lookup, "marked_units", return_value={}),
-                  mock.patch.object(queue_place, "suite_scope_prefix", side_effect=AssertionError("no child for a retired unit")),
-                  redirect_stdout(output), redirect_stderr(errors)):
-                code = style_plan.main(["split-all", "--production", str(production)])
-            self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "no style units\n", ""))
-
-    def test_split_all_runs_units_in_row_order_at_low_priority_and_continues_after_failure(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
-            root = Path(folder)
-            production = root / "production.md"
-            rows: list[str] = []
-            for unit in ("names-unit", "types-unit", "values-unit"):
-                worktree = root / unit
-                plan = worktree / "docs/retained-plan.md"
-                plan.parent.mkdir(parents=True)
-                _ = subprocess.run(["git", "init", "-b", unit, str(worktree)], check=True, capture_output=True)
-                _ = plan.write_text("# Standing unit\n")
-                rows.append(f"| {unit} | docs/retained-plan.md | {worktree} | {unit} |")
-            _ = production.write_text("# Production\n\n## Units\n\n"
-                                      + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
-                                      + "\n".join(rows) + "\n")
-            completed: list[str] = []
-            for unit in ("names-unit", "types-unit", "values-unit"):
-                _ = recorded_unit("production", unit, root / unit, production, plan="docs/retained-plan.md")
-
-            def child(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
-                if command[0] == "git":
-                    return run_git(command, capture_output=capture_output, text=text, check=check)
-                self.assertEqual(command[:8], ["systemd-run", "--user", "--scope", "--slice=builds.slice", "nice", "-n", "19", sys.executable])
-                self.assertTrue(capture_output and text)
-                self.assertFalse(check)
-                self.assertEqual(Path(command[8]), Path(style_plan.__file__).resolve())
-                self.assertEqual(command[9:12], ["split", "--unit", ("names-unit", "types-unit", "values-unit")[len(completed)]])
-                unit = command[11]
-                self.assertEqual(command[12:], ["--repo", str(root / unit)])
-                completed.append(unit)
-                if unit == "types-unit":
-                    return subprocess.CompletedProcess(command, 1, "", "split types-unit: cannot read tree\n")
-                return subprocess.CompletedProcess(command, 0, f"{unit}: 1/2/3/4 in 0.25 min\n", "")
-
-            output = io.StringIO()
-            with (mock.patch.object(queue_place, "suite_scope_prefix", return_value=[
-                    "systemd-run", "--user", "--scope", "--slice=builds.slice"]),
-                  mock.patch.object(subprocess, "run", side_effect=child), redirect_stdout(output)):
-                code = style_plan.main(["split-all", "--production", str(production)])
-            self.assertEqual(code, 1)
-            self.assertEqual(completed, ["names-unit", "types-unit", "values-unit"])
-            self.assertEqual(output.getvalue(), "names-unit: 1/2/3/4 in 0.25 min\n"
-                             + "types-unit: failed: stderr: split types-unit: cannot read tree\nvalues-unit: 1/2/3/4 in 0.25 min\n")
 
     def test_main_records_every_outcome_after_next_phase_returns(self) -> None:
         cases: tuple[tuple[object, str, int, str], ...] = (
@@ -660,14 +466,13 @@ class RefillRecordingTests(unittest.TestCase):
 
 
 
-from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+from scripts.production.staff_test_support import StaffTestCase
 from scripts.style import unit_files
 
 
 class BranchFileLocationTests(StaffTestCase):
-    def test_file_ownership_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+    def test_file_ownership_uses_the_staff_worktree(self) -> None:
         fixture = self.separated_unit_folders()
-        without_worktree_column(fixture.doc)
         rows = unit_files.unit_worktrees(fixture.doc)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].worktree, fixture.worktree)

@@ -85,8 +85,8 @@ config = offload.read_config(Path(args.settings))
 controller = offload.ProcessController()
 root = Path(os.environ["TEST_RUNNER_STATE"])
 mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
-if mode == "disk-once":
-    mode = "passed" if (root / "ssh-events.jsonl").exists() else "disk"
+if mode in ("disk-once", "lost-once"):
+    mode = "passed" if (root / "ssh-events.jsonl").exists() else mode.removesuffix("-once")
 actions = []
 initial = mac_test.read_claims(mac_test.state_paths(request.target))
 before = {claim.path: claim.record for claim in initial}
@@ -155,6 +155,11 @@ def stream(arguments):
     if mode in ("run-refusal", "after-probe"):
         wire, status = "linux_startup=unresolved\n", 75
         (root / (request.target + ".marker")).touch()
+    elif mode == "runtime-version-mismatch":
+        wire = (request.target + " version mismatch: rustc box=rustc other natedev=rustc fixture; "
+                + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/aws-build.nix\n"
+                + "mac_cleanup=kept\n")
+        status = 75
     elif mode in ("interrupted", "other-generation"):
         generation = "fixture-generation" if mode == "interrupted" else "old-generation"
         wire, status = "aws_interrupted=" + generation + "\n", 255
@@ -320,9 +325,15 @@ class VerifySshTargetsTests(VerifyMacOffloadFixture):
 
     def test_pinned_target_refusal_keeps_the_reason_and_never_runs_locally(self) -> None:
         self.configure("natedev,aws")
+        settings = self.root / "aws_target.conf"
+        _ = settings.write_text(settings.read_text() + "version_pin_file=nixos hosts/aws-build.nix\n")
         for mode, reason, detail in (
             ("disk", "disk", "not running on the aws (disk)"),
-            ("version-mismatch", "unreachable", "public tools or tracked scripts differ"),
+            ("version-mismatch", "aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
+             + "move the box pins in nixos hosts/aws-build.nix", "rustc box=rustc other"),
+            ("runtime-version-mismatch", "aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
+             + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/aws-build.nix",
+             "nextest box=nextest other"),
             ("probe-leftovers", "busy", "2 leftover processes"),
         ):
             with self.subTest(mode=mode):
@@ -334,8 +345,15 @@ class VerifySshTargetsTests(VerifyMacOffloadFixture):
                 self.assertIn(detail, result.stdout + result.stderr)
                 self.assertEqual(self.local_runs(), [])
                 self.assertEqual(self.admission.history(), [])
+                self.assertEqual(self.attempts()[-1]["reason"], reason)
 
     def test_pinned_wait_keeps_its_live_record_until_aws_becomes_available(self) -> None:
+        self.assert_pinned_wait_keeps_its_live_record("test")
+
+    def test_pinned_check_waits_until_aws_becomes_available(self) -> None:
+        self.assert_pinned_wait_keeps_its_live_record("check")
+
+    def assert_pinned_wait_keeps_its_live_record(self, kind: str) -> None:
         self.configure("natedev,aws")
         control = self.home / ".local/state/build-targets/aws/controller.json"
         _ = control.write_text('{"state":"stopped"}')
@@ -349,7 +367,7 @@ row = json.loads(records[0].read_text())
 Path(os.environ["TEST_RUNNER_STATE"], "waiting-step.json").write_text(json.dumps(row))
 Path(os.environ["HOME"], ".local/state/build-targets/aws/controller.json").write_text('{"state":"running"}')
 ''')
-        result = self.verify("test", "sample", "--target", "aws")
+        result = self.verify(kind, "sample", "--target", "aws")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = cast(dict[str, object], json.loads((self.runner_state / "waiting-step.json").read_text()))
         self.assertEqual((row["pinned_target"], row["state"]), ("aws", "waiting_ssh"))
@@ -666,7 +684,7 @@ steps_path.write_text(json.dumps(steps))
         self.enable_mac()
         _ = self.control_routing_clock()
         self.release_memory_after_polls(advance_clock=True)
-        result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"mac":"disk-once"}'})
+        result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"mac":"lost-once"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         first, second = self.ssh_events()
         self.assertEqual((first["clock"], second["clock"]), ("100", "281"))

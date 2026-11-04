@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
@@ -27,7 +28,7 @@ ENDED = "2026-10-02T16:40:18+00:00"
 def result_line(session: str, target: str, worktree: Path, *, duration_ms: int = 600_000,
                 profile: str = "debug", tool: str = "brp_launch", ended_at: str = ENDED,
                 binary_path: str = "", launched_as: str = "example", include_path: bool = True,
-                include_working_directory: bool = True) -> str:
+                include_working_directory: bool = True, target_directory: str = "") -> str:
     # The nested keys follow a real brp_launch transcript result from widget-examples.
     result: Record = {
         "status": "success",
@@ -43,6 +44,8 @@ def result_line(session: str, target: str, worktree: Path, *, duration_ms: int =
         },
         "parameters": {"target_name": target, "path": str(worktree)},
     }
+    if target_directory:
+        cast(Record, result["metadata"])["target_directory"] = target_directory
     if binary_path:
         cast(Record, result["metadata"])["binary_path"] = binary_path
     if not include_path:
@@ -429,6 +432,26 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(counts.unresolved, 0)
         self.assertEqual(self.records()[0]["worktree"], str(self.worktree))
         self.assertEqual(self.records()[0]["repo_path"], str(self.worktree.parent / "repository"))
+
+    def test_saved_launch_folders_use_only_transcript_evidence(self) -> None:
+        cases = (
+            ("", "/saved/output", "/saved/output"),
+            (str(self.worktree / "target/debug/examples/sample"), "", str(self.worktree / "target")),
+            ("/saved/custom/debug/examples/sample", "", "unresolved"),
+            ("", "", "unresolved"),
+        )
+        for number, (binary, target, expected) in enumerate(cases):
+            with self.subTest(binary=binary, target=target):
+                line = cast(Record, json.loads(result_line(str(number), "sample", self.worktree,
+                                                         binary_path=binary, target_directory=target)))
+                _ = self.transcript.write_text(json.dumps(line) + "\n")
+                with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "/collector/wrong"}):
+                    found = launches.launch_record(line, self.transcript)
+                self.assertIsInstance(found, launches.RecordedLaunch)
+                if isinstance(found, launches.RecordedLaunch):
+                    self.assertTrue(launches.save_launch(found.step))
+                    row = next(row for row in self.records() if row["id"] == found.step["id"])
+                    self.assertEqual(row["target_dir"], expected)
 
     def test_app_launch_records_binary_target(self) -> None:
         app_binary = str(self.worktree / "target" / "debug" / "editor")

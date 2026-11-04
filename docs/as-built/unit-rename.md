@@ -74,7 +74,7 @@ steps:
      `questions` run finds each item stored and asks no new review (sdlc, 2026-10-21);
    - the same live-list text and OUTSTANDING items of every other production's showrunner, such as
      the parent (`showrunners.SHOWRUNNER_STATE_DIR/<slug>/session/showrunner_state.json`); their unit
-     rows stay. A production whose Units table has its own unit of the old id, or whose doc cannot
+     rows stay. A production that has its own unit staff row of the old id, or whose doc cannot
      be read, keeps its text, and verify counts its file as history (cargo-liner-style, 2026-10-21);
    - the stall-watch stretch;
    - the reviewer leases and memory;
@@ -108,7 +108,7 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
 ## verify
 
 - **Live places.** These must hold the new names:
-  - the Units row;
+  - the unit staff row;
   - the doc cells and plan headers (apply's own edit would change nothing);
   - the branches and worktree;
   - the transcript folders, the stall stretch and the newest run;
