@@ -254,6 +254,8 @@ def audit(record: staff.StaffSnapshot) -> tuple[PortAudit, ...]:
     files: dict[SourceLocation, FileEvidence | FileMissing | Unavailable] = {}
     results: list[PortAudit] = []
     for row in record.find(kind="unit"):
+        if isinstance(row.worktree, staff.RemovedWorktree):
+            continue
         config_source, config_port = _configuration(row)
         document = _document(row, record, files)
         valid = isinstance(config_port, (unit_config.AppPort, unit_config.NoAppPort))
@@ -277,7 +279,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = parser.add_argument("--json", action="store_true", help="print the evidence as JSON")
     arguments = parser.parse_args(argv, namespace=_Arguments())
     try:
-        results = audit(read_snapshot())
+        record = read_snapshot()
+        results = audit(record)
     except staff.StaffUnreadable as error:
         print(f"unavailable: {error}", file=sys.stderr)
         return 0
@@ -288,13 +291,15 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.json:
         print(json.dumps(output, indent=2))
     else:
-        for result in output:
+        for evidence, result in zip(results, output):
             print(f"{result['id']} {result['name']}: {result['config_port']} [{result['config_source']}]; "
                   + f"Port={result['document_cell']!r} [{result['document_source']}]")
             if result["note"]:
                 print(f"  note: {result['note']}")
             if result["gap"]:
-                print(f"  gap for sdlc: {result['gap']}")
+                parent = record.by_id(evidence.row.parent) if evidence.row.parent is not None else None
+                production = parent.name if parent is not None else "unknown"
+                print(f"  gap for {production}: {result['gap']}")
     return 0
 
 
