@@ -48,6 +48,65 @@ store = gate.store
 READY_FOR_ADMISSION = gate.ReadyForAdmission()
 
 
+class SnapshotCompatibilityTests(unittest.TestCase):
+    def test_older_record_uses_field_default(self) -> None:
+        self.assertEqual(gate.parse_snapshot_value(
+            {"kind": "MeasuredMemory", "bytes": 12}, gate.MeasuredMemory),
+            gate.MeasuredMemory(12))
+
+    def test_newer_record_ignores_unknown_field(self) -> None:
+        self.assertEqual(gate.parse_snapshot_value(
+            {"kind": "MeasuredMemory", "bytes": 12, "future": {"kind": "UnknownRecord"}},
+            gate.MeasuredMemory), gate.MeasuredMemory(12))
+
+    def test_older_record_uses_default_factory(self) -> None:
+        self.assertEqual(gate.parse_snapshot_value(
+            {"kind": "PeakHold", "default_seconds": 30}, gate.PeakHold), gate.PeakHold(30))
+
+    def test_missing_required_field_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid snapshot record fields"):
+            _ = gate.parse_snapshot_value({"kind": "MeasuredMemory"}, gate.MeasuredMemory)
+
+    def test_wrong_or_missing_tag_is_refused(self) -> None:
+        for record in ({"bytes": 12}, {"kind": "GoneMemory", "bytes": 12}):
+            with self.subTest(record=record), self.assertRaisesRegex(ValueError, "invalid snapshot record tag"):
+                _ = gate.parse_snapshot_value(record, gate.MeasuredMemory)
+
+    def test_nested_records_use_defaults_and_ignore_unknown_fields(self) -> None:
+        record: dict[str, object] = {
+            "kind": "RunningStep", "session_id": "session", "session_name": "worker",
+            "step": "nextest", "folder": "/tmp/tree", "promise": 12,
+            "measured": {"kind": "MeasuredMemory", "bytes": 5, "future": False},
+            "future": {"kind": "UnknownRecord"},
+        }
+        self.assertEqual(gate.parse_snapshot_value(record, gate.RunningStep),
+                         gate.RunningStep("session", "worker", "nextest", "/tmp/tree", 12,
+                                          gate.MeasuredMemory(5)))
+
+    def test_former_schema_shims_use_dataclass_defaults(self) -> None:
+        records: tuple[object, ...] = (
+            gate.StepProfile("repo", "nextest", "tree", gate.ExpectedPeak(12, "measured", 1)),
+            gate.MemoryPressure(8),
+            gate.RunningStep("session", "worker", "nextest", "/tmp/tree", 12, gate.MeasuredMemory(5)),
+            gate.UnownedSliceMemory(5),
+        )
+        omitted = ("build_history_generation", "condition", "run", "started_at", "activity")
+        for original in records:
+            with self.subTest(schema=type(original).__name__):
+                record = {name: value for name, value in
+                          cast(dict[str, object], gate.snapshot_value(original)).items() if name not in omitted}
+                record["future"] = "ignored"
+                self.assertEqual(gate.parse_snapshot_value(record, type(original)), original)
+
+    def test_nested_required_field_and_tag_are_checked(self) -> None:
+        for memory in ({"kind": "MeasuredMemory"}, {"bytes": 5}, {"kind": "UnknownRecord", "bytes": 5}):
+            with self.subTest(memory=memory), self.assertRaises(ValueError):
+                _ = gate.parse_snapshot_value({
+                    "kind": "RunningStep", "session_id": "session", "session_name": "worker",
+                    "step": "nextest", "folder": "/tmp/tree", "promise": 12, "measured": memory,
+                }, gate.RunningStep)
+
+
 class BuildStepRecorder(Protocol):
     store: gate.BuildLogStore
 
@@ -294,7 +353,7 @@ class DecisionTests(unittest.TestCase):
             self.assertEqual(gate.decide(40 * GIB, 60 * GIB, 10 * GIB + 1, [gate.MeasuredMemory(11 * GIB)]).state, "hold")
 
     def test_psi_11_holds_a_step_that_fits_memory_and_budget(self) -> None:
-        decision = gate.decide(40 * GIB, 60 * GIB, GIB, [], pressure=gate.MemoryPressure(11))
+        decision = gate.decide(40 * GIB, 60 * GIB, GIB, [], pressure=gate.MemoryPressure(11, condition="full"))
         self.assertEqual(decision.state, "hold")
 
     def test_empty_machine_cannot_skip_the_budget_reserved_for_a_head(self) -> None:
@@ -3672,7 +3731,7 @@ class QueueApiTests(MemoryQueueFixture):
         with patch.dict(os.environ, {"BUILDLOG_MEMORY_PRESSURE": str(pressure)}):
             result = self.pass_for(400, need=1, free=40)
             self.assertEqual(result.decision.state, "hold")
-            self.assertEqual(result.decision.pressure, gate.MemoryPressure(11))
+            self.assertEqual(result.decision.pressure, gate.MemoryPressure(11, condition="full"))
             self.assertIsInstance(gate.queue_view().waiting[0].reason, gate.HeadAdmissionStatus)
         self.assertIsInstance(result.decision.order_hold, gate.NoOrderHold)
 
@@ -3982,7 +4041,7 @@ class ShellTests(unittest.TestCase):
             self.assertTrue(text.endswith("2.8 GiB kept for earlyoom)\n"))
 
     def test_wait_line_shows_reason_in_place_of_zero_running_steps(self) -> None:
-        pressure = gate.MemoryPressure(11)
+        pressure = gate.MemoryPressure(11, condition="full")
         decision = gate.AdmissionDecision("hold", 19_434_727_014, 0, 3 * GIB, 0, budget=21 * GIB)
         pressure_reason = pressure
         head_reason = gate.HeadAdmissionStatus(decision, 16_213_501_542,
@@ -4364,11 +4423,11 @@ class QueueExplanationTests(MemoryQueueFixture):
     def test_next_recovery_transitions_do_not_consume_a_start(self) -> None:
         due = gate.RecoveryStarts(NOW_EPOCH + 120, NOW_EPOCH)
         for previous, pressure, at, expected in (
-                (gate.NoRecoverySpacing(), gate.MemoryPressure(8), NOW_EPOCH, gate.PressureHoldRecorded()),
+                (gate.NoRecoverySpacing(), gate.MemoryPressure(8, condition="full"), NOW_EPOCH, gate.PressureHoldRecorded()),
                 (gate.PressureHoldRecorded(), gate.NoPressureHold(), NOW_EPOCH, due),
                 (due, gate.NoPressureHold(), NOW_EPOCH + 30, due),
                 (due, gate.NoPressureHold(), NOW_EPOCH + 120, gate.NoRecoverySpacing()),
-                (due, gate.MemoryPressure(8), NOW_EPOCH + 120, gate.PressureHoldRecorded())):
+                (due, gate.MemoryPressure(8, condition="full"), NOW_EPOCH + 120, gate.PressureHoldRecorded())):
             with self.subTest(previous=previous, at=at, pressure=pressure):
                 self.assertEqual(gate.next_recovery(previous, pressure, at, policy=admission_policy_fixture()), expected)
 
@@ -4540,7 +4599,7 @@ class QueueExplanationTests(MemoryQueueFixture):
         explanation = gate.explain_queue()
         if not isinstance(explanation.host, gate.HostAvailable) or not isinstance(explanation.head, gate.HeadExplanation):
             self.fail(f"expected readable explanation, got {explanation}")
-        self.assertEqual(explanation.host.pressure, gate.MemoryPressure(11))
+        self.assertEqual(explanation.host.pressure, gate.MemoryPressure(11, condition="full"))
         self.assertEqual(explanation.head.decision.state, "hold")
         self.assertEqual(explanation.head.decision.pressure, explanation.host.pressure)
         self.assertFalse((directory / "pressure-recovery").exists())
@@ -4553,7 +4612,7 @@ class QueueExplanationTests(MemoryQueueFixture):
         recovery = gate.explain_queue()
         if not isinstance(recovery.host, gate.HostAvailable) or not isinstance(recovery.head, gate.HeadExplanation):
             self.fail(f"expected recovery explanation, got {recovery}")
-        self.assertEqual(recovery.host.pressure, gate.MemoryPressure(0, next_start_at=NOW.timestamp() + 30))
+        self.assertEqual(recovery.host.pressure, gate.MemoryPressure(0, next_start_at=NOW.timestamp() + 30, condition="full"))
         self.assertEqual(recovery.head.decision.state, "hold")
         self.assertEqual(record.read_bytes(), before)
 
@@ -4618,7 +4677,7 @@ class QueueExplanationTests(MemoryQueueFixture):
                 {key: value for key, value in row.items() if key != "priority_since"})))
                 for path, row in inputs.ordered],
                 host=gate.HostMemory(0, 60 * GIB)),
-            "pressure": replace(inputs, pressure=gate.MemoryPressure(8)),
+            "pressure": replace(inputs, pressure=gate.MemoryPressure(8, condition="full")),
             "recovery": replace(inputs, recovery=gate.RecoveryStarts(NOW_EPOCH + 120, NOW_EPOCH + 30)),
             "older fit": replace(inputs, host=gate.HostMemory(60 * GIB, 60 * GIB),
                 ordered=[(head_path, {**head, "need": 10 * GIB, "since": NOW_EPOCH - 60,
@@ -4690,7 +4749,7 @@ class QueueExplanationTests(MemoryQueueFixture):
             result = gate.admission_pass(requested, NOW_EPOCH, limits, policy=admission_policy_fixture())
         self.assertEqual(walk.call_count, 1 + len(inputs.running))
         self.assertTrue(all(isinstance(row.blocker, gate.BlockingIndex) for row in result.rows))
-        pressure_held = gate.admission_pass(replace(requested, pressure=gate.MemoryPressure(8)), NOW_EPOCH, limits, policy=admission_policy_fixture())
+        pressure_held = gate.admission_pass(replace(requested, pressure=gate.MemoryPressure(8, condition="full")), NOW_EPOCH, limits, policy=admission_policy_fixture())
         self.assertTrue(all(isinstance(row.blocker, gate.NoSingleBlocker) for row in pressure_held.rows))
 
     def test_two_proposals_charge_the_first_need_to_the_second(self) -> None:
