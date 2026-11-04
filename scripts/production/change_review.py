@@ -333,7 +333,8 @@ def _line_value(doc: Path) -> str | None:
     return None
 
 
-def list_path(doc: Path) -> Path | None:
+def list_path(doc: Path, *,
+              record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Path | None:
     """The production's list, or None when its doc has no Change review line.
 
     The list is named for the top-level showrunner while it runs; otherwise it is the path the
@@ -344,7 +345,7 @@ def list_path(doc: Path) -> Path | None:
         return None
     named = Path(value).expanduser() if value else None
     try:
-        derived = list_file(showrunner_of(doc))
+        derived = list_file(showrunner_of(doc, record=record))
     except (ChangeReviewError, OSError):
         return named
     if named is not None and named.absolute() != derived.absolute():
@@ -610,7 +611,8 @@ def _sort(path: Path, lines: list[str]) -> None:
 
 def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day: date, merged: str, production: Path,
                 rank: str = "", owners: Sequence[Path] = (),
-                producers: Sequence[staff.StaffId | UnknownProducer] = ()) -> list[str]:
+                producers: Sequence[staff.StaffId | UnknownProducer] = (), *,
+                record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> list[str]:
     """Add the changes to To review and return the written rows.
 
     `merged` holds the merge hash or an empty string.
@@ -621,6 +623,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
     """
     if not changes:
         return []
+    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     items = [change.item if isinstance(change, PublicationChange) else change for change in changes]
     row_owners = [change.source.production if isinstance(change, PublicationChange) and change.source is not None
                   else owners[index] if owners else production for index, change in enumerate(changes)]
@@ -640,7 +643,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank),
                                      KIND: "", PRODUCER: str(row_producers[offset]) if isinstance(row_producers[offset], str) else "",
-                                     PRODUCTION: _cell(row_production(row_owners[offset]))})
+                                     PRODUCTION: _cell(row_production(row_owners[offset], record=record))})
                 for offset, item in enumerate(items)]
         _insert(lines, end, rows)
         return rows
@@ -835,15 +838,17 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
     return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
 
 
-def row_production(production: Path) -> str:
+def row_production(production: Path, *,
+                   record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> str:
     """The Production cell for a change of the production doc `production`: the slug of the production
     it is credited to (`credited`)."""
-    return slug_of(credited(production))
+    return slug_of(credited(production, record=record))
 
 
-def credited(production: Path) -> Path:
+def credited(production: Path, *,
+             record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Path:
     """Credit a style production to its staff parent. Other productions keep their own credit."""
-    record = staff.initial_snapshot()
+    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     row = record.by_doc(remote.local_machine(), production)
     while row is not None and row.parent is not None:
         try:
@@ -1382,7 +1387,8 @@ def production_doc(production: str) -> Path:
     return found
 
 
-def showrunner_of(doc: Path) -> str:
+def showrunner_of(doc: Path, *,
+                  record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> str:
     """The name of the top-level showrunner whose list takes the production's rows.
 
     A child production's rows go to its root's list. The name is the root showrunner's session
@@ -1392,10 +1398,20 @@ def showrunner_of(doc: Path) -> str:
     import showrunner_tree
 
     try:
-        root = showrunner_tree.root_of(showrunners.canonical_slug(showrunners.production_slug(str(doc))))
+        slug = showrunners.production_slug(str(doc))
+        if isinstance(record, session_staff.ReadCurrentStaff):
+            root = showrunner_tree.root_of(showrunners.canonical_slug(slug))
+            name = showrunners.current_name(root)
+        else:
+            if not any(isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
+                       and row.doc.path.name.removesuffix("-production.md") == slug
+                       for row in record.find(kind="showrunner")):
+                slug = showrunners.rename_history().get(slug, slug)
+            root = showrunner_tree.root_of(slug, record=record)
+            runners = showrunners.require_complete(showrunners.registered_showrunners(membership=record))
+            name = next((runner["session"] for runner in runners if runner["slug"] == root), "")
     except ValueError as error:
         raise ChangeReviewError(str(error)) from None
-    name = showrunners.current_name(root)
     if not name:
         raise ChangeReviewError(f"the showrunner of {root} is not running; the list is named for it")
     return name

@@ -366,7 +366,8 @@ def apply(old: str, new: str) -> RenamePlan:
         if not _pending(result):
             print("unchanged")
             return result
-        write_json(result.state[-1].source / "rename.json",
+        directory = result.state[-1]
+        write_json((directory.source if directory.source.exists() else directory.destination) / "rename.json",
                    {"old": result.old, "new": result.new, "staff_id": result.staff_id})
         _ = staff.rename(result.staff_id, result.new)
         for step in STEPS:

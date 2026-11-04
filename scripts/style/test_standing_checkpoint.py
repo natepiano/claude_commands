@@ -95,9 +95,9 @@ class StandingCheckpointTests(unittest.TestCase):
         with (self.repo / ".git/info/exclude").open("a") as exclude:
             _ = exclude.write("/docs/product-production.md\n")
         self.write(parent, self.production("main", self.repo))
-        self.write(self.doc, self.production("style/main", self.style) + f"\n- **Parent production:** {parent}\n- **Branch point:** main\n")
+        self.write(self.doc, self.production("style/main", self.style) + "\n- **Branch point:** main\n")
         _ = recorded_showrunner("sample", parent)
-        owner = recorded_showrunner("sample-style", self.doc)
+        owner = recorded_showrunner("sample-style", self.doc, parent="sample")
         _ = fixture_unit_location(owner, "names-unit", self.unit)
         self.plan = self.unit / "docs/style-production/units/names-unit.md"
         _ = unit_config.write(self.unit, unit_config.UnitConfig(

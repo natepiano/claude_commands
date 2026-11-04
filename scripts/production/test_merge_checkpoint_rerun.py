@@ -50,7 +50,7 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(snapshot.call_count, 1)
         self.assertEqual([row["Producer"] for row in change_review.pending(review)],
-                         [unit.id])
+                         [unit.id], result.stdout)
 
     def save_case(self) -> Path:
         snapshot = self.root.with_name("rerun-seed")

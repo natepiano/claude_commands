@@ -180,9 +180,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def attach(self, child: str, parent: str) -> None:
         self.move_parent(child, parent)
-        directory = self.showrunner_state / child
-        directory.mkdir(parents=True, exist_ok=True)
-        _ = (directory / "parent").write_text(f"{parent}\n", encoding="utf-8")
+        (self.showrunner_state / child).mkdir(parents=True, exist_ok=True)
 
     def move_parent(self, child: str, parent: str = "") -> None:
         rows = {row.name: row.id for row in staff.find(kind="showrunner")}
@@ -627,7 +625,7 @@ class BoardJsonTests(unittest.TestCase):
         expected_watch = sorted(str(path.resolve()) for path in (
             self.notifier, self.showrunner_state, child_state,
         ))
-        with self.source_readers():
+        with self.source_readers(), patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery()):
             for operation in ("attach", "detach"):
                 with self.subTest(operation=operation):
                     # Give each actual filesystem operation room to advance mtime,
@@ -641,12 +639,12 @@ class BoardJsonTests(unittest.TestCase):
 
                     if operation == "attach":
                         self.assertFalse((child_state / "parent").exists())
-                        self.move_parent(child.slug, root.slug)
-                        showrunner_parent.attach(child.slug, root.slug)
+                        showrunner_parent.attach_parent(child.slug, root.slug)
                     else:
-                        record = staff.snapshot()
-                        self.move_parent(child.slug)
-                        self.assertEqual(showrunner_parent.detach(child.slug, record=record), root.slug)
+                        showrunner_parent.detach_parent(child.slug)
+                    members = {row.name: row for row in staff.find(kind="showrunner")}
+                    self.assertEqual(members[child.slug].parent, members[root.slug].id if operation == "attach" else None)
+                    self.assertFalse((child_state / "parent").exists())
                     self.assertGreater(child_state.stat().st_mtime_ns, watched_mtime)
 
                     response, documents = self.generate("--session", fixture_runtime_id("showrunner::root"))

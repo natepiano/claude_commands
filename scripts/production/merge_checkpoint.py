@@ -549,7 +549,7 @@ def record_publication_changes(production: Production, commits: list[change_revi
                                report_unchanged: bool = True,
                                record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> None:
     """Register each visible change and report merges with missing rows."""
-    doc = change_review.list_path(production.doc)
+    doc = change_review.list_path(production.doc, record=record)
     if doc is None:
         if report_unchanged:
             report("change review", "ok", "the production doc has no Change review line; no rows written")
@@ -569,7 +569,7 @@ def record_publication_changes(production: Production, commits: list[change_revi
                 if any(sha.startswith(merged) or merged.startswith(sha)
                        for sha in cast(list[str], change_review._HASH.findall(row.get("Merged", ""))))}  # pyright: ignore[reportPrivateUsage]
         rows = [] if publication and all(change.item.change in held for change in publication) else change_review.append_rows(
-            doc, publication, datetime.now(production.zone).date(), merged, production.doc)
+            doc, publication, datetime.now(production.zone).date(), merged, production.doc, record=record)
         done.parent.mkdir(parents=True, exist_ok=True)
         done.touch()
         drifted = change_review.drift(production.checkout, production.merge_branch,
@@ -1511,7 +1511,7 @@ def run(request: MergeRequest) -> int:
                 report(step, "ok", "checkpoint already merged; resuming promotion")
             paths = changed_paths(request, f"{merge_head}^1")
         changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING
-        if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc) is not None:
+        if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc, record=request.staff_record) is not None:
             try:
                 changes = ChangesReadBeforePush(change_review.publication_changes(commits, request.production.doc, record=request.staff_record))
             except (change_review.ChangeReviewError, OSError) as error:
