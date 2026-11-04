@@ -34,7 +34,7 @@ from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import admission_code, queue_snapshot, queue_view
 from scripts.build_queue.queue_fixture import write_memory_config
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, only_admitted
+from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, caller_admission, only_admitted
 
 
 class CiSliceAdmissionTests(unittest.TestCase):
@@ -116,6 +116,25 @@ class CiSliceAdmissionTests(unittest.TestCase):
 
 
 class ServiceTests(unittest.TestCase):
+    def test_caller_admission_sets_the_child_zone(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = {"BUILDLOG_DIR": str(root / "log"), "USER_ZONE": "Pacific/Pago_Pago"}
+        _ = caller_admission(self, root, environment)
+        self.assertEqual(environment["USER_ZONE"], "UTC")
+        self.assertEqual(environment["USER_ZONE"], os.environ["USER_ZONE"])
+
+    def test_fixture_uses_utc_and_restores_the_callers_zone(self) -> None:
+        for zone in ("Pacific/Pago_Pago", ""):
+            with self.subTest(zone=zone), mock.patch.dict(os.environ):
+                if zone:
+                    os.environ["USER_ZONE"] = zone
+                else:
+                    _ = os.environ.pop("USER_ZONE", None)
+                with AdmissionFixture():
+                    self.assertEqual(os.environ["USER_ZONE"], "UTC")
+                self.assertEqual(os.environ.get("USER_ZONE", ""), zone)
+                self.assertEqual("USER_ZONE" in os.environ, bool(zone))
+
     def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -206,7 +225,7 @@ class ServiceTests(unittest.TestCase):
             with self.subTest(inherited=inherited), AdmissionFixture() as fixture:
                 fixture.configure(override_reconnect_seconds=4, reconnect_seconds=2)
                 fixture.free(0)
-                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                     _ = fixture.server.handle_request(fixture.request())
                     _ = fixture.server.handle_request(wire.AdmitHeadRequest("delayed-head", "urgent", "director"))
                     override = fixture.server.override
@@ -263,7 +282,7 @@ class ServiceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.configure(override_reconnect_seconds=4)
             request = fixture.launch()
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
                 _ = fixture.server.handle_request(wire.AdmitHeadRequest("launch-head", "urgent", "director"))
                 override = fixture.server.override
@@ -294,7 +313,7 @@ class ServiceTests(unittest.TestCase):
                 fixture.configure(override_reconnect_seconds=4)
                 fixture.free(0)
                 request = fixture.request()
-                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                     _ = fixture.server.handle_request(request)
                     _ = fixture.server.handle_request(wire.AdmitHeadRequest("queued-head", "urgent", "director"))
                     override = fixture.server.override
@@ -319,7 +338,7 @@ class ServiceTests(unittest.TestCase):
                 fixture.free(0)
                 request = fixture.request()
                 request = replace(request, argv=(*request.argv, "x" * 70000))
-                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                     _ = fixture.server.handle_request(request)
                     _ = fixture.server.handle_request(wire.AdmitHeadRequest("large-head", "urgent", "director"))
                     override = fixture.server.override
@@ -489,7 +508,7 @@ class ServiceTests(unittest.TestCase):
             fixture.free(16 * GIB)
             request = fixture.request(need=12 * GIB)
             mutation = wire.AdmitHeadRequest("persisted-head", "urgent", "director")
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
                 self.assertEqual(fixture.server.handle_request(mutation), [wire.Ok()])
                 override = fixture.server.override
@@ -511,7 +530,7 @@ class ServiceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.configure(override_reconnect_seconds=4)
             fixture.free(0)
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                 _ = fixture.server.handle_request(fixture.request())
                 _ = fixture.server.handle_request(wire.AdmitHeadRequest("head-grace", "urgent", "director"))
                 fixture.restart()
@@ -1221,7 +1240,7 @@ class CutoverServiceTests(unittest.TestCase):
                 follower = fixture.request(need=12 * GIB, since=head.since + 1)
                 _ = fixture.server.handle_request(head)
                 _ = fixture.server.handle_request(follower)
-                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(pressure) if pressure else gate.NoPressureHold()), \
+                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(pressure, condition="full") if pressure else gate.NoPressureHold()), \
                      mock.patch.object(gate, "head_override_event", wraps=gate.head_override_event) as events:
                     self.assertEqual(fixture.server.handle_request(
                         wire.AdmitHeadRequest("override", "user asked", "showrunner-id")), [wire.Ok()])
@@ -1274,7 +1293,7 @@ class CutoverServiceTests(unittest.TestCase):
             fixture.free(23 * GIB)
             head = fixture.request(need=12 * GIB)
             _ = fixture.server.handle_request(head)
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(6)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(6, condition="full")):
                 _ = fixture.server.handle_request(wire.AdmitHeadRequest("override", "urgent", "director"))
             before = fixture.state_text()
             viewed = fixture.server.handle_request(wire.ViewRequest())[0]
@@ -2369,7 +2388,7 @@ class CutoverServiceTests(unittest.TestCase):
                 wire.LaunchAdmitted(12884901888, "shape"), 1793601567.702956))
             self.assertEqual(path.read_text(), legacy)
 
-    def test_service_drain_rejects_unknown_state_fields(self) -> None:
+    def test_service_drain_ignores_unknown_state_fields(self) -> None:
         from scripts.build_queue.admission_test_support import TestProcesses
         state = service.ServiceState({}, {}, {}, gate.NoRecoverySpacing(), gate.NoHeadAdmissionOverride())
         with tempfile.TemporaryDirectory() as temporary:
@@ -2383,8 +2402,9 @@ class CutoverServiceTests(unittest.TestCase):
                         del record["legacy_cleanup"]
                     record["unknown"] = True
                     _ = (directory / "state.json").write_text(wire.encode_record(record))
-                    with self.assertRaisesRegex(ValueError, "invalid snapshot record fields"):
-                        _ = service.drain_check(directory, service=True, include_gate_callers=False, proc=proc)
+                    self.assertEqual(service.drain_check(
+                        directory, service=True, include_gate_callers=False, proc=proc), 0)
+                    self.assertEqual(service.read_state(directory), state)
 
     def service_drain_with_process(self, script: str, *, default_folder: bool) -> tuple[int, str]:
         from scripts.build_queue.admission_test_support import TestProcesses
@@ -2743,7 +2763,7 @@ class CutoverServiceTests(unittest.TestCase):
             requests = [fixture.request(need=GIB, since=fixture.clock.now() - age) for age in (300, 200, 100)]
             for request in requests:
                 _ = fixture.server.handle_request(request)
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(6)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(6, condition="full")):
                 _ = fixture.server.run_pass()
             self.assertFalse(fixture.server.reservations)
             policy = fixture.server.last_policy

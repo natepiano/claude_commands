@@ -69,7 +69,8 @@ class StaffMoveTests(StaffTestCase):
             {"workspace_id": "w1", "label": "tools"}, {"workspace_id": "w2", "label": "new-tools"},
         ]})
         self.reply(["pane", "list"], {"panes": [
-            {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "panes"},
+            {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "panes",
+             "agent_session": {"kind": "id", "value": self.unit.current_session}},
         ]})
         self.reply(["pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"], {
             "move_result": {"created_tab": {"tab_id": "w2:t2"}, "pane": {"pane_id": "w1:p1"}},
@@ -93,7 +94,8 @@ class StaffMoveTests(StaffTestCase):
         if isinstance(move, dict):
             move = cast(dict[str, object], move)
             after = {**self.responses, "--session agents pane list": {"code": 0, "stdout": json.dumps({"result": {
-                "panes": [{"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t2", "label": self.unit.name},
+                "panes": [{"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t2", "label": self.unit.name,
+                           "agent_session": {"kind": "id", "value": self.unit.current_session}},
                           *self.destination_panes],
             }})}}
             moved = {key: value for key, value in move.items() if key != "write_files"}
@@ -111,13 +113,15 @@ class StaffMoveTests(StaffTestCase):
         return [["--session", "agents", *arguments] for arguments in (
             ["workspace", "list"], ["tab", "list"], ["tab", "list", "--workspace", "w2"],
             ["workspace", "list"], ["tab", "list", "--workspace", "w2"],
-            ["workspace", "list"], ["tab", "list"],
+            ["workspace", "list"], ["tab", "list"], ["pane", "list"],
         )]
 
     def assert_unit_tab_is_sorted(self, *, already_placed: bool) -> None:
+        rows = {"new-tools": self.destination}
         for name in ("devtools", "herdr"):
-            _ = fixture_member("unit", name=name, parent=self.destination.id)
+            rows[name] = fixture_member("unit", name=name, parent=self.destination.id)
         self.members["unit"] = staff.rename(self.unit.id, "style")
+        rows["style"] = self.unit
         tabs = [
             {"tab_id": "w2:t0", "workspace_id": "w2", "label": "new-tools", "pane_count": 1},
             {"tab_id": "w2:t1", "workspace_id": "w2", "label": "devtools", "pane_count": 1},
@@ -125,12 +129,14 @@ class StaffMoveTests(StaffTestCase):
             {"tab_id": "w2:t3", "workspace_id": "w2", "label": "herdr", "pane_count": 1},
         ]
         self.destination_panes = [
-            {"pane_id": f"w2:p{index}", "workspace_id": "w2", "tab_id": tab["tab_id"], "label": tab["label"]}
+            {"pane_id": f"w2:p{index}", "workspace_id": "w2", "tab_id": tab["tab_id"], "label": tab["label"],
+             "agent_session": {"kind": "id", "value": rows[cast(str, tab["label"])].current_session}}
             for index, tab in enumerate(tabs) if index != 2
         ]
         self.reply(["pane", "list"], {"panes": [
             {"pane_id": "w1:p1", "workspace_id": "w2" if already_placed else "w1",
-             "tab_id": "w2:t2" if already_placed else "w1:t1", "label": "style"}, *self.destination_panes,
+             "tab_id": "w2:t2" if already_placed else "w1:t1", "label": "style",
+             "agent_session": {"kind": "id", "value": self.unit.current_session}}, *self.destination_panes,
         ]})
         self.reply(["tab", "list", "--workspace", "w2"], {"tabs": tabs})
         self.reply(["tab", "rename", "w2:t2", "style"], {})
@@ -148,7 +154,7 @@ class StaffMoveTests(StaffTestCase):
         self.reply(["tab", "rename", "w2:t2", "style"], {})
         self.write_json(herdr.layout_path("agents"), {
             "at": 0, "workspaces": [{"name": "new-tools", "seen": 0, "tabs": [
-                {"name": tab["label"], "seen": 0} for tab in tabs
+                {"name": rows[cast(str, tab["label"])].id, "seen": 0} for tab in tabs
             ]}],
         })
         result = staff_move.move_unit("sdlc", "models-unit", "target")
@@ -157,7 +163,7 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(moves, ["w2:p3", "w1:p1"] if already_placed else ["w1:p1", "w2:p3", "w1:p1"])
         self.assertEqual([tab["name"] for space in herdr.saved_layout("agents")["workspaces"]
                           if space["name"] == "new-tools" for tab in space["tabs"]],
-                         ["new-tools", "devtools", "herdr", "style"])
+                         [rows[name].id for name in ("new-tools", "devtools", "herdr", "style")])
         self.assertFalse(any(command[2:] == ["tab", "list", "--workspace", "w1"] for command in self.commands()))
 
     def test_newly_moved_tab_sorts_units_even_when_saved_order_is_wrong(self) -> None:
@@ -181,6 +187,7 @@ class StaffMoveTests(StaffTestCase):
             ["workspace", "list"],
             ["pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"], ["tab", "rename", "w2:t2", "panes"],
             ["workspace", "list"], ["tab", "list", "--workspace", "w2"], ["workspace", "list"], ["tab", "list"],
+            ["pane", "list"],
         )] + self.sorting_commands())
         with self.assertRaises(FrozenInstanceError):
             setattr(result, "row", self.unit)
@@ -394,7 +401,7 @@ class StaffMoveTests(StaffTestCase):
         _ = staff_move.move_unit("sdlc", "models-unit", "target")
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertEqual(sum(item[2:4] == ["pane", "move"] for item in self.commands()), 1)
-        self.assertEqual(self.commands()[-8:], [
+        self.assertEqual(self.commands()[-9:], [
             ["--session", "agents", "tab", "rename", "w2:t2", "panes"], *self.sorting_commands(),
         ])
 

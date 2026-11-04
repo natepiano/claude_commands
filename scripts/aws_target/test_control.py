@@ -5,6 +5,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import shutil
 import sys
 import subprocess
 from pathlib import Path
@@ -18,6 +19,8 @@ from scripts.aws_target import aws_target, config as settings_config, ledger, re
 from scripts.aws_target.control_test_support import ControlFixture
 from scripts.mac_test import mac_test
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.direct import step_record
+from scripts.mac_test import offload
 
 
 class ControlTests(ControlFixture):
@@ -29,6 +32,10 @@ class ControlTests(ControlFixture):
         self.publications.append(envelope)
         return True
 
+    def reject_publication(self, envelope: remote.AdmissionEnvelope) -> bool:
+        self.publications.append(envelope)
+        return False
+
     def controller(self) -> aws_target.Controller:
         return aws_target.Controller(self.settings, self.state, self.queue_directory,
                                      execute=self.aws, clock=self.clock, notify=lambda _event: True,
@@ -36,6 +43,41 @@ class ControlTests(ControlFixture):
 
     def demand(self) -> None:
         self.snapshot(self.waiter(101, step="check"), self.waiter(102, step="doc"))
+
+    def pinned_step(self, target: str = "aws", kind: str = "test") -> None:
+        self.enterContext(mock.patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(self.root / "steps")}))
+        self.enterContext(mock.patch.object(offload, "repository_identity")).return_value = (
+            offload.KnownRepository("hana", "https://example.invalid/team/hana"))
+        pid = os.getpid()
+        step_record.write(step_record.StepRecord("pinned", pid, step_record.process_start(pid), self.root,
+            kind, "hana", step_record.SshAllowed((target,)), step_record.StepState.WAITING_SSH,
+            "2026-01-15T12:00:00Z", selection=step_record.Pinned(target)))
+
+    def test_one_new_pinned_step_starts_capacity_without_local_queue_demand(self) -> None:
+        self.pinned_step()
+        self.assertEqual(self.controller().tick().state, "starting")
+        self.assertEqual(self.aws.count("start-instances"), 1)
+        decision = ledger.CostLedger(self.state).read_snapshot().decision
+        self.assertEqual(decision["status"], "allowed")
+
+    def test_pinned_step_cannot_start_capacity_when_either_spending_cap_refuses(self) -> None:
+        self.pinned_step()
+        for key in ("daily_limit_usd", "monthly_limit_usd"):
+            with self.subTest(key=key):
+                self.replace(key, "3")
+                self.assertEqual(self.controller().tick().state, "refused")
+                self.assertEqual(self.aws.count("start-instances"), 0)
+                self.replace(key, "20" if key == "daily_limit_usd" else "400")
+
+    def test_foreign_completed_and_local_only_pins_do_not_start_aws(self) -> None:
+        self.pinned_step("spare")
+        self.assertEqual(self.controller().tick().state, "stopped")
+        self.pinned_step(kind="build")
+        self.assertEqual(self.controller().tick().state, "stopped")
+        self.pinned_step()
+        step_record.state("pinned", step_record.StepState.ON_SSH, "aws")
+        self.assertEqual(self.controller().tick().state, "stopped")
+        self.assertEqual(self.aws.count("start-instances"), 0)
 
     def retained_claim(self) -> Path:
         return self.claim(mac_test.state_paths("aws"), generation="i-fixture:" + self.aws.generation)
@@ -72,6 +114,78 @@ class ControlTests(ControlFixture):
 
     def test_publication_timeout_cannot_delay_a_required_stop(self) -> None:
         self.publication_timeout_stops(unexpected=False)
+
+    def test_unpublished_permission_stops_an_idle_instance_at_the_limit(self) -> None:
+        self.aws.state = "running"
+        self.replace("idle_stop_minutes", "1")
+        controller = self.controller()
+        controller.publish = self.reject_publication
+        self.assertEqual(controller.tick().reason, "permission_unpublished")
+        self.clock.advance(60)
+        restarted = self.controller()
+        restarted.publish = self.reject_publication
+        result = restarted.tick()
+        self.assertEqual((result.state, result.reason), ("stopping", "unpublished_idle"))
+        self.assertEqual(self.aws.count("stop-instances"), 1)
+
+    def test_unpublished_permission_keeps_an_idle_instance_before_the_limit(self) -> None:
+        self.aws.state = "running"
+        self.replace("idle_stop_minutes", "1")
+        controller = self.controller()
+        controller.publish = self.reject_publication
+        self.assertEqual(controller.tick().reason, "permission_unpublished")
+        self.clock.advance(59)
+        result = controller.tick()
+        self.assertEqual((result.state, result.reason), ("running", "permission_unpublished"))
+        self.assertEqual(self.aws.count("stop-instances"), 0)
+
+    def test_published_permission_resets_the_unpublished_idle_timer(self) -> None:
+        self.aws.state = "running"
+        self.replace("idle_stop_minutes", "1")
+        controller = self.controller()
+        controller.publish = self.reject_publication
+        self.assertEqual(controller.tick().reason, "permission_unpublished")
+        self.clock.advance(59)
+        controller.publish = self.publish
+        self.assertEqual(controller.tick().reason, "")
+        self.clock.advance(1)
+        controller.publish = self.reject_publication
+        self.assertEqual(controller.tick().state, "running")
+        self.clock.advance(59)
+        self.assertEqual(controller.tick().state, "running")
+        self.assertEqual(self.aws.count("stop-instances"), 0)
+        self.clock.advance(1)
+        self.assertEqual(controller.tick().reason, "unpublished_idle")
+
+    def test_new_generation_resets_the_unpublished_idle_timer(self) -> None:
+        self.aws.state = "running"
+        self.replace("idle_stop_minutes", "1")
+        controller = self.controller()
+        controller.publish = self.reject_publication
+        self.assertEqual(controller.tick().reason, "permission_unpublished")
+        self.clock.advance(60)
+        self.aws.generation = "2026-01-15T12:01:00+00:00"
+        self.assertEqual(controller.tick().state, "running")
+        self.clock.advance(59)
+        self.assertEqual(controller.tick().state, "running")
+        self.assertEqual(self.aws.count("stop-instances"), 0)
+        self.clock.advance(1)
+        self.assertEqual(controller.tick().reason, "unpublished_idle")
+
+    def test_active_claim_prevents_the_unpublished_idle_stop(self) -> None:
+        self.aws.state = "running"
+        self.replace("idle_stop_minutes", "1")
+        claim = self.retained_claim()
+        controller = self.controller()
+        controller.publish = self.reject_publication
+        self.assertEqual(controller.tick().reason, "permission_unpublished")
+        self.clock.advance(60)
+        self.assertEqual(controller.tick().state, "running")
+        self.assertEqual(self.aws.count("stop-instances"), 0)
+        claim.unlink()
+        self.clock.advance(1)
+        self.assertEqual(controller.tick().reason, "unpublished_idle")
+        self.assertEqual(self.aws.count("stop-instances"), 1)
 
     def test_publication_timeout_cannot_delay_an_unexpected_generation_stop(self) -> None:
         self.publication_timeout_stops(unexpected=True)
@@ -112,17 +226,45 @@ class ControlTests(ControlFixture):
         called = self.root / "aws-called"
         _ = aws.write_text('#!/bin/sh\nprintf called > "$CLI_AWS_CALLED"\nexit 99\n')
         aws.chmod(0o755)
-        inactive = self.root / "inactive"
-        inactive.mkdir()
+        replica = self.root / "box"
+        replica.mkdir()
+        root = Path(__file__).resolve().parents[2]
+
+        def transfer(arguments: Sequence[str], deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT
+                     ) -> offload.CapturedCommandResult:
+            if "ls-files" in arguments:
+                timeout = deadline.seconds if isinstance(deadline, offload.CommandTimeLimit) else 10
+                reply = subprocess.run(arguments, capture_output=True, text=True, check=False, timeout=timeout)
+                return offload.CommandOutput(reply.returncode, reply.stdout, reply.stderr)
+            if "rev-parse" in arguments:
+                return offload.CommandOutput(0, "fixture-commit\n", "")
+            if arguments[0] == "rsync":
+                manifest, = [Path(word.removeprefix("--files-from=")) for word in arguments
+                             if word.startswith("--files-from=")]
+                for name in manifest.read_text().splitlines():
+                    destination = replica / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    _ = shutil.copyfile(root / name, destination)
+            return offload.CommandOutput(0, "", "")
+
+        controller = offload.ProcessController()
+        parity: offload.PublicToolParity = {
+            "rustc": "fixture", "nextest": "fixture", "mend": "fixture", "scripts_commit": "fixture-commit",
+        }
+        with mock.patch.object(controller, "capture", side_effect=transfer), \
+                mock.patch.object(offload, "expected_linux_parity", return_value=parity):
+            self.assertTrue(offload.copy_tracked_scripts(controller, offload.read_config(self.settings)))
+        inactive = replica / "config"
         registry = inactive / "build_targets.conf"
         _ = registry.write_text("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         settings = inactive / "aws_target.conf"
         _ = settings.write_text("offload=off\n")
         environment = {**os.environ, "PATH": str(tools), "PYTHONPATH": "", "CONF_DIR": str(inactive),
                        "BUILD_TARGETS_CONFIG": str(registry), "CLI_AWS_CALLED": str(called)}
-        for module in ("aws_target.py", "remote.py"):
+        for module in (replica / "scripts/aws_target/aws_target.py", replica / "scripts/aws_target/remote.py",
+                       replica / "scripts/mac_test/linux_runner.py"):
             with self.subTest(module=module):
-                result = subprocess.run([sys.executable, "-I", str(Path(__file__).with_name(module)), "--help"],
+                result = subprocess.run([sys.executable, "-I", str(module), "--help"],
                     cwd=self.root, env=environment,
                     capture_output=True, text=True, timeout=10, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -130,7 +272,7 @@ class ControlTests(ControlFixture):
 
         for command in ("tick", "start", "stop"):
             with self.subTest(disabled=command):
-                result = subprocess.run([sys.executable, "-I", str(Path(__file__).with_name("aws_target.py")), command],
+                result = subprocess.run([sys.executable, "-I", str(replica / "scripts/aws_target/aws_target.py"), command],
                     cwd=self.root, env=environment, capture_output=True, text=True, timeout=10, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(cast(dict[str, object], json.loads(result.stdout))["state"], "off")

@@ -27,8 +27,8 @@ from scripts.production.test_change_review import producer_rows
 from scripts.statusline import counts_row
 from footer_counts import FooterCounts
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
-    unit_membership,
+    fixture_member, isolated_source_readers, isolated_staff_file, production_staff_record,
+    recorded_showrunner, source_environment, unit_membership,
 )
 
 LIST = """# Change review
@@ -371,7 +371,7 @@ class FooterCountsTests(unittest.TestCase):
         from dataclasses import replace
         broken = replace(snapshot, rows=tuple(replace(row, parent=None) if row.id == one.id else row
                                                for row in snapshot.rows))
-        with (mock.patch.object(staff, "snapshot", return_value=broken),
+        with (mock.patch.object(staff, "snapshot", return_value=broken), production_staff_record(),
               mock.patch.object(unrouted_alert, "send_message") as send, contextlib.redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(footer_counts.changes(doc), 0)
             self.assertEqual(footer_counts.unrouted_changes(doc), 2)

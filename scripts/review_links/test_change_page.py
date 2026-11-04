@@ -27,7 +27,7 @@ from urllib.parse import urlencode, urljoin, urlsplit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
 from scripts.production import change_routing, change_review, footer_counts, next_item, showrunners, staff, unrouted_alert
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve
 
@@ -612,6 +612,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
 
     def test_an_unrouted_row_with_a_missing_alert_setting_still_renders(self) -> None:
+        _ = self.enterContext(production_staff_record())
         _ = self.enterContext(patch.object(change_routing, "configured_lists_directory", return_value=self.temporary))
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Conflict", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")])

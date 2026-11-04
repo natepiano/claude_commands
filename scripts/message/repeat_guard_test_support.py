@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import importlib
-import signal
 import subprocess
 import sys
 import tempfile
@@ -16,7 +15,7 @@ from pathlib import Path
 from typing import Literal, cast
 from unittest.mock import patch
 
-from scripts.lib import process_group
+from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 
@@ -76,7 +75,7 @@ def run_ready_notice_attempt(
 ) -> tuple[int | None, str, str]:
     """Time out a real blocked child only after its readiness signal arrives."""
     launch = subprocess.Popen
-    children: list[subprocess.Popen[str]] = []
+    owned = OwnedTestProcesses()
     attempt_timeout = timeout
     read_fd, write_fd = os.pipe()
     writer_open = True
@@ -86,9 +85,9 @@ def run_ready_notice_attempt(
                   start_new_session: bool) -> subprocess.Popen[str]:
             nonlocal writer_open
             child = launch(arguments, stdin=stdin, stdout=stdout, stderr=stderr, text=text,
-                           env={**(os.environ if env is None else env), "NOTICE_READY_FD": str(write_fd)},
+                           env=owned.environment({**(os.environ if env is None else env), "NOTICE_READY_FD": str(write_fd)}),
                            cwd=cwd, start_new_session=start_new_session, pass_fds=(write_fd,))
-            children.append(child)
+            owned.track(child, group=start_new_session)
             os.close(write_fd)
             writer_open = False
             communicate = child.communicate
@@ -109,11 +108,7 @@ def run_ready_notice_attempt(
                         if actual != marker:
                             raise AssertionError(f"expected {marker}, received {actual!r}")
                     except BaseException:
-                        try:
-                            process_group.send_process_group(child.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+                        owned.finish()
                         raise
                     raise subprocess.TimeoutExpired(arguments, attempt_timeout if timeout is None else timeout)
                 return communicate(input, timeout=TEST_HANG_GUARD_SECS)
@@ -127,9 +122,4 @@ def run_ready_notice_attempt(
         finally:
             if writer_open:
                 os.close(write_fd)
-            for child in children:
-                try:
-                    process_group.send_process_group(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+            owned.finish()

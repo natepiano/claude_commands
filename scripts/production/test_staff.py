@@ -356,6 +356,25 @@ class DocumentLookupTests(StaffTestCase):
 
 
 class StaffTests(StaffTestCase):
+    def test_snapshots_keep_their_production_record_source(self) -> None:
+        value: dict[str, object] = {"schema": 2, "rows": []}
+        _ = self.write_document(value)
+        self.assertFalse(staff.snapshot().production)
+        self.assertFalse(staff.local_snapshot().production)
+        self.assertFalse(staff.initial_snapshot().production)
+        production_file = self.root / "production-staff.json"
+        _ = production_file.write_text(json.dumps(value), encoding="utf-8")
+        with (mock.patch.dict(os.environ),
+              mock.patch.object(staff, "_default_file", return_value=production_file)):
+            del os.environ["STAFF_FILE"]
+            self.assertTrue(staff.snapshot().production)
+            self.assertFalse(staff.local_snapshot().production)
+            self.assertFalse(staff.initial_snapshot().production)
+            self.assertEqual(staff.snapshot().inputs, (str(production_file.absolute()),))
+            with (mock.patch.object(staff, "is_owner", return_value=False),
+                  mock.patch.object(staff, "_remote", return_value=value)):
+                self.assertTrue(staff.snapshot().production)
+
     def test_gate_module_writes_keep_the_real_staff_and_launch_folders_unchanged(self) -> None:
         from scripts.herdr import pane_launch
         from scripts.production import merge_gate
@@ -1153,9 +1172,10 @@ class StaffTests(StaffTestCase):
         self.assertCountEqual(staff.find(), rows)
 
     def test_missing_file_reads_as_empty_and_bootstraps_on_write(self) -> None:
-        self.assertIsNone(staff.by_id(MISSING_ID))
-        self.assertIsNone(staff.by_path("sdlc"))
-        self.assertEqual(staff.find(), [])
+        record = staff.initial_snapshot()
+        self.assertIsNone(record.by_id(MISSING_ID))
+        self.assertIsNone(record.by_path("sdlc"))
+        self.assertEqual(record.find(), [])
         self.assertFalse(self.staff_file.exists())
         created = fixture_member("showrunner", name="sdlc")
         self.assertEqual(staff.by_id(created.id), created)
@@ -1556,7 +1576,7 @@ class StaffTests(StaffTestCase):
     def test_absent_records_are_empty_on_owner_and_mac(self) -> None:
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
-                self.assertEqual(staff.snapshot(), staff.StaffSnapshot(()))
+                self.assertEqual(staff.initial_snapshot(), staff.StaffSnapshot(()))
         self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
         self.assertFalse(self.staff_file.exists())
         self.assertFalse(self.mac_file.exists())

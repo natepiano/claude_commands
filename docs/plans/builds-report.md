@@ -241,27 +241,31 @@ Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second la
 ### Phase 10 — Chart labels do not collide  · status: done
 **Depends on:** Phase 8
 
-The fresh design check of the Phase 8 shots (dataviz label rules) found two defects on the `buildlog charts` page:
+#### As-built
 
-1. The moment numbers above each of the six cost panels sit on the panel title (for example "2 1" over "Memory wait · h/day"). Keep the numbers clear of every panel title, at desktop and phone width.
-2. Costs by machine: the mac and CI lines are both 0, so the CI line hides the mac line. The end labels move apart to avoid each other, so "mac" sits beside the natedev line end and "natedev" sits far above it. Each end label must sit beside its own line end, or the chart must name the series in another clear way; a line hidden under another must stay visible (dataviz: 2px surface ring on overlapping marks).
-
-Acceptance: new tests in `scripts/buildlog/test_charts.py` pin both rules (no moment number box overlaps a panel title box; each end label is nearest its own line end). Fresh shots at 1280 px light and dark and at 500 px, judged once more under the dataviz rules.
+- Moment numbers sit in their own rows below each panel title. Numbers closer than 26 px go to the next row, and the plot top moves down to make room.
+- End labels stay at their own line ends. Ends with the same bucket and value share one label, which names each series and the value.
+- A label that does not fit, or that sits on another series' end, is dropped; the legend names that series. Gap notes yield to end labels.
+- Coincident line segments alternate dashed strokes. A point shared by several series shows one sector per series.
+- `test_charts.py` pins both rules: no moment number box overlaps a panel title box, and each end label is nearest its own line end.
 
 **Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/test_charts.py`.
 
-### Phase 11 — Every build step records its real target folder  · status: todo
+### Phase 11 — Every build step records its real target folder  · status: done
 **Depends on:** none (runs beside Phase 10)
 
-The builds showrunner, 2026-11-03: add-on 1 is current and belongs to report-unit (its Units row owns `scripts/buildlog/`, the build log and its writer). Phase 9 found that 1,399 of 1,517 cold natedev steps in 7 days have no absolute target folder (678 `unknown`, 721 unset). Cold-cause rounds cannot tell which folder went cold.
+#### As-built
 
-1. Every step the build log records carries its resolved absolute target folder.
-2. A step with no target folder records an explicit none state, never a blank or a missing field.
-3. One owner switches all callers: edit each caller that records a step (verify.sh call sites and any other). Tell verify-unit the exact lines before they are edited.
+- Cause (Phase 9): 1,399 of 1,517 cold natedev steps in 7 days had no absolute target folder (678 `unknown`, 721 unset).
+- `scripts/buildlog/step_context.py` gives the shell each step's tree key and target folder in 0.08 s. It applies the command's `env` wrapper (options, `--`, `-u`, `-C`, assignments), Cargo config and workspace default. It does not start `cargo locate-project`. It works as a script, as a package module and with `python3 -m`.
+- Caller metadata and known-folder hints are used only when the command does not change `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, `CARGO_HOME`, `HOME` or the working folder.
+- Target states: an absolute folder, `none` (not a Cargo step), or `unresolved` (the folder is not known). A missing captured folder records `unresolved`; the detached writer never resolves late. Old `unknown` and `unset` rows stay as they are.
+- `index.py` schema 29 stores `build_history_group` once: `folder:<path>`, `legacy:<checkout>` for old unknown/unset rows only, or NULL. NULL rows never read or make warm history. Index `steps_build_group_history` replaces `steps_build_history`. `report.py` compares the stored column.
+- `scripts/lib/cargo_target_config.py` is the one Cargo config and workspace reader for the recorder and `scripts/lint/sweep.py` (`CargoConfigPolicy`).
+- `scripts/lint/invoke.sh` writes each step through one `buildlog_write_step` function. verify-unit has the new line ranges.
+- The live index check runs after the merge (Change-Review line in the checkpoint).
 
-Acceptance: tests pin the target folder for each step kind and the explicit none state. A live run of one step shows its folder in the index.
-
-**Files:** `scripts/buildlog/` (writer and index), each caller that records a step (found by search; `scripts/direct/verify.sh` first).
+**Files:** `scripts/buildlog/step_context.py`, `parse.py`, `record.py`, `index.py`, `report.py`, `launches.py`, `scripts/lib/cargo_target_config.py`, `scripts/lib/shell_test_support.py`, `scripts/lint/invoke.sh`, `scripts/lint/sweep.py`, `scripts/direct/verify.sh`, and their tests.
 
 ### Phase 12 — A vault stop that waits on the user does not fail buildlog.service  · status: done
 **Depends on:** none (urgent bump from the builds showrunner, 2026-11-03)
@@ -274,3 +278,7 @@ The user unit `buildlog.service` on natedev failed from 21:29 EST. The vault ste
 Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command_failed`. The next hourly `buildlog.service` run ends without failure.
 
 **Files:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.
+
+### Phase 13 — Buildlog tests import their own modules  · status: done
+
+Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHONPATH. test_costs subprocess tests fail with no module cli or costs; test_vault_pull fails to import conf. Each test sets its own import path.

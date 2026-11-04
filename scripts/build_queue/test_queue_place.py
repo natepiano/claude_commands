@@ -31,7 +31,10 @@ from scripts.build_queue.queue_fixture import write_memory_config
 
 GIB = gate.GIB
 CHILD = "import sys; data=sys.stdin.buffer.read(); sys.stdout.buffer.write(data); sys.exit(int(sys.argv[1]))"
-BLOCKING_CHILD = "import signal,sys; print('ready', flush=True); signal.pause()"
+LIFELINE_WAIT = "os.read(int(os.environ['QUEUE_TEST_LIFELINE']), 1)"
+BLOCKING_CHILD = "import os,sys; print('ready', flush=True); " + LIFELINE_WAIT
+TERM_RESISTANT_CHILD = ("import os,signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        + "print('ready',flush=True); " + LIFELINE_WAIT)
 DESCENDANT_CHILD = """
 import os, signal, sys
 read_fd, write_fd = os.pipe()
@@ -43,7 +46,7 @@ if descendant == 0:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     os.write(write_fd, b'ready')
     os.close(write_fd)
-    signal.pause()
+    os.read(int(os.environ["QUEUE_TEST_LIFELINE"]), 1)
     os._exit(0)
 os.close(write_fd)
 os.read(read_fd, 5)
@@ -51,7 +54,7 @@ os.close(read_fd)
 print(descendant, flush=True)
 if sys.argv[1] == 'exit':
     sys.exit(0)
-signal.pause()
+os.read(int(os.environ["QUEUE_TEST_LIFELINE"]), 1)
 """
 BEFORE_SCOPE_START = """
 import os, sys
@@ -80,7 +83,7 @@ if descendant == 0:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     os.write(ready_write, b'R')
     os.close(ready_write)
-    signal.pause()
+    os.read(int(os.environ["QUEUE_TEST_LIFELINE"]), 1)
     os._exit(0)
 os.close(ready_write)
 os.read(ready_read, 1)
@@ -91,6 +94,91 @@ if os.read(exit_fd, 1) != b'E':
 os.close(exit_fd)
 os._exit(0)
 """
+
+
+def helper_lifeline_owner() -> None:
+    """Start helpers with one pipe writer owned by this process."""
+    read_fd, write_fd = os.pipe()
+    os.environ["QUEUE_TEST_LIFELINE"] = str(read_fd)
+    children: list[subprocess.Popen[bytes]] = []
+    pids: list[int] = []
+    for source, arguments in ((BLOCKING_CHILD, []), (TERM_RESISTANT_CHILD, []),
+                              (DESCENDANT_CHILD, ["term", "group"]),
+                              (DESCENDANT_CHILD, ["term", "detach"]),
+                              (DESCENDANT_CHILD, ["exit", "detach"])):
+        child = subprocess.Popen([sys.executable, "-c", source, *arguments],
+                                 pass_fds=(read_fd,), stdout=subprocess.PIPE)
+        children.append(child)
+        assert child.stdout is not None
+        if not select.select([child.stdout], [], [], 3)[0]:
+            raise AssertionError("helper did not become ready")
+        ready = cast(bytes, child.stdout.readline())
+        if source in (BLOCKING_CHILD, TERM_RESISTANT_CHILD):
+            pids.append(child.pid)
+        else:
+            pids.append(int(ready))
+            if arguments[0] == "exit":
+                _ = child.wait(timeout=3)
+            else:
+                pids.append(child.pid)
+    fork_read, fork_write = os.pipe()
+    exit_read, exit_write = os.pipe()
+    child = subprocess.Popen([sys.executable, "-c", UNSAMPLED_DESCENDANT, str(fork_read), str(exit_read)],
+                             pass_fds=(read_fd, fork_read, exit_read), stdout=subprocess.PIPE)
+    children.append(child)
+    assert child.stdout is not None
+    _ = cast(bytes, child.stdout.readline())
+    _ = os.write(fork_write, b"F")
+    pids.append(int(cast(bytes, child.stdout.readline())))
+    _ = os.write(exit_write, b"E")
+    _ = child.wait(timeout=3)
+    for descriptor in (fork_read, fork_write, exit_read, exit_write):
+        os.close(descriptor)
+    print(json.dumps(pids), flush=True)
+    os.close(read_fd)
+    # Keep the only writer open until the regression kills this process.
+    _ = os.read(sys.stdin.fileno(), 1)
+    os.close(write_fd)
+
+
+class HelperLifelineTests(unittest.TestCase):
+    def test_helpers_exit_after_the_test_process_is_killed(self) -> None:
+        owner = subprocess.Popen([sys.executable, "-c",
+            "from scripts.build_queue.test_queue_place import helper_lifeline_owner; helper_lifeline_owner()"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        pids: list[int] = []
+        descriptors: list[int] = []
+        try:
+            assert owner.stdout is not None
+            self.assertTrue(select.select([owner.stdout], [], [], 10)[0], "helper owner did not become ready")
+            pids = cast(list[int], json.loads(cast(bytes, owner.stdout.readline())))
+            descriptors = [os.pidfd_open(pid) for pid in pids]
+            owner.kill()
+            self.assertEqual(owner.wait(timeout=3), -signal.SIGKILL)
+            pending = set(descriptors)
+            deadline = time.monotonic() + 3
+            while pending and (remaining := deadline - time.monotonic()) > 0:
+                ready, _, _ = select.select(list(pending), [], [], remaining)
+                pending.difference_update(ready)
+            self.assertFalse(pending, "helpers survived the test process")
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+            _ = owner.wait(timeout=3)
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    _ = os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+            for descriptor in descriptors:
+                os.close(descriptor)
+            for stream in (owner.stdin, owner.stdout):
+                if stream is not None:
+                    stream.close()
 
 
 def private_scope_start() -> None:
@@ -120,10 +208,16 @@ def private_scope_start() -> None:
 
 class QueuePlaceFixture(ExitStack):
     """Private config, ledger and memory files shared by all helper scenarios."""
+
     def __init__(self, *, private_slice: str = "") -> None:
         super().__init__()
         self.private_slice: str = private_slice or f"queueplacetest{os.getpid()}{time.monotonic_ns()}.slice"
         self.enter_context(LauncherHangGuard("queue place fixture").protect())
+        self.lifeline_read: int
+        self.lifeline_write: int
+        self.lifeline_read, self.lifeline_write = os.pipe()
+        _ = self.callback(os.close, self.lifeline_read)
+        _ = self.callback(os.close, self.lifeline_write)
         self.root: Path = Path(self.enter_context(tempfile.TemporaryDirectory(prefix="queue-place-test-")))
         self.log: Path = self.root / "log"
         self.proc: Path = self.root / "proc"
@@ -136,6 +230,7 @@ class QueuePlaceFixture(ExitStack):
             "BUILDLOG_PROC": str(self.proc), "BUILDLOG_BUILD_BUDGET_GIB": "60",
             "BUILDLOG_SCOPE": "0", "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "UNIT_SESSION_DIR": "", "UNIT_RUN_DIR": "", "CLAUDE_CODE_SESSION_ID": "queue-place-test",
+            "QUEUE_TEST_LIFELINE": str(self.lifeline_read),
         }))
         self.admission: AdmissionFixture = self.enter_context(AdmissionFixture(root=self.root))
         self.admission.clock.epoch = time.time()
@@ -152,6 +247,8 @@ class QueuePlaceFixture(ExitStack):
                 argv = [*argv[:index], sys.executable, "-c",
                         "from scripts.build_queue.test_queue_place import private_scope_start; private_scope_start()",
                         self.private_slice, *argv[index + 2:]]
+            if argv[:1] != ["git"]:
+                kwargs["pass_fds"] = (*kwargs.get("pass_fds", ()), self.lifeline_read)
             child = spawn(argv, **kwargs)
             # Git reads config history and does not start the queued program.
             if argv[:1] == ["git"]:
@@ -263,6 +360,16 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_program_admission_carries_the_unit_override(self) -> None:
+        with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {gate.BUILDLOG_UNIT: "queue-unit"}):
+            with queue.queue_place("rust-analyzer", fixture.root):
+                _, row = fixture.reservation()
+                self.assertIn("queue_waiter", row)
+                assert "queue_waiter" in row
+                waiter = row["queue_waiter"]
+                self.assertEqual(waiter.get("unit"), "queue-unit")
+                self.assertEqual(waiter.get("session_id"), gate.waiter_identity("", "")["session_id"])
+
     def analyzer(self, fixture: QueuePlaceFixture, source: str) -> Path:
         executable = fixture.root / "rust-analyzer"
         _ = executable.write_text(f"#!{sys.executable}\n" + source)
@@ -623,7 +730,7 @@ class QueuePlaceTests(unittest.TestCase):
         with QueuePlaceFixture() as fixture:
             with queue.queue_place("rust-analyzer", fixture.root) as place:
                 child = place.popen([sys.executable, "-c",
-                    "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready',flush=True); signal.pause()"],
+                    TERM_RESISTANT_CHILD],
                     stdout=subprocess.PIPE)
                 assert child.stdout is not None
                 self.assertTrue(select.select([child.stdout], [], [], 3)[0])
@@ -860,6 +967,7 @@ class QueuePlaceTests(unittest.TestCase):
                 read_fd, write_fd = os.pipe()
                 holder = os.fork()
                 if holder == 0:
+                    os.close(fixture.lifeline_write)
                     _ = signal.alarm(TEST_HANG_GUARD_SECS)
                     os.close(read_fd)
                     status = 99
@@ -869,7 +977,7 @@ class QueuePlaceTests(unittest.TestCase):
                             _ = fixture.start_blocked(place)
                             place.observe(GIB, GIB)
                             _ = os.write(write_fd, b"ready")
-                            signal.pause()
+                            _ = os.read(fixture.lifeline_read, 1)
                     except SystemExit as error:
                         status = cast(int, error.code)
                     finally:
@@ -912,6 +1020,7 @@ class QueuePlaceTests(unittest.TestCase):
             read_fd, write_fd = os.pipe()
             holder = os.fork()
             if holder == 0:
+                os.close(fixture.lifeline_write)
                 _ = signal.alarm(TEST_HANG_GUARD_SECS)
                 os.close(read_fd)
                 try:
@@ -922,7 +1031,7 @@ class QueuePlaceTests(unittest.TestCase):
                         _ = place.sidecar.write_text(str(scope))
                         place.observe(GIB, GIB)
                         _ = os.write(write_fd, b"ready")
-                        signal.pause()
+                        _ = os.read(fixture.lifeline_read, 1)
                 finally:
                     os._exit(99)
             os.close(write_fd)
@@ -966,20 +1075,21 @@ class QueuePlaceTests(unittest.TestCase):
                 read_fd, write_fd = os.pipe()
                 holder = os.fork()
                 if holder == 0:
+                    os.close(fixture.lifeline_write)
                     _ = signal.alarm(TEST_HANG_GUARD_SECS)
                     os.close(read_fd)
                     try:
                         fixture.supply_process(os.getpid(), 0, parent=1)
                         with queue.queue_place("rust-analyzer", fixture.root) as place:
-                            program = ("import os,signal; pid=os.fork(); os._exit(0) if pid else signal.pause()"
-                                       if leader_exits else "import signal; signal.pause()")
+                            program = ("import os; pid=os.fork(); os._exit(0) if pid else " + LIFELINE_WAIT
+                                       if leader_exits else "import os; " + LIFELINE_WAIT)
                             child = place.popen([sys.executable, "-c", program],
                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                             scope_at_return = place.sidecar.read_text().strip()
                             place.observe(GIB, GIB)
                             _ = os.write(write_fd, json.dumps({"pid": child.pid, "scope": scope_at_return,
                                                                "status": child.poll()}).encode())
-                            signal.pause()
+                            _ = os.read(fixture.lifeline_read, 1)
                     finally:
                         os._exit(99)
                 os.close(write_fd)
@@ -1058,7 +1168,7 @@ class QueuePlaceTests(unittest.TestCase):
                 kwargs["pass_fds"] = (*kwargs.get("pass_fds", ()), ready_write, resume_read)
                 child = spawn(delayed, **kwargs)
                 _ = os.write(spawned_write, str(child.pid).encode())
-                signal.pause()
+                _ = os.read(fixture.lifeline_read, 1)
                 return child
 
             with mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \
@@ -1066,6 +1176,7 @@ class QueuePlaceTests(unittest.TestCase):
                  mock.patch.object(subprocess, "Popen", side_effect=start_before_publication):
                 holder = os.fork()
                 if holder == 0:
+                    os.close(fixture.lifeline_write)
                     _ = signal.alarm(TEST_HANG_GUARD_SECS)
                     os.close(ready_read)
                     os.close(resume_write)
@@ -1075,7 +1186,7 @@ class QueuePlaceTests(unittest.TestCase):
                         with queue.queue_place("rust-analyzer", fixture.root) as place:
                             place.observe(GIB, GIB)
                             _ = place.popen([sys.executable, "-c",
-                                "from pathlib import Path; import signal,sys; Path(sys.argv[1]).touch(); signal.pause()",
+                                "from pathlib import Path; import os,sys; Path(sys.argv[1]).touch(); " + LIFELINE_WAIT,
                                 str(marker)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     finally:
                         os._exit(99)

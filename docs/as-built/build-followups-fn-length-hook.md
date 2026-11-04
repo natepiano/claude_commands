@@ -77,9 +77,6 @@ This global count includes the same lists as the page across independent product
 The page, footer, and `/next` use the same typed waiting rule.
 The status count watches staff, lists, and delivery records.
 The merge writer and `change_review add` store Producer ids.
-`change_review backfill-producer [--list <path>] [--write]` fills historical rows after a backup.
-After the lists are filled, remove `producer_backfill.py`, including its adapter, and `test_producer_backfill.py`.
-Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
 
 `proposals` counts `proposals_table.waiting_entries(doc)`, the same own-production rows as `/next proposal`: open proposal issues waiting for approval and proposed lines in the ledger the Improvement queue field names. Accepted and deferred plan-backlog lines do not count. Shared issue folders are filtered by the production's slug and units (`proposals_folder.owners` and `proposer`); showrunners above and below count their own. `sources()` includes the Improvement queue ledger so the status line cache refreshes when it changes. A source that cannot be read counts 0. `counts_line` writes `For you: 1 question, 2 changes, 130 efficiency, 1 proposal`, zero counts left out, None when all are zero. Every kind is available through `/next`. The status line adds the open questions of the production's own list (`showrunner_footer.counts_line`, questions from `open_questions`). The dailies report's own footer (`dailies_render.py --footer`) shows the line too; no reply carries it.
 - **Old state.** Switch files left in `~/.local/state/showrunner/footers-off/` are not read; `tidy_wrapped.py` deletes a production's file at wrap. Pause and review-pause records still load. Their footer keys have no effect. Shutdown restart keeps only staff row IDs.
@@ -185,7 +182,7 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 
 - **fn-length blind spots.** Functions inside `macro_rules!` or `name! { … }` bodies are never measured (clippy sees expanded code the scan cannot expand). Edits made through shell commands (`sed`, heredocs) and growth from rustfmt reflowing a function measured at or under the limit are not seen. A failed `blocks.jsonl` append is silent and never changes the verdict. `cfg(test)` modules in package-root `examples/` targets are skipped because clippy never lints them.
 
-- **basedpyright** exits 3 in every checkout (`pyrightconfig.json` names a `.venv` no checkout has); read its last output line (`0 errors, 0 warnings, 0 notes`), not its exit status. `scripts/hooks` is a pyright execution environment with itself on `extraPaths`, so tests import `fn_length_lib` directly.
+- **basedpyright** exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`. `scripts/hooks` is a pyright execution environment with itself on `extraPaths`, so tests import `fn_length_lib` directly.
 
 - **Stall watch.** `~/.claude/sessions/` keeps stale `<pid>.json` records carrying a live session's id; the live record is the one whose pid answers `os.kill(pid, 0)`. Idle panes stayed byte-identical for 6.5 minutes in a live probe while a busy pane changed only from real activity. A status file reading `implementing` with no live process counts as idle.
 

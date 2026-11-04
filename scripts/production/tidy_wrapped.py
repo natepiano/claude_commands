@@ -72,7 +72,7 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
             raise TidyRefused(str(error)) from error
     owners = {slug}
     if document is not None:
-        record = staff.snapshot()
+        record = staff.initial_snapshot()
         try:
             owners.update(row.name for row in unit_lookup.doc_units(document, record))
         except staff.StaffUnreadable:

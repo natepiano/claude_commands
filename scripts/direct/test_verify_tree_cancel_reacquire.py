@@ -6,7 +6,7 @@ import unittest
 import sys
 from pathlib import Path
 
-from scripts.direct.verify_tree_cancel_test_support import CANCEL_LINE, VerifyTreeCancelFixture
+from scripts.direct.verify_tree_cancel_test_support import cancellation_lines, VerifyTreeCancelFixture
 from scripts.direct.verify_token_wait_test_support import BOARD
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -48,7 +48,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.edit_source()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 77, output + errors)
-        self.assertEqual((output + errors).splitlines().count(CANCEL_LINE.format(cmd="test")), 1)
+        self.assertEqual(len(cancellation_lines(output + errors, "test")), 1)
         self.assertEqual(sorted(waiters.iterdir()), [peer_entry], "cancel left its reacquisition entry")
         self.assertEqual((lock / "holder_pid").read_text(), str(holder.pid), "cancel released a peer's claim")
         self.assertIsNone(holder.poll(), "cancel killed its peer")

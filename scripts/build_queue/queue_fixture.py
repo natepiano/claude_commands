@@ -364,7 +364,8 @@ class QueueFixture(ExitStack):
         reading = self.read()
         return queue_view.QueueModel(reading, self.labels, head_facts.read_head_facts(reading),
                                      head_facts.read_pace(NOW), ZONE, queue_view.HostLoadUnavailable(),
-                                     gate.smallest_head_release(reading.explanation))
+                                     gate.smallest_head_release(reading.explanation),
+                                     ci_memory_slice=gate.read_memory_config().ci_memory_slice)
 
     def budget_model(self) -> queue_view.QueueModel:
         """The compact page uses the captured rows and the drawing's budget split."""
@@ -385,7 +386,8 @@ class QueueFixture(ExitStack):
         reading = replace(model.reading, explanation=explanation,
             view=replace(model.reading.view, waiting=(step, *model.reading.view.waiting[1:])),
             ordered=cast(list[tuple[Path, gate.Waiter]], ordered))
-        return replace(model, reading=reading, release=gate.smallest_head_release(reading.explanation))
+        return replace(model, reading=reading, release=gate.smallest_head_release(reading.explanation),
+                                     ci_memory_slice=gate.read_memory_config().ci_memory_slice)
 
 
 class QueueFixtureTests(unittest.TestCase):

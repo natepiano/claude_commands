@@ -60,9 +60,11 @@ import build_hold
 import override_guard
 from user_zone import user_zone
 if TYPE_CHECKING:
+    from ..direct.step_record import Pinned, ROUTED, TargetSelection
     from ..message import roster
     from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
 else:
+    from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
     from scripts.message import roster
     from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
 
@@ -249,6 +251,14 @@ class NatedevOnly:
     reason: str
 
 
+def target_can_retry(result: EligibleTarget | ExcludedTarget) -> bool:
+    """Keep temporary refusals available for a later reservation."""
+    return (isinstance(result, EligibleTarget)
+            or result.reason in {"busy", "blocked", "disk", "backoff", "unreachable", "state", "copy", "mac_busy",
+                                 "spending_limit", "spending_unavailable"}
+            or result.reason.startswith("state unreadable: "))
+
+
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing
                            ) -> EligibleTarget | ExcludedTarget:
@@ -280,7 +290,8 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
 
 
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
-                           kind: StepKind, routing: Routing) -> EligibleTarget | ExcludedTarget:
+                           kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED
+                           ) -> EligibleTarget | ExcludedTarget:
     """Read Linux policy and capacity without evaluating a development shell."""
     if target.platform == "macos":
         return mac_target_eligibility(target, repo_root, package, kind, routing)
@@ -296,6 +307,12 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     if isinstance(policy, offload.IneligibleMacStep):
         return ExcludedTarget(target, policy.reason)
     paths = mac_test.state_paths(target.name)
+    if isinstance(selection, Pinned) and is_aws_target(target):
+        control = mac_test.read_json_object(paths.directory / "controller.json") or {}
+        if control.get("state") in ("stopped", "starting", "pending", "stopping"):
+            return ExcludedTarget(target, "starting")
+        if control.get("state") == "refused":
+            return ExcludedTarget(target, str(control.get("reason", "controller refused")))
     answer = mac_test.free_now(paths, target.settings, repo_root)
     if answer != "free":
         return ExcludedTarget(target, answer)
@@ -329,6 +346,25 @@ def ssh_target_config(target: SshTarget) -> offload.OffloadConfig | ExcludedTarg
             raise
         print(f"build targets: {target.name}: spending refused: {error}", file=sys.stderr)
         return ExcludedTarget(target, "spending_unavailable")
+
+
+def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:
+    """Use normal eligibility, but wait for stopped AWS capacity before its reachability check."""
+    try:
+        target = offload.configured_ssh_target(args.target)
+        if args.kind not in ("test", "check", "doc"):
+            raise ValueError("--target supports test, check, and doc only")
+        kind = cast(StepKind, args.kind)
+        result = ssh_target_eligibility(target, Path(args.repo_root), args.package, kind, routing,
+                                        selection=Pinned(target.name))
+        if isinstance(result, ExcludedTarget) and result.reason not in ("busy", "blocked", "starting"):
+            raise ValueError(f"target {target.name} refused: {result.reason}")
+        print("ssh_allowed")
+        print_eligible_target(result)
+        return 0
+    except (ConfigError, OSError, UnicodeError, ValueError) as error:
+        print(f"build targets: {error}", file=sys.stderr)
+        return 2
 
 
 def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> bool:
@@ -495,16 +531,22 @@ def command_kind_eligible(repo_root: Path, package: str, kind: StepKind, routing
         decision = NatedevOnly("full gate runs on natedev")
     elif isinstance(routing, LocalRequired):
         decision = NatedevOnly(routing.reason)
-    for result in eligibility:
-        if not isinstance(result.target, SshTarget):
-            continue
-        if isinstance(result, EligibleTarget):
+    retry_allowed = kind in ("test", "check", "lint", "doc") and not isinstance(routing, LocalRequired)
+    remote_results = tuple(result for result in eligibility if isinstance(result.target, SshTarget))
+    disk_declined = any(isinstance(result, ExcludedTarget) and result.reason == "disk" for result in remote_results)
+    linux_allowed = False
+    if retry_allowed:
+        if disk_declined:
+            # Keep disk evidence independent of target order and retry permission.
+            decision = NatedevOnly("disk")
+        elif any(target_can_retry(result) for result in remote_results):
             decision = MacAllowed()
-            break
-        decision = NatedevOnly(result.reason)
-    linux_allowed = any(isinstance(result.target, SshTarget) and result.target.platform == "linux"
-                        and (isinstance(result, EligibleTarget) or result.reason in ("busy", "blocked"))
-                        for result in eligibility)
+            linux_allowed = any(isinstance(result.target, SshTarget) and result.target.platform == "linux"
+                                and target_can_retry(result) for result in remote_results)
+        else:
+            reasons = sorted(result.reason for result in remote_results if isinstance(result, ExcludedTarget))
+            if reasons:
+                decision = NatedevOnly(reasons[0])
     print("ssh_allowed" if linux_allowed else "mac_allowed" if isinstance(decision, MacAllowed)
           else f"natedev_only {display_field(decision.reason)}")
     for result in eligibility:
@@ -800,6 +842,7 @@ def parser() -> argparse.ArgumentParser:
     _ = eligible.add_argument("--package", default="")
     _ = eligible.add_argument("--kind", choices=("check", "lint", "doc", "test", "build", "example", "final"), default="")
     _ = eligible.add_argument("--local", dest="local_reason", default="")
+    _ = eligible.add_argument("--target", default="")
     register = commands.add_parser("register-local")
     _ = register.add_argument("--call-id", required=True)
     _ = register.add_argument("--pid", type=positive_pid, required=True)
@@ -828,6 +871,8 @@ def main() -> int:
         return command_release_wait(args.pid)
     if args.command == "eligible":
         routing = LocalRequired(args.local_reason) if args.local_reason else ANY_ELIGIBLE_TARGET
+        if args.target:
+            return command_pinned_eligible(args, routing)
         if args.kind:
             return command_kind_eligible(Path(args.repo_root).resolve(), args.package, cast(StepKind, args.kind), routing)
         return command_eligible(Path(args.repo_root).resolve(), args.package, routing)

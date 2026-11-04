@@ -8,7 +8,7 @@ from typing import assert_never
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_evidence
-from scripts.build_queue.queue_evidence import step_labels
+from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pad_left, pad_right, plain, field
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
@@ -41,6 +41,7 @@ class QueueModel:
     zone: ZoneInfo
     load: HostLoad | HostLoadUnavailable
     release: gate.HeadAfterEnd
+    ci_memory_slice: str = ""
 
     @cached_property
     def moves(self) -> head_facts.QueueMoves:
@@ -275,6 +276,14 @@ def started_ago(started: float, now: float) -> str:
     raise AssertionError("the seconds scale always matches")
 
 
+def leftover_age(minutes: int) -> str:
+    if minutes < 120:
+        return f"{minutes} min"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} h"
+    return f"{minutes // (24 * 60)} d"
+
+
 def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: str = "",
                 selector: str = "") -> list[Line]:
     explanation = model.reading.explanation
@@ -290,8 +299,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         identity = step_labels(step, model.labels)
         show = field(identity.showrunner) or "—"
         unit = field(identity.unit).removeprefix(show + "-")
-        if not unit or unit == "—":
-            unit = field(identity.session)
+        unit = unit or "—"
         return show, unit, bool(bumped_unit and identity.unit == bumped_unit)
 
     waiting_names = [names(step) for step in waiting]
@@ -301,7 +309,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     status = head_status(model, budget_bytes)
     labels: Line = (Span(f"free {free:.1f}", "success"), Span(" │ ", "inactive"),
                     Span(f"taken {taken:.1f}", "suggestion"))
-    place_width = max(2, len(str(len(waiting))))
+    place_width = max(3, len(str(len(waiting))))
     minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0),
                         max((len(str(age(row.started_at, explanation.now))) for row in running if row.started_at), default=0))
     step_width = max(7, min(13, max(
@@ -338,7 +346,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     if priority:
         lines.insert(2, (Span(priority),))
 
-    def heading(place: str, memory: str) -> Line:
+    def heading() -> Line:
+        place, memory = "#", "GiB: reserve/use; need"
         return (Span(pad_left(place, place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "
                      + pad_right(cut_tail("unit", unit_width), unit_width) + " " + pad_right("step", step_width) + " "
                      + pad_left("min", minutes_width) + " " + memory, "inactive"),)
@@ -360,43 +369,47 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
                 Span(column(field(step), step_width)),
                 Span(pad_left(minutes, minutes_width) + " ", "inactive"))
 
-    lines.extend([(Span("Running", bold=True),), heading("", "used / grant")])
+    lines.append(heading())
     for row, pair in zip(running, running_names):
         used = row.used / gate.GIB
         grant = row.grant / gate.GIB
-        text = f" {used:.1f}" if row.measured else " unknown"
-        if row.grant:
-            text += f" / {grant:.1f}"
+        text = f" {grant:.1f} / {used:.1f}" if row.measured else f" {grant:.1f} / —"
+        bar = running_bar(used, grant, budget)
+        if bar_column + terminal_width(plain([bar])) + len(text) > columns:
+            text = f" {grant:.1f}"
+        bar = clip(bar, max(0, columns - bar_column - len(text)))
         minutes = str(age(row.started_at, explanation.now)) if row.started_at else "—"
-        marker = "▸" if selector and running_matches_selector(row.step, selector, model.labels) else " "
-        lines.append((*identity_columns("", row.step.step, pair, minutes, marker),
-                      *running_bar(used, grant, budget), Span(text)))
-    if not running:
-        lines.append((Span("   None.", "inactive"),))
-    lines.extend([(), (Span("Queued", bold=True),), heading("#", "need")])
+        lines.append((*identity_columns("run", row.step.step, pair, minutes,
+                                        "▸" if (you and row.step.session_id == you
+                                                or selector and running_matches_selector(row.step, selector, model.labels)) else " "), *bar, Span(text)))
     for index, (step, pair, bar) in enumerate(zip(waiting, waiting_names, bars)):
         row = (*identity_columns(str(index + 1), step.step, pair, str(age(step.since, explanation.now)),
                                 "▸" if you and step.session_id == you else " "),
                Span(bar, "warning"), Span(f" {step.need / gate.GIB:.1f}", "warning" if index == 0 else "inactive"))
         lines.append((*row, *status) if index == 0 else row)
-    ended = [step for step in model.reading.view.running
-             if isinstance(step.measured, gate.UnownedSliceMemory)
-             and isinstance(step.measured.activity, ScopeProcesses)
-             and not isinstance(step.measured.activity.run, LiveBuildRun)]
+    head = explanation.head
+    if isinstance(head, gate.HeadExplanation) and head.decision.state == "hold":
+        lines.append((Span(f"Head: free {head.free.available / gate.GIB:.1f} GiB; "
+            + f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need {head.free.need / gate.GIB:.1f} GiB"),))
+    ended: list[tuple[gate.RunningStep, gate.UnownedSliceMemory, ScopeProcesses]] = []
+    for step in model.reading.view.running:
+        if not isinstance(step.measured, gate.UnownedSliceMemory):
+            continue
+        activity = step.measured.activity
+        if model.ci_memory_slice and step.measured.owner == model.ci_memory_slice:
+            continue
+        if isinstance(activity, ScopeProcesses) and not isinstance(activity.run, LiveBuildRun):
+            ended.append((step, step.measured, activity))
     if ended:
-        count = sum(step.measured.activity.count for step in ended
-                    if isinstance(step.measured, gate.UnownedSliceMemory)
-                    and isinstance(step.measured.activity, ScopeProcesses))
-        total = sum(step.measured.bytes for step in ended if isinstance(step.measured, gate.UnownedSliceMemory))
-        lines.extend([(), (Span(f"Still running after their build ended ({count} {'process' if count == 1 else 'processes'}, "
-                                + f"{total / gate.GIB:.1f} GiB)", bold=True),)])
-        for step in ended:
-            if not isinstance(step.measured, gate.UnownedSliceMemory) or not isinstance(step.measured.activity, ScopeProcesses):
-                continue
-            activity = step.measured.activity
+        count = sum(activity.count for _, _, activity in ended)
+        total = sum(memory.bytes for _, memory, _ in ended)
+        noun = "process" if count == 1 else "processes"
+        lines.extend([(), (Span(f"Still running after their build ended ({count} {noun}, {total / gate.GIB:.1f} GiB)",
+                               bold=True),),
+                      (Span("These processes outlive their builds; ask the named owner to stop them if no longer needed."),)])
+        for step, memory, activity in ended:
             identity = model.labels.get(activity.session_id)
-            owner = identity.unit if identity and identity.unit != "—" else activity.session_id[:8] or "unknown owner"
-            kind = "test fixture · " if activity.test_fixture else ""
-            lines.append((Span(f"   {field(owner)}    {kind}{field(activity.program)} · "
-                               + started_ago(activity.started_at, explanation.now)),))
+            owner = field(identity.session if identity else "") or field(activity.session_name) or "unlabelled session"
+            elapsed = leftover_age(age(activity.started_at, explanation.now)) if activity.started_at else "—"
+            lines.append((Span(f"   {owner} · {field(activity.program)} · {elapsed} · {memory.bytes / gate.GIB:.1f} GiB"),))
     return [clip(line, columns) for line in lines]

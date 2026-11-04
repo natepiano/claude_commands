@@ -712,7 +712,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     if status == 5 and re.search(r"^Ran 0 tests in", captured, re.MULTILINE) and "NO TESTS RAN" in captured:
         status = 0
     if job.kind is GateJobKind.TYPE_CHECK:
-        status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
+        status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
     tripwire_tripped = bool(calls or readings)
     if tripwire_tripped:
         status = 1
@@ -1390,8 +1390,16 @@ def merge_checkpoint(args: GateArguments) -> int:
         if merged != baseline:
             write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
                               RecordedPush(baseline, merged, checkpoint))
-        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
-                            source="checkpoint", full=args.full)
+        previous_unit = os.environ.get(memory_admit.BUILDLOG_UNIT)
+        os.environ[memory_admit.BUILDLOG_UNIT] = args.unit
+        try:
+            suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
+                                source="checkpoint", full=args.full)
+        finally:
+            if previous_unit is None:
+                _ = os.environ.pop(memory_admit.BUILDLOG_UNIT, None)
+            else:
+                os.environ[memory_admit.BUILDLOG_UNIT] = previous_unit
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         fetch_branches(repo, "main")

@@ -74,7 +74,7 @@ def scope_docs(doc: Path, below: bool = False) -> list[Path]:
 
 def owners(doc: Path, below: bool = False) -> frozenset[str]:
     """The proposer names whose proposals are this production's: each production and its staff units."""
-    record = staff.snapshot()
+    record = staff.initial_snapshot()
     names: set[str] = set()
     for production in scope_docs(doc, below):
         names.add(slug_of(production))

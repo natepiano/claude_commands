@@ -161,6 +161,14 @@ The bootstrap saves the identified lifecycle settings in `/var/lib/aws-build/rem
 Both host configurations expose that file through `/etc/aws-build/remote.conf`.
 The remote service reads this separate file.
 Sender copies cannot disable its idle shutdown through natedev's `offload=off` setting.
+The sender copies every tracked file under `scripts/` and `config/`.
+This includes `config/build_folders.conf`, which the remote service and Linux runner need during import.
+A version refusal names each mismatched tool, both versions, and the file set by `version_pin_file`.
+Move the box pins in that file before you retry the step.
+The controller also stops a running box after `idle_stop_minutes` without published permission when no target claim remains.
+It saves the first unpublished time for each generation in `controller.json`.
+A successful publication or a new generation resets this timer.
+The stop reason is `unpublished_idle`.
 
 ## Private scaler credential file
 
@@ -397,23 +405,26 @@ Keep that timestamp across restart and redeployment.
 ## User-run routing and parity proof
 
 Use a small approved repository and package.
-Select AWS through normal admission and claims.
+Use `--target aws` to select AWS for one step.
+The step keeps the normal admission, spending, and version checks.
+The step never runs on natedev.
+One waiting pinned step gives the controller immediate work to start the box.
 Do not bypass permission or delete another slot's output.
 
 1. Record the configured shell selector and the selected repository slot.
 2. Confirm the reserved execution probe checks `rustc -V` inside that shell.
 3. Confirm it checks `cargo nextest --version` and `cargo mend --version` inside the same shell.
 4. Confirm it checks the tracked scripts commit.
-5. Run cold test, check, and staged doc commands through the normal route.
+5. Run pinned test, check, and staged doc commands.
 
 ```sh
-"$HOME/.claude/scripts/direct/verify.sh" test PACKAGE --no-cache
-"$HOME/.claude/scripts/direct/verify.sh" check PACKAGE
-"$HOME/.claude/scripts/direct/verify.sh" doc
+"$HOME/.claude/scripts/direct/verify.sh" test PACKAGE --target aws
+"$HOME/.claude/scripts/direct/verify.sh" check PACKAGE --target aws
+"$HOME/.claude/scripts/direct/verify.sh" doc --target aws
 ```
 
 6. Read each detached result before proceeding.
-7. Confirm `target=aws` and `host=aws-build` in the records.
+7. Confirm `target=aws`, `host=aws-build`, and `pinned=true` in the step records.
 8. Repeat the commands to test cached shell inputs and warm build output.
 9. Confirm staged doc uses the staged tree identity.
 10. Confirm no AWS result becomes natedev pass evidence.

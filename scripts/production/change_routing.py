@@ -232,7 +232,7 @@ class StaffRouting:
     def unrouted(self, review_list: Path, row: dict[str, str], note: str, producer: str) -> UnroutedChange:
         list_owner = self.list_owner(review_list)
         print(f"staff: {note[0].lower() + note[1:]} (change {list_owner}/{row['#']})", file=sys.stderr)
-        if not row.get("Verdict") and _is_real_list(review_list, self._configured_folder):
+        if not row.get("Verdict") and _is_real_list(review_list, self._configured_folder) and self.record.production:
             root = self._review_root
             if not waits_for_user(review_list, row, root):
                 return UnroutedChange(note + "; no message goes out")

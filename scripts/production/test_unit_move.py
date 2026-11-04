@@ -45,6 +45,12 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
         original = pane_record.launch("w7:p1", owner.current_session, str(old),
             {"CLAUDE_CONFIG_DIR": str(config)}, ["claude", "-n", "alpha", "--model", "opus"])
         client = FakeClient([{"pane_id": "w7:p1", "tab_id": "w7:t1", "workspace_id": "w7", "label": "alpha"}])
+        shell_pid = 998041
+        def close(*arguments: str) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(arguments, ("pane", "close", "w7:p1"))
+            FakeClient.close_tab_of(client, arguments[2])
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
         marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(),
                                       herdr.HerdrPlace("agents", "w7:p1"))
 
@@ -64,6 +70,8 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
             with (mock.patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
                   mock.patch.object(add_unit, "launch_session", side_effect=launch),
                   mock.patch.object(add_unit, "wait_for_remote_control", return_value=marked),
+                  client.empty_shell(shell_pid, old),
+                  mock.patch.object(client, "run", side_effect=close),
                   mock.patch.object(herdr, "Herdr", return_value=client)):
                 resumed = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", owner.current_session,
                                    "--cwd", str(old), "--model", "opus")
@@ -467,6 +475,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         with (mock.patch.object(herdr, "Herdr", client_type),
               mock.patch.object(herdr, "open_tab", return_value="w1:p1") as opened,
               mock.patch.object(client_type, "start_command", side_effect=start),
+              mock.patch.object(client_type, "panes", side_effect=backend.panes),
               mock.patch.object(client_type, "result", side_effect=backend.result)):
             launched = herdr.launch_prepared_agent("agents", herdr.NewTab("production", "kept-name"),
                 herdr.PreparedAgentEnvironment(self.old_folder, {"CODEX_HOME": str(backend.config)}),
