@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import html
+import json
 import os
+import re
+import subprocess
 import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -27,6 +31,121 @@ class ChartTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.moment_fixture(self)
         _ = cast(object, self.enterContext(mock.patch.object(record, "configured_targets", return_value=())))
+
+    def label_page(self) -> str:
+        events = tuple(moments.BuildMoment(fixtures.START+timedelta(hours=1, seconds=number*10),
+                                          f"Change {number}", "all") for number in range(4))
+        self.fixture.progress([
+            {"event_type": "phase_finished", "phase_instance_id": f"phase-{day}-{duration}",
+             "working_dir": "/r/hana", "timestamp_epoch": fixtures.START.timestamp()+day*86400+3600,
+             "phase_started_at": fixtures.START.timestamp()+day*86400+3600-duration}
+            for day in range(2) for duration in (1200, 2400)
+        ])
+        coverage = tuple(costs.IndexedSourceCoverage(machine, fixtures.START.timestamp(), fixtures.END.timestamp())
+                         for machine in ("natedev", "mac", "CI"))
+        with closing(self.fixture.connection(*[
+            fixtures.build(f"{machine}-{day}", day*86400+7200, target=machine,
+                           mem_wait_s=3600*(day+1) if machine == "natedev" else 0)
+            for machine in ("natedev", "mac", "CI") for day in range(2)
+        ])) as connection, mock.patch.object(moments, "MOMENTS", events), \
+             mock.patch.object(costs, "source_coverage", return_value=coverage):
+            series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
+        return charts.render_html(series)
+
+    def rendered_layout(self, page: str, probe: str, width: int) -> str:
+        path = self.fixture.fixture.root/"label-layout.html"
+        script = ("<script>const failures=[];"+probe+
+                  ";const result=document.createElement('pre');result.id='layout-result';"+
+                  "result.textContent=failures.length?failures.join('\\n'):'PASS';document.body.append(result);</script>")
+        _ = path.write_text(page+script)
+        result = subprocess.run([
+            "google-chrome", "--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
+            "--no-default-browser-check", "--virtual-time-budget=300", f"--window-size={width},4000",
+            "--dump-dom", path.as_uri(),
+        ], capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = re.search(r'<pre id="layout-result">(.*?)</pre>', result.stdout, re.S)
+        self.assertIsNotNone(match, "The browser did not complete the layout probe.")
+        assert match is not None
+        return html.unescape(match[1])
+
+    def machine_label_page(self, values: dict[str, tuple[float, ...]]) -> str:
+        setup = r"""
+const source=data.buckets[0],day=86400000;
+data.moments=[];data.machines=Object.keys(fixtureValues);
+data.end=data.start+Object.values(fixtureValues)[0].length*day;
+data.buckets=Object.values(fixtureValues)[0].map((_,i)=>({...structuredClone(source),
+ start:data.start+i*day,end:data.start+(i+1)*day,
+ label:new Date(data.start+i*day).toISOString().slice(0,10).replaceAll('-',''),
+ rows:Object.entries(fixtureValues).map(([machine,values])=>({machine,cause:data.causes[0],
+ daily:{state:'measured',value:values[i]},perPhase:{state:'measured',value:values[i]}}))}));
+redraw();
+"""
+        return self.label_page()+"<script>const fixtureValues="+json.dumps(values)+";"+setup+"</script>"
+
+    def test_rendered_close_endpoints_with_unequal_values_never_share_a_value_label(self) -> None:
+        page = self.machine_label_page({"natedev": (1000, 100, 100), "mac": (0, 1, 1), "CI": (0, 1.5, 1.5)})
+        # Keep the false group visible beside the higher natedev endpoint.
+        page = page.replace("</head>", "<style>svg .end-label{font-size:9px}</style></head>")
+        probe = r"""
+const svg=document.getElementById('machinePlot'),labels=[...svg.querySelectorAll('.end-label')];
+if(!labels.length)failures.push('Missing endpoint labels');
+for(const label of labels){const members=JSON.parse(label.dataset.members),values=members.map(name=>fixtureValues[name].at(-1));
+ if(values.some(value=>value!==values[0]))failures.push('Unequal values share a label: '+label.textContent)}
+for(const name of ['mac','CI'])if(!document.getElementById('machineLegend').textContent.includes(name))failures.push('Missing legend identity');
+if(!document.getElementById('machineTable').textContent.includes('1.5 h/day'))failures.push('The table lost the CI value');
+"""
+        for width in (1280, 500):
+            with self.subTest(width=width):
+                self.assertEqual(self.rendered_layout(page, probe, width), "PASS")
+
+    def test_rendered_gap_notes_yield_to_endpoint_labels_when_their_boxes_collide(self) -> None:
+        page = self.machine_label_page({"natedev": (4,)+(2,)*29, "mac": (1.6,)*30, "CI": (0,)*30})
+        probe = r"""
+const missing=data.buckets.at(-1).rows.find(row=>row.machine==='natedev');
+missing.daily={state:'unavailable',reason:'missing fixture coverage'};redraw();
+const svg=document.getElementById('machinePlot'),labels=[...svg.querySelectorAll('.end-label')];
+for(const name of ['natedev','mac'])if(!labels.some(label=>JSON.parse(label.dataset.members).includes(name)))failures.push('Missing endpoint label: '+name);
+const overlaps=(a,b)=>a.left<b.right&&a.right>b.left&&a.top<b.bottom&&a.bottom>b.top;
+for(const note of svg.querySelectorAll('.gap-label'))for(const label of labels)if(overlaps(note.getBoundingClientRect(),label.getBoundingClientRect()))failures.push('Gap note overlaps '+label.textContent);
+if(!document.getElementById('machineTable').textContent.includes('missing fixture coverage'))failures.push('The table lost the gap reason');
+"""
+        for width in (1280, 500):
+            with self.subTest(width=width):
+                self.assertEqual(self.rendered_layout(page, probe, width), "PASS")
+
+    def test_rendered_moment_numbers_have_a_band_clear_of_every_panel_title(self) -> None:
+        page = self.label_page()
+        probe = r"""
+const titles=[...document.querySelectorAll('.panel-title')],numbers=[...document.querySelectorAll('.moment-number')];
+if(titles.length!==6||numbers.length!==32)failures.push('Missing fixture titles or moment numbers');
+function overlaps(a,b){return a.left<b.right&&a.right>b.left&&a.top<b.bottom&&a.bottom>b.top}
+for(const number of numbers)for(const title of titles)if(overlaps(number.getBoundingClientRect(),title.getBoundingClientRect()))failures.push('Moment '+number.textContent+' overlaps '+title.textContent);
+for(const panel of document.querySelectorAll('.plot-panel')){const marks=[...panel.querySelectorAll('.moment-number')];for(let i=0;i<marks.length;i++)for(let j=i+1;j<marks.length;j++)if(overlaps(marks[i].getBoundingClientRect(),marks[j].getBoundingClientRect()))failures.push('Moment numbers overlap')}
+"""
+        for width in (1280, 500):
+            with self.subTest(width=width):
+                self.assertEqual(self.rendered_layout(page, probe, width), "PASS")
+
+    def test_rendered_end_labels_stay_nearest_their_series_and_group_equal_endpoints(self) -> None:
+        page = self.label_page()
+        probe = r"""
+for(const svg of document.querySelectorAll('#phase,#machinePlot')){
+ const ends=new Map();for(const mark of svg.querySelectorAll('.series-point'))ends.set(mark.dataset.series,mark);
+ const labels=[...svg.querySelectorAll('.end-label')];if(!ends.size||!labels.length)failures.push('Missing rendered endpoints or labels');
+ const distance=(label,point)=>Math.hypot(Number(label.getAttribute('x'))-Number(point.getAttribute('cx')),Number(label.getAttribute('y'))-Number(point.getAttribute('cy')));
+ for(const label of labels){const members=JSON.parse(label.dataset.members||'[]');if(!members.length)failures.push('Missing label identities');
+ for(const member of members){const own=ends.get(member);if(!own||!label.firstChild.textContent.includes(member)){failures.push('Missing visible member '+member);continue}const nearest=Math.min(...[...ends.values()].map(point=>distance(label,point)));if(distance(label,own)>nearest+.1)failures.push(member+' label is nearer another endpoint')}
+ }
+}
+const machine=document.getElementById('machinePlot'),group=[...machine.querySelectorAll('.end-label')].find(label=>label.firstChild.textContent==='mac, CI · 0');
+if(!group)failures.push('Equal zero endpoints need one named group');
+if(!machine.querySelector('.overlap-mark[data-series="mac"]')||!machine.querySelector('.overlap-mark[data-series="CI"]'))failures.push('An overlapping series has no visible mark');
+for(const mark of machine.querySelectorAll('.overlap-mark'))if(mark.getAttribute('stroke-width')!=='2')failures.push('Missing surface ring');
+"""
+        for width in (1280, 500):
+            with self.subTest(width=width):
+                self.assertEqual(self.rendered_layout(page, probe, width), "PASS")
 
     def test_passed_tree_pairs_cross_midnight_and_the_first_edge(self) -> None:
         records = [fixtures.build("context", -60, duration_s=120, session="same", tree_key="tree", target="natedev"),

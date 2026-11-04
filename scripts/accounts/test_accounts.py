@@ -5745,9 +5745,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
-             "the usage service is busy; this shows the reading from 01-02 05:29; no usage read has been attempted"),
+             "the usage service is busy; this shows the reading from 01-02 05:29; the attempt time is not recorded"),
             (agent_accounts.UsageReadOutcome.ERROR,
-             "the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"),
+             "the usage read failed; this shows the reading from 01-02 05:29; the attempt time is not recorded"),
         )
         for outcome, reason in cases:
             with self.subTest(outcome=outcome):
@@ -5829,7 +5829,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("01-02 05:29 PST*", output)
-        self.assertIn("the usage service is busy; this shows the reading from 01-02 05:29; no usage read has been attempted", output)
+        self.assertIn("the usage service is busy; this shows the reading from 01-02 05:29; the attempt time is not recorded", output)
         self.assertEqual(usage_store.store_file().read_bytes(), before)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
@@ -5847,7 +5847,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; the attempt time is not recorded"])
         self.assertEqual(usage_store.load()["idle@example.invalid"].get("weekly"), window)
         self.live_reads.assert_called_once_with(directory)
 
@@ -5870,7 +5870,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; the attempt time is not recorded"])
         self.live_reads.assert_not_called()
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
@@ -5904,7 +5904,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| codex1 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
-        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1 and try again; no usage read has been attempted", output)
+        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1 and try again; the attempt time is not recorded", output)
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1", row)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
@@ -7917,7 +7917,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
                 (now - timedelta(minutes=3), "last read attempted at 11:57"),
                 (now - timedelta(minutes=3, seconds=1), "last read attempted at 11:56"),
                 (read, "last read attempted at 10-16 10:58"),
-                (accounts.StatusUnavailable(), "no usage read has been attempted"),
+                (accounts.StatusUnavailable(), "the attempt time is not recorded"),
                 (now + timedelta(minutes=1), "last read attempted at 12:01"),
             )
             for attempted, step in cases:
@@ -8324,13 +8324,13 @@ class StatusProblemCauseTests(unittest.TestCase):
                     "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
                     "* codex1: usage unavailable; Codex did not start at ~/.codex1; " + previous
                         + "; run accounts.py setup codex1 and try again"
-                        + ("; no usage read has been attempted" if outcome == agent_accounts.UsageReadOutcome.ERROR else
+                        + ("; the attempt time is not recorded" if outcome == agent_accounts.UsageReadOutcome.ERROR else
                            "; start a session on it to check it" if outcome == agent_accounts.UsageReadOutcome.REFUSED_401 else ""),
                     "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 store codex1's login; two homes on one login break token refresh; keep each login in one home",
                 ]
                 if outcome != agent_accounts.UsageReadOutcome.OK:
                     expected.append("* codex1: usage unavailable; " + (
-                        "the usage read failed; " + previous + "; no usage read has been attempted"
+                        "the usage read failed; " + previous + "; the attempt time is not recorded"
                         if outcome == agent_accounts.UsageReadOutcome.ERROR else
                         "the usage service did not accept this login; start a session on it to check it"))
                 terminal = accounts.render_status_table(reading).splitlines()
@@ -8377,7 +8377,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         reading = self.status_with(statuses, [], usage_store.StoredUsage(
             read_outcome=agent_accounts.UsageReadOutcome.ERROR,
             attempt_outcome=agent_accounts.UsageReadOutcome.ERROR))
-        line = "* claude2: usage unavailable; the usage read failed; no reading is stored yet; no usage read has been attempted"
+        line = "* claude2: usage unavailable; the usage read failed; no reading is stored yet; the attempt time is not recorded"
         self.assertIn(line, reading.notes)
         self.assertIn(line, accounts.render_status_table(reading).splitlines())
         self.assertIn(line.removeprefix("* "), cast(accounts.StatusDocument,

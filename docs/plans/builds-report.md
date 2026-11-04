@@ -93,7 +93,7 @@ The build report is too long for the user and is not used for analysis. Retire i
 **Files:**
 - `scripts/lint/memory_admit.py` — the admission reader, with `queue_rows()` and `write_head_since()`
 - `scripts/lint/memory_gate.sh` — cargo-token left and back times
-- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_build_why.py` — both sides' tests
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_queue_evidence.py` — both sides' tests
 - `docs/as-built/build-memory-admission.md`, `docs/as-built/unit-board.md` — the merged as-built text
 
 ### Phase 1 — The build report compares build rates before and after each build moment  · status: done
@@ -238,15 +238,16 @@ The user, 2026-11-03: tables do not work for them. Lower priority. Design a char
 
 Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second largest cost. Find the cause before a fix. Query the index for cold steps: worktree, target folder, and the event before each (new clone, branch switch, toolchain or flag change, sweep deletion). Write the cause with counts and hours to `docs/plans/builds-report-rounds.md`, then send it to the showrunner, which names the owner. No code changes.
 
-### Phase 10 — Chart labels do not collide  · status: todo
+### Phase 10 — Chart labels do not collide  · status: done
 **Depends on:** Phase 8
 
-The fresh design check of the Phase 8 shots (dataviz label rules) found two defects on the `buildlog charts` page:
+#### As-built
 
-1. The moment numbers above each of the six cost panels sit on the panel title (for example "2 1" over "Memory wait · h/day"). Keep the numbers clear of every panel title, at desktop and phone width.
-2. Costs by machine: the mac and CI lines are both 0, so the CI line hides the mac line. The end labels move apart to avoid each other, so "mac" sits beside the natedev line end and "natedev" sits far above it. Each end label must sit beside its own line end, or the chart must name the series in another clear way; a line hidden under another must stay visible (dataviz: 2px surface ring on overlapping marks).
-
-Acceptance: new tests in `scripts/buildlog/test_charts.py` pin both rules (no moment number box overlaps a panel title box; each end label is nearest its own line end). Fresh shots at 1280 px light and dark and at 500 px, judged once more under the dataviz rules.
+- Moment numbers sit in their own rows below each panel title. Numbers closer than 26 px go to the next row, and the plot top moves down to make room.
+- End labels stay at their own line ends. Ends with the same bucket and value share one label, which names each series and the value.
+- A label that does not fit, or that sits on another series' end, is dropped; the legend names that series. Gap notes yield to end labels.
+- Coincident line segments alternate dashed strokes. A point shared by several series shows one sector per series.
+- `test_charts.py` pins both rules: no moment number box overlaps a panel title box, and each end label is nearest its own line end.
 
 **Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/test_charts.py`.
 
@@ -274,3 +275,7 @@ The user unit `buildlog.service` on natedev failed from 21:29 EST. The vault ste
 Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command_failed`. The next hourly `buildlog.service` run ends without failure.
 
 **Files:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.
+
+### Phase 13 — Buildlog tests import their own modules  · status: done
+
+Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHONPATH. test_costs subprocess tests fail with no module cli or costs; test_vault_pull fails to import conf. Each test sets its own import path.

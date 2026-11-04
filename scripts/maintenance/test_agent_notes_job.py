@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -15,6 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.maintenance import agent_notes_job as job
+from scripts.maintenance import vault_commit
 from scripts.maintenance.settings import Part, Schedule, settings
 
 
@@ -85,8 +85,9 @@ class JobTests(unittest.TestCase):
     def test_phase_notes_join_an_existing_commit_without_causing_note_only_commits(self) -> None:
         vault = self.init_vault()
         git = self.vault_git
-        hierarchy = vault / "hana hierarchy.md"
-        _ = hierarchy.write_text("date_modified: 1\noriginal hierarchy\n")
+        agent_note = vault / "agents/notes.md"
+        agent_note.parent.mkdir()
+        _ = agent_note.write_text("date_modified: 1\noriginal agent note\n")
         hand = vault / "hand.md"
         _ = hand.write_text("original hand note\n")
         old_note = vault / "showrunners/show/old-unit.md"
@@ -105,10 +106,10 @@ class JobTests(unittest.TestCase):
         with patch.object(Path, "home", return_value=self.root), patch("builtins.print"):
             self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(git("rev-parse", "HEAD"), original_head)
-            _ = hierarchy.write_text("date_modified: 2\noriginal hierarchy\n")
+            _ = agent_note.write_text("date_modified: 2\noriginal agent note\n")
             self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(git("rev-parse", "HEAD"), original_head)
-            _ = hierarchy.write_text("date_modified: 3\nchanged hierarchy\n")
+            _ = agent_note.write_text("date_modified: 3\nchanged agent note\n")
             self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
 
         self.assertEqual(git("rev-list", "--count", "HEAD"), "2")
@@ -121,8 +122,9 @@ class JobTests(unittest.TestCase):
         vault = self.init_vault()
         folder = vault / "showrunners/tools"
         folder.mkdir(parents=True)
-        hierarchy = vault / "hana hierarchy.md"
-        _ = hierarchy.write_text("original hierarchy\n")
+        agent_note = vault / "agents/notes.md"
+        agent_note.parent.mkdir()
+        _ = agent_note.write_text("original agent note\n")
         design = folder / "design.md"
         deleted = folder / "deleted-design.md"
         _ = design.write_text("original design\n")
@@ -140,7 +142,7 @@ class JobTests(unittest.TestCase):
         phase = folder / "unit.md"
         phase_text = '---\nphase_table: true\nproduction_file: "[[tools-production]]"\nunit: tools-unit\n---\n'
         _ = phase.write_text(phase_text)
-        _ = hierarchy.write_text("changed hierarchy\n")
+        _ = agent_note.write_text("changed agent note\n")
         with patch.object(Path, "home", return_value=self.root), patch("builtins.print"):
             self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
 
@@ -165,49 +167,16 @@ class JobTests(unittest.TestCase):
         self.assertEqual((bad.outcome, bad.exit_code), (job.Outcome.TIMED_OUT, 124))
         self.assertLess(bad.seconds, 2)
 
-    def test_preserved_note_is_a_logged_skip_and_does_not_fail_or_repeat_the_job(self) -> None:
-        script = self.root / "part.py"
-        _ = script.write_text(
-            "import os,sys\n"
-            + "if sys.argv[-1] == 'hierarchy':\n"
-            + " print('hana hierarchy: left as it stands: no unit director')\n"
-            + " sys.exit(os.EX_TEMPFAIL)\n")
-        with patch.object(job, "__file__", str(script)), patch("sys.argv", ["agent-notes"]):
-            with patch("builtins.print") as output:
-                self.assertEqual(job.main(), 0)
-            lines = [str(cast(object, call.args[0])) for call in output.call_args_list]
-            self.assertTrue(any(line.startswith("hierarchy: skipped;") for line in lines))
-            self.assertIn("hana hierarchy: left as it stands: no unit director", lines)
-            with patch.object(job, "run_part") as run:
-                self.assertTrue(all(item.outcome is job.Outcome.NOT_DUE for item in job.run_job()))
-            run.assert_not_called()
-
-    def test_hierarchy_refusal_uses_the_skip_protocol_without_changing_the_note(self) -> None:
-        from scripts.maintenance import hana_hierarchy
-
-        with patch.object(hana_hierarchy, "gather", side_effect=hana_hierarchy.Refused("no directors")), \
-                patch("builtins.print") as output:
-            self.assertEqual(job._perform(Part.HIERARCHY), os.EX_TEMPFAIL)  # pyright: ignore[reportPrivateUsage]
-        output.assert_called_once_with("hana hierarchy: left as it stands: no directors", file=sys.stderr)
-
-    def test_hierarchy_source_command_failure_is_not_a_skip(self) -> None:
-        from dataclasses import replace
-        from scripts.maintenance import hana_hierarchy
-
-        script = self.root / "source.py"
-        for source in ("raise SystemExit(2)\n", "import signal; signal.pause()\n"):
-            with self.subTest(source=source):
-                _ = script.write_text(source)
-                with patch.object(hana_hierarchy, "ROSTER", str(script)), \
-                        patch.object(hana_hierarchy, "settings", return_value=replace(settings(), hierarchy_read_seconds=0.1)), \
-                        patch("builtins.print"):
-                    self.assertEqual(job._perform(Part.HIERARCHY), 1)  # pyright: ignore[reportPrivateUsage]
-
     def test_unexpected_part_exits_still_fail_the_job(self) -> None:
         script = self.root / "part.py"
         _ = script.write_text("raise SystemExit(2)\n")
         with patch.object(job, "__file__", str(script)), patch("sys.argv", ["agent-notes"]), patch("builtins.print"):
             self.assertEqual(job.main(), 1)
+
+    def test_a_vault_without_note_paths_succeeds(self) -> None:
+        with patch.object(Path, "home", return_value=self.root), patch.object(
+                vault_commit, "git", return_value=subprocess.CompletedProcess[str]([], 0, stdout="")):
+            self.assertEqual(job.perform(Part.VAULT), 0)
 
     def test_runtime_configuration_controls_each_parts_interval_and_deadline(self) -> None:
         original = self.config.read_text()
