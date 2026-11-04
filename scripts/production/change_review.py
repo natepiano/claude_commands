@@ -561,14 +561,11 @@ def _sort(path: Path, lines: list[str]) -> None:
 
 def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day: date, merged: str, production: Path,
                 rank: str = "", owners: Sequence[Path] = (),
-                producers: Sequence[staff.StaffId | UnknownProducer] = ()) -> list[str]:
-    """Add the changes to To review and return the written rows.
+                producers: Sequence[staff.StaffId | UnknownProducer] = (), *,
+                record: staff.StaffSnapshot) -> list[str]:
+    """Add changes to To review with fixed staff IDs from record.
 
-    `merged` holds the merge hash or an empty string.
-    `rank` holds the Urgency cell or an empty string for a normal row.
-    `owners` supplies each Production document; otherwise the rows use `production`.
-    `producers` supplies each fixed staff id; otherwise Producer stays empty.
-    The Mac build column receives a value only when it exists.
+    owners supplies production documents; producers supplies fixed staff IDs for plain Visible changes.
     """
     if not changes:
         return []
@@ -578,7 +575,6 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
     row_producers = [change.producer if isinstance(change, PublicationChange)
                      else producers[index] if producers else UnknownProducer() for index, change in enumerate(changes)]
 
-    record = staff.initial_snapshot()
     identities = [str(producer) if isinstance(producer, str) else row_production(owner, record)
                   for owner, producer in zip(row_owners, row_producers)]
 
@@ -792,13 +788,12 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
 
 def row_production(production: Path, record: staff.StaffSnapshot) -> str:
     """Read the fixed showrunner id for a production-owned change."""
-    owner = record.by_doc(remote.local_machine(), credited(production))
+    owner = record.by_doc(remote.local_machine(), credited(production, record))
     return str(owner.id) if owner is not None else slug_of(production)
 
 
-def credited(production: Path) -> Path:
+def credited(production: Path, record: staff.StaffSnapshot) -> Path:
     """Credit a style production to its staff parent. Other productions keep their own credit."""
-    record = staff.initial_snapshot()
     row = record.by_doc(remote.local_machine(), production)
     while row is not None and row.parent is not None:
         try:
@@ -835,12 +830,17 @@ class UnitSource:
 
 def unit_branches(docs: Iterable[Path]) -> dict[str, UnitSource]:
     """Resolve exact branch names before plan, unit and folder aliases."""
+    return _unit_branches(docs, _branch_snapshot())
+
+
+def _branch_snapshot() -> staff.StaffSnapshot:
+    """Return the staff snapshot used to resolve branches."""
     try:
         record = staff.snapshot()
     except staff.StaffUnreadable as error:
         print(f"change review: {error}", file=sys.stderr)
         record = staff.StaffSnapshot(())
-    return _unit_branches(docs, record)
+    return record
 
 
 def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot) -> dict[str, UnitSource]:
@@ -904,9 +904,8 @@ def producer_for(source: UnitSource, record: staff.StaffSnapshot, machine: str) 
     return member.id if member.worktree.machine == machine else UnknownProducer()
 
 
-def producer_at(directory: Path) -> staff.StaffId | UnknownProducer:
+def producer_at(directory: Path, record: staff.StaffSnapshot) -> staff.StaffId | UnknownProducer:
     """Read the fixed id of the unit that owns the requested directory."""
-    record = staff.snapshot()
     machine = remote.local_machine()
     member = record.unit_by_worktree(machine, directory) or record.by_worktree(machine, directory)
     return member.id if member is not None and member.kind == "unit" else UnknownProducer()
@@ -970,7 +969,8 @@ class Tree:
 
     def __init__(self, docs: Iterable[Path]) -> None:
         self.docs: list[Path] = list(dict.fromkeys(docs))
-        self.branches: dict[str, UnitSource] = unit_branches(self.docs)
+        self.record: staff.StaffSnapshot = _branch_snapshot()
+        self.branches: dict[str, UnitSource] = _unit_branches(self.docs, self.record)
         self.repos: list[Path] = []
         self.targets: dict[tuple[Path, str], Path] = {}
         self._chains: dict[tuple[Path, str], set[str]] = {}
@@ -1086,13 +1086,12 @@ def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[
     filled: dict[str, str] = {}
     untraced: dict[str, str] = {}
     owners: dict[str, Path] = {}
-    record = staff.snapshot()
     for row in pending(path):
         if row.get(PRODUCTION, "").strip():
             continue
         found = trace(row, tree)
         if isinstance(found, Path):
-            filled[row["#"]], owners[row["#"]] = row_production(found, record), found
+            filled[row["#"]], owners[row["#"]] = row_production(found, tree.record), found
         else:
             untraced[row["#"]] = found
     if not write or not filled:
@@ -1564,8 +1563,9 @@ def _run(options: CommandLine) -> int:
         case "add":
             item, rank = _visible(options), _rank_option(options)
             path = _list(options)
+            record = staff.snapshot()
             rows = append_rows(path, [item], today(), options.merged.strip(), production_doc(options.production), rank,
-                               producers=[producer_at(Path(options.repo).expanduser().resolve())])
+                               producers=[producer_at(Path(options.repo).expanduser().resolve(), record)], record=record)
             row = row_id(rows[0])
             print(row)
             for line in hold_for_row(path, row, options.hold or []):
@@ -1639,8 +1639,9 @@ def _run(options: CommandLine) -> int:
                 print("\n".join(refused) if refused else f"{len(commits)} commit(s) carry their {TRAILER} lines")
                 return 1 if refused else 0
             production = production_doc(options.production)
-            rows = append_rows(_list(options), publication_changes(commits, production), today(), options.merged,
-                               production)
+            record = staff.snapshot()
+            rows = append_rows(_list(options), publication_changes(commits, production, record=record),
+                               today(), options.merged, production, record=record)
             print("\n".join(rows) if rows else "no visible change to add")
     return 0
 

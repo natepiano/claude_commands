@@ -211,7 +211,7 @@ class NextItemTests(unittest.TestCase):
                          "no efficiency is waiting for you\n")
         path = self.root / "change-review" / "change-review - natedev.md"
         _ = change_review.append_rows(path, [Visible("Panels keep shields", "Run `hana`", "Each panel has its shield")],
-                                      date(2026, 10, 15), "", PRODUCTION)
+                                      date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())
         def the_list(production: str) -> Path:
             del production
             return path
@@ -235,15 +235,16 @@ class NextItemTests(unittest.TestCase):
             _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug}-item gain — proposed\n")
             _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n"
                                + f"- **Proposals:** {issues_folder}\n")
+            owner = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", doc))
             _ = (issues_folder / f"{slug}-item.md").write_text(
-                f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {slug}\ndate_created: 2026-10-01\n---\n")
+                f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {owner.id}\ndate_created: 2026-10-01\n---\n")
             _ = (outstanding / f"{slug}.json").write_text(f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')
         path = self.root / "change-review" / "change-review - natedev.md"
         # The side production is a root of its own, with its own list.
         side_list = path.with_name("change-review - side.md")
         for slug in (*slugs, "gone"):
             _ = change_review.append_rows(side_list if slug == "side" else path, [Visible(f"{slug}-item change", "Run it", "It works")], date(2026, 10, 15),
-                                          "", plans / f"{slug}-production.md")
+                                          "", plans / f"{slug}-production.md", record=staff.snapshot())
         # A row written before the Production column belongs to the list's root.
         _ = path.write_text(path.read_text(encoding="utf-8").replace(" gone |", "  |"), encoding="utf-8")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -309,7 +310,7 @@ class NextItemTests(unittest.TestCase):
     def test_a_child_with_no_change_review_line_reads_its_roots_list(self) -> None:
         path = self.root / "change-review - top.md"
         _ = change_review.append_rows(path, [Visible("kid change", "Run it", "It works")], date(2026, 10, 15), "",
-                                      self.root / "kid-production.md")
+                                      self.root / "kid-production.md", record=staff.snapshot())
         top, kid = self.root / "top-production.md", self.root / "kid-production.md"
 
         def the_list(production: str) -> Path:

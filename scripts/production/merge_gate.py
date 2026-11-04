@@ -60,7 +60,7 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.lib import build_folders
-from scripts.production import change_review  # noqa: E402
+from scripts.production import change_review, staff  # noqa: E402
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
@@ -1529,7 +1529,7 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
     """Add a row per visible change to the list, then name any landed merge still missing its rows."""
     merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
     try:
-        rows = change_review.append_rows(review_list, changes, change_review.today(), merged, production)
+        rows = change_review.append_rows(review_list, changes, change_review.today(), merged, production, record=staff.snapshot())
         drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED,
                                       change_review.foreign_units(production))
     except (change_review.ChangeReviewError, OSError) as error:

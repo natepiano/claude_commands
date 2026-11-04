@@ -562,6 +562,7 @@ def record_publication_changes(production: Production, commits: list[change_revi
     merged = good(git(production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
         # A stop after the list write but before the receipt must not add it twice.
+        record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
         publication = (changes.changes if isinstance(changes, ChangesReadBeforePush)
                        else change_review.publication_changes(commits, production.doc, record=record))
         existing = change_review.pending(doc) if doc.exists() else []
@@ -569,7 +570,7 @@ def record_publication_changes(production: Production, commits: list[change_revi
                 if any(sha.startswith(merged) or merged.startswith(sha)
                        for sha in cast(list[str], change_review._HASH.findall(row.get("Merged", ""))))}  # pyright: ignore[reportPrivateUsage]
         rows = [] if publication and all(change.item.change in held for change in publication) else change_review.append_rows(
-            doc, publication, datetime.now(production.zone).date(), merged, production.doc)
+            doc, publication, datetime.now(production.zone).date(), merged, production.doc, record=record)
         done.parent.mkdir(parents=True, exist_ok=True)
         done.touch()
         drifted = change_review.drift(production.checkout, production.merge_branch,

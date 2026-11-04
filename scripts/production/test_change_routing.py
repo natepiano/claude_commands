@@ -319,7 +319,7 @@ class StaffRoutingTests(unittest.TestCase):
         _ = staff.rename(self.unit.id, "renamed")
         _ = change_review.append_rows(listing, [change_review.Visible(f"Change {i}", "Read", "Proof") for i in range(5)],
             date(2026, 11, 2), "", docs["top"],
-            producers=[self.unit.id, change_review.UnknownProducer(), staff.StaffId(fixture_runtime_id("missing-producer")), retired.id, self.child.id])
+            producers=[self.unit.id, change_review.UnknownProducer(), staff.StaffId(fixture_runtime_id("missing-producer")), retired.id, self.child.id], record=staff.snapshot())
         with (mock.patch.object(change_review, "lists_directory", return_value=self.root), mock.patch.object(cli_review, "lists_directory", return_value=self.root),
               mock.patch.object(showrunners, "timer_docs", return_value=docs)):
             prepared = change_browser.prepare(change_page.ReviewBrowser("secret"), change_page.DeliveryStatus(self.root / "links"))
@@ -391,7 +391,7 @@ class StaffRoutingTests(unittest.TestCase):
                 docs = {name: root / f"{name}-production.md" for name in ("natedev", "builds")}
                 producer_rows(root, docs, {listing: "natedev"})
                 written = change_review.append_rows(listing, [change_review.Visible("Unknown AWS change", "Read", "Proof")],
-                                               date(2026, 11, 2), "e41fa2a4", docs["builds"])
+                                               date(2026, 11, 2), "e41fa2a4", docs["builds"], record=staff.snapshot())
                 _ = listing.write_text(listing.read_text().replace("| C2 |", "| C777 |"))
                 runner = staff.snapshot().by_path("builds")
                 parent = staff.snapshot().by_path("natedev")

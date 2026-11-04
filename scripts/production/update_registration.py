@@ -29,7 +29,7 @@ from merge_checkpoint import NoMerge, merge_branch_history, report
 
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup, unit_names
 from scripts.production.session_labels import StaffLabels
-from proposals_folder import ProposalsFolder, ProposalsUnavailable, issues_folder, slug_of
+from proposals_folder import issues_folder, slug_of
 from issues import Issue, frontmatter
 import urgency
 from urgency import Urgency, UrgencyError
@@ -811,10 +811,8 @@ def question_folder(document: Path, identities: QuestionStaff) -> QuestionFolder
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
     folder = issues_folder(owner.doc.path)
-    if isinstance(folder, ProposalsUnavailable):
-        raise OSError(f"{folder.document}: {folder.reason}")
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-    return QuestionFolder(folder.path if isinstance(folder, ProposalsFolder) else root / owner.id / "questions", owner.id)
+    return QuestionFolder(folder if folder is not None else root / owner.id / "questions", owner.id)
 
 
 @dataclass(frozen=True)

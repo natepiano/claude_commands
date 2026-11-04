@@ -246,7 +246,7 @@ class ChangePageTests(unittest.TestCase):
                                    worktree=staff.PresentWorktree("natedev", Path("/unused/feature")))
         _ = change_review.append_rows(self.review_list, [item, item, change_review.Visible(
             "Internal comments clarified", "Read the diff", "The old and new comments agree with the tests")],
-            date(2026, 11, 1), merged, self.production, producers=[self.unit.id] * 3)
+            date(2026, 11, 1), merged, self.production, producers=[self.unit.id] * 3, record=staff.snapshot())
         for row, kind in (("C1", "See in action"), ("C2", "See in action"), ("C3", "Read only")):
             _ = change_review.set_row_kind(self.review_list, row, kind, self.production)
         self.page_path = urlsplit(change_page.publish(self.production, self.review_list, ["C1", "C3"])).path
@@ -625,7 +625,7 @@ class ChangePageTests(unittest.TestCase):
         _ = self.enterContext(production_staff_record())
         _ = self.enterContext(patch.object(change_routing, "configured_lists_directory", return_value=self.temporary))
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Conflict", "Read", "Proof")],
-                                      date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")])
+                                      date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")], record=staff.snapshot())
         config = self.temporary / "config/review_links.conf"
         _ = config.write_text(config.read_text().replace("unrouted_alert_retry_seconds=60", ""))
         path = urlsplit(change_page.publish_browser()).path
@@ -966,7 +966,7 @@ class ChangePageTests(unittest.TestCase):
         other = self.temporary / "change-review - another.md"
         owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc("natedev", self.production))
         _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read the proof", "It agrees")],
-                                      date(2026, 11, 2), "", self.production, producers=[owner.id])
+                                      date(2026, 11, 2), "", self.production, producers=[owner.id], record=staff.snapshot())
         path = urlsplit(change_browser.publish()).path
         with patch.object(change_review, "read", wraps=change_review.read) as reads:
             reply = self.request(path, {})
@@ -1026,7 +1026,7 @@ class ChangePageTests(unittest.TestCase):
         other = self.temporary / "change-review - zeta.md"
         owner = fixture_member("showrunner", name="zeta", doc=staff.LiveDoc("natedev", self.production))
         _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read", "Proof")],
-                                      date(2026, 11, 2), "", self.production, producers=[owner.id])
+                                      date(2026, 11, 2), "", self.production, producers=[owner.id], record=staff.snapshot())
         path, forms, body = self.browser()
         browser = change_browser.page_at(self.root, path)
         prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
@@ -1037,7 +1037,7 @@ class ChangePageTests(unittest.TestCase):
     def test_sent_validation_and_question_tabs_sort_after_waiting_tabs(self) -> None:
         other = self.temporary / "change-review - alpha.md"
         _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read", "Proof")],
-                                      date(2026, 11, 2), "", self.production)
+                                      date(2026, 11, 2), "", self.production, record=staff.snapshot())
         page = change_page.ReviewPage(other, self.production, ("C1",), "")
         status = change_page.DeliveryStatus(self.root)
         for kind in ("validation", "question"):
@@ -1085,7 +1085,7 @@ class ChangePageTests(unittest.TestCase):
     def test_an_unrouted_row_refuses_a_question_without_saving_and_still_accepts_a_verdict(self) -> None:
         assert self.unit.parent is not None
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown", "Read", "Proof")],
-                                      date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")])
+                                      date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")], record=staff.snapshot())
         path, forms, body = self.browser()
         del body
         self.assertEqual(forms.tabs["page-owner/C4"], "unrouted")
@@ -1148,7 +1148,7 @@ class ChangePageTests(unittest.TestCase):
         _ = foreign.write_text(self.production.read_text())
         _ = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", foreign))
         written = change_review.append_rows(self.review_list, [change_review.Visible("Unknown unit", "Read", "Proof")],
-                                      date(2026, 11, 2), "abcdef12", foreign)
+                                      date(2026, 11, 2), "abcdef12", foreign, record=staff.snapshot())
         owner = staff.snapshot().by_path("sdlc")
         assert owner is not None
         _ = self.review_list.write_text(self.review_list.read_text().replace(
@@ -1194,9 +1194,9 @@ class ChangePageTests(unittest.TestCase):
         earlier = self.temporary / "change-review - earlier.md"
         _ = change_review.append_rows(earlier, [change_review.Visible("First", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", self.production,
-                                      urgency.cell(urgency.read(), "C2"), producers=[self.unit.id])
+                                      urgency.cell(urgency.read(), "C2"), producers=[self.unit.id], record=staff.snapshot())
         _ = change_review.append_rows(earlier, [change_review.Visible("Second", "Read", "Proof")],
-                                      date(2026, 11, 2), "abcdef12", self.production, producers=[self.unit.id])
+                                      date(2026, 11, 2), "abcdef12", self.production, producers=[self.unit.id], record=staff.snapshot())
         path, forms, body = self.browser()
         del body
         keys = list(forms.rows)
@@ -1222,7 +1222,7 @@ class ChangePageTests(unittest.TestCase):
         _ = change_review.append_rows(self.review_list,
                                       [change_review.Visible("First mixed change", "Read", "First proof"),
                                        change_review.Visible("Second mixed change", "Read", "Second proof")],
-                                      date(2026, 11, 2), "abcdef12", self.production, producers=[self.unit.id, second_unit.id])
+                                      date(2026, 11, 2), "abcdef12", self.production, producers=[self.unit.id, second_unit.id], record=staff.snapshot())
         path, forms, body = self.browser()
         del path, body
         self.assertEqual(forms.tabs["page-owner/C4"], "sdlc")
@@ -1888,7 +1888,7 @@ class ChangePageTests(unittest.TestCase):
         demo = fixture_member("showrunner", name="demo")
         _ = staff.set_doc(demo.id, staff.LiveDoc("natedev", self.production))
         _ = change_review.append_rows(earlier, [change_review.Visible("Earlier change", "Run it", "Proof")],
-                                      date(2026, 11, 1), "", self.production, producers=[demo.id])
+                                      date(2026, 11, 1), "", self.production, producers=[demo.id], record=staff.snapshot())
         _ = change_review.set_row_kind(earlier, "C1", "Read only", self.production)
         path = urlsplit(change_page.publish(self.production, earlier, ["C1"])).path
         page = change_page.page_at(self.root, path)
@@ -1957,7 +1957,7 @@ class ChangePageTests(unittest.TestCase):
         # C3 has no matching trailer. Its merge names one unit, which receives the answer.
         self.messages.clear()
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Local docs", "Read", "Proof")],
-                                      date(2026, 11, 1), "", self.production)
+                                      date(2026, 11, 1), "", self.production, record=staff.snapshot())
         _ = change_review.set_row_kind(self.review_list, "C4", "Read only", self.production)
         path = urlsplit(change_page.publish(self.production, self.review_list, ["C4"])).path
         page = change_page.page_at(self.root, path)
@@ -2134,7 +2134,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_a_producer_id_routes_feedback_to_its_unit(self) -> None:
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Direct checkpoint", "Run", "Proof")],
-                                      date(2026, 11, 1), "abcdef12", self.production, producers=[self.unit.id])
+                                      date(2026, 11, 1), "abcdef12", self.production, producers=[self.unit.id], record=staff.snapshot())
         _ = change_review.set_row_kind(self.review_list, "C4", "See in action", self.production)
         path = urlsplit(change_page.publish(self.production, self.review_list, ["C4"])).path
         page = change_page.page_at(self.root, path)
@@ -2163,7 +2163,7 @@ class ChangePageTests(unittest.TestCase):
             self.fail("the list showrunner must have a staff record")
         sibling_unit = fixture_member("unit", name="sibling-production-unit", parent=owner.id)
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Sibling change", "Run", "Proof")],
-                                      date(2026, 11, 1), "abcdef12", sibling, producers=[sibling_unit.id])
+                                      date(2026, 11, 1), "abcdef12", sibling, producers=[sibling_unit.id], record=staff.snapshot())
         _ = change_review.set_row_kind(self.review_list, "C4", "Read only", child)
         path = urlsplit(change_page.publish(child, self.review_list, ["C4"])).path
         page = change_page.page_at(self.root, path)
@@ -2172,7 +2172,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_an_unknown_production_is_refused_before_saving(self) -> None:
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown owner", "Run", "Proof")],
-                                      date(2026, 11, 1), "", self.temporary / "missing-production.md")
+                                      date(2026, 11, 1), "", self.temporary / "missing-production.md", record=staff.snapshot())
         _ = change_review.set_row_kind(self.review_list, "C4", "Read only", self.production)
         path = urlsplit(change_page.publish(self.production, self.review_list, ["C4"])).path
         page = change_page.page_at(self.root, path)
