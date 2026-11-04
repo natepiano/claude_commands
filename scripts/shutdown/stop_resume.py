@@ -14,7 +14,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import StringIO
 from importlib import import_module
 from threading import Event
@@ -56,6 +56,7 @@ class RowStarter(Protocol):
 
 STOP_GRACE_SECONDS = 2.0
 KILL_GRACE_SECONDS = 5.0
+CODEX_RELEASE_SECONDS = 65.0
 START_SECONDS = 20.0
 STAY_SECONDS = 10.0
 
@@ -144,6 +145,28 @@ def _retire_prompt(session_id: str) -> None:
         print(f"{session_id}: prompt cancellation: {error}", file=sys.stderr)
 
 
+def _stopped(identity: str, pid: int, kind: str) -> Stopped:
+    """Wait for every Codex host to release the thread after the TUI exits."""
+    if kind == "codex":
+        try:
+            deadline = monotonic() + CODEX_RELEASE_SECONDS
+            while True:
+                try:
+                    with redirect_stderr(StringIO()) as errors:
+                        threads = herdr.running_codex_threads(thread_host=lambda _arguments: False)
+                    if identity not in threads and not errors.getvalue():
+                        break
+                except (OSError, ValueError, herdr.HerdrFailure):
+                    pass
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Codex rollout is still held or unreadable after stop")
+                _ = Event().wait(min(0.5, remaining))
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            print(f"{identity}: stop release anomaly: {error}", file=sys.stderr)
+    return Stopped(identity, pid)
+
+
 def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
     """Signal only the process that proves the current conversation."""
     identity = session
@@ -194,7 +217,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
                 break
             _ = Event().wait(min(0.1, remaining))
         else:
-            return Stopped(identity, live.pid)
+            return _stopped(identity, live.pid, kind)
         if _same_process(live.pid, started):
             if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
                 return StopFailed(identity, "process identity changed; no signal sent")
@@ -205,7 +228,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
                 if remaining <= 0:
                     return StopFailed(identity, f"pid {live.pid} is still running after SIGKILL")
                 _ = Event().wait(min(0.1, remaining))
-        return Stopped(identity, live.pid)
+        return _stopped(identity, live.pid, kind)
     except ProcessLookupError:
         return NotRunning(identity)
     except (OSError, ValueError, herdr.HerdrFailure) as error:

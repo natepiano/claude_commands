@@ -922,6 +922,39 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
         self.assertEqual(native.call_args_list, [call(123, "codex", resume_id=identity)] * 4)
 
+    def test_codex_stop_waits_for_rollout_release_with_a_bound_and_no_refusal(self) -> None:
+        identity = self.entry["session_id"]
+        for killed in (False, True):
+            for release in ("released", "race", "unknown", "held", "unreadable"):
+                with self.subTest(killed=killed, release=release):
+                    self.clock.elapsed = 0.0
+                    self.kill.reset_mock()
+                    self.process.side_effect = (self.alive_until_kill if killed else
+                        [sessions.LiveSessionProcess(123), sessions.SessionNotLive()])
+                    reads: list[float] = []
+                    def threads(*, thread_host: Callable[[list[str]], bool]) -> set[str]:
+                        self.assertFalse(thread_host(["codex", "app-server"]))
+                        reads.append(self.clock.elapsed)
+                        if release == "race" and len(reads) == 1:
+                            raise ProcessLookupError("process ended during scan")
+                        if release == "unreadable":
+                            raise OSError("rollout unreadable")
+                        if release == "unknown" and len(reads) < 3:
+                            print("anomaly: Codex thread unknown", file=sys.stderr)
+                            return set()
+                        return set() if release in ("released", "race", "unknown") and len(reads) == 3 else {identity}
+                    with (patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))),
+                          patch.object(self.client, "codex_launch", return_value={"pid": 123}),
+                          patch.object(herdr, "running_codex_threads", side_effect=threads),
+                          patch.object(stop_resume, "CODEX_RELEASE_SECONDS", 1.0),
+                          redirect_stderr(io.StringIO()) as errors):
+                        self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped(identity, 123))
+                    self.assertTrue(reads)
+                    self.assertEqual(len(errors.getvalue().splitlines()), 0 if release in ("released", "race", "unknown") else 1)
+                    self.assertEqual(self.clock.elapsed, (stop_resume.STOP_GRACE_SECONDS if killed else 0)
+                                     + 1.0)
+                    self.assertEqual({invocation.args[0] for invocation in self.kill.call_args_list}, {123})
+
     def test_registry_removal_does_not_resume_until_the_saved_process_exits(self) -> None:
         self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),
                                  sessions.SessionNotLive(), sessions.SessionNotLive()]
