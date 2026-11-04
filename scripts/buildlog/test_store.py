@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import os
 import tempfile
@@ -142,6 +143,25 @@ class StoreTests(unittest.TestCase):
         store.append_line(path, {"id": "next"})
 
         self.assertEqual(path.read_bytes(), prefix + b'{"id":"next"}\n')
+
+    def test_whole_rows_uses_block_reads_on_an_unbuffered_handle(self) -> None:
+        path = self.root / "history.jsonl"
+        rows = [{"id": index, "text": "Δ" * 80} for index in range(2000)]
+        path.parent.mkdir(parents=True)
+        _ = path.write_bytes(b"".join((json.dumps(row) + "\n").encode() for row in rows))
+
+        class CountingReader(io.FileIO):
+            reads: int = 0
+
+            @override
+            def read(self, size: int | None = -1) -> bytes:
+                self.reads += 1
+                return super().read(size)
+
+        with CountingReader(path, "r") as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)
+            self.assertEqual(list(store.whole_rows(handle, 0)), rows)
+            self.assertLessEqual(handle.reads, 2, "the reader must not read once per byte or row")
 
     def test_short_reads_during_tail_repair_preserve_whole_rows(self) -> None:
         path = self.root / "natedev" / "2026-10.jsonl"

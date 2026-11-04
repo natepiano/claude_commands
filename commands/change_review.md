@@ -4,6 +4,21 @@ description: Add a change for the user to check to the top-level showrunner's ch
 
 # Change review
 
+## Bare command
+
+For `/change_review` with no action:
+
+1. Run the page script:
+
+   ```sh
+   "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py"
+   ```
+
+2. Check the printed link with `curl` on the publishing machine.
+3. Give the user only the link, then stop. Say nothing else.
+
+The actions below remain for unit directors and showrunners.
+
 Each top-level showrunner keeps one list of changes waiting for the user's
 check, named for it: `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
 such as `change-review - natedev.md`. A child production's rows go to its
@@ -83,14 +98,7 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 
 ## show
 
-When the user asks to review changes, open the prepared page:
-
-```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py"
-```
-
-1. Check the printed link with `curl` on the publishing machine.
-2. Give the link to the user.
+When the user asks to review changes, follow [Bare command](#bare-command).
 
 The page contains every waiting change, with staff-based showrunner tabs.
 Each row stores its producer's fixed staff id in the Producer cell.
@@ -130,6 +138,7 @@ Recovery skips records that a live request owns.
 It ignores legacy failed records and preserves validation ownership and open questions.
 The router alerts `unrouted_alert_recipient` once for each unrouted row and reason.
 It alerts only for a list in the real change-review folder; a list elsewhere never alerts.
+It alerts only from the production staff record; a `STAFF_FILE` override never alerts.
 This config key starts at `natedev`.
 `unrouted_alert_retry_seconds` starts at 60 seconds and accepts 5 through 3600 seconds.
 Both keys are in `config/review_links.conf` and are read when used.

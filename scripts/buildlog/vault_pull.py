@@ -77,6 +77,10 @@ class VaultCommandFailed:
 PullStop = TrackedFilesChanged | NotOnMain | HistoryDiverged | UntrackedWouldBeOverwritten | MacUnreachable | VaultLocked | VaultCommandFailed
 PullOutcome = Pulled | Current | PullStop
 StopCause = Literal["tracked_files_changed", "not_on_main", "history_diverged", "untracked_would_be_overwritten", "mac_unreachable", "vault_locked", "command_failed"]
+USER_ACTION_STOP_CAUSES: frozenset[StopCause] = frozenset({
+    "tracked_files_changed", "not_on_main", "history_diverged",
+    "untracked_would_be_overwritten", "vault_locked",
+})
 
 
 @dataclass(frozen=True)
@@ -293,6 +297,7 @@ def _vault_locked() -> int:
         sleeping = isinstance(outcome, MacUnreachable) and now - last_good <= UNREACHABLE_GRACE_S
         # Save before sending: a send failure must retry without losing the outage's start.
         write_state(VaultState(state.last_good, outage))
+        alert_recorded = outage.alerted
         if not outage.alerted and not sleeping:
             # A note's send key has no permanent deduplication window. Commit the
             # alert before sending, so a later save failure cannot repeat it.
@@ -301,10 +306,11 @@ def _vault_locked() -> int:
                 sent = rust_release.send_release_text(push_texts.render(PUSH_TEXT_ID, reason=reason, action=action))
             except (OSError, subprocess.SubprocessError):
                 sent = False
+            alert_recorded = sent
             if not sent:
                 write_state(VaultState(state.last_good, outage))
         description = " ".join(detail.splitlines())
         if sleeping:
             description = "Mac unreachable; the next hour retries"
         print("buildlog vault: stopped: " + description)
-        return 0 if sleeping else 1
+        return 0 if sleeping or (cause in USER_ACTION_STOP_CAUSES and alert_recorded) else 1

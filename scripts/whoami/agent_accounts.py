@@ -645,7 +645,7 @@ def codex_home_display(home: Path) -> str:
 
 
 def codex_homes(workers_home: Path | NoWorkersHome) -> list[Path]:
-    """The default home, existing numbered homes, and any other home in use."""
+    """List account homes without an empty numbered copy of the default home's login."""
     default = Path.home() / ".codex"
     numbered: list[tuple[int, Path]] = []
     try:
@@ -658,7 +658,10 @@ def codex_homes(workers_home: Path | NoWorkersHome) -> list[Path]:
     homes = [default, *(home for _, home in sorted(numbered))]
     if isinstance(workers_home, Path) and workers_home not in homes:
         homes.append(workers_home)
-    return homes
+    identity = codex_account(default)
+    return [home for home in homes if not (
+        isinstance(identity, KnownCodexAccount) and home == Path.home() / f".{identity.label}"
+        and not os.path.lexists(home / "auth.json"))]
 
 
 def codex_report_in_use(report: Report, workers_home: Path | NoWorkersHome) -> bool:
@@ -1143,7 +1146,7 @@ async def codex_live(home: Path) -> Report:
         numbered = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name)
         if not initialized and home.parent == Path.home() and numbered is not None:
             report.codex_startup = CodexStartupFailure(
-                home, f"/showrunner:accounts setup codex{numbered.group(1)}",
+                home, f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex{numbered.group(1)}",
             )
             report.problem = report.codex_startup.problem
         elif report.email is None:

@@ -27,7 +27,7 @@ from urllib.parse import urlencode, urljoin, urlsplit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
 from scripts.production import change_routing, change_review, footer_counts, next_item, showrunners, staff, unrouted_alert
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve
 
@@ -616,6 +616,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
 
     def test_an_unrouted_row_with_a_missing_alert_setting_still_renders(self) -> None:
+        _ = self.enterContext(production_staff_record())
         _ = self.enterContext(patch.object(change_routing, "configured_lists_directory", return_value=self.temporary))
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Conflict", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")])
@@ -793,6 +794,46 @@ class ChangePageTests(unittest.TestCase):
         assert runner is not None
         self.assertEqual(assignment.owner, change_routing.ShowrunnerOwnChange(runner.id, "page-owner"))
         self.assertEqual(assignment.production, self.production)
+
+    def test_two_orphan_answers_save_and_reach_the_root_after_the_first_stamps_its_document(self) -> None:
+        listing = self.temporary / "change-review - orphan.md"
+        missing = self.temporary / "wrapped-production.md"
+        _ = listing.write_text("\n".join((
+            "---", "productions:", f'  - "{missing}"', "---", "## To review", "",
+            "| # | Change | Merged | How to check |",
+            "| --- | --- | --- | --- |",
+            "| C1 | First orphan | | Read the first change |",
+            "| C2 | Second orphan | | Read the second change |", "")))
+        settings = Path(os.environ["CONF_DIR"]) / "review_links.conf"
+        _ = settings.write_text(settings.read_text().replace(
+            "unrouted_alert_recipient=natedev", "unrouted_alert_recipient=page-owner"))
+        runner = staff.snapshot().by_path("page-owner")
+        assert runner is not None
+        browser = change_page.ReviewBrowser("orphan-token")
+        status = change_page.DeliveryStatus(self.root)
+        for number in (1, 2):
+            with self.subTest(row=number):
+                prepared = change_browser.prepare(browser, status)
+                change = next(item for item in prepared.changes if item.key == f"orphan/C{number}")
+                page = change.page
+                self.assertIsInstance(page, change_page.AssignedReviewPage)
+                assert isinstance(page, change_page.AssignedReviewPage)
+                self.assertEqual(page.owner, change_routing.ShowrunnerOwnChange(runner.id, runner.name))
+                self.assertEqual(change.tab, runner.name)
+                self.assertEqual(page.production, self.production)
+                self.assertEqual(page.owner.showrunner_recipients, (runner.id,))
+                delivery = change_page.submit(page, urlencode({"row": f"C{number}", "token": page.token,
+                    "outcome": "works", "feedback": ""}), status)
+                self.assertIsInstance(delivery, change_page.MessageDelivery)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                self.assertEqual(delivery.recipients, (runner.id,))
+                change_page.deliver(delivery, status)
+                self.assertEqual(change_review.review_snapshot(listing).reviewed[-1]["Verdict"], "works")
+                self.assertIn(self.production, change_routing.list_documents(listing.read_text()))
+                self.assertEqual([recipient for recipient, _, _ in self.messages], [runner.name] * number)
+                self.assertIn(f"Change review C{number}: works", self.messages[-1][2])
+        self.assertEqual({row["#"]: row["Verdict"] for row in change_review.review_snapshot(listing).reviewed},
+                         {"C1": "works", "C2": "works"})
 
     def test_new_delivery_records_never_store_page_context(self) -> None:
         status = change_page.DeliveryStatus(self.root)

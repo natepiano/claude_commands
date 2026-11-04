@@ -331,6 +331,8 @@ class StaffSnapshot:
     inputs: tuple[str, ...] = field(default=(), compare=False)
     schema: int = field(default=2, compare=False)
     current_sessions_recorded: bool = field(default=True, compare=False)
+    # True only when snapshot() reads the production record.
+    production: bool = field(default=False, compare=False)
 
     @cached_property
     def rows_by_id(self) -> dict[StaffId, StaffRow]:
@@ -523,8 +525,12 @@ def _default_file() -> Path:
     return Path.home() / ".local/state/staff/staff.json"
 
 
+def _file_override() -> str:
+    return os.environ.get("STAFF_FILE", "")
+
+
 def _file() -> Path:
-    return Path(os.environ.get("STAFF_FILE") or _default_file()).expanduser()
+    return Path(_file_override() or _default_file()).expanduser()
 
 
 def folder_move_path(unit: StaffId) -> Path:
@@ -533,9 +539,9 @@ def folder_move_path(unit: StaffId) -> Path:
     return _file().parent / "folder_moves" / f"{unit}.json"
 
 
-def _is_owner() -> bool:
+def is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
-    return bool(os.environ.get("STAFF_FILE")) or remote.other_machine() != OWNER_MACHINE
+    return bool(_file_override()) or remote.other_machine() != OWNER_MACHINE
 
 
 def operation_fds() -> tuple[int, ...]:
@@ -670,14 +676,15 @@ def _parent_kinds(kind: Kind) -> tuple[Kind, ...]:
     return () if kind == "agent" else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
 
 
-def _validate(rows: list[StaffRow]) -> None:
+def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = ()) -> None:
     """Check the complete proposed graph before any bytes are replaced."""
     indexed: dict[StaffId, StaffRow] = {}
-    sessions: set[StaffId] = set()
+    unknown = {cast(str, row["id"]) for row in unknown_rows}
+    sessions = {cast(str, row.get("current_session", row["id"])) for row in unknown_rows}
     names: set[tuple[Kind, StaffId | None, str]] = set()
     worktrees: set[tuple[str, Path]] = set()
     for row in rows:
-        if row.id in indexed:
+        if row.id in indexed or row.id in unknown:
             raise StaffRefused(f"duplicate staff id: {row.id}")
         indexed[row.id] = row
         if not _valid_id(row.current_session):
@@ -707,10 +714,9 @@ def _validate(rows: list[StaffRow]) -> None:
             raise StaffRefused(f"{row.kind} name already exists: {row.name}")
         names.add(key)
     for row in rows:
-        if row.parent is None:
-            if row.kind not in ("showrunner", "agent"):
-                raise StaffRefused(f"{row.kind} {row.name} requires a parent")
-        else:
+        if row.parent is None and row.kind not in ("showrunner", "agent"):
+            raise StaffRefused(f"{row.kind} {row.name} requires a parent")
+        if row.parent is not None and row.parent not in unknown:
             parent = indexed.get(row.parent)
             allowed = _parent_kinds(row.kind)
             if parent is None or parent.kind not in allowed:
@@ -724,7 +730,7 @@ def _validate(rows: list[StaffRow]) -> None:
             if current.id in chain:
                 raise StaffRefused(f"staff parent loop at {current.name}")
             chain.add(current.id)
-            if current.parent is None:
+            if current.parent is None or current.parent in unknown:
                 break
             current = indexed[current.parent]
         checked.update(chain)
@@ -740,9 +746,17 @@ def _decode(text: str) -> object:
 def _rows(value: object) -> list[StaffRow]:
     if not isinstance(value, list):
         raise StaffUnreadable("staff rows must be a list")
-    rows = [StaffRow.from_json(item) for item in cast(list[object], value)]
+    rows: list[StaffRow] = []
+    unknown: list[dict[str, object]] = []
+    for item in cast(list[object], value):
+        fields = cast(dict[str, object], item) if isinstance(item, dict) else dict[str, object]()
+        if isinstance(fields.get("kind"), str) and fields["kind"] not in _KINDS:
+            unknown.append(fields)
+            print(f"staff anomaly: row {fields.get('id')}: unknown kind {fields['kind']}; skipped", file=sys.stderr)
+            continue
+        rows.append(StaffRow.from_json(cast(object, item)))
     try:
-        _validate(rows)
+        _validate(rows, unknown)
     except StaffRefused as error:
         raise StaffUnreadable(str(error)) from error
     return sorted(rows, key=lambda row: row.id)
@@ -822,16 +836,16 @@ def _remote_row(arguments: list[str]) -> StaffRow:
 
 
 def _all_rows() -> list[StaffRow]:
-    return list(_load().rows) if _is_owner() else _rows(_remote(["show"]))
+    return list(_load().rows) if is_owner() else _rows(_remote(["show"]))
 
 
 def snapshot() -> StaffSnapshot:
-    if _is_owner():
-        return _load()
+    if is_owner():
+        return replace(_load(), production=not _file_override())
     value = _remote(["show", "--snapshot"])
     if not isinstance(value, dict):
         raise StaffUnreadable("staff snapshot must be an object")
-    return _snapshot_value(cast(dict[str, object], value))
+    return replace(_snapshot_value(cast(dict[str, object], value)), production=True)
 
 
 def local_snapshot() -> StaffSnapshot:
@@ -842,7 +856,7 @@ def local_snapshot() -> StaffSnapshot:
 def initial_snapshot() -> StaffSnapshot:
     """Read a writer's starting record, including an installation not yet seeded."""
     try:
-        return snapshot()
+        return replace(snapshot(), production=False)
     except StaffAbsent:
         return StaffSnapshot(())
 
@@ -914,12 +928,13 @@ def _location_paths(row: StaffRow) -> tuple[Path, ...]:
 
 
 def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
-    document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows]}
+    retained = cast(dict[str, object], _decode(_file().read_text(encoding="utf-8"))) if _file().exists() else {}
+    unknown = [row for row in cast(list[dict[str, object]], retained.get("rows", [])) if row["kind"] not in _KINDS]
+    _validate(rows, unknown)
+    document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows] + unknown}
     if pending:
         document["pending_retire"] = sorted(pending)
-    content = json.dumps(document,
-                         indent=2, sort_keys=True) + "\n"
-    atomic_file.write_text_atomic(_file(), content)
+    atomic_file.write_text_atomic(_file(), json.dumps(document, indent=2, sort_keys=True) + "\n")
 
 
 def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
@@ -941,7 +956,6 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
                         for location in _location_paths(row):
                             if _under_test_root(location):
                                 raise StaffRefused(f"test-root path cannot enter the real staff record: {location}")
-            _validate(proposed)
             proposed.sort(key=lambda row: row.id)
             if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.
@@ -1004,7 +1018,7 @@ def ensure(kind: Kind, *, name: str, parent: StaffId | None = None,
            doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
                 runtime_id: str = "") -> StaffRow:
     """Admit the identity and its location in the same owner transaction."""
-    if not _is_owner():
+    if not is_owner():
         arguments = ["ensure", kind, f"--name={name}", f"--runtime-id={runtime_id}"]
         if parent is not None:
             arguments.extend(("--parent", parent))
@@ -1030,7 +1044,7 @@ def ensure_worker(name: str, parent: StaffId, *, runtime_id: str) -> StaffRow:
 def update_current_session(old_session: StaffId, new_session: StaffId) -> StaffRow:
     """Publish a proved runtime handoff without changing the member or its links."""
     _ = native_id(new_session)
-    if not _is_owner():
+    if not is_owner():
         return _remote_row(["update-current-session", old_session, new_session])
     def edit(rows: list[StaffRow]) -> StaffRow:
         old = next((row for row in rows if row.current_session == old_session), None)
@@ -1053,7 +1067,7 @@ def update_current_session(old_session: StaffId, new_session: StaffId) -> StaffR
 
 def promote_unit(identity: StaffId, *, name: str, parent: StaffId, doc: LiveDoc) -> StaffRow:
     """The same native session changes role without acquiring another identity."""
-    if not _is_owner():
+    if not is_owner():
         return _remote_row(["promote-unit", identity, "--name", name, "--parent", parent,
                             "--machine", doc.machine, "--path", str(doc.path)])
     def edit(rows: list[StaffRow]) -> StaffRow:
@@ -1103,7 +1117,7 @@ def publish_native_ids(expected: StaffSnapshot, identities: Mapping[StaffId, Sta
 
 def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
     """Reactivate the retained unit in place, preserving its identity and parent."""
-    if not _is_owner():
+    if not is_owner():
         return _remote_row(["restore-unit", staff_id, "--machine", worktree.machine, "--path", str(worktree.path)])
 
     def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffRow:
@@ -1123,7 +1137,7 @@ def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
 
 
 def rename(staff_id: StaffId, new_name: str) -> StaffRow:
-    if not _is_owner():
+    if not is_owner():
         return _remote_row(["rename", staff_id, f"--name={new_name}"])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
@@ -1138,7 +1152,7 @@ def rename(staff_id: StaffId, new_name: str) -> StaffRow:
 
 
 def move(staff_id: StaffId, new_parent: StaffId | None) -> StaffRow:
-    if not _is_owner():
+    if not is_owner():
         return _remote_row(["move", staff_id, f"--parent={new_parent if new_parent is not None else 'none'}"])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
@@ -1155,7 +1169,7 @@ def move(staff_id: StaffId, new_parent: StaffId | None) -> StaffRow:
 def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
                  expected: PresentWorktree | RemovedWorktree | WorktreeUnfilled) -> StaffRow:
     """Set one unit's worktree through the existing owner transaction."""
-    if not _is_owner():
+    if not is_owner():
         previous = (["--expected-state", "unfilled"] if isinstance(expected, WorktreeUnfilled) else
                     ["--expected-state", "present" if isinstance(expected, PresentWorktree) else "removed",
                      "--expected-machine", expected.machine, "--expected-path", str(expected.path)])
@@ -1179,7 +1193,7 @@ def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
 
 def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc) -> StaffRow:
     """Set one showrunner's document through the existing owner transaction."""
-    if not _is_owner():
+    if not is_owner():
         return _remote_row(["set-doc", showrunner, "--machine", doc.machine, "--path", str(doc.path),
                             "--state", "live" if isinstance(doc, LiveDoc) else "wrapped"])
 
@@ -1200,8 +1214,6 @@ def require_stopped(identity: StaffId) -> None:
     target = record.by_id(identity)
     if target is None:
         return
-    if target.kind != "worker":
-        raise StaffRefused("retire requires a worker; retain units and showrunners with their location state")
     from scripts.message import sessions
     observed = sessions.session_liveness(target.current_session)
     if isinstance(observed, sessions.LiveSessionProcess):
@@ -1215,7 +1227,7 @@ def require_stopped(identity: StaffId) -> None:
 
 
 def retire(staff_id: StaffId) -> StaffRow | None:
-    if not _is_owner():
+    if not is_owner():
         value = _remote(["retire", staff_id])
         return None if value is None else StaffRow.from_json(value)
 
@@ -1237,7 +1249,7 @@ class FixtureAlreadyAbsent:
 
 def _remove_test_fixture(staff_id: StaffId) -> FixtureRemoved | FixtureAlreadyAbsent:  # pyright: ignore[reportUnusedFunction]
     """Remove a stopped fixture tree whose locations name test folders."""
-    if not _is_owner():
+    if not is_owner():
         raise StaffRefused("remove the fixture on the staff owner machine")
     record = snapshot()
     row = record.by_id(staff_id)
@@ -1275,8 +1287,8 @@ def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
     row = _row_by_id(rows, staff_id)
     if row is None:
         return None
-    if row.kind != "worker":
-        raise StaffRefused("retire requires a worker; retain units and showrunners with their location state")
+    if row.kind not in ("worker", "agent"):
+        raise StaffRefused("retire requires a worker or agent; retain units and showrunners with their location state")
     rows.remove(row)
     return row
 
@@ -1306,7 +1318,7 @@ def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
 
 def defer_retire(staff_ids: Sequence[StaffId]) -> None:
     """Remember members kept alive after their source records disappear."""
-    if not _is_owner():
+    if not is_owner():
         _ = _remote(["defer-retire", *staff_ids])
         return
 
@@ -1323,7 +1335,7 @@ def defer_retire(staff_ids: Sequence[StaffId]) -> None:
 
 def retire_pending() -> tuple[StaffId, ...]:
     """Retire unheld units before showrunners, returning the remaining ids."""
-    if not _is_owner():
+    if not is_owner():
         value = _remote(["retire-pending"])
         if not isinstance(value, list) or any(not isinstance(item, str) or not _valid_id(item)
                                                for item in cast(list[object], value)):
@@ -1346,7 +1358,7 @@ def retire_pending() -> tuple[StaffId, ...]:
 
 def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
     """Apply source evidence in one transaction, preserving names matched by id."""
-    if not _is_owner():
+    if not is_owner():
         value = _remote(["apply-seed"], input_text=json.dumps(seed_input.to_json(), sort_keys=True))
         if not isinstance(value, dict):
             raise StaffUnreadable("staff snapshot must be an object")
@@ -1424,8 +1436,7 @@ def _paths(rows: list[StaffRow]) -> dict[StaffId, str]:
     for row in rows:
         chain: list[str] = [row.name]
         member = row
-        while member.kind not in ("showrunner", "agent"):
-            assert member.parent is not None
+        while member.kind not in ("showrunner", "agent") and member.parent is not None and member.parent in indexed:
             member = indexed[member.parent]
             chain.append(member.name)
         paths[row.id] = "/".join(reversed(chain))
@@ -1578,7 +1589,7 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
         return move(StaffId(arguments.target), _parent(arguments.parent))
     if arguments.verb == "apply-seed":
         return apply_seed(SeedInput.from_json(_decode(sys.stdin.read())))
-    if arguments.row_write and _is_owner():
+    if arguments.row_write and is_owner():
         require_stopped(StaffId(arguments.target))
         return _transaction(lambda rows: _retire_row(rows, StaffId(arguments.target)))
     return retire(StaffId(arguments.target))
@@ -1640,7 +1651,7 @@ def _main(arguments: _Arguments) -> int:
     if arguments.row_write and not (arguments.verb == "retire" or
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
-    with operation() if _is_owner() and not arguments.row_write else nullcontext():
+    with operation() if is_owner() and not arguments.row_write else nullcontext():
         result = _mutate(arguments)
     if isinstance(result, tuple):
         print(json.dumps(result))

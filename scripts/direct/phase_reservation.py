@@ -29,8 +29,9 @@ attribution or lost-record repair while their plan review finishes. A recorder-o
 state file and no berth mapping of its own was never enrolled, as FinalGate's `final` phase, and is
 no lost record: its edits check under the bare session id. The hook reads the recorder's
 state in process. `progress_history.py finish-phase` clears an inactive state when the
-phase completes, and `start-phase` on a finished phase id restores its enrolled state from the
-kept board answer and removes the release marker (rca 261023-3). With one
+phase completes. `start-phase` restores a finished phase's enrolled state from the kept board answer and removes the release marker.
+It removes the old worktree and baselines, so the next claim records the new dispatch root and baselines.
+With one
 open phase in the edit's worktree every edited path is that phase's. With several, a path is the phase's whose `files`
 list covers it: one repository-relative path per line, a trailing `/` covering the tree below.
 Before workers open, `claim --repo` writes the repository root in the phase directory's `worktree` file.
@@ -338,7 +339,7 @@ def _adopt_session_level_files(session_dir: Path) -> None:
             os.replace(session_dir / name, target / name)
 
 
-def _phase_worktree(directory: Path) -> KnownPhaseWorktree | LegacyPhaseWorktree:
+def phase_worktree(directory: Path) -> KnownPhaseWorktree | LegacyPhaseWorktree:
     """Read the repository root kept by claim, or keep legacy global matching."""
     try:
         root = (directory / WORKTREE_FILE).read_text(encoding="utf-8").strip()
@@ -351,7 +352,7 @@ def _phase_worktree(directory: Path) -> KnownPhaseWorktree | LegacyPhaseWorktree
 
 def _record_worktree(directory: Path, root: Path) -> None:
     """Keep one live worktree per phase, before claim checks its reservation state."""
-    previous = _phase_worktree(directory)
+    previous = phase_worktree(directory)
     if isinstance(previous, KnownPhaseWorktree):
         if previous.root.resolve() == root:
             return
@@ -394,7 +395,7 @@ def open_phases(session_dir: Path) -> list[OpenPhase]:
         return held_phases(session_dir)
     names = {phase_directory_name(phase) for phase in recorder_state.read_open_phase_ids(session_dir)}
     return [OpenPhase(name, session_dir / PHASES_DIR / name,
-                      _phase_worktree(session_dir / PHASES_DIR / name))
+                      phase_worktree(session_dir / PHASES_DIR / name))
             for name in sorted(names - {""}) if not (session_dir / PHASES_DIR / name / RELEASED_FILE).is_file()]
 
 
@@ -402,7 +403,7 @@ def held_phases(session_dir: Path) -> list[OpenPhase]:
     """Every phase whose directory still holds a state file, in phase-name order: a run with no recorder list."""
     phases = session_dir / PHASES_DIR
     found = sorted(phases.iterdir()) if phases.is_dir() else []
-    return [OpenPhase(path.name, path, _phase_worktree(path)) for path in found if (path / STATE_FILE).is_file()]
+    return [OpenPhase(path.name, path, phase_worktree(path)) for path in found if (path / STATE_FILE).is_file()]
 
 
 def enrolled_phases(phases: list[OpenPhase], root: Path, session_id: str) -> list[OpenPhase]:
@@ -507,6 +508,19 @@ def restore(phase_dir: Path, phase: str) -> str:
     if (phase_dir / STATE_FILE).exists() or board not in BOARD_STATES:
         return ""
     return enroll(phase_dir, phase, board)
+
+
+def reset_for_start(phase_dir: Path, phase: str) -> None:
+    """Remove the previous phase instance's placement and baselines before a new start."""
+    if not phase_dir.is_dir():
+        return
+    with (phase_dir / (BASELINE_FILE + ".lock")).open("a") as lock:
+        worker_lifecycle.acquire_flock(lock)
+        kind = _string(read_state(phase_dir).get("kind"))
+        if kind in HOLDS_RESERVATION:
+            raise StateRefused(f"phase {phase} holds a reservation ({kind}); confirm its release before restarting")
+        for name in (BASELINE_FILE, BASELINE_STATUS_FILE, WORKTREE_FILE):
+            (phase_dir / name).unlink(missing_ok=True)
 
 
 def commit_id(repo: Path, name: str) -> str:

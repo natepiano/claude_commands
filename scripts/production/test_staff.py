@@ -356,6 +356,25 @@ class DocumentLookupTests(StaffTestCase):
 
 
 class StaffTests(StaffTestCase):
+    def test_snapshots_keep_their_production_record_source(self) -> None:
+        value: dict[str, object] = {"schema": 2, "rows": []}
+        _ = self.write_document(value)
+        self.assertFalse(staff.snapshot().production)
+        self.assertFalse(staff.local_snapshot().production)
+        self.assertFalse(staff.initial_snapshot().production)
+        production_file = self.root / "production-staff.json"
+        _ = production_file.write_text(json.dumps(value), encoding="utf-8")
+        with (mock.patch.dict(os.environ),
+              mock.patch.object(staff, "_default_file", return_value=production_file)):
+            del os.environ["STAFF_FILE"]
+            self.assertTrue(staff.snapshot().production)
+            self.assertFalse(staff.local_snapshot().production)
+            self.assertFalse(staff.initial_snapshot().production)
+            self.assertEqual(staff.snapshot().inputs, (str(production_file.absolute()),))
+            with (mock.patch.object(staff, "is_owner", return_value=False),
+                  mock.patch.object(staff, "_remote", return_value=value)):
+                self.assertTrue(staff.snapshot().production)
+
     def test_gate_module_writes_keep_the_real_staff_and_launch_folders_unchanged(self) -> None:
         from scripts.herdr import pane_launch
         from scripts.production import merge_gate
@@ -634,12 +653,17 @@ class StaffTests(StaffTestCase):
         self.assertEqual(record.by_path("unfilled/removed"), units[2])
         self.assertCountEqual(record.find(), [*runners, *units])
 
-    def test_local_and_remote_retire_refuse_owners_and_remove_only_the_selected_worker(self) -> None:
+    def test_local_and_remote_retire_keep_owners_and_remove_selected_workers_and_agents(self) -> None:
         runner, unit, worker = self.tree()
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
                 for row in (runner, unit):
                     self.assert_refused(lambda: staff.retire(row.id))
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                agent = fixture_member("agent", name="test-agent-" + machine)
+                self.assertEqual(staff.retire(agent.id), agent)
+                self.assertIsNone(staff.by_id(agent.id))
         self.assertEqual(staff.retire(worker.id), worker)
         self.assertEqual(staff.by_id(unit.id), unit)
         self.assertEqual(staff.by_id(runner.id), runner)
@@ -1177,6 +1201,23 @@ class StaffTests(StaffTestCase):
         )
         for index, document in enumerate([*malformed, "unparseable"]):
             before = self.write_document(document)
+            if index == 3:
+                child = replace(worker, parent=showrunner.id)
+                unknown = {**valid, "kind": "visitor", "current_session": fixture_runtime_id("unknown-session")}
+                _ = self.write_document({"schema": 2, "rows": [unknown, child.to_json()]})
+                with redirect_stderr(io.StringIO()) as output:
+                    self.assertEqual(staff.snapshot().rows, (child,))
+                    created = staff.ensure("showrunner", name="new", runtime_id=fixture_runtime_id("new"))
+                    self.assertCountEqual(staff.snapshot().rows, (child, created))
+                self.assertEqual(output.getvalue(), f"staff anomaly: row {showrunner.id}: unknown kind visitor; skipped\n" * 3)
+                self.assertEqual(cast(dict[str, object], json.loads(self.staff_file.read_text()))["rows"],
+                    [row.to_json() for row in sorted((child, created), key=lambda row: row.id)] + [unknown])
+                before = self.staff_file.read_bytes()
+                for runtime_id, reason in ((str(showrunner.id), "staff id"), (unknown["current_session"], "current session")):
+                    with redirect_stderr(io.StringIO()), self.assertRaisesRegex(staff.StaffRefused, "duplicate " + reason):
+                        _ = staff.ensure("showrunner", name="duplicate", runtime_id=str(runtime_id))
+                    self.assertEqual(self.staff_file.read_bytes(), before)
+                continue
             if document == "unparseable":
                 before = b"{truncated"
                 _ = self.staff_file.write_bytes(before)

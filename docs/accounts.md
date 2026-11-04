@@ -27,10 +27,16 @@ It never opens a session.
 
 ## Every account in one table
 
-`/showrunner:accounts` prints one table for the numbered Claude and Codex accounts.
+`/showrunner:accounts` opens the accounts board.
+`/showrunner:accounts close` closes it.
+The board refreshes stored readings every ten seconds.
+Run account operations in a terminal with `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py`.
+The terminal status table lists the numbered Claude and Codex accounts.
 The table includes accounts without a login.
 `~/.claude` is the shared config home and has no account row.
 The legacy `~/.codex` has a row only while it holds a login.
+An empty numbered Codex home has no row when `~/.codex` holds its note's login.
+Usage reads use the home that holds the login.
 A noted account without a usable home has a `not set up` row when no home holds its login.
 Each role has a separate row.
 The first role row shows the account's values.
@@ -153,15 +159,14 @@ A readable credential entry without a token requires a session or manual login.
 
 Natedev's `agent-notes` job runs `scripts/maintenance/agent_notes_job.py`.
 Notes, quota warnings, the Codex pacer, refusal moves, crash recovery, phase-note
-pruning, the hana hierarchy note and the vault commit each run in a separate
-process with a time limit. `config/agent_notes.toml` owns their intervals and
+pruning and the vault commit each run in a separate process.
+Each process has a time limit. `config/agent_notes.toml` owns their intervals and
 limits and is read on each run. A slow or failed part does not stop the other
 parts. Quota warnings and the pacer read after the notes part exits;
 the vault commit runs after the writers exit. A rerun skips completed parts
 until their next interval and retries failed parts.
-A part that leaves its note as it stands is logged as skipped and counts as
-completed for its interval; a source-command failure or timeout still fails
-the job. Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
+A failed or timed-out part fails the job.
+Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
 
 Notes reuse usage reports for less than ten minutes, keeping their original
 reading times. Each notes pass refreshes session counts from the roster. Usage reports without credentials stay in
@@ -308,7 +313,10 @@ A missing or stale usage reading permits the move with a notice.
 
 ## Picking an account
 
-Automatic moves choose an account with room. The ranking chooses the soonest weekly reset, then the most weekly allowance left, then the account label. It keeps the current account while it has room when the caller asks it to. `/showrunner:accounts placement --explain` shows each Claude account's readings and the reason it was chosen or skipped.
+Automatic moves choose an account with room.
+The ranking chooses the soonest weekly reset, then the most weekly allowance left, then the account label.
+A caller can keep the current account while it has room.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py placement --explain` to see each account's readings and selection reason.
 
 Claude accounts have room until they have an unresolved provider refusal. Without an account move entry, low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. A group with an account move entry waits for its head; refusal fallback runs only when that group has no entry. Completing off-target members onto its already-selected account still runs; if fallback finds no destination with room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
 
@@ -338,10 +346,10 @@ Each step prints `done:` or `for you:`: the login, and the lines it cannot write
 
 ## Setting up a new directory
 
-For claude3, run inside a session:
+For claude3, run in a terminal:
 
 ```text
-/showrunner:accounts setup claude3
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup claude3
 ```
 
 Then start `claude3` in a terminal, run `/login` as claude3, and check `/showrunner:accounts`. Setup links shared content to `~/.claude`; it reports existing real files or directories rather than replacing them. Login stays separate for each directory.
@@ -351,7 +359,7 @@ Then start `claude3` in a terminal, run `/login` as claude3, and check `/showrun
 Create an account note with its login first (`~/rust/hanadocs/agents/codexN.md`). For codex1:
 
 ```text
-/showrunner:accounts setup codex1
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1
 ```
 
 Setup creates `~/.codex1` with mode 0700 and links existing shared entries to `~/.codex`: configuration, hooks, instructions, skills, rules, plugins, sessions, archived sessions, the session index, history and the model cache. It reports real files or directories that prevent a link. Sign-in and Codex's home state stay separate; setup never links or copies `auth.json`.
@@ -368,18 +376,25 @@ env CODEX_HOME="$HOME/.codex1" codex login
 
 Keep `env CODEX_HOME` on that command so it runs the binary directly and the login stays in the numbered home; workers always use their mapped account. Do not sign in to the shared `~/.codex` home.
 
-Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for workers. To check the home directly, use `/showrunner:accounts check codex1`. Problems under the table name missing, broken or replaced shared links, the wrong login, or a login held by another home; `--detail` also lists unknown entries. Keep each login in one home: two homes on one login break token refresh.
+Open `/showrunner:accounts` to see the new home's row.
+It shows `spare` until selected for workers.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py check codex1` to check the home directly.
+Problems name missing or broken shared links, the wrong login, or a login held by another home.
+Terminal status with `--detail` also lists unknown entries.
+Keep each login in one home; two homes on one login break token refresh.
 
 The repository's hook installer keeps a linked `hooks.json` and adds missing hooks to its target, so numbered homes continue to share `~/.codex`'s hooks.
 
 ## Swapping the Codex workers account
 
-One account serves every unit's Codex workers, including the `codex exec` fallback. The updater, 5-hour watcher, `/whoami` and account table follow that role. Read it with `/showrunner:accounts role workers`.
+One account serves every unit's Codex workers, including the `codex exec` fallback.
+The updater, 5-hour watcher, `/whoami`, and accounts board follow that role.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py role workers` to read it.
 
 ```text
-/showrunner:accounts swap workers codex1 --dry-run
-/showrunner:accounts swap workers codex1
-/showrunner:accounts swap workers codex2
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap workers codex1 --dry-run
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap workers codex1
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap workers codex2
 ```
 
 A swap reads both usage windows and the credits before it changes the role.
