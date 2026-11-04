@@ -956,6 +956,9 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
                         for location in _location_paths(row):
                             if _under_test_root(location):
                                 raise StaffRefused(f"test-root path cannot enter the real staff record: {location}")
+                        # The fixture backend uses UUID version 5; native backends use versions 4 and 7.
+                        if any(identity[14:15] == "5" for identity in (row.id, row.current_session)):
+                            raise StaffRefused("fixture runtime id cannot enter the real staff record")
             proposed.sort(key=lambda row: row.id)
             if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.

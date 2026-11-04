@@ -460,10 +460,52 @@ class StaffTests(StaffTestCase):
                 self.assertIn(str(path), str(refusal.exception))
                 self.assertEqual(primary_file.read_bytes(), before)
 
+    def test_primary_staff_write_refuses_fixture_ids_and_accepts_native_ids(self) -> None:
+        primary_home = self.root / "guard-home"
+        primary_file = primary_home / ".local/state/staff/staff.json"
+        with mock.patch.dict(os.environ, {"STAFF_FILE": "", "HOME": str(primary_home)}):
+            with self.assertRaisesRegex(staff.StaffRefused, "fixture runtime id cannot enter the real staff record"):
+                _ = fixture_member("showrunner", name="fixture")
+            self.assertFalse(primary_file.exists())
+
+            native = staff.ensure("showrunner", name="native",
+                                  runtime_id="019b3a40-4250-7000-8000-000000000101")
+            before = primary_file.read_bytes()
+            with self.assertRaisesRegex(staff.StaffRefused, "fixture runtime id cannot enter the real staff record"):
+                _ = staff.update_current_session(native.current_session, staff.StaffId(fixture_runtime_id("restarted")))
+            self.assertEqual(primary_file.read_bytes(), before)
+            self.assertEqual(staff.snapshot().rows, (native,))
+
+    def test_primary_staff_write_preserves_unchanged_fixture_rows_and_allows_cleanup(self) -> None:
+        fixture = fixture_member("showrunner", name="fixture",
+                                 doc=staff.LiveDoc("natedev", self.root / "fixture/production.md"))
+        native = staff.ensure("showrunner", name="native",
+                              runtime_id="019b3a40-4250-7000-8000-000000000101")
+        primary_home = self.root / "guard-home"
+        primary_file = primary_home / ".local/state/staff/staff.json"
+        primary_file.parent.mkdir(parents=True)
+        _ = primary_file.write_bytes(self.staff_file.read_bytes())
+        with mock.patch.dict(os.environ, {"STAFF_FILE": "", "HOME": str(primary_home)}):
+            changed = staff.rename(native.id, "renamed")
+            self.assertEqual(changed.name, "renamed")
+            self.assertEqual(staff.snapshot().by_id(fixture.id), fixture)
+            before = primary_file.read_bytes()
+
+            with self.assertRaisesRegex(staff.StaffRefused, "fixture runtime id cannot enter the real staff record"):
+                _ = fixture_member("showrunner", name="new-fixture")
+            self.assertEqual(primary_file.read_bytes(), before)
+            with self.assertRaisesRegex(staff.StaffRefused, "fixture runtime id cannot enter the real staff record"):
+                _ = staff.set_doc(fixture.id, staff.LiveDoc("natedev", Path("/srv/staff-guard/production.md")))
+            self.assertEqual(primary_file.read_bytes(), before)
+
+            with mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+                self.assertEqual(staff._remove_test_fixture(fixture.id), staff.FixtureRemoved(fixture))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(staff.snapshot().rows, (changed,))
+
     def test_primary_staff_update_keeps_unchanged_test_root_rows(self) -> None:
         runner = fixture_member("showrunner", name="stray",
             doc=staff.LiveDoc("natedev", Path("/dev/shm/merge-gate-existing/production.md")))
-        unrelated = fixture_member("showrunner", name="other")
+        unrelated = fixture_member("showrunner", name="other", runtime_id="019b3a40-4250-7000-8000-000000000102")
         primary_home = self.root / "primary-home"
         primary_file = primary_home / ".local/state/staff/staff.json"
         primary_file.parent.mkdir(parents=True)
