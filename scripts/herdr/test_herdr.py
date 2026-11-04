@@ -5132,6 +5132,13 @@ class RowTabTests(StaffTestCase):
         self.assertFalse(self.client.move_row_tabs(self.rows["unit"].id))
         self.assertEqual(self.client.commands, [])
 
+    def test_a_staff_root_has_no_parent_workspace(self) -> None:
+        before = self.staff_file.read_bytes()
+        with self.assertRaisesRegex(herdr.HerdrFailure, "has no parent workspace"):
+            _ = self.client.move_row_tabs(self.rows["parent"].id)
+        self.assertEqual(self.client.commands, [])
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
     def test_transfer_preserves_shared_tabs_separate_tabs_and_nested_grid_splits(self) -> None:
         initial = [dict(pane) for pane in self.client.tabs]
         for grid in (False, True):

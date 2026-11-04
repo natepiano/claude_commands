@@ -1507,7 +1507,7 @@ class Herdr:
         """Move member tabs and saved bindings into the parent's workspace."""
         record = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
         row = record.by_id(staff.StaffId(row_id))
-        parent = record.by_id(row.parent) if row is not None and row.parent is not None else None
+        parent = record.parent_of(row) if row is not None else None
         if row is None or parent is None:
             raise HerdrFailure(f"staff row {row_id!r} has no parent workspace")
         with _LayoutLock(self.session):

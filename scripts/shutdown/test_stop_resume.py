@@ -1069,7 +1069,7 @@ class StopResumeTests(unittest.TestCase):
     def test_stop_proves_an_idle_restarted_codex_process_with_the_staff_current_session(self) -> None:
         identity = self.entry["session_id"]
         self.client.rows.insert(0, {"pane_id": "w1:p1", "workspace_id": "w1", "label": "unnamed"})
-        row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", None,
+        row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
         self.process.side_effect = self.alive_until_kill
         self.client.process_info = {"foreground_processes": [
@@ -1111,7 +1111,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_stop_skips_an_unnamed_pane_without_the_selected_codex_conversation(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", None,
+        row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
         _ = self.client.rows[0].pop("agent_session")
         other = pane_record.launch("w1:p2", "other-thread", str(self.root), {},
