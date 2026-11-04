@@ -107,7 +107,10 @@ if tool == "rustc":
     raise SystemExit(0)
 if tool == "cargo":
     assert arguments in (["nextest", "--version"], ["mend", "--version"])
-    print(arguments[0] + " " + os.environ.get("TEST_SHELL_TOOL_VERSION", "fixture"))
+    if arguments[0] == "nextest" and "TEST_NEXTEST_VERSION" in os.environ:
+        print(os.environ["TEST_NEXTEST_VERSION"])
+    else:
+        print(arguments[0] + " " + os.environ.get("TEST_SHELL_TOOL_VERSION", "fixture"))
     raise SystemExit(0)
 if tool == "hostname":
     print("fake-linux")
@@ -177,6 +180,7 @@ class LinuxShellTests(unittest.TestCase):
             "HOME": str(self.root), "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
             "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
             "CONF_DIR": str(self.root),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "LINT_SWEEP_STATE_DIR": str(self.root / "sweep-state"),
         }
@@ -619,6 +623,59 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(event["environment"].get("TEST_SHELL_TOOL_VERSION"), "shell")
         self.assertEqual(len(self.events("nix")), 1)
 
+    def test_multiline_nextest_version_matches_before_execution(self) -> None:
+        for tool in ("rustc", "cargo"):
+            self.write_tool(self.root / "bin" / tool)
+        version = "cargo-nextest 0.9.143 (60fa45f63 2026-08-04)"
+        details = "release: 0.9.143 commit: 60fa45f63 date: 2026-08-04 host: x86_64-linux"
+        config = offload.read_config(self.settings)
+        config = replace(config, values={**config.values, "parity.nextest": version + " " + details})
+        self.environment["TEST_NEXTEST_VERSION"] = ("  " + version + "  \n"
+            + " release: 0.9.143  \n\tcommit: 60fa45f63\n date: 2026-08-04\n host: x86_64-linux  \n")
+        with mock.patch.object(offload, "read_config", return_value=config):
+            result = self.execute(self.request())
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("mac_exit=0", result.stdout)
+        self.assertEqual(len(self.events("lint")), 1)
+        self.assertNotIn("version mismatch", result.stderr)
+
+    def test_multiline_nextest_difference_refuses_execution_with_one_line(self) -> None:
+        for tool in ("rustc", "cargo"):
+            self.write_tool(self.root / "bin" / tool)
+        expected = " cargo-nextest 0.9.143  \n release: expected \n commit: abc\n date: today\n host: linux\n"
+        actual = " cargo-nextest 0.9.143 \n release: different  \n commit: abc\n date: today\n host: linux\n"
+        config = offload.read_config(self.settings)
+        config = replace(config, values={**config.values, "parity.nextest": expected,
+                                        "version_pin_file": "nixos hosts/aws-build.nix"})
+        self.environment["TEST_NEXTEST_VERSION"] = actual
+        with mock.patch.object(offload, "read_config", return_value=config):
+            result = self.execute(self.request())
+
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertFalse(self.events("lint"))
+        self.assertEqual(result.stderr.splitlines(), [
+            "aws version mismatch: nextest box=cargo-nextest 0.9.143 release: different commit: abc date: today host: linux "
+            + "natedev=cargo-nextest 0.9.143 release: expected commit: abc date: today host: linux; "
+            + "move the box pins in nixos hosts/aws-build.nix",
+        ])
+
+    def test_multiline_probe_versions_keep_one_record_per_tool(self) -> None:
+        for tool in ("rustc", "cargo", "hostname"):
+            self.write_tool(self.root / "bin" / tool)
+        _ = (self.root / ".claude/.build-target-script-commit").write_text("fixture-commit\n")
+        self.environment["TEST_NEXTEST_VERSION"] = (
+            " cargo-nextest 0.9.143 \n release: 0.9.143\n commit: abc\n date: today\n host: linux \n")
+
+        result = subprocess.run(["bash", "-c", offload.probe_script(self.identity, "aws", 2)],
+            cwd=self.root, env=self.environment, text=True, capture_output=True, check=False, timeout=5)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(values["nextest"],
+            "cargo-nextest 0.9.143 release: 0.9.143 commit: abc date: today host: linux")
+        self.assertIsInstance(offload.parse_probe(result.stdout), offload.ProbeSnapshot)
+
     def test_shell_tool_mismatch_never_reports_a_test_failure_or_executes_work(self) -> None:
         for tool in ("rustc", "cargo"):
             self.write_tool(self.root / "bin" / tool)
@@ -726,6 +783,7 @@ class LinuxProcessTests(unittest.TestCase):
         process.mkdir()
         fields = [state, str(parent), str(group), *(["0"] * 16), str(start)]
         _ = (process / "stat").write_text(f"{pid} (fixture process) " + " ".join(fields))
+        _ = (process / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
         _ = (process / "cmdline").write_bytes(b"\0".join(word.encode() for word in command) + b"\0")
         _ = (process / "environ").write_bytes(f"BUILD_TARGET_RUN_TOKEN={token}\0".encode() if token else b"")
         if cwd != MISSING_PROCESS_CWD:
@@ -787,6 +845,41 @@ class LinuxProcessTests(unittest.TestCase):
             else:
                 status = 0
         return subprocess.CompletedProcess(command, status, output.getvalue(), errors.getvalue())
+
+    def test_foreign_real_uid_skips_unreadable_process_evidence(self) -> None:
+        marker = self.marker()
+        self.process(102, start=124, cwd=self.root)
+        _ = (self.proc / "102/status").write_text(f"Uid:\t{os.getuid() + 1}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
+        self.deny_reads(environ=(102,), cwd=(102,), cmdline=(102,))
+
+        selected = linux_runner.select_slot_processes(self.mirror, self.proc)
+
+        self.assertEqual(selected.pids, ())
+        self.assertFalse(selected.unresolved)
+        self.assertEqual(linux_runner.slot_processes(self.mirror, self.proc), ())
+        self.assertFalse(marker.exists())
+
+    def test_same_real_uid_keeps_unreadable_process_ownership_unresolved(self) -> None:
+        marker = self.marker()
+        self.process(102, start=124, cwd=self.root)
+        self.deny_reads(environ=(102,), cwd=(102,), cmdline=(102,))
+        stat = Path.stat
+
+        def different_proc_owner(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            result = stat(path, follow_symlinks=follow_symlinks)
+            if path == self.proc / "102":
+                fields = list(result)
+                fields[4] = os.getuid() + 1
+                return os.stat_result(fields)
+            return result
+
+        with mock.patch.object(Path, "stat", different_proc_owner):
+            selected = linux_runner.select_slot_processes(self.mirror, self.proc)
+            self.assertEqual(selected.pids, ())
+            self.assertTrue(selected.unresolved)
+            with self.assertRaises(linux_runner.SlotProcessesUnresolved):
+                _ = linux_runner.slot_processes(self.mirror, self.proc)
+        self.assertTrue(marker.exists())
 
     def test_unreadable_process_before_the_lease_allows_confirmed_cleanup(self) -> None:
         marker = self.marker()

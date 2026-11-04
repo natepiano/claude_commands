@@ -1199,6 +1199,10 @@ class UnavailableToolParity:
 
 def expected_linux_parity(controller: ProcessController, config: OffloadConfig) -> PublicToolParity | UnavailableToolParity:
     """Compare public tools with configured pins or the sender's versions."""
+    if TYPE_CHECKING:
+        from .linux_runner import normalize_tool_version
+    else:
+        from linux_runner import normalize_tool_version
     expected: dict[str, str] = {}
     commands = (("rustc", ["rustc", "-V"]),
                 ("nextest", ["cargo", "nextest", "--version"]),
@@ -1211,7 +1215,7 @@ def expected_linux_parity(controller: ProcessController, config: OffloadConfig) 
             if not isinstance(result, CommandOutput) or result.status != 0 or not result.stdout.strip():
                 return UnavailableToolParity()
             value = result.stdout.strip()
-        expected[key] = value
+        expected[key] = normalize_tool_version(value)
     return {"rustc": expected["rustc"], "nextest": expected["nextest"],
             "mend": expected["mend"], "scripts_commit": expected["scripts_commit"]}
 

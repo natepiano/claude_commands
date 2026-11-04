@@ -102,6 +102,29 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(config.values["mac_budget_gib.hana"], "7")
         self.assertEqual(config.values["linux_only.hana"], "local-package")
 
+    def test_sender_normalizes_multiline_tool_versions_before_parity(self) -> None:
+        versions = {"rustc": " rustc fixture \n", "nextest":
+            " cargo-nextest 0.9.143  \n release: 0.9.143\n commit: abc\n date: today\n host: linux \n",
+            "mend": " mend fixture \n", "git": "fixture-commit\n"}
+        controller = offload.ProcessController()
+
+        def capture(arguments: Sequence[str],
+                    deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT) -> offload.CapturedCommandResult:
+            del deadline
+            name = "nextest" if arguments[:2] == ["cargo", "nextest"] else "mend" if arguments[0] == "cargo" else arguments[0]
+            return offload.CommandOutput(0, versions[name], "")
+
+        with mock.patch.object(controller, "capture", side_effect=capture):
+            expected = offload.expected_linux_parity(controller, offload.read_config(self.settings))
+
+        self.assertNotIsInstance(expected, offload.UnavailableToolParity)
+        if isinstance(expected, offload.UnavailableToolParity):
+            self.fail("The sender must read all fixture versions")
+        self.assertEqual(expected["nextest"],
+            "cargo-nextest 0.9.143 release: 0.9.143 commit: abc date: today host: linux")
+        self.assertEqual((expected["rustc"], expected["mend"], expected["scripts_commit"]),
+                         ("rustc fixture", "mend fixture", "fixture-commit"))
+
     def test_no_argument_config_reader_uses_the_file_values(self) -> None:
         config = offload.read_config()
         self.assertEqual(config, offload.read_config(self.settings))

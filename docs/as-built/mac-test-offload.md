@@ -80,6 +80,14 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 
 ### The offload runner — `scripts/mac_test/offload.py`
 
+Tool parity uses one form for the sender, the probe, execution, and refusal messages.
+The normalizer strips each version line and joins nonempty lines with one space.
+This includes all lines from `cargo nextest --version`.
+
+Linux cleanup reads the real UID from `/proc/<pid>/status` before it reads process ownership evidence.
+It excludes processes from other users.
+Unreadable evidence from the same user keeps the slot busy.
+
 - `offload.py run --repo-root DIR [--package PKG] [--verb nextest|check|clippy|mend-check|doc] --call-id ID [--settings FILE] [--last-decline busy|blocked] [--filter-run] [--result FILE] -- <verb arguments>` exits 0 on a Mac pass, 75 for local fallback, and the step's own status on a Mac failure. The default verb is `nextest`. Claims use `--what "<verb> <package or workspace>"`. `lint check` runs Cargo check; `lint mend-check` runs mend with `--fail-on-warn`; remote doc sets `LINT_CONFIG_FORCE=1`. Workspace verbs use the same manifest-based Linux-only check as `eligible --kind`. `--settings` selects that target's config. `--last-decline` suppresses an unchanged retry notice. `write_result` writes `mac=`, `reason=`, `seconds=` from `PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline`. A busy result alone adds `holder=`: the claim's `what`, `leftovers`, or `unreadable`; `KnownMacJob | LostRunLeftovers | UnreadableMacHolder` gives that value its meaning. Missing or contradictory results are unusable. Declined, lost and invalid results return the record to `waiting_mac` before the next wait.
 - Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests (user, 2026-10-18). An app open on the Mac does not exclude a test.
 - The probe reads the hostname and free GiB against `free_floor_gib`, with no power or process check. Coordination records decide whether the Mac is held or busy.

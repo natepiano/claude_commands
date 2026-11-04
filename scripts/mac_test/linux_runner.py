@@ -167,6 +167,23 @@ def policy_setting(values: dict[str, str], key: str, repository: str) -> str:
     return values[f'{key}.{repository}'] if f'{key}.{repository}' in values else values[key]
 
 
+def normalize_tool_version(value: str) -> str:
+    """Keep each nonempty version line in one common form."""
+    return ' '.join(line.strip() for line in value.splitlines() if line.strip())
+
+
+def tool_version_filter() -> str:
+    """Use the same normalizer for versions read by Bash."""
+    code = "\n".join((
+        "import sys",
+        "from pathlib import Path",
+        "sys.path.insert(0, str(Path.home() / '.claude'))",
+        "from scripts.mac_test.linux_runner import normalize_tool_version",
+        "print(normalize_tool_version(sys.stdin.read()))",
+    ))
+    return f'python3 -c {shlex.quote(code)}'
+
+
 def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
     """Read Linux disk capacity and the public tool versions."""
     return '\n'.join((
@@ -190,6 +207,9 @@ def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
         'rustc_version=$(rustc -V) || exit 1',
         'nextest_version=$(cargo nextest --version) || exit 1',
         'mend_version=$(cargo mend --version) || exit 1',
+        f'rustc_version=$(printf \'%s\' "$rustc_version" | {tool_version_filter()}) || exit 1',
+        f'nextest_version=$(printf \'%s\' "$nextest_version" | {tool_version_filter()}) || exit 1',
+        f'mend_version=$(printf \'%s\' "$mend_version" | {tool_version_filter()}) || exit 1',
         'scripts_commit=$(cat "$HOME/.claude/.build-target-script-commit") || exit 1',
         'printf \'rustc=%s\\nnextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
         + '"$rustc_version" "$nextest_version" "$mend_version" "$scripts_commit"',
@@ -271,10 +291,16 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
     uncertain: set[int] = set()
     root = mirror.resolve()
     own_pid = os.getpid()
+    own_uid = os.getuid()
     for process in proc_root.glob('[0-9]*'):
         pid = int(process.name)
         try:
-            if process.stat().st_uid != os.getuid():
+            # The real UID identifies the user even when proc ownership changes.
+            status = (process / 'status').read_text()
+            uid = re.search(r'^Uid:\s+(\d+)\b', status, re.MULTILINE)
+            if uid is None:
+                raise ValueError('process real UID is unavailable')
+            if int(uid[1]) != own_uid:
                 continue
             fields = process_fields(pid, proc_root)
         except (FileNotFoundError, ProcessLookupError):
@@ -682,11 +708,11 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     parity: list[str] = ["mismatches=()"]
     for name, invocation in (('rustc', 'rustc -V'), ('nextest', 'cargo nextest --version'),
                              ('mend', 'cargo mend --version')):
-        expected = values.get(f'parity.{name}', '')
+        expected = normalize_tool_version(values.get(f'parity.{name}', ''))
         if expected:
             parity.extend([
                 f'actual=$({invocation} 2>/dev/null) || actual=unavailable',
-                "actual=${actual//$\'\\n\'/ }",
+                f'actual=$(printf \'%s\' "$actual" | {tool_version_filter()}) || exit 75',
                 f'if [ "$actual" != {shlex.quote(expected)} ]; then',
                 f'  mismatches+=("{name} box=$actual natedev="{shlex.quote(expected)})',
                 'fi',
