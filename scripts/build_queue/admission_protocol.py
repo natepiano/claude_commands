@@ -7,6 +7,10 @@ import os
 from pathlib import Path
 from typing import TypeVar, cast
 
+from scripts.build_queue.admission_code import (
+    ADMISSION_CODE_PATHS as ADMISSION_CODE_PATHS,
+    admission_code_version as admission_code_version,
+)
 from scripts.lint import memory_admit as gate
 
 VERSION = 1
@@ -32,6 +36,27 @@ class Owner:
 
 
 @dataclass(frozen=True)
+class RunIdentity:
+    pid: int
+    start_time: str
+
+
+@dataclass(frozen=True)
+class NoRun:
+    pass
+
+
+NO_RUN = NoRun()
+
+
+@dataclass(frozen=True)
+class RunPlace:
+    run: RunIdentity
+    since: float
+    first_owner: Owner
+
+
+@dataclass(frozen=True)
 class Identity:
     session_id: str
     name: str
@@ -43,8 +68,13 @@ class Identity:
 Profile = gate.StepProfile | gate.ProgramProfile
 
 
+@dataclass(frozen=True, kw_only=True)
+class CallerCode:
+    code_version: str = ""
+
+
 @dataclass(frozen=True)
-class AdmitRequest:
+class AdmitRequest(CallerCode):
     episode: str
     owner: Owner
     argv: tuple[str, ...]
@@ -57,10 +87,11 @@ class AdmitRequest:
     profile: Profile
     fresh_test: bool
     token_back_at: float = 0.0
+    run: RunIdentity | NoRun = NO_RUN
 
 
 @dataclass(frozen=True)
-class LaunchRequest:
+class LaunchRequest(CallerCode):
     episode: str
     owner: Owner
     since: float
@@ -69,48 +100,48 @@ class LaunchRequest:
 
 
 @dataclass(frozen=True)
-class ReleaseRequest:
+class ReleaseRequest(CallerCode):
     request_id: str
     reservation: str
     status: int
 
 
 @dataclass(frozen=True)
-class WidthRequest:
+class WidthRequest(CallerCode):
     request_id: str
     reservation: str
     width: int
 
 
 @dataclass(frozen=True)
-class BuildHistoryRequest:
+class BuildHistoryRequest(CallerCode):
     pass
 
 
 @dataclass(frozen=True)
-class ViewRequest:
+class ViewRequest(CallerCode):
     pass
 
 
 @dataclass(frozen=True)
-class ExplainRequest:
+class ExplainRequest(CallerCode):
     pass
 
 
 @dataclass(frozen=True)
-class MineRequest:
+class MineRequest(CallerCode):
     session_id: str
 
 
 @dataclass(frozen=True)
-class AdmitHeadRequest:
+class AdmitHeadRequest(CallerCode):
     request_id: str
     why: str
     actor: str
 
 
 @dataclass(frozen=True)
-class PrioritySetRequest:
+class PrioritySetRequest(CallerCode):
     request_id: str
     unit: str
     why: str
@@ -118,13 +149,13 @@ class PrioritySetRequest:
 
 
 @dataclass(frozen=True)
-class PriorityClearRequest:
+class PriorityClearRequest(CallerCode):
     request_id: str
     actor: str
 
 
 @dataclass(frozen=True)
-class TokenWaitRequest:
+class TokenWaitRequest(CallerCode):
     request_id: str
     reservation: str
 
@@ -143,6 +174,19 @@ class Wait:
 
 
 @dataclass(frozen=True)
+class CleanupTiming:
+    silence_seconds: float
+    reconnect_seconds: float
+
+
+# These protocol intervals permit cleanup before any configuration is usable.
+PROTOCOL_CLEANUP_TIMING = CleanupTiming(120.0, 2.0)
+CLEANUP_STRING_MAX = 4096
+CLEANUP_STATUS_MIN = -(2 ** 63)
+CLEANUP_STATUS_MAX = 2 ** 63 - 1
+
+
+@dataclass(frozen=True)
 class Admitted:
     reservation: str
     need: int
@@ -150,6 +194,7 @@ class Admitted:
     max_path: str
     wave_path: str
     sampling_context: dict[str, object]
+    cleanup_timing: CleanupTiming = PROTOCOL_CLEANUP_TIMING
 
 
 @dataclass(frozen=True)
@@ -181,7 +226,7 @@ class ViewReply:
 @dataclass(frozen=True)
 class ExplainReply:
     explanation: gate.QueueExplanation
-    fallbacks: tuple[gate.ConfigFallback, ...] = ()
+    diagnostics: tuple[gate.ConfigurationDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -228,6 +273,12 @@ def _encode(value: object, variants: dict[str, type], *, main_service: bool = Fa
     if main_service and isinstance(value, (AdmitRequest, LaunchRequest)):
         identity = cast(dict[str, object], cast(dict[str, object], data)["identity"])
         del identity["unit"]
+    # Remove these main-service field omissions after the admission cut-over.
+    omitted: set[str] = {"run"} if isinstance(value, AdmitRequest) and isinstance(value.run, NoRun) else set()
+    if main_service and isinstance(value, CallerCode):
+        omitted.add("code_version")
+    for field_name in omitted:
+        del cast(dict[str, object], data)[field_name]
     return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
 
 
@@ -242,17 +293,62 @@ def _parse(line: str | bytes, variants: dict[str, type]) -> object:
         name = envelope.get("type")
         if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
-        return gate.parse_snapshot_value(envelope["data"], variants[name])
+        data = envelope["data"]
+        if variants is _REQUESTS and isinstance(data, dict):
+            data = {"code_version": "", **cast(dict[str, object], data)}
+        if variants[name] is Admitted and isinstance(data, dict):
+            data = {"cleanup_timing": gate.snapshot_value(PROTOCOL_CLEANUP_TIMING), **cast(dict[str, object], data)}
+        if variants[name] is AdmitRequest and isinstance(data, dict) and "run" not in data:
+            data = {**cast(dict[str, object], data), "run": gate.snapshot_value(NO_RUN)}
+        return gate.parse_snapshot_value(cast(object, data), variants[name])
     except (KeyError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
 
+def _validate_cleanup(request: Request) -> None:
+    if not isinstance(request, (ReleaseRequest, TokenWaitRequest)):
+        return
+    fields = (request.request_id, request.reservation, request.code_version)
+    if any(len(value) > CLEANUP_STRING_MAX for value in fields):
+        raise ValueError(f"cleanup string exceeds {CLEANUP_STRING_MAX} characters")
+    if isinstance(request, ReleaseRequest) and not CLEANUP_STATUS_MIN <= request.status <= CLEANUP_STATUS_MAX:
+        raise ValueError("cleanup status exceeds signed 64-bit range")
+
+
 def encode_request(request: Request, *, main_service: bool = False) -> str:
+    _validate_cleanup(request)
     return _encode(request, _REQUESTS, main_service=main_service)
 
 
 def parse_request(line: str | bytes) -> Request:
-    return cast(Request, _parse(line, _REQUESTS))
+    request = cast(Request, _parse(line, _REQUESTS))
+    _validate_cleanup(request)
+    return request
+
+
+def noncleanup_request_started(data: bytes) -> bool:
+    """Identify a noncleanup header before its request body is complete."""
+    source = data.decode("utf-8", errors="replace").lstrip()
+    if not source.startswith("{"):
+        return False
+    decoder = json.JSONDecoder()
+    rest = source[1:].lstrip()
+    try:
+        while rest:
+            key, end = cast(tuple[object, int], decoder.raw_decode(rest))
+            rest = rest[end:].lstrip()
+            if not rest.startswith(":"):
+                return False
+            value, end = cast(tuple[object, int], decoder.raw_decode(rest[1:].lstrip()))
+            if key == "type":
+                return isinstance(value, str) and _REQUESTS.get(value) not in (ReleaseRequest, TokenWaitRequest)
+            rest = rest[1:].lstrip()[end:].lstrip()
+            if not rest.startswith(","):
+                return False
+            rest = rest[1:].lstrip()
+    except ValueError:
+        pass
+    return False
 
 
 def encode_reply(reply: Reply) -> str:
@@ -265,3 +361,10 @@ def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:
             or isinstance(request, AdmitRequest) and isinstance(reply, LaunchAdmitted)):
         raise ValueError("admission outcome does not match request")
     return reply
+
+
+# JSON escapes one character into at most six ASCII bytes; include the newline.
+CLEANUP_REQUEST_MAX_BYTES = max(len(encode_request(ReleaseRequest(
+    "\0" * CLEANUP_STRING_MAX, "\0" * CLEANUP_STRING_MAX, status,
+    code_version="\0" * CLEANUP_STRING_MAX)).encode())
+    for status in (CLEANUP_STATUS_MIN, CLEANUP_STATUS_MAX))

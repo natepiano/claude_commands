@@ -12,12 +12,14 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+from scripts.lib import copy_record
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
     fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.production import staff
-from scripts.production.cli_fixture import invoke_cli
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.copies import copies
 
 SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
 
@@ -37,6 +39,13 @@ class TidyWrappedTests(unittest.TestCase):
         self.state = self.root / "showrunner"
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
+            "COPIES_CONFIG": str(Path(copies.__file__).resolve().parents[2] / "config/copies.conf"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
+            "SCRATCH_HOLDS": str(self.root / "copy-holds.json"),
+        }))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
 
     def write(self, path: Path, content: str) -> Path:
@@ -57,6 +66,58 @@ class TidyWrappedTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, docs)], env=env,
                               capture_output=True, text=True, check=False,
                               timeout=TEST_HANG_GUARD_SECS)
+
+    def test_wrap_removes_production_and_unit_checkouts_before_state(self) -> None:
+        source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
+                                          "cleanup@example.invalid", {"file.txt": "content"}).checkout
+        doc = self.doc("done", "wrapped")
+        _ = doc.write_text(doc.read_text() + "\n| Unit | Plan |\n| --- | --- |\n"
+                           + "| alpha-unit | standby |\n| beta-unit | (retired) plan.md |\n")
+        state = self.state_files("done")
+        with copies.standing("alpha-unit", source, "HEAD") as unit_tree:
+            with copies.standing("done", source, "HEAD") as production_tree:
+                pass
+            with copies.standing("beta-unit", source, "HEAD") as retired_tree:
+                pass
+            with copies.standing("live", source, "HEAD") as unrelated:
+                pass
+            refused = self.run_tidy(doc)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertTrue(all(path.exists() for path in state))
+        result = self.run_tidy(doc)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for tree in (unit_tree, production_tree, retired_tree):
+            self.assertFalse(tree.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertFalse(any(path.exists() for path in state))
+        self.assertEqual(self.run_tidy(doc).returncode, 0)
+
+    def test_wrap_keeps_state_until_a_damaged_copy_record_is_repaired(self) -> None:
+        source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
+                                          "cleanup@example.invalid", {"file.txt": "content"}).checkout
+        doc = self.doc("done", "wrapped")
+        state = self.state_files("done")
+        with copies.workspace("done", source, "HEAD", name="damaged", branch="worker") as tree:
+            pass
+        record = tree / copy_record.RECORD
+        original = record.read_text()
+        _ = record.write_text("{invalid")
+        refused = self.run_tidy(doc)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn(str(record), refused.stderr)
+        self.assertTrue(all(path.exists() for path in state))
+        _ = record.write_text(original)
+        self.assertEqual(self.run_tidy(doc).returncode, 0)
+        self.assertFalse(tree.exists())
+        self.assertFalse(any(path.exists() for path in state))
+
+    def test_wrap_accepts_production_and_unit_names_that_cannot_own_copies(self) -> None:
+        doc = self.doc("Done_Name", "wrapped")
+        _ = doc.write_text(doc.read_text() + "\n| Unit | Plan |\n| --- | --- |\n| Alpha_unit | standby |\n")
+        state = self.state_files("Done_Name")
+        result = self.run_tidy(doc)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(path.exists() for path in state))
 
     def test_a_wrapped_production_loses_its_own_files_and_keeps_the_others(self) -> None:
         own = self.state_files("done")

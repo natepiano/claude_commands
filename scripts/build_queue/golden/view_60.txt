@@ -6,9 +6,9 @@ budget 21.0                         ░░░░██████████�
 
   # showrunner unit     step    min GiB: reserve/use; need
 run tool-base… widget   nextest   0 █████▏░░░░░░ 11.1 / 5.1
-  1 tool-base… cables   mend     36 ██████▊ 6.8 ↑ ≤14.2 9:18
-  2▸tool-base… cables   nextest   6 ███████████▌ 11.5
-  3▸tool-base… cables   nextest   6 ███████████▌ 11.5
+  1 tool-base… ●cables  mend     36 ██████▊ 6.8 ↑ ≤14.2 9:18
+  2▸tool-base… ●cables  nextest   6 ███████████▌ 11.5
+  3▸tool-base… ●cables  nextest   6 ███████████▌ 11.5
   4 tool-base… hana-mi… mend     39 ███████▋ 7.6
   5 cargo-lin… berth    clippy   37 ██▉ 2.9
   6 tool-base… lfo      nextest  35 ██████████▊ 10.8

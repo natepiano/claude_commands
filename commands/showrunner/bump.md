@@ -5,10 +5,8 @@ argument-hint: "<unit> <what the user wants now>"
 
 # Bump
 
-Run in the showrunner session when the user calls a piece of work urgent: they
-want to use it now, and the full validation can come after. User, 2026-10-22,
-after trunk P140 (the 3D group box) waited days behind a flake fix and the
-merge queue.
+Run from any session when the user calls work urgent.
+A session that is not the owning showrunner sends steps 2–5 to the showrunner that owns the unit.
 
 `<unit>` owns the work. If no unit owns it yet, give it to the unit whose files
 it changes, and say so in one line.

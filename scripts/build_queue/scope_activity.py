@@ -33,12 +33,6 @@ class EmptyBuildScope:
 
 
 @dataclass(frozen=True)
-class ManagedCISlice:
-    """The CI slice has its own charge and process lifetime."""
-    pass
-
-
-@dataclass(frozen=True)
 class ScopeProcesses:
     count: int
     session_id: str
