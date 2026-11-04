@@ -3289,8 +3289,7 @@ def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
     live: dict[str, tuple[int, ...]] = {}
     runs: set[Path] = set()
     for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
-        for filename in (codex_mesh.SERVER_FILE, codex_mesh.RETIRED_FILE):
-            runs.update(path.parent for path in root.glob(f"*/{filename}"))
+        runs.update(path.parent for path in root.glob(f"*/{codex_mesh.SERVER_FILE}"))
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue

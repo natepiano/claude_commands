@@ -33,6 +33,7 @@ import pane_record  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.herdr.pane_launch import agent_kind  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
