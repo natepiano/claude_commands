@@ -120,6 +120,16 @@ def whole_rows(handle: BinaryIO, start: int) -> Iterator[dict[str, object]]:
             yield cast(dict[str, object], decoded)
 
 
+def locked_rows(path: Path, start: int = 0) -> Iterator[dict[str, object]]:
+    """Read complete rows under a shared lock; an absent file has no rows."""
+    try:
+        with path.open("rb") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            yield from whole_rows(handle, start)
+    except FileNotFoundError:
+        return
+
+
 def read_last_whole_row_end(path: Path) -> int:
     """Capture a recovery boundary under a shared flock; an absent file is 0."""
     try:

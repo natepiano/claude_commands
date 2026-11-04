@@ -1117,23 +1117,21 @@ def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
     """Read the latest repository slot results from host month files."""
     latest: dict[tuple[str, int], AttemptResult] = {}
     for path in sorted(store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')):
-        with path.open('rb') as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            for row in store.whole_rows(handle, 0):
-                if row.get('kind') != 'ssh_attempt' or row.get('target') != target:
-                    continue
-                count = row.get('unresolved_count')
-                at = float(str(row.get('evidence_at')))
-                slot = int(str(row.get('slot')))
-                if not math.isfinite(at) or at < 0 or slot < 0:
-                    raise ValueError('invalid attempt evidence')
-                result = AttemptResult(str(row.get('repo_identity', 'unknown')), slot,
-                                       str(row.get('outcome', 'unavailable')), str(row.get('completion', 'missing')),
-                                       str(row.get('cleanup', 'unconfirmed')),
-                                       count if type(count) is int and count >= 0 else MeasurementUnavailable('process count is unavailable'), at)
-                key = result.repo_identity, result.slot
-                if key not in latest or latest[key].evidence_at <= at:
-                    latest[key] = result
+        for row in store.locked_rows(path):
+            if row.get('kind') != 'ssh_attempt' or row.get('target') != target:
+                continue
+            count = row.get('unresolved_count')
+            at = float(str(row.get('evidence_at')))
+            slot = int(str(row.get('slot')))
+            if not math.isfinite(at) or at < 0 or slot < 0:
+                raise ValueError('invalid attempt evidence')
+            result = AttemptResult(str(row.get('repo_identity', 'unknown')), slot,
+                                   str(row.get('outcome', 'unavailable')), str(row.get('completion', 'missing')),
+                                   str(row.get('cleanup', 'unconfirmed')),
+                                   count if type(count) is int and count >= 0 else MeasurementUnavailable('process count is unavailable'), at)
+            key = result.repo_identity, result.slot
+            if key not in latest or latest[key].evidence_at <= at:
+                latest[key] = result
     return tuple(latest[key] for key in sorted(latest))
 
 def hold_event(args: list[str]) -> None:
