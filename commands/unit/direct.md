@@ -1156,9 +1156,9 @@ reports `No active phase to report`, continue without the progress report.
 Apply <LongLivedWorkers/>.
 When a repair round fails or its next edit replaces a run's tree, apply <WorkerRuns/>.
 
-Find a failing test's cause before you scope its repair: read the failure text
-and the fixture it runs in. A repair aimed at a cause no one has checked costs
-a full round.
+Before you assign a repair, have a worker quote the failing log line and the
+current source line that causes it. Put both quotes in the fix prompt. A repair
+aimed at an unchecked cause costs a full round.
 
 For a `dispatch` batch, set `${FIX_ROUND}` from the gate's `round` and create
 `${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md` under
