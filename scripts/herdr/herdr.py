@@ -3050,6 +3050,14 @@ def _process_display_name(pid: int) -> str:
     return f"pid {pid}"
 
 
+def codex_managed_daemon(arguments: list[str]) -> bool:
+    """Identify the shared daemon that does not hold a thread live."""
+    if not is_codex_process(arguments):
+        return False
+    index = 2 if Path(arguments[0]).name in {"node", "nodejs"} else 1
+    return arguments[index:index + 1] == ["app-server"] and "--managed-daemon" in arguments
+
+
 def running_codex_threads(*, thread_host: Callable[[list[str]], bool]) -> set[str]:
     """Read Codex identities across this user's processes, including processes outside herdr."""
     candidates: list[tuple[int, list[str]]] = []
@@ -4316,7 +4324,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             session_id = owner.current_session
         running = False
         if session_id:
-            running = (session_id in running_codex_threads(thread_host=lambda _: False) if kind == "codex"
+            running = (session_id in running_codex_threads(thread_host=codex_managed_daemon) if kind == "codex"
                        else isinstance(runtime_sessions.session_liveness(session_id), runtime_sessions.LiveSessionProcess))
     except (HerdrFailure, OSError, ValueError) as error:
         print(f"herdr {session_id}: live session evidence is unknown: {error}", file=sys.stderr)
