@@ -1586,43 +1586,21 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - `scripts/lib/cargo_output_test_support.py` — shared Cargo output fixture
 - `scripts/buildlog/index.py`, `scripts/buildlog/record.py` — index schema 30
 ### Phase 56 — Build holds and memory admission catch store interface errors before they run  · status: done
-**Depends on:** Phase 20. Land before Phase 11. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files.
 
-#### Work Order
+#### As-built
 
-**Goal:** type checks use the real buildlog store interface. Runtime imports keep their current behavior.
-
-**Measured:**
-1. `scripts/build_hold/hold_enforcer.py` copies the store interface in `BuildLogWriter` and casts an imported module to that protocol.
-2. `scripts/lint/memory_admit.py` copies the store interface in `BuildLogStore` and uses the same cast pattern.
-3. `scripts/build_hold/build_hold.py` imports `buildlog.store` under `TYPE_CHECKING` and imports the runtime module in the other branch.
-
-**Spec:**
-1. Apply the `build_hold.py` import pattern to `hold_enforcer.py`.
-   Import the real store under `TYPE_CHECKING`. Keep runtime module selection, path setup and import behavior unchanged.
-   Remove `BuildLogWriter` and its module cast. Remove imports that become unused.
-2. Apply the same pattern to the store import in `memory_admit.py`.
-   Remove `BuildLogStore` and its module cast. Keep unrelated interfaces unchanged.
-   Add no replacement store protocol or copied method declarations.
-3. Find every caller of the changed modules. Type-check each changed module and every caller module against the real store. Callers and the hold tests are verification only; edit them only when a type check requires it.
-   Preserve every existing assertion. Change no admission or hold behavior.
-
-**Constraints from prior phases:**
-- Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead` unchanged.
-  Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
-- Phase 8 will add installed-copy mutation guards later. This phase changes only store imports and type checks.
+- `hold_enforcer.py` imports `store` from `..buildlog` under `TYPE_CHECKING` and as `import store` at run time. The `BuildLogWriter` protocol, the `importlib` load and the cast are gone.
+- `memory_admit.py` re-exports `store` with `from ..buildlog import store as store`, so callers read `gate.store` and basedpyright checks it. It imports `parse`, `record` and `index` under `TYPE_CHECKING`; the `GitFacts`, `StepParser`, `GitIdentityReader`, `BuildLogFileMarks` and `BuildLogStore` protocol copies and their casts are gone.
+- `test_memory_admit.py` `BuildStepRecorder` uses the real `record` module.
 
 **Files:**
-- `scripts/build_hold/hold_enforcer.py` — real store import and removal of the copied protocol and cast.
-- `scripts/lint/memory_admit.py` — the same store import correction.
+- `scripts/build_hold/hold_enforcer.py` — `store` import for the type checker and at run time.
+- `scripts/lint/memory_admit.py` — the `store` re-export and the type-checker imports of `parse`, `record` and `index`.
+- `scripts/lint/test_memory_admit.py` — `BuildStepRecorder` over the real `record` module.
 
-**Workers:** `1 writer` alone. The existing tests do not change.
-- `impl` owns both import corrections and runs the existing tests and caller type checks.
+**Gotchas:** a plain import without `as store` is private to basedpyright, so callers that read `gate.store` fail the type check. `build_hold.py` and `head_facts.py` still load `store` as a second module object (`scripts.buildlog.store`); the gate comparison phase fixes this.
 
-**Acceptance gate:**
-- Basedpyright reports `0 errors, 0 warnings, 0 notes` over both changed modules and every caller module.
-- All `scripts/build_hold/test_*.py` modules and `scripts/lint/test_memory_admit.py` pass unchanged.
-- The store interface has one definition. Both modules preserve their runtime import behavior.
+**Ruled out:** caller-side `store` imports in six files, replaced by the one re-export.
 
 ### Phase 57 — The gate comparison shows Cargo waits with and without running gates  · status: todo
 **Depends on:** Phase 20 on `origin/main` for 24 hours. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its run-folder files do not overlap the chain files.
@@ -1655,9 +1633,14 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
    Do not infer avg10 hold durations from cumulative stall counters.
 5. Test overlapping gates, cancellation, token returns and incomplete intervals in private fixtures.
    Test one logical step with multiple reservation intervals. Verify that token gaps do not become memory waits.
-   Keep the measurement script and its tests in the phase run folder. Change no shared implementation file.
+   Keep the measurement script and its tests in the phase run folder. Spec 7 makes the only shared implementation change.
 6. Publish the comparison in a follow-up notice to builds.
    Include coverage limits, Cargo wait totals and the unavailable pressure comparison, when applicable.
+7. Load `scripts/buildlog/store.py` as one module object (showrunner ruling 2026-11-04, Phase 56 simplify F006).
+   `memory_admit.py` and `hold_enforcer.py` import it at run time as `import store`, with `scripts/buildlog` on `sys.path`.
+   `build_hold.py` :44 and `head_facts.py` :17 import it as `scripts.buildlog.store`. Both files also load `memory_admit`, so one process holds two `store` modules.
+   Change both callers to the runtime name `memory_admit.py` uses. Keep their `TYPE_CHECKING` imports for the type checker.
+   Add one test per caller: after the import, `sys.modules` holds one `store` module object, and the caller and `memory_admit` share it.
 
 **Constraints from prior phases:**
 - Phase 20 owns lifecycle recording and the one reader. This phase owns the deferred Phase 16 gate comparison.
@@ -1665,13 +1648,15 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - This phase does not calibrate a queue model or adopt another head policy.
 
 **Files:**
-- `phases/57/gate_comparison.py` in the unit run folder — new measurement script.
-- `phases/57/test_gate_comparison.py` in the unit run folder — new private measurement fixtures and tests.
-- `phases/57/gate_comparison_report.md` in the unit run folder — deployment time, due time, totals and coverage limits.
+- `phases/57/gate_comparison.py` — new measurement script, in the unit run folder.
+- `phases/57/test_gate_comparison.py` — in the unit run folder, new private measurement fixtures and tests.
+- `phases/57/gate_comparison_report.md` — in the unit run folder: deployment time, due time, totals and coverage limits.
+- `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py` — Spec 7, the runtime `store` import and its test.
+- `scripts/build_queue/head_facts.py`, `scripts/build_queue/test_head_facts.py` — Spec 7 (owner queue-unit; name them as `also touches` in the notice, tested against `origin/builds-queue`).
 
 **Workers:** `1 writer + 1 tester`
-- `impl` owns the measurement script, report and follow-up notice.
-- `test` owns the measurement tests and private fixtures.
+- `impl` owns the measurement script, report, follow-up notice and the Spec 7 imports.
+- `test` owns the measurement tests, private fixtures and the Spec 7 tests.
 
 **Acceptance gate:**
 - The measurement tests pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the script and its tests.
@@ -1679,3 +1664,4 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - The report names the actual retained coverage, cancelled gates, incomplete waits, open intervals and missing peak samples.
 - Pressure comparisons remain unavailable until the PSI record supports them.
 - The follow-up notice records the Phase 20 deployment time and the due time 24 hours later.
+- Spec 7: the build hold, head facts and memory admission tests pass on this branch and with `origin/builds-queue` merged in a copy. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the four Spec 7 files.
