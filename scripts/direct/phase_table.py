@@ -1747,9 +1747,15 @@ def _phase_note_name(production: str, unit: str, *, resolver: session_staff.RowR
 
 def _note_ownership(path: Path) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return NoteWithoutPhaseTableOwnership()
+    return phase_note_ownership(text)
+
+
+def phase_note_ownership(text: str) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
+    """Read the writer's ownership marker and identity from note content."""
+    lines = text.splitlines()
     if not lines or lines[0] != "---":
         return NoteWithoutPhaseTableOwnership()
     fields: dict[str, str] = {}
@@ -1879,8 +1885,17 @@ def _note_text(
     production_file: str,
     unit: str,
     record: PhaseRecord,
-    zone: ZoneInfo,
 ) -> str:
+    """Keep phase changes in the vault without clocks or progress updates."""
+    rows = ["| Phase | What it delivers | Status |", "| --- | --- | --- |"]
+    for row in reversed(record.phases):
+        if isinstance(row, DonePhase):
+            status = "done"
+        elif isinstance(row, OpenPhase):
+            status = "running"
+        else:
+            status = "todo" if isinstance(row.gate, NoGate) else "gated"
+        rows.append(f"| {row.phase} | {_cell_text(row.title)} | {status} |")
     return "\n".join(
         (
             "---",
@@ -1893,41 +1908,12 @@ def _note_text(
             "",
             f"# {name}",
             "",
-            render(record, zone),
+            f"**{_heading_text(record)}**",
+            "",
+            *rows,
             "",
         )
     )
-
-
-def _ensure_showrunners_excluded(vault_root: Path) -> None:
-    try:
-        checkout = Path(
-            _git_output(vault_root.parent, "rev-parse", "--show-toplevel")
-        ).resolve()
-    except Refusal:
-        return
-    try:
-        relative = vault_root.resolve().relative_to(checkout)
-    except ValueError:
-        return
-    if relative == Path():
-        return
-    exclude_line = f"{relative.as_posix()}/"
-    git_path = Path(
-        _git_output(checkout, "rev-parse", "--git-path", "info/exclude")
-    )
-    exclude = git_path if git_path.is_absolute() else checkout / git_path
-    try:
-        before = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-        if exclude_line in before.splitlines():
-            return
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        with exclude.open("a", encoding="utf-8") as handle:
-            if before and not before.endswith("\n"):
-                _ = handle.write("\n")
-            _ = handle.write(f"{exclude_line}\n")
-    except OSError as error:
-        raise Refusal(f"cannot update {exclude}: {error}") from error
 
 
 @contextmanager
@@ -1955,6 +1941,8 @@ def _write_note(target: Path, content: str, production: ProductionIdentity, unit
                     "phase note target is not owned by "
                     + f"{production.slug}/{unit}: {target}"
                 )
+            if target_existed and target.read_text(encoding="utf-8") == content:
+                return
             with tempfile.NamedTemporaryFile(
                 "w",
                 encoding="utf-8",
@@ -2212,7 +2200,6 @@ def refresh(session_dir: Path) -> None:
             "phase note target is not owned by "
             + f"{production.slug}/{reference.unit}: {target}"
         )
-    _ensure_showrunners_excluded(vault_root)
     _write_note(
         target,
         _note_text(
@@ -2221,7 +2208,6 @@ def refresh(session_dir: Path) -> None:
             _production_file_link(production.doc, vault_root.parent),
             reference.unit,
             record,
-            production.zone,
         ),
         identity,
         reference.unit,

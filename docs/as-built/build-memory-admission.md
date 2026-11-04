@@ -179,6 +179,11 @@ A failed job stores nothing. A frozen need keeps its recorded margin; a later wi
 The first selected charge evidence is persisted outside the pure pass. A failed optional evidence write does not undo admission.
 
 Each pass counts `sccache.service` and unowned child scopes under `builds.slice`.
+`ci_memory_slice` in `[memory]` of `config/lint.conf` names the system CI slice.
+`systemctl show` supplies its cgroup path. Each pass reads its `memory.current` and `memory.max` through `unowned_slice_memory`.
+An idle slice charges its live memory and swap. A `Runner.Worker` process keeps a `LifetimePromise` for the live limit plus current swap.
+The promise also reserves free RAM for growth to the limit. An unavailable reading refuses new grants and retries on the next pass.
+Releases remain available during a reading refusal.
 `UnownedSliceMemory` names each unowned scope and its size. Process-tree charges are subtracted to prevent duplicate charges.
 The held head shows free memory, reserve, and need from `HeadExplanation`.
 
