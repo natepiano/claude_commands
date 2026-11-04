@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import cast, final
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import workers
-from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, read_object
+from scripts.direct.assign_launcher_test_support import ROOT, read_object
 from scripts.direct import assign_launcher_test_support as launcher_fixture
 
 
@@ -26,10 +26,9 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
             return codex_mesh.LinuxFileChanges({path})
         return codex_mesh.KqueueFileChanges({path})
 
-    def observe_follow_settlement(self, settled: Path, transport_override: str = "") -> Path:
+    def observe_follow_settlement(self, settled: Path, transport_override: str = "") -> None:
         """Mark the return from the real follow call."""
-        script = self.prepare_launcher()[0]
-        _ = script.with_suffix(".py").write_text(
+        self.instrument_launcher(
             "from pathlib import Path\nfrom scripts.direct import assign\n" +
             transport_override +
             "real_follow = assign.Dispatch.follow\n" +
@@ -37,9 +36,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
             "    result = real_follow(dispatch, command, shown, log)\n" +
             f"    Path({str(settled)!r}).touch()\n" +
             "    return result\n" +
-            "assign.Dispatch.follow = follow\n" +
-            "raise SystemExit(assign.main())\n")
-        return script
+            "assign.Dispatch.follow = follow\n")
 
     def review_after_stage_one(self, *, adopt: bool) -> tuple[subprocess.CompletedProcess[str], Path]:
         """Change delivery ownership after the first follower releases its turn."""
@@ -59,7 +56,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
                 "else:\n" +
                 f"    runpy.run_path({str(ROOT / 'scripts/agents/codex_mesh.py')!r}, run_name='__main__')\n")
             transport_override = f"assign.MESH = {str(transport)!r}\n"
-        script = self.observe_follow_settlement(settled, transport_override)
+        self.observe_follow_settlement(settled, transport_override)
         original = self.server.respond
 
         @self.hang_guard.callback
@@ -79,7 +76,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                           "--early-ready", str(ready), script=script)
+                                           "--early-ready", str(ready))
                 try:
                     while not settled.exists():
                         self.assertFalse(launched.done(), "Stage 1 completed the entire review")
@@ -118,14 +115,13 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
 
     def review_adoption_at_boundary(self, boundary: str) -> subprocess.CompletedProcess[str]:
         """Change ownership at coordinator boundaries around real followers."""
-        script = self.prepare_launcher()[0]
         ready = self.session_dir.parent / "boundary.ready"
         trace = self.session_dir.parent / "follow-boundaries.jsonl"
         delivered = self.session_dir.parent / "boundary-delivered"
         destination = self.session_dir.parent / "boundary-destination"
         # The injected code changes the ownership boundary.
         # Real followers submit input, write receipts, and complete loopback server turns.
-        _ = script.with_suffix(".py").write_text(
+        self.instrument_launcher(
             "import fcntl, json\nfrom pathlib import Path\nfrom scripts.direct import assign\nfrom scripts.agents import worker_lifecycle\n" +
             f"boundary = {boundary!r}\nready = Path({str(ready)!r})\n" +
             f"trace = Path({str(trace)!r})\ndestination = Path({str(destination)!r})\n" +
@@ -181,8 +177,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
             "    return result\n" +
             "assign.Dispatch.follow = follow\nassign.Dispatch.claim_follow = claim\n" +
             "assign.read_roster = read\n" +
-            "assign.Dispatch.mesh_call = mesh_call\n" +
-            "raise SystemExit(assign.main())\n")
+            "assign.Dispatch.mesh_call = mesh_call\n")
         original = self.server.respond
 
         @self.hang_guard.callback
@@ -208,7 +203,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
             self.server.held_turn_completes_successfully = True
             with ThreadPoolExecutor(max_workers=1) as executor:
                 launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                           "--early-ready", str(ready), script=script)
+                                           "--early-ready", str(ready))
                 try:
                     self.hang_guard.event(self.server.held_turn_ready)
                     watch = self.watch(delivered)
@@ -228,7 +223,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
                     self.server.release_held_turn.set()
         else:
             result = self.launch("review", "--lens", "contract", "--pass", "1",
-                                 "--early-ready", str(ready), script=script)
+                                 "--early-ready", str(ready))
         transitions = [cast(dict[str, object], json.loads(line)) for line in trace.read_text().splitlines()]
         self.assertEqual(len([entry for entry in transitions if entry.get("adopted")]), 1, transitions)
         follows = [entry for entry in transitions if "follow" in entry]
@@ -290,7 +285,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         self.server.respond = final_diff
         with ThreadPoolExecutor(max_workers=1) as executor:
             launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                       "--early-ready", str(ready), script=ASSIGN)
+                                       "--early-ready", str(ready))
             try:
                 self.hang_guard.event(self.server.held_turn_ready)
                 self.assertEqual(deliveries, [])
@@ -331,7 +326,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         reply = self.session_dir / "phases/7/review_reply_contract_1.txt"
         status = reply.with_name("review_status_contract_1")
         settled = self.session_dir.parent / "stage-one-settled"
-        script = self.observe_follow_settlement(settled)
+        self.observe_follow_settlement(settled)
         original = self.server.respond
         deliveries: list[str] = []
 
@@ -365,7 +360,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                           "--early-ready", str(ready), script=script)
+                                           "--early-ready", str(ready))
                 try:
                     while not settled.exists():
                         self.assertFalse(launched.done(), "review exited before its final diff existed")
@@ -451,11 +446,10 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
                              for event in self.events()))
 
     def test_a_review_launcher_follow_uses_the_current_review_row_instead_of_history(self) -> None:
-        _ = write_registry(self.registry, {"direct.codex": {"review": "gpt-other-sol:high"}}, update=True)
         self.commit_project()
-        self.review_launcher("--slot", "review", "1")
+        self.review_launcher("--new-worker", "project-review", "1")
         name, record = next(iter(self.assignment_records().items()))
-        self.assertEqual(record["turn_model"], "gpt-other-sol")
+        self.assertEqual(record["turn_model"], "gpt-kept-sol")
         identity_path = self.identity_path(name)
         identity = read_object(identity_path)
         self.assertEqual(identity["model"], "gpt-kept-sol")
@@ -463,7 +457,9 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         reservation = workers.allocation_for_follow(self.session_dir, name)
         workers.release_allocation(self.session_dir, name, reservation)
         self.assertTrue(self.assignment_records()[name].get("unit_ledger"))
+        _ = write_registry(self.registry, {"direct.codex": {"review": "gpt-other-sol:high"}}, update=True)
         self.review_launcher("--to", name, "2")
+        self.assertEqual(self.assignment_records()[name]["turn_model"], "gpt-other-sol")
         turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
         self.assertEqual(turn["model"], "gpt-other-sol")
         self.assertEqual(self.turn_starts, 2)

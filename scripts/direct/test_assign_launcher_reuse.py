@@ -137,11 +137,10 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
         self.write_pool_roster({name: record})
         before = roster_path.read_bytes()
         turns_before = self.turn_starts
-        script = self.prepare_launcher()[0]
         trace = self.session_dir / "compact-refusal.jsonl"
         # Only the transport's compaction result is injected. The real coordinator
         # decides whether to claim, follow, alter artifacts or announce continuation.
-        _ = script.with_suffix(".py").write_text(
+        self.instrument_launcher(
             "import json, subprocess\nfrom pathlib import Path\nfrom scripts.direct import assign\n" +
             f"trace = Path({str(trace)!r})\nreal_call = assign.Dispatch.mesh_call\n" +
             "def mesh_call(dispatch, verb, *options, **kwargs):\n" +
@@ -150,8 +149,8 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
             "        return subprocess.CompletedProcess(['compact'], 4, '', " +
             "'codex_mesh: compacted, but the roster changed during compaction (status=paused)\\n')\n" +
             "    return real_call(dispatch, verb, *options, **kwargs)\n" +
-            "assign.Dispatch.mesh_call = mesh_call\nraise SystemExit(assign.main())\n")
-        result = self.launch("implement", "--to", name, script=script)
+            "assign.Dispatch.mesh_call = mesh_call\n")
+        result = self.launch("implement", "--to", name)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("roster changed during compaction", result.stderr)
         self.assertIn("reopen --to " + name, result.stderr)

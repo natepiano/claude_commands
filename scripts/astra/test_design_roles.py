@@ -234,13 +234,16 @@ class DurableRolesTests(unittest.TestCase):
         def prime(arguments: list[str], *, capture_output: bool, text: bool,
                   check: bool, timeout: float | None = None,
                   env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-            if arguments[0] == "bash":
+            if arguments[1] != str(design_roles.ROOT / "scripts/direct/assign.sh"):
                 self.assertTrue(text)
                 return subprocess.run(arguments, capture_output=capture_output, text=True,
                                       check=check, timeout=timeout, env=env)
             self.assertTrue(capture_output and text)
             self.assertFalse(check)
-            self.assertEqual(arguments[2], "prime")
+            self.assertEqual(arguments[:6], ["bash", str(design_roles.ROOT / "scripts/direct/assign.sh"),
+                                           "--role", "implement", "--operation", "prime"])
+            self.assertNotIn("--sandbox", arguments)
+            self.assertNotIn("--paths", arguments)
             commands.append(arguments)
             mesh = Path(arguments[arguments.index("--session-dir") + 1])
             mesh.mkdir(parents=True, exist_ok=True)
@@ -248,7 +251,15 @@ class DurableRolesTests(unittest.TestCase):
             server["design_context"] = json.loads((mesh / "design_context.json").read_text())
             _ = (mesh / "mesh_server.json").write_text(json.dumps(server))
             with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
-                code = codex_mesh.main(arguments[2:])
+                options = dict(zip(arguments[6::2], arguments[7::2]))
+                self.assertEqual(options["--held-role"], "designer")
+                code = codex_mesh.main([
+                    "prime", "--session-dir", str(mesh), "--name", options["--new-worker"],
+                    "--cwd", options["--cwd"], "--instructions-file", options["--prompt"],
+                    "--model", options["--model"], "--effort", options["--effort"],
+                    "--sandbox", "danger-full-access", "--held-design", options["--held-design"],
+                    "--held-role", options["--held-role"],
+                ])
             return subprocess.CompletedProcess(arguments, code, output.getvalue(), errors.getvalue())
 
         signal_process = os.kill

@@ -85,7 +85,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Pr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
-from scripts.direct import plan_history
+from scripts.direct import assign_gate, plan_history
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 from scripts.agents import worker_lifecycle
 
@@ -5437,9 +5437,8 @@ def _after_turn_end(stream: TurnStream, log: TextIO, turn_outcome: TurnOutcome) 
 
 def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
     """Finish a one-turn launcher unless more work is coming to its thread."""
-    # A run may have started since the last safety scan. Discover it before
-    # claiming an empty inbox; finished records are still never reopened.
-    _ = stream.runs.current()
+    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+        return StreamStep.NEXT_FRAME
     # A finished turn may have a peer turn opening behind it.
     if (_more_work_coming(stream.client, stream.thread_id, stream.deadline)
             or stream.client.has_pending_frames):
@@ -5447,12 +5446,8 @@ def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
         # Finish only after every notice it buffered has had its turn.
         stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
-    _end_dead_runs(stream.session_dir, stream.name, stream.runs)
     if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
         return StreamStep.FINISH
-    # The turn ended on a run still going: stay attached until its result is held.
-    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
-        return StreamStep.NEXT_FRAME
     moved = _move_worker(stream)
     if isinstance(moved, WorkerWaitingForRoom):
         return _wait_for_room(stream, log, moved)
@@ -8878,18 +8873,11 @@ class WorkersRunMove:
 
 
 def _account_move_command(session_dir: str, name: str) -> str:
-    return shlex.join([sys.executable, str(Path(__file__).resolve()), "resume-account-move",
+    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    role = _as_str(record.get("role"))
+    return shlex.join(["bash", str(Path(__file__).resolve().parents[1] / "direct/assign.sh"),
+                       "--role", "implement" if role == "impl" else role, "--operation", "resume-account-move",
                        "--session-dir", session_dir, "--to", name])
-
-
-def _resume_account_move_detached(session_dir: str, name: str) -> None:
-    """Give an interrupted worker without a launcher its own continuation watcher."""
-    with _session_path(session_dir, f"{name}.account-move-launcher.log").open("ab") as log:
-        _ = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "resume-account-move",
-             "--session-dir", session_dir, "--to", name],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
-        )
 
 
 def command_resume_account_move(args: argparse.Namespace) -> int:
@@ -8974,7 +8962,6 @@ def _wait_account_move_resumes(
     """Await every dispatched move against one deadline, without serial worker waits."""
     pending = {(move.session_dir, move.name): move for move in moves}
     outcomes: dict[tuple[str, str], WorkerSwitchOutcome] = {}
-    detached: set[tuple[str, str]] = set()
     deadline = time.monotonic() + ACCOUNT_MOVE_RESUME_TIMEOUT_SECS
     while pending:
         for key, move in tuple(pending.items()):
@@ -8988,9 +8975,10 @@ def _wait_account_move_resumes(
                 if key in outcomes:
                     del pending[key]
                     continue
-                if key not in detached and (move.launcher_pid <= 0 or not _pid_alive(move.launcher_pid)):
-                    _resume_account_move_detached(*key)
-                    detached.add(key)
+                if move.launcher_pid <= 0 or not _pid_alive(move.launcher_pid):
+                    outcomes[key] = WorkerMoveFailed("the director must resume this worker through assign.sh",
+                                                     _account_move_command(*key))
+                    del pending[key]
             except (ConnectionError, OSError, SystemExit) as error:
                 outcomes[key] = WorkerMoveFailed(f"resume failed: {error}", _account_move_command(*key))
                 del pending[key]
@@ -9785,4 +9773,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in {"start", "follow", "reopen", "fork", "adopt", "prime", "resume-account-move"}:
+        assign_gate.require_assign()
     sys.exit(main())

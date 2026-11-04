@@ -3080,7 +3080,10 @@ def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
         lines = _workers_swap_lines(switches, workers_home, account_label, dry_run=False)
     except (ConnectionError, OSError, SystemExit) as error:
         lines = (f"Workers role now uses {account_label}; worker move failed: {error}. "
-                 + "Resume affected workers with codex_mesh.py resume-account-move --session-dir <run> --to <worker>.",)
+                 + "Resume affected workers with bash "
+                 + str(Path(__file__).resolve().parents[1] / "direct/assign.sh")
+                 + " --role <recorded role> --operation resume-account-move --session-dir <run> --to <worker>. "
+                 + "Use implement for the recorded impl role.",)
     return WorkersSwapStarted(lines)
 
 

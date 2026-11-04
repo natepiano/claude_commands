@@ -698,11 +698,10 @@ def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effo
     name = admitted.name
     if name != _instance(design, role).name:
         raise RoleRefused("staff admission names another worker")
-    policy = access_policy(design, role)
-    result = subprocess.run([sys.executable, str(ROOT / 'scripts/agents/codex_mesh.py'), 'prime',
-                             '--session-dir', str(mesh), '--name', name, '--cwd', design.repository,
-                             '--instructions-file', str(prompt), '--model', model, '--effort', effort,
-                             '--sandbox', 'read-only' if isinstance(policy, ReadOnlyReviewer) else policy.launch_sandbox,
+    result = subprocess.run(['bash', str(ROOT / 'scripts/direct/assign.sh'),
+                             '--role', 'implement' if role == 'designer' else 'review', '--operation', 'prime',
+                             '--session-dir', str(mesh), '--new-worker', name, '--cwd', design.repository,
+                             '--prompt', str(prompt), '--model', model, '--effort', effort,
                              '--held-design', design.placement.design_id, '--held-role', role],
                             capture_output=True, text=True, check=False)
     if result.returncode:
@@ -715,11 +714,13 @@ def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effo
 def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path, model: str, effort: str) -> None:
     """Submit one turn outside store locks and save its reply at the header's path."""
     mesh = mesh_directory(design.placement.design_id)
-    result = subprocess.run([sys.executable, str(ROOT / 'scripts/agents/codex_mesh.py'), 'follow',
+    result = subprocess.run(['bash', str(ROOT / 'scripts/direct/assign.sh'),
+                             '--role', 'implement' if role == 'designer' else 'review', '--operation', 'follow',
                              '--session-dir', str(mesh), '--to', _instance(design, role).name,
-                             '--role', 'impl' if role == 'designer' else 'review', '--message-file', str(prompt),
-                             '--summary-file', str(reply), '--log-file', str(reply.with_suffix('.log')),
-                             '--model', model, '--effort', effort, '--cwd', design.repository], check=False)
+                             '--cwd', design.repository, '--prompt', str(prompt),
+                             '--summary', str(reply), '--log', str(reply.with_suffix('.log')),
+                             '--model', model, '--effort', effort,
+                             '--held-design', design.placement.design_id, '--held-role', role], check=False)
     if result.returncode:
         raise RoleRefused('RoleNeedsRecovery: held turn did not complete; pending input is retained')
 

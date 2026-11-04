@@ -6336,8 +6336,11 @@ with path.with_name(path.name + ".lock").open("a") as lock:
     def test_workers_swap_reports_each_failed_worker_with_manual_resume_and_keeps_new_role(self) -> None:
         _, target = self.workers_fixture()
         run = self.root / "run with spaces"
-        interrupt_command = f"python3 mesh.py resume-account-move --session-dir '{run}' --to project-impl"
-        resume_command = f"python3 mesh.py resume-account-move --session-dir '{run}' --to project-review"
+        assign = Path(accounts.__file__).resolve().parents[1] / "direct/assign.sh"
+        interrupt_command = shlex.join(["bash", str(assign), "--role", "implement", "--operation",
+                                        "resume-account-move", "--session-dir", str(run), "--to", "project-impl"])
+        resume_command = shlex.join(["bash", str(assign), "--role", "review", "--operation",
+                                     "resume-account-move", "--session-dir", str(run), "--to", "project-review"])
         switches = (codex_mesh.WorkersRunSwitch(run, (), (
             codex_mesh.SwitchingWorker("project-impl", True,
                 codex_mesh.WorkerMoveFailed("interrupt failed: access denied", interrupt_command)),
@@ -6361,6 +6364,17 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         idle = next(line for line in lines if " · test-worker → codex1" in line)
         self.assertNotIn("failed", idle)
         self.assertNotIn("interrupted", idle)
+
+    def test_workers_swap_failure_reports_the_assign_recovery_form(self) -> None:
+        _ = self.workers_fixture()
+        with patch.object(codex_mesh, "retire_workers_servers", side_effect=OSError("server unavailable")):
+            code, output, errors = self.run_cli("swap", "workers", "codex1")
+        self.assertEqual((code, errors), (0, ""))
+        assign = Path(accounts.__file__).resolve().parents[1] / "direct/assign.sh"
+        self.assertIn(f"bash {assign} --role <recorded role> --operation resume-account-move "
+                      + "--session-dir <run> --to <worker>.", output)
+        self.assertIn("Use implement for the recorded impl role.", output)
+        self.assertNotIn("--mesh", output)
 
     def test_workers_swap_role_write_failure_exits_one_before_interrupting_workers(self) -> None:
         _ = self.workers_fixture()
