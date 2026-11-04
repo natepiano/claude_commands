@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import argparse
 import json
@@ -28,6 +29,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import herdr
+from scripts.lib import operation_deadline
 import pane_record
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.shutdown.codex_trust import trust_arguments
@@ -120,6 +122,8 @@ def _signal_process(pid: int, number: int) -> None:
                 raise ValueError("herdr did not place the pid in a workspace pane")
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             raise PermissionError(f"{refusal}: {error}") from error
+    if number in (signal.SIGTERM, signal.SIGKILL):
+        operation_deadline.check()
     os.kill(pid, number)
 
 
@@ -140,11 +144,15 @@ def _record_launches(selected: list[str]) -> None:
         print(f"stop: launch note anomaly: {error}", file=sys.stderr)
 
 
-def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+def stop(session: str, *, deadline: float = math.inf) -> Stopped | NotRunning | StopFailed | SessionNotFound:
     from scripts.production import staff
 
-    with staff.row_operation(session):
-        return _stop_recorded(session)
+    try:
+        with operation_deadline.within(deadline), staff.row_operation(session):
+            return _stop_recorded(session)
+    except TimeoutError as error:
+        reason = str(error)
+        return StopFailed(session, reason if "deadline passed" in reason else f"deadline passed; {reason}")
 
 
 def _stop_recorded(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
@@ -177,6 +185,8 @@ def _retire_prompt(session_id: str) -> None:
 def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
     """Signal only the process that proves the current conversation."""
     identity = session
+    last_signal = ""
+    signal_pid = 0
     tab: herdr.TabSession | SessionNotFound = SessionNotFound(session)
     try:
         from scripts.production import staff
@@ -213,16 +223,17 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         if not herdr.check_native_target(live.pid, kind, proved):
             return StopFailed(identity, "process identity changed; no signal sent")
         _signal_process(live.pid, signal.SIGTERM)
+        last_signal = "SIGTERM"
+        signal_pid = live.pid
         deadline = monotonic() + STOP_GRACE_SECONDS
         while _same_process(live.pid, started):
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
-            _ = Event().wait(min(0.1, remaining))
+            _ = Event().wait(operation_deadline.remaining(min(0.1, remaining)))
         else:
             return Stopped(identity, live.pid)
         if _same_process(live.pid, started):
-            last_signal = "SIGTERM"
             try:
                 if not herdr.check_native_target(live.pid, kind, proved):
                     return StopFailed(identity, "process identity changed; no signal sent")
@@ -238,12 +249,15 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     return StopFailed(identity, f"pid {live.pid} is still running after {last_signal}")
-                _ = Event().wait(min(0.1, remaining))
+                _ = Event().wait(operation_deadline.remaining(min(0.1, remaining)))
         return Stopped(identity, live.pid)
     except ProcessLookupError:
         return NotRunning(identity)
     except (OSError, ValueError, herdr.HerdrFailure) as error:
-        return StopFailed(identity, str(error))
+        reason = str(error)
+        if isinstance(error, TimeoutError) and last_signal:
+            reason += f"; pid {signal_pid} received {last_signal} and still runs"
+        return StopFailed(identity, reason)
 
 
 def resume_arguments(entry: pane_record.PaneLaunch) -> list[str]:

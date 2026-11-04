@@ -43,6 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pane_launch
+from scripts.agents import worker_lifecycle
+from scripts.lib import operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
@@ -927,7 +929,7 @@ PROGRAM_TIMEOUT_SECONDS = 10.0
 def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
+        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=operation_deadline.remaining(timeout),
                               env=unmarked_environment() if environment is None else child_environment(environment))
     except OSError as error:
         raise HerdrFailure(f"{argv[0]}: {error}") from error
@@ -1137,11 +1139,15 @@ class _LayoutLock:
         self.handle: int = -1
 
     def __enter__(self) -> None:
-        import fcntl
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.handle = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-            fcntl.flock(self.handle, fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(self.handle)
+        except TimeoutError:
+            if self.handle >= 0:
+                os.close(self.handle)
+                self.handle = -1
+            raise
         except OSError as error:
             print(f"herdr: layout lock is unavailable: {self.path}: {error}", file=sys.stderr)
 
@@ -1161,6 +1167,9 @@ class Herdr:
 
     def run(self, *arguments: str, deadline: float = math.inf) -> str:
         """Run within the caller's monotonic deadline, retaining the usual 10 s cap."""
+        deadline = worker_lifecycle.effective_deadline(deadline)
+        if deadline <= time.monotonic():
+            raise HerdrFailure("deadline passed")
         context = f"herdr {' '.join(arguments[:2])}"
         try:
             result = run_program(self.argv(*arguments), timeout=min(PROGRAM_TIMEOUT_SECONDS, max(0.0, deadline - time.monotonic())))
@@ -1175,7 +1184,7 @@ class Herdr:
 
     def run_in_pane(self, pane: str, command: list[str], *, terminal: str = "") -> None:
         """Run a command only when the selected pane contains its empty shell."""
-        deadline = time.monotonic() + PROGRAM_TIMEOUT_SECONDS
+        deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
         while True:
             try:
                 if check_target("", action="keys", place=HerdrPlace(self.session, pane), terminal=terminal,
@@ -1797,7 +1806,7 @@ class Herdr:
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
         launched_at = datetime.now(timezone.utc)
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         attempt_timeout_ms = min(timeout_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
         try:
             while True:
@@ -1812,7 +1821,7 @@ class Herdr:
                     if (error.code != "agent_pane_busy"
                             or deadline <= time.monotonic()):
                         raise
-                    time.sleep(0.1)
+                    time.sleep(operation_deadline.remaining(min(0.1, deadline - time.monotonic())))
                     attempt_timeout_ms = min(int((deadline - time.monotonic()) * 1000),
                                              _AGENT_START_TIMEOUT_MAXIMUM_MS)
                     continue
@@ -1860,7 +1869,7 @@ class Herdr:
     def start_command(self, argv: list[str], kind: str, pane: str,
                       timeout: float) -> subprocess.CompletedProcess[str]:
         """Observe a submitted agent while its CLI waits for interactive readiness."""
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + operation_deadline.remaining(timeout)
         shell: PaneShell | PaneShellUnknown = PaneShellUnknown()
         agent_seen = False
         tracked: set[AgentProcessIdentity] = set()
@@ -1871,6 +1880,7 @@ class Herdr:
         except (HerdrFailure, subprocess.TimeoutExpired):
             pass
         next_observation = time.monotonic() + 0.5
+        operation_deadline.check()
         try:
             process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                        env=unmarked_environment())
@@ -2017,7 +2027,7 @@ class Herdr:
                               ) -> PromptInputReady | PromptInputTimedOut:
         if isinstance(cursor, UnspecifiedPromptTranscript) and isinstance(transcript, SessionTranscript):
             cursor = TranscriptCursor(transcript, launched_at)
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         while time.monotonic() < deadline:
             state = self.prompt_input_state(pane, transcript, launched_at, cursor=cursor)
@@ -2058,7 +2068,7 @@ class Herdr:
         if timeout_ms <= 0 or not opening.text.strip():
             return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
         opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt)
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         cursor = (TranscriptCursor(opening.transcript, launched_at)
                   if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
@@ -2728,7 +2738,7 @@ def _server_start_failure(name: str) -> HerdrFailure:
 def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
     from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
-    deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
+    deadline = time.monotonic() + operation_deadline.remaining(min(10.0, timeout_ms / 1000))
     try:
         if server_answering(run_program(client.argv("status", "server"),
                                         timeout=max(0.001, deadline - time.monotonic()))):
@@ -2760,6 +2770,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: Securi
             pass
         return False
 
+    operation_deadline.check()
     try:
         pid = start_detached(client.argv("server"), ready=ready, within=deadline - time.monotonic(),
                              output=DiscardOutput(), environment=ExplicitEnvironment(unmarked_environment()))
@@ -2773,6 +2784,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: Securi
         try:
             identity = _startup_process_reader(PROGRAM_TIMEOUT_SECONDS).identity(pid)
             if check_target(identity, action="signal"):
+                operation_deadline.check()
                 os.kill(pid, signal.SIGTERM)
         except (_StartupProcessGone, ProcessLookupError, FileNotFoundError):
             pass
@@ -2789,7 +2801,7 @@ def start_server(name: str, timeout_ms: int, *,
     if _platform() == "darwin":
         return _start_darwin_server(herdr, timeout_ms,
             session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
-    deadline = time.monotonic() + timeout_ms / 1000
+    deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
     try:
         if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
             return ServerAdopted()
@@ -3313,7 +3325,7 @@ def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
             except (HerdrFailure, OSError, ValueError):
                 pass
             unknown.append(f"{_process_display_name(pid)} (Codex thread unknown)")
-    deadline = time.monotonic() + PROGRAM_TIMEOUT_SECONDS
+    deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
     for run in sorted(runs):
         try:
             for identity in codex_mesh.loaded_threads(run, deadline):

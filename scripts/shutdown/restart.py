@@ -1,6 +1,7 @@
 """Stop live staff rows, then resume their current sessions in their saved tabs."""
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -18,7 +19,7 @@ for dependency in ("herdr", "message", "lib", "shutdown"):
 import herdr
 import sessions
 from scripts.production import staff
-from scripts.lib import nix_env
+from scripts.lib import nix_env, operation_deadline
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -63,24 +64,25 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
     print(f"{row.name}: restart anomaly: {reason[0] if reason else type(error).__name__}", file=sys.stderr)
 
 
-def stop_row(row: staff.StaffRow, client: herdr.Herdr) -> bool:
+def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf) -> bool:
     try:
-        panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
-        if len(panes) > 1:
-            _anomaly(row, "duplicate panes retained; no signal sent")
+        with operation_deadline.within(deadline):
+            panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
+            if len(panes) > 1:
+                _anomaly(row, "duplicate panes retained; no signal sent")
+                return False
+            if panes and not herdr.check_target(str(row.current_session), action="signal",
+                    place=herdr.HerdrPlace(client.session, panes[0]["pane_id"]),
+                    terminal=panes[0].get("terminal_id", ""), client=client):
+                return False
+            result = stop_resume.stop(str(row.current_session))
+            if isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
+                return True
+            _anomaly(row, result.reason if isinstance(result, stop_resume.StopFailed) else "session not found")
             return False
-        if panes and not herdr.check_target(str(row.current_session), action="signal",
-                place=herdr.HerdrPlace(client.session, panes[0]["pane_id"]),
-                terminal=panes[0].get("terminal_id", ""), client=client):
-            return False
-    except (herdr.HerdrFailure, OSError, ValueError) as error:
+    except (OSError, herdr.HerdrFailure, ValueError) as error:
         _anomaly(row, error)
         return False
-    result = stop_resume.stop(str(row.current_session))
-    if isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
-        return True
-    _anomaly(row, result.reason if isinstance(result, stop_resume.StopFailed) else "session not found")
-    return False
 
 
 def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
@@ -111,68 +113,70 @@ def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str,
 
 
 def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
-              present: bool = False, target_account: str = "") -> str:
-    live = herdr.read_conversation(str(row.current_session))
-    if isinstance(live, herdr.LiveConversation):
-        print(f"{row.name}: unchanged")
-        return ""
-    if isinstance(live, herdr.UnknownConversation):
-        herdr.conversation_note(live)
-    machine, folder = row_folder(row, record)
-    import remote
-    if machine != remote.local_machine():
-        raise ValueError(f"{row.name}: session is on {machine}")
-    kind, environment, arguments = session_launch(str(row.current_session))
-    if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
-        from scripts.accounts import accounts
+              present: bool = False, target_account: str = "", deadline: float = math.inf) -> str:
+    with operation_deadline.within(deadline):
+        live = herdr.read_conversation(str(row.current_session))
+        if isinstance(live, herdr.LiveConversation):
+            print(f"{row.name}: unchanged")
+            return ""
+        if isinstance(live, herdr.UnknownConversation):
+            herdr.conversation_note(live)
+        machine, folder = row_folder(row, record)
+        import remote
+        if machine != remote.local_machine():
+            raise ValueError(f"{row.name}: session is on {machine}")
+        kind, environment, arguments = session_launch(str(row.current_session))
+        if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
+            from scripts.accounts import accounts
 
-        target_account = accounts.role_account(row.kind).label
-    if target_account and kind == "claude":
-        from scripts.accounts import accounts
+            target_account = accounts.role_account(row.kind).label
+        if target_account and kind == "claude":
+            from scripts.accounts import accounts
 
-        target_dir = accounts.account_dir(target_account)
-        _ = stop_resume.heal_account_trust(folder, target_dir,
-            Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
-        environment = named_account_environment(target_dir)
-    destination = client.saved_row_tab(str(row.id), row.name)
-    prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
-                                                  herdr.NO_ENVIRONMENT_REMOVALS)
-    if isinstance(prepared, nix_env.Refused):
-        raise OSError(str(prepared))
-    target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
-    try:
-        panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
-        if len(panes) > 1:
-            _anomaly(row, "duplicate panes retained")
-        elif panes and not panes[0].get("terminal_id"):
-            _anomaly(row, "pane has no terminal id; pane retained")
-        elif panes:
-            target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
-        _anomaly(row, error)
-    # Read liveness again immediately before the launch.
-    current = herdr.read_conversation(str(row.current_session), kind)
-    if isinstance(current, herdr.LiveConversation):
-        print(f"{row.name}: unchanged")
-        return ""
-    if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
-        herdr.conversation_note(current)
-    if kind == "claude":
-        arguments.extend(["--name", row.name])
-    result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
-        trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),
-        int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000), agent=row.name,
-        reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
-                          live.reason if isinstance(live, herdr.UnknownConversation) else ""))
-    try:
-        client.remember_row_tab(str(row.id), result.pane)
-        if present:
-            client.focus_tab_of(result.pane)
-            client.close_startup_workspaces(result.pane.split(":", 1)[0])
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
-        _anomaly(row, error)
-    print(f"{row.name}: restarted")
-    return result.pane
+            target_dir = accounts.account_dir(target_account)
+            _ = stop_resume.heal_account_trust(folder, target_dir,
+                Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
+            environment = named_account_environment(target_dir)
+        destination = client.saved_row_tab(str(row.id), row.name)
+        prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
+                                                      herdr.NO_ENVIRONMENT_REMOVALS)
+        if isinstance(prepared, nix_env.Refused):
+            raise OSError(str(prepared))
+        target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
+        try:
+            panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
+            if len(panes) > 1:
+                _anomaly(row, "duplicate panes retained")
+            elif panes and not panes[0].get("terminal_id"):
+                _anomaly(row, "pane has no terminal id; pane retained")
+            elif panes:
+                target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            _anomaly(row, error)
+        # Read liveness again immediately before the launch.
+        current = herdr.read_conversation(str(row.current_session), kind)
+        if isinstance(current, herdr.LiveConversation):
+            print(f"{row.name}: unchanged")
+            return ""
+        if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
+            herdr.conversation_note(current)
+        if kind == "claude":
+            arguments.extend(["--name", row.name])
+        operation_deadline.check()
+        result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
+            trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),
+            int(operation_deadline.remaining(herdr.PROGRAM_TIMEOUT_SECONDS) * 1000), agent=row.name,
+            reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
+                              live.reason if isinstance(live, herdr.UnknownConversation) else ""))
+        try:
+            client.remember_row_tab(str(row.id), result.pane)
+            if present:
+                client.focus_tab_of(result.pane)
+                client.close_startup_workspaces(result.pane.split(":", 1)[0])
+        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+            _anomaly(row, error)
+        print(f"{row.name}: restarted")
+        return result.pane
 
 
 def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
