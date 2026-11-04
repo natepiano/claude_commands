@@ -33,6 +33,8 @@ Exit 0 when the unit is resumed; 1 on a refusal or a failed step; 2 on usage.
 """
 from __future__ import annotations
 
+from scripts.message import sessions
+
 
 import argparse
 import re
@@ -188,7 +190,7 @@ def resume_folder(unit: RetiredUnit) -> Path:
 def has_transcript(unit: RetiredUnit) -> bool:
     folder = unit_move.project_folder(str(resume_folder(unit)))
     return any((directory / "projects" / folder / f"{unit.session_id}.jsonl").is_file()
-               for directory in unit_move.config_dirs())
+               for directory in sessions.config_dirs())
 
 
 def is_running(unit: RetiredUnit) -> bool:

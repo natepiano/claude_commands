@@ -243,7 +243,7 @@ class PaneRecordTests(unittest.TestCase):
               mock.patch.dict(os.environ, source_environment(self.root / "sources")),
               isolated_source_readers()):
             parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-            owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
+            owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id="019b3a40-4250-7000-8000-000000000102")
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
             retained = pane_record.launch("w1:p2", owner.id, "/work/alpha", {}, ["claude"])
@@ -281,7 +281,7 @@ class PaneRecordTests(unittest.TestCase):
         _ = self.enterContext(isolated_source_readers())
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
         parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-        owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
+        owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id="019b3a40-4250-7000-8000-000000000102")
         current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
         _ = staff.update_current_session(owner.current_session, current)
         return owner, current, path
@@ -522,8 +522,8 @@ class PaneRecordTests(unittest.TestCase):
     def test_restored_unit_id_comes_from_the_productions_units_table(self) -> None:
         from scripts.production import staff, session_staff, showrunners
 
-        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", parent.id, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
+        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", staff.ReportsTo(parent.id), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         document = "# Production — demo\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| `alpha` | standby |\n"
         source = showrunners.ShowrunnerSource(
             showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
@@ -536,7 +536,7 @@ class PaneRecordTests(unittest.TestCase):
     def test_staff_owner_supersedes_a_promoted_showrunners_old_session_staff(self) -> None:
         from scripts.production import staff, session_staff, showrunners
 
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         source = showrunners.ShowrunnerSource(
             showrunners.Timer("demo", "session:019b3a40-4250-7000-8000-000000000102", self.root / "demo.md", "UTC"), "# demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {

@@ -59,7 +59,7 @@ class AddUnitStaffRowTests(AddUnitTestCase):
             parent = before.by_path("director")
             self.assertIsNotNone(parent)
             assert parent is not None
-            self.assertEqual((row.kind, row.name, row.parent), ("unit", "alpha", parent.id))
+            self.assertEqual((row.kind, row.name, row.parent), ("unit", "alpha", staff.ReportsTo(parent.id)))
             self.assertCountEqual(staff.snapshot().rows, (*before.rows, row))
         self.assertEqual(self.herdr_calls(), [])
 

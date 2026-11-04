@@ -144,7 +144,7 @@ class ChangePageTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.raw_messages = []
-        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", None, current_session=staff.StaffId(""))
+        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""))
 
     def test_publications_keep_the_html_and_manifest_under_one_configured_root(self) -> None:
         from scripts.review_links import review_link
@@ -744,7 +744,7 @@ class ChangePageTests(unittest.TestCase):
         doc = self.temporary / "current-owner-production.md"
         _ = doc.write_text(self.production.read_text())
         runner = fixture_member("showrunner", name="current-owner", doc=staff.LiveDoc("natedev", doc))
-        _ = staff.move(self.unit.id, runner.id)
+        _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         status = change_page.DeliveryStatus(self.root)
         delivery = change_page.submit(self.page, urlencode(self.answer()), status)
         change_page.deliver(delivery, status)
@@ -762,7 +762,7 @@ class ChangePageTests(unittest.TestCase):
         doc = self.temporary / "current-owner-production.md"
         _ = doc.write_text(self.production.read_text())
         runner = fixture_member("showrunner", name="current-owner", doc=staff.LiveDoc("natedev", doc))
-        _ = staff.move(self.unit.id, runner.id)
+        _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         assignments: list[change_routing.ChangeAssignment] = []
         resolve = change_routing.StaffRouting.owner_and_production
 
@@ -977,7 +977,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_staff_moves_the_unit_changes_to_its_current_showrunner_tab(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
-        _ = staff.move(self.unit.id, runner.id)
+        _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         path, forms, body = self.browser()
         self.assertEqual(forms.tabs["page-owner/C1"], "sdlc")
         self.assertIn('sdlc (<span data-count>3</span>)', body)
@@ -1060,7 +1060,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_production_aliases_share_one_document_read_per_page_request(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
-        _ = staff.move(self.unit.id, runner.id)
+        _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         reads: list[Path] = []
         read_text = Path.read_text
 
@@ -1179,7 +1179,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_an_earlier_lists_prerequisites_keep_qualified_ids_in_the_embedded_tab_order(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
-        _ = staff.move(self.unit.id, runner.id)
+        _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         earlier = self.temporary / "change-review - earlier.md"
         _ = change_review.append_rows(earlier, [change_review.Visible("First", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", self.production,
@@ -1206,7 +1206,7 @@ class ChangePageTests(unittest.TestCase):
     def test_rows_from_two_units_use_their_producer_ids_for_their_staff_tabs(self) -> None:
         first = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
         second = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", self.production))
-        _ = staff.move(self.unit.id, first.id)
+        _ = staff.move(self.unit.id, staff.ReportsTo(first.id))
         second_unit = fixture_member("unit", name="second-unit", parent=second.id)
         _ = change_review.append_rows(self.review_list,
                                       [change_review.Visible("First mixed change", "Read", "First proof"),

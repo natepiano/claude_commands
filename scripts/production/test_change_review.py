@@ -132,7 +132,7 @@ class ProducerFixture(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", None, current_session=staff.StaffId(""))
+        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""))
 
 
     @override

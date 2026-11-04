@@ -10,6 +10,8 @@ refusing every progress call while two agents were still working.
 from __future__ import annotations
 
 from scripts.lib import test_hang_guard
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file
 
 from scripts.lib.test_models_registry import registry_text, write_registry
 
@@ -65,11 +67,18 @@ if verb in ('compact', 'can-follow', 'follow'):
     with (session / 'mesh_events.txt').open('a') as events:
         events.write(verb + '\\n')
 if verb == 'follow':
-    (session / 'follow_cwd.txt').write_text(option('--cwd'))
+    from scripts.production import staff, session_staff, worker_admission
+    member = worker_admission.member(session, option('--to'))
+    (session / 'follow_cwd.txt').write_text(str(session_staff.worker_directory(staff.local_snapshot(), member.id)))
 if verb == 'start':
     name = option('--name')
     roster[name] = {'thread_id': 'thread-for-' + name, 'turn_id': 'turn-1',
                     'status': 'done', 'role': option('--role'), 'task': option('--task')}
+    from scripts.production.staff_test_support import fixture_worker, isolated_staff_file
+    from scripts.production import staff
+    with isolated_staff_file(pathlib.Path(os.environ['STAFF_FILE']), {}):
+        worker = fixture_worker(name, staff.native_id(os.environ['CODEX_THREAD_ID']))
+    roster[name]['staff_id'] = worker.id
     pathlib.Path(option('--reply-file')).write_text('initial reply\\n')
 elif verb == 'compact':
     name = option('--to')
@@ -181,10 +190,14 @@ if sys.argv[1] == '--bg':
         pathlib.Path(os.environ['STUB_SUMMARY']).write_bytes(own_summary.read_bytes())
     name = sys.argv[sys.argv.index('--name') + 1]
     import uuid
+    session_id = 'abc12345-' + str(uuid.uuid5(uuid.NAMESPACE_URL, name))[9:]
+    projects = pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR') or str(root / '.claude')) / 'projects/fixture'
+    projects.mkdir(parents=True, exist_ok=True)
+    (projects / f'{session_id}.jsonl').write_text(json.dumps({'type': 'assistant', 'message': {'stop_reason': 'end_turn'}}) + '\\n')
     registry = pathlib.Path(os.environ.get('NOTIFIER_SESSIONS_DIR', str(root / 'sessions')))
     registry.mkdir(parents=True, exist_ok=True)
     (registry / f"{os.environ['FIXTURE_BACKEND_PID']}.json").write_text(json.dumps({
-        'id': 'abc12345', 'sessionId': 'abc12345-' + str(uuid.uuid5(uuid.NAMESPACE_URL, name))[9:],
+        'id': 'abc12345', 'sessionId': session_id,
         'name': name, 'pid': int(os.environ['FIXTURE_BACKEND_PID']),
         'procStart': os.environ['FIXTURE_BACKEND_START'], 'updatedAt': 1, 'messagingSocketPath': ''}))
     print(f'backgrounded · abc12345 · {name}')
@@ -202,7 +215,8 @@ elif sys.argv[1:3] == ['agents', '--json']:
     if launch_args.exists():
         arguments = json.loads(launch_args.read_text())
         name = arguments[arguments.index('--name') + 1]
-    print(json.dumps([{'id': 'abc12345', 'name': name, 'status': status}]
+    session_id = json.loads(next((root / 'sessions').glob('*.json')).read_text())['sessionId']
+    print(json.dumps([{'id': 'abc12345', 'sessionId': session_id, 'name': name, 'status': status}]
                      if status != 'gone' else []))
 elif sys.argv[1] == 'logs':
     pane = root / 'pane.bin'
@@ -265,6 +279,8 @@ class ImplementLauncherFixture(LauncherFixture):
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         with isolated_staff_file(self.root / "staff.json", {}):
             parent = unit_membership("fixture", "fixture-unit")
+            from scripts.production import staff
+            parent = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.working_dir), expected=parent.worktree)
         return parent.id
 
     @override
@@ -517,6 +533,13 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     def observed_status(self, session_dir: Path, command: str) -> str:
         return (session_dir / f"observed_{command}.txt").read_text(encoding="utf-8")
 
+    def recorded_worker(self, session_dir: Path, slot: str = "impl") -> staff.StaffRow:
+        identity = cast(dict[str, object], json.loads((session_dir / f"impl_worker_{slot}.json").read_text()))
+        with isolated_staff_file(self.root / "staff.json", {}):
+            member = staff.local_snapshot().by_id(staff.native_id(str(identity["staff_id"])))
+        assert member is not None
+        return member
+
     def claude_worker(self, session_dir: Path) -> Path:
         registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, base_text=CLAUDE_REGISTRY)
@@ -535,21 +558,21 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             json.dumps({"type": "assistant", "message": {"stop_reason": "end_turn"}})
             + "\n", encoding="utf-8"
         )
-        _ = (session_dir / "workers").write_text(
-            "abc12345\tfixture-impl\n", encoding="utf-8"
-        )
         _ = (session_dir / "impl_bg_id_impl").write_text(
             "abc12345\n", encoding="utf-8"
         )
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_worker, isolated_staff_file
+        with isolated_staff_file(self.root / "staff.json", {}):
+            worker = fixture_worker("fixture-impl", staff.native_id(self.staff_parent), runtime_id=session_id)
         _ = (session_dir / "impl_worker_impl.json").write_text(json.dumps({
-            "name": "fixture-impl", "slot": "impl", "family": "claude",
-            "model": "opus", "worker_id": session_id,
+            "staff_id": worker.id, "slot": "impl", "model": "opus",
         }), encoding="utf-8")
         _ = (session_dir / "impl_status_impl").write_text(
             "implemented\n", encoding="utf-8"
         )
         _ = (self.root / "worker_state").write_text("idle\n", encoding="utf-8")
-        for name, content in (("claude", STUB_CLAUDE), ("send", STUB_SEND)):
+        for name, content in (("claude-bin", STUB_CLAUDE), ("send", STUB_SEND)):
             script = self.root / name
             _ = script.write_text(content, encoding="utf-8")
             script.chmod(0o755)
@@ -560,7 +583,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     ) -> subprocess.CompletedProcess[str]:
         environment = self.environment()
         environment.update({
-            "CLAUDE_BIN": str(self.root / "claude"),
+            "CLAUDE_BIN": str(self.root / "claude-bin"),
             "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_PROJECTS_DIR": str(self.root / "projects"),
@@ -592,7 +615,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     ) -> subprocess.CompletedProcess[str]:
         registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, {"direct.claude": {"impl": registry_row}}, base_text=CLAUDE_REGISTRY)
-        stub = self.root / "claude"
+        stub = self.root / "claude-bin"
         _ = stub.write_text(STUB_CLAUDE, encoding="utf-8")
         stub.chmod(0o755)
         environment = self.environment()

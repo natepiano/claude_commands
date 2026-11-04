@@ -27,7 +27,6 @@ import rename_state
 import tidy_wrapped
 from scripts.hooks import showrunner_footer
 
-from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
 
 class RegistrationTests(RegistrationFixture):
@@ -439,8 +438,8 @@ class QuestionIdentityTests(RegistrationFixture):
     def test_footer_ignores_questions_when_the_document_has_no_local_staff_owner(self) -> None:
         self.file_question()
         owner = staff.by_id(self.asker_id)
-        assert owner is not None and owner.parent is not None
-        _ = staff.set_doc(owner.parent, staff.LiveDoc("macbook", self.doc))
+        assert owner is not None and isinstance(owner.parent, staff.ReportsTo)
+        _ = staff.set_doc(owner.parent.id, staff.LiveDoc("macbook", self.doc))
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
                             showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
@@ -476,7 +475,7 @@ class QuestionIdentityTests(RegistrationFixture):
     def test_answer_resolves_the_fixed_asker_after_a_transfer(self) -> None:
         self.file_question()
         destination = fixture_member("showrunner", name="destination")
-        _ = staff.move(self.asker_id, destination.id)
+        _ = staff.move(self.asker_id, staff.ReportsTo(destination.id))
         references: list[str] = []
         resolve = staff.StaffSnapshot.by_member_reference
 

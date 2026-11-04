@@ -29,10 +29,10 @@ class FileOnlyLabelTests(unittest.TestCase):
             doc = root / "healthy-production.md"
             _ = doc.write_text("# Healthy production\n")
             identity = staff.StaffId(fixture_runtime_id("healthy-owner"))
-            healthy_owner = staff.StaffRow(identity, "showrunner", "healthy-owner", None,
+            healthy_owner = staff.StaffRow(identity, "showrunner", "healthy-owner", staff.StaffRoot(),
                                            current_session=identity, doc=staff.LiveDoc("natedev", doc))
             missing_id = staff.StaffId(fixture_runtime_id("missing-owner"))
-            missing = staff.StaffRow(missing_id, "showrunner", "missing-owner", None,
+            missing = staff.StaffRow(missing_id, "showrunner", "missing-owner", staff.StaffRoot(),
                                      current_session=missing_id,
                                      doc=staff.LiveDoc("natedev", root / "missing-production.md"))
             _ = fake_showrunner.write_timer(root, "healthy-alias", identity, "UTC", doc)
@@ -67,10 +67,10 @@ class FileOnlyLabelTests(unittest.TestCase):
                 document = root / f"{name}.md"
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
-                rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", None,
+                rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", staff.StaffRoot(),
                                           current_session=owner_id, doc=staff.LiveDoc("natedev", document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
-                rows.append(staff.StaffRow(unit_id, "unit", name, owner_id, current_session=unit_id,
+                rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
                                           worktree=staff.PresentWorktree("natedev", root / name)))
             snapshot = staff.StaffSnapshot(tuple(rows))
 
@@ -111,10 +111,10 @@ class FileOnlyLabelTests(unittest.TestCase):
                 document = root / f"{name}.md"
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
-                rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", None,
+                rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", staff.StaffRoot(),
                                           current_session=owner_id, doc=staff.LiveDoc("natedev", document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
-                rows.append(staff.StaffRow(unit_id, "unit", name, owner_id, current_session=unit_id,
+                rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
                                           worktree=staff.PresentWorktree("natedev", root / name)))
                 _ = fake_showrunner.write_timer(timers, name + "-alias", owner_id, "UTC", document)
             unreadable = timers / "showrunner-broken-alias/conf"
@@ -154,10 +154,10 @@ class FileOnlyLabelTests(unittest.TestCase):
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
                 document_state = (staff.WrappedDoc("natedev", document) if name == "wrapped"
                                   else staff.LiveDoc("natedev", document))
-                rows.append(staff.StaffRow(owner_id, "showrunner", name, None,
+                rows.append(staff.StaffRow(owner_id, "showrunner", name, staff.StaffRoot(),
                                           current_session=owner_id, doc=document_state))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
-                rows.append(staff.StaffRow(unit_id, "unit", name + "-child", owner_id, current_session=unit_id,
+                rows.append(staff.StaffRow(unit_id, "unit", name + "-child", staff.ReportsTo(owner_id), current_session=unit_id,
                                           worktree=staff.PresentWorktree("natedev", root / name)))
             snapshot = staff.StaffSnapshot(tuple(rows))
             problems: list[str] = []

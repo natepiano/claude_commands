@@ -12,9 +12,6 @@
 #                                 its turn to end -- for a caller that talks to
 #                                 the session itself (ask_a_friend) rather than
 #                                 waiting on a summary
-#   env AGENT_BG_LEDGER=<file>    append `<id>\t<mesh_name>` to <file> once the
-#                                 session is registered, for the caller's
-#                                 cleanup -- direct/remove_workers.py reads it
 #
 # Why this exists rather than agent_exec.sh: a worker launched with
 # `claude --print` is INVISIBLE. It holds the ListAgents/SendMessage tools but
@@ -33,11 +30,7 @@
 # in the foreground for the life of the agent and exits with its outcome, and
 # the caller's `wait`, heartbeat watch, and pass recording work unchanged.
 #
-# The session is deliberately LEFT ALIVE when its turn ends. A message resumes a
-# stopped-turn session from its transcript, so a finished implementer can still
-# answer the tester's question. The caller ends it: a worker through the
-# AGENT_BG_LEDGER record and direct/remove_workers.py, a friend through the id
-# in <id_file>.
+# The session stays alive after its turn ends. Staff supplies its current identity for cleanup.
 
 set -euo pipefail
 unset STAFF_ID
@@ -66,7 +59,6 @@ MODEL="${7:-}"
 POLL_SECS="${8:-15}"
 EFFORT="${AGENT_BG_EFFORT:-}"
 DETACH="${AGENT_BG_DETACH:-0}"
-LEDGER="${AGENT_BG_LEDGER:-}"
 
 # Never the bare name: the user's interactive shell aliases `claude` to inject
 # `--remote-control "<dir> <date>"`, which turns `claude stop <id>` into a new
@@ -102,16 +94,34 @@ ADMISSION_RUN="${UNIT_RUN_DIR:-${WORKING_DIR}}"
 OPENING_ROLE="${AGENT_BG_ROLE:-${UNIT_TEAM_ROLE:-}}"
 "$PY" "$WORKER_FILL" admit --name "$MESH_NAME" --run "$ADMISSION_RUN" --role "$OPENING_ROLE" || exit 2
 
+# Read the prior conversation before publication replaces current_session.
+PROMPT_FILE="$("$PY" - "$WORKER_FILL" "$ADMISSION_RUN" "$MESH_NAME" "$OPENING_ROLE" "$PROMPT_FILE" "$LOG_FILE" <<'PYCONTEXT'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+from scripts.production import worker_admission
+allowed = worker_admission.admit(sys.argv[3], Path(sys.argv[2]), role=sys.argv[4])
+context = worker_admission.family_switch_context(allowed, "claude")
+prompt = Path(sys.argv[5])
+if context:
+    text = prompt.read_text()
+    prompt = Path(sys.argv[6] + ".prompt")
+    prompt.write_text(context + "\n\n" + text)
+print(prompt)
+PYCONTEXT
+)" || exit 2
+
 publish_worker() {
   # The banner can precede the registry record. Wait only while no record matches.
   source "$NIX_ENV_LIB/conf.sh"
   local register_wait
   register_wait="$(conf_value direct CLAUDE_WORKER_REGISTER_WAIT_SECS)" || return 2
-  NATIVE_ID="$(BG_ID="$BG_ID" "$PY" - "$NIX_ENV_LIB/../.." "$register_wait" <<'PYREG'
+  NATIVE_ID="$(BG_ID="$BG_ID" "$PY" - "$WORKER_FILL" "$register_wait" <<'PYREG'
 import sys
 import os
 import time
-sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
 from scripts.message import sessions
 from scripts.production import staff
 wait_seconds = int(sys.argv[2])
@@ -332,19 +342,6 @@ if [[ "$delivery" != SENT:* && "$delivery" != SKIPPED:* ]]; then
   exit 2
 fi
 
-if [[ -n "${LEDGER}" ]]; then
-  LEDGER="$("$PY" - "$(dirname "${BASH_SOURCE[0]}")/../direct" "${LEDGER}" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from worker_state import worker_ledger
-
-path = Path(sys.argv[2])
-print(worker_ledger(path.parent) if path.name in ("seats", "workers") else path)
-PY
-)"
-  printf '%s\t%s\n' "${BG_ID}" "${MESH_NAME}" >> "${LEDGER}"
-fi
 "$PY" "$(dirname "${BASH_SOURCE[0]}")/../usage/agents_log.py" append --id "${BG_ID}" --role worker || true
 if [[ "${DETACH}" == "1" ]]; then
   echo "launched ${MESH_NAME} (${BG_ID})"

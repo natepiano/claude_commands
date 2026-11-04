@@ -2428,7 +2428,8 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/process_failure.py", library / "process_failure.py")
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/probe_session.py", library / "probe_session.py")
-        for relative in ("lib/script_envelope.py", "lib/atomic_file.py", "lib/session_paths.py", "production/staff.py", "shutdown/remote.py"):
+        for relative in ("lib/script_envelope.py", "lib/session_paths.py", "lib/atomic_file.py", "lib/conf.py", "agents/worker_lifecycle.py",
+                         "production/staff.py", "shutdown/remote.py"):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)
@@ -5135,8 +5136,8 @@ class SavedLayoutTests(unittest.TestCase):
         retired = unit_membership("current", "retired-unit")
         old_child = unit_membership("wrapped", "child-unit")
         _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
-        assert old_child.parent is not None
-        _ = staff.set_doc(old_child.parent, staff.WrappedDoc("natedev", self.root / "archive.md"))
+        assert isinstance(old_child.parent, staff.ReportsTo)
+        _ = staff.set_doc(old_child.parent.id, staff.WrappedDoc("natedev", self.root / "archive.md"))
         processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p1"),
                                        {"STAFF_ID": retired.id}, "claude", "/missing")]
         classifier = herdr.UnitTabClassifier("fixture", processes, staff.snapshot())

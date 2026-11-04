@@ -149,7 +149,7 @@ class BerthHookTests(unittest.TestCase):
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
                                   str(self.repo), str(self.repo / "design.md"), "design",
                                   "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("demo", "design-unit"), binding,
-                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen("designer-thread")),
+                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen(staff.StaffId("designer-thread"))),
                                    design_roles.RoleInstance("reviewer", "lasting-reviewer", design_roles.RoleNotOpened())))
         self.environment.update({"HELD_DESIGN_ID": design_id, "DESIGN_BINDING_GENERATION": "2"})
         with mock.patch.dict(os.environ, self.environment):

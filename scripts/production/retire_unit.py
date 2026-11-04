@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import session_staff, staff, staff_sources, unit_config
+from scripts.production import staff, staff_sources, unit_config, unit_table
 from scripts.shutdown.remote import local_machine
 from scripts.lib import process_group, conf
 from scripts.copies import copies
@@ -206,8 +206,8 @@ def production_of(slug: str) -> Production:
 
 
 def find_unit(slug: str, given: str, *,
-              record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Unit:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+              record: staff.StaffSnapshot | None = None) -> Unit:
+    record = staff.snapshot() if record is None else record
     production = production_of(slug)
     rows = production_units.unit_table(production.doc.read_text(encoding="utf-8").splitlines())
     ids = [production_units.cell_value(row.get("Unit", "")) for row in rows]
@@ -423,11 +423,23 @@ def _json(path: Path) -> dict[str, object]:
 
 
 def runs_of(worktree: Path) -> list[Path]:
-    """Every /unit:direct run folder whose history names the worktree."""
+    """Find run folders through the staff rows of their workers."""
+    from scripts.production import worker_admission
+
+    record = staff.local_snapshot()
+    owners = {row.id for row in record.rows
+              if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree))
+              and row.worktree.path == worktree}
     found: list[Path] = []
     for root in unit_runs.run_roots(os.environ.get("RETIRE_UNIT_RUN_ROOT") or None):
         for folder in sorted(root.iterdir()) if root.is_dir() else ():
-            if folder.name != "active" and _json(folder / unit_runs.STATE_FILE).get("working_dir") == str(worktree):
+            if not folder.is_dir() or folder.name == "active":
+                continue
+            try:
+                owner = worker_admission.parent(record, run=folder)
+            except (OSError, ValueError):
+                continue
+            if owner.id in owners:
                 found.append(folder)
     return found
 
@@ -578,7 +590,7 @@ def marked_director(unit: Unit) -> unit_lookup.LiveClaude | unit_lookup.ClaudeNo
 
 def transcript_locations(session_id: str) -> list[Path]:
     """Distinct project folders holding this transcript, including shared account symlinks once."""
-    return sorted({path.resolve() for directory in unit_move.config_dirs()
+    return sorted({path.resolve() for directory in sessions.config_dirs()
                    for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
 
 
@@ -618,9 +630,8 @@ def last_session(unit: Unit) -> str:
     if unit.retired:
         for row in production_units.unit_table(unit.production.doc.read_text(encoding="utf-8").splitlines()):
             if production_units.cell_value(row.get("Unit", "")) == unit.name:
-                saved = re.match(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?=,|\))", row.get("Plan", ""))
-                if saved:
-                    return saved[1]
+                if saved := unit_table.retired_session(row.get("Plan", "")):
+                    return saved
     launches = [entry for entry in pane_record.launches()
                 if entry["environment"].get("SHOWRUNNER_UNIT_ID") == unit.name and entry["session_id"]]
     if launches:
@@ -632,7 +643,7 @@ def last_interactive_session(worktree: Path, *, dependencies: Callable[[Path], N
     """Recover the newest interactive transcript from this worktree's project folder."""
     folder = unit_move.project_folder(str(worktree))
     transcripts: set[Path] = set()
-    for directory in unit_move.config_dirs():
+    for directory in sessions.config_dirs():
         project = directory / "projects" / folder
         if dependencies is not None:
             dependencies(project)
@@ -881,7 +892,8 @@ def stop_rest(unit: Unit, found: Found, recorded_session_id: str = "", *, settin
     """Stop owned resources; remaining unowned cwd processes come back as blockers."""
     from scripts.direct import workers
     left: list[str] = []
-    workers.end_unit(unit.production.slug, unit.name)
+    if isinstance(unit.staff_member, staff.StaffRow):
+        workers.end_unit(unit.staff_member)
     for item in found.runs:
         result = run([sys.executable, str(MESH), "stop", "--session-dir", str(item.run)], settings=settings)
         if result.returncode:
@@ -1018,8 +1030,8 @@ def prepare_retirement(unit: Unit, row: staff.StaffRow, *, settings: conf.Config
 
 
 def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
-           record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> int:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+           record: staff.StaffSnapshot | None = None) -> int:
+    record = staff.snapshot() if record is None else record
     member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), record)
     if isinstance(member, staff_sources.NoSuchMember):
         raise Refused(f"{unit.name}: no staff row; run staff_sources.py fill")
@@ -1097,8 +1109,9 @@ def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
     if workers:
         return 1
     if not failed:
-        _ = staff.set_worktree(member.row.id, staff.RemovedWorktree(local_machine(), location.path),
-                               expected=member.row.worktree)
+        removed = staff.RemovedWorktree(local_machine(), location.path)
+        if member.row.worktree != removed:
+            _ = staff.set_worktree(member.row.id, removed, expected=member.row.worktree)
         print(f"{unit.name} already retired" if already_retired and not committed else f"{unit.name} retired")
     return 1 if failed else 0
 

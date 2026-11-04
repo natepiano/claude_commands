@@ -206,7 +206,7 @@ def _document_port(source: SourceLocation, cells: dict[str, str], note: str = ""
 
 def _document(row: staff.StaffRow, record: staff.StaffSnapshot,
               files: dict[SourceLocation, FileEvidence | FileMissing | Unavailable]) -> DocumentPortEvidence:
-    owner = record.by_id(row.parent) if row.parent is not None else None
+    owner = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
     if owner is None or owner.kind != "showrunner" or isinstance(owner.doc, staff.DocUnfilled):
         problem = Unavailable("parent has no bound production document")
         return DocumentPortEvidence(problem, "", problem)
@@ -297,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             if result["note"]:
                 print(f"  note: {result['note']}")
             if result["gap"]:
-                parent = record.by_id(evidence.row.parent) if evidence.row.parent is not None else None
+                parent = record.parent_of(evidence.row)
                 production = parent.name if parent is not None else "unknown"
                 print(f"  gap for {production}: {result['gap']}")
     return 0

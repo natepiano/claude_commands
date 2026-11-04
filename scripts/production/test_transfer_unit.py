@@ -20,22 +20,19 @@ from dataclasses import replace
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.astra import design_roles
+from scripts.astra.design_role_test_support import designer_fixture
 from scripts.astra.design_role_test_support import write_empty_binding_record
-from scripts.direct import workers
-from scripts.production import staff, staff_move, unit_config
+from scripts.production import staff, session_staff, staff_move, unit_config
 from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
 from scripts.production.rename_rerun_test_support import final_files, saved_fixture
 from scripts.production.staff_test_support import SOURCES_SCRIPT
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production.transfer_unit_test_support import (
-    UnitTransferFixture, SCRIPT,
-)
+from scripts.production.transfer_unit_test_support import UnitTransferFixture
 import transfer_unit
 from rename_state import write_text
 import fake_showrunner
 import fake_unit_host
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS as PROCESS_TIMEOUT
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -86,8 +83,8 @@ class UnitTransferTests(UnitTransferFixture):
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.unit), expected=row.worktree)
         receiving = next(row for row in staff.find(kind="showrunner") if row.name == "other")
-        assert row.parent is not None
-        giving = staff.by_id(row.parent)
+        assert isinstance(row.parent, staff.ReportsTo)
+        giving = staff.by_id(row.parent.id)
         assert giving is not None
         parents = tuple(staff.set_doc(parent.id, staff.LiveDoc(
             "natedev", checkout / "docs/plans" / f"{parent.name}-production.md"))
@@ -97,20 +94,20 @@ class UnitTransferTests(UnitTransferFixture):
         path = self.unit / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.by_id(row.id), replace(row, parent=receiving.id))
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(receiving.id)))
         self.assertEqual(tuple(staff.by_id(parent.id) for parent in parents), parents)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         self.assertTrue(self.unit.is_dir())
         self.assertEqual(self.git("check-ignore", ".unit.toml", cwd=self.unit), ".unit.toml")
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.by_id(row.id), replace(row, parent=receiving.id))
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(receiving.id)))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_bad_unrelated_record_warns_once_across_move_and_verification(self) -> None:
         self.env['DESIGN_ROLES_STATE'] = str(self.root / 'state/astra/design-roles')
         with mock.patch.dict(os.environ, self.env):
             bad = write_empty_binding_record(self.unit, design_roles.UnitHolder('unrelated', 'other-unit'),
-                                             lifecycle=design_roles.RoleOpen('unrelated-thread'))
+                                             lifecycle=design_roles.RoleOpen(staff.StaffId('unrelated-thread')))
         completed = self.transfer('apply')
         self.assert_ok(completed)
         self.assertEqual(completed.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
@@ -127,7 +124,7 @@ class UnitTransferTests(UnitTransferFixture):
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id,
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, staff.ReportsTo(parent.id), current_session=row.id,
                                 worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
         self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
         self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
@@ -169,7 +166,7 @@ class UnitTransferTests(UnitTransferFixture):
         self.assert_ok(planned)
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id,
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, staff.ReportsTo(parent.id), current_session=row.id,
                                 worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
         self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
         self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
@@ -294,7 +291,7 @@ class UnitTransferTests(UnitTransferFixture):
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
         worker = fixture_member("worker", name="impl1", parent=row.id)
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", staff.ReportsTo(parent.id), current_session=row.id,
                                 worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
         self.assertEqual(staff.snapshot().by_id(worker.id), worker)
         saved = cast(dict[str, object], json.loads((self.root / "state/showrunner/demo/transfer_unit.json").read_text()))
@@ -378,7 +375,7 @@ class UnitTransferTests(UnitTransferFixture):
             with mock.patch.object(self, "root", Path(directory)):
                 listener = contexts.enter_context(self.lock_notice(lock))
             def pause(transfer: transfer_unit.UnitTransfer, save: Callable[[], None]) -> None:
-                self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
+                self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", staff.ReportsTo(parent.id), current_session=row.id,
                                 worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
                 process = self.start_script(SOURCES_SCRIPT, "seed")
                 pending.append(process)
@@ -391,7 +388,7 @@ class UnitTransferTests(UnitTransferFixture):
                 self.assert_ok(self.transfer("apply"))
             output, errors = pending[0].communicate(timeout=PROCESS_TIMEOUT)
         self.assertEqual(pending[0].returncode, 0, output + errors)
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", staff.ReportsTo(parent.id), current_session=row.id,
                                 worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
 
     def test_rerun_finishes_each_uncommitted_document_write(self) -> None:
@@ -493,47 +490,7 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertEqual(self.messages(), [])
         self.assertEqual(self.git("rev-parse", "demo", "other", "demo-alpha"), before)
 
-    def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
-        result = subprocess.run([sys.executable, "-c", 'import runpy, sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))\nfrom scripts.direct import workers\ndef unavailable(*args, **kwargs):\n    raise workers.WorkerUnavailable("worker ownership changed; rerun apply")\nworkers.move_unit = unavailable\nworkers.rename_unit = unavailable\nworkers.end_unit = unavailable\nsys.argv = sys.argv[1:]\nsys.path.insert(0, str(Path(sys.argv[0]).parent))\nrunpy.run_path(sys.argv[0], run_name="__main__")\n', str(SCRIPT), "apply", "demo", "alpha-unit",
-            str(self.receiving / "docs/plans/other-production.md"), "--scratch", str(self.root / "scratch")],
-            cwd=self.giving, env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("worker ownership changed; rerun apply", result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
 
-    def test_transfer_rebinds_the_writer_ledger_without_changing_its_thread_or_owner(self) -> None:
-        run = self.root / "runs" / "carried"
-        run.mkdir(parents=True)
-        state = run / "progress_history_state.json"
-        self.write(state, json.dumps({"production": "demo", "unit": "alpha-unit", "working_dir": str(self.unit)}))
-        with mock.patch.dict(os.environ, self.env):
-            store = workers.UnitWorkerLedger(workers.ledger_path("demo", "alpha-unit"))
-            worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
-                workers.CodexThread("original-thread", str(self.root / "codex")), workers.Paused(),
-                [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
-            with store.locked() as ledger:
-                ledger.workers[worker.name] = worker
-        roster = run / "mesh_roster.json"
-        self.write(roster, json.dumps({"w7": {"thread_id": "original-thread", "role": "impl",
-            "status": "paused", "unit_ledger": str(store.path)}}))
-        record = run / "mesh_runs" / "kept-command.json"
-        with subprocess.Popen([sys.executable, "-c", "import sys; from pathlib import Path; sys.stdin.read(); Path('command-finished').write_text(str(Path.cwd()))",
-                               "mesh_runs.py", "supervise", str(record)],
-                              cwd=self.unit, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as command:
-            self.write(record, json.dumps({"worker": "w7", "status": "running", "pid": command.pid, "cwd": str(self.unit)}))
-            self.assert_ok(self.transfer("apply"))
-            self.assertIsNone(command.poll(), "transfer ended the paused worker's detached command")
-            _output, errors = command.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(command.returncode, 0, errors.decode())
-            self.assertEqual((self.unit / "command-finished").read_text(), str(self.unit))
-            self.assertTrue(record.exists())
-        with mock.patch.dict(os.environ, self.env):
-            target = workers.ledger_for_run(run)
-            self.assertEqual(target.path, workers.ledger_path("other", "alpha-unit"))
-            with target.locked() as ledger:
-                self.assertEqual(ledger.workers["w7"], worker)
-        self.assertFalse(store.path.exists())
-        self.assertEqual(json.loads(roster.read_text())["w7"]["unit_ledger"], str(target.path))
 
     def test_apply_moves_the_row_header_and_state_and_keeps_the_branch(self) -> None:
         tip = self.git("rev-parse", "demo-alpha")
@@ -567,15 +524,17 @@ class UnitTransferTests(UnitTransferFixture):
             design_roles.register_repository("fixture-repo", {"fixture-host": str(self.unit)}, inventory_complete=True)
             placement = design_roles.authority_request("reserve", {"repository_id": "fixture-repo",
                 "document": "docs/plans/alpha.md", "host": "fixture-host", "request_id": "transfer-fixture"})
+            row = designer_fixture(design_roles.UnitHolder("demo", "alpha-unit"),
+                                   "demo-design-astra-designer", self.root / "codex-home")
             design = design_roles.HeldDesign(design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1),
                 "fixture-repo", str(self.unit), document, "design", "2026-10-22T12:00:00+00:00",
                 design_roles.UnitHolder("demo", "alpha-unit"), design_roles.DesignUnbound(),
-                (design_roles.RoleInstance("designer", "demo-design-astra-designer", design_roles.RoleOpen("designer-thread")),
+                (design_roles.RoleInstance("designer", "demo-design-astra-designer", design_roles.RoleOpen(row.id)),
                  design_roles.RoleInstance("reviewer", "demo-design-astra-reviewer", design_roles.RoleNotOpened())))
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             mesh = design_roles.mesh_directory(design.placement.design_id)
         self.write(mesh / "mesh_roster.json", json.dumps({"demo-design-astra-designer": {
-            "thread_id": "designer-thread", "status": "done", "cwd": str(self.unit)}}))
+            "staff_id": row.id, "status": "done", "cwd": str(self.unit)}}))
         self.assert_ok(self.transfer("apply"))
         with mock.patch.dict(os.environ, self.env):
             moved = design_roles.read_design(design.placement.design_id)
@@ -583,7 +542,7 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertEqual((moved.repository, moved.document, moved.roles), (design.repository, design.document, design.roles))
         self.assertEqual(moved.placement.generation, 2)
         roster = cast(dict[str, dict[str, str]], json.loads((mesh / "mesh_roster.json").read_text(encoding="utf-8")))
-        self.assertEqual(roster["demo-design-astra-designer"]["cwd"], str(self.unit))
+        self.assertEqual(session_staff.worker_directory(staff.local_snapshot(), staff.StaffId(roster["demo-design-astra-designer"]["staff_id"])), self.unit)
         self.assert_ok(self.transfer("verify"))
 
     def test_work_in_progress_stays_and_only_the_header_is_committed(self) -> None:

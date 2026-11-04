@@ -163,4 +163,4 @@ class RowProductionMetadataTests(StaffTestCase):
         self.assertEqual((metadata.problems[0].unit_id, metadata.problems[0].name), (unit.id, unit.name))
         self.assertIn("the worktree is not recorded", metadata.problems[0].reason)
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(unit.parent, runner.id)
+        self.assertEqual(unit.parent, staff.ReportsTo(runner.id))

@@ -45,7 +45,7 @@ SESSION = "nightly-review"
 DOC = Path("/work/docs/plans/build-followups-production.md")
 UNIT = LiveClaude("nightly-review", "aaaaaaaa-0000-0000-0000-000000000001", "/run/cc-socks/42.sock", 42)
 PRODUCTION = nightly_review.NightlyProduction(DOC, "build-followups", nightly_review.NightlyUnit(
-    staff.StaffRow(staff.StaffId(UNIT.session_id), "unit", SESSION, None,
+    staff.StaffRow(staff.StaffId(UNIT.session_id), "unit", SESSION, staff.StaffRoot(),
                    current_session=staff.StaffId(UNIT.session_id),
                    worktree=staff.PresentWorktree("natedev", DOC.parents[1])),
     unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ("nightly-review",)),
@@ -305,7 +305,7 @@ class NightlyProductionTests(NightlyReviewTests):
         unit = recorded_unit(name + "-owner", "nightly-review", tree, path, plan=plan)
         responsibilities = '["nightly-review"]' if plan == "permanent" else "[]"
         _ = (tree / ".unit.toml").write_text(f'plan = "{plan}"\nresponsibilities = {responsibilities}\n')
-        parent = staff.snapshot().by_id(unit.parent) if unit.parent is not None else None
+        parent = staff.snapshot().parent_of(unit)
         if parent is None:
             self.fail("the nightly fixture unit lost its parent")
         _ = fake_showrunner.write_timer(Path(os.environ["NOTIFIER_STATE_DIR"]), name,

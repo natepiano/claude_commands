@@ -12,7 +12,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 from git_process import GitExitAnswers, run_git
 
 import style_ledger
-from scripts.production import staff, staff_sources, unit_lookup, session_staff
+from scripts.production import staff, staff_sources, unit_lookup
 from production_units import cell_value, production_field, unit_table
 
 
@@ -34,8 +34,8 @@ def file_text(repo: Path, commit: str, path: str) -> str:
 
 
 def unit_worktrees(doc: Path, *,
-                   record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitWorktree, ...]:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+                   record: staff.StaffSnapshot | None = None) -> tuple[UnitWorktree, ...]:
+    record = staff.snapshot() if record is None else record
     lines = doc.read_text().splitlines()
     sources = unit_lookup.member_sources()
     slug = unit_lookup.production_slug_for_document(doc, record, sources)

@@ -8,7 +8,6 @@ from scripts.production.staff_test_support import fixture_member
 
 import json
 import os
-import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -23,8 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 
-from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIPT, SLUG
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.rename_unit_test_support import UnitRenameFixture, SLUG
 
 
 @final
@@ -82,7 +80,7 @@ class UnitRenameTests(UnitRenameFixture):
     def test_bad_unrelated_record_warns_once_across_move_and_verification(self) -> None:
         with mock.patch.dict(os.environ, self.env):
             bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('unrelated', 'other-unit'),
-                                             lifecycle=design_roles.RoleOpen('unrelated-thread'))
+                                             lifecycle=design_roles.RoleOpen(staff.StaffId('unrelated-thread')))
         completed = self.rename('apply')
         self.assert_ok(completed)
         self.assertEqual(completed.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
@@ -164,13 +162,6 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual(self.snapshot(), before)
 
 
-    def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
-        result = subprocess.run([sys.executable, "-c", 'import runpy, sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))\nfrom scripts.direct import workers\ndef unavailable(*args, **kwargs):\n    raise workers.WorkerUnavailable("worker ownership changed; rerun apply")\nworkers.move_unit = unavailable\nworkers.rename_unit = unavailable\nworkers.end_unit = unavailable\nsys.argv = sys.argv[1:]\nsys.path.insert(0, str(Path(sys.argv[0]).parent))\nrunpy.run_path(sys.argv[0], run_name="__main__")\n', str(SCRIPT), "apply", SLUG, "alpha", "gamma",
-            "--scratch", str(self.root / "scratch")], cwd=self.checkout, env=self.env,
-            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("worker ownership changed; rerun apply", result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
 
     def test_plan_writes_nothing_and_names_each_step(self) -> None:
         before = self.snapshot()

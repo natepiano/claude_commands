@@ -81,7 +81,6 @@ case "${AGENT_FAMILY}" in
     if "$PY" "${AGENTS_DIR}/codex_mesh.py" start --resident \
       --session-dir "${SESSION_DIR}" \
       --name "${FRIEND}" \
-      --cwd "${WORKING_DIR}" \
       --prompt-file "${QUESTION_FILE}" \
       --summary-file "${ANSWER_FILE}" \
       --log-file "${LOG_FILE}" \

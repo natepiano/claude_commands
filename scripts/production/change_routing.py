@@ -201,9 +201,9 @@ class StaffRouting:
             return self.unrouted(review_list, row, f"Producer {identity} is not a staff unit or showrunner", identity)
         parent = producer
         seen: set[staff.StaffId] = set()
-        while parent.kind != "showrunner" and parent.parent is not None and parent.id not in seen:
+        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:
             seen.add(parent.id)
-            ancestor = self.record.by_id(parent.parent)
+            ancestor = self.record.by_id(parent.parent.id)
             if ancestor is None:
                 break
             parent = ancestor

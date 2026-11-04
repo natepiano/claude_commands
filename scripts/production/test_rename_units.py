@@ -59,24 +59,24 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertIn(f"relaunch: shutdown.py restart --only {row.current_session}", result.stdout)
 
 
-    def test_a_journal_that_counted_seven_steps_finishes_with_the_new_steps_only(self) -> None:
+    def test_a_journal_that_counted_six_steps_finishes_with_the_new_steps_only(self) -> None:
         self.prepare_unit_moves()
         self.marked_unit("alpha-unit")
         self.assert_success(self.run_rename("apply"))
         journal = self.journal()
         del journal["completed"]
-        journal["step"] = 7
+        journal["step"] = 6
         _ = (self.state / "new/rename.json").write_text(json.dumps(journal))
         branch_tip = self.git("rev-parse", NEW)
         refused = self.run_command("unit", NEW, "alpha-unit")
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("apply must complete _rename_unit_workers", refused.stdout + refused.stderr)
+        self.assertIn("apply must complete _rename_branch, _retarget_phase_notes", refused.stdout + refused.stderr)
         self.assert_success(self.run_rename("apply"))
         completed = cast(list[str], self.journal()["completed"])
-        self.assertEqual(completed[:7], [
+        self.assertEqual(completed[:6], [
             "_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state", "_rename_stall_watch",
-            "_rename_branch", "_rename_unit_workers"])
-        self.assertEqual(len(completed), 8)
+            "_rename_branch"])
+        self.assertEqual(len(completed), 7)
         self.assertEqual(self.git("rev-parse", NEW), branch_tip)
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
 

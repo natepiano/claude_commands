@@ -195,7 +195,7 @@ class AuditUnitPortsTests(StaffTestCase):
         parent = staff.local_snapshot().by_path("cargo-liner")
         assert parent is not None
         web = self.write_configuration("web", unit_config.NoAppPort())
-        _ = staff.move(web.id, parent.id)
+        _ = staff.move(web.id, staff.ReportsTo(parent.id))
         before = self.versions()
         code, output, errors = self.cli_output()
         self.assertEqual((code, errors), (0, ""))

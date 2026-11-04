@@ -35,7 +35,7 @@ from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.herdr.pane_launch import agent_kind  # noqa: E402
-from scripts.production import staff  # noqa: E402
+from scripts.production import staff, worker_admission  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 
@@ -184,13 +184,6 @@ def move_worktree(checkout: Path, old_branch: str, new_branch: str, old: Path, n
     _ = git(new, "switch", new_branch)
 
 
-def config_dirs() -> list[Path]:
-    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
-    override = os.environ.get("CLAUDE_CONFIG_DIR")
-    if override:
-        directories.add(Path(override).expanduser())
-    return sorted(directories)
-
 
 def copy_trust(path: Path, old: str, new: str) -> None:
     config = json_object(read_json(path))
@@ -221,7 +214,7 @@ def project_folder(worktree: str) -> str:
 def move_configs(old: str, new: str) -> None:
     """Move the transcript folders and copy the trust entry in every Claude config dir."""
     old_project, new_project = project_folder(old), project_folder(new)
-    for directory in config_dirs():
+    for directory in sessions.config_dirs():
         move(PathMove(directory / "projects" / old_project, directory / "projects" / new_project))
         config = (Path.home() / ".claude.json" if directory == Path.home() / ".claude"
                   else directory / ".claude.json")
@@ -474,10 +467,19 @@ def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch,
 
 
 def folder_runs(folder: Path) -> tuple[Path, ...]:
-    """Find the unit's run folders before changing its location."""
-    return tuple(sorted({path.parent for root in progress_history.SESSION_ROOTS
-        for path in root.glob(f"*/{unit_runs.STATE_FILE}")
-        if worker_lifecycle.read_json_object(path).get("working_dir") == str(folder)}))
+    """Find run folders through the unit staff location."""
+    record = staff.local_snapshot()
+    owners = {row.id for row in record.rows
+              if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.path == folder}
+    runs: set[Path] = set()
+    for root in progress_history.SESSION_ROOTS:
+        for path in root.glob(f"*/{unit_runs.STATE_FILE}"):
+            try:
+                if worker_admission.parent(record, run=path.parent).id in owners:
+                    runs.add(path.parent)
+            except ValueError as error:
+                print(f"anomaly: {path.parent}: {error}", file=sys.stderr)
+    return tuple(sorted(runs))
 
 
 def pause_folder_workers(runs: tuple[Path, ...]) -> None:
@@ -524,7 +526,7 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
             raise RenameRefused("destination is inside the unit worktree")
         moved = False
         if not old.exists():
-            owner = record.by_id(row.parent) if row.parent is not None else None
+            owner = record.parent_of(row)
             if (owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
                     and owner.doc.machine == remote.local_machine()):
                 try:
@@ -569,11 +571,6 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                 move_run(history, old, destination, git(destination, "branch", "--show-current"))
             except (OSError, ValueError, RenameRefused) as error:
                 print(f"unit_move: {history}: {error}", file=sys.stderr)
-        for run in runs:
-            try:
-                _ = (run / "working_dir").write_text(f"{destination}\n", encoding="utf-8")
-            except OSError as error:
-                print(f"unit_move: {run}: {error}", file=sys.stderr)
         try:
             _ = staff.set_worktree(unit, staff.PresentWorktree(row.worktree.machine, destination), expected=row.worktree)
         except (staff.StaffRefused, staff.StaffNotFound, OSError, ValueError) as error:

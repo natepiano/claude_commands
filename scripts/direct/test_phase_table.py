@@ -3797,7 +3797,7 @@ class PhaseTableTests(unittest.TestCase):
         unit = next(row for row in staff.snapshot().find(kind="unit", parent=owner.id)
                     if row.name == "table")
         recipient = recorded_showrunner("other", other_production)
-        _ = staff.move(unit.id, recipient.id)
+        _ = staff.move(unit.id, staff.ReportsTo(recipient.id))
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
             "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         live_record = cast(dict[str, object], json.loads(

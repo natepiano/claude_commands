@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production import staff
+
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -52,10 +54,9 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertIn("follow", events[events.index("claim"):], events)
 
     def test_a_dispatch_names_its_director_in_the_run_folder(self) -> None:
-        # The production tree reads the director here: its one marker names only one of the runs
-        # it has open side by side, and a run opened by hand has none.
+        # Staff records the director for each worker.
         session_dir = self.start_phase("director")
-        environment = self.environment()
+        environment = self.mesh_environment()
         environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
         result = subprocess.run(
             ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
@@ -63,7 +64,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
             check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((session_dir / "director").read_text(encoding="utf-8"), "sid-director\n")
+        self.assertEqual(self.recorded_worker(session_dir).parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
 
     def test_a_dispatch_with_no_pass_kind_is_refused(self) -> None:
         # What the incident actually looked like on the wire: a worker launched
@@ -309,7 +310,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                         self.assertEqual(identity.get("turn_id"), "turn-2")
                         self.assertEqual(identity.get("pid"), process.pid)
                     else:
-                        self.assertTrue(identity.get("worker_id"), identity)
+                        self.assertEqual(identity.get("staff_id"), self.recorded_worker(session).id)
                 finally:
                     release.touch()
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)

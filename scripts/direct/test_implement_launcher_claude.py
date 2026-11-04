@@ -6,6 +6,8 @@ import unittest
 import json
 from typing import cast
 from scripts.direct.implement_launcher_claude_test_support import ClaudeLauncherFixture
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file
 
 
 class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
@@ -20,8 +22,12 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual((run / "impl_worker_impl.json").read_bytes(), original)
         identity = cast(dict[str, object], json.loads((run / "impl_worker_fix.json").read_text()))
         original_identity = cast(dict[str, object], json.loads(original))
-        self.assertNotEqual(identity["name"], original_identity["name"])
-        self.assertEqual(identity["family"], "claude")
+        self.assertNotEqual(identity["staff_id"], original_identity["staff_id"])
+        account = cast(dict[str, str], json.loads((self.root / "launch_environment.json").read_text()))
+        with isolated_staff_file(self.root / "staff.json", {
+            "CLAUDE_CONFIG_DIR": account["CLAUDE_CONFIG_DIR"] or str(self.root / ".claude"),
+        }):
+            self.assertIsInstance(staff.local_snapshot().backends[self.recorded_worker(run, "fix").id], staff.ClaudeBackend)
         self.assertFalse((run / "mesh_roster.json").exists())
 
     def test_claude_fresh_refusal_preserves_artifacts_and_opens_no_pass_or_process(self) -> None:
@@ -69,7 +75,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual(len(workers), 1)
         self.assertEqual(workers[0]["parent"], self.environment()["CODEX_THREAD_ID"])
         identity = cast(dict[str, object], json.loads((run / "impl_worker_impl.json").read_text()))
-        self.assertEqual(workers[0]["id"], identity["worker_id"])
+        self.assertEqual(workers[0]["id"], identity["staff_id"])
         self.assertEqual((self.root / "opening-message.txt").read_bytes(), self.prompt_file.read_bytes())
 
 

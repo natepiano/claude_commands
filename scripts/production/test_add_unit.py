@@ -98,7 +98,7 @@ class NativeClaudeUnitTests(StaffTestCase):
         self.assertIsInstance(outcome, herdr.PromptSubmitted)
         row = backend.before_opening.by_id(staff.StaffId(identity))
         assert row is not None
-        self.assertEqual((row.id, row.name, row.parent), (identity, "fresh", runner.id))
+        self.assertEqual((row.id, row.name, row.parent), (identity, "fresh", staff.ReportsTo(runner.id)))
         self.assertNotIn("--session-id", backend.arguments)
         self.assertNotIn("--resume", backend.arguments)
         self.assertNotIn("STAFF_ID", backend.environment)
@@ -684,7 +684,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                     parent = next(owner for owner in staff.snapshot().find(kind="showrunner")
                                   if isinstance(owner.doc, staff.LiveDoc) and owner.doc.path == self.doc)
                     member = next(row for row in staff.snapshot().find(kind="unit")
-                                  if row.name == "alpha" and row.parent == parent.id)
+                                  if row.name == "alpha" and row.parent == staff.ReportsTo(parent.id))
                     _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", self.root / "other-worktree"), expected=member.worktree)
                 document = self.doc.read_text()
                 head = self.git("rev-parse", "HEAD")

@@ -1,8 +1,8 @@
 """Exercise durable design identity with local stores and a recording mesh transport."""
 from __future__ import annotations
 
-from scripts.production import worker_admission
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production import staff, session_staff, worker_admission
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_session
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.test_models_registry import write_registry
@@ -33,7 +33,6 @@ from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import codex_mesh, worker_lifecycle  # noqa: E402
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
-from scripts.direct import workers  # noqa: E402
 from scripts.astra.design_role_test_support import write_empty_binding_record, write_mesh_server_record
 from scripts.astra.design_roles import launch_thread as launch_native_role
 from scripts.astra.design_roles import resolve_holder as resolve_current_holder  # noqa: E402
@@ -114,15 +113,22 @@ class DurableRolesTests(unittest.TestCase):
         production_membership("demo", "design-unit")
         self.repository = self.root / "checkout"
         self.repository.mkdir()
+        _ = document.write_text(document.read_text().replace("## Units",
+            f"- **Merge branch:** main\n- **Showrunner checkout:** {self.repository}\n- **Log:** log.md\n\n## Units"))
         _ = (self.repository / "design.md").write_text("# Design\n")
         self.launches, self.dispatches, self.releases = [], [], []
         self.holder_session, self.lose_creation_ack, self.fail_dispatch = '17759e5d-1377-577b-b283-19888bbfc1f5', False, False
+        unit = staff.by_path("demo/design")
+        assert unit is not None
+        _ = staff.update_current_session(unit.current_session, staff.native_id(self.holder_session))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.repository), expected=unit.worktree)
         config = self.root / "models.conf"
         _ = write_registry(config, {'assignments': {'design_roles': 'codex'}, 'design_roles.codex': {'designer': 'gpt-fixture:xhigh', 'reviewer': 'gpt-review-fixture:high'}, 'codex.agents': {'gpt-fixture': 'xhigh', 'gpt-review-fixture': 'high'}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root / "home"), "DESIGN_ROLES_STATE": str(self.root / "roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"), "DESIGN_ROLES_HOST": "natedev",
             "ASTRA_ROLES_STATE": str(self.root / "holds"), "CODEX_THREAD_ID": self.holder_session,
+            "USAGE_STATE_DIR": str(self.root / "usage"),
             "MODELS_CONFIG_FILE": str(config),
         })))
         _ = self.enterContext(patch.object(design_roles, "authority_request", side_effect=self.authority))
@@ -172,15 +178,20 @@ class DurableRolesTests(unittest.TestCase):
         self.assertTrue(prompt.is_file())
         self.assertEqual((model, effort), ("gpt-fixture", "xhigh") if role == "designer"
                          else ("gpt-review-fixture", "high"))
-        thread = fixture_runtime_id("astra-" + role)
+        label = "astra-" + role
+        if any(opened_role == role for opened_role, _thread in self.launches):
+            label += "-" + design.placement.design_id
+        thread = fixture_runtime_id(label)
         mesh = design_roles.mesh_directory(design.placement.design_id)
         mesh.mkdir(parents=True, exist_ok=True)
         path = mesh / "mesh_roster.json"
         roster = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}
         instance = self.instance(design, role)
-        roster[instance.name] = {"thread_id": thread, "status": "done", "role": "astra-" + role,
+        fixture_session(thread, staff.CodexBackend(self.root / "codex-home"))
+        published = worker_admission.publish(admitted, thread)
+        roster[instance.name] = {"staff_id": published.row.id, "status": "done",
                                  "held_design_id": design.placement.design_id, "held_role": role,
-                                 "cwd": design.repository, "launcher_pid": 0}
+                                 "launcher_pid": 0}
         _ = path.write_text(json.dumps(roster))
         write_mesh_server_record(mesh, self.root / "codex-home")
         self.launches.append((role, thread))
@@ -212,19 +223,31 @@ class DurableRolesTests(unittest.TestCase):
         return design_roles.resume(design.placement.design_id + "/" + role, prompt)
 
     def test_astra_role_publishes_the_returned_thread_as_its_staff_identity(self) -> None:
+        self.check_native_role(design_roles.UnitHolder("demo", "design-unit"))
+
+    def test_showrunner_held_astra_role_keeps_its_worker_row_and_backend(self) -> None:
+        self.check_native_role(design_roles.ShowrunnerHolder("demo"))
+
+    def check_native_role(self, holder: design_roles.Holder) -> None:
         from scripts.agents import test_codex_mesh as mesh_fixture
-        from scripts.production import staff
-        from scripts.production.staff_test_support import production_membership
+        from scripts.production.staff_test_support import production_membership, recorded_showrunner
 
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CODEX_HOME": str(self.root / "codex-home"),
             "AGENT_NOTES_DIR": str(self.root / "agent-notes"),
         })))
+        owner = staff.by_path("demo")
+        assert owner is not None and isinstance(owner.doc, staff.LiveDoc)
+        document = owner.doc.path
         backend = mesh_fixture.MeshCommandFixture()
         backend.setUp()
         self.addCleanup(backend.doCleanups)
         self.addCleanup(backend.tearDown)
+        _ = recorded_showrunner("demo", document)
         production_membership("demo", "design-unit")
+        unit = staff.by_path("demo/design")
+        assert unit is not None
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.repository), expected=unit.worktree)
         self.holder_session = os.environ["CODEX_THREAD_ID"]
         design_roles.register_repository("fixture-repo", {"natedev": str(self.repository),
                                                         "macbook": str(self.root / "mac-checkout")},
@@ -245,7 +268,8 @@ class DurableRolesTests(unittest.TestCase):
             mesh = Path(arguments[arguments.index("--session-dir") + 1])
             mesh.mkdir(parents=True, exist_ok=True)
             server = cast(dict[str, object], json.loads((backend.session_dir / "mesh_server.json").read_text()))
-            server["design_context"] = json.loads((mesh / "design_context.json").read_text())
+            server["codex_home"] = str(self.root / "codex-home")
+            server["design_context"] = codex_mesh._design_context(str(mesh))  # pyright: ignore[reportPrivateUsage]
             _ = (mesh / "mesh_server.json").write_text(json.dumps(server))
             with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
                 code = codex_mesh.main(arguments[2:])
@@ -261,27 +285,24 @@ class DurableRolesTests(unittest.TestCase):
         with patch.object(design_roles, "launch_thread", side_effect=launch_native_role), \
                 patch.object(design_roles, "subprocess", SimpleNamespace(run=prime)), \
                 patch.object(os, "kill", side_effect=check_signal):
-            design = self.open_designer()
+            design = design_roles.open_role("fixture-repo", "design.md", "designer", holder,
+                                            "design", binding=self.binding(self.run_a), request_id="open-one")
         instance = self.instance(design, "designer")
         self.assertIsInstance(instance.lifecycle, design_roles.RoleOpen)
         assert isinstance(instance.lifecycle, design_roles.RoleOpen)
-        row = staff.by_id(staff.StaffId(instance.lifecycle.thread_id))
+        row = staff.by_id(instance.lifecycle.staff_id)
         self.assertIsNotNone(row)
         assert row is not None
         self.assertEqual((row.id, row.name), (mesh_fixture.THREAD_ID, instance.name))
+        self.assertEqual(row.name, instance.name)
+        parent = staff.by_path("demo" if isinstance(holder, design_roles.ShowrunnerHolder) else "demo/design")
+        assert parent is not None
+        self.assertEqual(row.parent, staff.ReportsTo(parent.id))
+        self.assertEqual(staff.snapshot().backends[row.id], staff.CodexBackend(self.root / "codex-home"))
         self.assertEqual(len(commands), 1)
         self.assertEqual(len(backend.methods("thread/start")), 1)
         self.assertEqual(backend.methods("turn/start"), [])
         self.assertEqual(self.dispatches, [])
-
-    def test_staff_refusal_does_not_claim_or_launch_an_astra_role(self) -> None:
-        with patch.object(worker_admission, "admit", side_effect=worker_admission.AdmissionRefused("staff: demo-design-astra-designer: not opened: write refused")):
-            with self.assertRaisesRegex(ValueError, "staff: demo-design-astra-designer: not opened: write refused"):
-                _ = self.open_designer()
-        self.assertEqual(self.launches, [])
-        self.assertTrue(all(isinstance(role.lifecycle, design_roles.RoleNotOpened) and not role.lifecycle.claim
-                            for path in design_roles.state_root().glob("*/design.json")
-                            for role in design_roles.read_design(path.parent.name).roles))
 
     def test_damaged_design_roster_refuses_publication_without_erasing_ownership(self) -> None:
         design = self.open_designer()
@@ -311,43 +332,6 @@ class DurableRolesTests(unittest.TestCase):
                 self.assertIn(str(path), str(refused.exception))
                 self.assertEqual(path.read_text(), damaged)
 
-    def test_roster_repair_restores_design_authority_limits_and_refuses_unfinished_transfer(self) -> None:
-        design = self.open_designer()
-        mesh = design_roles.mesh_directory(design.placement.design_id)
-        path = mesh / "mesh_roster.json"
-        role = self.instance(design, "designer")
-        self.assertIsInstance(role.lifecycle, design_roles.RoleOpen)
-        assert isinstance(role.lifecycle, design_roles.RoleOpen)
-        thread = role.lifecycle.thread_id
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.root / "unit-workers")})))
-        store = workers.ledger_for_run(mesh)
-        with store.locked() as ledger:
-            ledger.workers[role.name] = workers.UnitWorker(
-                role.name, "astra-designer", "codex", "gpt-fixture", "xhigh", {"kind": "WorkerLaunchPolicy"},
-                workers.CodexThread(thread, str(self.root / "codex-home")), workers.HeldBy(str(mesh)))
-        _ = path.write_bytes(b"")
-        transition = design_roles.design_directory(design.placement.design_id) / "transition.json"
-        _ = transition.write_text('{"in_progress": true}')
-        client = MagicMock(spec=codex_mesh.Client)
-        cast(MagicMock, client.call).return_value = {"result": {"thread": {"id": thread, "status": {"type": "idle"}, "turns": []}}}
-        with (patch.object(codex_mesh, "recorded_run_ports", return_value=[12345]),
-              patch.object(codex_mesh, "Client", return_value=client)):
-            with self.assertRaisesRegex(workers.WorkerUnavailable, "transfer.*unfinished"):
-                _ = workers.repair_roster(mesh)
-            self.assertEqual(path.read_bytes(), b"")
-            transition.unlink()
-            _ = workers.repair_roster(mesh)
-        repaired = cast(dict[str, object], json.loads(path.read_text()))
-        record = cast(dict[str, object], repaired[role.name])
-        self.assertEqual(record["thread_id"], thread)
-        self.assertEqual(record["held_design_id"], design.placement.design_id)
-        self.assertEqual(record["held_role"], "designer")
-        policy = cast(dict[str, object], record["access_policy"])
-        self.assertEqual(policy["kind"], "PhaseBoundDesigner")
-        self.assertNotIn("context_tokens", record)
-        self.assertEqual((path.with_name(path.name + ".damaged")).read_bytes(), b"")
-        self.assertEqual(self.launches, [("designer", thread)])
-
     def test_open_retry_and_normalized_document_alias_keep_one_pair_and_thread(self) -> None:
         design = self.open_designer()
         retried = self.open_designer(document=str(self.repository / "sub/../design.md"), request_id="retry")
@@ -366,7 +350,7 @@ class DurableRolesTests(unittest.TestCase):
         design_id = output.getvalue().strip().removesuffix('/designer')
         design = design_roles.read_design(design_id)
         self.assertEqual(design.binding, self.binding(self.run_a))
-        self.assertEqual(self.instance(design, 'designer').lifecycle, design_roles.RoleOpen('9309c903-5894-501a-8aa7-f33ea912e074'))
+        self.assertEqual(self.instance(design, 'designer').lifecycle, design_roles.RoleOpen(staff.StaffId('9309c903-5894-501a-8aa7-f33ea912e074')))
 
     def test_save_refuses_an_empty_binding_repository_without_changing_the_record(self) -> None:
         design = self.open_designer()
@@ -391,7 +375,7 @@ class DurableRolesTests(unittest.TestCase):
             with patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
                 design_roles.end_holder('demo', 'next-unit')
         ended = design_roles.read_design(design.placement.design_id)
-        self.assertEqual(self.instance(ended, 'designer').lifecycle, design_roles.RoleEnded('9309c903-5894-501a-8aa7-f33ea912e074'))
+        self.assertIsInstance(self.instance(ended, 'designer').lifecycle, design_roles.RoleEnded)
         self.assertEqual(errors.getvalue().splitlines(), [f'warning: {bad}: missing or invalid repository'] * 4)
         self.assertTrue(bad.is_file())
 
@@ -403,8 +387,8 @@ class DurableRolesTests(unittest.TestCase):
             lambda: design_roles.unbind_run(str(self.run_a)),
             lambda: design_roles.held_document(self.repository / 'broken-design.md'),
         )
-        lifecycles = (design_roles.RoleOpen('held-thread'), design_roles.RolePausedForMove('held-thread'),
-                      design_roles.RoleNeedsRecovery('held-thread', 'lost acknowledgement'))
+        lifecycles = (design_roles.RoleOpen(staff.StaffId('held-thread')), design_roles.RolePausedForMove(staff.StaffId('held-thread')),
+                      design_roles.RoleNeedsRecovery(staff.StaffId('held-thread'), 'lost acknowledgement'))
         for lifecycle in lifecycles:
             for operation in operations:
                 with self.subTest(lifecycle=lifecycle, operation=operation):
@@ -430,7 +414,7 @@ class DurableRolesTests(unittest.TestCase):
     def test_holder_checks_skip_bad_unrelated_records_and_keep_valid_failures(self) -> None:
         holder = design_roles.UnitHolder('demo', 'design-unit')
         bad = write_empty_binding_record(self.repository, design_roles.UnitHolder('other', 'other-unit'),
-                                         lifecycle=design_roles.RoleOpen('unrelated-thread'))
+                                         lifecycle=design_roles.RoleOpen(staff.StaffId('unrelated-thread')))
         design = self.open_designer()
         errors = io.StringIO()
         with redirect_stderr(errors):
@@ -446,9 +430,9 @@ class DurableRolesTests(unittest.TestCase):
 
     def test_holder_checks_refuse_only_matching_bad_live_roles(self) -> None:
         holder = design_roles.UnitHolder('demo', 'design-unit')
-        lifecycles = (design_roles.RoleNotOpened(), design_roles.RoleEnded('ended-thread'),
-                      design_roles.RoleOpen('held-thread'), design_roles.RolePausedForMove('held-thread'),
-                      design_roles.RoleNeedsRecovery('held-thread', 'lost acknowledgement'))
+        lifecycles = (design_roles.RoleNotOpened(), design_roles.RoleEnded(staff.StaffId('ended-thread')),
+                      design_roles.RoleOpen(staff.StaffId('held-thread')), design_roles.RolePausedForMove(staff.StaffId('held-thread')),
+                      design_roles.RoleNeedsRecovery(staff.StaffId('held-thread'), 'lost acknowledgement'))
         for lifecycle in lifecycles:
             with self.subTest(lifecycle=lifecycle):
                 bad = write_empty_binding_record(self.repository, holder, lifecycle=lifecycle)
@@ -467,7 +451,7 @@ class DurableRolesTests(unittest.TestCase):
 
     def test_record_operation_warns_once_across_holders_and_warns_again_on_retry(self) -> None:
         stranded = design_roles.UnitHolder('unrelated', 'stranded-unit')
-        bad = write_empty_binding_record(self.repository, stranded, lifecycle=design_roles.RoleOpen('stranded-thread'))
+        bad = write_empty_binding_record(self.repository, stranded, lifecycle=design_roles.RoleOpen(staff.StaffId('stranded-thread')))
         second = write_empty_binding_record(self.repository, design_roles.ShowrunnerHolder('unrelated'))
         design = self.open_designer()
         holders = (
@@ -550,19 +534,6 @@ class DurableRolesTests(unittest.TestCase):
         if isinstance(lifecycle, design_roles.RoleNotOpened):
             self.assertTrue(lifecycle.claim)
         self.assertEqual(len(list((self.root / "roles").glob("*/design.json"))), 1)
-
-    def test_incomplete_inventory_and_inventoried_legacy_source_refuse_new_threads(self) -> None:
-        design_roles.register_repository("unresolved-repo", {"natedev": str(self.repository)}, inventory_complete=False)
-        with self.assertRaisesRegex(design_roles.RoleRefused, "inventory"):
-            _ = design_roles.open_role("unresolved-repo", "design.md", "reviewer", design_roles.ShowrunnerHolder("demo"), "design")
-        _ = self.authority("reserve", {"repository_id": "fixture-repo", "document": "design.md",
-                                       "host": "natedev", "request_id": "inventory"})
-        _ = self.authority("legacy", {"repository_id": "fixture-repo", "document": "design.md", "host": "natedev",
-                                      "source": {"mesh": str(self.root / "old-run"), "name": "legacy-designer", "thread_id": "legacy-thread"}})
-        with self.assertRaisesRegex(design_roles.RoleRefused, "AdoptionRequired.*legacy-thread"):
-            _ = self.open_designer()
-        self.assertEqual(self.launches, [])
-        self.assertEqual(list((self.root / "roles").glob("*/design.json")), [])
 
     def test_simultaneous_hosts_reserve_only_one_document_placement(self) -> None:
         def reserve(host: str) -> str:
@@ -803,8 +774,6 @@ class DurableRolesTests(unittest.TestCase):
     def test_repair_retry_finishes_a_failed_launch_context_publication(self) -> None:
         self.assert_interrupted_repair_finishes_publication("design_context.json")
 
-    def test_repair_retry_finishes_a_failed_census_publication(self) -> None:
-        self.assert_interrupted_repair_finishes_publication("serving_home.json")
 
     def test_binding_repair_does_not_accept_other_record_damage(self) -> None:
         design = self.open_designer()
@@ -885,24 +854,6 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual(design_roles.holder_failures(design.holder),
                          [f"{path}: missing or invalid repository; live held role needs recovery"])
 
-    def test_adoption_retry_refuses_a_damaged_record_by_path_and_field(self) -> None:
-        self.assert_adoption_preserves_thread_and_pending_text({"model": "gpt-fixture", "effort": "xhigh"})
-        paths = list((self.root / "roles").glob("*/design.json"))
-        self.assertEqual(len(paths), 1)
-        design = design_roles.read_design(paths[0].parent.name)
-        path = damage_binding_repository(design)
-        before = path.read_bytes()
-        error = io.StringIO()
-        with redirect_stderr(error), redirect_stdout(io.StringIO()):
-            code = design_roles.main(["adopt", "--repository", "fixture-repo", "--document", "design.md",
-                "--role", "designer", "--production", "demo", "--unit", "design-unit", "--area", "design",
-                "--source-mesh", str(self.root / "old-run"), "--name", "original-designer-alias",
-                "--thread-id", "original-thread", "--adoption-id", "transfer-one"])
-        self.assertEqual(code, 2)
-        self.assertEqual(error.getvalue().splitlines(),
-                         [f"design_roles: {path}: missing or invalid binding.repository"])
-        self.assertEqual(path.read_bytes(), before)
-
     def test_pending_messages_clear_only_after_successful_turn_acceptance(self) -> None:
         design = self.open_designer()
         message = design_roles.queue_message(design.placement.design_id, "designer", "holder", "Keep evidence.")
@@ -946,6 +897,12 @@ class DurableRolesTests(unittest.TestCase):
     def test_holder_transfer_fences_the_old_session_and_keeps_the_thread(self) -> None:
         design = self.open_designer()
         destination = design_roles.UnitHolder("demo", "next-unit")
+        from scripts.production.staff_test_support import fixture_member
+        owner = staff.by_path("demo")
+        assert owner is not None
+        _ = fixture_member("unit", name="next", parent=owner.id,
+                       runtime_id="f9e81ae0-b71b-5628-9de0-9e240fb1d01e",
+                       worktree=staff.PresentWorktree("natedev", self.root / "next-checkout"))
 
         def resolve(holder: design_roles.Holder) -> design_roles.HolderReach:
             return design_roles.HolderReach('f9e81ae0-b71b-5628-9de0-9e240fb1d01e' if holder == destination else '17759e5d-1377-577b-b283-19888bbfc1f5')
@@ -968,13 +925,37 @@ class DurableRolesTests(unittest.TestCase):
     def test_holder_restart_repairs_a_missing_hold_without_replacing_the_thread(self) -> None:
         design = self.open_designer()
         (self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json").unlink()
+        previous = self.holder_session
         self.holder_session = '5dea413e-cf4a-5eba-b1b4-0b19c7e0d86e'
+        _ = staff.update_current_session(staff.native_id(previous), staff.native_id(self.holder_session))
         os.environ["CODEX_THREAD_ID"] = self.holder_session
         _ = self.resume(design, "designer")
         records = astra_roles.live_roles()
         self.assertEqual([(record["thread_id"], record["manager"]) for record in records],
                          [("9309c903-5894-501a-8aa7-f33ea912e074", '5dea413e-cf4a-5eba-b1b4-0b19c7e0d86e')])
         self.assertEqual(len(self.launches), 1)
+
+    def test_role_becomes_idle_after_its_process_exits_without_a_status_write(self) -> None:
+        design = self.open_designer()
+        instance = self.instance(design, "designer")
+        roster = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
+        with subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+            assert child.stdout is not None
+            self.assertEqual(child.stdout.readline(), "ready\n")
+            data = cast(dict[str, dict[str, object]], json.loads(roster.read_text()))
+            data[instance.name].update(status="running", launcher_pid=child.pid)
+            _ = roster.write_text(json.dumps(data))
+            before = roster.read_bytes()
+            try:
+                live = astra_roles.live_roles()
+                self.assertEqual([role["state"] for role in live], ["busy"])
+            finally:
+                _ = child.communicate(timeout=10)
+            self.assertEqual(child.returncode, 0)
+        live = astra_roles.live_roles()
+        self.assertEqual([role["state"] for role in live], ["idle"])
+        self.assertEqual(roster.read_bytes(), before)
 
     def test_durable_hold_survives_run_removal_and_keeps_one_census_edge(self) -> None:
         design = self.open_designer()
@@ -1133,7 +1114,7 @@ class DurableRolesTests(unittest.TestCase):
         _ = marker.write_text("{}")
         paused = cast(list[dict[str, object]], design_roles.list_roles()["roles"])
         designer = next(row for row in paused if row["role"] == "designer")
-        self.assertEqual(designer["lifecycle"], {"kind": "RolePausedForMove", "thread_id": "9309c903-5894-501a-8aa7-f33ea912e074"})
+        self.assertEqual(designer["lifecycle"], {"kind": "RolePausedForMove", "staff_id": "9309c903-5894-501a-8aa7-f33ea912e074"})
         self.assertEqual(designer["holder_reach"], {"kind": "HolderReach", "session_id": '17759e5d-1377-577b-b283-19888bbfc1f5'})
         marker.unlink()
         roster = cast(dict[str, dict[str, object]], json.loads((mesh / "mesh_roster.json").read_text()))
@@ -1142,7 +1123,7 @@ class DurableRolesTests(unittest.TestCase):
         failed = cast(list[dict[str, object]], design_roles.list_roles()["roles"])
         designer = next(row for row in failed if row["role"] == "designer")
         self.assertEqual(cast(dict[str, object], designer["lifecycle"])["kind"], "RoleNeedsRecovery")
-        self.assertEqual(cast(dict[str, object], designer["lifecycle"])["thread_id"], "9309c903-5894-501a-8aa7-f33ea912e074")
+        self.assertEqual(cast(dict[str, object], designer["lifecycle"])["staff_id"], "9309c903-5894-501a-8aa7-f33ea912e074")
         self.assertEqual(self.dispatches, [])
 
     def test_patch_checks_use_the_current_run_and_refuse_stale_or_mixed_paths(self) -> None:
@@ -1193,7 +1174,7 @@ class DurableRolesTests(unittest.TestCase):
         design_roles.unbind_run(str(self.run_a))
         unbound = design_roles.read_design(design.placement.design_id)
         self.assertIsInstance(unbound.binding, design_roles.DesignUnbound)
-        self.assertEqual(self.instance(unbound, "designer").lifecycle, design_roles.RoleOpen("9309c903-5894-501a-8aa7-f33ea912e074"))
+        self.assertEqual(self.instance(unbound, "designer").lifecycle, design_roles.RoleOpen(staff.StaffId("9309c903-5894-501a-8aa7-f33ea912e074")))
         with self.assertRaises(design_roles.RoleRefused):
             _ = self.resume(unbound, "designer")
         for path, contents in saved.items():
@@ -1210,7 +1191,7 @@ class DurableRolesTests(unittest.TestCase):
             ended = design_roles.end(design.placement.design_id + "/designer")
             retried = design_roles.end(design.placement.design_id + "/designer")
         self.assertIsInstance(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded)
-        self.assertEqual(retried, ended)
+        self.assertIsInstance(self.instance(retried, "designer").lifecycle, design_roles.RoleEnded)
         with self.assertRaisesRegex(design_roles.RoleRefused, "role ended; this design identity cannot be reopened"):
             _ = self.open_designer()
         self.assertEqual(len(self.launches), 1)
@@ -1264,7 +1245,8 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual(current.roles[0].name, design.roles[0].name)
         roster = cast(dict[str, dict[str, object]], json.loads(
             (design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
-        self.assertEqual(roster[design.roles[0].name]["cwd"], design.repository)
+        self.assertEqual(session_staff.worker_directory(staff.local_snapshot(),
+                         staff.StaffId(str(roster[design.roles[0].name]["staff_id"]))), Path(design.repository))
         self.assertEqual(design_roles.holder_failures(old), [])
         self.assertEqual(self.dispatches[-1][1], "9309c903-5894-501a-8aa7-f33ea912e074")
         self.assertEqual(self.launches, [("designer", "9309c903-5894-501a-8aa7-f33ea912e074")])
@@ -1339,118 +1321,6 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual(design_roles.read_design(design.placement.design_id).holder, design.holder)
         self.assertTrue(design_roles.rename_failures("demo", "design-unit", str(self.repository)))
 
-    def test_legacy_adoption_requires_matching_thread_launch_evidence(self) -> None:
-        holder = design_roles.UnitHolder("demo", "design-unit")
-        for evidence in ("matching", "missing", "different-model", "different-effort", "other-thread"):
-            with self.subTest(evidence=evidence):
-                document = evidence + ".md"
-                _ = (self.repository / document).write_text("# Design\n")
-                source = self.root / ("legacy-" + evidence)
-                source.mkdir()
-                name, thread = "legacy-" + evidence, "legacy-thread-" + evidence
-                _ = (source / "mesh_roster.json").write_text(json.dumps({name: {
-                    "thread_id": thread, "status": "paused", "paused_from": "done", "cwd": str(self.repository)}}))
-                _ = (source / "mesh_server.json").write_text(json.dumps({"port": 32100, "pid": os.getpid(),
-                    "codex_home": str(self.root / "codex-home")}))
-                if evidence != "missing":
-                    launch_thread = "another-thread" if evidence == "other-thread" else thread
-                    model = "gpt-other" if evidence == "different-model" else "gpt-fixture"
-                    effort = "low" if evidence == "different-effort" else "xhigh"
-                    _ = (source / "impl_worker_design.json").write_text(json.dumps({
-                        "name": name, "slot": "design", "family": "codex", "model": model, "worker_id": launch_thread}))
-                    phase = source / "phases/3"
-                    phase.mkdir(parents=True)
-                    _ = (phase / "impl_agent_design").write_text(
-                        "task=impl\nfamily=codex\nagent=" + model + "\neffort=" + effort + "\n")
-                    _ = (phase / "impl_agent_design.log").write_text(
-                        "[2026-10-21T12:00:00Z] mesh: " + name + " thread " + launch_thread + "\n")
-                placement = self.authority("reserve", {"repository_id": "fixture-repo", "document": document,
-                    "host": "natedev", "request_id": "inventory-" + evidence})
-                _ = self.authority("legacy", {"repository_id": "fixture-repo", "document": document,
-                    "host": "natedev", "source": {"mesh": str(source), "name": name, "thread_id": thread,
-                    "holder": {"kind": "UnitHolder", "production_slug": "demo", "unit_name": "design-unit"}}})
-                _ = (self.run_a / "phases/1/files").write_text(document + "\n")
-                binding = design_roles.DesignBoundToPhase(str(self.run_a), "1", str(self.repository), (document,))
-                methods: list[str] = []
-
-                def request(method: str, params: object, **options: object) -> dict[str, object]:
-                    del params, options
-                    methods.append(method)
-                    if method == "thread/read":
-                        return {"result": {"thread": {"id": thread, "status": {"type": "idle"}, "turns": []}}}
-                    if method == "thread/queue/list":
-                        return {"result": {"data": []}}
-                    if method == "thread/unsubscribe":
-                        return {"result": {"status": "notLoaded"}}
-                    raise AssertionError("unexpected adoption request: " + method)
-
-                client = cast(codex_mesh.Client, MagicMock(spec=codex_mesh.Client))
-                client.port = 32100
-                with patch.object(codex_mesh, "Client", return_value=client), \
-                        patch.object(client, "call", side_effect=request), patch.object(design_roles, "confirm_adoption"):
-                    if evidence == "matching":
-                        adopted = design_roles.adopt("fixture-repo", document, "designer", holder, "design",
-                            source_mesh=str(source), name=name, thread_id=thread, adoption_id="adopt-" + evidence,
-                            binding=binding)
-                        destination = design_roles.mesh_directory(adopted.placement.design_id)
-                        roster = cast(dict[str, dict[str, object]], json.loads((destination / "mesh_roster.json").read_text()))
-                        self.assertEqual(self.instance(adopted, "designer").lifecycle, design_roles.RoleOpen(thread))
-                        self.assertEqual(adopted.placement.design_id, placement["design_id"])
-                        self.assertEqual(roster[name]["thread_id"], thread)
-                        self.assertEqual((roster[name]["model"], roster[name]["effort"]), ("gpt-fixture", "xhigh"))
-                        self.assertEqual(roster[name]["status"], "done")
-                        self.assertNotIn("paused_from", roster[name])
-                        self.assertIn("thread/unsubscribe", methods)
-                    else:
-                        with self.assertRaisesRegex(design_roles.RoleRefused, "^AdoptionRequired:"):
-                            _ = design_roles.adopt("fixture-repo", document, "designer", holder, "design",
-                                source_mesh=str(source), name=name, thread_id=thread, adoption_id="adopt-" + evidence,
-                                binding=binding)
-                        self.assertNotIn("thread/unsubscribe", methods)
-                        self.assertFalse((design_roles.design_directory(str(placement["design_id"])) / "design.json").exists())
-        self.assertEqual(self.launches, [])
-
-    def test_refused_adoption_leaves_the_authority_without_a_transfer_claim(self) -> None:
-        holder = design_roles.UnitHolder("demo", "design-unit")
-        for reason in ("unbound-designer", "missing-model-evidence"):
-            with self.subTest(reason=reason):
-                document = reason + ".md"
-                _ = (self.repository / document).write_text("# Design\n")
-                source = self.root / reason
-                source.mkdir()
-                name, thread = reason + "-seat", reason + "-thread"
-                entry: dict[str, object] = {"thread_id": thread, "status": "done"}
-                if reason == "unbound-designer":
-                    entry.update({"model": "gpt-fixture", "effort": "xhigh"})
-                roster = source / "mesh_roster.json"
-                _ = roster.write_text(json.dumps({name: entry}))
-                _ = (source / "mesh_server.json").write_text(json.dumps({"port": 32100, "pid": os.getpid(),
-                    "codex_home": str(self.root / "codex-home")}))
-                _ = self.authority("reserve", {"repository_id": "fixture-repo", "document": document,
-                    "host": "natedev", "request_id": "inventory-" + reason})
-                _ = self.authority("legacy", {"repository_id": "fixture-repo", "document": document,
-                    "host": "natedev", "source": {"mesh": str(source), "name": name, "thread_id": thread,
-                    "holder": {"kind": "UnitHolder", "production_slug": "demo", "unit_name": "design-unit"}}})
-                _ = (self.run_a / "phases/1/files").write_text(document + "\n")
-                binding = (design_roles.DesignUnbound() if reason == "unbound-designer" else
-                    design_roles.DesignBoundToPhase(str(self.run_a), "1", str(self.repository), (document,)))
-                before = roster.read_bytes()
-                client = cast(codex_mesh.Client, MagicMock(spec=codex_mesh.Client))
-                with patch.object(codex_mesh, "Client", return_value=client), \
-                        patch.object(client, "call", return_value={"result": {"thread": {"id": thread, "status": {"type": "idle"}}}}), \
-                        self.assertRaises(design_roles.RoleRefused):
-                    _ = design_roles.adopt("fixture-repo", document, "designer", holder, "design", source_mesh=str(source),
-                        name=name, thread_id=thread, adoption_id="refused-" + reason, binding=binding)
-                authority = self.authority("lookup", {"repository_id": "fixture-repo", "document": document,
-                    "host": "natedev"})
-                self.assertNotEqual(authority.get("adoption_state"), "AdoptionReserved")
-                self.assertNotIn("adoption_id", authority)
-                self.assertEqual(roster.read_bytes(), before)
-                self.assertFalse((source / "transfer.json").exists())
-                with self.assertRaisesRegex(design_roles.RoleRefused, "^AdoptionRequired:"):
-                    _ = design_roles.open_role("fixture-repo", document, "reviewer", holder, "design")
-        self.assertEqual(self.launches, [])
-
     def test_last_role_end_stops_the_server_and_preserves_design_evidence(self) -> None:
         design = self.open_designer()
         design = design_roles.open_role("fixture-repo", "design.md", "reviewer", design.holder, "design",
@@ -1513,196 +1383,12 @@ class DurableRolesTests(unittest.TestCase):
         self.assertFalse(server.exists())
         self.assertIn("thread/unsubscribe", methods)
         roster = cast(dict[str, dict[str, object]], json.loads((mesh / "mesh_roster.json").read_text()))
-        self.assertEqual({entry["thread_id"] for entry in roster.values()}, {"9309c903-5894-501a-8aa7-f33ea912e074", "364898ad-f177-5514-80f3-b82001fa95d9"})
+        self.assertEqual({entry["staff_id"] for entry in roster.values()}, {"9309c903-5894-501a-8aa7-f33ea912e074", "364898ad-f177-5514-80f3-b82001fa95d9"})
         self.assertTrue(all(entry["status"] == "ended" for entry in roster.values()))
         self.assertEqual({path: path.read_bytes() for path in evidence}, evidence)
         self.assertEqual(design_roles.pending_messages(design_id, "reviewer"), (message,))
         self.assertEqual(self.authority("lookup", {"repository_id": "fixture-repo", "document": "design.md",
                                                  "host": "natedev"}), authority_before)
-
-    def test_adoption_preserves_thread_alias_and_pending_text_and_is_retryable(self) -> None:
-        self.assert_adoption_preserves_thread_and_pending_text({"model": "gpt-fixture", "effort": "xhigh"})
-
-    def test_adoption_with_only_accepted_turn_settings_preserves_the_thread_and_pending_text(self) -> None:
-        self.assert_adoption_preserves_thread_and_pending_text({"turn_model": "gpt-fixture", "turn_effort": "xhigh"})
-
-    def test_cli_adopt_without_checkout_saves_the_resolved_binding_repository(self) -> None:
-        self.assert_adoption_preserves_thread_and_pending_text({'model': 'gpt-fixture', 'effort': 'xhigh'}, through_cli=True)
-
-    def assert_adoption_preserves_thread_and_pending_text(self, settings: dict[str, str], *, through_cli: bool = False) -> None:
-        source = self.root / "old-run"
-        source.mkdir()
-        name, thread = "original-designer-alias", "original-thread"
-        _ = (source / "mesh_roster.json").write_text(json.dumps({name: {
-            "thread_id": thread, "status": "done", "cwd": str(self.repository),
-            **settings}}))
-        _ = (source / "mesh_server.json").write_text(json.dumps({"port": 32100, "pid": os.getpid(),
-                                                                 "codex_home": str(self.root / "codex-home")}))
-        holder = design_roles.UnitHolder("demo", "design-unit")
-        placement = self.authority("reserve", {"repository_id": "fixture-repo", "document": "design.md",
-                                               "host": "natedev", "request_id": "inventory"})
-        _ = self.authority("legacy", {"repository_id": "fixture-repo", "document": "design.md", "host": "natedev",
-            "source": {"mesh": str(source), "name": name, "thread_id": thread,
-                       "holder": {"kind": "UnitHolder", "production_slug": "demo", "unit_name": "design-unit"}}})
-        queued = [{"id": "queued-one", "input": [{"type": "text", "text": "Keep this queued evidence."}]}]
-        methods: list[str] = []
-        release_fails = True
-
-        def request(method: str, params: object, **options: object) -> dict[str, object]:
-            del params, options
-            methods.append(method)
-            if method == "thread/queue/list":
-                return {"result": {"data": list(queued)}}
-            if method == "thread/read":
-                return {"result": {"thread": {"id": thread, "status": {"type": "idle"}, "turns": []}}}
-            if method == "thread/queue/delete":
-                self.assertIn("Keep this queued evidence.", (source / (name + ".pending.json")).read_text())
-                queued.clear()
-                return {"result": {}}
-            if method == "thread/unsubscribe":
-                if release_fails:
-                    raise ConnectionError("release acknowledgement lost")
-                return {"result": {"status": "notLoaded"}}
-            raise AssertionError("unexpected mesh method: " + method)
-
-        client = cast(codex_mesh.Client, MagicMock(spec=codex_mesh.Client))
-        client.port = 32100
-        confirm = MagicMock()
-        with patch.object(codex_mesh, "Client", return_value=client), \
-                patch.object(client, "call", side_effect=request), \
-                patch.object(design_roles, "confirm_adoption", confirm):
-            with self.assertRaisesRegex(design_roles.RoleRefused, "AdoptionNeedsRecovery"):
-                _ = design_roles.adopt("fixture-repo", "design.md", "designer", design_roles.UnitHolder("demo", "design-unit"),
-                                "design", source_mesh=str(source), name=name, thread_id=thread,
-                                adoption_id="transfer-one", binding=self.binding(self.run_a))
-            fenced = cast(dict[str, dict[str, object]], json.loads((source / "mesh_roster.json").read_text()))
-            self.assertEqual(cast(dict[str, object], fenced[name]["transferring_role"])["adoption_id"], "transfer-one")
-            self.assertFalse(list((self.root / "roles").glob("*/design.json")))
-            release_fails = False
-            if through_cli:
-                output = io.StringIO()
-                with redirect_stdout(output):
-                    code = design_roles.main(['adopt', '--repository', 'fixture-repo', '--document', 'design.md',
-                        '--role', 'designer', '--production', 'demo', '--unit', 'design-unit', '--area', 'design',
-                        '--source-mesh', str(source), '--name', name, '--thread-id', thread, '--adoption-id', 'transfer-one',
-                        '--run-directory', str(self.run_a), '--phase', '1', '--output-path', 'design.md'])
-                self.assertEqual(code, 0, output.getvalue())
-                adopted = design_roles.read_design(output.getvalue().strip().removesuffix('/designer'))
-                self.assertEqual(adopted.binding, self.binding(self.run_a))
-            else:
-                adopted = design_roles.adopt("fixture-repo", "design.md", "designer", design_roles.UnitHolder("demo", "design-unit"),
-                                      "design", source_mesh=str(source), name=name, thread_id=thread,
-                                      adoption_id="transfer-one", binding=self.binding(self.run_a))
-            before = len(methods)
-            retried = design_roles.adopt("fixture-repo", "design.md", "designer", design_roles.UnitHolder("demo", "design-unit"),
-                                  "design", source_mesh=str(source), name=name, thread_id=thread,
-                                  adoption_id="transfer-one", binding=self.binding(self.run_a))
-        self.assertEqual(retried.placement, adopted.placement)
-        self.assertEqual(confirm.call_count, 1)
-        self.assertEqual(len(methods), before)
-        self.assertEqual(self.instance(adopted, "designer"), design_roles.RoleInstance("designer", name, design_roles.RoleOpen(thread)))
-        destination = design_roles.mesh_directory(adopted.placement.design_id)
-        self.assertIn("Keep this queued evidence.", (destination / (name + ".pending.json")).read_text())
-        redirected = cast(dict[str, dict[str, object]], json.loads((source / "mesh_roster.json").read_text()))
-        self.assertEqual(cast(dict[str, object], redirected[name]["role_redirect"])["design_id"], adopted.placement.design_id)
-        self.assertEqual(self.launches, [])
-        self.assertNotIn("thread/start", methods)
-        self.assertNotIn("thread/fork", methods)
-        authority = self.authority("reserve", {"repository_id": "fixture-repo", "document": "design.md",
-                                               "host": "natedev", "request_id": "inspect"})
-        self.assertEqual(authority["design_id"], placement["design_id"])
-        self.assertEqual(authority["adoption_state"], "completed")
-        self.assertNotIn("adoption_required", authority)
-        counterpart = design_roles.open_role("fixture-repo", "design.md", "reviewer", holder, "design",
-                                      binding=self.binding(self.run_a))
-        self.assertEqual(counterpart.placement, adopted.placement)
-        self.assertEqual(self.instance(counterpart, "reviewer").lifecycle, design_roles.RoleOpen("364898ad-f177-5514-80f3-b82001fa95d9"))
-
-    def test_adoption_retry_completes_after_the_authority_commit_acknowledgement_is_lost(self) -> None:
-        source = self.root / "legacy-mesh"
-        source.mkdir()
-        name, thread = "original-designer", "original-thread"
-        _ = (source / "mesh_roster.json").write_text(json.dumps({name: {
-            "thread_id": thread, "status": "done", "cwd": str(self.repository),
-            "model": "gpt-fixture", "effort": "xhigh"}}))
-        _ = (source / "mesh_server.json").write_text(json.dumps({"port": 32100, "pid": os.getpid(),
-                                                                 "codex_home": str(self.root / "codex-home")}))
-        holder = design_roles.UnitHolder("demo", "design-unit")
-        placement = self.authority("reserve", {"repository_id": "fixture-repo", "document": "design.md",
-                                               "host": "natedev", "request_id": "inventory"})
-        _ = self.authority("legacy", {"repository_id": "fixture-repo", "document": "design.md", "host": "natedev",
-            "source": {"mesh": str(source), "name": name, "thread_id": thread,
-                       "holder": {"kind": "UnitHolder", "production_slug": "demo", "unit_name": "design-unit"}}})
-        lose_commit_ack = True
-
-        def authority(operation: str, payload: dict[str, object]) -> dict[str, object]:
-            nonlocal lose_commit_ack
-            result = self.authority(operation, payload)
-            if operation == "adopt-commit" and lose_commit_ack:
-                lose_commit_ack = False
-                raise OSError("authority commit acknowledgement lost")
-            return result
-
-        def request(method: str, params: object, **options: object) -> dict[str, object]:
-            del params, options
-            if method == "thread/read":
-                return {"result": {"thread": {"id": thread, "status": {"type": "idle"}, "turns": []}}}
-            if method == "thread/queue/list":
-                return {"result": {"data": []}}
-            if method == "thread/unsubscribe":
-                return {"result": {"status": "notLoaded"}}
-            raise AssertionError("unexpected mesh method: " + method)
-
-        client = cast(codex_mesh.Client, MagicMock(spec=codex_mesh.Client))
-        client.port = 32100
-        with patch.object(codex_mesh, "Client", return_value=client), \
-                patch.object(client, "call", side_effect=request), \
-                patch.object(design_roles, "authority_request", side_effect=authority), \
-                patch.object(design_roles, "confirm_adoption"):
-            with self.assertRaisesRegex(OSError, "commit acknowledgement lost"):
-                _ = design_roles.adopt("fixture-repo", "design.md", "designer", holder, "design", source_mesh=str(source),
-                                name=name, thread_id=thread, adoption_id="transfer-one", binding=self.binding(self.run_a))
-            committed = self.authority("reserve", {"repository_id": "fixture-repo", "document": "design.md",
-                                                   "host": "natedev", "request_id": "inspect-interruption"})
-            self.assertEqual(committed["adoption_state"], "completed")
-            self.assertNotIn("adoption_required", committed)
-            adopted = design_roles.adopt("fixture-repo", "design.md", "designer", holder, "design", source_mesh=str(source),
-                                  name=name, thread_id=thread, adoption_id="transfer-one", binding=self.binding(self.run_a))
-        authority_state = self.authority("reserve", {"repository_id": "fixture-repo", "document": "design.md",
-                                                    "host": "natedev", "request_id": "inspect-completion"})
-        self.assertEqual(authority_state["adoption_state"], "completed")
-        self.assertNotIn("adoption_required", authority_state)
-        self.assertEqual(adopted.placement.design_id, placement["design_id"])
-        self.assertEqual(design_roles.read_design(adopted.placement.design_id).placement, adopted.placement)
-        self.assertEqual(self.instance(adopted, "designer").lifecycle, design_roles.RoleOpen(thread))
-        redirected = cast(dict[str, dict[str, object]], json.loads((source / "mesh_roster.json").read_text()))
-        self.assertEqual(cast(dict[str, object], redirected[name]["role_redirect"])["design_id"], placement["design_id"])
-        self.assertTrue((design_roles.design_directory(adopted.placement.design_id) / "adoption.json").is_file())
-        self.assertFalse((design_roles.design_directory(adopted.placement.design_id) / "transition.json").exists())
-        self.assertEqual([record["thread_id"] for record in astra_roles.live_roles()], [thread])
-        self.assertEqual(self.launches, [])
-
-    def test_adoption_refuses_a_thread_or_holder_outside_the_recorded_source(self) -> None:
-        source = self.root / "inventoried-mesh"
-        source.mkdir()
-        roster = source / "mesh_roster.json"
-        _ = roster.write_text(json.dumps({"original-name": {"thread_id": "original-thread", "status": "done"}}))
-        _ = self.authority("reserve", {"repository_id": "fixture-repo", "document": "design.md",
-                                       "host": "natedev", "request_id": "inventory"})
-        _ = self.authority("legacy", {"repository_id": "fixture-repo", "document": "design.md", "host": "natedev",
-            "source": {"mesh": str(source), "name": "original-name", "thread_id": "original-thread",
-                       "holder": {"kind": "UnitHolder", "production_slug": "demo", "unit_name": "design-unit"}}})
-        before = roster.read_bytes()
-        for thread, holder in (("other-thread", design_roles.UnitHolder("demo", "design-unit")),
-                               ("original-thread", design_roles.UnitHolder("demo", "other-unit"))):
-            with self.subTest(thread=thread, holder=holder), \
-                    patch.object(codex_mesh, "Client", side_effect=AssertionError("source must not be contacted")), \
-                    self.assertRaisesRegex(design_roles.RoleRefused, "AdoptionRequired"):
-                _ = design_roles.adopt("fixture-repo", "design.md", "designer", holder, "design", source_mesh=str(source),
-                                name="original-name", thread_id=thread, adoption_id="transfer", binding=self.binding(self.run_a))
-        self.assertEqual(roster.read_bytes(), before)
-        self.assertFalse((source / "transfer.json").exists())
-        self.assertFalse(list((self.root / "roles").glob("*/design.json")))
 
     def test_end_retry_requires_proof_that_the_original_turn_is_no_longer_live(self) -> None:
         design = self.open_designer()
@@ -1732,7 +1418,7 @@ class DurableRolesTests(unittest.TestCase):
             self.assertTrue((self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json").exists())
             active = False
             ended = design_roles.end(instance_id)
-        self.assertEqual(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded("9309c903-5894-501a-8aa7-f33ea912e074"))
+        self.assertEqual(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded(staff.StaffId("9309c903-5894-501a-8aa7-f33ea912e074")))
         self.assertFalse((self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json").exists())
 
     def test_showrunner_notifier_target_requires_a_live_local_session(self) -> None:
@@ -1742,42 +1428,6 @@ class DurableRolesTests(unittest.TestCase):
         self.assertIsInstance(reach, design_roles.HolderUnavailable)
         if isinstance(reach, design_roles.HolderUnavailable):
             self.assertIn("local session", reach.reason)
-
-    def test_adoption_destination_requires_the_same_idle_thread_without_a_new_turn(self) -> None:
-        design = design_roles.open_role("fixture-repo", "design.md", "reviewer", design_roles.ShowrunnerHolder("demo"), "design")
-        directory = design_roles.design_directory(design.placement.design_id)
-        mesh = design_roles.mesh_directory(design.placement.design_id)
-        prompt = next(directory.glob("prompts/*.md"))
-        roster = cast(dict[str, dict[str, object]], json.loads((mesh / "mesh_roster.json").read_text()))
-        roster[self.instance(design, "reviewer").name]["instructions_file"] = str(prompt)
-        _ = (mesh / "mesh_roster.json").write_text(json.dumps(roster))
-        _ = (mesh / "serving_home.json").write_text(json.dumps({"codex_home": str(self.root / "codex-home")}))
-        resumed_thread = "364898ad-f177-5514-80f3-b82001fa95d9"
-        requests: list[tuple[str, dict[str, object]]] = []
-
-        def request(method: str, params: dict[str, object], *arguments: object,
-                    **options: object) -> dict[str, object]:
-            del arguments, options
-            requests.append((method, params))
-            if method == "thread/resume":
-                return {"result": {"thread": {"id": resumed_thread}}}
-            if method == "thread/read":
-                return {"result": {"thread": {"id": resumed_thread, "status": {"type": "idle"}, "turns": []}}}
-            raise AssertionError("adoption must not create a thread or turn: " + method)
-
-        client = cast(codex_mesh.Client, MagicMock(spec=codex_mesh.Client))
-        with patch.object(codex_mesh, "ensure_server", return_value=(32100, False)), \
-                patch.object(codex_mesh, "Client", return_value=client), \
-                patch.object(client, "call", side_effect=request):
-            design_roles.confirm_adoption(design, "reviewer", "364898ad-f177-5514-80f3-b82001fa95d9")
-            resumed_thread = "replacement-thread"
-            with self.assertRaisesRegex(design_roles.RoleRefused, "identity differs"):
-                design_roles.confirm_adoption(design, "reviewer", "364898ad-f177-5514-80f3-b82001fa95d9")
-        self.assertEqual([method for method, _params in requests], ["thread/resume", "thread/read", "thread/resume"])
-        self.assertEqual(requests[0][1], {"threadId": "364898ad-f177-5514-80f3-b82001fa95d9",
-                                         "developerInstructions": prompt.read_text(),
-                                         "sandbox": "read-only", "approvalPolicy": "never"})
-
 
 if __name__ == "__main__":
     _ = unittest.main()

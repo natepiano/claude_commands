@@ -154,8 +154,8 @@ class LifecycleTests(LifecycleFixture):
         below = rows.get(child_name)
         if below is None:
             _ = fixture_member("showrunner", name=child_name, parent=above.id)
-        elif below.parent != above.id:
-            _ = staff.move(below.id, above.id)
+        elif below.parent != staff.ReportsTo(above.id):
+            _ = staff.move(below.id, staff.ReportsTo(above.id))
         return path
 
     def test_wrap_child_check_follows_staff_parent_despite_stale_parent_file(self) -> None:
@@ -163,7 +163,7 @@ class LifecycleTests(LifecycleFixture):
         self.showrunner("kid", live=True)
         _ = self.reports_to("kid", "example")
         child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
-        _ = staff.move(child.id, None)
+        _ = staff.move(child.id, staff.StaffRoot())
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
         self.assertEqual((self.state / "showrunner/kid/parent").read_text(), "example\n")
@@ -172,7 +172,7 @@ class LifecycleTests(LifecycleFixture):
         self.merged_units()
         top = fixture_member("showrunner", name="top")
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
-        runner = staff.move(runner.id, top.id)
+        runner = staff.move(runner.id, staff.ReportsTo(top.id))
         alpha = fixture_member("unit", name="alpha", parent=runner.id)
         beta = fixture_member("unit", name="beta", parent=runner.id)
         child = fixture_member("showrunner", name="kid", parent=runner.id)
@@ -1133,7 +1133,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertFalse(parent.exists())
         child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
-        self.assertEqual(child.parent, runner.id)
+        self.assertEqual(child.parent, staff.ReportsTo(runner.id))
         self.assertIsInstance(runner.doc, staff.WrappedDoc)
         self.assertIn("retained children kid", result.stdout)
         [sent] = self.sent()

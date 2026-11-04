@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from scripts.lib import test_hang_guard
+from scripts.production import staff, session_staff
+from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file
 
 import json
 import shutil
 import subprocess
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, override
 
@@ -81,6 +84,11 @@ if verb == 'start':
     )
     pathlib.Path(option('--summary-file')).write_text('No findings.\\n')
     pathlib.Path(option('--log-file')).write_text('stub mesh log\\n')
+    from scripts.production.staff_test_support import fixture_worker, isolated_staff_file
+    from scripts.production import staff
+    with isolated_staff_file(pathlib.Path(os.environ['STAFF_FILE']), {}):
+        worker = fixture_worker(name, staff.native_id(os.environ['CODEX_THREAD_ID']))
+    entry['staff_id'] = worker.id
     entry['status'] = 'done'
 elif verb == 'compact':
     if (roster_path.parent / 'compact_still_live').exists():
@@ -163,7 +171,14 @@ elif verb == 'follow':
         log.write('stub mesh log\\n')
     entry['status'] = 'done'
     if os.environ.get('STUB_REPLACEMENT_THREAD'):
-        entry['thread_id'] = os.environ['STUB_REPLACEMENT_THREAD']
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_runtime_id, fixture_session, isolated_staff_file
+        with isolated_staff_file(pathlib.Path(os.environ['STAFF_FILE']), {}):
+            member = staff.local_snapshot().by_id(staff.native_id(entry['staff_id']))
+            replacement = fixture_runtime_id(os.environ['STUB_REPLACEMENT_THREAD'])
+            fixture_session(replacement, staff.CodexBackend(pathlib.Path(os.environ['CODEX_HOME'])))
+            staff.update_current_session(member.current_session, replacement)
+        entry['thread_id'] = replacement
     if os.environ.get('STUB_TURN_FAILURE'):
         entry['status'] = 'failed'
         save_entry()
@@ -207,6 +222,12 @@ class ReviewLauncherFixture(LauncherFixture):
         super().setUp()
         self.prompt_file: Path = self.root / "review_prompt.md"
         self.review_script = self.root / "scripts" / "direct" / "review.sh"
+
+    @cached_property
+    def staff_parent(self) -> str:
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+        with isolated_staff_file(self.root / "staff.json", {}):
+            return unit_membership("fixture", "fixture-unit").id
 
     @override
     def prepare_fixture(self) -> None:
@@ -296,6 +317,11 @@ class ReviewLauncherFixture(LauncherFixture):
     @override
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
+        environment["STAFF_FILE"] = str(self.root / "staff.json")
+        environment["CODEX_HOME"] = str(self.root / "codex-home")
+        environment["CODEX_THREAD_ID"] = self.staff_parent
+        environment["PYTHONPATH"] = str(DIRECT_DIR.resolve().parents[1])
+        _ = environment.pop("STAFF_ID", None)
         environment["LINT_CONFIG_FILE"] = str(self.root / "lint.conf")
         environment["UNIT_EARLY_POLL_SECS"] = "0.01"
         environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
@@ -399,8 +425,15 @@ class ReviewLauncherFixture(LauncherFixture):
     ) -> str:
         roster = session_dir / "mesh_roster.json"
         records = cast(dict[str, object], json.loads(roster.read_text())) if roster.exists() else {}
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_worker
+        with isolated_staff_file(self.root / "staff.json", {}):
+            worker = fixture_worker(name, staff.native_id(self.staff_parent),
+                                    runtime_id=fixture_runtime_id(thread_id),
+                                    backend=staff.CodexBackend(self.root / "codex-home"))
         records[name] = {
-            "thread_id": thread_id,
+            "staff_id": worker.id,
+            "thread_id": worker.current_session,
             "turn_id": "turn-1",
             "status": status,
             "role": role,
@@ -411,6 +444,13 @@ class ReviewLauncherFixture(LauncherFixture):
             encoding="utf-8",
         )
         return name
+
+    def recorded_worker(self, session: Path, name: str) -> staff.StaffRow:
+        records = cast(dict[str, dict[str, object]], json.loads((session / "mesh_roster.json").read_text()))
+        with isolated_staff_file(self.root / "staff.json", {}):
+            member = session_staff.worker_row(records[name], staff.local_snapshot())
+        assert member is not None
+        return member
 
     def unit_review_command(
         self, session_dir: Path, lens: str = "contract", ready_file: str = "", *, slot: str = "review",

@@ -20,7 +20,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 BACKEND = '''import json, os, sys
 from pathlib import Path
 sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
-from scripts.production import staff
 log = Path(os.environ["FIXTURE_BACKEND_LOG"])
 with log.open("a") as output:
     output.write(json.dumps({"arguments": sys.argv[1:], "STAFF_ID": os.environ.get("STAFF_ID", "")}) + "\\n")
@@ -120,7 +119,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = staff.by_id(staff.StaffId(self.fixture.identity))
         assert row is not None
-        self.assertEqual((row.name, row.parent), ("fresh-impl", self.fixture.unit.id))
+        self.assertEqual((row.name, row.parent), ("fresh-impl", staff.ReportsTo(self.fixture.unit.id)))
         sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
         self.assertEqual(sent["row"], row.to_json())
         self.assertEqual(cast(list[str], sent["arguments"])[:2], ["--to", "session:" + self.fixture.identity])
@@ -157,7 +156,7 @@ if os.environ.get("BG_ID"):
         self.assertEqual(reads.read_text().splitlines(), ["empty", "empty", "ready"])
         row = staff.by_id(staff.StaffId(self.fixture.identity))
         assert row is not None
-        self.assertEqual((row.name, row.parent), ("fresh-impl", self.fixture.unit.id))
+        self.assertEqual((row.name, row.parent), ("fresh-impl", staff.ReportsTo(self.fixture.unit.id)))
         self.assertTrue(self.fixture.sent.exists())
         self.assertEqual(len(self.backend_calls()), 1)
 
@@ -167,7 +166,7 @@ if os.environ.get("BG_ID"):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = staff.by_id(staff.StaffId(self.fixture.identity))
         assert row is not None
-        self.assertEqual(row.parent, self.fixture.unit.id)
+        self.assertEqual(row.parent, staff.ReportsTo(self.fixture.unit.id))
         self.assertEqual(len(self.backend_calls()), 1)
         self.assertEqual(json.loads(self.fixture.sent.read_text())["row"], row.to_json())
         parent = staff.by_id(self.fixture.unit.id)
@@ -181,7 +180,7 @@ if os.environ.get("BG_ID"):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 row = staff.by_id(staff.StaffId(self.fixture.identity))
                 assert row is not None
-                self.assertEqual(row.parent, self.fixture.unit.id)
+                self.assertEqual(row.parent, staff.ReportsTo(self.fixture.unit.id))
                 self.assertEqual(json.loads(self.fixture.sent.read_text())["row"], row.to_json())
                 self.assertEqual(len(self.backend_calls()), count)
                 self.assertEqual(self.fixture.id_file.read_text().strip(), self.fixture.identity[:8])

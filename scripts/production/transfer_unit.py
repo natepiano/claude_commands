@@ -36,7 +36,6 @@ import merge_checkpoint  # noqa: E402
 import production_units  # noqa: E402
 import rename_state  # noqa: E402
 import rename_unit  # noqa: E402
-import retire_unit  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import tidy_wrapped  # noqa: E402
@@ -374,9 +373,6 @@ def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
     The unit's held design roles name the receiving production as holder, so they resume under it.
     The phase note follows on the unit's next refresh, and the giving showrunner's report state
     keeps its rows as history."""
-    from scripts.direct import workers
-    workers.move_unit(transfer.from_slug, transfer.to_slug, transfer.unit,
-                      runs=tuple(retire_unit.runs_of(Path(transfer.worktree_dir))))
     try:
         design_roles.move_holder(design_roles.UnitHolder(transfer.from_slug, transfer.unit),
                           design_roles.UnitHolder(transfer.to_slug, transfer.unit), reason="unit transfer")
@@ -450,7 +446,7 @@ def verify_failures(transfer: UnitTransfer) -> list[str]:
         failures.append(f"stall-watch: the stretch is still under {transfer.from_slug}")
     record = staff.snapshot()
     row = record.by_id(transfer.staff_id)
-    if row is None or row.parent != transfer.parent_staff_id:
+    if row is None or row.parent != staff.ReportsTo(transfer.parent_staff_id):
         failures.append(f"staff: {unit} is not under {transfer.to_slug}")
     failures.extend(design_roles.holder_failures(design_roles.UnitHolder(transfer.from_slug, unit)))
     return failures

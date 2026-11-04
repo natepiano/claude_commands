@@ -273,7 +273,7 @@ def row_production(row: staff.StaffRow, record: staff.StaffSnapshot,
     """Resolve a unit's current parent from the caller's owner snapshot."""
     doc = session_staff.RowResolver(record).production_doc(row)
     if isinstance(doc, session_staff.ProductionDoc):
-        slugs = [slug for slug, parent in sources.showrunner_members(record).items() if parent.id == row.parent]
+        slugs = [slug for slug, parent in sources.showrunner_members(record).items() if staff.ReportsTo(parent.id) == row.parent]
         slug = slugs[0] if len(slugs) == 1 else showrunners.production_slug(str(doc.path))
         return UnitProduction(slug, str(doc.path))
     raise staff.StaffUnreadable(f"{row.name}: {doc.reason}")
@@ -295,7 +295,7 @@ def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
     while row is not None:
         if row.kind == "showrunner":
             return MemberFound(row)
-        row = record.by_id(row.parent) if row.parent is not None else None
+        row = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
     return NoSessionShowrunner()
 
 

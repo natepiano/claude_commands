@@ -10,12 +10,13 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast, final, override
 from unittest import mock
 from scripts.direct import workers
-from scripts.production import staff_sources
+from scripts.production import fake_unit_host, staff, staff_sources, worker_admission
+from scripts.production.staff_test_support import StaffTestCase, fixture_worker, isolated_staff_file, unit_membership
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -78,40 +79,43 @@ class FakeProcess(NamedTuple):
 
 
 @final
-class RunProcessTests(unittest.TestCase):
+class RunProcessTests(StaffTestCase):
     """What a stopped unit's runs leave in its worktree. The processes are records: nothing real is signalled."""
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
-        self.worktree = Path()
+        self.process_worktree = Path()
         self.processes: dict[int, FakeProcess] = {}
         self.signalled: list[int] = []
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         _ = self.enterContext(isolated_parents())
         PARENTS["alpha-unit"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.dict(os.environ, config_environment(self.root / "config")))
-        self.worktree = self.root / "claude-demo-alpha"
+        self.process_worktree = self.root / "claude-demo-alpha"
         other = self.root / "claude-demo-beta"
-        mine = self.run_folder("run-a", self.worktree)
+        parent = unit_membership(SLUG, "alpha-unit")
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.process_worktree), expected=parent.worktree)
+        mine = self.run_folder("run-a", self.process_worktree)
         theirs = self.run_folder("run-b", other)
         lint = ["python3", "mesh_runs.py", "supervise", str(self.run_record(mine, "lint", 101))]
         _ = self.run_record(mine, "test", 104)
         self.processes = {
             # The unit's detached lint run: the supervisor leads its session, verify.sh and tee are in it.
-            101: FakeProcess(self.worktree, 101, lint),
-            102: FakeProcess(self.worktree, 101, ["bash", "verify.sh", "lint", "pkg"]),
-            103: FakeProcess(self.worktree, 101, ["tee", "-a", "run.log"]),
+            101: FakeProcess(self.process_worktree, 101, lint),
+            102: FakeProcess(self.process_worktree, 101, ["bash", "verify.sh", "lint", "pkg"]),
+            103: FakeProcess(self.process_worktree, 101, ["tee", "-a", "run.log"]),
             # The idle-stop watcher of the run's stopped app-server, and its sleep.
-            201: FakeProcess(self.worktree, 201, self.watcher(mine)),
-            202: FakeProcess(self.worktree, 201, ["sleep", "300"]),
+            201: FakeProcess(self.process_worktree, 201, self.watcher(mine)),
+            202: FakeProcess(self.process_worktree, 201, ["sleep", "300"]),
             # A record whose pid now names another process; another unit's watcher; the user's shell.
-            104: FakeProcess(self.worktree, 104, ["cargo", "build"]),
-            203: FakeProcess(self.worktree, 203, self.watcher(theirs)),
-            900: FakeProcess(self.worktree, 900, ["zsh"]),
+            104: FakeProcess(self.process_worktree, 104, ["cargo", "build"]),
+            203: FakeProcess(self.process_worktree, 203, self.watcher(theirs)),
+            900: FakeProcess(self.process_worktree, 900, ["zsh"]),
             # Another unit's detached run, in its own worktree.
             301: FakeProcess(other, 301, ["python3", "mesh_runs.py", "supervise",
                                           str(self.run_record(theirs, "lint", 301))]),
@@ -133,12 +137,20 @@ class RunProcessTests(unittest.TestCase):
         worktree.mkdir(parents=True, exist_ok=True)
         folder = self.root / "runs" / name
         (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
-        _ = (folder / "progress_history_state.json").write_text(json.dumps({"working_dir": str(worktree)}))
+        parent = unit_membership(SLUG, "alpha-unit" if worktree == self.process_worktree else name)
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", worktree), expected=parent.worktree)
+        _ = (folder / "progress_history_state.json").write_text(json.dumps({"production": SLUG, "unit": parent.name}))
         return folder
 
     def run_record(self, folder: Path, label: str, pid: int) -> Path:
         path = folder / retire_unit.DETACHED_RUNS / f"{label}.json"
-        _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "cwd": str(self.worktree)}))
+        parent = worker_admission.parent(staff.local_snapshot(), run=folder)
+        member = fixture_worker(label, parent.id, backend=staff.CodexBackend(self.root / "codex"))
+        _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "staff_id": member.id}))
+        roster = folder / "mesh_roster.json"
+        entries = cast(dict[str, object], json.loads(roster.read_text())) if roster.exists() else {}
+        entries[member.name] = {"staff_id": member.id, "status": "done"}
+        _ = roster.write_text(json.dumps(entries))
         return path
 
     def watcher(self, folder: Path) -> list[str]:
@@ -172,7 +184,7 @@ class RunProcessTests(unittest.TestCase):
 
     def rename(self) -> rename_unit.UnitRename:
         return rename_unit.UnitRename(SLUG, "alpha-unit", "gamma-unit", "", "", SLUG, "demo-alpha", "demo-gamma",
-                                      str(self.worktree), str(self.root / "claude-demo-gamma"), "", "")
+                                      str(self.process_worktree), str(self.root / "claude-demo-gamma"), "", "")
 
     def stop(self) -> str:
         output = io.StringIO()
@@ -180,20 +192,36 @@ class RunProcessTests(unittest.TestCase):
             rename_unit.stop_unit(self.rename(), lambda: None)
         return output.getvalue()
 
-    def test_rename_refuses_a_paused_workers_live_command_inside_the_worktree_without_signalling(self) -> None:
+    def test_rename_prints_the_detached_command_anomaly_without_signalling_the_command(self) -> None:
+        self.processes = {pid: process for pid, process in self.processes.items() if process.session == 101}
         run = self.root / "runs" / "run-a"
         record = run / retire_unit.DETACHED_RUNS / "lint.json"
-        _ = record.write_text(json.dumps({"status": "running", "pid": 101, "worker": "w7", "cwd": str(self.worktree)}))
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"working_dir": str(self.worktree),
-            "production": SLUG, "unit": "alpha-unit"}))
-        with mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.root / "unit-workers")}):
+        _ = record.write_text(json.dumps({"status": "running", "pid": 101, "worker": "w7"}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": SLUG, "unit": "alpha-unit"}))
+        parent = unit_membership(SLUG, "alpha-unit")
+        environment = {**fake_unit_host.environment(self.root),
+            "UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
+            "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
+            "CLAUDE_CODE_SESSION_ID": parent.current_session, "CODEX_THREAD_ID": ""}
+        fake_unit_host.write(environment, [fake_unit_host.HostedUnit("agents", "w1:p1", {
+            "SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": "alpha-unit",
+            "CLAUDE_CODE_SESSION_ID": parent.current_session})])
+        fake_unit_host.place_process(environment, os.getpid(), "w1:p1", session="agents")
+        with (isolated_staff_file(self.staff_file, environment),
+              mock.patch.dict(os.environ, environment)):
+            member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(self.root / "codex"))
+            fields = cast(dict[str, object], json.loads(record.read_text()))
+            fields["staff_id"] = member.id
+            _ = record.write_text(json.dumps(fields))
             store = workers.UnitWorkerLedger(workers.ledger_path(SLUG, "alpha-unit"))
             with store.locked() as ledger:
                 ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
-                    workers.CodexThread("kept-thread", str(self.root / "codex")), workers.Paused(),
-                    [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
-            with self.assertRaisesRegex(RenameRefused, r"detached run lint of w7 works inside"):
+                    workers.CodexThread(member.current_session, str(self.root / "codex")), workers.Paused(),
+                    [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})], staff_id=member.id)
+            errors = io.StringIO()
+            with redirect_stderr(errors):
                 _ = self.stop()
+            self.assertIn(f"anomaly: {run}: detached commands remain active", errors.getvalue())
         self.assertEqual(self.signalled, [])
         self.assertIn(101, self.processes)
         self.assertIn(102, self.processes)
@@ -202,7 +230,7 @@ class RunProcessTests(unittest.TestCase):
     def test_run_ownership_passes_one_settings_read_to_process_arguments(self) -> None:
         with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
               mock.patch.object(retire_unit, "command_line", wraps=self.arguments) as arguments):
-            found = retire_unit.run_processes(self.worktree, [101, 102])
+            found = retire_unit.run_processes(self.process_worktree, [101, 102])
         self.assertEqual(set(found), {101, 102})
         reads.assert_called_once_with("production")
         settings = [cast(object, call.kwargs["settings"]) for call in arguments.call_args_list]
@@ -215,9 +243,9 @@ class RunProcessTests(unittest.TestCase):
                 with self.subTest(folder=folder, shell=shell):
                     arguments = self.watcher(folder)
                     arguments[0], arguments[4] = shell, "555"
-                    self.processes[203] = FakeProcess(self.worktree, 203, arguments)
-                    self.processes[204] = FakeProcess(self.worktree, 203, ["sleep", "300"])
-                    found = retire_unit.run_processes(self.worktree, [203, 204])
+                    self.processes[203] = FakeProcess(self.process_worktree, 203, arguments)
+                    self.processes[204] = FakeProcess(self.process_worktree, 203, ["sleep", "300"])
+                    found = retire_unit.run_processes(self.process_worktree, [203, 204])
                     self.assertEqual(set(found), {203, 204})
                     for name in found.values():
                         self.assertIn("app-server watcher 203 of dead server 555", name)
@@ -229,8 +257,8 @@ class RunProcessTests(unittest.TestCase):
             (self.root / "elsewhere/run-a", set()), (self.root / "gone", set()))
         for folder, expected in cases:
             with self.subTest(folder=folder):
-                self.processes[203] = FakeProcess(self.worktree, 203, self.watcher(folder))
-                self.assertEqual(set(retire_unit.run_processes(self.worktree, [203])), expected)
+                self.processes[203] = FakeProcess(self.process_worktree, 203, self.watcher(folder))
+                self.assertEqual(set(retire_unit.run_processes(self.process_worktree, [203])), expected)
         self.assertEqual(self.signalled, [])
 
     def test_dead_server_watcher_requires_the_mesh_entry_point_and_valid_server_pid(self) -> None:
@@ -240,8 +268,8 @@ class RunProcessTests(unittest.TestCase):
                 arguments = self.watcher(self.root / "gone")
                 arguments[4] = "555"
                 arguments[index] = value
-                self.processes[203] = FakeProcess(self.worktree, 203, arguments)
-                self.assertEqual(retire_unit.run_processes(self.worktree, [203]), {})
+                self.processes[203] = FakeProcess(self.process_worktree, 203, arguments)
+                self.assertEqual(retire_unit.run_processes(self.process_worktree, [203]), {})
         self.assertEqual(self.signalled, [])
 
     def test_the_stop_ends_the_runs_supervisor_and_watcher_and_leaves_the_rest(self) -> None:
@@ -273,8 +301,8 @@ class RunProcessTests(unittest.TestCase):
         and, when it is 0, ends them. The calls come back."""
         folder = self.root / "runs" / "run-a"
         _ = (folder / "mesh_server.json").write_text(json.dumps({"pid": 501, "port": 51101}))
-        self.processes = {501: FakeProcess(self.worktree, 501, ["codex", "app-server", "--listen", "ws://x"]),
-                          502: FakeProcess(self.worktree, 501, ["codex-code-mode-host"])}
+        self.processes = {501: FakeProcess(self.process_worktree, 501, ["codex", "app-server", "--listen", "ws://x"]),
+                          502: FakeProcess(self.process_worktree, 501, ["codex-code-mode-host"])}
         calls: list[list[str]] = []
 
         def mesh(argv: list[str], cwd: Path | None = None, *,
@@ -310,10 +338,10 @@ class RunProcessTests(unittest.TestCase):
         former = self.root / "delegate"
         folder = former / "run-old"
         (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
-        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"working_dir": str(self.worktree)}))
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"production": SLUG, "unit": "alpha-unit"}))
         record = self.run_record(folder, "lint-old", 401)
-        self.processes = {401: FakeProcess(self.worktree, 401, ["python3", "mesh_runs.py", "supervise", str(record)]),
-                          402: FakeProcess(self.worktree, 401, ["bash", "verify.sh", "lint", "pkg"])}
+        self.processes = {401: FakeProcess(self.process_worktree, 401, ["python3", "mesh_runs.py", "supervise", str(record)]),
+                          402: FakeProcess(self.process_worktree, 401, ["bash", "verify.sh", "lint", "pkg"])}
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": ""}))
         _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
         _ = self.enterContext(mock.patch.object(unit_runs, "FORMER_RUN_ROOT", former))

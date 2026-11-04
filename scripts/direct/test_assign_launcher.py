@@ -19,7 +19,8 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker_records
+from scripts.production import staff, session_staff
 from scripts.direct import workers
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 from scripts.lint import style_review
@@ -37,7 +38,10 @@ def setUpModule() -> None:
 def read_object(path: Path) -> dict[str, object]:
     with path.open() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-        return cast(dict[str, object], json.load(handle))
+        records = cast(dict[str, object], json.load(handle))
+    if path.name == codex_mesh.ROSTER_FILE:
+        return fixture_worker_records(records, staff.local_snapshot())
+    return records
 
 
 @final
@@ -65,6 +69,13 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.server.hang_guard = self.hang_guard
         self.project = self.session_dir.parent / "project"
         self.project.mkdir()
+        owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
+        assert owner is not None
+        parent = staff.local_snapshot().parent_of(owner)
+        assert parent is not None
+        _ = staff.rename(parent.id, "fixture-production")
+        owner = staff.rename(owner.id, "fixture")
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", self.project), expected=owner.worktree)
         _ = (self.project / "plan.md").write_text("## Delegation Context\n\n- **Project:** Assignment fixture\n")
         self.history = self.session_dir.parent / "history"
         self.paths = self.session_dir.parent / "paths.txt"
@@ -87,9 +98,10 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "UNIT_CODEX_MESH": "1", "UNIT_SYNC_WRITES": "0",
             "PYTHONPATH": str(ROOT), "TMPDIR": "/tmp",
         }))
+        (self.session_dir / "progress_history_state.json").unlink(missing_ok=True)
         self.record("start-run", "--working-dir", str(self.project), "--plan-doc", "plan.md",
                     "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "high",
-                    "--main-session-id", "assign-director")
+                    "--main-session-id", owner.current_session)
         self.record("set-unit", "--production", "fixture-production", "--unit", "fixture-unit")
         self.record("start-phase", "--phase-id", "7", "--phase-title", "Assignment core")
         self.claims = []
@@ -185,7 +197,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         row = staff.by_id(staff.StaffId(thread))
         self.assertIsNotNone(row)
         assert row is not None
-        self.assertEqual((row.id, row.name, row.parent), (thread, name, os.environ["CODEX_THREAD_ID"]))
+        self.assertEqual((row.id, row.name, row.parent), (thread, name, staff.ReportsTo(staff.StaffId(os.environ["CODEX_THREAD_ID"]))))
         self.assertTrue(self.claims)
         self.assertTrue(all(str(entry["thread_id"]) == row.id for entry in self.claims))
 
@@ -194,7 +206,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         _ = record.write_text("{broken")
         result = self.launch()
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
-        self.assertIn("staff: impl: not opened:", result.stderr)
+        self.assertIn("invalid staff JSON:", result.stderr)
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual(record.read_text(), "{broken")
 
@@ -203,7 +215,6 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         starts = self.methods("thread/start")
         self.assertEqual(cast(dict[str, object], starts[0]["params"])["sandbox"], "read-only")
         self.assertTrue((self.session_dir / "phases/7/review_status_rerun_1").exists())
-        self.assertEqual(next(iter(self.assignment_records().values()))["role"], "review")
 
     def test_recorder_ad_hoc_phase_dispatches_into_adhoc_directory(self) -> None:
         self.record("start-phase", "--phase-id", "ad hoc", "--phase-title", "Ad hoc review")
@@ -263,8 +274,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
 
     def test_writer_dispatch_records_paths_rules_identity_and_a_finished_pass(self) -> None:
         _ = self.successful()
-        name, record = next(iter(self.assignment_records().items()))
-        self.assertEqual(record["role"], "impl")
+        name = next(iter(self.assignment_records()))
         self.assertEqual(self.turn_starts, 1)
         prompt = self.turn_inputs[0]
         self.assertIn(self.prompt.read_text().strip(), prompt)
@@ -286,8 +296,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
 
     def test_review_is_read_only_and_thread_board_and_summary_use_the_shown_context(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
-        name, record = next(iter(self.assignment_records().items()))
-        self.assertEqual(record["role"], "review")
+        name = next(iter(self.assignment_records()))
         starts = self.methods("thread/start")
         self.assertEqual(cast(dict[str, object], starts[0]["params"])["sandbox"], "read-only")
         names = [str(cast(dict[str, object], request["params"])["name"])
@@ -347,7 +356,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         _ = self.successful()
         name, original = next(iter(self.assignment_records().items()))
         identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
-                             if read_object(path).get("name") == name)
+                             if read_object(path).get("staff_id") == self.assignment_records()[name]["staff_id"])
         identity = identity_path.read_bytes()
         for options, expected in ((["--model", "gpt-other-sol:high"], ("gpt-other-sol", "high")),
                                   (["--effort", "max"], ("gpt-kept-sol", "max"))):
@@ -365,7 +374,6 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
     def test_new_worker_uses_its_requested_address_and_full_access_sandbox(self) -> None:
         _ = self.successful("test", "--new-worker", "address-without-role")
         self.assertEqual(set(self.assignment_records()), {"address-without-role"})
-        self.assertEqual(self.assignment_records()["address-without-role"]["role"], "test")
         self.assertEqual(cast(dict[str, object], self.methods("thread/start")[0]["params"])["sandbox"],
                          "danger-full-access")
 
@@ -408,7 +416,6 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         records = self.assignment_records()
         self.assertEqual(set(records), {name})
         self.assertEqual(records[name]["thread_id"], thread)
-        self.assertEqual(records[name]["role"], "review")
         self.assertEqual(records[name]["access_policy"], {"kind": "ReadOnlyReviewer"})
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(self.methods("thread/fork"), [])
@@ -510,7 +517,6 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         records = self.assignment_records()
         self.assertEqual(set(records), {"project-review"})
         self.assertEqual(records["project-review"]["thread_id"], mesh_fixture.THREAD_ID)
-        self.assertEqual(records["project-review"]["role"], "review")
         self.assertEqual(records["project-review"]["access_policy"], {"kind": "ReadOnlyReviewer"})
         self.assertEqual(cast(dict[str, object], self.methods("thread/start")[0]["params"])["sandbox"],
                          "read-only")
@@ -527,11 +533,10 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         name, original = next(iter(self.assignment_records().items()))
         _ = self.successful("implement", "--to", name)
         identities = [read_object(path) for path in self.session_dir.rglob("impl_worker_*.json")]
-        matched = [identity for identity in identities if identity.get("name") == name]
+        matched = [identity for identity in identities if identity.get("staff_id") == original["staff_id"]]
         self.assertEqual(len(matched), 1, identities)
-        self.assertEqual(matched[0]["worker_id"], original["thread_id"])
+        self.assertEqual(matched[0]["staff_id"], original["staff_id"])
         self.assertNotIn("role", matched[0])
-        self.assertEqual(self.assignment_records()[name]["role"], "impl")
         self.assertEqual(len(self.methods("thread/start")), 1)
 
     def test_a_replacement_after_review_to_implementation_keeps_writable_access(self) -> None:
@@ -546,32 +551,13 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(replacement["sandbox"], "danger-full-access")
         turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
         self.assertEqual(cast(dict[str, object], turn["sandboxPolicy"])["type"], "dangerFullAccess")
-        self.assertEqual(after["role"], "impl")
         self.assertEqual(after["access_policy"], {"kind": "WorkerLaunchPolicy"})
-
-    def test_a_corrupt_durable_family_or_worker_id_refuses_before_the_next_turn(self) -> None:
-        _ = self.successful()
-        name = next(iter(self.assignment_records()))
-        identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
-                             if read_object(path).get("name") == name)
-        identity = read_object(identity_path)
-        for field, value in (("family", "claude"), ("worker_id", "another-worker-thread")):
-            with self.subTest(field=field):
-                damaged = {**identity, field: value}
-                _ = identity_path.write_text(json.dumps(damaged))
-                result = self.launch("implement", "--to", name)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn(f"{name} has no matching durable worker identity for slot {name}",
-                              result.stdout + result.stderr)
-                self.assertEqual(read_object(identity_path), damaged)
-                self.assertEqual(self.turn_starts, 1)
-        _ = identity_path.write_text(json.dumps(identity))
 
     def test_a_saved_slot_keys_the_claim_and_board_for_a_full_worker_address(self) -> None:
         name = "project-impl"
         _ = self.successful("implement", "--new-worker", name)
         identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
-                             if read_object(path).get("name") == name)
+                             if read_object(path).get("staff_id") == self.assignment_records()[name]["staff_id"])
         identity = read_object(identity_path)
         identity["slot"] = "impl"
         _ = identity_path.write_text(json.dumps(identity))
@@ -604,7 +590,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         _ = self.successful()
         name = next(iter(self.assignment_records()))
         identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
-                             if read_object(path).get("name") == name)
+                             if read_object(path).get("staff_id") == self.assignment_records()[name]["staff_id"])
         identity = read_object(identity_path)
         identity["model"] = "gpt-other-sol"
         _ = identity_path.write_text(json.dumps(identity))
@@ -614,7 +600,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(read_object(identity_path)["model"], "gpt-other-sol")
         self.assertEqual(self.turn_starts, 2)
 
-    def test_a_legacy_roster_without_a_model_uses_registry_changes_on_the_same_thread(self) -> None:
+    def test_a_roster_without_a_model_uses_registry_changes_on_the_same_thread(self) -> None:
         _ = self.successful()
         name, record = next(iter(self.assignment_records().items()))
         original_thread = record["thread_id"]
@@ -748,7 +734,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                 launcher_pid = int((phase / "review_pid_contract").read_text())
                 os.kill(launcher_pid, 0)
                 address = next(iter(self.assignment_records()))
-                pending = self.session_dir / f"{address}.pending.json"
+                pending = session_staff.worker_inbox_path(str(self.session_dir), address)
                 watch = (codex_mesh.LinuxFileChanges({pending}) if sys.platform.startswith("linux")
                          else codex_mesh.KqueueFileChanges({pending}))
                 try:
@@ -876,24 +862,21 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "raise SystemExit(assign.main())\n")
         return script
 
-    def review_after_stage_one(self, *, adopt: bool) -> tuple[subprocess.CompletedProcess[str], Path]:
-        """Change delivery ownership only after the first follower has released its turn."""
+    def review_after_stage_one(self) -> subprocess.CompletedProcess[str]:
+        """Delay the second review stage until the first follower releases its turn."""
         ready = self.session_dir.parent / "handoff.ready"
         settled = self.session_dir.parent / "stage-one-settled"
-        destination = self.session_dir.parent / "taking-run"
         reply = self.session_dir / "phases/7/review_reply_contract_1.txt"
-        transport_override = ""
-        if not adopt:
-            # A successful transport acknowledgment alone must not complete a review.
-            # Keep the recorder, follower and app-server real, but lose the send.
-            transport = self.session_dir.parent / "codex_mesh.py"
-            _ = transport.write_text(
-                "import runpy, sys\n" +
-                "if sys.argv[1] == 'send':\n" +
-                "    print('queued transport acknowledgment without delivery')\n" +
-                "else:\n" +
-                f"    runpy.run_path({str(ROOT / 'scripts/agents/codex_mesh.py')!r}, run_name='__main__')\n")
-            transport_override = f"assign.MESH = {str(transport)!r}\n"
+        # A successful transport acknowledgment alone must not complete a review.
+        # Keep the recorder, follower and app-server real, but lose the send.
+        transport = self.session_dir.parent / "codex_mesh.py"
+        _ = transport.write_text(
+            "import runpy, sys\n" +
+            "if sys.argv[1] == 'send':\n" +
+            "    print('queued transport acknowledgment without delivery')\n" +
+            "else:\n" +
+            f"    runpy.run_path({str(ROOT / 'scripts/agents/codex_mesh.py')!r}, run_name='__main__')\n")
+        transport_override = f"assign.MESH = {str(transport)!r}\n"
         script = self.observe_follow_settlement(settled, transport_override)
         original = self.server.respond
 
@@ -932,44 +915,17 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                     self.assertTrue(all(record.get("status") == "done" for record in roster.values()), roster)
                     self.assertEqual(self.turn_starts, 1)
                     self.assertFalse(any(event.get("event_type") == "pass_finished" for event in self.events()))
-                    if adopt:
-                        with roster_path.open("r+") as handle:
-                            fcntl.flock(handle, fcntl.LOCK_EX)
-                            roster = cast(dict[str, dict[str, object]], json.load(handle))
-                            name, record = next(iter(roster.items()))
-                            destination.mkdir()
-                            _ = (destination / codex_mesh.ROSTER_FILE).write_text(json.dumps({name: record.copy()}))
-                            record["adopted_to"] = str(destination)
-                            codex_mesh.advance_worker_roster_revision(record)
-                            _ = handle.seek(0)
-                            _ = handle.write(json.dumps(roster))
-                            _ = handle.truncate()
                     ready.touch()
                     result = self.hang_guard.result(launched)
                 finally:
                     ready.touch()
         finally:
             watch.close()
-        return result, destination
+        return result
 
-    def test_an_early_review_adopted_after_stage_one_reports_handoff_without_a_second_prompt(self) -> None:
-        result, destination = self.review_after_stage_one(adopt=True)
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        folder = self.session_dir / "phases/7"
-        self.assertEqual((folder / "review_status_contract_1").read_text().strip(), "handed_off")
-        self.assertIn(str(destination), (folder / "review_summary_contract_1.txt").read_text())
-        name = next(iter(self.assignment_records()))
-        self.assertIn(f"handed off: {name} to {destination}; completion unknown", result.stdout + result.stderr)
-        self.assertEqual(self.turn_starts, 1)
-        self.assertFalse(any(event.get("event_type") == "pass_finished" and
-                             event.get("status") == "completed" for event in self.events()))
-        delivered = read_object(destination / f"{name}.pending.json")
-        messages = cast(list[str], delivered["messages"])
-        self.assertEqual(len(messages), 1, delivered)
-        self.assertIn("Stage 2:", messages[0])
 
     def test_an_early_review_without_stage_two_delivery_records_error_instead_of_done(self) -> None:
-        result = self.review_after_stage_one(adopt=False)[0]
+        result = self.review_after_stage_one()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         folder = self.session_dir / "phases/7"
         self.assertEqual((folder / "review_status_contract_1").read_text().strip(), "error")
@@ -979,177 +935,14 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(finished[0]["status"], "error")
         self.assertFalse(any(record.get("adopted_to") for record in self.assignment_records().values()))
 
-    def review_adoption_at_boundary(self, boundary: str) -> subprocess.CompletedProcess[str]:
-        """Insert ownership changes at exact coordinator boundaries around real followers."""
-        script = self.prepare_launcher()[0]
-        ready = self.session_dir.parent / "boundary.ready"
-        trace = self.session_dir.parent / "follow-boundaries.jsonl"
-        delivered = self.session_dir.parent / "boundary-delivered"
-        destination = self.session_dir.parent / "boundary-destination"
-        # The injected code changes only the ownership boundary. Real followers
-        # submit input, write receipts, and settle actual loopback-server turns.
-        _ = script.with_suffix(".py").write_text(
-            "import fcntl, json\nfrom pathlib import Path\nfrom scripts.direct import assign\nfrom scripts.agents import worker_lifecycle\n" +
-            f"boundary = {boundary!r}\nready = Path({str(ready)!r})\n" +
-            f"trace = Path({str(trace)!r})\ndestination = Path({str(destination)!r})\n" +
-            f"delivered = Path({str(delivered)!r})\n" +
-            "real_follow = assign.Dispatch.follow\nreal_claim = assign.Dispatch.claim_follow\n" +
-            "real_mesh_call = assign.Dispatch.mesh_call\n" +
-            "real_read = assign.read_roster\nactive_dispatch = None\n" +
-            "follow_count = 0\nclaim_count = 0\nadopted = False\n" +
-            "def adopt(dispatch):\n" +
-            "    global adopted\n" +
-            "    if adopted: return\n" +
-            "    adopted = True\n" +
-            "    destination.mkdir()\n" +
-            "    with worker_lifecycle.locked_state(dispatch.run / 'mesh_roster.json') as handle:\n" +
-            "        roster = handle.read_object()\n" +
-            "        record = roster[dispatch.worker]\n" +
-            "        (destination / 'mesh_roster.json').write_text(json.dumps({dispatch.worker: record.copy()}))\n" +
-            "        record['adopted_to'] = str(destination)\n" +
-            "        assign.codex_mesh.advance_worker_roster_revision(record)\n" +
-            "        handle.publish(json.dumps(roster))\n" +
-            "    if boundary == 'before_inbox':\n" +
-            "        pending = dispatch.run / (dispatch.worker + '.pending.json')\n" +
-            "        with worker_lifecycle.locked_state(pending) as handle:\n" +
-            "            (destination / pending.name).write_text(handle.read())\n" +
-            "            handle.publish(json.dumps(worker_lifecycle.empty_inbox()))\n" +
-            "    with trace.open('a') as handle: handle.write(json.dumps({'adopted': True}) + '\\n')\n" +
-            "def follow(dispatch, command, shown, log):\n" +
-            "    global follow_count, active_dispatch\n" +
-            "    active_dispatch = dispatch\n" +
-            "    follow_count += 1\n" +
-            "    if boundary == 'after_claim' and follow_count == 2: adopt(dispatch)\n" +
-            "    if boundary == 'first_claim' and follow_count == 1: adopt(dispatch)\n" +
-            "    result = real_follow(dispatch, command, shown, log)\n" +
-            "    with trace.open('a') as handle:\n" +
-            "        handle.write(json.dumps({'follow': follow_count, 'code': result}) + '\\n')\n" +
-            "    if result == 0:\n" +
-            "        if boundary == 'combined' or boundary == 'completed' and follow_count == 2: adopt(dispatch)\n" +
-            "        if follow_count == 1 and boundary != 'combined': ready.touch()\n" +
-            "    return result\n" +
-            "def claim(dispatch):\n" +
-            "    global claim_count\n" +
-            "    claim_count += 1\n" +
-            "    if boundary == 'before_claim' and claim_count == 2: adopt(dispatch)\n" +
-            "    return real_claim(dispatch)\n" +
-            "def read(run, name):\n" +
-            "    record = real_read(run, name)\n" +
-            "    if boundary == 'before_inbox' and follow_count == 1 and active_dispatch is not None:\n" +
-            "        adopt(active_dispatch)\n" +
-            "    return record\n" +
-            "def mesh_call(dispatch, verb, *options, **kwargs):\n" +
-            "    result = real_mesh_call(dispatch, verb, *options, **kwargs)\n" +
-            "    if verb == 'send' and result.returncode == 0: delivered.touch()\n" +
-            "    return result\n" +
-            "assign.Dispatch.follow = follow\nassign.Dispatch.claim_follow = claim\n" +
-            "assign.read_roster = read\n" +
-            "assign.Dispatch.mesh_call = mesh_call\n" +
-            "raise SystemExit(assign.main())\n")
-        original = self.server.respond
 
-        @self.hang_guard.callback
-        def final_reply(request: dict[str, object]) -> list[dict[str, object]] | None:
-            frames = original(request)
-            if request.get("method") == "turn/start" and frames is not None:
-                params = cast(dict[str, object], request["params"])
-                stage_two = "Stage 2:" in json.dumps(params)
-                if boundary == "combined" and self.turn_starts == 1:
-                    self.live_turn = "turn-1"
-                answer: dict[str, object] = {"jsonrpc": "2.0", "method": "item/completed", "params": {
-                    "threadId": params["threadId"], "turnId": f"turn-{self.turn_starts}",
-                    "item": {"id": f"answer-{self.turn_starts}", "type": "agentMessage",
-                             "text": "Final boundary review." if stage_two else "Provisional boundary review."}}}
-                frames.insert(len(frames) if boundary == "combined" and self.turn_starts == 1 else -1, answer)
-            return frames
 
-        self.server.respond = final_reply
-        if boundary == "combined":
-            self.outcomes = ["disconnect"]
-            self.server.hold_turn_completion = True
-            self.server.answer_requests_during_held_turn = True
-            self.server.held_turn_completes_successfully = True
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                           "--early-ready", str(ready), script=script)
-                try:
-                    self.hang_guard.event(self.server.held_turn_ready)
-                    watch = (codex_mesh.LinuxFileChanges({delivered}) if sys.platform.startswith("linux")
-                             else codex_mesh.KqueueFileChanges({delivered}))
-                    try:
-                        ready.touch()
-                        while not delivered.exists():
-                            event = self.hang_guard.change(watch.wait, self.lifecycle_clock.monotonic)
-                            self.assertNotEqual(event, codex_mesh.WaitDeadlineExpired.EXPIRED)
-                    finally:
-                        watch.close()
-                    self.live_turn = ""
-                    self.server.hold_turn_completion = False
-                    self.server.release_held_turn.set()
-                    result = self.hang_guard.result(launched)
-                finally:
-                    ready.touch()
-                    self.server.release_held_turn.set()
-        else:
-            result = self.launch("review", "--lens", "contract", "--pass", "1",
-                                 "--early-ready", str(ready), script=script)
-        transitions = [cast(dict[str, object], json.loads(line)) for line in trace.read_text().splitlines()]
-        self.assertEqual(len([entry for entry in transitions if entry.get("adopted")]), 1, transitions)
-        follows = [entry for entry in transitions if "follow" in entry]
-        expected_codes = ([2] if boundary == "first_claim" else
-                          [0] if boundary in {"combined", "before_claim", "before_inbox"} else
-                          [0, 2] if boundary == "after_claim" else [0, 0])
-        self.assertEqual([entry["code"] for entry in follows], expected_codes, transitions)
-        return result
 
-    def assert_completed_boundary_review(self, result: subprocess.CompletedProcess[str]) -> None:
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        folder = self.session_dir / "phases/7"
-        self.assertEqual((folder / "review_status_contract_1").read_text().strip(), "done")
-        self.assertIn("Final boundary review.", (folder / "review_summary_contract_1.txt").read_text())
-        self.assertNotIn("completion unknown", result.stdout + result.stderr)
-        receipts = [cast(dict[str, object], json.loads(line)) for line in
-                    (folder / "dispatch_1_submissions.jsonl").read_text().splitlines()]
-        self.assertTrue(any("Stage 2:" in json.dumps(receipt.get("messages")) for receipt in receipts), receipts)
-        finished = [event for event in self.events() if event.get("event_type") == "pass_finished"]
-        self.assertEqual(len(finished), 1, self.events())
-        self.assertEqual(finished[0]["status"], "completed")
-        self.assertEqual(self.turn_starts, 2)
 
-    def test_adoption_after_the_second_review_follow_keeps_its_completed_result(self) -> None:
-        self.assert_completed_boundary_review(self.review_adoption_at_boundary("completed"))
 
-    def test_adoption_after_one_follow_consumes_both_review_stages_keeps_its_completed_result(self) -> None:
-        self.assert_completed_boundary_review(self.review_adoption_at_boundary("combined"))
 
-    def assert_handed_off_boundary_review(self, result: subprocess.CompletedProcess[str]) -> None:
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        folder = self.session_dir / "phases/7"
-        self.assertEqual((folder / "review_status_contract_1").read_text().strip(), "handed_off")
-        self.assertIn(str(self.session_dir.parent / "boundary-destination"),
-                      (folder / "review_summary_contract_1.txt").read_text())
-        self.assertIn("completion unknown", result.stdout + result.stderr)
-        self.assertEqual(self.turn_starts, 1)
-        self.assertFalse(any(event.get("event_type") == "pass_finished" and event.get("status") == "completed"
-                             for event in self.events()))
 
-    def test_adoption_before_the_second_review_claim_settles_as_handoff(self) -> None:
-        self.assert_handed_off_boundary_review(self.review_adoption_at_boundary("before_claim"))
 
-    def test_adoption_after_the_roster_read_before_the_inbox_read_settles_as_handoff(self) -> None:
-        self.assert_handed_off_boundary_review(self.review_adoption_at_boundary("before_inbox"))
-
-    def test_adoption_after_the_second_claim_before_the_child_check_settles_as_handoff(self) -> None:
-        self.assert_handed_off_boundary_review(self.review_adoption_at_boundary("after_claim"))
-
-    def test_adoption_after_the_first_claim_before_the_child_check_settles_as_handoff(self) -> None:
-        result = self.review_adoption_at_boundary("first_claim")
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        status = self.session_dir / "phases/7/review_status_contract_1"
-        self.assertEqual(status.read_text().strip(), "handed_off")
-        self.assertEqual(self.turn_starts, 0)
-        self.assertFalse(any(event.get("event_type") == "pass_finished" and event.get("status") == "completed"
-                             for event in self.events()))
 
     def test_a_review_launcher_follow_uses_the_current_review_row_instead_of_history(self) -> None:
         _ = write_registry(self.registry, {"direct.codex": {"review": "gpt-other-sol:high"}}, update=True)
@@ -1171,7 +964,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         name, record = next(iter(self.assignment_records().items()))
         self.assertEqual(record["turn_model"], "gpt-other-sol")
         identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
-                             if read_object(path).get("name") == name)
+                             if read_object(path).get("staff_id") == self.assignment_records()[name]["staff_id"])
         identity = read_object(identity_path)
         self.assertEqual(identity["model"], "gpt-kept-sol")
         self.assertEqual(workers.resolve(self.session_dir, "review"), name)
@@ -1248,33 +1041,3 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(read_object(self.session_dir / "progress_history_state.json")["status"], "active")
         self.assertTrue(any(event.get("event_type") == "reopened" for event in self.events()))
-
-    def test_handoff_records_the_destination_without_finishing_or_resending_the_assignment(self) -> None:
-        original = self.server.respond
-        destination = str(self.session_dir.parent / "taking-run")
-
-        @self.hang_guard.callback
-        def handoff(request: dict[str, object]) -> list[dict[str, object]] | None:
-            if request.get("method") != "turn/start":
-                return original(request)
-            with (self.session_dir / codex_mesh.ROSTER_FILE).open("r+") as handle:
-                fcntl.flock(handle, fcntl.LOCK_EX)
-                roster = cast(dict[str, dict[str, object]], json.load(handle))
-                record = next(iter(roster.values()))
-                record["adopted_to"] = destination
-                codex_mesh.advance_worker_roster_revision(record)
-                _ = handle.seek(0)
-                _ = handle.write(json.dumps(roster))
-                _ = handle.truncate()
-            return [{"id": request["id"], "result": {"turn": {"id": "handoff-turn"}}}]
-
-        self.server.respond = handoff
-        result = self.launch()
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        folder = self.session_dir / "phases/7"
-        self.assertEqual((folder / "impl_status").read_text().strip(), "handed_off")
-        self.assertIn(destination, (folder / "impl_summary.txt").read_text())
-        self.assertIn("completion unknown", result.stdout + result.stderr)
-        self.assertEqual(len(self.methods("turn/start")), 1)
-        self.assertFalse(any(event.get("event_type") == "pass_finished" and
-                             event.get("status") == "completed" for event in self.events()))

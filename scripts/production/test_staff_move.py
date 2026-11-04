@@ -177,7 +177,7 @@ class StaffMoveTests(StaffTestCase):
         with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot:
             result = staff_move.move_unit("sdlc", "models-unit", "target")
         snapshot.assert_called_once_with()
-        self.assertEqual(result.row, replace(self.unit, parent=self.destination.id))
+        self.assertEqual(result.row, replace(self.unit, parent=staff.ReportsTo(self.destination.id)))
         self.assertTrue(result.membership_changed)
         self.assertIsInstance(result.tab, staff_move.TabMoved)
         self.assertEqual(staff.snapshot(), replace(before, rows=tuple(
@@ -213,7 +213,7 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(code, 0, errors.getvalue())
         self.assertEqual(output.getvalue(), "done: panes under new-tools\n")
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=self.destination.id))
+        self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=staff.ReportsTo(self.destination.id)))
         self.assertEqual(sum(command[2:4] == ["pane", "move"] for command in self.commands()), 1)
 
     def test_no_live_pane_keeps_parent_change_and_reports_the_unmoved_tab_once(self) -> None:
@@ -222,7 +222,7 @@ class StaffMoveTests(StaffTestCase):
             with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
                 code = staff.main(["move", "sdlc/models-unit", "target"])
         self.assertEqual(code, 0, errors.getvalue())
-        self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=self.destination.id))
+        self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=staff.ReportsTo(self.destination.id)))
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertIn("tab was not moved", output.getvalue())
         self.assertEqual(self.commands(), [["--session", "agents", "pane", "list"]])
@@ -236,7 +236,7 @@ class StaffMoveTests(StaffTestCase):
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = staff.main(["move", "sdlc/models-unit", "target"])
         self.assertEqual(code, 0, errors.getvalue())
-        self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=self.destination.id))
+        self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=staff.ReportsTo(self.destination.id)))
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertIn("tab was not moved (no live pane)", output.getvalue())
         self.assertEqual(self.commands(), [["--session", "agents", "pane", "list"]] * 2)
@@ -249,14 +249,14 @@ class StaffMoveTests(StaffTestCase):
             result = staff_move.move_unit("sdlc", "models-unit", "target")
         marks.assert_not_called()
         self.assertIsInstance(result.tab, staff_move.TabMoved)
-        self.assertEqual(result.row.parent, self.destination.id)
+        self.assertEqual(result.row.parent, staff.ReportsTo(self.destination.id))
         self.assertIn(["--session", "agents", "pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"],
                       self.commands())
         self.assertFalse(any(command[2:4] in (["pane", "process-info"], ["pane", "close"], ["agent", "start"])
                              for command in self.commands()))
 
     def test_hand_resumed_tab_moves_on_retry_after_parent_already_changed(self) -> None:
-        _ = staff.move(self.unit.id, self.destination.id)
+        _ = staff.move(self.unit.id, staff.ReportsTo(self.destination.id))
         before = self.staff_file.read_bytes()
         self.reply(["pane", "list"], {"panes": [
             {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "panes"},
@@ -274,7 +274,7 @@ class StaffMoveTests(StaffTestCase):
         self.reply(["pane", "process-info", "--pane", "w1:p1"], {"process_info": {"shell_pid": 101}})
         result = staff_move.move_unit("sdlc", "models-unit", "target")
         self.assertIsInstance(result.tab, staff_move.TabMoved)
-        self.assertEqual(result.row.parent, self.destination.id)
+        self.assertEqual(result.row.parent, staff.ReportsTo(self.destination.id))
         self.assertIn(["--session", "agents", "pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"],
                       self.commands())
         self.assertTrue(all(command[2:4] in (["pane", "process-info"], ["pane", "list"], ["workspace", "list"],
@@ -319,7 +319,7 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(sum(command[2:4] == ["pane", "move"] for command in self.commands()), 1)
 
     def test_missing_pinned_identity_never_selects_destination_name(self) -> None:
-        replacement = fixture_member("unit", name="models", parent=self.destination.id)
+        replacement = fixture_member("unit", name="models", parent=staff.ReportsTo(self.destination.id))
         before = self.staff_file.read_bytes()
         with self.assertRaises(staff.StaffRefused):
             _ = staff_move.move_unit("sdlc", "models-unit", "target",
@@ -372,7 +372,7 @@ class StaffMoveTests(StaffTestCase):
                 "CLAUDE_CODE_SESSION_ID": self.unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
             })
             result = staff_move.move_unit("sdlc", "models-unit", "target")
-            self.assertEqual(result.row, replace(self.unit, parent=self.destination.id))
+            self.assertEqual(result.row, replace(self.unit, parent=staff.ReportsTo(self.destination.id)))
             self.assertFalse(self.mac_file.exists())
         self.assertEqual(self.ssh_commands(), [
             ["show", "--snapshot", "--json"], ["move", self.unit.id, f"--parent={self.destination.id}", "--json"],
@@ -382,7 +382,7 @@ class StaffMoveTests(StaffTestCase):
                       self.commands())
 
     def test_taken_unit_name_refuses_before_tab_move(self) -> None:
-        _ = fixture_member("unit", name=self.unit.name, parent=self.destination.id)
+        _ = fixture_member("unit", name=self.unit.name, parent=staff.ReportsTo(self.destination.id))
         before = self.staff_file.read_bytes()
         with self.assertRaises(staff.StaffRefused):
             _ = staff_move.move_unit("sdlc", "models-unit", "target")
@@ -438,7 +438,7 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn("no workspace named 'new-tools'", errors.getvalue())
         self.assertEqual(staff.snapshot(), replace(before, rows=tuple(
-            replace(row, parent=self.destination.id) if row.id == self.unit.id else row for row in before.rows)))
+            replace(row, parent=staff.ReportsTo(self.destination.id)) if row.id == self.unit.id else row for row in before.rows)))
         self.assertTrue(all(command[2:4] not in (["pane", "move"], ["workspace", "create"])
                             for command in self.commands()))
 

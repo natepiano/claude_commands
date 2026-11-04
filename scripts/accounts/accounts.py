@@ -4922,18 +4922,16 @@ def _worker_status_records(inputs: set[Path]) -> list[tuple[Path, str, dict[str,
             except (OSError, ValueError):
                 continue
             homes: dict[int, str] = {}
+            from scripts.agents import codex_mesh
             try:
-                retired = read_object(path.parent / "mesh_retired.json").get("servers", [])
-            except (OSError, ValueError):
-                retired = []
-            inputs.add(path.parent / "mesh_retired.json")
-            servers = [*(cast(list[object], retired) if isinstance(retired, list) else []), server]
-            for value in servers:
-                if isinstance(value, dict):
-                    record = cast(dict[str, object], value)
-                    port, home = record.get("port"), record.get("codex_home")
-                    if isinstance(port, int) and isinstance(home, str):
-                        homes[port] = home
+                records = codex_mesh.run_server_records(path.parent)
+            except (OSError, ValueError) as error:
+                print(f"anomaly: {error}".replace("\n", " "), file=sys.stderr)
+                records = []
+            for record in records:
+                port, home = record.get("port"), record.get("codex_home")
+                if isinstance(port, int) and isinstance(home, str):
+                    homes[port] = home
             for name, value in raw.items():
                 if not isinstance(value, dict):
                     continue

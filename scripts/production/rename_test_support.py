@@ -24,6 +24,7 @@ from scripts.astra import design_roles
 from scripts.direct import workers
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
+from scripts.astra.design_role_test_support import designer_fixture
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
@@ -129,7 +130,7 @@ class FolderMoveFixture(StaffTestCase):
     history: Path = Path()
     records: Path = Path()
     owner: staff.StaffRow = staff.StaffRow(
-        staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "unit", "fixture", None,
+        staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "unit", "fixture", staff.StaffRoot(),
         current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
 
     @override
@@ -178,14 +179,12 @@ class FolderMoveFixture(StaffTestCase):
             str(self.root / "neighbour"), {}, ["claude", "-n", "neighbour"])
         pane_record.write("agents", sibling)
         fields: dict[str, object] = {
-            "run_id": "move-run", "working_dir": str(self.old_folder), "worktree": self.old_folder.name,
+            "run_id": "move-run", "worktree": self.old_folder.name,
             "branch": "unit-branch", "plan_doc": str(self.old_folder / "plan.md"),
             "history_file": str(self.history), "status": "active", "production": "production", "unit": "kept-name",
         }
         write_text_atomic(self.history, json.dumps({**fields, "event_type": "run_started", "run_started_at": 1}) + "\n")
         write_text_atomic(self.run_dir / STATE_FILENAME, json.dumps(fields) + "\n")
-        write_text_atomic(self.run_dir / "working_dir", str(self.old_folder) + "\n")
-        write_text_atomic(self.run_dir / "director", self.owner.current_session + "\n")
 
     def folder_git(self, checkout: Path, *arguments: str) -> str:
         result = subprocess.run(["git", "-C", str(checkout), *arguments],
@@ -434,7 +433,7 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
         # Failure injection scripts assign these names just as they do in a CLI
         # subprocess. Each call restores them before another test can observe it.
         for module, names in ((os, ("rename", "replace")),
-                              (workers, ("move_unit", "rename_unit", "end_unit", "repoint_unit_worktree"))):
+                              (workers, ("end_unit",))):
             for name in names:
                 _ = scope.enter_context(mock.patch.object(module, name, cast(object, getattr(module, name))))
 
@@ -817,7 +816,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"), f"{new_tip}\trefs/heads/new")
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.completed_steps(), 8)
+        self.assertEqual(self.completed_steps(), 7)
         self.assertIs(self.journal()["done"], False)
 
     def held_design(self, repository_id: str, checkout: Path, holder: design_roles.Holder) -> design_roles.HeldDesign:
@@ -826,39 +825,20 @@ class ProductionRenameFixture(StaffTestCase):
             design_roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
             placement = design_roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
                                                             "host": "fixture-host", "request_id": repository_id})
+            row = designer_fixture(holder, f"old-{repository_id}-astra-designer", self.root / "codex-home")
+            self.env["CODEX_HOME"] = str(self.root / "codex-home")
             design = design_roles.HeldDesign(
                 design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
                 str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", holder, design_roles.DesignUnbound(),
-                (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen("designer-thread")),
+                (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen(row.id)),
                  design_roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", design_roles.RoleNotOpened())))
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             self.write(design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json", json.dumps(
-                {design.roles[0].name: {"thread_id": "designer-thread", "status": "done", "cwd": str(checkout)}}))
+                {design.roles[0].name: {"staff_id": row.id, "status": "done"}}))
         return design
 
     def read_held(self, design: design_roles.HeldDesign) -> tuple[design_roles.HeldDesign, str]:
-        """The design as saved now, and its designer's launch directory."""
+        """Read the current design and its repository."""
         with mock.patch.dict(os.environ, self.env):
             current = design_roles.read_design(design.placement.design_id)
-            roster = cast(dict[str, dict[str, str]], json.loads(
-                (design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
-        return current, roster[design.roles[0].name]["cwd"]
-
-    def seed_paused_unit_worker(self) -> Path:
-        old = self.unit_worktree(OLD, "alpha-unit")
-        run = self.root / "runs/before-move"
-        self.write(run / workers.STATE, json.dumps({"status": "active", "working_dir": str(old),
-            "plan_doc": str(old / "docs/plans/alpha-unit.md"), "run_id": run.name}))
-        self.write(run / "working_dir", str(old))
-        with mock.patch.dict(os.environ, self.env):
-            store = workers.ledger_for_run(run)
-            worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
-                workers.CodexThread("057316c9-bc95-50de-b3fc-9010799ce6e7", str(self.root / "codex-home")), workers.Paused(),
-                [workers.WorkerEvent("opened", "before move", str(run), 1.0)])
-            with store.locked() as ledger:
-                ledger.workers["w7"] = worker
-        self.write(run / workers.ROSTER, json.dumps({"w7": {
-            "thread_id": "057316c9-bc95-50de-b3fc-9010799ce6e7", "codex_home": str(self.root / "codex-home"),
-            "role": "impl", "family": "codex", "model": "kept-model", "effort": "xhigh",
-            "status": "paused", "cwd": str(old / "subdir"), "unit_ledger": str(store.path)}}))
-        return run
+        return current, current.repository

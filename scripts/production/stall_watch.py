@@ -1231,7 +1231,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     else:
         runners = showrunners.registered_showrunners(deadline=inspection_deadline, membership=record)
     work: list[PaneInspection] = []
-    members_by_parent: dict[staff.StaffId | None, tuple[str, ...]] = {}
+    members_by_parent: dict[staff.ReportsTo | staff.StaffRoot, tuple[str, ...]] = {}
     for configured in runners:
         # A showrunner that is not running has no one to tell: its units are not watched.
         showrunner_socket = configured["socket"]
@@ -1251,7 +1251,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 row = unit_lookup.unit_row(name, record, reference=reference)
                 if row.parent not in members_by_parent:
                     members_by_parent[row.parent] = tuple(alias
-                        for member in record.find(kind="unit", parent=row.parent)
+                        for member in (record.find(kind="unit", parent=row.parent.id) if isinstance(row.parent, staff.ReportsTo) else ())
                         if not isinstance(member.worktree, staff.RemovedWorktree)
                         for alias in (member.name, unit_names.unit_id(member.name)))
                 work.append(PaneInspection(slug, configured, zone, members_by_parent[row.parent], name, unit, row))

@@ -8,7 +8,6 @@ from contextlib import redirect_stderr
 from dataclasses import dataclass, field
 import io
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -16,7 +15,7 @@ from typing import cast
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import atomic_file, unit_runs
+from scripts.lib import atomic_file
 from scripts.production import staff, staff_sources, unit_config, showrunners, rename_state, unit_names, unit_move
 from scripts.shutdown import pane_record, remote
 from scripts.message import sessions
@@ -37,54 +36,6 @@ class MigrationPlan:
     parked: tuple[ParkedPublication, ...] = ()
 
 
-def historical_workers(record: staff.StaffSnapshot, evidence: dict[staff.StaffId, set[str]],
-                       missing: list[str]) -> None:
-    """A completed roster proves identity only within its recorded director's ownership."""
-    claims: dict[str, set[staff.StaffId]] = {}
-    for row in record.rows:
-        if row.kind in ("unit", "showrunner"):
-            for native in evidence[row.id]:
-                claims.setdefault(native, set()).add(row.id)
-    owners = {native: next(iter(rows)) for native, rows in claims.items() if len(rows) == 1}
-    candidates: dict[staff.StaffId, dict[str, list[str]]] = {}
-    parent_entries: dict[staff.StaffId, list[str]] = {}
-    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
-        for path in sorted(root.glob("*/mesh_roster.json")):
-            try:
-                parent = owners.get(unit_runs.director(path.parent))
-                if parent is None:
-                    continue
-                value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-                if not isinstance(value, dict):
-                    raise ValueError("roster is not an object")
-                entries = cast(dict[str, object], value)
-                parent_entries.setdefault(parent, []).extend(
-                    f"{name}={fields.get('thread_id')} in {path}" for name, entry in entries.items()
-                    if isinstance(entry, dict) and (fields := cast(dict[str, object], entry)).get("thread_id"))
-                for row in record.find(kind="worker", parent=parent):
-                    # A current backend observation takes precedence over older runs.
-                    if evidence[row.id]:
-                        continue
-                    entry = entries.get(row.name)
-                    if not isinstance(entry, dict):
-                        continue
-                    thread = cast(dict[str, object], entry).get("thread_id")
-                    if not isinstance(thread, str) or not thread:
-                        missing.append(f"{row.id} {row.name}: {path}: missing recorded thread id")
-                        continue
-                    native = staff.native_id(thread)
-                    candidates.setdefault(row.id, {}).setdefault(native, []).append(str(path))
-            except (OSError, UnicodeError, ValueError, staff.StaffRefused) as error:
-                missing.append(f"{path}: historical worker evidence unavailable: {error}")
-    for identity, threads in candidates.items():
-        evidence[identity].update(threads)
-        if len(threads) > 1:
-            detail = "; ".join(f"{native} in {', '.join(paths)}" for native, paths in sorted(threads.items()))
-            missing.append(f"{identity}: conflicting parent-owned roster candidates: {detail}")
-    for row in record.find(kind="worker"):
-        if not evidence[row.id] and row.parent is not None and row.parent in parent_entries:
-            missing.append(f"{row.id} {row.name}: no exact worker name in parent-owned rosters; candidates: "
-                           + "; ".join(parent_entries[row.parent]))
 
 
 def worktree_transcript(row: staff.StaffRow, evidence: set[str], missing: list[str]) -> None:
@@ -98,7 +49,7 @@ def worktree_transcript(row: staff.StaffRow, evidence: set[str], missing: list[s
         return
     folder = unit_move.project_folder(str(row.worktree.path))
     try:
-        paths = {path.resolve() for directory in unit_move.config_dirs()
+        paths = {path.resolve() for directory in sessions.config_dirs()
                  for path in (directory / "projects" / folder).glob("*.jsonl")}
         if len(paths) != 1:
             if paths and not evidence:
@@ -167,8 +118,7 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
         if native in evidence:
             evidence[native].add(native)
     try:
-        workers = staff_sources.observe_workers(record, sources,
-                                               unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+        workers = staff_sources.observe_workers(record, sources)
     except (OSError, ValueError, staff.StaffUnreadable) as error:
         missing.append(f"worker runtime evidence unavailable: {error}")
     else:
@@ -180,13 +130,13 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
             if identity in evidence:
                 evidence[identity].update(backend.values())
         for observed in workers.workers:
-            if (not isinstance(observed.owner.match, staff.StaffRow)
-                    or isinstance(observed.identity, staff_sources.BackendUnavailable)):
+            if isinstance(observed.identity, staff_sources.BackendUnavailable):
                 continue
             matches = [row for row in record.find(kind="worker", parent=observed.owner.match.id)
                        if row.name == observed.name]
             if len(matches) == 1:
-                evidence[matches[0].id].update(observed.identity.values())
+                evidence[matches[0].id].add(observed.identity.session_id
+                    if isinstance(observed.identity, staff_sources.ClaudeSession) else observed.identity.thread_id)
             elif matches:
                 missing.append(f"{observed.name}: no unique worker row under {observed.owner.match.id}")
     retirements, retired_missing = staff_sources.migration_retirements(record)
@@ -222,7 +172,6 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
             if isinstance(config.retired, unit_config.RetiredSession):
                 evidence[candidate.member.row.id].add(config.retired.session_id)
                 parked[candidate.member.row.id] = config
-    historical_workers(record, evidence, missing)
     # A recorded handoff is conversation evidence, never a new member identity.
     for row in record.rows:
         if row.current_session != row.id and not row.id.startswith("s"):
@@ -252,12 +201,13 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
     # A proved child cannot finish before its owner's native identity is proved.
     while True:
         unowned = [row for row in record.rows if row.id in identities
-                   and row.parent is not None and row.parent not in identities]
+                   and isinstance(row.parent, staff.ReportsTo) and row.parent.id not in identities]
         if not unowned:
             break
         for row in unowned:
             del identities[row.id]
-            missing.append(f"{row.id} {row.name}: missing proved native parent {row.parent}")
+            assert isinstance(row.parent, staff.ReportsTo)
+            missing.append(f"{row.id} {row.name}: missing proved native parent {row.parent.id}")
     additions: list[staff.StaffRow] = []
     publications: list[ParkedPublication] = [ParkedPublication(identities.get(identity, identity), config)
                                            for identity, config in parked.items() if identity in identities]
@@ -273,7 +223,7 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
                 raise staff.StaffRefused("missing retired session evidence")
             native = staff.native_id(config.retired.session_id)
             parent = identities[owner.row.id]
-            row = staff.StaffRow(native, "unit", unit_names.name(name), parent, candidate.worktree, current_session=native)
+            row = staff.StaffRow(native, "unit", unit_names.name(name), staff.ReportsTo(parent), candidate.worktree, current_session=native)
             occupied = next((entry for entry in record.rows if identities.get(entry.id, entry.id) == native), None)
             if occupied is not None or any(entry.id == native for entry in additions):
                 raise staff.StaffRefused(f"{native}: retired destination already occupied")
@@ -395,7 +345,8 @@ def migrate(*, dry_run: bool = False) -> int:
         for old, native in sorted(changed.items()):
             print(f"proved {old} -> {native}")
         for row in migration.additions:
-            print(f"{'would add' if dry_run else 'add'} retired {row.id} {row.name} parent {row.parent}")
+            assert isinstance(row.parent, staff.ReportsTo)
+            print(f"{'would add' if dry_run else 'add'} retired {row.id} {row.name} parent {row.parent.id}")
         for line in migration.missing:
             print("missing " + line.replace("\n", " "))
         if not dry_run:
@@ -411,13 +362,13 @@ def migrate(*, dry_run: bool = False) -> int:
                 raise staff.StaffRefused(f"{backup}: invalid migration backup")
             fields = cast(dict[str, object], saved)
             rows = fields.get("rows")
-            if fields.get("schema") not in (1, 2) or not isinstance(rows, list):
+            if fields.get("schema") not in (1, 2, 3) or not isinstance(rows, list):
                 raise staff.StaffRefused(f"{backup}: invalid migration backup")
-            for value in cast(list[object], rows):
-                _ = staff.StaffRow.from_json(value)
+            _ = staff._snapshot_value(fields)  # pyright: ignore[reportPrivateUsage]
             publish_references(migration)
-            with redirect_stderr(io.StringIO()):
-                _ = staff.publish_native_ids(record, changed, migration.additions)
+            if changed or migration.additions:
+                with redirect_stderr(io.StringIO()):
+                    _ = staff.publish_native_ids(record, changed, migration.additions)
         if not changed and not migration.additions:
             print("unchanged")
         if dry_run or changed or migration.additions or migration.missing:

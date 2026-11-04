@@ -16,6 +16,8 @@ A rerun after the move pushes the doc commit.
 """
 from __future__ import annotations
 
+from scripts.message import sessions
+
 import json
 import os
 import re
@@ -74,7 +76,7 @@ def _trust_file(directory: Path) -> Path:
 
 def _move_claude(old: Path, new: Path) -> None:
     unit_move.move_configs(str(old), str(new))
-    for directory in unit_move.config_dirs():
+    for directory in sessions.config_dirs():
         trust = _trust_file(directory)
         if trust.exists():
             unit_move.copy_trust(trust, str(old), str(new))

@@ -51,7 +51,7 @@ class StaffLabels:
             _ = result.pop("SHOWRUNNER_UNIT", None)
             _ = result.pop("SHOWRUNNER_UNIT_ID", None)
         elif row.kind == "unit":
-            parent = self.record.by_id(row.parent) if row.parent is not None else None
+            parent = self.record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
             if parent is None or parent.kind != "showrunner":
                 return result
             slugs = [slug for slug, owner in self.showrunners.items() if owner.id == parent.id]

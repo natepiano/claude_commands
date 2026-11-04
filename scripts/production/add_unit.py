@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff, production_units
+from scripts.production import staff, unit_lookup, staff_sources, unit_config, production_units
 from scripts.shutdown import remote
 from scripts.lib import git_exclude
 
@@ -315,8 +315,8 @@ def stub_plan(production: Production, branch: str) -> Path:
 
 
 def launch_request(args: argparse.Namespace, *,
-                   record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> RequestedUnitLaunch:
-    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+                   record: staff.StaffSnapshot | None = None) -> RequestedUnitLaunch:
+    record = staff.initial_snapshot() if record is None else record
     production = read_production(Path(cast(str, args.production)))
     try:
         # A name given as its unit id would get the suffix twice: feature-log-unit-unit.
@@ -524,7 +524,7 @@ def _is_excluded_standing_plan(production: Production, plan: Path) -> bool:
 
 
 def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
-              record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> ReadyToLaunch:
+              record: staff.StaffSnapshot | None = None) -> ReadyToLaunch:
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
     handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
@@ -545,7 +545,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
             raise Refusal(f"session {session_id} already runs as pid {observed.pid}; "
                           + f"to make it this unit, run add_unit with --attach {session_id}")
     production = request.production
-    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    record = staff.initial_snapshot() if record is None else record
     _ = checked_unit_member(production, request.unit, record)
     branch = git(production, "branch", "--show-current").stdout.strip()
     if branch != production.merge_branch:
@@ -1318,9 +1318,9 @@ class UnitMembershipPublished:
 
 
 def admit_unit(request: UnitLaunch, *,
-               record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> UnitAdmissionPending | UnitMembershipPublished:
+               record: staff.StaffSnapshot | None = None) -> UnitAdmissionPending | UnitMembershipPublished:
     """Create the actual worktree before the row, then publish the checked config."""
-    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    record = staff.initial_snapshot() if record is None else record
     config = configuration_for(request)
     ensure_worktree(request)
     location = staff.PresentWorktree(remote.local_machine(), request.worktree.resolve())
@@ -1335,7 +1335,7 @@ def admit_unit(request: UnitLaunch, *,
 
 
 def publish_unit(ready: ReadyToLaunch, *,
-                 record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> UnitAdmissionPending | UnitMembershipPublished:
+                 record: staff.StaffSnapshot | None = None) -> UnitAdmissionPending | UnitMembershipPublished:
     """Admit the actual worktree before publishing its Units row."""
     request = ready.launch
     before = git(request.production, "rev-parse", request.production.merge_branch).stdout.strip()
@@ -1370,8 +1370,8 @@ def checked_unit_member(production: Production, unit: str,
         if isinstance(found.row.worktree, staff.RemovedWorktree):
             raise Refusal(f"unit {unit} is retired; resume that unit, or remove it for good to free the name")
         parent = staff_sources.member(staff_sources.ShowrunnerMember(production.slug), record)
-        if not isinstance(parent, staff_sources.MemberFound) or found.row.parent != parent.row.id:
-            owner = record.by_id(found.row.parent) if found.row.parent is not None else None
+        if not isinstance(parent, staff_sources.MemberFound) or found.row.parent != staff.ReportsTo(parent.row.id):
+            owner = record.by_id(found.row.parent.id) if isinstance(found.row.parent, staff.ReportsTo) else None
             if owner is None or owner.kind != "showrunner":
                 raise staff.StaffUnreadable(f"{found.row.name}: no showrunner staff row")
             raise Refusal(f"{found.row.name} is under {owner.name}; to move it, run: "
@@ -1382,9 +1382,9 @@ def checked_unit_member(production: Production, unit: str,
 def ensure_staff_unit(production: Production, unit: str, *,
                       worktree: staff.PresentWorktree | staff.WorktreeUnfilled = staff.WORKTREE_UNFILLED,
                       runtime_id: str = "",
-                      record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> staff.StaffRow:
+                      record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
     """Admit a unit with its location; only resume_unit reactivates a removed row."""
-    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    record = staff.initial_snapshot() if record is None else record
     found = checked_unit_member(production, unit, record)
     if isinstance(found, staff_sources.MemberFound):
         if runtime_id and found.row.current_session != staff.native_id(runtime_id):
@@ -1395,7 +1395,7 @@ def ensure_staff_unit(production: Production, unit: str, *,
     if isinstance(worktree, staff.WorktreeUnfilled):
         raise Refusal(f"unit {unit}: no filled worktree for admission")
     runner = ensure_staff_showrunner(production)
-    return staff.ensure("unit", name=unit_names.name(unit), parent=runner.id, worktree=worktree, runtime_id=runtime_id)
+    return staff.ensure("unit", name=unit_names.name(unit), parent=staff.ReportsTo(runner.id), worktree=worktree, runtime_id=runtime_id)
 
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()

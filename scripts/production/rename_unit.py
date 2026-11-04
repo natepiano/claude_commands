@@ -20,6 +20,9 @@ verify reruns the last step on a finished rename.
 """
 from __future__ import annotations
 
+from scripts.direct import workers
+from scripts.message import sessions
+
 import argparse
 import dataclasses
 import os
@@ -642,10 +645,6 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
-    from scripts.direct import workers
-    workers.rename_unit(rename.slug, rename.old, rename.new,
-                        runs=tuple(set((*retire_unit.runs_of(Path(rename.old_worktree)),
-                                        *retire_unit.runs_of(Path(rename.new_worktree))))))
     try:
         design_roles.rename_holder(rename.slug, rename.old, rename.new, rename.old_worktree, rename.new_worktree)
     except (OSError, ValueError, SystemExit) as error:
@@ -833,18 +832,12 @@ def stop_unit(rename: StopTarget, save: Callable[[], None]) -> None:
 def _refuse_detached_worktree(rename: StopTarget) -> None:
     if not isinstance(rename, UnitRename):
         return
-    from scripts.direct import workers
-    worktree = rename.worktree().resolve()
     for folder in retire_unit.runs_of(rename.worktree()):
-        for path, record in workers.retained_detached_runs(folder):
-            cwd = Path(str(record.get("cwd", ""))).resolve()
-            if cwd == worktree or worktree in cwd.parents:
-                raise RenameRefused(f"detached run {path.stem} of {record.get('worker', '')} works inside "
-                                    + f"{worktree}; rerun apply once it ends")
+        if workers.retained_detached_runs(folder):
+            print(f"anomaly: {folder}: detached commands remain active", file=sys.stderr)
 
 
 def _retained_command_sessions(worktree: Path) -> set[int]:
-    from scripts.direct import workers
     protected: set[int] = set()
     for folder in retire_unit.runs_of(worktree):
         for _, record in workers.retained_detached_runs(folder):
@@ -859,7 +852,6 @@ def _retained_command_sessions(worktree: Path) -> set[int]:
 
 def _stop_runs(rename: StopTarget) -> None:
     """Pause unit workers and clean up processes outside their retained work."""
-    from scripts.direct import workers
     worktree = rename.worktree()
     folders = retire_unit.runs_of(worktree)
     _refuse_detached_worktree(rename)
@@ -874,7 +866,6 @@ def _stop_runs(rename: StopTarget) -> None:
             print(f"{retire_unit.failure(result)}; SIGTERM instead")
         elif folder in servers:
             print(f"stopped: app-server pid {servers[folder].pid} of run {folder.name}")
-    workers.pause_unit(rename.slug, rename.old)
     protected = _retained_command_sessions(worktree)
     inside = unit_move.processes_inside(worktree) if unit_move.exists(worktree) else []
     runs = retire_unit.run_processes(worktree, inside) if inside else {}
@@ -1013,13 +1004,10 @@ def _doc_failures(rename: UnitRename) -> list[str]:
 
 def _state_failures(rename: UnitRename) -> list[str]:
     old, new = Path(rename.old_worktree), Path(rename.new_worktree)
-    failures = [f"{directory / 'projects'}: transcripts still under {old}" for directory in unit_move.config_dirs()
+    failures = [f"{directory / 'projects'}: transcripts still under {old}" for directory in sessions.config_dirs()
                 if old != new and (directory / "projects" / unit_move.project_folder(str(old))).exists()]
     if stall_watch.stretch_path(rename.slug, rename.old).exists():
         failures.append(f"stall-watch: the stretch is still under {rename.old}")
-    # Step 7 moves the newest run, the one run_state reads; older runs under the old path are history.
-    if unit_move.newest_run(old) is not None and unit_move.newest_run(new) is None:
-        failures.append(f"run records: the newest run still names {old}")
     failures.extend(f"{issue.path}: proposal still names {rename.old}" for issue in _unit_proposals(rename, rename.old))
     if _is_style(rename):
         with style_ledger.preview_ledger(_style_repository(rename)) as ledger:
@@ -1096,7 +1084,7 @@ def _sweep_roots(rename: UnitRename) -> unit_rename_sweep.Roots:
     reworded, kept = _other_showrunner_states(rename)
     return unit_rename_sweep.Roots(
         state=state, production_state=rename_state.unit_journal(rename.slug).parent,
-        configs=tuple(directory for directory in unit_move.config_dirs() if not directory.name.endswith(".lock")),
+        configs=tuple(directory for directory in sessions.config_dirs() if not directory.name.endswith(".lock")),
         checkouts=(Path(rename.checkout), Path(rename.new_worktree)),
         live_files=(*(scratch / name for name in rename_state.SCRATCH_FILES), *reworded),
         history_prefixes=(str(Path(rename.checkout) / "docs/plans" / f"{rename.slug}-log"), *map(str, kept)))

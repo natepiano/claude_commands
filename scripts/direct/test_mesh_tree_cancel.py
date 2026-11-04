@@ -11,6 +11,8 @@ from typing import cast
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, mesh_runs
+from scripts.production import session_staff, staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
 from scripts.direct.test_verify_tree_cancel import CANCEL_LINE, VerifyTreeCancelFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_until
@@ -26,12 +28,10 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
     def start_detached(self, fixture: VerifyTreeCancelFixture, identity: str, *, done_message: bool = False) -> Path:
         session = fixture.board
         session.mkdir(parents=True, exist_ok=True)
-        _ = (session / codex_mesh.ROSTER_FILE).write_text(json.dumps({identity: {
-            "thread_id": identity + "-thread", "status": "running", "launcher_pid": os.getpid(),
-            "turn_id": identity + "-turn", "port": 4100,
-        }}))
-        environment = {**fixture.environment, "CODEX_THREAD_ID": identity + "-thread",
-                       "TEST_FINISH": "1", "GUILD_ROLES_STATE": str(fixture.root / "roles")}
+        native = fixture_runtime_id(identity)
+        environment = {**fixture.environment, "CODEX_THREAD_ID": native,
+                       "CODEX_HOME": str(fixture.root / "codex"), "TEST_FINISH": "1",
+                       "DESIGN_ROLES_STATE": str(fixture.root / "roles")}
         done_flags: list[str] = []
         if done_message:
             done = fixture.root / "done-message.txt"
@@ -40,8 +40,17 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         # Start through the public entry point. The real detached supervisor,
         # verify, git, watcher and durable caller inbox all remain unmocked.
         with patch.dict(os.environ, environment, clear=True), \
+                isolated_staff_file(fixture.root / "staff.json", environment), \
                 patch.object(mesh_runs, "RUN_ROOTS", (fixture.root,)), \
                 contextlib.chdir(fixture.workspace), contextlib.redirect_stdout(io.StringIO()) as output:
+            parent = unit_membership("fixture", identity)
+            _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", fixture.workspace), expected=parent.worktree)
+            worker = fixture_member("worker", name=identity, parent=parent.id, runtime_id=native,
+                                    backend=staff.CodexBackend(Path(os.environ["CODEX_HOME"])))
+            _ = (session / codex_mesh.ROSTER_FILE).write_text(json.dumps({identity: {
+                "staff_id": worker.id, "status": "running", "launcher_pid": os.getpid(),
+                "turn_id": identity + "-turn", "port": 4100,
+            }}))
             status = mesh_runs.main(["start", "--label", identity + " verify test", *done_flags, "--",
                                      "bash", str(VERIFY), "test", "sample"])
         self.assertEqual(status, 0, output.getvalue())
@@ -49,7 +58,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual(len(records), 1)
         record = cast(mesh_runs.RunRecord, json.loads(records[0].read_text()))
         fixture.started_groups.add(record["pid"])
-        self.assertEqual(record["thread_id"], identity + "-thread")
+        self.assertEqual(record["staff_id"], native)
         return records[0]
 
     def finished_record(self, path: Path) -> mesh_runs.RunRecord:
@@ -61,8 +70,12 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         wait_until(finished, path.parent, timeout=TEST_HANG_GUARD_SECS)
         return cast(mesh_runs.RunRecord, json.loads(path.read_text()))
 
+    def inbox_path(self, fixture: VerifyTreeCancelFixture, identity: str) -> Path:
+        with isolated_staff_file(fixture.root / "staff.json", {}):
+            return session_staff.inbox_path(staff.native_id(fixture_runtime_id(identity)))
+
     def inbox(self, fixture: VerifyTreeCancelFixture, identity: str) -> dict[str, object]:
-        return cast(dict[str, object], json.loads((fixture.board / (identity + ".pending.json")).read_text()))
+        return cast(dict[str, object], json.loads(self.inbox_path(fixture, identity).read_text()))
 
     def test_two_simultaneous_callers_receive_only_their_own_cancellation_or_pass(self) -> None:
         VerifyTreeCancelFixture.setUpClass()
@@ -89,7 +102,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual(first.get("exit_code"), 77, Path(first["log"]).read_text())
         self.assert_no_cache_verdict()
         self.assert_resources_released()
-        self.assertFalse((other.board / (second_identity + ".pending.json")).exists(),
+        self.assertFalse(self.inbox_path(other, second_identity).exists(),
                          "stable caller received the other caller's cancellation")
         second_running = cast(dict[str, object], json.loads(second_path.read_text()))
         self.assertEqual(second_running.get("status"), "running", "stable caller stopped with edited caller")
@@ -101,8 +114,10 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual(len(list((other.board / "verify_cache").glob("*.pass"))), 1)
         cancelled = self.inbox(self, first_identity)
         passed = self.inbox(other, second_identity)
-        self.assertEqual(cancelled.get("thread_id"), first_identity + "-thread")
-        self.assertEqual(passed.get("thread_id"), second_identity + "-thread")
+        self.assertEqual(self.inbox_path(self, first_identity).name,
+                         f"{first['staff_id']}.pending.json")
+        self.assertEqual(self.inbox_path(other, second_identity).name,
+                         f"{second['staff_id']}.pending.json")
         cancelled_messages = cast(list[str], cancelled["messages"])
         passed_messages = cast(list[str], passed["messages"])
         self.assertEqual(len(cancelled_messages), 1, cancelled)
@@ -117,8 +132,8 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         self.assertIn("PASS (exit 0)", pass_text)
         self.assertNotIn("cancelled", pass_text.lower())
         self.assertNotIn("exit 77", pass_text)
-        self.assertFalse((self.board / (second_identity + ".pending.json")).exists())
-        self.assertFalse((other.board / (first_identity + ".pending.json")).exists())
+        self.assertFalse(self.inbox_path(self, second_identity).exists())
+        self.assertFalse(self.inbox_path(other, first_identity).exists())
         self.assertEqual([(record.get("outcome"), record.get("status")) for record in self.records()],
                          [("cancelled", 77)])
         self.assertEqual([(record.get("outcome"), record.get("status")) for record in other.records()],

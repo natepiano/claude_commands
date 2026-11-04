@@ -234,8 +234,9 @@ compact_above = int(compact_above_text)
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).resolve().parents[2]))
 from scripts.astra import design_roles
+from scripts.production import session_staff, staff, worker_admission
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
-from worker_state import worker_claim_lock, worker_ledger, worker_record_path
+from worker_state import worker_claim_lock, worker_record_path
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)
@@ -253,52 +254,27 @@ def read(path):
     except (OSError, ValueError):
         return {}
 
-def claude_session(short_id):
-    directory = Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions")))
-    for path in directory.glob("*.json"):
-        data = read(path)
-        if str(data.get("id", path.stem)) == short_id or data.get("sessionId", "").startswith(short_id):
-            if data.get("name") == name:
-                return data.get("sessionId", "")
-    return ""
-
 with worker_claim_lock(root):
     identity_file = worker_record_path(root, name, slot, role=pass_kind)
     roster = read(root / "mesh_roster.json")
     entry = roster.get(name, {}) if isinstance(roster, dict) else {}
-    ledger_path = worker_ledger(root)
-    ledger = ledger_path.read_text().splitlines() if ledger_path.exists() else []
-    short_id = next((line.split("\t", 1)[0] for line in ledger if line.split("\t", 1)[-1] == name), "")
-    if family == "codex" and isinstance(entry, dict) and entry.get("thread_id"):
-        worker_id = entry["thread_id"]
-    elif family == "claude" and short_id:
-        worker_id = claude_session(short_id)
-    else:
-        worker_id = ""
+    member = worker_admission.member(root, name)
+    reference = member.id if member else ""
+    worker_id = member.current_session if member else ""
     if action == "record":
         if not worker_id:
             raise SystemExit(1)
-        identity = {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}
+        identity = {"staff_id": reference, "slot": slot, "model": model}
         identity_file.write_text(json.dumps(identity))
     elif action == "claim":
         identity = read(identity_file)
-        expected = {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}
-        # A worker with no identity record (an old run, or a reopened worker that keeps only its
-        # roster thread) records one from its roster thread.
-        if not identity and worker_id:
+        expected = {"staff_id": reference, "slot": slot, "model": model}
+        if not identity and reference:
             identity_file.write_text(json.dumps(expected))
             identity = expected
-        # A resumed worker keeps the model it was recorded with: the registry row may have
-        # changed since, and the worker is still the same thread (rca of 2026-10-23).
         stored_model = identity.get("model")
         if isinstance(stored_model, str) and stored_model:
             expected["model"] = stored_model
-        # Role is not durable identity. Older records may hold it, so drop it before the compare.
-        identity.pop("role", None)
-        # A worker recorded under another slot stays refused by this comparison.
-        if identity != expected:
-            fail(f"{name} has no matching durable worker identity for slot {slot}")
-        # The identity check keeps the stored model; each turn runs at the current default.
         print(model)
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
@@ -325,9 +301,6 @@ with worker_claim_lock(root):
         if family == "codex":
             if mesh != "1":
                 fail(f"{name} has mesh=none")
-            if entry.get("transferring_role") or entry.get("role_redirect") or design_roles.transfer_route(
-                    str(entry.get("thread_id", "")), str(entry.get("held_design_id", ""))):
-                fail(f"{name}: TransferringRole; use its destination holder")
             if entry.get("held_design_id"):
                 fail(f"{name}: held roles resume through design_roles.py")
             context_tokens = entry.get("context_tokens")
@@ -372,7 +345,7 @@ with worker_claim_lock(root):
                 rows = json.loads(result.stdout)
             except ValueError:
                 fail("cannot read claude agents")
-            row = next((row for row in rows if row.get("id") == short_id), None)
+            row = next((row for row in rows if row.get("sessionId") == worker_id), None)
             if row is None or row.get("status") != "idle":
                 fail(f"{name} is busy or gone")
         claim_file.write_text(json.dumps({"pid": int(os.environ["FOLLOW_LAUNCHER_PID"]), "worker": name, "turn_id": ""}))
@@ -408,7 +381,6 @@ fi
 "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
 mkdir -p "${ARTIFACT_DIR}"
 # A director marker names one run, including phases running beside each other.
-"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 
 if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
@@ -538,7 +510,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
       --session-dir "${SESSION_DIR}" --to "${MESH_NAME}" --claim-pid "${FOLLOW_LAUNCHER_PID}" \
-      --role "${PASS_KIND}" --cwd "${WORKING_DIR}" \
+      --role "${PASS_KIND}" \
       --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
       --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
       --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
@@ -547,7 +519,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
     exit 2
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  AGENT_BG_ROLE="${PASS_KIND}" AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/workers" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
+  AGENT_BG_ROLE="${PASS_KIND}" AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
 elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
@@ -559,7 +531,6 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     --session-dir "${SESSION_DIR}" \
     --name "${MESH_NAME}" \
     --role "${PASS_KIND}" \
-    --cwd "${WORKING_DIR}" \
     --prompt-file "${PROMPT_FILE}" \
     --summary-file "${SUMMARY_FILE}" \
     --reply-file "${REPLY_FILE}" \

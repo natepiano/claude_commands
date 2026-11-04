@@ -1633,7 +1633,7 @@ def _production_unit_plans(production: Production, *, resolver: session_staff.Ro
         raise Refusal(f"{production.doc}: no staff owner binds the document")
     plans: list[ProductionUnitPlan | UnitPlanUnavailable] = []
     for row in staff.active(resolver.record, "unit"):
-        if row.parent != owner.id:
+        if not row.reports_to(owner.id):
             continue
         tree = resolver.unit_worktree(row)
         try:
@@ -1681,7 +1681,7 @@ def _production_reference(plan_path: Path, *, resolver: session_staff.RowResolve
     if not isinstance(doc, session_staff.ProductionDoc):
         print(f"phase_table: {member.row.name}: {doc.reason}", file=sys.stderr)
         return PlanOutsideProduction()
-    parent = resolver.record.by_id(member.row.parent) if member.row.parent is not None else None
+    parent = resolver.record.parent_of(member.row)
     if parent is None:
         return PlanOutsideProduction()
     timer = showrunners.timer_for(parent, resolver.record)

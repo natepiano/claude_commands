@@ -11,19 +11,21 @@ import unittest
 from collections.abc import Callable
 from contextlib import redirect_stderr
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
 from scripts.accounts import accounts
 from scripts.agents import codex_mesh
-from scripts.production import staff
+from scripts.production import staff, session_staff
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import FolderMoveBackend, FolderMoveFixture
 from scripts.production.add_unit_test_support import AddUnitTestCase
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_roster
 from scripts.shutdown import pane_record
 from scripts.message import sessions
+from scripts.usage import agents_log
 import herdr
 import unit_move
 from rename_state import RenameRefused
@@ -108,8 +110,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
         state = cast(dict[str, object], json.loads((self.run_dir / "progress_history_state.json").read_text()))
         event = cast(dict[str, object], json.loads(self.history.read_text().splitlines()[0]))
         for fields in (state, event):
-            self.assertEqual((fields["working_dir"], fields["branch"], fields["plan_doc"], fields["run_id"]),
-                             (str(self.new_folder), "unit-branch", str(self.new_folder / "plan.md"), "move-run"))
+            self.assertEqual((fields["branch"], fields["plan_doc"], fields["run_id"]),
+                             ("unit-branch", str(self.new_folder / "plan.md"), "move-run"))
         self.assertEqual(tuple((pane["pane_id"], pane.get("terminal_id")) for pane in backend.panes()),
                          (("w1:p1", "kept-terminal"), ("w1:p2", "neighbour-terminal")))
 
@@ -135,13 +137,15 @@ class UnitFolderMoveTests(FolderMoveFixture):
     def test_running_unit_stops_pauses_moves_and_resumes_with_its_worker_command(self) -> None:
         backend = self.folder_backend(live=True)
         thread = fixture_runtime_id("folder-worker")
-        self.write_json(self.run_dir / "mesh_roster.json", {"impl1": {
+        self.write_json(self.run_dir / "mesh_roster.json", fixture_roster({"impl1": {
             "thread_id": thread, "role": "impl", "status": "running",
             "cwd": str(self.old_folder), "paused_turn": True,
         }, "review1": {
             "thread_id": fixture_runtime_id("folder-reviewer"), "role": "review", "status": "paused",
             "cwd": str(self.old_folder), "paused_turn": True,
-        }})
+        }}, self.owner.id, self.root / "codex-home"))
+        agents_log.append(thread, "impl", None, datetime.now(timezone.utc))
+        agents_log.append(fixture_runtime_id("folder-reviewer"), "review", None, datetime.now(timezone.utc))
         worker_prompt = self.run_dir / "impl1.resume-prompt.md"
         task = "Keep the existing worker task.\n"
         _ = worker_prompt.write_text(task)
@@ -184,7 +188,6 @@ class UnitFolderMoveTests(FolderMoveFixture):
             self.assertEqual(events, ["stop", "pause", "move"])
             self.assertFalse(self.old_folder.exists())
             self.assertEqual(pane_record.read("agents")["w1:p1"]["cwd"], str(self.new_folder))
-            self.assertEqual((self.run_dir / "working_dir").read_text().strip(), str(self.new_folder))
             result = set_worktree(unit, worktree, expected=expected)
             events.append("staff")
             return result
@@ -224,7 +227,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(worker_prompt.read_text(), task + note)
         self.assertEqual(reviewer_prompt.read_text(), note)
         self.assertIn(str(self.new_folder), prompt)
-        self.assertEqual(self.read_rows()["impl1"]["thread_id"], thread)
+        self.assertEqual(session_staff.worker_session(self.read_rows()["impl1"], staff.local_snapshot()), thread)
         self.assertEqual(self.read_rows()["impl1"]["status"], "paused")
         self.assertEqual(queued.read_text(), "Continue the existing task.\n")
         paused.assert_called_once()
@@ -317,8 +320,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
 
     def test_crash_after_git_move_finishes_staff_paths_without_starting_a_stopped_unit(self) -> None:
         backend = self.folder_backend()
-        assert self.owner.parent is not None
-        _ = staff.set_doc(self.owner.parent, staff.LiveDoc("natedev", self.checkout / "plan.md"))
+        assert isinstance(self.owner.parent, staff.ReportsTo)
+        _ = staff.set_doc(self.owner.parent.id, staff.LiveDoc("natedev", self.checkout / "plan.md"))
         self.new_folder.parent.mkdir(parents=True)
         _ = self.folder_git(self.old_folder, "worktree", "move", str(self.old_folder), str(self.new_folder))
         self.assertEqual(staff.by_id(self.owner.id), self.owner)
@@ -372,8 +375,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
 
     def test_missing_source_does_not_adopt_a_repository_with_another_common_directory(self) -> None:
         backend = self.folder_backend()
-        assert self.owner.parent is not None
-        _ = staff.set_doc(self.owner.parent, staff.LiveDoc("natedev", self.checkout / "plan.md"))
+        assert isinstance(self.owner.parent, staff.ReportsTo)
+        _ = staff.set_doc(self.owner.parent.id, staff.LiveDoc("natedev", self.checkout / "plan.md"))
         shutil.rmtree(self.old_folder)
         self.new_folder.mkdir(parents=True)
         _ = self.folder_git(self.new_folder, "init", "-b", "unrelated")
@@ -539,11 +542,10 @@ class UnitFolderMoveTests(FolderMoveFixture):
               mock.patch.object(codex_mesh, "_bind_serving_server"),
               mock.patch.object(codex_mesh, "_serving_request", side_effect=request)):
             opened = codex_mesh.open_unit_worker(str(self.run_dir), "impl1", "impl")
-            self.assertEqual(opened["thread_id"], native)
+            self.assertEqual(session_staff.worker_session(opened, staff.local_snapshot()), native)
             self.assertEqual(server.call_args.kwargs["cwd"], str(self.new_folder))
             self.assertEqual(requests[0][1]["cwd"], str(self.new_folder))
-            state = cast(dict[str, object], json.loads((self.run_dir / "progress_history_state.json").read_text()))
-            arguments = argparse.Namespace(turn_cwd=state["working_dir"], session_dir=str(self.run_dir), name="impl1",
+            arguments = argparse.Namespace(turn_cwd=str(self.new_folder), session_dir=str(self.run_dir), name="impl1",
                                            model="gpt-fixture", effort="high", service_tier="default")
             start = cast(Callable[..., str], getattr(codex_mesh, "_start_turn"))
             with mock.patch.object(codex_mesh, "_turn_service_tier", return_value="default"):
@@ -553,7 +555,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         worker = staff.snapshot().by_current_session(native)
         self.assertIsInstance(worker, staff.StaffRow)
         assert isinstance(worker, staff.StaffRow)
-        self.assertEqual(worker.parent, self.owner.id)
+        self.assertEqual(worker.parent, staff.ReportsTo(self.owner.id))
 
 
 if __name__ == "__main__":

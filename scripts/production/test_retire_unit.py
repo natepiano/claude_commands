@@ -5,8 +5,7 @@ sessions are fixture records; nothing real stops."""
 from __future__ import annotations
 
 from scripts.production.staff_test_support import without_worktree_column
-
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id
 
 import io
 import json
@@ -54,13 +53,14 @@ from scripts.production.staff_test_support import StaffTestCase
 from scripts.lib import process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import stop_resume
+from scripts.shutdown import pane_record as staff_pane_record
 import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
 from scripts.production.rename_rerun_test_support import saved_fixture
 from scripts.issue_score.selection import UseConfiguredValue
-from scripts.lib import conf
 from scripts.copies import copies
+from scripts.lib import atomic_file, conf
 from scripts.agents import worker_lifecycle
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
@@ -468,13 +468,8 @@ class RetireUnitTests(unittest.TestCase):
         runs = self.root / "runs"
         self.run_folder = runs / "run-1"
         self.run_folder.mkdir(parents=True)
-        _ = (self.run_folder / "progress_history_state.json").write_text(
-            json.dumps({"working_dir": str(self.worktree)}), encoding="utf-8")
-        _ = (self.run_folder / "director").write_text(DIRECTOR + "\n", encoding="utf-8")
         # The test's own pid stands in for the app-server: the mesh stand-in never signals it.
         _ = (self.run_folder / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
-        _ = (self.run_folder / "mesh_roster.json").write_text(
-            json.dumps({"alpha-impl": {"status": "running"}, "alpha-old": {"status": "ended"}}), encoding="utf-8")
         holds = self.root / "holds"
         holds.mkdir()
         _ = (holds / DIRECTOR).write_text("{}", encoding="utf-8")
@@ -518,6 +513,16 @@ class RetireUnitTests(unittest.TestCase):
                                                        "BUILD_HOLD_DIR": str(holds),
                                                        "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
                                                        "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}))
+        roster: dict[str, object] = {}
+        home = self.root / "codex"
+        store = workers.UnitWorkerLedger(workers.ledger_path("alpha", "alpha-unit"))
+        with store.locked() as ledger:
+            for name, status in (("alpha-impl", "running"), ("alpha-old", "ended")):
+                row = fixture_worker(name, self.unit_staff_id, backend=staff.CodexBackend(home))
+                roster[name] = {"staff_id": row.id, "status": status}
+                ledger.workers[name] = workers.UnitWorker(name, "impl", "codex", "", "", {},
+                    workers.CodexThread(row.current_session, str(home)), workers.Paused(), [], staff_id=row.id)
+        _ = (self.run_folder / "mesh_roster.json").write_text(json.dumps(roster), encoding="utf-8")
         _ = self.enterContext(mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "claims"))
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
@@ -533,7 +538,10 @@ class RetireUnitTests(unittest.TestCase):
         def marked_unit(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
             return self.marked
 
+        self.config = self.root / "config"
+        self.enterContext(mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(self.root / "panes")}))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
+        _ = self.enterContext(mock.patch.object(staff_pane_record, "RECORD_DIR", self.root / "panes"))
         pane_record.write("alpha", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
             {"CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude", "-n", "alpha"]))
         def process_info(*_arguments: str, deadline: float = math.inf) -> dict[str, object]:
@@ -542,10 +550,9 @@ class RetireUnitTests(unittest.TestCase):
             pid = self.marked.claude.pid if self.marked and isinstance(self.marked.claude, unit_lookup.LiveClaude) else 4101
             return {"process_info": {"shell_pid": pid}}
 
-        self.config = self.root / "config"
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", marked_unit))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", side_effect=process_info))
-        _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: [self.config]))
+        _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [self.config]))
         self.transcript(self.worktree)
 
     def transcript(self, cwd: Path) -> None:
@@ -669,14 +676,21 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_retire_unit_rerun(self) -> None:
         runner, unit = self.staff_unit()
-        original = staff.set_worktree
+        original = atomic_file.write_text_atomic
         for after in (False, True):
-            def interrupted(staff_id: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree, *,
-                            expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
-                if after:
-                    _ = original(staff_id, value, expected=expected)
-                raise RuntimeError("stopped at staff retirement")
-            with mock.patch.object(staff, "set_worktree", side_effect=interrupted):
+            def interrupted(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+                retiring = False
+                if path == self.staff.staff_file:
+                    document = cast(dict[str, object], json.loads(text))
+                    rows = (staff.StaffRow.from_json(value) for value in cast(list[object], document["rows"]))
+                    retiring = any(row.id == unit.id and isinstance(row.worktree, staff.RemovedWorktree)
+                                   for row in rows)
+                if retiring and not after:
+                    raise RuntimeError("stopped at staff retirement")
+                original(path, text, new_file_mode=new_file_mode)
+                if retiring:
+                    raise RuntimeError("stopped at staff retirement")
+            with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted):
                 with self.assertRaisesRegex(RuntimeError, "stopped at staff retirement"):
                     _ = self.retire()
         code, output = self.retire()
@@ -1340,18 +1354,19 @@ class RetireUnitTests(unittest.TestCase):
         self.assertNotIn("Traceback", output)
         self.assertTrue(self.worktree.exists())
 
-    def test_retirement_ends_the_unit_workers_and_reports_quarantine_removal(self) -> None:
+    def test_retirement_ends_the_unit_workers_and_preserves_history(self) -> None:
         store = workers.UnitWorkerLedger(workers.ledger_path("alpha", "alpha-unit"))
+        row = fixture_worker("w7", self.unit_staff_id, runtime_id=fixture_runtime_id("retiring-thread"),
+                             backend=staff.CodexBackend(self.root / "codex"))
         with store.locked() as ledger:
             ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
-                workers.CodexThread("retiring-thread", str(self.root / "codex")), workers.Paused(), [])
-            ledger.quarantined_workers["damaged"] = {"reason": "invalid backend", "record": {}}
+                workers.CodexThread(str(row.current_session), str(self.root / "codex")), workers.Paused(), [], staff_id=row.id)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(store.path.exists())
+        saved = cast(dict[str, object], json.loads(store.path.read_text()))
+        self.assertEqual(saved["workers"], {})
+        self.assertEqual(cast(dict[str, list[dict[str, object]]], saved["history"])[row.id][-1]["kind"], "ended")
         self.assertIn("w7", output)
-        self.assertIn("damaged", output)
-        self.assertIn("invalid backend", output)
         self.assertIn(str(store.path), output)
 
     def test_retirement_forgets_its_pane_launch_without_calling_shutdown_cli(self) -> None:
@@ -1454,7 +1469,7 @@ class RetireUnitTests(unittest.TestCase):
                          "alpha-branch")
     def test_bad_unrelated_role_record_warns_once_and_does_not_stop_retirement(self) -> None:
         bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('other', 'other-unit'),
-                                         lifecycle=design_roles.RoleOpen('unrelated-thread'))
+                                         lifecycle=design_roles.RoleOpen(staff.StaffId('unrelated-thread')))
         errors = io.StringIO()
         with redirect_stderr(errors):
             code, output = self.retire()
@@ -1465,7 +1480,7 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_bad_live_role_for_this_unit_preserves_the_unit_for_recovery(self) -> None:
         bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('alpha', 'alpha-unit'),
-                                         lifecycle=design_roles.RoleOpen('held-thread'))
+                                         lifecycle=design_roles.RoleOpen(staff.StaffId('held-thread')))
         before = self.doc.read_bytes()
         record = bad.read_bytes()
         code, output = self.retire()
@@ -1493,7 +1508,6 @@ class RetireUnitTests(unittest.TestCase):
 
 
     def outside_director(self) -> Path:
-        (self.run_folder / "director").unlink()
         self.claude = []
         old = self.config / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
         old.unlink()

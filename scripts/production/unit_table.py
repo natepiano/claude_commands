@@ -64,3 +64,9 @@ def unit_spellings(lines: list[str]) -> dict[str, str]:
             continue
         spellings.setdefault(name, set()).add(displayed)
     return {name: next(iter(values)) for name, values in spellings.items() if len(values) == 1}
+
+
+def retired_session(plan: str) -> str:
+    """Read the conversation selector from an existing retirement note."""
+    saved = re.match(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?=,|\))", plan)
+    return saved[1] if saved else ""

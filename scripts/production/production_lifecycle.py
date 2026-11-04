@@ -14,7 +14,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import session_staff, staff, staff_sources, unit_config
+from scripts.production import staff, staff_sources, unit_config
 from scripts.shutdown.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
@@ -119,8 +119,8 @@ def production_name(lines: list[str]) -> str:
 
 
 def units(lines: list[str], production: Production, sources: unit_lookup.MemberSources, *,
-          record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitRow, ...]:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+          record: staff.StaffSnapshot | None = None) -> tuple[UnitRow, ...]:
+    record = staff.snapshot() if record is None else record
     parsed: list[UnitRow] = []
     rows = unit_table(lines)
     permanent = [cell_value(cells["Unit"]) for cells in rows if cell_value(cells.get("Plan", "")) == "permanent"]

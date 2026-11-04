@@ -32,9 +32,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
                     (session_dir / "impl_bg_id_impl").read_text(encoding="utf-8"),
                     "abc12345\n",
                 )
-                self.assertIn(
-                    "abc12345\t", (session_dir / "workers").read_text(encoding="utf-8")
-                )
+                self.assertTrue(self.recorded_worker(session_dir).current_session.startswith("abc12345-"))
 
 
 if __name__ == "__main__":

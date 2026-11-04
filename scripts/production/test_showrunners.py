@@ -207,7 +207,7 @@ raise SystemExit(1)
         record = staff.initial_snapshot()
         parent_row = record.by_path(parent) or fixture_member("showrunner", name=parent)
         child_row = record.by_path(child) or fixture_member("showrunner", name=child)
-        _ = staff.move(child_row.id, parent_row.id)
+        _ = staff.move(child_row.id, staff.ReportsTo(parent_row.id))
         self.stored_parent(child, parent)
 
     def unit_session(self, unit: str, pane: str) -> None:

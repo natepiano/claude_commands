@@ -6,7 +6,7 @@ import argparse
 import re
 import shlex
 import sys
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from collections.abc import Generator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -535,15 +535,6 @@ def _rename_stall_watch(plan: RenamePlan) -> None:
         unit_move.move(move)
 
 
-def _rename_unit_workers(plan: RenamePlan) -> None:
-    from scripts.direct import workers
-    root = workers.ledger_path(plan.old, "unused").parent
-    units = {path.name.removesuffix(".move.json") if path.name.endswith(".move.json") else path.stem
-             for path in root.glob("*.json")}
-    for unit in sorted(units):
-        workers.move_unit(plan.old, plan.new, unit)
-
-
 def _check_edits(plan: RenamePlan) -> None:
     allowed = {_relative(plan, path) for path in (plan.old_doc, plan.new_doc, *plan.plans)}
     changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
@@ -592,7 +583,7 @@ def _retarget_phase_notes(plan: RenamePlan) -> None:
 
 
 APPLY_STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state,
-               _rename_stall_watch, _rename_unit_workers, _rename_branch,
+               _rename_stall_watch, _rename_branch,
                _retarget_phase_notes)
 APPLY_STEP_NAMES = tuple(step.__name__ for step in APPLY_STEPS)
 # The step list of journals that recorded a count; its order maps a count to step names.
@@ -783,90 +774,6 @@ def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None
     _ = unit_move.git(plan.checkout, "push", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
-def _repoint_unit_workers(plan: RenamePlan, name: str, record: dict[str, object], *, dry_run: bool = False) -> None:
-    from scripts.direct import workers
-    changes = workers.repoint_unit_worktree(
-        plan.new, name, Path(_string(record, "old_worktree")), Path(_string(record, "new_worktree")),
-        _string(record, "new_branch"), from_production=plan.old, dry_run=dry_run)
-    for change in changes:
-        print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
-    if not changes:
-        print(f"{name}: workers have nothing to change")
-
-
-def repair_workers(new: str, *, dry_run: bool = False) -> None:
-    """Repair saved worker paths from journaled moves or current Units rows."""
-    from scripts.direct import workers
-    new = showrunners.canonical_slug(new)
-    _validate_slug(new)
-    path = rename_state.production_journal(new)
-    with nullcontext() if dry_run else unit_move.production_lock():
-        journal = _object(read_json(path)) if path.exists() else {}
-        if journal:
-            resolved, completed = _load(path, new, new)
-            if not dry_run:
-                _save(resolved, completed)
-                journal = _object(read_json(path))
-            doc = resolved.new_doc if "_rename_doc" in completed else resolved.old_doc
-        else:
-            checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{new}")
-            if isinstance(checked, showrunners.NoCheckedDoc):
-                raise RenameRefused(f"{new}: no production doc: {checked.reason}")
-            doc = checked.path
-        text = doc.read_text(encoding="utf-8")
-        former_names = [_string(journal, "old")] if journal else []
-        for line in text.splitlines():
-            if line.startswith("- **Formerly:**"):
-                former_names.extend(cast(list[str], re.findall(r"`([^`]+)`", line)))
-        former = tuple(dict.fromkeys(former_names))
-        members = staff.snapshot()
-        units = tuple(workers.UnitWorktree(new, production_units.cell_value(row.get("Unit", "")),
-            unit_lookup.local_worktree(staff_sources.member(staff_sources.UnitMember(
-                new, production_units.cell_value(row.get("Unit", ""))), members)).path,
-            production_units.cell_value(row.get("Branch", "")))
-            for row in production_units.unit_table(text.splitlines())
-            if not production_units.plan_cell_is_retired(row.get("Plan", "")))
-        found = workers.find_moved_unit_runs(units, former)
-        for skipped in found.skipped:
-            print(skipped)
-        records = _object(journal.get("unit_moves", {}))
-        journaled: set[tuple[str, Path]] = set()
-        reported: set[str] = set()
-        for name, raw in sorted(records.items()):
-            record = _object(raw)
-            completed = record.get("step")
-            if type(completed) is not int or completed < 2:
-                continue
-            old = Path(_string(record, "old_worktree"))
-            changes = workers.repoint_unit_worktree(new, name, old, Path(_string(record, "new_worktree")),
-                _string(record, "new_branch"), from_production=former[0] if former else new, dry_run=dry_run)
-            for change in changes:
-                print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
-            if not changes:
-                print(f"{name}: workers have nothing to change")
-            reported.add(name)
-            journaled.add((name, old))
-            if not dry_run and not record.get("workers_repointed", False):
-                record["workers_repointed"] = True
-                write_json(path, journal)
-        for move in found.moves:
-            name = move.current.unit
-            if (name, move.old) in journaled:
-                continue
-            changes = workers.repoint_moved_unit_runs(move, from_production=former[0] if former else new, dry_run=dry_run)
-            for change in changes:
-                print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
-            if not changes and name not in reported:
-                print(f"{name}: workers have nothing to change")
-            reported.add(name)
-        if not reported:
-            print(f"{new}: no moved unit was found: no unit run names an old worktree"
-                  + (" with one matching Units row" if found.skipped else ""))
-        for current in units:
-            if current.unit not in reported:
-                print(f"{current.unit}: workers have nothing to change")
-
-
 def unit(new: str, name: str) -> None:
     """Move one stopped unit, resuming recorded branch, worktree and configuration steps."""
     with _rename_journal(new) as (result, journal), design_roles.record_operation():
@@ -919,10 +826,6 @@ def unit(new: str, name: str) -> None:
             _stopped_unit(result, name)
             _move_unit_worktree(result, record)
             record["step"] = 2
-            write_json(result.journal, journal)
-        if not record.get("workers_repointed", False):
-            _repoint_unit_workers(result, name, record)
-            record["workers_repointed"] = True
             write_json(result.journal, journal)
         if completed < 3:
             _move_unit_configs(record)
@@ -994,7 +897,6 @@ def main(argv: list[str]) -> int:
 
 
 def _main(argv: list[str]) -> int:
-    from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
     for name in ("plan", "apply", "repair-notes"):
@@ -1006,9 +908,6 @@ def _main(argv: list[str]) -> int:
     _ = command.add_argument("unit")
     command = actions.add_parser("finish")
     _ = command.add_argument("new")
-    command = actions.add_parser("repair-workers", help="repair worker paths for units moved before this fix")
-    _ = command.add_argument("new", metavar="production")
-    _ = command.add_argument("--dry-run", action="store_true")
     command = actions.add_parser("checkout", help="move the showrunner checkout through a shutdown restart")
     _ = command.add_argument("new", metavar="slug")
     _ = command.add_argument("path", nargs="?", default="")
@@ -1023,8 +922,6 @@ def _main(argv: list[str]) -> int:
                 print("no phase notes to repair")
         elif action == "unit":
             unit(new, cast(str, args.unit))
-        elif action == "repair-workers":
-            repair_workers(new, dry_run=cast(bool, args.dry_run))
         elif action == "finish":
             finish(new)
         elif action == "checkout":
@@ -1038,7 +935,7 @@ def _main(argv: list[str]) -> int:
                 print(f"{result.old} is now {result.new}; " + (f"keep {result.merge_branch} until finish" if result.renames_branch else f"merge branch {result.merge_branch} kept"))
     except (staff.StaffRefused, staff.StaffNotFound, staff.StaffUnreadable):
         raise
-    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable,
+    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused,
             git_exclude.ExcludeRefused, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1

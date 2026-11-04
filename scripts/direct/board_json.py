@@ -400,7 +400,7 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
         else:
             root = record.by_current_session(session)
             while root is not None and root.kind != "showrunner":
-                root = record.by_id(root.parent) if root.parent is not None else None
+                root = record.by_id(root.parent.id) if isinstance(root.parent, staff.ReportsTo) else None
     except staff.StaffUnreadable as error:
         print(f"board_json: {error}", file=sys.stderr)
         return NoBoardSubtree()
@@ -415,7 +415,7 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
             if slug in by_slug:
                 boards.append(by_slug[slug])
         level = sorted((child for row in level for child in staff.active(record, "showrunner")
-                        if child.parent == row.id and child.id in slugs),
+                        if child.parent == staff.ReportsTo(row.id) and child.id in slugs),
                        key=lambda row: slugs.get(row.id, row.name))
     return BoardSubtree(record, tuple(boards))
 
@@ -431,7 +431,7 @@ def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
     if owner is None:
         print(f"board_json: {runner['slug']}: the production document is not recorded", file=sys.stderr)
     for row in staff.active(record, "unit"):
-        if owner is None or row.parent != owner.id:
+        if owner is None or row.parent != staff.ReportsTo(owner.id):
             continue
         tree = resolver.unit_worktree(row)
         try:

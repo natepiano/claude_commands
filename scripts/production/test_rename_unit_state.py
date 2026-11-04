@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.astra import design_roles
-from scripts.direct import workers
-from scripts.production import staff
+from scripts.production import staff, session_staff
+from scripts.astra.design_role_test_support import designer_fixture
+from scripts.production.staff_test_support import fixture_worker, unit_membership
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -52,30 +53,6 @@ class UnitRenameStateTests(UnitRenameFixture):
         for name in ("doc", "checkout"):
             self.assertNotIn(name, self.journal())
 
-    def test_rename_keeps_the_worker_address_and_rebinds_the_ledger_context(self) -> None:
-        run = self.root / "runs" / "carried"
-        run.mkdir(parents=True)
-        old_worktree = self.rust / "claude-demo-alpha"
-        self.write(run / "progress_history_state.json", json.dumps({"production": SLUG,
-            "unit": "alpha-unit", "working_dir": str(old_worktree)}))
-        with mock.patch.dict(os.environ, self.env):
-            store = workers.UnitWorkerLedger(workers.ledger_path(SLUG, "alpha-unit"))
-            worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
-                workers.CodexThread("original-thread", str(self.root / "codex")), workers.Paused(),
-                [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
-            with store.locked() as ledger:
-                ledger.workers[worker.name] = worker
-        self.write(run / "mesh_roster.json", json.dumps({"w7": {"thread_id": "original-thread", "role": "impl",
-            "status": "paused", "unit_ledger": str(store.path)}}))
-        result = self.rename("apply")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        with mock.patch.dict(os.environ, self.env):
-            target = workers.ledger_for_run(run)
-            self.assertEqual(target.path, workers.ledger_path(SLUG, "gamma-unit"))
-            with target.locked() as ledger:
-                self.assertEqual(ledger.workers["w7"], worker)
-        self.assertFalse(store.path.exists())
-        self.assertEqual(json.loads((run / "mesh_roster.json").read_text())["w7"]["unit_ledger"], str(target.path))
 
     def test_verify_fails_on_an_unclassified_stale_reference(self) -> None:
         self.assert_ok(self.rename("apply"))
@@ -167,11 +144,15 @@ class UnitRenameStateTests(UnitRenameFixture):
         config = self.root / "design_roles.conf"
         self.write(config, "[ownership]\nhost=fixture-host\n")
         self.env.update({"DESIGN_ROLES_CONFIG": str(config), "DESIGN_ROLES_HOST": "fixture-host"})
+        parent = unit_membership(SLUG, "alpha-unit")
+        designer = designer_fixture(design_roles.UnitHolder(SLUG, "alpha-unit"), "original-astra-designer", self.root / "codex-home")
+        reviewer = fixture_worker("original-astra-reviewer", parent.id,
+                                  backend=staff.CodexBackend(self.root / "codex-home"))
         design = design_roles.HeldDesign(design_roles.DesignPlacement("00000000-0000-4000-8000-000000000056", "fixture-host", 1),
             "fixture-repo", str(old), str(old / "docs/plans/alpha.md"), "design", "2026-10-21T12:00:00+00:00",
             design_roles.UnitHolder("demo", "alpha-unit"), design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", "original-designer-alias", design_roles.RoleOpen("original-designer-thread")),
-             design_roles.RoleInstance("reviewer", "original-reviewer-alias", design_roles.RoleOpen("original-reviewer-thread"))))
+            (design_roles.RoleInstance("designer", designer.name, design_roles.RoleOpen(designer.id)),
+             design_roles.RoleInstance("reviewer", reviewer.name, design_roles.RoleOpen(reviewer.id))))
         with mock.patch.dict(os.environ, self.env):
             design_roles.register_repository("fixture-repo", {"fixture-host": str(old)}, inventory_complete=True)
             placement = design_roles.authority_request("reserve", {"repository_id": "fixture-repo",
@@ -182,16 +163,16 @@ class UnitRenameStateTests(UnitRenameFixture):
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             mesh = design_roles.mesh_directory(design.placement.design_id)
         mesh.mkdir(parents=True)
-        roster = {instance.name: {"thread_id": cast(design_roles.RoleOpen, instance.lifecycle).thread_id,
+        roster = {instance.name: {"staff_id": member.id,
                                   "status": "running" if instance.role == "designer" else "done", "cwd": str(old)}
-                  for instance in design.roles}
+                  for instance, member in zip(design.roles, (designer, reviewer), strict=True)}
         self.write(mesh / "mesh_roster.json", json.dumps(roster))
         result = self.rename("apply")
         self.assert_refused(result, "busy")
         self.assertFalse(self.journal()["done"])
         with mock.patch.dict(os.environ, self.env):
             self.assertEqual(design_roles.read_design(design.placement.design_id).holder, design.holder)
-        roster["original-designer-alias"]["status"] = "done"
+        roster["original-astra-designer"]["status"] = "done"
         self.write(mesh / "mesh_roster.json", json.dumps(roster))
         self.assert_ok(self.rename("apply"))
         with mock.patch.dict(os.environ, self.env):
@@ -201,8 +182,9 @@ class UnitRenameStateTests(UnitRenameFixture):
         self.assertEqual([(instance.name, instance.lifecycle) for instance in renamed.roles],
                          [(instance.name, instance.lifecycle) for instance in design.roles])
         self.assertEqual(renamed.placement.generation, 2)
-        self.assertEqual({entry["cwd"] for entry in cast(dict[str, dict[str, str]], json.loads((mesh / "mesh_roster.json").read_text())).values()},
-                         {str(new)})
+        self.assertEqual({session_staff.worker_directory(staff.local_snapshot(), staff.StaffId(entry["staff_id"]))
+                          for entry in cast(dict[str, dict[str, str]], json.loads((mesh / "mesh_roster.json").read_text())).values()},
+                         {new})
 
     def test_add_unit_refuses_a_unit_being_renamed(self) -> None:
         self.assert_refused(self.rename("apply", refuse="push origin demo:refs/heads/demo"), "simulated failure")

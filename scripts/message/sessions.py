@@ -378,6 +378,14 @@ def named(name: str, records: list[SessionRecord]) -> SessionRecord | None:
                  if (found := addressed(candidate, records)) is not None), None)
 
 
+def config_dirs() -> list[Path]:
+    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        directories.add(Path(override).expanduser())
+    return sorted(directories)
+
+
 def latest_transcript(session_id: str, projects: Path) -> Path | None:
     """The session's transcript under the Claude projects folder: the newest one, when a resume left several."""
     transcripts = sorted(projects.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)

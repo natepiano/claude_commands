@@ -390,9 +390,22 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             if history.stem in self.unheld_runs:
                 continue
             folder.mkdir(parents=True, exist_ok=True)
-            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"history_file": str(history)}))
-            if history.stem in self.director_overrides:
-                unit_runs.record_director(folder, self.director_overrides[history.stem])
+            events = self.run_records.get(history.stem, [])
+            first = events[0] if events else {}
+            main_agent = first.get("main_agent", {})
+            session = self.director_overrides.get(history.stem, unit_session(history.stem))
+            if history.stem not in self.director_overrides and isinstance(main_agent, dict):
+                candidate = cast(dict[str, object], main_agent).get("session_id")
+                if isinstance(candidate, str):
+                    session = candidate
+            membership = staff.local_snapshot()
+            owner = membership.by_current_session(session)
+            run_state: dict[str, object] = {"history_file": str(history)}
+            if owner is not None and isinstance(owner.parent, staff.ReportsTo):
+                parent = membership.by_id(owner.parent.id)
+                assert parent is not None
+                run_state.update(production=parent.name, unit=owner.name)
+            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
                        "STALL_TEST_SEND_TOGETHER": str(together)}
         if subprocess_cli:
@@ -1147,7 +1160,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.configure({"showrunner": ["unit-one"], "receiver": []})
         row = unit_membership("showrunner", "unit-one")
         receiver = showrunner_relationship("receiver")
-        _ = staff.move(row.id, receiver.id)
+        _ = staff.move(row.id, staff.ReportsTo(receiver.id))
         launches = self.root / "launches"
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(pane_record, "RECORD_DIR", launches),

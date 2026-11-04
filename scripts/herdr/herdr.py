@@ -4065,8 +4065,8 @@ class UnitTabClassifier:
         from scripts.production import staff
 
         parents = {row.id: row for row in staff.active(record, "showrunner")}
-        units: dict[str, UnitTab] = {row.current_session: UnitTab(row, parents[row.parent]) for row in staff.active(record, "unit")
-                                     if row.parent is not None and row.parent in parents}
+        units: dict[str, UnitTab] = {row.current_session: UnitTab(row, parents[row.parent.id]) for row in staff.active(record, "unit")
+                                     if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents}
         self.by_pane = {process.place.pane: units[ident] for process in processes
                         if process.place.session == session
                         and (ident := process.marks.get("CODEX_THREAD_ID")

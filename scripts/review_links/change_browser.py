@@ -13,7 +13,7 @@ from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
-from scripts.production import change_review, change_routing
+from scripts.production import change_review, change_routing, staff
 from scripts.production.change_routing import UnavailableProduction
 from scripts.production.proposals_folder import slug_of
 from scripts.review_links import change_page
@@ -105,12 +105,12 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
         root = runner
         while root is not None:
             parent = root.parent
-            if parent is None or parent not in routing.runners:
+            if not isinstance(parent, staff.ReportsTo) or parent.id not in routing.runners:
                 break
-            root = routing.runners[parent]
+            root = routing.runners[parent.id]
         current = (defaults.get(root.name) if root is not None else None) or routing.list_paths.get(tab) or defaults.get(tab, page.review_list)
         name = change_review.queue(current)
-        if runner is not None and runner.parent is not None and isinstance(page, change_page.AssignedReviewPage):
+        if runner is not None and isinstance(runner.parent, staff.ReportsTo) and isinstance(page, change_page.AssignedReviewPage):
             name += "-" + slug_of(page.production)
         entries: list[urgency.Entry[dict[str, str]]] = []
         by_key: dict[str, WaitingChange] = {}

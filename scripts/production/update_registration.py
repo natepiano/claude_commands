@@ -303,7 +303,7 @@ class QuestionStaff:
             return parent
         row = self.record.by_member_reference(unit)
         if row is not None:
-            if row.kind != "unit" or row.parent != parent.id:
+            if row.kind != "unit" or row.parent != staff.ReportsTo(parent.id):
                 raise RegistrationFailure("ask", f"{unit} is not a unit of {production.slug}")
             return row
         selector = session_staff.UnitMember(production.slug, unit)
@@ -381,7 +381,7 @@ def relay_line(production: Production, slug: str, asker: QuestionAsker,
                 return "relay: none; this showrunner asked it"
             loaded = names.runtime_names()
             label = loaded.job("showrunner") if isinstance(loaded, names.Names) else "requesting role (display name unavailable)"
-        elif row.parent == current_owner.id:
+        elif row.parent == staff.ReportsTo(current_owner.id):
             current_slug = production.slug
         if current_slug != production.slug:
             return f"relay: to the showrunner of {current_slug}, for {label} (staff {row.id})"

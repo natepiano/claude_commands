@@ -31,7 +31,6 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_showrun
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
-from dailies_input_test_support import setUpModule as setUpModule
 
 
 class RowDailiesTests(StaffTestCase):
@@ -101,8 +100,8 @@ class DailiesInputTests(DailiesInputFixture):
             row = unit_membership(fixture_showrunner_name("example", self.doc), label)
             folder = self.root / name
             _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder), expected=row.worktree)
-            assert row.parent is not None
-            _ = staff.set_doc(row.parent, staff.LiveDoc("natedev", self.doc))
+            assert isinstance(row.parent, staff.ReportsTo)
+            _ = staff.set_doc(row.parent.id, staff.LiveDoc("natedev", self.doc))
             write_text_atomic(folder / ".unit.toml", f'plan = "docs/{name}.md"\nresponsibilities = []\n')
 
     def test_a_unit_whose_run_is_finished_needs_no_entry_and_is_left_out(self) -> None:

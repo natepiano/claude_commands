@@ -1,16 +1,17 @@
 """Check launch permission, then publish the backend runtime identity."""
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 import io
-from pathlib import Path
+import json
 import sys
+from pathlib import Path
+from typing import cast
 
 from scripts.agents import worker_lifecycle
 from scripts.lib import unit_runs
-from scripts.production import staff, session_staff, showrunners
+from scripts.production import staff, session_staff
 
 
 class AdmissionRefused(ValueError):
@@ -24,7 +25,7 @@ class WorkerStartAllowed:
     name: str
     parent: staff.StaffId
     run: Path
-    role: str
+    member: staff.StaffRow | None
 
 
 @dataclass(frozen=True)
@@ -34,121 +35,130 @@ class PublishedWorker:
     row: staff.StaffRow
 
 
-@dataclass(frozen=True)
-class UnpublishedWorker:
-    """A returned native backend retained in its existing inbox, before success."""
-
-    inbox: Path
-    identity: staff.StaffId
-    parent: staff.StaffId
-
-
 def showrunner_member(record: staff.StaffSnapshot, sources: session_staff.MemberSources,
-                      slug: str, *, dependencies: Callable[[Path], None] | None = None
+                      slug: str
                       ) -> session_staff.MemberFound | session_staff.NoSuchMember:
-    """Resolve a holder's former slug only through its recorded rename journal."""
+    """Find the showrunner in staff."""
     selector = session_staff.ShowrunnerMember(slug)
-    found = sources.member(selector, record)
-    if isinstance(found, session_staff.MemberFound):
-        return found
-    matches: dict[staff.StaffId, staff.StaffRow] = {}
-    for path in sorted(showrunners.SHOWRUNNER_STATE_DIR.glob("*/rename.json")):
-        if dependencies is not None:
-            dependencies(path)
-        try:
-            journal = worker_lifecycle.read_json_object(path)
-            old, new = journal.get("old"), journal.get("new")
-            if not isinstance(old, str) or not old or not isinstance(new, str) or not new:
-                raise ValueError("rename journal needs old and new slugs")
-        except (OSError, ValueError) as error:
-            raise staff.StaffUnreadable(f"{path}: {error}") from error
-        source = sources.productions.get(new)
-        former = showrunners.former_slugs(source.document) if source is not None else ()
-        # Formerly is supporting evidence, never a replacement for the journal.
-        if slug != old or (former and old not in former):
-            continue
-        current = sources.member(session_staff.ShowrunnerMember(new), record)
-        if isinstance(current, session_staff.MemberFound):
-            matches[current.row.id] = current.row
-    if len(matches) > 1:
-        raise staff.StaffUnreadable(f"{slug}: no unique renamed showrunner staff entry")
-    return session_staff.MemberFound(next(iter(matches.values()))) if matches else found
+    return sources.member(selector, record)
 
 
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
-           pending: tuple[staff.SeedMember, ...] = (), run: Path | None = None) -> staff.StaffRow | staff.SeedMember:
-    """Resolve the caller or recorded director before using production names."""
-    row = record.by_current_session(staff_id) if staff_id else None
-    if row is not None and row.kind == "worker" and row.parent is not None:
-        row = record.by_id(row.parent)
-    if row is not None and row.kind in ("unit", "showrunner"):
-        return row
+           run: Path | None = None) -> staff.StaffRow:
+    """Resolve the run unit before using the caller or worker parents."""
     if run is not None:
-        director = unit_runs.director(run)
-        row = record.by_member_reference(director) if director else None
-        if row is not None and row.kind in ("unit", "showrunner"):
-            return row
-        state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+        try:
+            state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+        except (OSError, ValueError) as error:
+            print(f"anomaly: {error}".replace("\n", " "), file=sys.stderr)
+            state = {}
         production = value if isinstance(value := state.get("production"), str) else ""
         unit = value if isinstance(value := state.get("unit"), str) else ""
     if unit:
         found = session_staff.unit_match(session_staff.ObservedUnit(unit), record)
-    else:
-        sources = sources if sources is not None else session_staff.member_sources()
-        found = showrunner_member(record, sources, production)
+        if isinstance(found, session_staff.MemberFound):
+            return found.row
+        if production:
+            sources = sources if sources is not None else session_staff.member_sources()
+            found = sources.member(session_staff.UnitMember(production, unit), record)
+            if isinstance(found, session_staff.MemberFound):
+                return found.row
+    if run is not None:
+        entries = session_staff.read_worker_roster(run / "mesh_roster.json")
+        for raw in entries.values():
+            if not isinstance(raw, dict):
+                continue
+            child = record.by_id(staff.StaffId(str(cast(dict[str, object], raw).get("staff_id", ""))))
+            owner = record.parent_of(child) if child is not None else None
+            if owner is not None:
+                return owner
+    row = record.by_current_session(staff_id)
+    if row is not None and row.kind == "worker":
+        row = record.parent_of(row)
+    if row is not None and row.kind in ("unit", "showrunner"):
+        return row
+    sources = sources if sources is not None else session_staff.member_sources()
+    found = showrunner_member(record, sources, production)
     if isinstance(found, session_staff.NoSuchMember):
-        if unit:
-            from scripts.production import unit_names
-            candidates = [entry for entry in pending if entry.kind == "unit"
-                          and entry.name == unit_names.name(unit)]
-            if len(candidates) > 1:
-                raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
-            if candidates:
-                return candidates[0]
         raise ValueError(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
     return found.row
+
+
+def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:
+    """Find the named worker under its staff parent."""
+    return next((row for row in record.find(kind="worker", parent=owner) if row.name == name), None)
 
 
 def admit(name: str, run: Path, *, role: str, production: str = "", unit: str = "") -> WorkerStartAllowed:
     """Refuse before starting a backend or taking lifecycle, inbox or roster locks."""
     try:
-        if role in ("designer", "reviewer"):
-            role = "astra-" + role
+        del role
         record = staff.snapshot()
         explicit = bool(production or unit)
         owner = parent(record, staff_id="" if explicit else staff.runtime_id(),
                        production=production, unit=unit, run=None if explicit else run)
-        assert isinstance(owner, staff.StaffRow)
         _ = staff.WorkerName.parse(name)
         if isinstance(owner.worktree, staff.RemovedWorktree):
             print(f"staff: {name}: parent {owner.id} is retired; admission continues", file=sys.stderr)
-        return WorkerStartAllowed(name, owner.id, run, role)
+        existing = find_worker(record, owner.id, name)
+        return WorkerStartAllowed(name, owner.id, run, existing)
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (staff.StaffRefused, staff.StaffUnreadable, staff.StaffNotFound, OSError, ValueError) as error:
         raise AdmissionRefused(f"staff: {name}: not opened: {error}".replace("\n", " ")) from error
 
 
-def publish(allowed: WorkerStartAllowed, runtime_id: str, *, previous_id: str = "") -> PublishedWorker:
-    """Publish a returned backend id before dispatch or roster success."""
+def member(run: Path, name: str) -> staff.StaffRow | None:
+    record = staff.local_snapshot()
+    owner = parent(record, staff_id=staff.runtime_id(), run=run)
+    return find_worker(record, owner.id, name)
+
+
+def family_switch_context(allowed: WorkerStartAllowed, family: str) -> str:
+    """Read the prior conversation when the new session uses another family."""
+    row = allowed.member
+    if row is None:
+        return ""
+    backend = staff.local_snapshot().backends.get(row.id)
+    paths: list[Path] = []
+    if isinstance(backend, staff.CodexBackend) and family == "claude":
+        for folder in ("sessions", "archived_sessions"):
+            paths.extend((backend.codex_home / folder).rglob(f"*{row.current_session}.jsonl"))
+    elif isinstance(backend, staff.ClaudeBackend) and family == "codex":
+        from scripts.message import sessions
+        paths = [path for home in sessions.config_dirs()
+                 if (path := sessions.latest_transcript(row.current_session, home / "projects")) is not None]
+    messages: list[str] = []
+    try:
+        for path in paths:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                value = cast(object, json.loads(line))
+                if not isinstance(value, dict):
+                    continue
+                fields = cast(dict[str, object], value)
+                raw = fields.get("message", fields.get("payload", {}))
+                if not isinstance(raw, dict):
+                    continue
+                message = cast(dict[str, object], raw)
+                if message.get("role", fields.get("type")) in ("user", "assistant"):
+                    messages.append(json.dumps(message.get("content", message.get("text", "")), ensure_ascii=False))
+    except (OSError, ValueError) as error:
+        print(f"anomaly: {row.name}: transcript extract: {error}", file=sys.stderr)
+    return "Prior conversation:\n" + "\n".join(messages)[-32000:] if messages else ""
+
+
+def publish(allowed: WorkerStartAllowed, runtime_id: str) -> PublishedWorker:
+    """Publish the session before dispatch."""
     try:
         identity = staff.native_id(runtime_id)
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            if previous_id and previous_id != runtime_id:
-                old = staff.by_current_session(previous_id)
-                if old is None:
-                    replay = staff.by_current_session(identity)
-                    if replay is None:
-                        # An interrupted backend may never have published its first row.
-                        return PublishedWorker(staff.ensure_worker(allowed.name, allowed.parent,
-                                                                   runtime_id=runtime_id))
-                    if (replay.kind, replay.name, replay.parent) != ("worker", allowed.name, allowed.parent):
-                        raise staff.StaffRefused(f"{previous_id}: replacement owner is not proved")
-                    return PublishedWorker(replay)
-                if (old.kind, old.name, old.parent) != ("worker", allowed.name, allowed.parent):
-                    raise staff.StaffRefused(f"{previous_id}: replacement owner is not proved")
-                row = staff.update_current_session(old.current_session, identity)
+            if allowed.member is not None:
+                row = staff.update_current_session(allowed.member.current_session, identity)
             else:
-                row = staff.ensure_worker(allowed.name, allowed.parent, runtime_id=runtime_id)
+                row = staff.ensure_worker(identity, allowed.name, allowed.parent)
         return PublishedWorker(row)
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (staff.StaffRefused, staff.StaffUnreadable, staff.StaffNotFound, OSError, ValueError) as error:
         raise AdmissionRefused(f"staff: {allowed.name}: {runtime_id}: publication refused: {error}".replace("\n", " ")) from error

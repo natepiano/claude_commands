@@ -166,8 +166,6 @@ class MeshWorker(TypedDict, total=False):
     lens: str
     cwd: str
     held_design_id: str
-    transferring_role: dict[str, object]
-    role_redirect: dict[str, object]
 
 
 def as_string(value: object) -> str:
@@ -268,9 +266,9 @@ def production_places(
     by_id = {item["sessionId"]: item for item in records}
     for row in staff.active(record, "unit"):
         identity = row.current_session
-        if identity in ledger_workers or row.parent is None:
+        if identity in ledger_workers or not isinstance(row.parent, staff.ReportsTo):
             continue
-        parent = record.by_id(row.parent)
+        parent = record.by_id(row.parent.id)
         if parent is None or parent.kind != "showrunner":
             problem(problems, row.name, "the staff parent is unavailable")
             continue
@@ -309,7 +307,7 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
         runners = showrunner_ids(records, registered, membership=record)
         directors: dict[str, str] = {
             row.current_session: parent.current_session for row in record.find(kind="worker")
-            if row.parent is not None and (parent := record.by_id(row.parent)) is not None}
+            if isinstance(row.parent, staff.ReportsTo) and (parent := record.by_id(row.parent.id)) is not None}
         places = production_places(records, set(directors), problems,
                                    record=record, resolver=resolver)
         names: dict[str, str] = {item["sessionId"]: item["name"] for item in records}
@@ -332,7 +330,7 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
                 director = (UnderDirector(unit, names[owner], f"session:{owner}")
                             if owner in names else UnitWithoutRunningDirector(unit))
             labels[session_id] = make_labels(names[session_id], showrunner, director)
-        labels.update(codex_unit_labels(wanted - labels.keys(), environment, records, places, problems))
+        labels.update(codex_unit_labels(wanted - labels.keys(), environment, records, places, problems, membership=record))
         return labels
     except Exception:
         return {}
@@ -422,13 +420,32 @@ def mesh_records(run: LiveRun, problems: list[str]) -> dict[str, MeshWorker]:
 
 
 def listed_mesh_worker(record: MeshWorker) -> bool:
-    return not (record.get("status") == "ended" or record.get("transferring_role")
-                or record.get("role_redirect") or record.get("held_design_id"))
+    return not (record.get("status") == "ended" or record.get("held_design_id"))
+
+
+def staff_relationships(membership: staff.StaffSnapshot, member: staff.StaffRow,
+                        names: Mapping[str, str], showrunners: Mapping[str, ShowrunnerRelationship]
+                        ) -> tuple[DirectorRelationship, ShowrunnerRelationship]:
+    parent = membership.parent_of(member)
+    if parent is None:
+        return NoDirector(), NoShowrunner()
+    if parent.kind == "showrunner":
+        return NoDirector(), UnderShowrunner(parent.name, names.get(parent.current_session, parent.name),
+                                             f"session:{parent.current_session}")
+    director: DirectorRelationship = (UnderDirector(parent.name, names[parent.current_session],
+                                                    f"session:{parent.current_session}")
+                                      if parent.current_session in names else UnitWithoutRunningDirector(parent.name))
+    showrunner = showrunners.get(parent.current_session, NoShowrunner())
+    if isinstance(showrunner, NoShowrunner) and (owner := membership.parent_of(parent)) is not None:
+        showrunner = UnderShowrunner(owner.name, names.get(owner.current_session, owner.name),
+                                    f"session:{owner.current_session}")
+    return director, showrunner
 
 
 def codex_unit_labels(
     wanted: set[str], environment: Mapping[str, str], records: list[SessionRecord],
     places: Mapping[str, ProductionPlace], problems: list[str],
+    *, membership: staff.StaffSnapshot,
 ) -> dict[str, UnitLabels]:
     if not wanted:
         return {}
@@ -444,34 +461,28 @@ def codex_unit_labels(
             continue
         for path in paths:
             run = LiveRun(path.parent, NoRunningDirector())
-            workers = {
-                thread: name for name, record in sorted(mesh_records(run, problems).items())
-                if (thread := as_string(record.get("thread_id"))) and thread in wanted and listed_mesh_worker(record)
-            }
+            workers: dict[str, str] = {}
+            for name, entry in sorted(mesh_records(run, problems).items()):
+                try:
+                    current = cast(Mapping[str, object], entry)
+                except staff.StaffUnreadable as error:
+                    problem(problems, f"Codex worker {path}:{name}", error)
+                    continue
+                thread = as_string(session_staff.worker_session(current, membership))
+                if thread in wanted and listed_mesh_worker(entry):
+                    workers[thread] = name
             if workers:
                 matches[path.parent.resolve()] = workers
     if not matches:
         return {}
     names: dict[str, str] = {item["sessionId"]: item["name"] for item in records}
     labels: dict[str, UnitLabels] = {}
-    runs = {run.path: run for run in live_runs(roots, set(names), problems)}
-    for path in matches:
-        owner = unit_runs.director(path)
-        if owner in names:
-            _ = runs.setdefault(path, LiveRun(path, DirectorSession(owner)))
-    for run in runs.values():
-        if run.path not in matches:
-            continue
-        owner = unit_runs.director(run.path)
-        director_id = owner if owner in names else (run.director.session_id
-            if isinstance(run.director, DirectorSession) else "")
-        if director_id in names:
-            place = places.get(director_id)
-            showrunner: ShowrunnerRelationship = place.showrunner if place is not None else NoShowrunner()
-            director: DirectorRelationship = place.director if place is not None else NoDirector()
-        else:
-            stopped = stopped_run_place(run.path)
-            showrunner, director = stopped.showrunner, stopped.director
-        for thread, name in matches[run.path].items():
-            labels[thread] = make_labels(name, showrunner, director)
+    for workers in matches.values():
+        for thread in workers:
+            member = membership.by_current_session(thread)
+            if member is None or not isinstance(member.parent, staff.ReportsTo):
+                continue
+            director, showrunner = staff_relationships(membership, member, names,
+                                                        {key: place.showrunner for key, place in places.items()})
+            labels[thread] = make_labels(member.name, showrunner, director)
     return labels

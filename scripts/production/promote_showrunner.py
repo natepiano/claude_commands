@@ -30,7 +30,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import completion_receipt, staff, staff_sources, session_staff
+from scripts.production import completion_receipt, staff, staff_sources
 from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
@@ -120,7 +120,7 @@ def _committed(doc: Path) -> None:
 
 
 def checked(name: str, child_doc: Path, *,
-            record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Promotion:
+            record: staff.StaffSnapshot | None = None) -> Promotion:
     """Everything the promotion needs. Raises Refusal naming what is in the way."""
     parent_doc = showrunners.production_of(staff.runtime_id())
     if parent_doc is None:
@@ -128,7 +128,7 @@ def checked(name: str, child_doc: Path, *,
     parent = read_production(parent_doc)
     unit = name if name.replace("_", "-").endswith("-unit") else f"{name}-unit"
     pending = promotion_record(parent, unit)
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    record = staff.snapshot() if record is None else record
     if pending.exists():
         fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
         if Path(fields["child_doc"]).resolve() != child_doc.expanduser().resolve():

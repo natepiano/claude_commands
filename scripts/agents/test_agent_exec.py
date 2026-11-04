@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.message import sessions
+from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id
 from scripts.accounts import accounts
 from scripts.lib.nix_env_test_support import NixFixture
@@ -200,12 +201,15 @@ class ClaudeLauncherTests(unittest.TestCase):
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
         for caller, expected in (("claude1", "claude1"), ("", "claude3")):
             with self.subTest(caller=caller):
+                for worker in staff.local_snapshot().find(kind="worker", parent=owner.id):
+                    _ = staff.retire(worker.id)
                 (self.home / "id").unlink(missing_ok=True)
                 environment = {**self.environment, **private_env, "AGENT_BG_ROLE": "impl", "AGENT_BG_DETACH": "1", "BACKGROUND_LAUNCH_FILE": str(captured),
                                "CODEX_THREAD_ID": owner.id, "NOTIFIER_SESSIONS_DIR": str(registry),
                                "FIXTURE_REGISTRY_PATH": str(registry / f"{os.getpid()}.json"),
                                "FIXTURE_REGISTRY_RECORD": json.dumps(record), "FIXTURE_NATIVE_ID": native,
                                "AGENT_BG_SEND_SCRIPT": str(sender)}
+                _ = environment.pop("CLAUDE_CONFIG_DIR", None)
                 if caller:
                     environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
                 result = subprocess.run(["bash", str(SCRIPTS / "agents/agent_bg.sh"), "fixture-worker", str(self.home),
