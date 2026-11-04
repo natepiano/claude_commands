@@ -47,7 +47,7 @@ class StopResumeTests(unittest.TestCase):
             for target in (None, "claude3"):
                 with self.subTest(kind=kind, target=target):
                     pane_record.save("agents", {self.entry["pane_id"]: self.entry})
-                    row = staff.StaffRow(identity, kind, "alpha", None, current_session=identity)
+                    row = staff.StaffRow(identity, kind, "alpha", staff.STAFF_ROOT, current_session=identity)
                     expected = target or ("claude4" if kind != "agent" else "claude3")
                     with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
                           patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
@@ -1689,7 +1689,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_move_confirms_each_member_runs_on_the_target_after_resume(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId(identity), "unit", "alpha", None,
+        row = staff.StaffRow(staff.StaffId(identity), "unit", "alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(identity))
         line = ("alpha: not running on claude4 after the move; resume it with: "
                 + f"accounts.py move {identity} claude4")

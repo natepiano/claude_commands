@@ -365,7 +365,7 @@ def apply(old: str, new: str) -> RenamePlan | staff.StaffRow:
             try:
                 changed = _set_displays(result)
             except (OSError, ValueError, Refusal, tidy_wrapped.TidyRefused,
-                    staff.StaffRefused, herdr.HerdrFailure, WorkerUnavailable) as error:
+                    staff.StaffRefused, herdr.HerdrFailure) as error:
                 print(f"anomaly: set_displays: {error}", file=sys.stderr)
                 changed = True
             print("done" if changed else "unchanged")

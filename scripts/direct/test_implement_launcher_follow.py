@@ -86,7 +86,7 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
         self.assertIn("effort=xhigh\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
         self.assertEqual(json.loads(path.read_text()), {**identity, "model": "gpt-blind"})
 
-    def test_mesh_disabled_follow_refuses_before_recording_a_pass(self) -> None:
+    def test_unreadable_staff_follow_refuses_before_recording_a_pass(self) -> None:
         session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         roster = cast("dict[str, object]", json.loads(
@@ -96,14 +96,17 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
         status_path = session_dir / "impl_status_impl"
         before = status_path.read_text(encoding="utf-8")
         passes = self.open_passes(session_dir)
+        environment = self.environment()
+        _ = (self.root / "staff.json").write_text("{invalid staff")
         args = ["bash", str(self.implement_script), "--to", name,
                 str(session_dir), str(self.working_dir), str(self.prompt_file),
                 "impl", "the retry path", "impl", "writing the retry path", "0", "impl"]
 
-        refused = subprocess.run(args, env=self.environment(), capture_output=True,
+        refused = subprocess.run(args, env=environment, capture_output=True,
                                  text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
         self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("not opened:", refused.stderr)
         self.assertEqual(status_path.read_text(encoding="utf-8"), before)
         self.assertEqual(self.open_passes(session_dir), passes)
         self.assertNotIn("follow-up to", (session_dir / "board.log").read_text())
