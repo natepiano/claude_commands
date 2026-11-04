@@ -162,7 +162,7 @@ class NativePaneSessionTests(StaffTestCase):
                   patch.object(herdr, "_PLATFORM", "linux"),
                   patch.object(sessions, "process_start", return_value="same-process"),
                   patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": wrong})):
-                self.assertEqual(herdr.native_process(998079, "codex").identity, identity)
+                self.assertEqual(herdr.native_process(998079, "codex").identity, herdr.LaunchArgument(identity))
 
     def test_codex_daemon_client_uses_resume_id_without_rollout_or_exported_thread(self) -> None:
         identity = fixture_runtime_id("daemon-client-resume")
@@ -184,7 +184,7 @@ class NativePaneSessionTests(StaffTestCase):
 
     def test_foreground_process_without_argv_does_not_hide_the_agent(self) -> None:
         identity = fixture_runtime_id("foreground-agent")
-        observation = herdr.NativeAgentProcess(identity, "same-start", {"CODEX_HOME": str(self.root / ".codex2")})
+        observation = herdr.NativeAgentProcess(herdr.RolloutThread(identity), "same-start", {"CODEX_HOME": str(self.root / ".codex2")})
         info: dict[str, object] = {"shell_pid": 998070, "foreground_process_group_id": 998075,
                 "foreground_processes": [{"pid": 998074},
                     {"pid": 998075, "name": "codex", "argv": ["codex"], "cwd": str(self.root)}]}
@@ -204,7 +204,7 @@ class NativePaneSessionTests(StaffTestCase):
     def test_native_pane_process_returns_the_proved_account_and_launch_identity_for_the_exact_codex_pid(self) -> None:
         current = fixture_runtime_id("pane-current-thread")
         launch = fixture_runtime_id("pane-launch-thread")
-        observation = herdr.NativeAgentProcess(current, "same-start", {
+        observation = herdr.NativeAgentProcess(herdr.RolloutThread(current), "same-start", {
             "CODEX_THREAD_ID": launch, "CODEX_HOME": str(self.root / ".codex2")})
         payload = {"result": {"process_info": {"foreground_processes": [
             {"pid": 998074, "argv": ["zsh"]}, {"pid": 998075, "argv": ["codex", "resume", launch]}]}}}
@@ -230,10 +230,10 @@ class NativePaneSessionTests(StaffTestCase):
               patch.object(sessions, "process_start", return_value="same-process"),
               patch.object(herdr, "process_environment", return_value=environment)):
             observed = herdr.native_process(998072, "codex")
-        self.assertEqual(observed, herdr.NativeAgentProcess(current, "same-process", environment))
+        self.assertEqual(observed, herdr.NativeAgentProcess(herdr.RolloutThread(current), "same-process", environment))
         self.assertEqual(observed.environment["CODEX_THREAD_ID"], launch)
 
-    def test_no_open_rollout_reports_launch_fallback_and_keeps_native_session_behavior(self) -> None:
+    def test_launch_argument_cannot_prove_the_current_pane_session(self) -> None:
         launch = fixture_runtime_id("native-fallback-launch")
         proc = self.root / "fallback-proc"
         (proc / "998076" / "fd").mkdir(parents=True)
@@ -248,11 +248,13 @@ class NativePaneSessionTests(StaffTestCase):
               patch.object(herdr, "process_environment", return_value=environment),
               patch.object(herdr, "run_program", return_value=completed)):
             observed = herdr.native_process(998076, "codex")
-            identity = herdr.Herdr("agents").native_session("w1:p1", "codex", 1)
-        self.assertEqual(observed.identity, launch)
+            with self.assertRaisesRegex(herdr.HerdrFailure, "launch argument does not prove"):
+                _ = herdr.Herdr("agents").native_session("w1:p1", "codex", 1)
+        self.assertEqual(observed.identity, herdr.LaunchArgument(launch))
         self.assertEqual(observed.started, "same-process")
         self.assertEqual(observed.environment, environment)
-        self.assertEqual(identity, launch)
+        with self.assertRaisesRegex(ValueError, "launch argument does not prove"):
+            _ = observed.current_identity
 
     def test_native_pane_identity_uses_its_exact_claude_pid_registry_without_an_exported_id(self) -> None:
         identity = fixture_runtime_id("herdr-native-Claude")
@@ -312,7 +314,7 @@ class CodexAnomalyNameTests(StaffTestCase):
             with self.subTest(arguments=arguments):
                 self.assertEqual(herdr.codex_managed_daemon(arguments), expected)
 
-    def test_daemon_rollouts_prove_threads_without_notes_from_its_tui_clients(self) -> None:
+    def test_daemon_rollouts_prove_threads_and_quiet_clients_report_unknown(self) -> None:
         proc = self.root / "proc"
         process = proc / "42"
         (process / "fd").mkdir(parents=True)
@@ -334,7 +336,8 @@ class CodexAnomalyNameTests(StaffTestCase):
               patch.object(sessions, "process_start", return_value="fixture-start"),
               redirect_stderr(io.StringIO()) as output):
             self.assertEqual(herdr.running_codex_threads(thread_host=lambda _arguments: False), identities)
-            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(len(output.getvalue().splitlines()), 6)
+            self.assertTrue(all("Codex thread unknown" in line for line in output.getvalue().splitlines()))
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 _ = herdr.codex_rollout_thread(42)
             _ = (process / "cmdline").write_bytes(b"codex\0app-server\0--managed-daemon\0")
@@ -343,7 +346,8 @@ class CodexAnomalyNameTests(StaffTestCase):
             self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), {live})
             (proc / "43" / "fd" / "0").unlink()
             self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), set())
-            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(len(output.getvalue().splitlines()), 17)
+            self.assertTrue(all("Codex thread unknown" in line for line in output.getvalue().splitlines()))
 
     def assert_unknown_codex_note(self, source: Literal["tab", "registry", "pid"]) -> None:
         pid = 998071
@@ -502,14 +506,14 @@ class PromptSubmissionTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr, "_tab_staff", return_value=staff.initial_snapshot()))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
         _ = self.enterContext(patch.object(self.client, "panes", return_value=[
-            {"pane_id": "destination:p1", "session_id": self.transcript.session_id}]))
+            {"pane_id": "destination:p1", "terminal_id": "destination-terminal", "session_id": self.transcript.session_id}]))
         _ = self.enterContext(patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("claude",))))
         _ = self.enterContext(patch.object(self.client, "native_session", return_value=self.transcript.session_id))
         _ = self.enterContext(patch.object(self.client, "result", return_value={"process_info": {
             "shell_pid": 23455, "foreground_process_group_id": 23456,
             "foreground_processes": [{"pid": 23456, "name": "claude", "argv": ["claude"]}]}}))
         _ = self.enterContext(patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-            self.transcript.session_id, "fixture-prompt-recipient", {})))
+            herdr.RolloutThread(self.transcript.session_id), "fixture-prompt-recipient", {})))
         _ = self.enterContext(patch.object(herdr, "prompt_recipient_process",
             return_value=herdr.PromptRecipientProcess(23456, "fixture-prompt-recipient")))
         _ = self.enterContext(patch.object(time, "monotonic", side_effect=lambda: self.elapsed))
@@ -1360,7 +1364,7 @@ class PromptSubmissionTests(unittest.TestCase):
         with (patch.object(self.client, "panes", return_value=[
                   {"pane_id": "destination:p1", "session_id": replacement}]),
               patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-                  replacement, "replacement-generation", {}))):
+                  herdr.RolloutThread(replacement), "replacement-generation", {}))):
             outcome = self.submit()
         self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
         self.assertEqual(self.typed, [])
@@ -1655,8 +1659,14 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
                 fresh[0]["terminal_id"] = terminal
                 with (patch.object(client, "panes", return_value=fresh),
                       patch.object(client, "_close_pane") as closed,
-                      self.assertRaisesRegex(herdr.HerdrFailure, "terminal identity changed")):
-                    client.close_retained_pane("w1:p1")
+                      redirect_stderr(io.StringIO()) as errors):
+                    if terminal:
+                        with self.assertRaisesRegex(herdr.HerdrFailure, "terminal identity changed"):
+                            client.close_retained_pane("w1:p1")
+                    else:
+                        client.close_retained_pane("w1:p1")
+                        self.assertEqual(errors.getvalue().splitlines(), [
+                            "herdr conversation: terminal is unknown; target retained"])
                 closed.assert_not_called()
                 self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)
 
@@ -1774,7 +1784,7 @@ class TargetCatastropheTests(StaffTestCase):
         cast(Mock, self.client.composer).side_effect = read_composer
         def native(_pid: int, _kind: str) -> herdr.NativeAgentProcess:
             identity = cast(str, cast(Mock, self.client.native_session).return_value)
-            return herdr.NativeAgentProcess(identity, "private-generation", {})
+            return herdr.NativeAgentProcess(herdr.RolloutThread(identity), "private-generation", {})
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=native))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
 
@@ -1865,10 +1875,10 @@ class HerdrTests(unittest.TestCase):
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             if (pid, kind) != (998041, "claude"):
                 raise herdr.HerdrFailure("unexpected private process")
-            return herdr.NativeAgentProcess(session, "fixture-start", {})
+            return herdr.NativeAgentProcess(herdr.RolloutThread(session), "fixture-start", {})
         def composer(_pane: str) -> herdr.ComposerInput:
             return herdr.ComposerInput("")
-        with (patch.object(herdr.Herdr, "panes", return_value=[{"pane_id": pane, "session_id": session}]),
+        with (patch.object(herdr.Herdr, "panes", return_value=[{"pane_id": pane, "terminal_id": "prompt-terminal", "session_id": session}]),
               patch.object(client, "result", side_effect=process_info),
               patch.object(client, "composer", side_effect=composer),
               patch.object(herdr, "native_process", side_effect=native)):
@@ -1945,6 +1955,7 @@ class HerdrTests(unittest.TestCase):
         self.process_pane_replies = {}
         self.proc = self.root / "proc"
         self.proc.mkdir()
+        (self.root / "home/.claude/sessions").mkdir(parents=True)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HERDR_BIN": str(self.fake), "SYSTEMD_RUN": str(self.fake), "SYSTEMCTL": str(self.fake),
             "HERDR_PROC": str(self.proc), "FAKE_HERDR_LOG": str(self.log),
@@ -3677,9 +3688,9 @@ class HerdrTests(unittest.TestCase):
         with codex_launch_evidence(self.root, ["codex", "-m", "fixture-model"]) as process_info:
             self.configure_herdr(["pane", "process-info", "--pane", "pane-1"],
                                  json.dumps({"result": process_info}))
-            _ = self.herdr.start_agent("worker", "pane-1", "codex", ["-m", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 200)
+            _ = self.herdr.start_agent("worker", "pane-1", "codex", ["-m", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 10_000)
         self.assertEqual(self.start_commands(), [
-            ["--session", "fixture", "agent", "start", "worker", "--kind", "codex", "--pane", "pane-1", "--timeout", "200", "--", "-m", "fixture-model"],
+            ["--session", "fixture", "agent", "start", "worker", "--kind", "codex", "--pane", "pane-1", "--timeout", "10000", "--", "-m", "fixture-model"],
             ["--session", "fixture", "agent", "prompt", "pane-1", script_prompt("opening\nprompt")],
         ])
 
@@ -3718,14 +3729,14 @@ class HerdrTests(unittest.TestCase):
                       patch.object(herdr, "run_program", side_effect=self.run_fake)):
                     self.log.unlink(missing_ok=True)
                     if module_launch:
-                        _ = herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200,
+                        _ = herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 10_000,
                                               agent=label or "7pane-1")
                     else:
-                        _ = self.herdr.start_agent(label or "7pane-1", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
+                        _ = self.herdr.start_agent(label or "7pane-1", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 10_000)
                     start, prompt = self.start_commands()[-2:]
                     self.assertEqual(start, [
                         "--session", "fixture", "agent", "start", expected, "--kind", "claude",
-                        "--pane", "7pane-1", "--timeout", "200", "--", "--model", "opus",
+                        "--pane", "7pane-1", "--timeout", "10000", "--", "--model", "opus",
                     ])
                     self.assertEqual(prompt, ["--session", "fixture", "agent", "prompt", "7pane-1", script_prompt("continue")])
 
@@ -4725,13 +4736,13 @@ class HerdrTests(unittest.TestCase):
     def test_read_sources_formats_keys_and_close(self) -> None:
         client = self.herdr
         with (patch.object(client, "panes", return_value=[{
-                  "pane_id": "pane-1", "workspace_id": "w1", "session_id": None}]),
+                  "pane_id": "pane-1", "workspace_id": "w1", "session_id": None, "terminal_id": "terminal-1"}]),
               patch.object(client, "result", side_effect=[{"process_info": {
                   "shell_pid": 998042, "foreground_process_group_id": 998043,
                   "foreground_processes": [{"pid": 998043, "name": "claude", "argv": ["claude"]}]}}, {"process_info": {
                   "shell_pid": 998042, "foreground_process_group_id": 998042,
                   "foreground_processes": [{"pid": 998042, "name": "bash", "argv": ["bash"]}]}}]),
-              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess("keys-session", "fixture-start", {})),
+              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(herdr.RolloutThread("keys-session"), "fixture-start", {})),
               patch.object(client, "composer", return_value=herdr.ComposerInput("")),
               patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell())):
             _ = client.read("pane-1", 40, joined=False, ansi=False)
@@ -4929,6 +4940,7 @@ class LayoutHerdr(herdr.Herdr):
 
     def add_tab(self, workspace: str, label: str) -> dict[str, object]:
         tab = {"tab_id": self.new_id("t"), "pane_id": self.new_id("p"), "workspace_id": workspace, "label": label}
+        tab["terminal_id"] = "terminal-" + tab["pane_id"]
         if label != herdr.LAYOUT_PLACEHOLDER:
             self.assign_session(tab, label)
         self.tabs.append(tab)
@@ -5048,7 +5060,7 @@ class RowTabsHerdr(LayoutHerdr):
     def native_process(self, pid: int, kind: str) -> herdr.NativeAgentProcess:
         if kind != "claude":
             raise ValueError("private native session is unavailable")
-        return herdr.NativeAgentProcess(self.tabs[pid - 991000]["session_id"], "private-generation", {})
+        return herdr.NativeAgentProcess(herdr.RolloutThread(self.tabs[pid - 991000]["session_id"]), "private-generation", {})
 
     def replace_leaf(self, tree: dict[str, object], pane: str, replacement: dict[str, object]) -> dict[str, object]:
         if tree.get("type") == "pane":
@@ -5388,7 +5400,7 @@ class SavedLayoutTests(unittest.TestCase):
                           for space in herdr.saved_layout("fixture")["workspaces"] for tab in space["tabs"]],
                          [("workspace-b", row_id)])
         self.assertEqual(client.saved_row_tab(row_id, "moving-row"),
-                         herdr.SplitPane("pane-b", "right", 0.5, "moving-row"))
+                         herdr.ExistingPane("pane-b", "terminal-p2"))
 
     def test_remember_row_tab_keeps_a_pending_row_before_the_restarted_row(self) -> None:
         client = LayoutHerdr()
