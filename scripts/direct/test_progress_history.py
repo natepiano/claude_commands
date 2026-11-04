@@ -125,19 +125,22 @@ class ProgressHistoryTests(unittest.TestCase):
                          "review trial: ux 0 findings, code 1 findings, review-worker minutes 0, "
                          + "ux check minutes 0, ux repair minutes 0")
 
-    def test_production_resolver_accepts_both_plan_header_forms(self) -> None:
+    def test_production_resolver_uses_staff_without_a_plan_header(self) -> None:
         document = self.root / "example-production.md"
         _ = document.write_text("# Production\n")
-        _ = recorded_unit("Example", "unit-a", self.working_dir, document, plan="unit-plan.md")
+        member = recorded_unit("Example", "unit-a", self.working_dir, document, plan="unit-plan.md")
         plan = self.working_dir / "unit-plan.md"
-        for header in ("**Production: Example**", "**Production:** Example"):
-            for field in ("project_plan_doc", "plan_doc"):
-                with self.subTest(header=header, field=field):
-                    _ = plan.write_text(f'> {header} — unit `unit-a`; production doc `production.md`\n')
-                    identity = progress_history.resolve_production_unit({
-                        "working_dir": str(self.working_dir), field: plan.name,
-                    })
-                    self.assertEqual(identity, progress_history.ProductionUnitIdentity("Example", "unit-a"))
+        _ = plan.write_text("# Unit plan\n")
+        for field in ("project_plan_doc", "plan_doc"):
+            with self.subTest(field=field):
+                identity = progress_history.resolve_production_unit({
+                    "working_dir": str(self.working_dir), field: plan.name,
+                })
+                self.assertEqual(identity, progress_history.ProductionUnitIdentity("Example", "unit-a"))
+        parent = recorded_showrunner("Receiving", document)
+        _ = staff.move(member.id, parent.id)
+        self.assertEqual(progress_history.resolve_production_unit({"working_dir": str(self.working_dir)}),
+                         progress_history.ProductionUnitIdentity("Receiving", "unit-a"))
 
     def test_set_unit_rebinds_ledger_identity_without_changing_run_history(self) -> None:
         run = self.start_run("identity", 1760658000)
@@ -372,16 +375,9 @@ print('two homes isolated; recorder lock retained; caller restored')
             returned = handler(arguments)
         return returned, stdout.getvalue(), stderr.getvalue()
 
-    def add_production_marker(self, session_dir: Path) -> None:
+    def record_production_member(self, session_dir: Path) -> None:
         state = self.read_state(session_dir)
         plan_path = Path(cast(str, state["project_plan_doc"]))
-        plan_text = plan_path.read_text(encoding="utf-8")
-        _ = plan_path.write_text(
-            plan_text
-            + "> **Production: Example** — unit `unit-a`; "
-            + "production doc `docs/example-production.md`\n",
-            encoding="utf-8",
-        )
         document = self.working_dir / "docs" / "example-production.md"
         if not document.exists():
             _ = document.write_text("# Production — Example\n")
@@ -2851,7 +2847,7 @@ with patch.object(fcntl, "flock", admission):
         _ = (git_directory / "commondir").write_text("../..\n")
         _ = (worktree / ".git").write_text("gitdir: ../hana/.git/worktrees/widget-enhancements\n")
         plan = worktree / "tool-based-ui-widget.md"
-        _ = plan.write_text("> **Production:** Hana — unit `widgets`; production doc `hana.md`\n")
+        _ = plan.write_text("# Widgets\n")
         document = self.root / "hana-production.md"
         _ = document.write_text("# Production\n")
         if recorded:
@@ -2883,7 +2879,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(phase["repository"], started["repository"])
         self.assertEqual(phase["unit"], "widget-enhancements")
 
-    def test_phase_source_prefers_explicit_run_identity_to_plan_header(self) -> None:
+    def test_phase_source_prefers_explicit_run_identity_to_staff(self) -> None:
         name = "phase-source-explicit"
         session, worktree, plan = self.phase_source_fixture(name)
         _ = self.run_command("set-unit", "--session-dir", str(session), "--production", "Other production",
@@ -2899,7 +2895,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(phase["production"], started["production"])
         self.assertEqual(phase["plan_doc"], {"state": "Recorded", "value": plan.name})
 
-    def test_old_phases_resolve_plan_header_and_common_repository_once_per_run(self) -> None:
+    def test_old_phases_resolve_staff_and_common_repository_once_per_run(self) -> None:
         name = "phase-source-old"
         session, worktree, plan = self.phase_source_fixture(name)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
@@ -2973,7 +2969,7 @@ with patch.object(fcntl, "flock", admission):
         _ = production_doc.write_text("# Production — tool-based-ui\n", encoding="utf-8")
         for index, reference in enumerate((str(production_doc.relative_to(worktree)), str(production_doc))):
             with self.subTest(reference=reference):
-                _ = plan.write_text(f"> **Production:** {reference} — unit geometry-material-unit, branch widgets\n",
+                _ = plan.write_text("# Geometry material\n",
                                     encoding="utf-8")
                 _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
                                      "--phase-title", "Production document", at=1010 + index)
@@ -3017,7 +3013,7 @@ with patch.object(fcntl, "flock", admission):
         name = "phase-production-doc-unavailable"
         session, worktree, plan = self.phase_source_fixture(name, recorded=False)
         production_doc = worktree / "production.md"
-        _ = plan.write_text("> **Production:** production.md — unit geometry-material-unit, branch widgets\n",
+        _ = plan.write_text("# Geometry material\n",
                             encoding="utf-8")
         state_path = session / "progress_history_state.json"
         state = cast(dict[str, object], json.loads(state_path.read_text()))
@@ -3050,7 +3046,7 @@ with patch.object(fcntl, "flock", admission):
         name = "phase-production-plain-name"
         session, worktree, plan = self.phase_source_fixture(name, production="tool-based-ui",
                                                                unit="geometry-material-unit")
-        _ = plan.write_text("> **Production:** tool-based-ui — unit geometry-material-unit, branch widgets\n",
+        _ = plan.write_text("# Geometry material\n",
                             encoding="utf-8")
         self.assertFalse((worktree / "tool-based-ui").exists())
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
@@ -3061,18 +3057,11 @@ with patch.object(fcntl, "flock", admission):
 
     def test_new_phases_record_production_without_requiring_a_unit_header(self) -> None:
         name = "phase-bare-production-new"
-        session, worktree, plan = self.phase_source_fixture(name)
-        headers = (
-            ("> **Production:** natedev", "natedev", ""),
-            ("> **Production:** build-followups (enh-showrunner-unit)", "build-followups", ""),
-            (f"> **Production:** natedev — unit herdr-unit, worktree {worktree}", "natedev", "herdr-unit"),
-            ("> **Production: natedev**", "natedev", ""),
-            ("> **Production: build-followups** (enh-showrunner-unit)", "build-followups", ""),
-            (f"> **Production: natedev** — unit `herdr-unit`; worktree {worktree}", "natedev", "herdr-unit"),
-        )
-        for index, (header, _production, _unit) in enumerate(headers):
-            with self.subTest(header=header):
-                _ = plan.write_text(header + "\n", encoding="utf-8")
+        session, _worktree, plan = self.phase_source_fixture(name)
+        plans = ("# Plan", "# Updated plan")
+        for index, text in enumerate(plans):
+            with self.subTest(plan=text):
+                _ = plan.write_text(text + "\n", encoding="utf-8")
                 _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
                                      "--phase-title", "Production without unit", at=1010 + index)
                 started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
@@ -3082,9 +3071,9 @@ with patch.object(fcntl, "flock", admission):
                 phase = cast(list[dict[str, object]], report["phases"])[-1]
                 self.assertEqual(phase["production"], {"state": "Recorded", "value": "Hana"})
 
-    def test_old_phases_read_production_from_headers_without_a_quoted_unit(self) -> None:
+    def test_old_phases_read_production_from_staff_without_a_plan_header(self) -> None:
         name = "phase-bare-production-old"
-        session, worktree, plan = self.phase_source_fixture(name)
+        session, _worktree, plan = self.phase_source_fixture(name)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
                              "--phase-title", "Legacy production", at=1010)
         events = self.read_events(name)
@@ -3093,17 +3082,9 @@ with patch.object(fcntl, "flock", admission):
                 for key in ("production", "unit", "repository", "wait_coverage"):
                     del event[key]
         _ = (self.history_dir / "runs" / f"{name}.jsonl").write_text("\n".join(json.dumps(event) for event in events))
-        headers = (
-            ("> **Production:** natedev", "natedev"),
-            ("> **Production:** build-followups (enh-showrunner-unit)", "build-followups"),
-            (f"> **Production:** natedev — unit herdr-unit, worktree {worktree}", "natedev"),
-            ("> **Production: natedev**", "natedev"),
-            ("> **Production: build-followups** (enh-showrunner-unit)", "build-followups"),
-            (f"> **Production: natedev** — unit herdr-unit, worktree {worktree}", "natedev"),
-        )
-        for header, _production in headers:
-            with self.subTest(header=header):
-                _ = plan.write_text(header + "\n", encoding="utf-8")
+        for text in ("# Plan", "# Updated plan"):
+            with self.subTest(plan=text):
+                _ = plan.write_text(text + "\n", encoding="utf-8")
                 report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
                 phase, = cast(list[dict[str, object]], report["phases"])
                 self.assertEqual(phase["production"], {"state": "Recorded", "value": "Hana"})
@@ -3111,12 +3092,11 @@ with patch.object(fcntl, "flock", admission):
 
     def test_phase_production_and_unit_each_keep_their_run_state_override(self) -> None:
         name = "phase-partial-source"
-        session, worktree, plan = self.phase_source_fixture(name, production="natedev", unit="herdr-unit")
+        session, _worktree, plan = self.phase_source_fixture(name, production="natedev", unit="herdr-unit")
         state_path = session / "progress_history_state.json"
-        for index, (field, value, header, production, unit) in enumerate((
-            ("unit", "assigned-unit", "> **Production:** natedev", "natedev", "assigned-unit"),
-            ("production", "assigned-production", f"> **Production:** natedev — unit herdr-unit, worktree {worktree}",
-             "assigned-production", "herdr-unit"),
+        for index, (field, value, production, unit) in enumerate((
+            ("unit", "assigned-unit", "natedev", "assigned-unit"),
+            ("production", "assigned-production", "assigned-production", "herdr-unit"),
         )):
             with self.subTest(field=field):
                 state = cast(dict[str, object], json.loads(state_path.read_text()))
@@ -3124,7 +3104,7 @@ with patch.object(fcntl, "flock", admission):
                 _ = state.pop("unit", None)
                 state[field] = value
                 _ = state_path.write_text(json.dumps(state))
-                _ = plan.write_text(header + "\n", encoding="utf-8")
+                _ = plan.write_text("# Plan\n", encoding="utf-8")
                 _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
                                      "--phase-title", "Independent source fields", at=1010 + index)
                 started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
@@ -3144,7 +3124,7 @@ with patch.object(fcntl, "flock", admission):
                 for key in ("production", "unit", "repository", "wait_coverage"):
                     del event[key]
         _ = (self.history_dir / "runs" / f"{name}.jsonl").write_text("\n".join(json.dumps(event) for event in events))
-        _ = plan.write_bytes(b"> **Production:** natedev\n\xff")
+        _ = plan.write_bytes(b"# Plan\n\xff")
         for unavailable in ("invalid UTF-8", "missing file", "directory"):
             with self.subTest(unavailable=unavailable):
                 if unavailable == "missing file":
@@ -6124,7 +6104,7 @@ with patch.object(fcntl, "flock", admission):
         )
         self.assertEqual(header.splitlines()[0], "**bevy_hana_rubric**")
 
-    def report_eta_chain(self, name: str, *, untimed_gate: bool = False, ranged: bool = True) -> tuple[Path, str]:
+    def report_eta_chain(self, name: str, *, ranged: bool = True) -> tuple[Path, str]:
         def at(hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 16, hour, minute, tzinfo=UTC).timestamp())
 
@@ -6135,24 +6115,10 @@ with patch.object(fcntl, "flock", admission):
             "### Phase 5 — Current delivery  · status: todo", "",
             "### Phase 6 — Next delivery  · status: todo", "",
         ]
-        if untimed_gate:
-            lines += ["**Blocked by:** G2", ""]
         lines += ["### Phase 7 — Last delivery  · status: todo", ""]
         _ = plan_path.write_text(
             plan_path.read_text(encoding="utf-8") + "\n".join(lines), encoding="utf-8",
         )
-        if untimed_gate:
-            self.add_production_marker(session_dir)
-            _ = (plan_path.parent / "example-production.md").write_text(
-                "\n".join((
-                    "# Production — Example", "", "## Production Context", "",
-                    "- **User zone:** UTC", "", "## Gates", "",
-                    "| Gate | Waiting | Waits on | Clears when |",
-                    "| --- | --- | --- | --- |",
-                    "| G2 | unit-a phase 6 | renderer phase 9 | reviewed checkpoint |", "",
-                )),
-                encoding="utf-8",
-            )
         _ = self.run_command(
             "start-phase", "--session-dir", str(session_dir),
             "--phase-id", "4", "--phase-title", "Finished delivery", at=at(16, 18),
@@ -6190,7 +6156,7 @@ with patch.object(fcntl, "flock", admission):
 
     def short_report_fixture(
         self, name: str, *, promises: tuple[str, ...] = ("17:15", "17:45", "18:30"),
-        running_fix: bool = True, completed_fix: bool = True, gate: str = "",
+        running_fix: bool = True, completed_fix: bool = True,
     ) -> Path:
         session_dir = self.start_run(name, self.report_time(15))
         plan = self.working_dir / "docs" / f"{name}.md"
@@ -6198,18 +6164,8 @@ with patch.object(fcntl, "flock", admission):
             plan.read_text(encoding="utf-8") + "\n".join((
                 "### Phase 3 — Retry handling  · status: todo", "",
                 "### Phase 4 — Next delivery  · status: todo", "",
-                *(["**Blocked by:** G3", ""] if gate else []),
             )), encoding="utf-8",
         )
-        if gate:
-            self.add_production_marker(session_dir)
-            _ = (plan.parent / "example-production.md").write_text("\n".join((
-                "# Production — Example", "", "## Production Context", "",
-                "- **User zone:** UTC", "", "## Gates", "",
-                "| Gate | Waiting | Waits on | Clears when |",
-                "| --- | --- | --- | --- |",
-                f"| G3 | unit-a phase 4 | renderer phase 9 | {gate} |", "",
-            )), encoding="utf-8")
         self.start_phase(session_dir, self.report_time(15))
         if completed_fix:
             self.start_slot_pass(session_dir, "impl", "fix", self.report_time(15, 1), fix_pass=1)
@@ -6251,7 +6207,7 @@ with patch.object(fcntl, "flock", admission):
     @staticmethod
     def eta_report_line(report: str) -> str:
         return next(line for line in report.splitlines()
-                    if line.startswith(("ETA ", "gated ")))
+                    if line.startswith("ETA "))
 
     def assert_summary_without_round_table(self, report: str) -> None:
         rows = self.table_rows(report, [*SUMMARY_HEADER[:5], "Phases", *SUMMARY_HEADER[5:]])
@@ -6400,40 +6356,6 @@ with patch.object(fcntl, "flock", admission):
         )
         self.assertIn("repairing retry recovery", detailed)
 
-    def test_later_phase_gates_do_not_replace_the_current_phase_promise(self) -> None:
-        for name, gate in (
-            ("timed", "release 2026-10-21 11:47"),
-            ("untimed", "reviewed checkpoint"),
-        ):
-            with self.subTest(gate=gate):
-                session_dir = self.short_report_fixture(f"short-{name}", gate=gate)
-
-                report = self.short_progress(session_dir, self.report_time(16))
-
-                self.assertEqual(self.eta_report_line(report),
-                                 "ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round + 1 running)")
-                self.assert_summary_without_round_table(report)
-                for offset, slot in enumerate(("impl", "test")):
-                    self.finish_slot_pass(session_dir, slot, "completed", self.report_time(16, 1) + offset)
-                self.team_slot = ""
-                between = self.short_progress(session_dir, self.report_time(16, 10))
-                self.assertEqual(self.eta_report_line(between),
-                                 "ETA 18:30 (first 17:15, +1:15, moved 2×, 3 fix rounds)")
-                self.assert_summary_without_round_table(between)
-
-    def test_eta_line_names_only_the_requested_phases_own_gate(self) -> None:
-        eta_line = cast(Callable[[Path, str], str], vars(progress_history)["_phase_eta_line"])
-        for name, gate, expected in (
-            ("timed", "release 2026-10-21 11:47", "gated until Wed 21 Oct 11:47"),
-            ("untimed", "reviewed checkpoint", "gated by G3: renderer phase 9"),
-        ):
-            with self.subTest(gate=gate):
-                session_dir = self.short_report_fixture(f"short-own-{name}", gate=gate)
-                with patch.dict(os.environ, {
-                    "UNIT_HISTORY_DIR": str(self.history_dir),
-                    "UNIT_NOW_EPOCH": str(self.report_time(16)), "USER_ZONE": "UTC",
-                }):
-                    self.assertEqual(eta_line(session_dir, "4"), expected)
 
     def test_short_report_keeps_the_stage_of_an_activity_after_its_phase_finished(self) -> None:
         session_dir = self.short_report_fixture("short-shrink", running_fix=False)
@@ -6479,13 +6401,6 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual([swing(cell) for cell in project[-2:]], [swing(cell) for cell in phase[-2:]])
         self.assertEqual(project[3], "today 18:54")
 
-    def test_project_eta_names_an_untimed_gate_and_has_no_band(self) -> None:
-        _, report = self.report_eta_chain("project-gated", untimed_gate=True)
-        row = next(line for line in report.splitlines() if line.startswith("| Project"))
-        cells = [cell.strip() for cell in row.strip("|").split("|")]
-
-        self.assertEqual(cells[1:4], ["38", "02:00:00", "after G2"])
-        self.assertEqual(cells[-2:], ["—", "—"])
 
     def test_eta_records_exact_and_ranged_events(self) -> None:
         now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
@@ -6818,7 +6733,7 @@ with patch.object(fcntl, "flock", admission):
             with self.subTest(name=name):
                 session_dir = self.start_run(f"eta-refresh-{name}", now - 100)
                 self.start_phase(session_dir, now - 50)
-                self.add_production_marker(session_dir)
+                self.record_production_member(session_dir)
                 arguments = parser.parse_args(
                     [
                         "eta",
@@ -6870,7 +6785,7 @@ with patch.object(fcntl, "flock", admission):
                     "completed",
                     at=started_at + 30,
                 )
-            self.add_production_marker(session_dir)
+            self.record_production_member(session_dir)
             if command == "start-phase":
                 arguments = parser.parse_args(
                     [
@@ -6955,7 +6870,7 @@ with patch.object(fcntl, "flock", admission):
 
     def test_phase_table_timeout_prints_one_line(self) -> None:
         session_dir = self.start_run("refresh-timeout", 50_000)
-        self.add_production_marker(session_dir)
+        self.record_production_member(session_dir)
         arguments = recorder_parser().parse_args(
             [
                 "start-phase",
@@ -7028,7 +6943,7 @@ with patch.object(fcntl, "flock", admission):
             plan_text + "### Phase 3 — Retry handling  · status: todo\n\n",
             encoding="utf-8",
         )
-        self.add_production_marker(session_dir)
+        self.record_production_member(session_dir)
         production_doc = self.working_dir / "docs" / "example-production.md"
         _ = production_doc.write_text(
             "\n".join(
@@ -7075,7 +6990,7 @@ with patch.object(fcntl, "flock", admission):
         ):
             report = self.run_progress(session_dir, at=started_at + 100)
 
-        note = vault_root / "example-showrunner" / "unit-a.md"
+        note = vault_root / "example-showrunner" / "unit-a-unit.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
         self.assertEqual(
             note.read_text(encoding="utf-8").splitlines()[:10],
@@ -7084,11 +6999,11 @@ with patch.object(fcntl, "flock", admission):
                 "phase_table: true",
                 "showrunner: example-showrunner",
                 f'production_file: "{production_doc.resolve().as_uri()}"',
-                "unit: unit-a",
+                "unit: unit-a-unit",
                 'now: "Phase 3 of 1 — Retry handling"',
                 "---",
                 "",
-                "# unit-a",
+                "# unit-a-unit",
                 "",
             ],
         )
@@ -7096,7 +7011,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertIn("| Phase 3 |", report)
         self.assertEqual(
             [path.relative_to(vault_root) for path in vault_root.rglob("*.md")],
-            [Path("example-showrunner/unit-a.md")],
+            [Path("example-showrunner/unit-a-unit.md")],
         )
         self.assertEqual(
             {path.relative_to(self.history_dir) for path in self.history_dir.rglob("*")},
@@ -7116,7 +7031,7 @@ with patch.object(fcntl, "flock", admission):
             plan_text + "### Phase 3 — Retry handling  · status: todo\n\n",
             encoding="utf-8",
         )
-        self.add_production_marker(session_dir)
+        self.record_production_member(session_dir)
         production_doc = self.working_dir / "docs" / "example-production.md"
         _ = production_doc.write_text(
             "\n".join(
@@ -7162,7 +7077,7 @@ with patch.object(fcntl, "flock", admission):
         )
 
         self.assertEqual(result, "ETA recorded: 13:00 UTC")
-        note = vault_root / "example-showrunner" / "unit-a.md"
+        note = vault_root / "example-showrunner" / "unit-a-unit.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
         note_text = note.read_text(encoding="utf-8")
         self.assertIn("phase_table: true", note_text)
@@ -7515,9 +7430,6 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(check["phase_id"], "3")
 
 
-
-
-
     def test_matching_and_absent_prompt_phase_lines_both_record_the_launch_check(self) -> None:
         for label, text, expected in (
             ("matched", "Work Specification\nPhase 3 — Retry handling\nWrite the retry.\n", "matched"),
@@ -7825,13 +7737,13 @@ class PublicPhaseHelperTests(unittest.TestCase):
         self.assertEqual(
             plan_history.plan_phases(plan),
             [
-                {"id": "1", "title": "Archived delivery", "done": True, "depends_on": None, "blocked_by": ""},
-                {"id": "2", "title": "Finished delivery", "done": True, "depends_on": None, "blocked_by": ""},
-                {"id": "3", "title": "Live delivery", "done": False, "depends_on": None, "blocked_by": ""},
+                {"id": "1", "title": "Archived delivery", "done": True, "depends_on": None},
+                {"id": "2", "title": "Finished delivery", "done": True, "depends_on": None},
+                {"id": "3", "title": "Live delivery", "done": False, "depends_on": None},
             ],
         )
 
-    def test_plan_phases_read_each_phase_dependencies_and_gate(self) -> None:
+    def test_plan_phases_read_each_phase_dependencies(self) -> None:
         plan = self.root / "plan.md"
         _ = plan.write_text(
             "\n".join(
@@ -7839,7 +7751,6 @@ class PublicPhaseHelperTests(unittest.TestCase):
                     "### Phase 1 — Base  · status: todo",
                     "**Depends on:** none",
                     "### Phase 2 — Report  · status: todo",
-                    "**Blocked by:** G3 — trunk phase 4 merged",
                     "**Depends on:** Phase 1, Phase 4",
                     "### Phase 3 — Docs  · status: todo",
                     "",
@@ -7851,8 +7762,8 @@ class PublicPhaseHelperTests(unittest.TestCase):
         phases = plan_history.plan_phases(plan)
 
         self.assertEqual(
-            [(phase["depends_on"], phase["blocked_by"]) for phase in phases],
-            [([], ""), (["1", "4"], "G3"), (None, "")],
+            [phase["depends_on"] for phase in phases],
+            [[], ["1", "4"], None],
         )
 
     def test_plan_dependencies_read_only_named_local_phase_spans(self) -> None:

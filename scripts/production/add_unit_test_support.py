@@ -449,8 +449,7 @@ class AddUnitTestCase(ShutdownTestCase):
                 f"- **Showrunner checkout:** `{self.checkout}`\n"
                 "- **Showrunner session:** director\n"
                 "- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n"
-                "- **User zone:** America/Los_Angeles — reports use PDT\n\n"
-                "## Gates\n")
+                "- **User zone:** America/Los_Angeles — reports use PDT\n\n")
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,

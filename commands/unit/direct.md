@@ -178,10 +178,10 @@ it. A failed compaction leaves the thread available for its own compaction.
 </CoreContract>
 
 <ProductionUnit>
-When the plan header carries a `> **Production:**` line, this run is a unit of
-that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/>
-in full at <PrepareSession/> and after every compaction, and apply it
-throughout. It changes six things in this command:
+Your staff row identifies your unit and its parent showrunner.
+The parent row identifies your production and its document.
+Read `~/.claude/docs/production_format.md` → <ProductionUnit/> at <PrepareSession/> and after every compaction.
+Apply it throughout the run when your staff row has a parent showrunner. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
   branch into this branch, at every phase start and when asked;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
@@ -767,7 +767,7 @@ Execute in order:
 
 Apply <CoreContract/>, <TurnEndGate/>, <CompactionContract/>,
 <UserFacingText/>, and <VerificationNarration/> throughout, and
-<ProductionUnit/> when the plan header names a production.
+<ProductionUnit/> when your staff parent is a showrunner.
 
 The numbered steps below carry no turn boundaries. Consecutive steps run in one
 turn unless <TurnEndGate/> authorizes a stop between them. Steps 1–8 apply to

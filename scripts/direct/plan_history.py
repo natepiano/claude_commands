@@ -51,7 +51,6 @@ UNIT_PHASE_PREFIX = re.compile(
     r"(?<![\w-])(?P<quote>`|'|\"|\*\*)?(?P<unit>[\w-]+-unit)"
     + r"(?:['’]s)?(?(quote)(?P=quote))(?:['’]s)?[ \t]+$"
 )
-BLOCKED_BY_PATTERN = re.compile(r"^\*\*Blocked by:\*\*[ \t]*(?P<gate>G\d+)", re.MULTILINE)
 
 
 class PlanPhase(TypedDict):
@@ -62,8 +61,6 @@ class PlanPhase(TypedDict):
     done: bool
     # The phases its `**Depends on:**` line names; None when the line is absent.
     depends_on: list[str] | None
-    # The gate its `**Blocked by:**` line names; empty when none.
-    blocked_by: str
 
 
 class EtaBand(NamedTuple):
@@ -150,14 +147,12 @@ def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver |
                 for dependency in phase_ids.replace(",", " ").replace("&", " ").split():
                     if dependency.lower() != "and" and dependency not in depends_on:
                         depends_on.append(dependency)
-        blocked_match = BLOCKED_BY_PATTERN.search(body)
         phases.append(
             PlanPhase(
                 id=identifier,
                 title=title,
                 done=done,
                 depends_on=depends_on,
-                blocked_by="" if blocked_match is None else blocked_match.group("gate"),
             )
         )
     return phases, duplicates

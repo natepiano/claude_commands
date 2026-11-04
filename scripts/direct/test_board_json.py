@@ -161,21 +161,14 @@ class BoardJsonTests(unittest.TestCase):
         showrunner_launch(row, row.id, self.environment)
         return fixture
 
-    def plan(self, fixture: ProductionFixture, *, gate: str = "", all_done: bool = False) -> None:
+    def plan(self, fixture: ProductionFixture, *, all_done: bool = False) -> None:
         status = "done" if all_done else "todo"
         _ = fixture.plan.write_text("\n".join((
             f"> **Production: {fixture.slug}** — unit `alpha-unit`; production doc `{fixture.document}`",
             "", "### Phase 1 — First delivery  · status: done", "",
             f"### Phase 2 — Current delivery  · status: {status}", "",
             f"### Phase 3 — Next delivery  · status: {status}", "",
-            *(["**Blocked by:** G2", ""] if gate else []),
             f"### Phase 4 — Last delivery  · status: {status}", "",
-        )), encoding="utf-8")
-        text = fixture.document.read_text(encoding="utf-8").split("\n## Gates", 1)[0]
-        _ = fixture.document.write_text(text + "\n" + "\n".join((
-            "## Gates", "", "| Gate | Waiting | Waits on | Clears when |",
-            "| --- | --- | --- | --- |",
-            f"| G2 | alpha phase 3 | renderer phase 9 | {gate} |", "",
         )), encoding="utf-8")
 
     def attach(self, child: str, parent: str) -> None:
@@ -1398,43 +1391,6 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual((row["fix_done"], row["fix_running"]), (1, 1))
         self.assertEqual(row["findings"], {"blocker": 0, "minor": 1, "nit": 0})
 
-    def test_gates_and_finish_contract_with_and_without_an_open_phase(self) -> None:
-        fixture = self.production()
-        for open_phase in (False, True):
-            for clears, kind in (("release 2026-10-16 19:00", "timed"),
-                                 ("renderer review", "untimed"),
-                                 ("cleared 2026-10-16 19:00", "none")):
-                with self.subTest(open_phase=open_phase, kind=kind):
-                    self.plan(fixture, gate=clears)
-                    events = self.delivery_events(open_phase=open_phase)
-                    if open_phase:
-                        events.append(self.event(
-                            "eta_stated", NOW - 600, eta_phase_id="2", eta_at=NOW + 1_800,
-                        ))
-                    _ = self.write_run(fixture, events)
-                    _, unit = self.unit(fixture)
-                    rows = [object_fields(row) for row in array_items(unit["phases"])]
-                    gate = object_fields(rows[2]["gate"])
-                    self.assertEqual(gate["kind"], kind)
-                    self.assertEqual(rows[2]["status"], "todo" if kind == "none" else "gated")
-                    finish = object_fields(unit["finish"])
-                    if kind == "untimed":
-                        self.assertEqual(gate, {"kind": "untimed", "gate": "G2", "waits_on": "renderer phase 9"})
-                        self.assertEqual(finish, {"kind": "after_gate", "gate": "G2", "waits_on": "renderer phase 9"})
-                        for row in rows[2:]:
-                            self.assertIsNone(row["start"])
-                            self.assertIsNone(row["finish"])
-                            self.assertEqual(object_fields(row["gate"])["kind"], "untimed")
-                    else:
-                        self.assertEqual(finish["kind"], "predicted")
-                        self.assertEqual(finish["at"], rows[-1]["finish"])
-                        if kind == "timed":
-                            self.assertEqual(gate["gate"], "G2")
-                            self.assertEqual(gate["waits_on"], "renderer phase 9")
-                            self.assertEqual(object_fields(gate["until"])["at"], NOW + 3_600)
-                            self.assertEqual(object_fields(rows[2]["start"])["at"], NOW + 3_600)
-                        else:
-                            self.assertEqual(gate, {"kind": "none"})
 
     def test_no_run_is_standing_by_with_unknown_finish(self) -> None:
         fixture = self.production()
@@ -1445,21 +1401,6 @@ class BoardJsonTests(unittest.TestCase):
         self.assertIsNone(unit["eta"])
         self.assertEqual(unit["finish"], {"kind": "unknown"})
 
-    def test_stage_names_the_gate_when_the_next_unfinished_phase_is_blocked(self) -> None:
-        fixture = self.production()
-        self.plan(fixture, gate="renderer review")
-        text = fixture.plan.read_text(encoding="utf-8").replace("**Blocked by:** G2\n", "")
-        _ = fixture.plan.write_text(
-            text.replace("### Phase 3", "**Blocked by:** G2\n\n### Phase 3"),
-            encoding="utf-8",
-        )
-        _ = self.write_run(fixture, self.delivery_events(open_phase=False))
-
-        _, unit = self.unit(fixture)
-
-        self.assertIsNone(unit["phase"])
-        self.assertEqual(unit["stage"], "Waiting on G2")
-        self.assertEqual(object_fields(unit["finish"])["kind"], "after_gate")
 
     def test_finished_plan_exposes_the_actual_finish_and_done_phase_history(self) -> None:
         fixture = self.production()
@@ -1877,13 +1818,12 @@ class BoardJsonTests(unittest.TestCase):
         fixture = self.production()
         _ = self.session_files()
         samples: list[dict[str, object]] = []
-        for clears in ("", "release 2026-10-16 19:00", "renderer review"):
-            self.plan(fixture, gate=clears)
-            _ = self.write_run(fixture, [*self.delivery_events(), self.event(
-                "eta_stated", NOW - 60, eta_phase_id="2", eta_at=NOW + 1_800,
-            )])
-            document, _ = self.unit(fixture)
-            samples.append(document)
+        self.plan(fixture)
+        _ = self.write_run(fixture, [*self.delivery_events(), self.event(
+            "eta_stated", NOW - 60, eta_phase_id="2", eta_at=NOW + 1_800,
+        )])
+        document, _ = self.unit(fixture)
+        samples.append(document)
         self.standing_plan(fixture)
         _ = self.ledger(fixture)
         document, _ = self.unit(fixture)

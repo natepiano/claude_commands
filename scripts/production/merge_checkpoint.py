@@ -710,20 +710,6 @@ def other_units(request: MergeRequest, paths: tuple[str, ...]) -> None:
         report("other units", "ok", f"{unit.name}: {', '.join(overlap) if overlap else 'no overlap'}")
 
 
-def gate_names(request: MergeRequest, first_code_merge: bool) -> str:
-    if not first_code_merge or "## Gates" not in request.lines:
-        return "no gate"
-    start = request.lines.index("## Gates") + 1
-    found: list[str] = []
-    for line in request.lines[start:]:
-        if line.startswith("## "):
-            break
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) >= 3 and cells[2].lower() == f"{request.unit.name} phase {request.phase}".lower():
-            found.append(f"{cells[0]}: {cells[1]}")
-    return ", ".join(found) if found else "no gate"
-
-
 def into(path: PurePath, branch: str, why: str, unblocks: str) -> None:
     print(f"into: {path} ({branch}) — {why}; unblocks: {unblocks}", flush=True)
 
@@ -1531,7 +1517,6 @@ def run(request: MergeRequest) -> int:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("red", "failed", str(error),
                            "repair the test logging failure and send a new checkpoint") from error
-        first_code_merge = isinstance(pushed, NotYetPushed) and isinstance(request.kind, CodeCheckpoint)
         promotion_done = checkpoint_step_record(request.production.checkout, merge_head, "promotion")
         tip = ""
         try:
@@ -1561,7 +1546,7 @@ def run(request: MergeRequest) -> int:
                     if request.bump:
                         deliver_gate_result(request, merge_head, tip)
                     into(request.production.checkout, request.production.merge_branch,
-                         "the merge branch collects every unit's checkpoints", gate_names(request, first_code_merge))
+                         "the merge branch collects every unit's checkpoints", "the unit’s next checkpoint")
             finish_promotion(request)
         finally:
             if tip:

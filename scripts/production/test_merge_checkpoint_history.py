@@ -72,7 +72,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(sha, "--shrink", review=False)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         self.assertEqual(len(self.events("review_regime.py")), 1)
-        self.assertNotIn("unblocks: G1", result.process.stdout)
         self.assertIn("docs/plans/alpha-next.md", self.git("ls-tree", "-r", "--name-only", "HEAD"))
     def test_shrink_after_criss_cross_merge_scopes_only_its_doc(self) -> None:
         code = self.checkpoint()

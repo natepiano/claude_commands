@@ -37,13 +37,6 @@ Scope of each unit:
 
 `commands/showrunner/produce.md`, `settings.json` (hook entries) and `pyrightconfig.json` are hub files in natedev. An edit to one of them goes through cargo-berth's normal flow, and the checkpoint notice names the natedev owner.
 
-## Gates
-
-| Gate | Waiting | Waits on | Clears when |
-| --- | --- | --- | --- |
-
-None yet. When a plan needs another unit's checkpoint, the gate goes here.
-
 ## Close-out
 
 - Each unit's as-built doc is in `docs/as-built/`, and the docs it replaces are deleted or amended.

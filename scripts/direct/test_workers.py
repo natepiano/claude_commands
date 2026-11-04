@@ -394,7 +394,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             found = workers.live_unit_director(self.session_dir)
         self.assertEqual(found, workers.LiveUnitDirector("new-director", 4321))
 
-    def test_ledger_uses_canonical_production_for_both_headers_and_saved_metadata(self) -> None:
+    def test_ledger_uses_staff_production_for_plan_and_saved_metadata(self) -> None:
         worktree = self.session_dir.parent / "repository"
         plan = worktree / "plan.md"
         production_doc = worktree / "production.md"
@@ -405,14 +405,14 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         _ = (notifier / "conf").write_text(
             "TARGET=session:fixture\nCHECK="
             + shlex.join(["zsh", "/opt/tools/production_check.sh", str(production_doc)]) + "\n")
-        for source in ("**Production: demo**", "**Production:** demo", "saved metadata"):
+        for source in ("plan", "saved metadata"):
             with self.subTest(source=source):
                 self.write_run_context(self.session_dir)
                 state = json_object(self.session_dir / workers.STATE)
                 if source == "saved metadata":
                     state.update({"production": "demo", "unit": "builders"})
                 else:
-                    _ = plan.write_text(f'> {source} — unit `builders`; plan\n')
+                    _ = plan.write_text('# Builders\n')
                     state["plan_doc"] = str(plan)
                 _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
                 self.assertEqual(progress_history.resolve_production_unit(state),
@@ -420,11 +420,11 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                 self.assertEqual(workers.ledger_for_run(self.session_dir).path,
                                  workers.ledger_path("renamed", "builders"))
 
-    def test_plan_header_metadata_resolves_without_completing_a_pending_worker_move(self) -> None:
+    def test_staff_metadata_resolves_without_completing_a_pending_worker_move(self) -> None:
         state = json_object(self.session_dir / workers.STATE)
         worktree = Path(str(state["working_dir"]))
         plan = worktree / "unit-plan.md"
-        _ = plan.write_text('> **Production: fixture-production** — unit `fixture-unit`; production doc `production.md`\n')
+        _ = plan.write_text('# Fixture\n')
         document = worktree / "production.md"
         _ = document.write_text("# Production — fixture-production\n")
         member = recorded_unit("fixture-production", "fixture-unit", worktree, document, plan=plan.name)
@@ -1648,10 +1648,10 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(target["model"], "gpt-kept-sol")
         self.assertEqual(self.methods("thread/start"), [])
 
-    def test_plan_unit_identity_survives_the_worktree_move(self) -> None:
+    def test_staff_unit_identity_survives_the_worktree_move(self) -> None:
         old = self.session_dir.parent / "repository"
         plan = old / "plan.md"
-        _ = plan.write_text('> **Production: demo** — unit `builders`; plan\n')
+        _ = plan.write_text('# Builders\n')
         document = self.session_dir.parent / "demo-production.md"
         _ = document.write_text("# Production — demo\n")
         row = recorded_unit("demo", "builders", old, document, plan=plan.name)
@@ -1676,7 +1676,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
     def test_moved_paused_worker_resumes_in_a_new_run_with_its_thread_and_home(self) -> None:
         old = self.session_dir.parent / "repository"
         plan = old / "plan.md"
-        _ = plan.write_text('> **Production:** demo — unit `builders`; plan\n')
+        _ = plan.write_text('# Builders\n')
         document = self.session_dir.parent / "demo-production.md"
         _ = document.write_text("# Production — demo\n")
         row = recorded_unit("demo", "builders", old, document, plan=plan.name)

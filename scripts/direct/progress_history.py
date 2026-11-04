@@ -4278,8 +4278,6 @@ def _project_chain_eta(
     except phase_table.NoPlan:
         return "—", "—", "—"
     finish = record.plan_finish
-    if isinstance(finish, phase_table.GateBlockedFinish):
-        return f"after {finish.gate}", "—", "—"
     if not isinstance(finish, phase_table.FinishedAt | phase_table.PredictedFinish):
         return "—", "—", "—"
     target = finish.at.timestamp()
@@ -4327,12 +4325,6 @@ def _phase_eta_line(session_dir: Path, phase_number: str) -> str:
     for row in candidates:
         if row.phase != phase_number:
             continue
-        if isinstance(row, phase_table.TodoPhase):
-            gate = row.gate
-            if isinstance(gate, phase_table.TimedGate) and gate.until.timestamp() > now:
-                return f"gated until {gate.until.astimezone(zone):%a %d %b %H:%M}"
-            if isinstance(gate, phase_table.UntimedGate):
-                return f"gated by {gate.gate}: {gate.waits_on}"
         if not row.eta_trail:
             return "ETA unavailable"
         target = row.eta_trail[-1][0]

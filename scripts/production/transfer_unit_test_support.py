@@ -144,8 +144,7 @@ class UnitTransferFixture(StaffTestCase):
         self.write(self.giving / "docs/plans/demo-production.md", self.production_doc("demo", self.giving))
         self.write(self.giving / "docs/plans/other-production.md", self.production_doc("other", self.receiving))
         self.write(self.giving / "docs/plans/alpha.md",
-                   "# alpha\n\n> **Production: demo** — unit `alpha-unit`; production doc "
-                   + "`docs/plans/demo-production.md`\n\nalpha prose stays.\n")
+                   "# alpha\n\nalpha prose stays.\n")
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "fixture")
         _ = self.git("push", "-u", "origin", "demo")

@@ -320,7 +320,7 @@ class DailiesInputFixture(unittest.TestCase):
             "- **Showrunner session:** test-showrunner",
             "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles",
-            "- **Updates:** every 15 minutes", "", "## Gates", "",
+            "- **Updates:** every 15 minutes", "",
         ]
         _ = self.doc.write_text("\n".join(rows), encoding="utf-8")
         self.timer("example")

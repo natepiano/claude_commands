@@ -839,7 +839,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assert_epoch(later.times.start, 1_300)
         self.assert_epoch(later.times.finish, 1_600)
 
-    def eta_chain_fixture(self, *, gate: str = "", production: bool = True) -> None:
+    def eta_chain_fixture(self) -> None:
         """Ten-minute recorded work, a two-minute gap, then the Phase 5 promises."""
         lines = [
             "### Phase 4 — Finished delivery  · status: done",
@@ -849,25 +849,12 @@ class PhaseTableTests(unittest.TestCase):
             "### Phase 6 — Next delivery  · status: todo",
             "",
         ]
-        if gate:
-            lines += ["**Blocked by:** G2", ""]
         lines += ["### Phase 7 — Last delivery  · status: todo"]
-        if production:
-            production_doc = self.write_production("unit-a")
-            _ = production_doc.write_text(
-                production_doc.read_text(encoding="utf-8")
-                + plan_text(
-                    "", "## Gates", "",
-                    "| Gate | Waiting | Waits on | Clears when |",
-                    "| --- | --- | --- | --- |",
-                    f"| G2 | this unit phase 6 | renderer phase 9 | {gate} |",
-                ),
-                encoding="utf-8",
-            )
-            lines.insert(
-                0,
-                "> **Production: show** — unit `unit-a`; production doc `docs/show-production.md`",
-            )
+        _ = self.write_production("unit-a")
+        lines.insert(
+            0,
+            "> **Production: show** — unit `unit-a`; production doc `docs/show-production.md`",
+        )
         self.write_plan(plan_text(*lines))
         _ = self.write_run(
             "current", self.chain_time(16, 0),
@@ -921,80 +908,6 @@ class PhaseTableTests(unittest.TestCase):
         assert isinstance(record.plan_finish, phase_table.PredictedFinish)
         self.assert_epoch(record.plan_finish.at, self.chain_time(18, 59))
 
-    def test_timed_gate_delays_the_chain_and_names_the_release_time(self) -> None:
-        self.eta_chain_fixture(gate="release 2026-10-16 19:00; fallback 2026-10-16 20:00")
-
-        record = self.build(self.chain_time(18, 0))
-        gated = record.phases[2]
-        assert isinstance(gated, phase_table.TodoPhase)
-        assert isinstance(gated.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(gated.times.start, self.chain_time(19, 0))
-        self.assert_epoch(gated.times.finish, self.chain_time(19, 10))
-        assert isinstance(record.plan_finish, phase_table.PredictedFinish)
-        self.assert_epoch(record.plan_finish.at, self.chain_time(19, 22))
-        rendered = phase_table.render(record, ZoneInfo("UTC"))
-        gated_row = next(line for line in rendered.splitlines() if line.startswith("| 6 |"))
-        self.assertIn("gated until Fri 16 Oct 19:00", gated_row)
-
-    def test_untimed_gate_removes_times_from_itself_and_every_later_phase(self) -> None:
-        self.eta_chain_fixture(gate="renderer checkpoint and review")
-
-        record = self.build(self.chain_time(18, 0))
-        rendered = phase_table.render(record, ZoneInfo("UTC"))
-
-        for phase in ("6", "7"):
-            row = next(line for line in rendered.splitlines() if line.startswith(f"| {phase} |"))
-            cells = [cell.strip() for cell in row.strip("|").split("|")]
-            self.assertEqual(cells[2:], ["gated by G2: renderer phase 9", "—", "—"])
-
-    def test_timed_gate_uses_the_productions_local_zone(self) -> None:
-        self.eta_chain_fixture(gate="release 2026-10-16 19:00")
-        production = self.working_dir / "docs" / "show-production.md"
-        _ = production.write_text(
-            production.read_text(encoding="utf-8").replace(
-                "**User zone:** UTC", "**User zone:** America/New_York",
-            ),
-            encoding="utf-8",
-        )
-
-        with patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
-            record = self.build(self.chain_time(18, 0))
-
-        gated = record.phases[2]
-        assert isinstance(gated, phase_table.TodoPhase)
-        assert isinstance(gated.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(gated.times.start, self.chain_time(23, 0))
-        rendered = phase_table.render(record, ZoneInfo("America/New_York"))
-        row = next(line for line in rendered.splitlines() if line.startswith("| 6 |"))
-        self.assertIn("gated until Fri 16 Oct 19:00", row)
-
-    def test_gate_release_before_the_chain_does_not_pull_a_phase_earlier(self) -> None:
-        self.eta_chain_fixture(gate="expected 2026-10-16 17:00")
-
-        record = self.build(self.chain_time(18, 0))
-        next_phase = record.phases[2]
-        assert isinstance(next_phase, phase_table.TodoPhase)
-        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(next_phase.times.start, self.chain_time(18, 32))
-
-    def test_cleared_gate_does_not_delay_predictions(self) -> None:
-        self.eta_chain_fixture(gate="cleared 2026-10-16 19:00 — merged")
-
-        record = self.build(self.chain_time(18, 0))
-        next_phase = record.phases[2]
-        assert isinstance(next_phase, phase_table.TodoPhase)
-        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(next_phase.times.start, self.chain_time(18, 32))
-        self.assertNotIn("gated", phase_table.render(record, ZoneInfo("UTC")))
-
-    def test_blocked_by_is_ignored_without_a_production_document(self) -> None:
-        self.eta_chain_fixture(gate="renderer checkpoint", production=False)
-
-        record = self.build(self.chain_time(18, 0))
-        next_phase = record.phases[2]
-        assert isinstance(next_phase, phase_table.TodoPhase)
-        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(next_phase.times.start, self.chain_time(18, 32))
 
     def test_phase_history_counts_moves_fixes_and_findings_across_attempts(self) -> None:
         self.write_plan(plan_text(
@@ -2124,9 +2037,8 @@ class PhaseTableTests(unittest.TestCase):
             "**Depends on:** Phase 2",
             "### Phase 5 — Docs  · status: todo",
             "**Depends on:** Phase 1",
-            "### Phase 6 — Gated  · status: todo",
-            "**Blocked by:** G2 — trunk phase 3 merged",
-            "**Depends on:** none",
+            "### Phase 6 — Later delivery  · status: todo",
+            "**Depends on:** Phase 2",
         )
 
         check = self.build(1_100).parallel
@@ -2191,8 +2103,7 @@ class PhaseTableTests(unittest.TestCase):
             "### Phase 4 — Report  · status: todo",
             "**Depends on:** Phase 2, Phase 5",
             "### Phase 5 — Docs  · status: todo",
-            "**Blocked by:** G1 — trunk phase 2 merged",
-            "**Depends on:** none",
+            "**Depends on:** Phase 2",
         )
 
         line = phase_table.parallel_line(self.build(1_100).parallel)

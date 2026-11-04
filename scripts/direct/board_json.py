@@ -79,23 +79,13 @@ class BoardClock:
     def trail(self, row: phase_table.PhaseHistory) -> list[list[dict[str, object]]]:
         return [[self.time(target), self.time(stated)] for target, stated in row.eta_trail]
 
-    def gate(self, gate: phase_table.NoGate | phase_table.TimedGate | phase_table.UntimedGate) -> dict[str, object]:
-        if isinstance(gate, phase_table.NoGate):
-            return {"kind": "none"}
-        result: dict[str, object] = {"kind": "untimed", "gate": gate.gate, "waits_on": gate.waits_on}
-        if isinstance(gate, phase_table.TimedGate):
-            result.update(kind="timed", until=self.time(gate.until))
-        return result
-
     def phase(self, row: phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase) -> dict[str, object]:
         status = "done" if isinstance(row, phase_table.DonePhase) else "open"
-        gate: phase_table.NoGate | phase_table.TimedGate | phase_table.UntimedGate = phase_table.NoGate()
         start: object = None
         finish: object = None
         took: object = None
         if isinstance(row, phase_table.TodoPhase):
-            gate = row.gate
-            status = "todo" if isinstance(gate, phase_table.NoGate) else "gated"
+            status = "todo"
         if isinstance(row, phase_table.DonePhase | phase_table.TodoPhase):
             if isinstance(row.times, phase_table.CompletedPhaseTiming | phase_table.PredictedPhaseTiming):
                 start, finish = self.time(row.times.start), self.time(row.times.finish)
@@ -106,7 +96,7 @@ class BoardClock:
             took = max(0, self.now - row.started.timestamp())
         return {
             "id": row.phase, "title": row.title, "status": status, "took": took,
-            "start": start, "finish": finish, "gate": self.gate(gate),
+            "start": start, "finish": finish, "gate": {"kind": "none"},
             "fix_done": row.fix_done, "fix_running": row.fix_running, "findings": row.findings,
             "eta": {"first": self.time(row.first_eta) if isinstance(row.first_eta, datetime) else None,
                     "trail": self.trail(row),
@@ -126,9 +116,7 @@ class BoardClock:
             "fix_done": row.fix_done, "fix_running": row.fix_running,
         }
 
-    def finish(self, finish: phase_table.FinishedAt | phase_table.PredictedFinish | phase_table.UnknownFinish | phase_table.GateBlockedFinish) -> dict[str, object]:
-        if isinstance(finish, phase_table.GateBlockedFinish):
-            return {"kind": "after_gate", "gate": finish.gate, "waits_on": finish.waits_on}
+    def finish(self, finish: phase_table.FinishedAt | phase_table.PredictedFinish | phase_table.UnknownFinish) -> dict[str, object]:
         if isinstance(finish, phase_table.FinishedAt | phase_table.PredictedFinish):
             return {"kind": "finished" if isinstance(finish, phase_table.FinishedAt) else "predicted", "at": self.time(finish.at)}
         return {"kind": "unknown"}
@@ -231,7 +219,7 @@ def phase_steps(events: list[dict[str, object]], clock: BoardClock, current: pha
     return result
 
 
-def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase], current: phase_table.OpenPhase | phase_table.NoOpenPhase, ticket: TicketInProgress | NoTicketInProgress) -> str:
+def stage(events: list[dict[str, object]], state: str, current: phase_table.OpenPhase | phase_table.NoOpenPhase, ticket: TicketInProgress | NoTicketInProgress) -> str:
     events = [event for event in events if isinstance(current, phase_table.OpenPhase)
               and event.get("phase_instance_id") == current.instance_id]
     open_passes: dict[str, dict[str, object]] = {}
@@ -268,11 +256,6 @@ def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.Do
         return f"Ticket {ticket.id} running" if isinstance(ticket, TicketInProgress) else f"Phase {current.phase} running"
     if state == "run-finished":
         return "Run done"
-    for row in rows:
-        if isinstance(row, phase_table.TodoPhase) and not isinstance(row.gate, phase_table.NoGate):
-            return f"Waiting on {row.gate.gate}"
-        if not isinstance(row, phase_table.DonePhase):
-            break
     return "Standing by"
 
 
@@ -338,7 +321,7 @@ def unit(unit_name: str, worktree: Path, plan_text: str, clock: BoardClock, sour
     except phase_table.NoPlan:
         record = phase_table.PhaseRecord(record_plan, datetime.fromtimestamp(clock.now, clock.zone), phase_table.NoOpenPhase(), [], phase_table.UnknownFinish(), phase_table.NothingToStart("no plan"))
     if not record.phases:
-        record = phase_table.build_run(record_plan, events, resolver=resolver)
+        record = phase_table.build_run(record_plan, events)
     state = "standing-by"
     if isinstance(found, unit_run.RunFound):
         state = "run-finished" if events and events[-1].get("event_type") == "run_finished" else "running"
@@ -348,7 +331,7 @@ def unit(unit_name: str, worktree: Path, plan_text: str, clock: BoardClock, sour
     tickets = unit_ticket_progress(worktree, ledger_unit, sources) if standing else UnitTicketProgress()
     ticket = tickets.open_ticket
     if isinstance(ticket, TicketInProgress) and isinstance(current, phase_table.OpenPhase):
-        current = next((row for row in phase_table.build_run(record.plan, events, resolver=resolver).phases if isinstance(row, phase_table.OpenPhase)
+        current = next((row for row in phase_table.build_run(record.plan, events).phases if isinstance(row, phase_table.OpenPhase)
                         and (row.phase == ticket.id or re.match(
                             rf"{re.escape(ticket.id)}(?=\s|$)", row.title))), current)
     current_phase: dict[str, object] | None = None
@@ -365,7 +348,7 @@ def unit(unit_name: str, worktree: Path, plan_text: str, clock: BoardClock, sour
     return {"key": unit_name.removesuffix("-unit"), "plan": plan_text if plan.is_file() else "", "state": state,
             "phase": current_phase,
             "phases": [clock.phase(row) for row in record.phases], "finish": clock.finish(record.plan_finish),
-            "stage": stage(events, state, record.phases, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
+            "stage": stage(events, state, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
             "summary": summary, "steps": phase_steps(events, clock, current), "workers": worker_rows}
 
 
