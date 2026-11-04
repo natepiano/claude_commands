@@ -30,6 +30,87 @@ from scripts.build_queue import queue_snapshot, queue_view
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, only_admitted
 
 
+class CiSliceAdmissionTests(unittest.TestCase):
+    def test_idle_ci_use_reduces_the_admission_budget(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = (fixture.root / "ci.slice/memory.current").write_text(str(4 * GIB))
+            request = fixture.request(need=18 * GIB)
+            replies = fixture.server.handle_request(request)
+            self.assertTrue(any(isinstance(reply, wire.Wait) for reply in replies))
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 4 * GIB)
+
+    def test_running_ci_job_uses_the_current_limit_on_every_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(ci_memory_margin_gib=20)
+            ci = fixture.root / "ci.slice"
+            _ = (ci / "memory.current").write_text(str(2 * GIB))
+            _ = (ci / "memory.max").write_text(str(18 * GIB))
+            (fixture.proc.path / "123").mkdir()
+            _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
+            _ = (ci / "cgroup.procs").write_text("123\n")
+            request = fixture.request(need=8 * GIB)
+            _ = fixture.server.handle_request(request)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 18 * GIB)
+            _ = (ci / "memory.max").write_text(str(12 * GIB))
+            _ = fixture.server.run_pass()
+            self.assertIn(request.episode, fixture.server.reservations)
+
+    def test_running_ci_job_uses_live_use_plus_the_current_margin(self) -> None:
+        with AdmissionFixture() as fixture:
+            ci = fixture.root / "ci.slice"
+            _ = (ci / "memory.current").write_text(str(2 * GIB))
+            (fixture.proc.path / "123").mkdir()
+            _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
+            _ = (ci / "cgroup.procs").write_text("123\n")
+            request = fixture.request(need=14 * GIB)
+            _ = fixture.server.handle_request(request)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 8 * GIB)
+            fixture.configure(ci_memory_margin_gib=3)
+            _ = fixture.server.run_pass()
+            self.assertIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 5 * GIB)
+
+    def test_missing_ci_limit_refuses_grants_but_keeps_cleanup_and_recovers(self) -> None:
+        with AdmissionFixture() as fixture:
+            grant = only_admitted(fixture.server.handle_request(fixture.request(need=GIB)))
+            limit = fixture.root / "ci.slice/memory.max"
+            limit.unlink()
+            result = fixture.server.run_pass()
+            assert isinstance(result, gate.PassResult)
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, gate.QueueInputs)
+            unavailable = inputs.host
+            assert isinstance(unavailable, gate.ReadingUnavailable)
+            self.assertIn("hana-ci.slice", unavailable.reason)
+            self.assertIn("memory.max", unavailable.reason)
+            self.assertNotIn("\n", unavailable.reason)
+            self.assertGreater(fixture.server.next_pass, fixture.clock.monotonic())
+            self.assertTrue(math.isfinite(fixture.server.next_pass))
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual(view.reading.explanation.host, unavailable)
+            replies = fixture.server.handle_request(wire.ReleaseRequest("ci-cleanup", grant.reservation, 0))
+            self.assertEqual(replies, [wire.Ok()])
+            request = fixture.request(need=GIB)
+            replies = fixture.server.handle_request(request)
+            self.assertTrue(any(isinstance(reply, wire.Wait) and reply.reason == unavailable for reply in replies))
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            _ = limit.write_text(str(18 * GIB))
+            _ = fixture.server.run_pass()
+            self.assertIn(request.episode, fixture.server.reservations)
+
+
 class ServiceTests(unittest.TestCase):
     def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
         with AdmissionFixture() as fixture:
