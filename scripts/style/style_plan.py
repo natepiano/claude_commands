@@ -52,7 +52,7 @@ import style_proposals
 from issues import Issue, frontmatter
 from scripts.production.production_doc import Refusal, production_field
 from proposal_issue import ApprovedDecision, decision_answer, require_generated_body
-from unit_files import changed_files, git, unit_file_holders, unit_worktrees
+from unit_files import changed_files, git, report_unit_problems_once, unit_file_holders, unit_worktrees
 from unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
                         parse_pilot_scope, unit_plan_path)
 
@@ -3252,6 +3252,7 @@ def refill_outcome(result: NextPhase) -> str:
             return "board unavailable"
 
 
+@report_unit_problems_once()
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
