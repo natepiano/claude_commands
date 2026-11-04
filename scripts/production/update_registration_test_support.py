@@ -221,11 +221,10 @@ class RegistrationFixture(unittest.TestCase):
         return path
 
     def build_command_copy(self, tree: Path) -> None:
-        _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("agents", "astra", "build_hold", "build_targets", "buildlog", "direct", "herdr", "lib", "lint", "mac_test", "message", "shutdown", "usage", "whoami"):
-            _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
+        _ = shutil.copytree(SCRIPT.parent.parent, tree / "scripts",
+                            ignore=shutil.ignore_patterns("__pycache__"))
         hooks = tree / "scripts/hooks"
-        hooks.mkdir(parents=True)
+        hooks.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(SCRIPT.parent.parent / "hooks/showrunner_footer.py", hooks)
         template = tree / "commands/showrunner/produce.md"
         template.parent.mkdir(parents=True)

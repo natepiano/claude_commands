@@ -439,7 +439,7 @@ def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> di
     identity = _object_dict(fields.get("main_agent")) or {}
     session_id = _string(identity.get("session_id")) or _string(fields.get("owner_session"))
     if not unit_owned and session_id:
-        record = staff.snapshot()
+        record = staff.initial_snapshot()
         row = record.by_member_reference(session_id)
         if row is not None and row.kind == "worker":
             row = record.by_id(row.parent) if row.parent else None
@@ -470,7 +470,7 @@ def _read_state(session_dir: Path) -> dict[str, object]:
         raise SystemExit(f"Invalid progress state: {path}")
     if not state.get("main_agent") and not state.get("owner_session"):
         state["owner_session"] = unit_runs.director(session_dir)
-    return plan_history.staff_directory(state, staff.snapshot())
+    return plan_history.staff_directory(state, staff.initial_snapshot())
 
 
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
@@ -911,7 +911,7 @@ def _historical_project_timing(
         history_paths = runs_dir.glob("*.jsonl")
     except OSError:
         return None
-    record = staff.snapshot()
+    record = staff.initial_snapshot()
     for history_path in history_paths:
         event = plan_history.run_started_event(history_path)
         if event is None:
@@ -1368,7 +1368,7 @@ def _start_run(args: argparse.Namespace) -> None:
         raise SystemExit(
             "Unable to detect the unit director's model and effort; pass explicit --main-* values"
         )
-    current = plan_history.staff_directory({"main_agent": main_agent}, staff.snapshot())
+    current = plan_history.staff_directory({"main_agent": main_agent}, staff.initial_snapshot())
     working_dir_value = _string(current.get("working_dir")) or working_dir_value
     working_dir = Path(working_dir_value).expanduser().resolve()
     now = plan_history.now_epoch()
@@ -1848,7 +1848,7 @@ def _disarm_review(args: argparse.Namespace) -> None:
 
 def _load_events() -> tuple[list[dict[str, object]], int]:
     events: list[dict[str, object]] = []
-    record = staff.snapshot()
+    record = staff.initial_snapshot()
     ignored = 0
     runs_dir = plan_history.history_root() / "runs"
     if not runs_dir.exists():
@@ -2494,7 +2494,7 @@ def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
     except OSError:
         return []
     events: list[dict[str, object]] = []
-    record = staff.snapshot()
+    record = staff.initial_snapshot()
     for line in lines:
         event = _json_object(line)
         if event is not None and _integer(event.get("schema_version")) == SCHEMA_VERSION:

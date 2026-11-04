@@ -433,7 +433,9 @@ class UnitWatchdogTests(unittest.TestCase):
         owner = self.add_unit("alpha")
         _ = pane_record.forget_unit("alpha")
         self.die("alpha")
-        Path(owner["cwd"]).rmdir()
+        folder = owner["cwd"]
+        assert isinstance(folder, str)
+        Path(folder).rmdir()
         lines: list[str] = []
         for minute in (0, 2, 4):
             lines.extend(self.pass_at(minute))

@@ -762,11 +762,13 @@ def _rows(value: object) -> list[StaffRow]:
     return sorted(rows, key=lambda row: row.id)
 
 
-def _load() -> StaffSnapshot:
+def _load(*, initial: bool = False) -> StaffSnapshot:
     try:
         text = _file().read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return StaffSnapshot(())
+    except FileNotFoundError as error:
+        if initial:
+            return StaffSnapshot(())
+        raise StaffAbsent(f"cannot read staff record: {error}") from error
     except (OSError, UnicodeError) as error:
         raise StaffUnreadable(f"cannot read staff record: {error}") from error
     value = _decode(text)
@@ -943,7 +945,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             fcntl.flock(lock, fcntl.LOCK_EX)
             for temporary in path.parent.glob(f".{path.name}.*"):
                 temporary.unlink()
-            original = _load()
+            original = _load(initial=True)
             proposed = list(original.rows)
             pending = set(original.pending_retire)
             result = edit(proposed, pending)

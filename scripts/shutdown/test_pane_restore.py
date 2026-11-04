@@ -900,6 +900,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         arguments = ["move-folder", "--unit", self.owner.id, "--to", str(self.new_folder)]
         moved = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments, dict(os.environ), self.checkout)
         self.assertEqual(moved.returncode, 0, moved.stderr)
+        backend.live = False
+        backend.publish_process_state()
         entry = pane_record.read("agents")["w1:p1"]
         entry["ended"] = False
         pane_record.write("agents", entry)
