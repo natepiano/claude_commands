@@ -774,7 +774,13 @@ class AdmissionServer:
         readings = gate.QueueSnapshotReadings(processes, {}, host, pressure, self.recovery,
                                              self.readings.compilers(), policy=policy)
         ordered, priority = self._queue_order()
-        unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path)
+        try:
+            unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path,
+                                               ci_memory_slice=config.ci_memory_slice,
+                                               ci_memory_margin_bytes=config.ci_memory_margin_bytes)
+        except gate.SliceMemoryUnavailable as error:
+            readings = replace(readings, host=gate.ReadingUnavailable(str(error)))
+            unowned = ()
         inputs = gate.build_queue_inputs(ordered, memories, readings, self.override, now, priority, unowned)
         limits = gate.resolve_admission_limits(host.total if isinstance(host, gate.HostMemory)
                                              else gate.UnknownHostTotal(), config)

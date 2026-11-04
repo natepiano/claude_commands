@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
+from contextlib import closing
 from typing import Literal, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -15,6 +17,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "production", "lib"
 
 from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.production import staff
+from scripts.agents import codex_mesh
 from inventory import CheckoutState, Host, InvalidInventory, Inventory, Session, inventory, parse_inventory
 from remote import other_machine, run_remote as run_remote
 import remote_control
@@ -146,10 +149,33 @@ def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[M
     return reports
 
 
-def held_session_ids() -> list[str]:
-    record = staff.initial_snapshot()
-    return [str(row.current_session) for identity in shutdown_record.read()
-            if (row := record.by_member_reference(identity)) is not None]
+def wait_for_workers() -> None:
+    """Name local worker turns and wait until each turn ends."""
+    names = {str(row.current_session): f"{row.name}: {row.current_session}"
+             for row in staff.initial_snapshot().rows if row.kind == "worker"}
+    announced: set[str] = set()
+    while True:
+        waiting: set[str] = set()
+        notices: set[str] = set()
+        for server in codex_mesh._running_servers():  # pyright: ignore[reportPrivateUsage]
+            try:
+                with closing(codex_mesh.Client(server.port, "shutdown")) as client:
+                    loaded = codex_mesh._loaded_thread_ids(client, time.monotonic() + 10)  # pyright: ignore[reportPrivateUsage]
+                    for identity in names.keys() & loaded:
+                        state = codex_mesh._read_live_turn(client, identity)  # pyright: ignore[reportPrivateUsage]
+                        if isinstance(state, (codex_mesh.ThreadLive, codex_mesh.ThreadActiveWithoutTurn)):
+                            waiting.add(names[identity])
+                        elif isinstance(state, codex_mesh.ThreadStateUnknown):
+                            notices.add(f"{names[identity]}: readiness anomaly: {state.reason}")
+            except (ConnectionError, OSError, SystemExit) as error:
+                notices.add(f"worker readiness anomaly: {error}")
+        for line in sorted((notices | waiting) - announced):
+            print(line if line in notices else f"{line}: waiting for worker turn",
+                  file=sys.stderr if line in notices else sys.stdout, flush=True)
+        announced.update(notices | waiting)
+        if not waiting:
+            return
+        time.sleep(1)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -190,8 +216,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(shutdown_record.read()))
             return 0
         if options.command == "held-sessions":
-            for identity in held_session_ids():
-                print(identity)
+            wait_for_workers()
             return 0
         if options.command == "remote-control":
             result = remote_control.fix(options.session, options.pid, options.proc_start,
