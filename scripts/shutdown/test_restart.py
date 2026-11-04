@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, override
@@ -215,6 +216,43 @@ class RestartTests(ShutdownTestCase):
         self.launches.append((agent, destination))
         self.running.add(str(row.current_session))
         return herdr.AgentLaunched(f"w1:p{self.rows.index(row)}", herdr.PromptSubmissionNotRequired())
+
+    def test_start_row_ignores_a_managed_daemon_at_both_live_checks(self) -> None:
+        self.running.clear()
+        row = self.rows[0]
+        daemon = ["/package/bin/codex", "app-server", "--listen", "unix://", "--managed-daemon"]
+        def threads(*, thread_host: Callable[[list[str]], bool]) -> set[str]:
+            self.assertIs(thread_host, herdr.codex_managed_daemon)
+            return set() if thread_host(daemon) else {str(row.current_session)}
+        with (patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", row.current_session])),
+              patch.object(herdr, "running_codex_threads", side_effect=threads) as scan,
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p0", herdr.PromptSubmissionNotRequired())) as launch,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p0")
+        self.assertEqual(scan.call_count, 2)
+        launch.assert_called_once()
+        self.assertEqual(output.getvalue(), f"{row.name}: restarted\n")
+
+    def test_codex_clients_stay_live_and_only_daemon_rows_are_omitted(self) -> None:
+        self.running.clear()
+        row = self.rows[0]
+        for arguments, live in ((["codex", "app-server", "--managed-daemon"], False),
+                                (["codex", "resume", str(row.current_session)], True),
+                                (["codex", "app-server", "--listen", "ws://127.0.0.1:1234"], True)):
+            def threads(*, thread_host: Callable[[list[str]], bool]) -> set[str]:
+                self.assertIs(thread_host, herdr.codex_managed_daemon)
+                return set() if thread_host(arguments) else {str(row.current_session)}
+            with (self.subTest(arguments=arguments),
+                  patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", row.current_session])),
+                  patch.object(herdr, "running_codex_threads", side_effect=threads),
+                  patch.object(herdr, "launch_prepared_agent") as launch,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(restart.live_rows(staff.StaffSnapshot((row,)), herdr.Herdr("agents")), [row] if live else [])
+                if live:
+                    self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "")
+                    self.assertEqual(output.getvalue(), f"{row.name}: unchanged\n")
+                launch.assert_not_called()
 
     def test_start_row_uses_the_target_account_environment(self) -> None:
         self.running.clear()

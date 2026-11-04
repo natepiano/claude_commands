@@ -152,7 +152,7 @@ class LinuxShellTests(unittest.TestCase):
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
         )
         _ = (self.root / "mac.conf").write_text("offload=on\nhost=fake-mac\nlinux_only.phase-copy=\n")
-        _ = (self.root / "lint.conf").write_text("# range: 0..\nrecent_minutes=60\n")
+        _ = write_config_fixture(self.root / "lint.conf", "recent_minutes=60\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
         })))
@@ -1593,7 +1593,7 @@ class LinuxDispatchTests(unittest.TestCase):
         ])
         source_copy = next(argv for argv in self.commands if argv[0] == "rsync" and any(word.startswith("--exclude-from=") for word in argv))
         self.assertIn("--delete", source_copy)
-        self.assertEqual(self.filters, ["/.git\n/target/\n/private/\n/.env\n"])
+        self.assertEqual(self.filters, ["/.git\n/target/\n/.mac-test-mirror\n/private/\n/.env\n"])
         self.assertNotIn("--copy-links", source_copy)
         identity = offload.repository_identity(self.source)
         if not isinstance(identity, offload.KnownRepository):

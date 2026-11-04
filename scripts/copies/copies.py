@@ -25,6 +25,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import conf, copy_record, file_lock, scratch
+from scripts.lib.conf import UseConfiguredValue
 from scripts.message import process_table, sessions
 from scripts.lib.atomic_file import remove_dead_temporary_files, write_text_atomic
 
@@ -376,6 +377,31 @@ def initialize_git(tree: Path, source: Path) -> None:
         exclude.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(exclude, text + ("\n" if text and not text.endswith("\n") else "")
                           + "\n".join(entries) + "\n")
+
+
+def clone(source: Path, task: str = "", word: str = "hana", now: float | None = None, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> Path:
+    """Create a task-owned clone. Keep partial files owned if Git fails."""
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    path = scratch.new(task, word, now=now, scratch_settings=scratch_settings)
+    _ = scratch.update_record(path, lambda record: {
+        **(record.fields if isinstance(record, copy_record.Registered) else {}),
+        "test_hana_clone": True, "source_path": str(source.resolve()),
+    }, scratch_settings=scratch_settings)
+    checkout = path / "checkout"
+    try:
+        # The task folder keeps one lock path while its checkout gains Git metadata.
+        with claim_tree(path, create=False) as state:
+            if state is not ClaimState.ACQUIRED:
+                raise CopyError(f"{path}: task folder is busy")
+            checkout.mkdir()
+            initialize_git(checkout, source.resolve())
+            _ = git(checkout, "reset", "--hard", "--quiet")
+    except (OSError, CopyError) as error:
+        raise CopyError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
+    return checkout
 
 
 def apply_changes(tree: Path, worktree: Path, base: str) -> None:
@@ -860,11 +886,21 @@ class CopyArguments(argparse.Namespace):
     apply_uncommitted: str | None = None
     merge: str | None = None
     command: list[str] = []
+    source: str = ""
+    task: str = ""
+    until: str = ""
+    name: str = "hana"
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = CopyParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
+    clone_command = commands.add_parser("clone", help="create a task-owned test clone")
+    _ = clone_command.add_argument("source")
+    ends = clone_command.add_mutually_exclusive_group()
+    _ = ends.add_argument("--task", default="")
+    _ = ends.add_argument("--until", default="")
+    _ = clone_command.add_argument("--name", default="hana")
     run = commands.add_parser("run", help="prepare a standing tree and run a command in it")
     remove = commands.add_parser("remove", help="remove an owner's idle standing trees")
     for command in (run, remove):
@@ -878,6 +914,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = commands.add_parser("list", help="list standing trees and their busy state")
     try:
         args = parser.parse_args(argv, namespace=CopyArguments())
+        if args.action == "clone":
+            task = scratch.parsed_until(args.until) if args.until else args.task
+            print(clone(Path(args.source), task, args.name))
+            return 0
         if args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not command:

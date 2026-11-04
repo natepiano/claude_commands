@@ -1882,6 +1882,7 @@ route_compiling_step() {
 }
 
 step_stopped_by_hold() {
+    (( status > 128 )) || return 1
     local admission=0
     env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" stopped --call-id "$BUILDLOG_CALL_ID" \
         --consumed "$HOLD_WAIT_DIR/stops" || admission=$?
@@ -3016,9 +3017,10 @@ refresh_test_build_inputs() {
     # buildlog_begin takes its source key after that wait.
     rm -f "$HOLD_WAIT_DIR/test-build-inputs"
     VERDICT_KEY="$(VERIFY_COMPUTE_TEST_BUILD=1 tree_key)"
-    export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR=""
+    export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR="" BUILDLOG_TEST_BUILD_DIR=""
     if [[ -f "$HOLD_WAIT_DIR/test-build-inputs" ]]; then
-        { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR; } \
+        { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR;
+          IFS= read -r BUILDLOG_TEST_BUILD_DIR; } \
             < "$HOLD_WAIT_DIR/test-build-inputs"
     fi
     # A hold can also arrive during memory admission, after buildlog_begin.

@@ -242,7 +242,7 @@ class HerdrSessionsTests(unittest.TestCase):
         self.respond(["agents"], tabs=("unit",))
         self.server(100, "agents")
         unit = unit_membership("build", "one")
-        self.process(101, 100, ["codex"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build",
+        self.process(101, 100, ["codex", "resume", unit.id], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build",
                                                 "SHOWRUNNER_UNIT_ID": "one", "CODEX_THREAD_ID": unit.id})
         (self.proc / "101" / "fd").mkdir()
         with patch.object(runtime_sessions, "process_start", return_value="fixture-codex-start"):

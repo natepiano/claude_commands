@@ -1759,8 +1759,6 @@ class Herdr:
 
     def _codex_launch(self, pane: str, info: dict[str, object],
                       arguments: Sequence[str]) -> pane_launch.PaneLaunch:
-        resume_id = next((arguments[index + 1] for index, argument in enumerate(arguments[:-1])
-                          if argument == "resume"), "")
         matches: list[pane_launch.PaneLaunch] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
             process = json_object(value, "Codex launch process")
@@ -1770,7 +1768,7 @@ class Herdr:
             pid = process.get("pid")
             if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
                 raise ValueError("Codex launch has no process id")
-            observed = native_process(pid, "codex", resume_id=resume_id)
+            observed = native_process(pid, "codex")
             cwd = json_text(process.get("cwd"), "Codex launch cwd")
             if not Path(cwd).is_absolute():
                 raise ValueError("Codex launch working folder is unavailable")
@@ -3105,7 +3103,34 @@ def codex_rollout_thread(pid: int) -> str:
     return next(iter(identities))
 
 
-def native_process(pid: int, kind: str, *, resume_id: str = "") -> NativeAgentProcess:
+def _codex_resume_thread(pid: int) -> str:
+    if _platform() == "darwin":
+        process = next((process for process in _darwin_processes() if process.pid == pid), None)
+        if process is None or isinstance(process.arguments, UnreadableProcessArguments):
+            raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+        arguments = list(process.arguments.argv)
+    else:
+        arguments = _process_arguments(_proc_root() / str(pid))
+    if is_codex_process(arguments):
+        options = iter(arguments[2:] if Path(arguments[0]).name in {"node", "nodejs"} else arguments[1:])
+        for option in options:
+            if option in {"-c", "--config", "--enable", "--disable", "-m", "--model",
+                          "-C", "--cd", "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval",
+                          "--local-provider", "-i", "--image", "--add-dir", "--remote", "--remote-auth-token-env"}:
+                _ = next(options, "")
+            elif option == "--":
+                break
+            elif not option.startswith("-"):
+                if option == "resume":
+                    try:
+                        return staff.native_id(next(options, ""))
+                    except staff.StaffRefused:
+                        pass
+                break
+    raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+
+
+def native_process(pid: int, kind: str) -> NativeAgentProcess:
     """Bind the current identity and account to one unchanged process."""
     started = _process_birth(pid)
     environment = process_environment(pid)
@@ -3113,10 +3138,7 @@ def native_process(pid: int, kind: str, *, resume_id: str = "") -> NativeAgentPr
         try:
             identity = codex_rollout_thread(pid)
         except NoOpenCodexRollout:
-            try:
-                identity = staff.native_id(environment.get("CODEX_THREAD_ID") or resume_id)
-            except staff.StaffRefused as error:
-                raise ValueError(f"pid {pid}: Codex launch identity is unavailable") from error
+            identity = _codex_resume_thread(pid)
     elif kind == "claude":
         try:
             identity = staff.runtime_id(pid)
