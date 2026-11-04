@@ -1791,6 +1791,118 @@ class TestPhaseChargeTests(MemoryQueueFixture):
 
 
 
+class QueueLifetimeReaderTests(unittest.TestCase):
+    def test_overlapping_gates_keep_sampled_unsampled_and_cancelled_lifetimes(self) -> None:
+        with AdmissionFixture() as fixture:
+            first = fixture.request(step="merge-gate", need=2 * GIB, since=fixture.clock.now() - 10)
+            first = replace(first, sidecar=str(fixture.scope(first.owner)))
+            first_grant = only_admitted(fixture.server.handle_request(first))
+            fixture.scoped_peak(first_grant, GIB)
+            fixture.clock.advance(5)
+            second = fixture.request(step="merge-gate", need=3 * GIB, since=fixture.clock.now() - 3)
+            second_grant = only_admitted(fixture.server.handle_request(second))
+            fixture.free(0)
+            cancelled = fixture.request(step="merge-gate")
+            peer = fixture.connect(cancelled)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            fixture.clock.advance(4)
+            peer.close()
+            fixture.server.run_once(0)
+            fixture.clock.advance(1)
+            _ = fixture.server.handle_request(wire.ReleaseRequest("first-end", first_grant.reservation, 0))
+            first_end = fixture.clock.now()
+            fixture.clock.advance(1)
+            _ = fixture.server.handle_request(wire.ReleaseRequest("second-end", second_grant.reservation, 1))
+            lifetimes = {step.pid: step for step in gate.read_queue_lifetimes(fixture.state_dir)}
+            self.assertEqual(set(lifetimes), {first.owner.pid, second.owner.pid, cancelled.owner.pid})
+            sampled, unsampled, left = (lifetimes[request.owner.pid] for request in (first, second, cancelled))
+            self.assertEqual((sampled.start_time, sampled.since, sampled.step),
+                             (first.owner.start_time, first.since, "merge-gate"))
+            self.assertEqual((sampled.memory_wait_s, unsampled.memory_wait_s), (10, 3))
+            self.assertEqual(len(sampled.intervals), 1)
+            self.assertEqual(len(unsampled.intervals), 1)
+            self.assertLess(unsampled.intervals[0].admitted_at, first_end)
+            self.assertEqual(sampled.intervals[0].reservation_id, first_grant.reservation)
+            self.assertEqual(sampled.intervals[0].budget, 21 * GIB)
+            self.assertIsInstance(sampled.end, gate.ReservationEnded)
+            assert isinstance(sampled.end, gate.ReservationEnded)
+            self.assertEqual(sampled.end.peak, gate.PeakSampled(GIB))
+            self.assertIsInstance(sampled.end.end_kind, gate.StepEnd)
+            self.assertEqual(sampled.end.ended_at, first_end)
+            self.assertIsInstance(unsampled.end, gate.ReservationEnded)
+            assert isinstance(unsampled.end, gate.ReservationEnded)
+            self.assertIsInstance(unsampled.end.peak, gate.NoPositiveSample)
+            self.assertEqual(unsampled.end.outcome, "failed")
+            self.assertIsInstance(left.end, gate.LeftQueue)
+            assert isinstance(left.end, gate.LeftQueue)
+            self.assertEqual(left.end.reason, "cancelled")
+            self.assertFalse(left.intervals)
+            self.assertEqual(len(fixture.history()), 1)
+
+    def test_token_return_joins_intervals_without_completing_the_step(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(since=fixture.clock.now() - 5)
+            first = only_admitted(fixture.server.handle_request(request))
+            fixture.clock.advance(10)
+            _ = fixture.server.handle_request(wire.TokenWaitRequest("token-return", first.reservation))
+            open_step, = gate.read_queue_lifetimes(fixture.state_dir)
+            self.assertIsInstance(open_step.end, gate.StepStillOpen)
+            interval_end = open_step.intervals[0].end
+            assert isinstance(interval_end, gate.ReservationEnded)
+            self.assertIsInstance(interval_end.end_kind, gate.TokenReturn)
+            fixture.clock.advance(20)
+            fixture.free(0)
+            returned = replace(request, episode="after-token", token_back_at=fixture.clock.now())
+            self.assertIsInstance(fixture.server.handle_request(returned)[0], wire.Wait)
+            fixture.clock.advance(7)
+            fixture.free(60 * GIB)
+            _ = fixture.server.run_pass()
+            second = only_admitted([fixture.server.ledger[returned.episode].reply])
+            fixture.clock.advance(2)
+            _ = fixture.server.handle_request(wire.ReleaseRequest("finished", second.reservation, 0))
+            step, = gate.read_queue_lifetimes(fixture.state_dir)
+            self.assertEqual((step.pid, step.start_time, step.since),
+                             (request.owner.pid, request.owner.start_time, request.since))
+            self.assertEqual([interval.reservation_id for interval in step.intervals],
+                             [first.reservation, second.reservation])
+            self.assertEqual(len(step.token_gaps), 1)
+            gap = step.token_gaps[0]
+            self.assertEqual(gap.token_back_at - gap.token_left_at, 20)
+            self.assertEqual(step.memory_wait_s, 12)
+            self.assertIsInstance(step.end, gate.ReservationEnded)
+            assert isinstance(step.end, gate.ReservationEnded)
+            self.assertIsInstance(step.end.end_kind, gate.StepEnd)
+            self.assertEqual(step.end, step.intervals[-1].end)
+
+    def test_cancellation_and_owner_exit_during_token_wait_leave_no_completed_step(self) -> None:
+        for reason in ("cancelled", "owner_gone"):
+            with self.subTest(reason=reason), AdmissionFixture() as fixture:
+                request = fixture.request()
+                grant = only_admitted(fixture.server.handle_request(request))
+                fixture.clock.advance(2)
+                _ = fixture.server.handle_request(wire.TokenWaitRequest("token-return", grant.reservation))
+                fixture.clock.advance(3)
+                if reason == "cancelled":
+                    reconnect = replace(request, episode="token-wait-reconnect")
+                    peer = fixture.connect(reconnect)
+                    reply = peer.replies()[0]
+                    assert isinstance(reply, wire.Wait)
+                    self.assertIsInstance(reply.reason, gate.TokenWaitingWaiter)
+                    peer.close()
+                    fixture.server.run_once(0)
+                else:
+                    fixture.end_owner(request.owner)
+                step, = gate.read_queue_lifetimes(fixture.state_dir)
+                self.assertIsInstance(step.end, gate.LeftQueue)
+                assert isinstance(step.end, gate.LeftQueue)
+                self.assertEqual((step.end.reason, step.end.ended_at), (reason, fixture.clock.now()))
+                self.assertEqual(len(step.intervals), 1)
+                interval_end = step.intervals[0].end
+                assert isinstance(interval_end, gate.ReservationEnded)
+                self.assertIsInstance(interval_end.end_kind, gate.TokenReturn)
+                self.assertFalse(fixture.history())
+
+
 class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
     """Private identities and clocks for queue priority and token waits."""
 
@@ -1898,6 +2010,44 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
 
 
 
+
+    def test_lifecycle_retry_stops_the_duplicate_scan_at_an_older_row(self) -> None:
+        directory = gate.admission_dir(self.root)
+        path = directory / "queue_times.jsonl"
+        old = json.dumps({"kind": "admitted", "at": self.clock - 100, "padding": "x" * 4096}) + "\n"
+        _ = path.write_text(old * 256)
+        event: dict[str, object] = {"kind": "left", "event_id": "left:cancelled-step",
+                                  "ended_at": self.clock - 1, "reason": "cancelled"}
+        loads = json.loads
+        decoded_bytes = 0
+
+        def counted(value: str | bytes | bytearray) -> object:
+            nonlocal decoded_bytes
+            decoded_bytes += len(value)
+            return cast(object, loads(value))
+
+        with patch.object(json, "loads", side_effect=counted):
+            gate.append_queue_time(directory, event, self.clock)
+            gate.append_queue_time(directory, event, self.clock + 1)
+        self.assertLess(decoded_bytes, 64 * 1024, "a lifecycle retry must not decode the older prefix")
+        rows = self.gaps()
+        self.assertEqual(len(rows), 257)
+        self.assertEqual(sum(row.get("event_id") == event["event_id"] for row in rows), 1)
+
+    def test_recent_queue_events_trim_the_oldest_rows_to_the_byte_limit(self) -> None:
+        directory = gate.admission_dir(self.root)
+        path = directory / "queue_times.jsonl"
+        rows = [{"kind": "admitted", "at": self.clock - 36 + index,
+                 "sequence": index, "padding": "x" * (256 * 1024)} for index in range(36)]
+        _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        self.assertGreater(path.stat().st_size, 8 * 1024 * 1024)
+        gate.append_queue_time(directory, {"kind": "left", "sequence": 36}, self.clock)
+        kept = self.gaps()
+        self.assertLess(path.stat().st_size, 6 * 1024 * 1024)
+        self.assertGreater(len(kept), 1)
+        self.assertLess(len(kept), len(rows))
+        self.assertEqual([row["sequence"] for row in kept], list(range(37 - len(kept), 37)))
+        self.assertTrue(all(cast(float, row["at"]) >= self.clock - 14 * 86400 for row in kept))
 
     def test_queue_time_append_stamps_all_kinds_and_trims_old_rows_in_order(self) -> None:
         directory = gate.admission_dir(self.root)
@@ -4974,6 +5124,68 @@ class QueueExplanationTests(MemoryQueueFixture):
              patch.object(gate, "read_recovery", side_effect=AssertionError("pure read read recovery")):
             self.assertEqual(gate.queue_read_from(inputs, limits, policy=admission_policy_fixture()), expected)
 
+    def test_frozen_pass_keeps_one_window_for_admission_view_explanation_and_wait_text(self) -> None:
+        policy = admission_policy_fixture()
+        limits = gate.resolve_admission_limits(60 * GIB, gate.read_memory_config())
+        _ = self.running(100, 10, age=30)
+        self.readings[100] = gate.MeasuredMemory(10 * GIB)
+        _ = self.waiting(300, 12 * GIB, 20, priority_since=NOW_EPOCH - 60)
+        _ = self.waiting(400, 2 * GIB, 5)
+        original = replace(self.snapshot_inputs(), host=gate.HostMemory(60 * GIB, 60 * GIB),
+                           blockers_for=frozenset(("300-head", "400-warmup")))
+        for offset, window_type in ((0, gate.StrictUntil), (policy.timing.strict_seconds, gate.BackfillUntil)):
+            with self.subTest(offset=offset):
+                inputs = replace(original, now=NOW_EPOCH + offset)
+                resolved = gate.head_policy(inputs, inputs.now, limits, policy)
+                result = gate.admission_pass(inputs, inputs.now, limits, policy)
+                reason = result.rows[0].reason
+                assert isinstance(reason, gate.HeadAdmissionStatus)
+                self.assertIsInstance(reason.backfill, window_type)
+                self.assertEqual(reason.backfill, resolved.window)
+                with patch.object(gate, "head_window", side_effect=AssertionError("reader recomputed the window")):
+                    reading = gate.queue_read_from_pass(inputs, limits, policy, result)
+                    text = gate.head_wait_text(reason, ZoneInfo("UTC"), policy)
+                head = reading.explanation.head
+                assert isinstance(head, gate.HeadExplanation)
+                self.assertEqual(head.order, resolved.window)
+                self.assertEqual(reading.view.waiting[0].reason, reason)
+                self.assertEqual(head.waiter.reason, reason)
+                self.assertEqual(head.decision, result.rows[0].decision)
+                self.assertEqual(reading.view.waiting[1].reason, result.rows[1].reason)
+                self.assertEqual(reading.explanation.line.steps[0].waiter.reason, result.rows[1].reason)
+                self.assertTrue(text.endswith(gate.window_clause(reason.backfill, limits.budget, reason.need, ZoneInfo("UTC"))))
+
+    def test_recovery_release_keeps_required_endings_and_frozen_window(self) -> None:
+        policy = admission_policy_fixture()
+        limits = gate.resolve_admission_limits(60 * GIB, gate.read_memory_config())
+        _ = self.running(100, 18, age=30)
+        self.readings[100] = gate.MeasuredMemory(18 * GIB)
+        _ = self.waiting(300, 12 * GIB, 20, priority_since=NOW_EPOCH - 60)
+        _ = self.waiting(400, GIB, 5)
+        recovery = gate.RecoveryStarts(NOW_EPOCH + 120, NOW_EPOCH + 30)
+        inputs = replace(self.snapshot_inputs(), host=gate.HostMemory(60 * GIB, 60 * GIB), recovery=recovery)
+        reading = gate.queue_read_from(inputs, limits, policy)
+        head = reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        reason = head.waiter.reason
+        assert isinstance(reason, gate.HeadAdmissionStatus)
+        self.assertEqual(head.order, reason.backfill)
+        self.assertEqual(head.decision.state, "hold")
+        with patch.object(Path, "open", side_effect=AssertionError("release opened a file")), \
+             patch.object(Path, "read_text", side_effect=AssertionError("release read a file")), \
+             patch.object(time, "time", side_effect=AssertionError("release read the clock")):
+            release = gate.smallest_head_release(reading.explanation)
+            ended = gate.inputs_after_steps_end(inputs, frozenset((0,)))
+            after = gate.admission_pass(ended, inputs.now, limits, policy)
+        self.assertIsInstance(release, gate.HeadStartsAt)
+        assert isinstance(release, gate.HeadStartsAt)
+        self.assertEqual((release.at, release.ended), (recovery.next_start_at, (0,)))
+        self.assertEqual(after.policy.window, head.order)
+        pressure = after.rows[0].decision.pressure
+        assert isinstance(pressure, gate.MemoryPressure)
+        self.assertEqual(pressure.next_start_at, release.at)
+        self.assertEqual(reading.explanation.decided_from, inputs)
+
     def test_release_helper_keeps_due_recovery_and_uses_the_frozen_pass_context(self) -> None:
         limits = gate.resolve_admission_limits(60 * GIB, gate.read_memory_config())
         _ = self.running(100, 8, age=30)
@@ -5109,7 +5321,7 @@ class QueueExplanationTests(MemoryQueueFixture):
         due = gate.RecoveryStarts(NOW_EPOCH + 120, NOW_EPOCH)
         inputs = replace(self.snapshot_inputs(), recovery=due, host=gate.HostMemory(60 * GIB, 60 * GIB))
         result = gate.admission_pass(inputs, NOW_EPOCH, limits, policy=admission_policy_fixture())
-        self.assertEqual(result.recovery, due)
+        self.assertEqual(result.policy.recovery, due)
         self.assertEqual(result.rows[0].admission,
             gate.ProposedAdmission(1, gate.RecoveryStarts(NOW_EPOCH + 120, NOW_EPOCH + 30), gate.OverrideKept()))
         self.assertIsInstance(result.rows[1].admission, gate.NotAdmitted)

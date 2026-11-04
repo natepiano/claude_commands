@@ -199,6 +199,48 @@ The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.
 Queue views continue to use the service.
 
+### Queue lifecycle and calibration
+
+The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
+The same record holds Cargo steps and `merge-gate` steps.
+The append function locks the file and removes incomplete rows before an append.
+At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
+
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, applied budget, and head window.
+2. `left` records a cancelled waiter or a waiter whose owner is gone.
+3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+
+Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
+Each admission and end also identifies its reservation interval by `reservation_id`.
+A token wait ends an interval with `TokenReturn`. It does not complete the step.
+A normal end uses `StepEnd`. An exit before a positive sample records `NoPositiveSample`.
+The saved finalization intent retains the facts for the end event across retries.
+The event identity prevents a retry from publishing the same end twice.
+The service saves pending admission and cancellation facts with each durable state transition.
+One lifecycle outbox publishes these facts after the state write and during restart.
+Reservation removal and removal of its non-token place use the same state write.
+
+`read_queue_lifetimes` joins these events into `QueueStepLifetime` records.
+Each record retains its reservation intervals, token gaps, and final end state.
+Memory wait includes the first wait and each wait after a token returns.
+It excludes the token gaps and running time.
+A missing return time gives `MemoryWaitIncomplete`; an unfinished step gives `StepStillOpen`.
+The Phase 16 comparison is due 24 hours after these lifecycle records reach main.
+It compares Cargo waits and pressure holds with and without overlapping gate intervals.
+
+`head_policy` resolves the deployed head rule and ordered walk from one frozen snapshot.
+Admission, queue readers, blocker searches, and release searches use that result.
+The active window supplies the shell wait text and admission records.
+The queue card preserves captured window evidence until the service saves its first priority mark.
+The deployed rule keeps the recovery slot, queue priority, and the head-admission override.
+
+The Phase 20 calibration has insufficient evidence.
+The calibration requires seven days under the deployed Phase 39 configuration.
+The phase review found no eligible days or cohort budget after that deployment boundary.
+Recorded wait minutes, replayed wait minutes, and their ratio are unavailable.
+The main reference has a 24 GiB build budget; this is not a calibration cohort.
+The comparative replay does not run. The capacity rule is not adopted.
+
 ### Estimates and charges
 
 The client calls `step_estimate` before admission and after `EstimateExpired`.
