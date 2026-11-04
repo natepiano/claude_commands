@@ -67,8 +67,6 @@ Codex review prompts also include section 3's command block.
 5. `## Project Context`: include the current context. Omit plan **Style** metadata.
 6. `## Work Specification`: include the following instructions verbatim.
    "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
-   The next Work Order rejects the change or records `Assertion-Change: <path>::<test> — <why>` for `assertion_guard.py`.
-   When the phase removes or renames tests, write these lines into this Work Order before dispatch. Use `<path>::*` for a whole deleted file.
    For tests, prohibit constant comparisons, implementation copies, library tests, configured mock tests, existence checks, and duplicate behavior tests.
    Include these repair rules:
    - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.

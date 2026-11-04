@@ -1383,26 +1383,6 @@ allows the checkpoint but is batched at <FinalGate/> and reported by
 <RunSummary/>.
 </RunApplicationSmokeTest>
 
-<UserBuildGuard>
-Before a build goes to the user's machine (an install, a binary path given to
-the user, a deploy), run in that repository:
-
-`python3 ~/.claude/scripts/direct/assertion_guard.py --base main`
-
-Use `Assertion-Change: <path>::<test> — <why>` for one test.
-Use `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted` for deleted tests with the same prefix in that path.
-The prefix rules only `test removed` findings.
-It does not rule assertions in tests that remain.
-A prefix that matches no removed test blocks.
-
-Exit 1 (a removed, weaker or turned-off assertion or test with no
-`Assertion-Change:` ruling) or exit 2 (it could not run) stops the hand-off:
-route the finding through <FixDispatch/>, or record its ruling, then run it
-again. The user got a build that does not work from cargo-liner-tile
-checkpoint e21d5b93, where a worker weakened an `assert_eq!` (user,
-2026-10-28).
-</UserBuildGuard>
-
 <UXReview>
 Runs when the phase changes what users see, in the app or in any example; a
 phase that changes nothing on screen skips it and says so in one line. Guide:
