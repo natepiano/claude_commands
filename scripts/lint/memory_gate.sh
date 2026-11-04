@@ -18,12 +18,6 @@ buildlog_memory_python() {
     fi
 }
 
-# Keep the version of the code this shell loads, even after source files change.
-if [[ -z "${BUILDLOG_ADMISSION_CODE_VERSION:-}" ]]; then
-    BUILDLOG_ADMISSION_CODE_VERSION="$(buildlog_memory_python -I "${BUILDLOG_MEM_ADMIT_SCRIPT%/*}/admission_code.py")" || exit 2
-    export BUILDLOG_ADMISSION_CODE_VERSION
-fi
-
 # Status 0 when the holder directory is missing or readable with no entry.
 # This shell must expand patterns unfiltered; any doubt starts Python.
 build_hold_nothing_held() {

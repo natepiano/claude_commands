@@ -31,14 +31,17 @@ class ProtocolTests(unittest.TestCase):
                 _ = target.write_bytes((source / relative).read_bytes())
             before = wire.admission_code_version(scripts)
             environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_ADMISSION_CODE_VERSION"}
-            command = '''source "$1"
+            command = '''BUILDLOG_ADMISSION_CODE_VERSION="$(python3 "$3" code-version)" || exit 2
+export BUILDLOG_ADMISSION_CODE_VERSION
+source "$1"
 printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
 printf '\\n# Changed version code.\\n' >> "$2"
 source "$1"
 printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
 '''
             result = subprocess.run(["bash", "-c", command, "bash", str(scripts / "lint/memory_gate.sh"),
-                                     str(scripts / "build_queue/admission_code.py")],
+                                     str(scripts / "build_queue/admission_code.py"),
+                                     str(source / "build_queue/admission_client.py")],
                                     env=environment, capture_output=True, text=True, timeout=10, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), [before, before])
