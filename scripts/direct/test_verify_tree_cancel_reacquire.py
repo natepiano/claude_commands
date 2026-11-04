@@ -105,7 +105,7 @@ trap probe_local_attempt DEBUG
         self.edit_source()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 77, output + errors)
-        self.assertEqual((output + errors).splitlines().count(CANCEL_LINE.format(cmd="test")), 1)
+        self.assertEqual(len(cancellation_lines(output + errors, "test")), 1)
         self.assertEqual(sorted(waiters.iterdir()), [peer_entry], "cancel left its token entry")
         self.assertEqual((lock / "holder_pid").read_text(), str(holder.pid), "cancel released a peer's claim")
         self.assertIsNone(holder.poll(), "cancel killed its peer")
