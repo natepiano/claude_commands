@@ -30,10 +30,12 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
     from ..lib import build_folders
+    from ..lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from ..aws_target import ledger
     from ..build_targets.target_config import SshTarget, is_aws_target
 else:
     from scripts.lib import build_folders
+    from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from scripts.build_targets.target_config import SshTarget, is_aws_target
 
 
@@ -165,16 +167,49 @@ def policy_setting(values: dict[str, str], key: str, repository: str) -> str:
     return values[f'{key}.{repository}'] if f'{key}.{repository}' in values else values[key]
 
 
+def normalize_tool_version(value: str) -> str:
+    """Keep each nonempty version line in one common form."""
+    return ' '.join(line.strip() for line in value.splitlines() if line.strip())
+
+
+def tool_version_filter() -> str:
+    """Use the same normalizer for versions read by Bash."""
+    code = "\n".join((
+        "import sys",
+        "from pathlib import Path",
+        "sys.path.insert(0, str(Path.home() / '.claude'))",
+        "from scripts.mac_test.linux_runner import normalize_tool_version",
+        "print(normalize_tool_version(sys.stdin.read()))",
+    ))
+    return f'python3 -c {shlex.quote(code)}'
+
+
 def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
     """Read Linux disk capacity and the public tool versions."""
     return '\n'.join((
         ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
         f'mkdir -p -- "$HOME"/{shlex.quote(mirror)} || exit 1',
-        'free_gib=$(df -Pk "$HOME" | awk \'NR == 2 {printf "%.6f", $4 / 1048576}\') || exit 1',
+        f'checkout="$HOME"/{shlex.quote(mirror)}',
+        'if [[ -f "$checkout/Cargo.toml" ]]; then',
+        "  capacity_code=" + shlex.quote("\n".join((
+            "import sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, str(Path.home() / '.claude'))",
+            "from scripts.mac_test.linux_runner import output_free_bytes",
+            "print(f'{output_free_bytes(Path(sys.argv[1])) / 1024 ** 3:.6f}')",
+        ))),
+        '  free_gib=$(python3 -c "$capacity_code" "$checkout") || { printf \'disk capacity unavailable\\n\' >&2; exit 1; }',
+        'else',
+        '  disk_usage=$(df -Pk "$checkout") || exit 1',
+        '  free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
+        'fi',
         'printf \'free_gib=%s\\nhost=%s\\n\' "$free_gib" "$(hostname -s)"',
         'rustc_version=$(rustc -V) || exit 1',
         'nextest_version=$(cargo nextest --version) || exit 1',
         'mend_version=$(cargo mend --version) || exit 1',
+        f'rustc_version=$(printf \'%s\' "$rustc_version" | {tool_version_filter()}) || exit 1',
+        f'nextest_version=$(printf \'%s\' "$nextest_version" | {tool_version_filter()}) || exit 1',
+        f'mend_version=$(printf \'%s\' "$mend_version" | {tool_version_filter()}) || exit 1',
         'scripts_commit=$(cat "$HOME/.claude/.build-target-script-commit") || exit 1',
         'printf \'rustc=%s\\nnextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
         + '"$rustc_version" "$nextest_version" "$mend_version" "$scripts_commit"',
@@ -243,6 +278,26 @@ SLOT_PROCESSES_UNRESOLVED = 3
 STARTUP_REFUSAL_RECORD = 'linux_startup=unresolved'
 
 
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """Public process fields that remain readable for non-dumpable processes."""
+
+    real_uid: int
+    parent: int
+    group: int
+    start_time: int
+    state: str
+
+
+def process_identity(pid: int, proc_root: Path) -> ProcessIdentity:
+    fields = process_fields(pid, proc_root)
+    status = (proc_root / str(pid) / 'status').read_text()
+    uid = re.search(r'^Uid:\s+(\d+)\b', status, re.MULTILINE)
+    if uid is None:
+        raise ValueError('process real UID is unavailable')
+    return ProcessIdentity(int(uid[1]), int(fields[1]), int(fields[2]), int(fields[19]), fields[0])
+
+
 def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
                           require_boot_identity: bool = False) -> SlotProcessSelection:
     """Read each ownership source independently before deciding uncertainty."""
@@ -256,32 +311,43 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
     uncertain: set[int] = set()
     root = mirror.resolve()
     own_pid = os.getpid()
+    own_uid = os.getuid()
+    identities: dict[int, ProcessIdentity] = {}
     for process in proc_root.glob('[0-9]*'):
         pid = int(process.name)
         try:
-            if process.stat().st_uid != os.getuid():
-                continue
-            fields = process_fields(pid, proc_root)
+            identities[pid] = process_identity(pid, proc_root)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
             uncertain.add(pid)
-            continue
-        if fields[0] in ('Z', 'X'):
+    # The checking process and its ancestors cannot be leftovers of a lost run.
+    checking_chain: set[int] = set()
+    ancestor = own_pid
+    while ancestor in identities and ancestor not in checking_chain:
+        checking_chain.add(ancestor)
+        ancestor = identities[ancestor].parent
+    for pid, identity in identities.items():
+        if identity.real_uid != own_uid or identity.state in ('Z', 'X'):
             continue
         if not isinstance(lease, UnmarkedSlot):
             if pid == lease['pid']:
-                if (int(fields[19]) != lease['start_time']
-                        or int(fields[2]) != lease['process_group']):
+                if (identity.start_time != lease['start_time']
+                        or identity.group != lease['process_group']):
                     raise ValueError('slot process identity changed')
                 selected.add(pid)
-                parents[pid] = int(fields[1])
+                parents[pid] = identity.parent
                 continue
-            if int(fields[19]) < lease['start_time']:
+            if identity.start_time < lease['start_time']:
                 continue
-        parents[pid] = int(fields[1])
-        if pid == own_pid:
+        if pid in checking_chain:
             continue
+        # Slot children keep their user; only an orphan can acquire a root parent (PID 1).
+        parent = identities.get(identity.parent)
+        if identity.parent != 1 and parent is not None and parent.real_uid != own_uid:
+            continue
+        parents[pid] = identity.parent
+        process = proc_root / str(pid)
         denied = False
         try:
             command = (process / 'cmdline').read_bytes().split(b'\0')
@@ -564,6 +630,30 @@ def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
         return 75
 
 
+def output_filesystem_paths(checkout: Path) -> tuple[Path, ...]:
+    """Resolve the checkout and its Cargo output filesystems."""
+    outputs = read_cargo_output_roots(checkout)
+    if isinstance(outputs, CargoOutputUnavailable):
+        if not (checkout / "Cargo.toml").exists():
+            return (checkout,)
+        raise OSError(outputs.reason)
+    return (checkout, outputs.target_directory, outputs.build_directory)
+
+
+def output_free_bytes(checkout: Path) -> int:
+    readings: list[int] = []
+    for path in output_filesystem_paths(checkout):
+        while True:
+            try:
+                readings.append(shutil.disk_usage(path)[2])
+                break
+            except FileNotFoundError:
+                if path == path.parent:
+                    raise
+                path = path.parent
+    return min(readings)
+
+
 def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
     """Use the existing budget sweep without the machine-wide disk sweep."""
     code = '\n'.join((
@@ -572,9 +662,14 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
         "sys.path.insert(0, str(Path.home() / '.claude/scripts/lint'))",
         'import sweep',
         'import conf',
-        'config = conf.path("lint")',
-        'recent_seconds = int(conf.read(config).number(sweep.RECENT_KEY) * 60)',
-        'sys.exit(sweep.sweep_workspace(sys.argv[1], str(config), False, recent_seconds / 60))',
+        'config = conf.read(conf.path("lint"))',
+        'recent_seconds = int(config.number(sweep.RECENT_KEY) * 60)',
+        'import os',
+        'target = Path(sys.argv[1])',
+        'checkout = Path(os.environ["BUILDLOG_WORKSPACE"])',
+        'os.chdir(checkout)',
+        'selected = None if (checkout / "Cargo.toml").is_file() else str(target)',
+        'sys.exit(sweep.sweep_workspace(selected, config, False, recent_seconds / 60))',
     ))
     return subprocess.run([sys.executable, '-c', code, str(target)],
                           env={**os.environ, **environment}, check=False).returncode
@@ -628,6 +723,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         'BUILDLOG_PINNED_TARGET': values.get('pinned_target', ''),
         'BUILDLOG_SYNC': '0', 'LINT_SKIP_SWEEP': '1',
         'CARGO_TARGET_DIR': str(target),
+        'BUILDLOG_WORKSPACE': str(mirror),
     }
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
@@ -637,11 +733,11 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     parity: list[str] = ["mismatches=()"]
     for name, invocation in (('rustc', 'rustc -V'), ('nextest', 'cargo nextest --version'),
                              ('mend', 'cargo mend --version')):
-        expected = values.get(f'parity.{name}', '')
+        expected = normalize_tool_version(values.get(f'parity.{name}', ''))
         if expected:
             parity.extend([
                 f'actual=$({invocation} 2>/dev/null) || actual=unavailable',
-                "actual=${actual//$\'\\n\'/ }",
+                f'actual=$(printf \'%s\' "$actual" | {tool_version_filter()}) || exit 75',
                 f'if [ "$actual" != {shlex.quote(expected)} ]; then',
                 f'  mismatches+=("{name} box=$actual natedev="{shlex.quote(expected)})',
                 'fi',
@@ -672,11 +768,11 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
         step_started = started.exists()
     try:
-        free = shutil.disk_usage(mirror).free / (1024 ** 3)
+        free = output_free_bytes(mirror) / (1024 ** 3)
         if free < floor:
             if target.exists():
                 shutil.rmtree(target)
-            cleanup = '0'
+            cleanup = '0' if trim_build_folder(target, environment) == 0 else '1'
         else:
             trimmed = trim_build_folder(target, environment)
             cleanup = 'kept' if trimmed == 0 else '1'

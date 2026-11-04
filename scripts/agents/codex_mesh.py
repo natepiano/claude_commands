@@ -88,6 +88,7 @@ from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMa
 from scripts.direct import plan_history
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 from scripts.agents import worker_lifecycle
+from scripts.lib.agent_scope import agent_scope_prefix
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
 from scripts.lib import build_folders, nix_env, process_group, unit_runs
@@ -3054,6 +3055,9 @@ def _start_server(
     session_dir: str, workers_home: Path, dev_shell: ServerDevShell = _INHERITED_SERVER_ENVIRONMENT,
 ) -> int:
     """Start this session's app-server and record it. The caller holds the server lock."""
+    prefix, unavailable = agent_scope_prefix()
+    if unavailable:
+        _log_server(session_dir, "agent scope unavailable: " + " ".join(unavailable.splitlines()))
     while True:
         chosen = _free_port()
         log_path = _session_path(session_dir, SERVER_LOG)
@@ -3084,7 +3088,8 @@ def _start_server(
         try:
             with log_path.open("ab") as log_handle:
                 process = subprocess.Popen(
-                    command,
+                    # A scope executes the server in place, so its PID remains the recorded PID.
+                    [*prefix, *command],
                     stdout=subprocess.DEVNULL,
                     stderr=log_handle,
                     start_new_session=True,

@@ -58,9 +58,38 @@ advertises a model alias that `[claude.agents]` does not yet list.
 
 `[claude.context]` is the fourth layer: `default=<window>` plus one
 `<family>=<first version>:<window>` row per Claude family (`opus=4.7:1m`). The
-context-usage hooks read it to place the auto-compaction trigger they warn
-against; nothing in the hook scripts names a model. A new family, or a family
+context-usage hooks read it to calculate the auto-compaction trigger.
+The per-call message uses `context_usage.conf`. A new family, or a family
 whose first 1M release changes, is a row here.
+
+## codex_daemon.conf
+
+`agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
+Both callers read the value when they use it.
+
+## context_usage.conf
+
+`message = off` disables the per-call context message for main threads and subagents.
+`on` enables the existing thresholds and messages.
+A missing file, missing key, or invalid value means `on`.
+The hook reads the file on each call through `scripts.lib.conf`.
+Tests select a temporary config folder with `CONF_DIR`.
+The hook still reads the transcript and writes its debug log.
+Compaction runs by itself during work.
+
+## context_deferral.conf
+
+Each non-comment line uses `kind: value`; `#` starts a comment.
+`window` sets the maximum region length in characters, after whitespace is collapsed.
+`action`, `marker`, `state`, `later`, and `exclude` hold case-insensitive regular expressions.
+The hook joins the expressions of each kind with `|`.
+It blocks an `action` with a `marker`, or an `action` with both a `state` and a `later` phrase.
+Each region must fit the window and contain no `exclude` match.
+`window`, `action`, and `exclude` are required; absent `marker`, `state`, or `later` entries disable their rule.
+`stop-context-deferral.py` reads this file at each stop through the same `CONF_DIR` folder selection.
+The hook removes code, paired quotations, and block quotes, including continuation lines, before it collapses whitespace.
+It blocks once with exit 2 and permits a stop with `stop_hook_active` set.
+A missing file, invalid entry, or hook error permits the stop without output.
 
 ## lint.conf
 
@@ -88,6 +117,125 @@ config decides whether a check runs, never with what flags.
 call `lint_config_enabled <op>` (plus `lint_config_skip_notice <op> <what>` for
 the SKIPPED line), or run it as the `/lint_config` CLI.
 
+
+The folder audit and build sweep also read these settings through `scripts/lib/conf.py`.
+The `folder_*` keys control the folder audit. The `sweep_*` keys control the build sweep.
+
+| Key | Meaning |
+| --- | --- |
+| `folder_min_age_seconds` | Minimum idle time before the audit names a loose folder. |
+| `folder_remove_after_seconds` | Shared idle time for loose folders and ordinary temporary folders. |
+| `folder_idle_depth` | Maximum folder depth for the idle scan. |
+| `folder_idle_entry_limit` | Maximum entries in one idle scan. |
+| `folder_rg_files_per_call` | Maximum transcript files in one search. |
+| `folder_start_lines` | Maximum transcript lines for the session start time. |
+| `folder_start_bytes` | Maximum bytes in one transcript start line. |
+| `folder_state_dir` | State folder for the daily folder audit. |
+| `sweep_doc_index_mib` | Maximum size of the rustdoc merge index in MiB. |
+| `sweep_proc_locks_reads` | Number of process lock reads before a lock is absent. |
+| `sweep_dep_info_head_bytes` | Maximum bytes read from a dependency file header. |
+| `sweep_max_tree_depth` | Maximum depth for Cargo build tree discovery. |
+| `sweep_free_floor_percent` | Free-space floor on other build filesystems, in percent (20). |
+| `sweep_floor_roots` | Roots for Cargo target discovery. |
+| `sweep_ci_targets` | CI targets measured outside the removable roots. |
+| `sweep_growth_window_seconds` | Maximum interval for a disk growth comparison. |
+| `sweep_snapshot_max_age_seconds` | Maximum age of a current disk snapshot. |
+| `sweep_alert_interval_seconds` | Minimum interval between disk alerts. |
+| `sweep_push_text_limit` | Maximum length of a phone alert. |
+| `sweep_page_paths` | Maximum paths in a phone alert. |
+| `sweep_unexplained_fall_bytes` | Unexplained disk loss that triggers an alert. |
+| `sweep_large_removal_bytes` | Removed bytes that trigger an alert. |
+| `sweep_floor_search_depth` | Maximum folder depth for target discovery. |
+| `sweep_sender_timeout_seconds` | Maximum time passed to the session sender. |
+| `sweep_holder_lookback_seconds` | Use window before a build hold starts. |
+| `sweep_delete_stamp_grace_seconds` | Use stamp tolerance after a sweep deletion. |
+| `sweep_history_timeout_seconds` | Maximum time to read build history. |
+| `sweep_cold_crates` | Minimum compiled crates for a cold rebuild. |
+| `sweep_message_path_widths` | Alert path widths. The first width is the default. |
+| `sweep_message_limit` | Maximum length of a session alert. |
+| `sweep_measurement_paths` | Maximum disk measurement paths in an alert. |
+| `sweep_floor_skip` | Folder names excluded from target discovery. |
+| `sweep_scan_workers` | Maximum concurrent target scans. |
+
+Floor records and `floor.lock` use `tmp_sweep.state_dir()`.
+Disk measurements and build history use `scripts/buildlog/store.py::root()`.
+
+## hana_instances.conf
+
+`scripts/hana_instances/hana_instances.py` reads these settings through `scripts/lib/conf.py` on each invocation.
+`CONF_DIR` selects the configuration folder, including temporary test folders.
+An exempt port still identifies a test Hana when the process has test labels or an agent environment.
+Mac host and SSH settings remain in `mac_test.conf`.
+
+| Key | Meaning |
+| --- | --- |
+| `exempt_ports` | User and demo Hana ports, separated by commas. |
+| `test_max_hours` | Maximum age of a labelled test Hana. |
+| `unlabelled_max_minutes` | Maximum age of a test Hana without labels. |
+| `stop_grace_seconds` | Time between TERM and KILL. |
+| `clone_max_hours` | Maximum idle age of a test clone. |
+
+
+## scratch.conf
+
+`scripts/lib/scratch.py` reads these settings through `scripts/lib/conf.py`.
+`CONF_DIR` selects the configuration folder. Values retain the previous defaults.
+
+| Key | Meaning |
+| --- | --- |
+| `visible_root` | Root for visible scratch folders. |
+| `holds_file` | File that records scratch holds. |
+| `default_life_seconds` | Lifetime of a scratch folder without an explicit task. |
+| `repo_depth` | Maximum folder depth for the repository scan. |
+| `suffix_length` | Number of random characters in a scratch folder name. |
+| `repo_skip` | Folder names excluded from repository scans and folder audit scans. |
+| `record_lock_attempts` | Maximum attempts to lock a changing copy folder. |
+
+
+## hana_shot.conf
+
+`scripts/hana_shot/hana_shot.py` reads these settings through `scripts/lib/conf.py`.
+`CONF_DIR` selects the configuration folder. Values retain the previous defaults.
+
+| Key | Meaning |
+| --- | --- |
+| `refused_port` | Port reserved for the user Hana. |
+| `host` | Local address for BRP calls. |
+| `call_timeout_seconds` | Maximum time for a BRP call. |
+| `capture_timeout_seconds` | Maximum time for a screenshot capture. |
+| `copy_timeout_seconds` | Maximum time to copy a screenshot. |
+| `settle_seconds` | Maximum time for the camera to become stable. |
+| `unchanged_frames` | Frames required when the camera does not move. |
+| `window_frames` | Frames required after a window change. |
+| `resend_seconds` | Maximum interval for a capture retry. |
+| `setup_seconds` | Maximum time for a setup target to appear. |
+| `ready_seconds` | Maximum time for the ready log line. |
+| `warm_frame_ms` | Maximum frame time before a capture. |
+| `warm_seconds` | Maximum time to wait for warm frames. |
+| `black_maximum` | Maximum pixel value treated as a black capture. |
+| `max_margin` | Maximum clear viewport fraction on each side. |
+| `shot_directory_bytes` | Maximum retained screenshot bytes. |
+| `max_age_seconds` | Maximum age of a retained screenshot. |
+| `workers` | Maximum concurrent capture operations. |
+| `remote_awake_seconds` | Maximum remote display wake time. |
+| `local_awake_seconds` | Maximum local display wake time. |
+| `minimum_frame_seconds` | Minimum delay between frame samples. |
+| `default_frame_ms` | Frame time when diagnostics have no value. |
+| `margin_probe` | Viewport margin change for a fit probe. |
+| `selector_suggestions` | Maximum selector suggestions. |
+| `git_timeout_seconds` | Maximum time for a Git identity query. |
+| `git_status_seconds` | Maximum time to inspect uncommitted build paths. |
+| `port_probe_seconds` | Maximum time for a port probe. |
+| `poll_seconds` | Delay between process readiness checks. |
+| `shutdown_call_seconds` | Maximum time for the shutdown BRP call. |
+| `shutdown_seconds` | Maximum time to wait for a Hana exit. |
+| `signal_grace_seconds` | Time after a shutdown signal. |
+| `panic_context_lines` | Maximum lines per panic excerpt. |
+| `panic_max_lines` | Maximum panic excerpt lines. |
+| `dirty_path_limit` | Maximum dirty build paths in a label. |
+| `fit_iterations` | Maximum iterations when measuring the current margin. |
+| `default_margin` | Default clear viewport fraction on each side. |
+
 ## mac_test.conf
 
 Controls Mac test offload and the `/build:mac` block command. It names the CI
@@ -99,6 +247,12 @@ and repository size limits for each Mac mirror's build folder,
 Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
+
+The Mac floor sweep reads `sweep_floor_gib=150` from this file.
+The value must meet `free_floor_gib`. A missing or lower floor refuses the pass.
+`sweep_floor_roots` names `/tmp`, `~/rust`, and `~/.local/state/mac-test/mirror`.
+Only marked build output and mirrors inside these roots are eligible.
+The on-demand command and the future timer use `sweep.py --floor-only --host mac`.
 
 ## aws_target.conf
 
@@ -443,3 +597,37 @@ A selected known_hosts file requires strict host key checking for SSH and rsync.
 The proof creates a managed scratch home and a tiny Rust fixture.
 It uses private memory files and executes test, check, and staged doc in one warm slot.
 It removes the scratch home when the proof ends. Automated tests never execute this proof.
+
+## production.conf
+
+The production launch scripts read these settings through the shared reader at use.
+Smoke launches read `host` and `refused_port` from `hana_shot.conf`.
+Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
+`CONF_DIR` selects another configuration folder.
+
+| Key | Default | Use |
+| --- | --- | --- |
+| `mac_run_hold_seconds` | `60` | Default time for the main Hana run. |
+| `mac_run_host` | `natemccoy@mac` | SSH destination for the Mac run. |
+| `mac_run_port` | `15710` | BRP port for the Mac run. |
+| `mac_run_log` | `/tmp/mac_run_hana.log` | Remote log for the main Hana run. |
+| `mac_run_launch` | `/tmp/mac_run_hana.command` | Remote Terminal command for the Mac run. |
+| `mac_run_status` | `/tmp/mac_run_hana.status` | Remote exit record for the Mac run. |
+| `mac_run_example_seconds` | `20` | Time for each demo example. |
+| `mac_run_claim_seconds` | `600` | Maximum time to wait for the Mac claim. |
+| `mac_run_deployment_target` | `14.0` | Minimum macOS version for the test build. |
+| `mac_run_status_grace_seconds` | `60` | Extra time to wait for the exit record. |
+| `mac_run_poll_seconds` | `1` | Delay between exit record checks. |
+| `mac_run_log_lines` | `20` | Maximum main log lines after an early exit. |
+| `mac_run_example_log_lines` | `10` | Maximum example log lines after an early exit. |
+| `mac_run_bundle` | `/tmp/mac_run.bundle` | Remote Git bundle for the Mac run. |
+| `mac_run_example_log_prefix` | `/tmp/mac_run_` | Remote log prefix for each demo example. |
+| `mac_run_source` | `~/rust/hana` | Remote repository for the scratch clone. |
+| `mac_run_examples` | `hana_diegetic typography;hana_diegetic units;hana_diegetic widgets;hana_diegetic diegetic_text_stress;hana_conduit playground;hana_lagrange showcase fit_overlay;hana_liminal all_modes;hana_valence staggered_unfold;hana_mimesis_tools show_beam` | Demo examples separated by semicolons. Each entry names a crate, example, and optional feature. |
+| `smoke_port` | `15790` | Default BRP port for a smoke launch. |
+| `smoke_ready_seconds` | `300` | Maximum time for BRP readiness. |
+| `smoke_exit_seconds` | `30` | Maximum time for a graceful exit. |
+| `smoke_connect_seconds` | `1` | Maximum time to connect to BRP. |
+| `smoke_call_seconds` | `5` | Maximum time for a BRP request. |
+| `smoke_signal_grace_seconds` | `2` | Delay after the termination signal. |
+| `smoke_poll_seconds` | `1` | Delay between readiness and exit checks. |

@@ -41,11 +41,17 @@ build_hold_nothing_held() {
 # no call record.
 BUILDLOG_HOLD_CALL_ID="${BUILDLOG_HOLD_CALL_ID:-}" BUILDLOG_HOLD_CALLER=""
 
+# Linux target slots and their build budget provide admission on the target.
+buildlog_target_admitted() {
+    [[ "${BUILDLOG_CALLER:-}" == verify-linux ]]
+}
+
 # Status 0 when natedev's hold applies to this step's caller. The Mac leg of a
 # test (verify-mac) and every run on the Mac answer to the Mac's claims, not
 # to natedev's hold. Other callers ask the check when the fast path cannot
 # prove that the holder directory is empty.
 build_hold_applies() {
+    buildlog_target_admitted && return 1
     if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then return 0; fi
     [[ "${BUILDLOG_CALLER:-}" != verify-mac && "${OSTYPE:-}" != darwin* ]] || return 1
     return 0
@@ -150,7 +156,7 @@ buildlog_wait_for_memory() {
     local -
     set -o pipefail
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
-    if [[ "${OSTYPE:-}" == darwin* && -z "${BUILDLOG_MEMINFO+x}" ]]; then
+    if buildlog_target_admitted || [[ "${OSTYPE:-}" == darwin* && -z "${BUILDLOG_MEMINFO+x}" ]]; then
         BUILDLOG_MEM_OUTCOME=Granted
         return 0
     fi

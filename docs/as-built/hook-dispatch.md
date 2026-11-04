@@ -26,15 +26,15 @@ their old order; push-delivered runs last, for PushNotification only.
 | `pre_tool_use` | heredoc-guard, tool-output-read, showrunner-move-guard, change-review-gate, checkpoint-doc-gate | `Bash` |
 | | scratch-guard (10 s) | `Bash\|Write\|NotebookEdit` |
 | `post_tool_use` | basedpyright, fn-length | `Edit\|MultiEdit\|Write` |
-| | context-usage, banned-words | all tools |
+| | context-usage (message off in `config/context_usage.conf`), banned-words | all tools |
 | | push-delivered | `PushNotification` |
-| `stop` | conversation-pause, prose-banned-words, herdr_tab_title | — |
+| `stop` | conversation-pause, prose-banned-words, context-deferral (10 s), herdr_tab_title | — |
 
 `settings.json` has one dispatcher entry per event:
 
 - PreToolUse: matcher `Bash|Write|NotebookEdit`, timeout 3040 s.
 - PostToolUse: no matcher, timeout 2430 s.
-- Stop: no matcher, timeout 1830 s.
+- Stop: no matcher, timeout 1840 s.
 
 Each outer timeout covers the largest sum of hook budgets that match one tool, plus 30 s of
 dispatcher overhead, so every hook keeps its full budget.

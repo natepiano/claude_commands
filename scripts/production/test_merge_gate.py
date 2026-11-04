@@ -14,6 +14,7 @@ from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.lib import scratch
 from scripts.production import change_review, merge_gate, staff
 from scripts.lint import memory_admit
 from scripts.production.test_change_review import ProducerFixture
@@ -56,7 +57,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
             self.assertEqual(repo, checkout)
-            with (repo / ".claude-busy").open("a") as contender:
+            with scratch.busy_path(repo).open("a") as contender:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(contender, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -71,7 +72,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         excludes = (checkout / ".git/info/exclude").read_text().splitlines()
         self.assertEqual(excludes.count("/.claude-busy"), 1)
         self.assertEqual(excludes.count("/.scratch.json"), 1)
-        with (checkout / ".claude-busy").open("a") as contender:
+        with scratch.busy_path(checkout).open("a") as contender:
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_checkpoint_names_its_unit_before_admission_and_suites(self) -> None:
@@ -205,8 +206,10 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertRegex(result.stdout, r"(?m)^hooks: OK \d+\.\d+s$")
         self.assertNotRegex(result.stdout, r"(?m)^tests:")
         launches = [call for call in self.calls() if call["tool"] == "suite-python"]
-        folders = [call["args"][call["args"].index("-s") + 1] for call in launches]
-        self.assertCountEqual(folders, [str(nested.parent), str(nested.parent.parent)] * 2)
+        runner = str(merge_gate.RUNNER)
+        self.assertCountEqual([call["args"] for call in launches],
+                              [[runner, str(folder), nested.name]
+                               for folder in (nested.parent, nested.parent.parent)] * 2)
         self.assertTrue(all(call["cwd"] == str(self.checkout) for call in launches))
         timings = merge_gate.read_measures(self.state / "runner" / "module_seconds.json")
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
@@ -462,8 +465,12 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertRegex(result.stdout, r"(?m)^Largest module peak: [\d.]+ GiB \(sampled memory\); module: (?:\w+/test_\w+\.py|\(not sampled\))$")
         launches = [call for call in self.calls() if call["tool"] == "suite-python"]
         self.assertEqual(len(launches), self.module_count)
+        runner = str(merge_gate.RUNNER)
+        expected = [[runner, str(self.checkout / "scripts" / suite), "test_first.py"] for suite in self.suites]
+        if "lib" in self.suites:
+            expected.append([runner, str(self.checkout / "scripts/lib"), "test_second.py"])
+        self.assertCountEqual([call["args"] for call in launches], expected)
         for call in launches:
-            self.assertIn("discover", call["args"])
             self.assertEqual(call["cwd"], str(self.checkout))
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
         self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))

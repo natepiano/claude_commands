@@ -25,12 +25,19 @@ from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
+from scripts.lib import conf
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 DAY = 86_400
 LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
 ENDED_SESSION = "66666666-7777-8888-9999-000000000000"
 WORKER_SESSION = fixture_runtime_id("tmp-sweep-worker")
 PROJECT = "-home-natepiano-rust-hana"
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(fake_cargo_output_roots())
 
 
 def write(path: Path, text: str = "x" * 4096) -> Path:
@@ -90,6 +97,7 @@ class TmpSweepCase(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
             "BUILDLOG_DIR": str(base / "buildlog"),
+            **config_environment(base / "config"),
         })))
         self.now = time.time() + 2 * DAY
         _ = self.enterContext(mock.patch.object(tmp_sweep, "state_dir", return_value=self.state))
@@ -134,6 +142,22 @@ class TmpSweepCase(unittest.TestCase):
 
 class CopyTests(TmpSweepCase):
     now: float = 0.0
+
+    def test_unregistered_checkout_removal_uses_the_cargo_output_guard(self) -> None:
+        checkout = self.tmp / "old-checkout"
+        checkout.mkdir(parents=True)
+        events: list[str] = []
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            self.assertEqual(path, checkout)
+            self.assertEqual(saved, ())
+            self.assertTrue(path.exists())
+            events.append("guard")
+        entry = tmp_sweep.RemovableEntry(str(checkout), str(self.tmp), self.now, 0)
+        result = tmp_sweep.Sweep()
+        with mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean):
+            self.assertTrue(tmp_sweep.remove_idle_entry(entry, result, False))
+        self.assertEqual(events, ["guard"])
+        self.assertFalse(checkout.exists())
 
     def test_private_root_never_selects_the_live_copies_authority(self) -> None:
         authority_root = self.tmp.parent / "authority copies"
@@ -252,9 +276,10 @@ class CopyTests(TmpSweepCase):
         _ = write(path / copy_record.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
         original = tmp_sweep.remove_entry
         with (path / ".claude-busy").open("a") as holder:
-            def start_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
+            def start_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool,
+                                    *, scratch_settings: conf.ConfigRead) -> bool:
                 fcntl.flock(holder, fcntl.LOCK_SH)
-                return original(entry, result, dry_run)
+                return original(entry, result, dry_run, scratch_settings=scratch_settings)
             with mock.patch.object(tmp_sweep, "remove_entry", side_effect=start_before_remove):
                 _ = self.sweep()
         self.assertTrue(path.is_dir())
@@ -307,10 +332,11 @@ class CopyTests(TmpSweepCase):
         scratch.exclude_copy_metadata(path)
         original = tmp_sweep.remove_entry
 
-        def edit_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
+        def edit_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool,
+                              *, scratch_settings: conf.ConfigRead) -> bool:
             if entry.path == str(path):
                 _ = write(path / "ordinary", "unsaved work")
-            return original(entry, result, dry_run)
+            return original(entry, result, dry_run, scratch_settings=scratch_settings)
 
         with mock.patch.object(tmp_sweep, "remove_entry", side_effect=edit_before_remove):
             result = self.sweep()
@@ -335,6 +361,16 @@ class CopyTests(TmpSweepCase):
 
 
 class IdleTests(TmpSweepCase):
+    def test_unrecorded_folder_uses_the_shared_removal_age(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "lint.conf",
+                                 "folder_remove_after_seconds=86400\n")
+        output = write(self.tmp / "shots" / "image.png")
+
+        result = self.sweep()
+
+        self.assertFalse(output.parent.exists())
+        self.assertEqual([entry["path"] for entry in result.deleted], [str(output.parent)])
+
     def test_a_recent_entry_stops_the_scan_before_the_rest_is_loaded(self) -> None:
         folder = write(self.tmp / "large" / "recent").parent
         self.recent(folder / "recent")
@@ -1003,8 +1039,10 @@ class LogTests(TmpSweepCase):
         idle = write(self.tmp / "shots" / "1.png")
         run = tmp_sweep.run
 
-        def fixture_run(dry_run: bool, now: float) -> int:
-            return run(dry_run, now, self.roots(), str(self.proc))
+        def fixture_run(dry_run: bool, now: float, *, lint_settings: conf.ConfigRead,
+                        scratch_settings: conf.ConfigRead) -> int:
+            return run(dry_run, now, self.roots(), str(self.proc),
+                       lint_settings=lint_settings, scratch_settings=scratch_settings)
 
         with (mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
               mock.patch.object(tmp_sweep, "run", side_effect=fixture_run),

@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from typing import cast
 
+from scripts.direct.verify_mac_offload_test_support import CARGO_STUB
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     WaitObservation,
@@ -19,6 +20,36 @@ from scripts.direct.verify_hold_wait_test_support import (
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
+    def test_step_failure_with_hold_refusal_text_stays_a_failure(self) -> None:
+        hold_scripts = Path(__file__).resolve().parents[1] / "build_hold"
+        failing_step = f'''if arguments[:2] == ["nextest", "run"]:
+    failed = Path(os.environ["TEST_RUNNER_STATE"]) / "failed-once"
+    if not failed.exists():
+        failed.touch()
+        sys.path.insert(0, {str(hold_scripts)!r})
+        import build_hold
+        from datetime import datetime
+        build_hold.start_hold(
+            Path(os.environ["BUILD_HOLD_DIR"]), build_hold.HolderIdentity("hana", "hana"),
+            "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone(),
+        )
+        print("natedev builds and tests are held by hana for render checks; this run was stopped. "
+              "You get a notice at the release; run it again then.", file=sys.stderr)
+        raise SystemExit(9)
+'''
+        self.fixture.write_executable(
+            self.fixture.bin_directory / "cargo",
+            CARGO_STUB.replace('if arguments[:2] == ["nextest", "run"]:\n', failing_step),
+        )
+        with release_registered_call(self.cycle_file):
+            result = self.fixture.verify("test", "sample", "--local", "step failure", "--filter", "smoke")
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 9, output)
+        self.assertIn("this run was stopped", output)
+        self.assertNotIn("hold stopped this step", output)
+        self.assertNotIn("; waiting", output)
+        self.assertEqual(len(self.fixture.local_runs()), 1)
+
     def test_unheld_local_call_needs_no_release(self) -> None:
         result = self.fixture.verify("test", "sample", "--local", "local admission test", "--filter", "smoke")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

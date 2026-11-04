@@ -436,11 +436,10 @@ def authority_request(operation: str, payload: dict[str, object]) -> dict[str, o
     return _object(cast(object, json.loads(result.stdout)))
 
 
-def register_repository(repository_id: str, checkouts: dict[str, str], *, inventory_complete: bool = False) -> None:
+def register_repository(repository_id: str, checkouts: dict[str, str]) -> None:
     if not repository_id or not checkouts:
         raise RoleRefused('repository id and checkout mappings are required')
-    _ = authority_request('register', {'repository_id': repository_id, 'checkouts': checkouts,
-                                      'inventory_complete': inventory_complete})
+    _ = authority_request('register', {'repository_id': repository_id, 'checkouts': checkouts})
 
 
 def _authority_local(operation: str, payload: dict[str, object]) -> dict[str, object]:
@@ -455,10 +454,8 @@ def _authority_local(operation: str, payload: dict[str, object]) -> dict[str, ob
                 if not host or not isinstance(checkout, str) or not Path(checkout).is_absolute():
                     raise RoleRefused('checkout mappings must name absolute paths')
             previous = repositories.get(repository_id)
-            if previous is not None and previous != payload:
-                recorded = _object(previous)
-                if recorded.get('checkouts') != checkouts or recorded.get('inventory_complete') is True:
-                    raise RoleRefused('repository already registered; update its checkout mapping explicitly')
+            if previous is not None and _object(previous).get('checkouts') != checkouts:
+                raise RoleRefused('repository already registered; update its checkout mapping explicitly')
             repositories[repository_id] = payload
             _atomic(path, repositories)
             return payload
@@ -467,10 +464,8 @@ def _authority_local(operation: str, payload: dict[str, object]) -> dict[str, ob
             host = payload.get('host') or '<host>'
             raise RoleRefused(f'repository {repository_id} is not registered; run design_roles.py register '
                               + f'--repository {repository_id} --host {host} '
-                              + '--checkout <absolute path> --inventory-complete')
+                              + '--checkout <absolute path>')
         repository = _object(repository)
-        if repository.get('inventory_complete') is not True:
-            raise RoleRefused('legacy inventory incomplete; recovery required')
         checkouts = _object(repository.get('checkouts'))
         host = _text(payload, 'host')
         checkout = checkouts.get(host)
@@ -1437,7 +1432,6 @@ def main(argv: list[str]) -> int:
     _ = p.add_argument('--repository', required=True)
     _ = p.add_argument('--host', required=True)
     _ = p.add_argument('--checkout', required=True)
-    _ = p.add_argument('--inventory-complete', action='store_true')
     args = cast(dict[str, object], vars(parser.parse_args(argv)))
     def argument(key: str) -> str:
         return cast(str, args.get(key, ''))
@@ -1487,8 +1481,7 @@ def main(argv: list[str]) -> int:
         elif command == 'unbind-run':
             unbind_run(argument('run_directory'))
         elif command == 'register':
-            register_repository(argument('repository'), {argument('host'): argument('checkout')},
-                                inventory_complete=cast(bool, args['inventory_complete']))
+            register_repository(argument('repository'), {argument('host'): argument('checkout')})
         elif command == 'authority':
             config = configparser.ConfigParser()
             _ = config.read(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')

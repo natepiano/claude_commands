@@ -143,6 +143,14 @@ def read(path):
     except (OSError, ValueError):
         return {}
 
+if action == "admit":
+    try:
+        worker_admission.admit(name, root, role=pass_kind)
+    except worker_admission.AdmissionRefused as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(2)
+    raise SystemExit(0)
+
 with worker_claim_lock(root):
     identity_file = worker_record_path(root, name, slot, role=pass_kind)
     roster = read(root / "mesh_roster.json")
@@ -257,6 +265,7 @@ with worker_claim_lock(root):
 PY
 }
 
+worker_record admit
 "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
 mkdir -p "${ARTIFACT_DIR}"
 

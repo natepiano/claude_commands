@@ -36,7 +36,7 @@ class HostLoadUnavailable:
 class QueueModel:
     reading: gate.QueueRead
     labels: Mapping[str, UnitLabels]
-    facts: head_facts.HeadFacts | gate.NoWaiter
+    facts: head_facts.HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter
     pace: head_facts.RecordedPace | head_facts.PaceUnavailable
     zone: ZoneInfo
     load: HostLoad | HostLoadUnavailable
@@ -48,6 +48,11 @@ class QueueModel:
         return head_facts.queue_moves(self.reading, self.facts)
 
 
+def same_waiter(left: gate.WaitingStep, right: gate.WaitingStep) -> bool:
+    """Match a saved decision to its row even when display fields change."""
+    return left.pid == right.pid and left.since == right.since
+
+
 def step_checks(model: QueueModel, position: int) -> gate.HeadExplanation | gate.LineWaiter | gate.ReadingUnavailable:
     explanation = model.reading.explanation
     if isinstance(explanation.host, gate.ReadingUnavailable):
@@ -55,9 +60,9 @@ def step_checks(model: QueueModel, position: int) -> gate.HeadExplanation | gate
     step = model.reading.view.waiting[position - 1]
     if isinstance(step.reason, gate.ReadingUnavailable):
         return step.reason
-    if position == 1 and isinstance(explanation.head, gate.HeadExplanation):
+    if isinstance(explanation.head, gate.HeadExplanation) and same_waiter(explanation.head.waiter, step):
         return explanation.head
-    return next((item for item in explanation.line.steps if item.waiter == step),
+    return next((item for item in explanation.line.steps if same_waiter(item.waiter, step)),
                 gate.ReadingUnavailable("step admission checks unavailable"))
 
 
@@ -117,7 +122,7 @@ def is_moved(model: QueueModel, position: int) -> bool:
 
 
 def has_move_priority(model: QueueModel, position: int) -> bool:
-    return model.reading.ordered[position - 1][1].get("priority_rank", 1) == 0
+    return isinstance(gate.waiter_priority(model.reading.ordered[position - 1][1]), gate.PriorityUnit)
 
 
 def pressure_check(pressure: gate.Pressure, model: QueueModel) -> tuple[bool, str]:
@@ -138,8 +143,16 @@ def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUna
             check_line(checks.free.passes, queue_evidence.free_text(checks.free))]
 
 
+def eligible_head_position(waiting: Sequence[gate.WaitingStep]) -> int:
+    """Position of the first row eligible for the head rule; requires an eligible row."""
+    return next(place for place, step in enumerate(waiting, 1)
+                if not isinstance(step.reason, gate.TokenWaitingWaiter))
+
+
 def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) -> str:
     match reason:
+        case gate.TokenWaitingWaiter():
+            return "waiting for the cargo token"
         case gate.EstimateExpired():
             return "estimate expired"
         case gate.ReadingUnavailable():
@@ -151,7 +164,7 @@ def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) 
         case gate.NeedsMemory():
             return "free memory"
         case gate.BehindHead():
-            return "#1's turn"
+            return f"#{eligible_head_position(waiting)}'s turn"
         case gate.BehindOlderFit():
             place = next((place for place, step in enumerate(waiting, 1)
                           if step.session_id == reason.older_session_id and step.since == reason.older_since), 0)
@@ -159,7 +172,7 @@ def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) 
         case gate.ReadyForAdmission():
             return "starts at the next check"
         case gate.HeadAdmissionStatus():
-            return "#1's turn"
+            return f"#{eligible_head_position(waiting)}'s turn"
         case _:
             assert_never(reason)
 
@@ -182,9 +195,10 @@ def countdown(until: float, now: float) -> str:
 
 def head_status(model: QueueModel, budget: int) -> Line:
     head = model.reading.explanation.head
-    if isinstance(head, gate.NoWaiter):
+    if not isinstance(head, gate.HeadExplanation):
         return ()
-    recorded = bool(model.reading.ordered and "priority_since" in model.reading.ordered[0][1])
+    recorded = any(row["pid"] == head.waiter.pid and "priority_since" in row
+                   for _, row in model.reading.ordered)
     strict = head.has_priority and (not recorded or isinstance(head.order, gate.StrictUntil))
     room = gate.strict_room(budget, head.waiter.need)
     allows_room = strict and recorded and isinstance(head.order, gate.StrictUntil) and room > 0
@@ -287,6 +301,7 @@ def leftover_age(minutes: int) -> str:
 def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: str = "",
                 selector: str = "") -> list[Line]:
     explanation = model.reading.explanation
+    head = explanation.head
     budget_bytes = explanation.limits.budget
     budget = budget_bytes / gate.GIB
     taken = explanation.totals.charged / gate.GIB
@@ -318,8 +333,9 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     fixed = place_width + step_width + minutes_width + 5
     tail = max(terminal_width(plain([labels])), (bar_eighths(budget, budget) + 7) // 8,
                max((len(bar) + len(f" {step.need / gate.GIB:.1f}") +
-                    (terminal_width(plain([status])) if index == 0 else 0)
-                    for index, (step, bar) in enumerate(zip(waiting, bars))), default=0))
+                    (terminal_width(plain([status]))
+                     if isinstance(head, gate.HeadExplanation) and same_waiter(head.waiter, step) else 0)
+                    for step, bar in zip(waiting, bars)), default=0))
     show_width, unit_width = 12, 10
     room = columns - fixed - tail
     if columns > 60:
@@ -385,9 +401,10 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     for index, (step, pair, bar) in enumerate(zip(waiting, waiting_names, bars)):
         row = (*identity_columns(str(index + 1), step.step, pair, str(age(step.since, explanation.now)),
                                 "▸" if you and step.session_id == you else " "),
-               Span(bar, "warning"), Span(f" {step.need / gate.GIB:.1f}", "warning" if index == 0 else "inactive"))
-        lines.append((*row, *status) if index == 0 else row)
-    head = explanation.head
+               Span(bar, "warning"), Span(f" {step.need / gate.GIB:.1f}", "warning" if isinstance(head, gate.HeadExplanation) and same_waiter(head.waiter, step) else "inactive"))
+        lines.append((*row, *status) if isinstance(head, gate.HeadExplanation) and same_waiter(head.waiter, step) else row)
+    if isinstance(head, gate.TokenWaitersOnly):
+        lines.extend([(), (Span("All waiting steps are waiting for the cargo token."),)])
     if isinstance(head, gate.HeadExplanation) and head.decision.state == "hold":
         lines.append((Span(f"Head: free {head.free.available / gate.GIB:.1f} GiB; "
             + f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need {head.free.need / gate.GIB:.1f} GiB"),))
