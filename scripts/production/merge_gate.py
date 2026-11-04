@@ -50,6 +50,7 @@ import stat
 import statistics
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 from typing import Literal, TextIO, cast
@@ -58,6 +59,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+from scripts.notify.pushover import API_HOST
 from scripts.copies import copies
 from scripts.lib import build_folders
 from scripts.production import change_review  # noqa: E402
@@ -115,7 +118,7 @@ LIVE_ROOTS = (str(Path.home().resolve()),
 LIVE_PUSH_KEYS = tuple(str(path.resolve()) for path in (
     Path(LIVE_ROOTS[0]) / ".config/pushover/env",
     Path(os.environ.get("XDG_CONFIG_HOME") or Path(LIVE_ROOTS[0]) / ".config") / "pushover/env"))
-# Python children inherit this hook through PYTHONPATH, including launcher children.
+# Python children load this hook from the module's private user site.
 SUITE_GUARD = r'''import os, sys
 from urllib.parse import urlsplit
 
@@ -135,7 +138,7 @@ def refuse_external_effect(event, args):
         host = args[1][0] if isinstance(args[1], tuple) else ""
     else:
         host = ""
-    if isinstance(host, str) and host.lower().rstrip(".") == "api.pushover.net":
+    if isinstance(host, str) and host.lower().rstrip(".") == push_host:
         refuse("test refused a Pushover push: " + host)
     writing = True
     if event == "open":
@@ -710,20 +713,20 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started = time.monotonic()
     try:
         if kind is GateJobKind.TEST_MODULE:
-            root = log.parent
+            root = Path(tempfile.mkdtemp(prefix="roots-", dir=log.parent))
             home, state, claude, config = (root / name for name in ("home", "state", "claude", "config"))
             for folder in (home, state, claude, config):
                 folder.mkdir()
-            guard = root / "python-startup"
-            guard.mkdir()
+            userbase = home / ".local"
+            guard = Path(sysconfig.get_path("purelib", "posix_user", vars={"userbase": str(userbase)}))
+            guard.mkdir(parents=True)
             _ = (guard / "sitecustomize.py").write_text(
                 f"live_roots = {LIVE_ROOTS!r}\npush_keys = {LIVE_PUSH_KEYS!r}\n"
-                + f"marker = {str(root / 'refused-effects')!r}\n" + SUITE_GUARD)
+                + f"push_host = {API_HOST!r}\nmarker = {str(log.parent / 'refused-effects')!r}\n" + SUITE_GUARD)
             environment = {**environment, "HOME": str(home), "XDG_STATE_HOME": str(state),
                            "XDG_CONFIG_HOME": str(config), "SCRATCH_ROOT": str(claude / "scratch"),
-                           "PYTHONDONTWRITEBYTECODE": "1",
-                           "PYTHONPATH": str(guard) + os.pathsep + environment.get("PYTHONPATH", "")}
-            for name in ("PUSHOVER_USER", "PUSHOVER_TOKEN"):
+                           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUSERBASE": str(userbase)}
+            for name in ("PUSHOVER_USER", "PUSHOVER_TOKEN", "PYTHONNOUSERSITE"):
                 _ = environment.pop(name, None)
         process = subprocess.Popen([sys.executable, "-c", SUITE_BOOTSTRAP, *argv],
                                    cwd=repo, env=environment, stdin=subprocess.DEVNULL,
