@@ -221,16 +221,56 @@ Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the ha
 
 The user, 2026-11-03: tables do not work for them. Lower priority. Design a chart view of the build history (costs and phase time over time, each build change marked). Design first; the build waits for the user's go.
 
-Constraints from Phase 7 (the design must answer each one):
+#### As-built
 
-1. Buckets: `costs.collect_costs()` pairs reruns and Mac execution only inside one window. One call per bucket loses reruns across a bucket edge and earlier Mac runs that overlap later waits. Pair in one continuous pass, then split into buckets. Name the interval edges and add test fixtures that cross an edge.
-2. Uncertainty: keep the Mac idle upper bound and its unknown part (`MacIdleEstimate`), missing phase times and unavailable per-phase costs visible in each chart. Never show them as zero. Test each state.
-3. Readers: reuse `moments.progress_events()` and the costs readers. Read history once per chart set, read-only. Set a measured speed limit for the full series.
-4. Do not restore `/build:report`.
+- Design: `docs/plans/builds-report-charts-design.md`. The user said "go" on 2026-11-03, relayed by builds.
+- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html` and opens it. The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
+- Charts: hana phase time (daily median and p90), costs by cause as small multiples, and costs by machine. Each has numbered moment lines, a crosshair tooltip and a table view.
+- `costs.py` is the shared cost reader for `buildlog costs` and `buildlog charts`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
+- `index.py` `COST_INDEXES` (made in `create_schema` and `open_for_update`) give indexed window reads instead of whole-table scans.
+- Speed, as process CPU time (user+sys): 7 days 0.60–0.71 s (limit 1.5 s); 30 days 1.76–1.82 s (limit 3 s).
+- The fresh design check found two label defects; Phase 10 fixes them.
 
-Design: `docs/plans/builds-report-charts-design.md`. The user, 2026-11-03, relayed by builds: "go" on the browser page. Build it as designed: `buildlog charts`, daily buckets, 7-day default, start-based cost attribution.
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/index.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_index.py`, `docs/plans/builds-report-charts-design.md`.
 
 ### Phase 9 — Round 1: find why natedev rebuilds cold  · status: done
 **Depends on:** Phase 7
 
 Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second largest cost. Find the cause before a fix. Query the index for cold steps: worktree, target folder, and the event before each (new clone, branch switch, toolchain or flag change, sweep deletion). Write the cause with counts and hours to `docs/plans/builds-report-rounds.md`, then send it to the showrunner, which names the owner. No code changes.
+
+### Phase 10 — Chart labels do not collide  · status: todo
+**Depends on:** Phase 8
+
+The fresh design check of the Phase 8 shots (dataviz label rules) found two defects on the `buildlog charts` page:
+
+1. The moment numbers above each of the six cost panels sit on the panel title (for example "2 1" over "Memory wait · h/day"). Keep the numbers clear of every panel title, at desktop and phone width.
+2. Costs by machine: the mac and CI lines are both 0, so the CI line hides the mac line. The end labels move apart to avoid each other, so "mac" sits beside the natedev line end and "natedev" sits far above it. Each end label must sit beside its own line end, or the chart must name the series in another clear way; a line hidden under another must stay visible (dataviz: 2px surface ring on overlapping marks).
+
+Acceptance: new tests in `scripts/buildlog/test_charts.py` pin both rules (no moment number box overlaps a panel title box; each end label is nearest its own line end). Fresh shots at 1280 px light and dark and at 500 px, judged once more under the dataviz rules.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/test_charts.py`.
+
+### Phase 11 — Every build step records its real target folder  · status: todo
+**Depends on:** none (runs beside Phase 10)
+
+The builds showrunner, 2026-11-03: add-on 1 is current and belongs to report-unit (its Units row owns `scripts/buildlog/`, the build log and its writer). Phase 9 found that 1,399 of 1,517 cold natedev steps in 7 days have no absolute target folder (678 `unknown`, 721 unset). Cold-cause rounds cannot tell which folder went cold.
+
+1. Every step the build log records carries its resolved absolute target folder.
+2. A step with no target folder records an explicit none state, never a blank or a missing field.
+3. One owner switches all callers: edit each caller that records a step (verify.sh call sites and any other). Tell verify-unit the exact lines before they are edited.
+
+Acceptance: tests pin the target folder for each step kind and the explicit none state. A live run of one step shows its folder in the index.
+
+**Files:** `scripts/buildlog/` (writer and index), each caller that records a step (found by search; `scripts/direct/verify.sh` first).
+
+### Phase 12 — A vault stop that waits on the user does not fail buildlog.service  · status: done
+**Depends on:** none (urgent bump from the builds showrunner, 2026-11-03)
+
+The user unit `buildlog.service` on natedev failed from 21:29 EST. The vault step stopped on uncommitted files in `~/rust/hanadocs` on the Mac and returned exit 1 (`vault_pull.py:310` returns 1 for every stop except "Mac unreachable"). The stop already alerts the user to commit or discard the files.
+
+1. A vault stop that waits on a user action, with its alert sent, exits 0 and keeps its printed stop line.
+2. A real failure (`command_failed`) still exits 1.
+
+Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command_failed`. The next hourly `buildlog.service` run ends without failure.
+
+**Files:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.
