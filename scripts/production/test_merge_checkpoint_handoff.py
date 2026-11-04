@@ -288,7 +288,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         checkpoint = self.checkpoint(relative="src/lib.rs", content="fn fixed() {}\n")
         refused = self.run_checkpoint(checkpoint)
         self.assertNotEqual(refused.process.returncode, 0)
-        self.assertIn("outside Owns: src/lib.rs", refused.process.stdout)
+        self.assertIn("outside responsibilities: src/lib.rs", refused.process.stdout)
         permitted = self.run_checkpoint(checkpoint, "--also", "src/lib.rs")
         self.assertEqual(permitted.process.returncode, 0, permitted.process.stdout + permitted.process.stderr)
         self.assertIn("scope: ok", permitted.process.stdout)
