@@ -947,7 +947,7 @@ class QueueTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "20"}):
             decision = memory_admit.decide(available, 60 * GIB, need,
                                            [memory_admit.MeasuredMemory(19 * GIB)],
-                                           pressure=memory_admit.MemoryPressure(23.4))
+                                           pressure=memory_admit.MemoryPressure(23.4, condition="full"))
         row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need, "since": NOW - 300}
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
                                        memory_admit.head_wait_reason(decision, need, available, row, NOW, policy=admission_policy_fixture()))

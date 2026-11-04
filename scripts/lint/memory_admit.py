@@ -16,7 +16,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Generator, Iterable, Iterator, Mapping
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -563,7 +563,7 @@ class MemoryPressure:
     some_avg10: float = 0.0
     swap_used_percent: float = 0.0
     next_start_at: float = 0.0
-    condition: Literal["full", "swap"] | PressureConditionNotRecorded = "full"
+    condition: Literal["full", "swap"] | PressureConditionNotRecorded = PressureConditionNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -2643,7 +2643,7 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -
     swap = 100 * max(0, host.swap_total - host.swap_free) / host.swap_total if host.swap_total else 0.0
     if swap > policy.pressure.swap_used_limit and some > policy.pressure.some_avg10_limit:
         return MemoryPressure(full, some, swap, condition="swap")
-    return MemoryPressure(full, some, swap) if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
+    return MemoryPressure(full, some, swap, condition="full") if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
 
 
 def read_recovery(directory: Path) -> RecoverySpacing:
@@ -2684,7 +2684,7 @@ def pressure_with_recovery(recovery: RecoverySpacing, pressure: Pressure, now: f
     if isinstance(pressure, MemoryPressure):
         return pressure
     if isinstance(recovery, RecoveryStarts) and now < min(recovery.ends_at, recovery.next_start_at):
-        return MemoryPressure(0, next_start_at=min(recovery.ends_at, recovery.next_start_at))
+        return MemoryPressure(0, next_start_at=min(recovery.ends_at, recovery.next_start_at), condition="full")
     return pressure
 
 
@@ -3569,24 +3569,13 @@ def parse_snapshot_value(value: object, schema: object) -> object:
             diagnostics.append({**main_diagnostic, "kind": "ConfigurationDiagnostic"})
         record = {name: item for name, item in record.items() if name != "fallbacks"}
         record["diagnostics"] = diagnostics
-    if schema is StepProfile and record.keys() == annotations.keys() - {"build_history_generation"} | {"kind"}:
-        record = {**record, "build_history_generation": snapshot_value(NoBuildHistoryGeneration())}
-    if schema is MemoryPressure:
-        # Remove this main-service compatibility after the admission cut-over.
-        main_pressure_fields = annotations.keys() - {"condition"} | {"kind"}
-        if record.keys() == main_pressure_fields:
-            record = {**record, "condition": snapshot_value(PressureConditionNotRecorded())}
-    if schema in (RunningStep, UnownedSliceMemory):
-        # Older services omit display evidence that these fields add.
-        for member in fields(schema):
-            if member.name not in record and member.name in ("activity", "run", "started_at"):
-                record = {**record, member.name: snapshot_value(member.default)}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
         raise ValueError("invalid snapshot record tag")
-    if record.keys() != annotations.keys() | {"kind"}:
+    if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING
+           for member in fields(schema)):
         raise ValueError("invalid snapshot record fields")
     return cast(Callable[..., object], schema)(**{name: parse_snapshot_value(record[name], kind)
-                                                for name, kind in annotations.items()})
+                                                for name, kind in annotations.items() if name in record})
 
 
 @dataclass(frozen=True)
