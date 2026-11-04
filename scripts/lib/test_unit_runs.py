@@ -7,13 +7,13 @@ import json
 import os
 import sys
 import tempfile
-import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, showrunner_relationship
 if TYPE_CHECKING:
     from scripts.message import sessions
 else:
@@ -21,7 +21,12 @@ else:
     import sessions
 
 
-class UnitRunsTest(unittest.TestCase):
+class UnitRunsTest(StaffTestCase):
+    def staff_owner(self, run: Path, session_id: str) -> None:
+        parent = showrunner_relationship("runs-fixture")
+        owner = fixture_member("unit", name="owner-" + session_id[:8], parent=parent.id, runtime_id=session_id)
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name}))
+
     def test_both_roots_are_read_the_new_name_first(self) -> None:
         self.assertEqual(unit_runs.run_roots(), (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate")))
         self.assertEqual(unit_runs.active_dirs(), (Path("/tmp/claude/unit/active"), Path("/tmp/claude/delegate/active")))
@@ -90,58 +95,6 @@ class UnitRunsTest(unittest.TestCase):
             self.assertIn("can go", shown.getvalue())
             self.assertTrue(marker.exists(), "removal-check only judges; it never unlinks")
 
-    def test_the_recorded_director_wins_over_the_session_that_started_the_run(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            run, history = Path(folder) / "run", Path(folder) / "history.jsonl"
-            run.mkdir()
-            self.assertEqual(unit_runs.director(run), "")
-            _ = history.write_text(json.dumps({"event_type": "run_started", "main_agent": {"session_id": "sid-start"}})
-                                   + "\n" + json.dumps({"event_type": "phase_started"}) + "\n")
-            # A pass opened inside a Codex worker rewrote the state's identity with its own thread.
-            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps(
-                {"history_file": str(history), "main_agent": {"session_id": "thread-worker"}}))
-            self.assertEqual(unit_runs.director(run), "sid-start")
-            unit_runs.record_director(run, "sid-now")
-            self.assertEqual(unit_runs.director(run), "sid-now")
-            self.assertEqual(sorted(path.name for path in run.iterdir()), [unit_runs.DIRECTOR_FILE, unit_runs.STATE_FILE])
-
-    def test_a_history_that_does_not_open_with_the_start_names_no_director(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            run, history = Path(folder) / "run", Path(folder) / "history.jsonl"
-            run.mkdir()
-            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"history_file": str(history)}))
-            self.assertEqual(unit_runs.director(run), "")
-            _ = history.write_text(json.dumps({"event_type": "phase_started", "main_agent": {"session_id": "sid"}}) + "\n")
-            self.assertEqual(unit_runs.director(run), "")
-            _ = (run / unit_runs.STATE_FILE).write_text("not json")
-            self.assertEqual(unit_runs.director(run), "")
-
-    def test_a_claude_worker_of_the_run_is_never_recorded_as_its_director(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            run = Path(folder)
-            unit_runs.record_director(run, "sid-director")
-            _ = (run / "impl_worker_impl.json").write_text(json.dumps(
-                {"slot": "impl", "family": "claude", "worker_id": "sid-claude-impl"}))
-            _ = (run / "impl_worker_fix.json").write_text(json.dumps(
-                {"slot": "fix", "family": "codex", "worker_id": "sid-codex-shaped"}))
-            _ = (run / "workers").write_text("sid-clau\tproj-test\n")
-            for worker in ("sid-claude-impl", "sid-claude-test"):
-                unit_runs.record_director(run, worker)
-                self.assertEqual(unit_runs.director(run), "sid-director")
-            unit_runs.record_director(run, "sid-codex-shaped")
-            self.assertEqual(unit_runs.director(run), "sid-codex-shaped")
-
-    def test_record_director_names_the_shell_session_and_skips_without_one(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            run = Path(folder)
-            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
-                self.assertEqual(unit_runs.main(["record-director", str(run)]), 0)
-            self.assertFalse((run / unit_runs.DIRECTOR_FILE).exists())
-            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-shell"}):
-                self.assertEqual(unit_runs.main(["record-director", str(run)]), 0)
-                self.assertEqual(unit_runs.main(["record-director", str(run / "missing")]), 0)
-            self.assertEqual((run / unit_runs.DIRECTOR_FILE).read_text(encoding="utf-8"), "sid-shell\n")
-            self.assertFalse((run / "missing").exists())
 
     def test_held_lists_the_marker_run_then_every_run_the_session_directs(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -149,21 +102,21 @@ class UnitRunsTest(unittest.TestCase):
             for run in (new / "run-marked", new / "run-side", new / "run-other", old / "run-former"):
                 run.mkdir(parents=True)
             active.mkdir()
-            _ = (active / "sid-me").write_text(f"{new / 'run-marked'}\n")
-            # The marker's run also records its director; it is listed once, first.
-            unit_runs.record_director(new / "run-marked", "sid-me")
-            unit_runs.record_director(new / "run-side", "sid-me")
-            unit_runs.record_director(new / "run-other", "sid-other")
-            unit_runs.record_director(old / "run-former", "sid-me")
+            _ = (active / fixture_runtime_id("sid-me")).write_text(f"{new / 'run-marked'}\n")
+            # Staff identifies the owner. The marker places the run first.
+            self.staff_owner(new / "run-marked", fixture_runtime_id("sid-me"))
+            self.staff_owner(new / "run-side", fixture_runtime_id("sid-me"))
+            self.staff_owner(new / "run-other", fixture_runtime_id("sid-other"))
+            self.staff_owner(old / "run-former", fixture_runtime_id("sid-me"))
             with patch.object(unit_runs, "RUN_ROOT", new), patch.object(unit_runs, "FORMER_RUN_ROOT", old):
-                self.assertEqual(unit_runs.held("sid-me", active_override=active), [
+                self.assertEqual(unit_runs.held(fixture_runtime_id("sid-me"), active_override=active), [
                     str(new / "run-marked"), str(new / "run-side"), str(old / "run-former")])
-                self.assertEqual(unit_runs.held("sid-other", active_override=active), [str(new / "run-other")])
-                self.assertEqual(unit_runs.held("sid-none", active_override=active), [])
+                self.assertEqual(unit_runs.held(fixture_runtime_id("sid-other"), active_override=active), [str(new / "run-other")])
+                self.assertEqual(unit_runs.held(fixture_runtime_id("sid-none"), active_override=active), [])
                 self.assertEqual(unit_runs.held("", active_override=active), [])
-            self.assertEqual(unit_runs.held("sid-me", new, active), [str(new / "run-marked"), str(new / "run-side")])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("sid-me"), new, active), [str(new / "run-marked"), str(new / "run-side")])
             with contextlib.redirect_stdout(io.StringIO()) as shown:
-                self.assertEqual(unit_runs.main(["held", "sid-me", "--root", str(new), "--active", str(active)]), 0)
+                self.assertEqual(unit_runs.main(["held", fixture_runtime_id("sid-me"), "--root", str(new), "--active", str(active)]), 0)
             self.assertEqual(shown.getvalue().splitlines(), [str(new / "run-marked"), str(new / "run-side")])
 
     def test_shared_scan_keeps_a_late_marker_first_without_rereading_directors(self) -> None:
@@ -173,14 +126,14 @@ class UnitRunsTest(unittest.TestCase):
             for name in ("a-run", "z-run", "other-run"):
                 run = root / name
                 run.mkdir(parents=True)
-                unit_runs.record_director(run, "other" if name == "other-run" else "director")
-            _ = (active / "director").write_text(str(root / "z-run") + "\n")
-            _ = (active / "other").write_text(str(root / "other-run") + "\n")
+                self.staff_owner(run, fixture_runtime_id("other") if name == "other-run" else fixture_runtime_id("director"))
+            _ = (active / fixture_runtime_id("director")).write_text(str(root / "z-run") + "\n")
+            _ = (active / fixture_runtime_id("other")).write_text(str(root / "other-run") + "\n")
             with patch.object(unit_runs, "director", wraps=unit_runs.director) as read:
                 scanned = unit_runs.held_by_session(root)
-                self.assertEqual(unit_runs.held("director", root, active, scanned=scanned),
+                self.assertEqual(unit_runs.held(fixture_runtime_id("director"), root, active, scanned=scanned),
                                  [str(root / "z-run"), str(root / "a-run")])
-                self.assertEqual(unit_runs.held("other", root, active, scanned=scanned), [str(root / "other-run")])
+                self.assertEqual(unit_runs.held(fixture_runtime_id("other"), root, active, scanned=scanned), [str(root / "other-run")])
                 self.assertEqual(read.call_count, 3)
                 self.assertEqual({call.args[0] for call in read.call_args_list}, set(root.iterdir()))
 
@@ -190,14 +143,14 @@ class UnitRunsTest(unittest.TestCase):
             (root / "a-run").mkdir(parents=True)
             outside.mkdir()
             active.mkdir()
-            unit_runs.record_director(root / "a-run", "director")
-            unit_runs.record_director(outside, "director")
+            self.staff_owner(root / "a-run", fixture_runtime_id("director"))
+            self.staff_owner(outside, fixture_runtime_id("director"))
             target = str(outside) + "/."
-            _ = (active / "director").write_text(target + "\n")
+            _ = (active / fixture_runtime_id("director")).write_text(target + "\n")
             scanned = unit_runs.held_by_session(root)
-            self.assertEqual(unit_runs.held("director", root, active, scanned=scanned),
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director"), root, active, scanned=scanned),
                              [target, str(root / "a-run")])
-            self.assertEqual(unit_runs.held("director", root, active), [target, str(root / "a-run")])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director"), root, active), [target, str(root / "a-run")])
 
     def test_a_stale_marker_does_not_assign_another_directors_run(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -205,12 +158,12 @@ class UnitRunsTest(unittest.TestCase):
             run = root / "run"
             run.mkdir(parents=True)
             active.mkdir()
-            unit_runs.record_director(run, "replacement")
-            _ = (active / "original").write_text(str(run) + "\n")
+            self.staff_owner(run, fixture_runtime_id("replacement"))
+            _ = (active / fixture_runtime_id("original")).write_text(str(run) + "\n")
             scanned = unit_runs.held_by_session(root)
-            self.assertEqual(unit_runs.held("original", root, active, scanned=scanned), [])
-            self.assertEqual(unit_runs.held("original", root, active), [])
-            self.assertEqual(unit_runs.held("replacement", root, active, scanned=scanned), [str(run)])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("original"), root, active, scanned=scanned), [])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("original"), root, active), [])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("replacement"), root, active, scanned=scanned), [str(run)])
 
     def test_a_foreign_outside_marker_does_not_change_another_directors_shared_list(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -218,22 +171,22 @@ class UnitRunsTest(unittest.TestCase):
             root.mkdir()
             active.mkdir()
             outside.mkdir()
-            unit_runs.record_director(outside, "director-b")
-            _ = (active / "director-a").write_text(str(outside) + "\n")
+            self.staff_owner(outside, fixture_runtime_id("director-b"))
+            _ = (active / fixture_runtime_id("director-a")).write_text(str(outside) + "\n")
             scanned = unit_runs.held_by_session(root)
-            self.assertEqual(unit_runs.held("director-a", root, active, scanned=scanned), [])
-            self.assertEqual(unit_runs.held("director-a", root, active), [])
-            independent = unit_runs.held("director-b", root, active)
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director-a"), root, active, scanned=scanned), [])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director-a"), root, active), [])
+            independent = unit_runs.held(fixture_runtime_id("director-b"), root, active)
             self.assertEqual(independent, [])
-            self.assertEqual(unit_runs.held("director-b", root, active, scanned=scanned), independent)
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director-b"), root, active, scanned=scanned), independent)
 
     def test_held_without_a_marker_lists_only_the_directed_runs(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             runs, active = Path(folder) / "runs", Path(folder) / "active"
             (runs / "run-side").mkdir(parents=True)
-            unit_runs.record_director(runs / "run-side", "sid-me")
-            self.assertEqual(unit_runs.held("sid-me", runs, active), [str(runs / "run-side")])
-            self.assertEqual(unit_runs.held("sid-me", Path(folder) / "missing", active), [])
+            self.staff_owner(runs / "run-side", fixture_runtime_id("sid-me"))
+            self.assertEqual(unit_runs.held(fixture_runtime_id("sid-me"), runs, active), [str(runs / "run-side")])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("sid-me"), Path(folder) / "missing", active), [])
 
     def test_the_removal_check_refuses_while_a_running_session_owns_a_former_marker(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -244,8 +197,8 @@ class UnitRunsTest(unittest.TestCase):
             with patch.object(unit_runs, "FORMER_RUN_ROOT", former), \
                     contextlib.redirect_stdout(io.StringIO()) as shown, \
                     patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
-                self.assertEqual(unit_runs.removal_check({"sid-open": "two-accounts", "sid-other": "elsewhere"}), 1)
-                self.assertEqual(unit_runs.removal_check({"sid-other": "elsewhere"}), 0)
+                self.assertEqual(unit_runs.removal_check({"sid-open": "two-accounts", fixture_runtime_id("sid-other"): "elsewhere"}), 1)
+                self.assertEqual(unit_runs.removal_check({fixture_runtime_id("sid-other"): "elsewhere"}), 0)
             self.assertIn(f"two-accounts (sid-open): {former / 'run-open'}", shown.getvalue())
             self.assertNotIn("sid-ended", shown.getvalue())
             self.assertIn("the former name can go", shown.getvalue())
@@ -298,4 +251,6 @@ class UnitRunsTest(unittest.TestCase):
             self.assertIn("nothing to move", shown.getvalue())
 
 if __name__ == "__main__":
+    import unittest
+
     _ = unittest.main()

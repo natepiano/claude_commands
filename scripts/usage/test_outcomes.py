@@ -753,9 +753,12 @@ class OutcomeTests(OutcomeFixture):
         with closing(sqlite3.connect(self.db_path)) as database, database:
             for table in ("openings", "edits", *OUTCOME_TABLES, "checkpoints", "account_readings", "account_role_changes"):
                 _ = database.execute(f"DROP TABLE {table}")
+            _ = database.execute("ALTER TABLE cursors DROP COLUMN context")
             _ = database.execute("PRAGMA user_version = 0")
             _ = database.execute("INSERT INTO cursors VALUES ('natedev', 'old-cursor-sentinel', 123)")
         output = self.collect()
+        self.assertEqual([cast(str, row["name"]) for row in self.rows("PRAGMA table_info(cursors)")],
+                         ["machine", "path", "offset", "context"])
         self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), version)
         self.assertFalse(self.rows("SELECT * FROM cursors WHERE path = 'old-cursor-sentinel'"))
         self.assertEqual(self.all_values(self.rows("SELECT * FROM turns ORDER BY family, agent_id, turn_key")), before)
@@ -764,7 +767,7 @@ class OutcomeTests(OutcomeFixture):
         self.assert_source_additions(output, "claude", 0)
         self.assert_source_additions(output, "codex", 0)
         with closing(sqlite3.connect(self.db_path)) as database, database:
-            _ = database.execute("INSERT INTO cursors VALUES ('natedev', 'current-cursor-sentinel', 456)")
+            _ = database.execute("INSERT INTO cursors (machine, path, offset) VALUES ('natedev', 'current-cursor-sentinel', 456)")
         before_rows = self.snapshot()
         _ = self.collect()
         self.assertEqual(self.snapshot(), before_rows, "The new version does not clear cursors again")

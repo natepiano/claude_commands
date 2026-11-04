@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing
 import json
 import os
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import unittest
 from unittest import mock
 
 import index
+from index import GATE_TABLES
 from test_index import Record, point_root_at, rows, table_rows, use_test_log
 
 use_test_log()
@@ -32,7 +34,6 @@ else:
 
 EPOCH = 1_793_700_000.0
 STARTED = "2026-11-03T12:00:00.000Z"
-GATE_TABLES = ("gate_runs", "gate_suites", "gate_modules", "gate_tests")
 
 
 def fixture_run() -> GateRun:
@@ -100,6 +101,19 @@ class GateIndexTests(unittest.TestCase):
     def snapshot(self) -> dict[str, list[Record]]:
         return {table: table_rows(table) for table in GATE_TABLES}
 
+    def test_missing_gate_tables_recover_all_recorded_attempts(self) -> None:
+        source = self.write_run("recovered", fixture_run())
+        self.assertEqual(index.update(), 1)
+        before = self.snapshot()
+        original = (self.root / source).read_bytes()
+        table = GATE_TABLES[0]
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute(f"DROP TABLE {table}")
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(index.update(), 0)
+        self.assertEqual((self.root / source).read_bytes(), original)
+
     def test_gate_rows_preserve_fields_attempts_and_last_attempt_totals(self) -> None:
         run = fixture_run()
         source = self.write_run("gate-one", run)
@@ -127,7 +141,11 @@ class GateIndexTests(unittest.TestCase):
                 })
         self.assertCountEqual(table_rows("gate_tests"), expected_tests)
         before = self.snapshot()
-        self.assertEqual(index.update(), 0)
+        with closing(index.read_only()) as connection:
+            version = cast(tuple[int], connection.execute("PRAGMA data_version").fetchone())
+            self.assertEqual(index.update(), 0)
+            self.assertEqual(cast(tuple[int], connection.execute("PRAGMA data_version").fetchone()), version,
+                             "An unchanged update must not write the database")
         self.assertEqual(self.snapshot(), before)
 
     def test_reused_run_has_zero_counts_and_no_child_rows(self) -> None:
@@ -144,7 +162,7 @@ class GateIndexTests(unittest.TestCase):
         removed = self.write_run("remove", fixture_run(), host="first-host")
         kept = self.write_run("keep", fixture_run(), host="second-host")
         self.assertEqual(index.update(), 2)
-        with closing(index.open_for_update()) as connection:
+        with closing(index.open_for_update(index.index_path())) as connection:
             index.forget(connection, removed)
         for table in GATE_TABLES:
             with self.subTest(table=table):

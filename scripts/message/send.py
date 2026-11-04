@@ -1600,9 +1600,45 @@ def pending(to: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _print_roster_problems(problems: list[str]) -> None:
+def _recipient_roster_problems(
+    to: str, problems: list[str], observed: roster.Roster, membership: staff.StaffSnapshot,
+) -> list[str]:
+    """Use staff identities for anomalies and text for diagnostics without typed owners."""
+    member = resolve_staff_recipient(to, membership, observed=observed.entries)
+    references = {to, to.split(":", 1)[-1]}
+    if isinstance(member, staff.StaffRow):
+        references.update((member.name, str(member.id), str(member.current_session)))
+    typed: dict[str, bool] = {}
+    for anomaly in observed.row_anomalies:
+        owner = anomaly.row
+        matches = (owner.id == member.id if isinstance(member, staff.StaffRow)
+                   else to.casefold() in (owner.name.casefold(), owner.id, owner.current_session,
+                                          f"session:{owner.current_session}", f"codex:{owner.current_session}"))
+        for text in (anomaly.diagnostic, f"warning: {anomaly.diagnostic}"):
+            typed[text] = typed.get(text, False) or matches
+    related: list[str] = []
     for problem in problems:
+        if problem in typed:
+            matches = typed[problem]
+        else:
+            matches = any(reference and re.search(
+                rf"(?<![\w-]){re.escape(reference)}(?![\w-])", problem, re.IGNORECASE)
+                for reference in references)
+        if matches:
+            related.append(problem)
+    return related
+
+
+def _print_roster_problems(
+    to: str, problems: list[str], observed: roster.Roster, membership: staff.StaffSnapshot,
+) -> None:
+    related = _recipient_roster_problems(to, problems, observed, membership)
+    for problem in related:
         print(f"send.py: roster: {problem}", file=sys.stderr)
+    omitted = len(problems) - len(related)
+    if omitted:
+        print(f"send.py: roster problems omitted: {omitted}; "
+              + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py", file=sys.stderr)
 
 
 def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
@@ -1687,8 +1723,8 @@ def resolve_staff_recipient(
         chain = [candidate.name]
         parent = candidate
         visited = {candidate.id}
-        while parent.kind != "showrunner" and parent.parent is not None:
-            ancestor = membership.by_id(parent.parent)
+        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo):
+            ancestor = membership.by_id(parent.parent.id)
             if ancestor is None or ancestor.id in visited:
                 break
             visited.add(ancestor.id)
@@ -1791,44 +1827,61 @@ def resolve_recipient(
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
     membership = staff.snapshot() if membership is None else membership
-    if to.startswith("uds:"):
-        return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
-    member = resolve_staff_recipient(to, membership, observed=observed.entries)
-    if isinstance(member, RecipientLookupFailed):
-        usage_error(member.reason)
-    if isinstance(member, staff.StaffRow):
-        for anomaly in observed.row_anomalies:
-            if anomaly.row.id == member.id:
-                usage_error(anomaly.diagnostic)
-    if isinstance(scope, NamedMachine):
-        return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
-                                          else to if to.startswith("worker:") else f"session:{member.current_session}")
-                              if isinstance(member, staff.StaffRow) else to)
-    if to.startswith("codex:"):
-        thread_id = to.removeprefix("codex:")
-        if not thread_id:
-            usage_error("codex: needs a thread id")
-    result = matching_recipients(to, scope, observed, membership=membership)
-    _print_roster_problems(result.problems)
-    if isinstance(result, LocalRosterIncomplete):
-        usage_error(f"absence of {to} here is not proven; use an address or --machine")
-    if isinstance(result, RecipientSearchFailed):
-        return RecipientLookupFailed(result.reason)
-    if result.entries:
-        return _matched_recipient(to, result.entries, result.destination)
-    if to.startswith("worker:"):
-        usage_error(f"no roster session has address {to}")
-    if to.startswith("codex:"):
-        from scripts.whoami.agent_accounts import codex_home_display
+    problems = observed.diagnostics
 
-        checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
-        return RecipientLookupFailed(
-            f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
-    if isinstance(member, staff.StaffRow):
-        return ClaudeRecipient(f"session:{member.current_session}")
-    if to.startswith("session:"):
-        return ClaudeRecipient(to)
-    usage_error(f"no staff row or live session for {to!r}")
+    def lookup() -> DeliveryRoute:
+        nonlocal problems
+        if to.startswith("uds:"):
+            return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
+        member = resolve_staff_recipient(to, membership, observed=observed.entries)
+        if isinstance(member, RecipientLookupFailed):
+            usage_error(member.reason)
+        if isinstance(member, staff.StaffRow):
+            for anomaly in observed.row_anomalies:
+                if anomaly.row.id == member.id:
+                    usage_error(anomaly.diagnostic)
+        if isinstance(scope, NamedMachine):
+            return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
+                                              else to if to.startswith("worker:") else f"session:{member.current_session}")
+                                  if isinstance(member, staff.StaffRow) else to)
+        if to.startswith("codex:"):
+            thread_id = to.removeprefix("codex:")
+            if not thread_id:
+                usage_error("codex: needs a thread id")
+        result = matching_recipients(to, scope, observed, membership=membership)
+        problems = result.problems
+        if isinstance(result, LocalRosterIncomplete):
+            usage_error(f"absence of {to} here is not proven; use an address or --machine")
+        if isinstance(result, RecipientSearchFailed):
+            related = _recipient_roster_problems(to, problems, observed, membership)
+            reason = (f"recipient lookup failed for {to!r}"
+                      if any(problem in result.reason for problem in problems if problem not in related)
+                      else result.reason)
+            return RecipientLookupFailed(reason)
+        if result.entries:
+            return _matched_recipient(to, result.entries, result.destination)
+        if to.startswith("worker:"):
+            usage_error(f"no roster session has address {to}")
+        if to.startswith("codex:"):
+            from scripts.whoami.agent_accounts import codex_home_display
+
+            checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
+            return RecipientLookupFailed(
+                f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
+        if isinstance(member, staff.StaffRow):
+            return ClaudeRecipient(f"session:{member.current_session}")
+        if to.startswith("session:"):
+            return ClaudeRecipient(to)
+        usage_error(f"no staff row or live session for {to!r}")
+
+    failed = True
+    try:
+        route = lookup()
+        failed = isinstance(route, RecipientLookupFailed)
+        return route
+    finally:
+        if failed:
+            _print_roster_problems(to, problems, observed, membership)
 
 
 def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | None = None,
@@ -2937,10 +2990,10 @@ def repeat_notice_owner(sender: str) -> str:
         usage_error(member.reason)
     visited: set[staff.StaffId] = set()
     while member.kind != "showrunner":
-        if member.parent is None or member.id in visited:
+        if isinstance(member.parent, staff.StaffRoot) or member.id in visited:
             usage_error(f"missing showrunner staff row for {sender!r}")
         visited.add(member.id)
-        parent = membership.by_id(member.parent)
+        parent = membership.by_id(member.parent.id)
         if parent is None:
             usage_error(f"missing showrunner staff row for {sender!r}")
         member = parent

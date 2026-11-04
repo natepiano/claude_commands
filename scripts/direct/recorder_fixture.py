@@ -25,6 +25,23 @@ from scripts.direct import progress_history
 from scripts.lib import models_registry, user_zone
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
+
+
+def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
+                        workers: Mapping[str, str]) -> None:
+    """Publish private staff references before the recorder attributes a wait."""
+    import json
+    with isolated_staff_file(root / "staff.json", environment):
+        owner = fixture_member("showrunner", name="wait-owner")
+        parent = fixture_member("unit", name="wait-unit", parent=owner.id,
+                                runtime_id=fixture_runtime_id("fixture-director"),
+                                worktree=staff.PresentWorktree("natedev", root))
+        roster = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
+                  for name, identity in workers.items()}
+    session.mkdir(parents=True, exist_ok=True)
+    _ = (session / "mesh_roster.json").write_text(json.dumps(roster))
 
 
 
@@ -152,13 +169,12 @@ class LauncherFixture(unittest.TestCase):
         return session_dir
 
 
-def launcher_registry(implementation_roles: tuple[str, ...], *, mesh: bool = False) -> str:
+def launcher_registry(implementation_roles: tuple[str, ...]) -> str:
     """Build both launcher registries from the same catalog and role settings."""
     return registry_text({
         "assignments": ExactRows({"direct": "codex"}),
         "direct.codex": {**dict.fromkeys(implementation_roles, "gpt-called:xhigh"), "review": "gpt-blind:max"},
         "codex.agents": {"gpt-called": "low,medium,high,xhigh,max", "gpt-blind": "low,medium,high,xhigh,max"},
-        "direct.options": {"codex_mesh": "1" if mesh else "0"},
     })
 
 

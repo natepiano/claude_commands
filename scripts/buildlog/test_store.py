@@ -41,7 +41,7 @@ class StoreTests(unittest.TestCase):
             with self.subTest(start=start):
                 self.assertEqual(list(store.locked_rows(path, start)), expected)
 
-    def test_locked_rows_wait_for_an_appender_and_keep_the_lock_until_closed(self) -> None:
+    def test_locked_rows_wait_for_an_appender_then_release_before_decoding(self) -> None:
         path = self.root / "history.jsonl"
         path.parent.mkdir(parents=True)
         flock = fcntl.flock
@@ -57,13 +57,19 @@ class StoreTests(unittest.TestCase):
                 flock(appender.fileno(), fcntl.LOCK_UN)
                 flock(fd, operation)
 
+            decode = json.loads
+
+            def decode_without_lock(raw: str | bytes | bytearray) -> object:
+                with path.open("rb") as contender:
+                    flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return cast(object, decode(raw))
+
             iterator = store.locked_rows(path)
             try:
-                with mock.patch.object(fcntl, "flock", side_effect=acquire_after_append):
+                with mock.patch.object(fcntl, "flock", side_effect=acquire_after_append), \
+                        mock.patch.object(json, "loads", side_effect=decode_without_lock):
                     self.assertEqual(next(iterator), {"id": "before"})
-                with path.open("rb") as contender:
-                    with self.assertRaises(BlockingIOError):
-                        flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                store.append_line(path, {"id": "later"})
                 self.assertEqual(list(iterator), [{"id": "after"}])
             finally:
                 _ = list(iterator)

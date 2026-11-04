@@ -33,11 +33,11 @@ from typing import NamedTuple, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import conf
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
 from scripts.production.production_doc import Refusal
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
-from proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs, slug_of
+from proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
@@ -316,9 +316,11 @@ def table(rows: list[Row]) -> str:
     return "\n".join(lines)
 
 
-def queue(doc: Path) -> str:
+def queue(doc: Path, *, record: staff.StaffSnapshot | None = None) -> str:
     """The name urgency.py pins the proposal /next showed under."""
-    return f"proposal-{slug_of(doc)}"
+    from scripts.production.store_owner import document_id
+
+    return f"proposal-{document_id(doc, record=record)}"
 
 
 def scope_issues(doc: Path, below: bool = False) -> list[Issue]:

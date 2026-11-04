@@ -40,6 +40,7 @@ from scripts.accounts.role_map import stored_role_map
 from scripts.hierarchies import log_records, push_audit
 from scripts.hierarchies.log_records import EventSource as EventSource
 from scripts.lib import unit_runs
+from scripts.buildlog.index import index_path_in
 from scripts.message import roster
 from scripts.production import showrunners, session_staff, staff, issues, change_review, dailies_render
 from scripts.production.production_doc import Refusal
@@ -1536,7 +1537,7 @@ def staff_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
         live = {item["sessionId"] for item in unit_labels.newest_sessions()}
         running = running_phase_worktrees(unit_lookup.runs_dir(), problems)
         for row in staff.active(record, "unit"):
-            parent = record.by_id(row.parent) if row.parent is not None else None
+            parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
             if parent is None:
                 problems.append(log_records.SourceProblem(row.name, "the staff parent is unavailable", event_source=log_records.SourceNotApplicable.STATE))
                 continue
@@ -1647,7 +1648,7 @@ def read_builds(path: Path, problems: list[log_records.SourceProblem]) -> list[B
                 invalid[str(error)] += 1
         if invalid:
             detail = "; ".join(f"{reason} ({count})" for reason, count in invalid.items())
-            problems.append(log_records.SourceProblem(str(path), f"invalid build rows skipped: {sum(invalid.values())}; {detail}", kind=log_records.RowsSkipped(sum(invalid.values())), event_source=EventSource.BUILDS))
+            problems.append(log_records.SourceProblem("buildlog index", f"invalid build rows skipped: {sum(invalid.values())}; {detail}", kind=log_records.RowsSkipped(sum(invalid.values())), event_source=EventSource.BUILDS))
         return result
 
 
@@ -1836,7 +1837,8 @@ def load_window_sources(window: log_records.Window, notifications: push_audit.Au
         worker_read = readers.submit(read_source, "session roster / codex_mesh", read_workers, ([], []), worker_problems,
                                      log_records.SourceNotApplicable.STATE)
         token_read = readers.submit(read_source, str(token_path), lambda: read_tokens(token_path, window), [], token_problems, EventSource.TOKENS)
-        builds = read_source("buildlog/index.sqlite", lambda: read_builds(state / "buildlog/index.sqlite", problems), [], problems, event_source=EventSource.BUILDS)
+        build_index = index_path_in(state / "buildlog")
+        builds = read_source("buildlog index", lambda: read_builds(build_index, problems), [], problems, event_source=EventSource.BUILDS)
         hana_prefixes = [Path(unit.worktree).name for unit in units if unit.hana and unit.worktree]
         phases = read_source("progress_history runs",
                              lambda: read_phases(unit_runs.history_root_in(state) / "runs", problems, hana_prefixes), [], problems, event_source=EventSource.PHASES)
@@ -2677,7 +2679,7 @@ def load_comparison(before: log_records.Window, after: log_records.Window) -> tu
     for key in claims.keys() - {source.value for source in EventSource}:
         config_problems.append(log_records.SourceProblem(str(COVERAGE_CONFIG), f"coverage config [{key}]: unknown source key", event_source=log_records.SourceNotApplicable.CONFIG))
     parts: list[ComparisonWindow] = []
-    memory = read_build_memory(state / "buildlog/index.sqlite")
+    memory = read_build_memory(index_path_in(state / "buildlog"))
     for index, window in enumerate((before, after)):
         sources = load_window_sources(window, notifications)
         sources.problems.extend(config_problems)

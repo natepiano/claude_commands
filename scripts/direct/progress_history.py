@@ -442,7 +442,7 @@ def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> di
         record = staff.initial_snapshot()
         row = record.by_member_reference(session_id)
         if row is not None and row.kind == "worker":
-            row = record.by_id(row.parent) if row.parent else None
+            row = record.parent_of(row)
         unit_owned = row is not None and row.kind == "unit"
     result: dict[str, object] = {}
     directory = _string(fields.get("working_dir"))
@@ -497,7 +497,7 @@ SESSION_ROOTS = tuple(
 
 
 def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: str) -> bool:
-    if fields.get("working_dir") not in (str(old), str(new)):
+    if fields.get("worktree") not in (old.name, new.name):
         return False
     fields["branch"] = new_branch
     fields.update(_stored_fields(fields))
@@ -5097,7 +5097,7 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
                 except (OSError, UnicodeError) as error:
                     return ProductionNotRecorded(f"phase plan cannot be read: {error}")
             return ProductionNotRecorded("the run has no matching unit staff row")
-        parent = record.by_id(row.parent) if row.parent is not None else None
+        parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
         if parent is None:
             return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
         timer = showrunners.timer_for(parent, record)
@@ -5238,11 +5238,12 @@ def resolve_worker_pass(session_dir: Path, state: dict[str, object],
     if not candidates:
         candidates = [_phase_identity(state, phase) for phase in phases if phase.get("status") == "active"]
     try:
-        roster = _json_object((session_dir / "mesh_roster.json").read_text(encoding="utf-8"))
+        roster = session_staff.read_worker_roster(session_dir / "mesh_roster.json")
     except (OSError, ValueError) as error:
         return UnresolvedWaitAttribution(f"worker roster unavailable: {error}", tuple(candidates))
-    names = [name for name, value in (roster or {}).items()
-             if thread_id and (_object_dict(value) or {}).get("thread_id") == thread_id]
+    membership = staff.local_snapshot()
+    names = [name for name, value in roster.items()
+             if thread_id and session_staff.worker_session(_object_dict(value) or {}, membership) == thread_id]
     if len(names) != 1:
         return UnresolvedWaitAttribution(f"worker thread has {len(names)} roster matches", tuple(candidates))
     matching = [candidate for candidate in candidates if candidate.get("worker_name") == names[0]]
@@ -5554,10 +5555,11 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
         if not separator or run_id in ("", ".", "..") or "/" in name:
             return NoNamedSupplier("worker alias has no run and worker identity")
         threads: set[str] = set()
+        membership = staff.local_snapshot()
         for root in unit_runs.run_roots(os.environ.get("UNIT_RUN_ROOT")):
             try:
-                roster = _json_object((root / run_id / "mesh_roster.json").read_text(encoding="utf-8")) or {}
-                thread = _string((_object_dict(roster.get(name)) or {}).get("thread_id"))
+                roster = session_staff.read_worker_roster(root / run_id / "mesh_roster.json")
+                thread = session_staff.worker_session(_object_dict(roster.get(name)) or {}, membership)
                 if thread:
                     threads.add(thread)
             except (OSError, ValueError):

@@ -47,7 +47,7 @@ A step records its width through its argv: `invoke.sh` puts `--test-threads N` b
 
 `width_trial.py report --since <ISO-8601 with offset> --until <ISO-8601 | now>` prints the switchback scorecard for natedev. Exit 0 on a report, 2 on a usage error.
 
-- `load_steps` reads `step = 'nextest'` rows from the build-log index (`store.root() / INDEX_NAME`, moved by `BUILDLOG_DIR`) and selects them by request time, `started_at − mem_wait_s`. A step's arm is `test_threads(argv)`: 16 is `physical`, 32 `logical`, none `unset`, any other width its number. Its block is `request // BLOCK_S` (6000 s).
+- `load_steps` reads `step = 'nextest'` rows from the build-log index (`index_path()`, moved by `BUILDLOG_DIR`) and selects them by request time, `started_at − mem_wait_s`. A step's arm is `test_threads(argv)`: 16 is `physical`, 32 `logical`, none `unset`, any other width its number. Its block is `request // BLOCK_S` (6000 s).
 - **whole-hana** run: `caller = 'verify'`, `repo = 'hana'`, the `-E` value is exactly `package(hana)`, and no `--test` in argv.
 - Metrics, `physical` against `logical`:
 

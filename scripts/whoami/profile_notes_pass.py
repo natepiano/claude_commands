@@ -559,7 +559,10 @@ def child_policy(peer_python: Mapping[str, str] = NO_PEER_PYTHON) -> tuple[Trust
         return ("-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no",
                 "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "PermitLocalCommand=no",
                 "-o", "ProxyCommand=none", *args[:5], command)
-    unmarked = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID", "NIX_HEAL_PREPARED_SESSION", "NIX_HEAL_PREPARED_DIRECTORY")
+    unmarked = (
+        *(name for name in environment if name.startswith("SHOWRUNNER_")),
+        "NIX_HEAL_PREPARED_SESSION", "NIX_HEAL_PREPARED_DIRECTORY",
+    )
     specs: tuple[tuple[str, Callable[[tuple[str, ...]], bool], Callable[[tuple[str, ...]], tuple[str, ...]], tuple[tuple[str, str], ...], tuple[str, ...]], ...] = (
         ("ps", ps_read, identity, (("LC_ALL", "C"), ("TZ", "UTC")), unmarked),
         ("lsof", lsof_read, lambda args: ("-Di", *args), (), unmarked),

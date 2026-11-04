@@ -15,7 +15,7 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs
 from scripts.usage import collect
-from scripts.production import session_staff, staff, staff_sources, unit_lookup
+from scripts.production import staff, staff_sources, unit_lookup
 
 
 @dataclass(frozen=True)
@@ -30,13 +30,13 @@ class NoMatchingRun:
 
 
 def matching_start(run_id: str, event: object, worktree: str, *,
-                   record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> RunFound | NoMatchingRun:
+                   record: staff.StaffSnapshot | None = None) -> RunFound | NoMatchingRun:
     if not isinstance(event, dict):
         return NoMatchingRun()
     fields = cast(dict[str, object], event)
     agent = fields.get("main_agent")
     identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    record = staff.snapshot() if record is None else record
     row = record.by_member_reference(identity) if isinstance(identity, str) else None
     started = fields.get("run_started_at")
     if (fields.get("event_type") != "run_started" or row is None
@@ -51,8 +51,8 @@ def matching_start(run_id: str, event: object, worktree: str, *,
 
 
 def local_run(root: Path, worktree: str, *,
-              record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> RunFound | NoMatchingRun:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+              record: staff.StaffSnapshot | None = None) -> RunFound | NoMatchingRun:
+    record = staff.snapshot() if record is None else record
     newest: RunFound | NoMatchingRun = NoMatchingRun()
     for path in sorted(root.glob("runs/*.jsonl")):
         try:
@@ -97,8 +97,8 @@ for path in sorted(root.glob('runs/*.jsonl')):
 
 
 def mac_run(root: str, worktree: str, *,
-            record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> RunFound | NoMatchingRun:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+            record: staff.StaffSnapshot | None = None) -> RunFound | NoMatchingRun:
+    record = staff.snapshot() if record is None else record
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
             collect.MAC_HOST, remote_command(root)]
     try:
