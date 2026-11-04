@@ -337,14 +337,17 @@ class LifecycleTests(LifecycleFixture):
         common_dir = Path(self.git("rev-parse", "--git-common-dir"))
         with (self.checkout / common_dir / "info/exclude").open("a", encoding="utf-8") as output:
             _ = output.write("production.log\n")
-        self.write(self.log, "# Production log — example\n\n### STATE\nresumed state\n")
+        self.write(self.log, "# Production log — example\n\n### STATE\nNext: old next item\n")
+        self.write(self.state / "showrunner" / "example" / "session" / "showrunner_state.json",
+                   json.dumps({"next": ["merge alpha", "check beta"]}))
 
         ordinary = self.run_lifecycle("load", "--no-ci")
         self.assert_step(ordinary, "ok")
-        self.assertNotIn("resumed state", ordinary.stdout)
+        self.assertNotIn("merge alpha", ordinary.stdout)
         resumed = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(resumed, "ok")
-        self.assertIn("resumed state", resumed.stdout)
+        self.assertIn("state: ok — merge alpha; check beta", resumed.stdout)
+        self.assertNotIn("old next item", resumed.stdout)
         self.assertIn("alpha-unit: no code checkpoint", resumed.stdout)
 
     def test_load_copies_the_scratchpad_state_once_and_never_replaces_it(self) -> None:
@@ -372,7 +375,7 @@ class LifecycleTests(LifecycleFixture):
         _ = (self.state / "live-alpha").touch()
         result = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(result, "ok")
-        self.assertIn("old state", result.stdout)
+        self.assertIn("state: ok — no next list", result.stdout)
         self.assertIn("alpha-unit", result.stdout)
         self.assertIn("beta-unit", result.stdout)
         self.assertIn(alpha_merge[:7], result.stdout)

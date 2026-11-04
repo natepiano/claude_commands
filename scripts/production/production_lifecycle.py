@@ -29,7 +29,7 @@ from merge_checkpoint import (CodeCheckpoint, MergeEntry, NoMerge,
                               git, good, merge_branch_history, promote_local_checkout,
                               pull_mac_checkout, report)
 from scripts.production import production_doc
-from update_registration import QuestionStaff
+from update_registration import QuestionStaff, RegistrationFailure, judgment_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from atomic_file import write_text_atomic
@@ -179,13 +179,14 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         move_session_state(production.slug, scratch)
     if not resume and not isinstance(doc_status(lines), ProductionRunning):
         return
-    if production.log.exists():
-        log_lines = production.log.read_text(encoding="utf-8").splitlines()
-        starts = [index for index, line in enumerate(log_lines) if line.startswith("### STATE")]
-        state_lines = log_lines[starts[-1]:] if starts else []
-        report("state", "ok", " | ".join(state_lines) if state_lines else "no STATE block")
-    else:
-        report("state", "ok", "no production log yet")
+    owed: tuple[str, ...] = ()
+    try:
+        owed = judgment_state(showrunners.session_state_dir(production.slug) / "showrunner_state.json", "load").owed
+    except FileNotFoundError:
+        pass
+    except (RegistrationFailure, OSError, ValueError, UnicodeError) as error:
+        print(f"anomaly: {error}", file=sys.stderr)
+    report("state", "ok", "; ".join(owed) if owed else "no next list")
     history = (merge_branch_history(production.checkout, production.merge_branch)
                if isinstance(state, PlanLanded) else None)
     try:
