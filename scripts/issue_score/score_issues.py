@@ -26,7 +26,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.issue_score import client, decide, questions, vault
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.issue_score import experiment as wording
 from scripts.issue_score.blind import blind, blind_score
 from scripts.issue_score.evaluate import Split, compare, in_split, load_run

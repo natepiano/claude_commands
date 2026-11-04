@@ -52,6 +52,7 @@ from __future__ import annotations
 import gzip
 import fcntl
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -64,7 +65,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from test_phase import (
@@ -85,9 +86,11 @@ else:
     import step_context
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-import memory_admit
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+else:
+    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 if TYPE_CHECKING:
     from ..aws_target.config import MeasurementUnavailable
 else:
@@ -102,6 +105,24 @@ else:
 
 if TYPE_CHECKING:
     import sample
+
+
+class RecordedCall(Protocol):
+    call_id: str
+
+
+class AdmissionMetadata(Protocol):
+    Call: object
+    CallRecord: type[RecordedCall]
+
+    def parse_snapshot_value(self, value: object, schema: object) -> object: ...
+    def test_threads(self, argv: list[str]) -> int | None: ...
+    def recorded_repository_key(self, argv: list[str], cwd: str) -> str: ...
+
+
+def admission_metadata() -> AdmissionMetadata:
+    """Load admission only when recording needs its metadata, after initialization."""
+    return cast(AdmissionMetadata, cast(object, importlib.import_module("memory_admit")))
 
 RECORD_VERSION = 1
 TARGET_DIR_UNSET = "unset"
@@ -619,14 +640,15 @@ def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, obje
     fields = cast(dict[str, object], loaded)
     call = fields.get("call_id")
     if isinstance(call, dict):
-        recorded_call = memory_admit.parse_snapshot_value(cast(dict[str, object], call), memory_admit.Call)
-        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, memory_admit.CallRecord) else None
+        metadata = admission_metadata()
+        recorded_call = metadata.parse_snapshot_value(cast(dict[str, object], call), metadata.Call)
+        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, metadata.CallRecord) else None
     # Admission's parser returns the first width. Supplying nextest's environment
     # default last preserves an explicit flag, including a nonnumeric one.
     width_argv = argv
     if "NEXTEST_TEST_THREADS" in os.environ:
         width_argv = [*argv, "--test-threads", os.environ["NEXTEST_TEST_THREADS"]]
-    context = _test_phase_context({**fields, "test_threads": memory_admit.test_threads(width_argv)})
+    context = _test_phase_context({**fields, "test_threads": admission_metadata().test_threads(width_argv)})
     return {
         **context,
         # Admission has no entry-charge record (bytes, cutoff, form, widths).
@@ -882,7 +904,7 @@ def step(args: list[str]) -> None:
             return
         tty = tty_text == "1"
         directory = git_directory(argv, cwd)
-        repository = memory_admit.git_identity(argv, cwd)[0]
+        repository_key = admission_metadata().recorded_repository_key(argv, cwd)
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_key = sent_tree_key()
@@ -900,6 +922,7 @@ def step(args: list[str]) -> None:
                 store.note_error(f"parse {name} {held}")
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
+        output_roots = read_cargo_output_roots(Path(directory)) if name != "sweep" else CargoOutputUnavailable("sweep step")
         memory = peak_and_stall(peak)
         step_slice = "none" if not peak else "builds" if Path(peak).is_file() else "fallback"
         phase = read_test_phase(phase_file)
@@ -920,7 +943,10 @@ def step(args: list[str]) -> None:
             "cwd": cwd,
             "target_dir": step_context.target_folder_text(
                 step_context.captured_target_folder(os.environ.get("BUILDLOG_TARGET_FOLDER", ""))),
-            "repo_identity": repository.key if isinstance(repository, memory_admit.RepositoryIdentity) else store.UNKNOWN_IDENTITY,
+            **({"target_directory": str(output_roots.target_directory),
+                "build_directory": str(output_roots.build_directory)}
+               if isinstance(output_roots, CargoOutputRoots) else {}),
+            "repo_identity": repository_key,
             **git_facts(directory),
             **tree,
             # A reusable test build needs verify's Cargo inputs as well as
@@ -1145,13 +1171,13 @@ def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step
 
 
 def queue_priority(action: Literal["set", "clear"], unit: str,
-                   why: str, set_by: str, at: float, *, transition_id: str = "") -> None:
+                   why: str, set_by: str, at: float, *, transition_id: str = "", start: int = 0) -> None:
     host = store.host_name()
     _ = append_row_once(store.host_file(host, at), {
         "kind": "queue_priority", "v": RECORD_VERSION,
         "id": transition_id or f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "action": action, "unit": unit, "why": why, "set_by": set_by,
-    })
+    }, start)
 
 
 class IdleFloorTarget(TypedDict):
@@ -1162,13 +1188,15 @@ class IdleFloorTarget(TypedDict):
     reason: NotRequired[str]
 
 
-def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float) -> None:
+def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float,
+               *, filesystem: str = "") -> None:
     host = store.host_name()
     store.append_line(store.host_file(host, at), {
         "kind": "floor_scan", "v": RECORD_VERSION,
         "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "free_after_scan": free_after_scan, "floor": floor, "shortfall": floor - free_after_scan,
         "idle_targets": idle_targets,
+        **({"filesystem": filesystem} if filesystem else {}),
     })
 
 

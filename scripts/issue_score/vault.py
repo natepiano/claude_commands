@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlsplit
 
 from scripts.feature_log import feature_log
 from scripts.lib import conf
-from .selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
 from .questions import body_character_limit, GOAL_LABELS, IssueState, PROJECT_ABOUT, StyleState
 

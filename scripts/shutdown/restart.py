@@ -129,7 +129,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         _ = stop_resume.heal_account_trust(folder, target_dir,
             Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
         environment = named_account_environment(target_dir)
-    if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=lambda _arguments: False):
+    if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon):
         print(f"{row.name}: unchanged")
         return ""
     destination = client.saved_row_tab(str(row.id), row.name)
@@ -151,7 +151,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             print(f"{row.name}: unchanged")
             return ""
         raise OSError(live.reason)
-    if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=lambda _arguments: False):
+    if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon):
         print(f"{row.name}: unchanged")
         return ""
     if kind == "claude":
@@ -190,7 +190,7 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
         print(f"restart: Claude liveness anomaly: {error}", file=sys.stderr)
         live = {}
     try:
-        codex_live = herdr.running_codex_threads(thread_host=lambda _arguments: False)
+        codex_live = herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon)
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         print(f"restart: Codex liveness anomaly: {error}", file=sys.stderr)
         codex_live = set[str]()
