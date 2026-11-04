@@ -230,6 +230,7 @@ final_pass_finish() {
     FINAL_PASS_START=""
 }
 STEP_RECORD_ACTIVE=0
+STEP_RECORD_ARGS=()
 STEP_RUNS_ON=natedev_only
 STEP_TARGET_TABLE=""
 HOLD_LINT=0
@@ -304,6 +305,9 @@ run() {
     local held_before=${TOKEN_HELD:-0} status=0
     run_step "$@" || status=$?
     finish_step_token "$held_before" "$status" || status=$?
+    if [[ "${STEP_RECORD_ACTIVE:-0}" == 1 ]] && step_writes_tree "$@"; then
+        env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" --state local_noncompiling || exit 2
+    fi
     if [[ "$status" != 0 && -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         exit "$status"
     fi
@@ -315,6 +319,11 @@ run_step() {
     local STEP_WRITES_TREE=0
     if step_writes_tree "$@"; then
         STEP_WRITES_TREE=1
+        # Keep the call's decision for the next step.
+        if [[ "${STEP_RECORD_ACTIVE:-0}" == 1 ]]; then
+            env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" \
+                --runs-on natedev_only --reason 'step writes the tree' --state local_noncompiling || exit 2
+        fi
         # Both queue hooks must keep this step in the original tree.
         local LINT_QUEUE_LEAVE_HOOK=false BUILDLOG_MAC_IDLE_HOOK=false
         export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
@@ -1741,14 +1750,14 @@ initialize_step_record() {
             fi
         done <<< "$table"
     fi
-    local record_args=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
+    STEP_RECORD_ARGS=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
         --repo "$(git rev-parse --show-toplevel)" --kind "$CMD"
         --runs-on "$STEP_RUNS_ON" --reason "$decision_reason" --state waiting_hold)
     if [[ "$STEP_RUNS_ON" == ssh_allowed ]]; then
-        record_args+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
+        STEP_RECORD_ARGS+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
     fi
-    if [[ "$CMD" == test ]]; then record_args+=(--package "$PKG"); fi
-    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${record_args[@]}" || exit 2
+    if [[ "$CMD" == test ]]; then STEP_RECORD_ARGS+=(--package "$PKG"); fi
+    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" || exit 2
     STEP_RECORD_ACTIVE=1
     export BUILDLOG_MEM_WAIT_FIRST_FILE="${BUILDLOG_MEM_WAIT_FIRST_FILE:-$HOLD_WAIT_DIR/first-queued-at}"
     if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
