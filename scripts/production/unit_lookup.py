@@ -60,7 +60,7 @@ from scripts.production.session_staff import (
     lookup_slug as _lookup_slug,
     production_members as production_members,
     group_marked_units as group_marked_units,
-    retained_unit_marks,
+    retained_session_labels,
     session_staff_and_directors as session_staff_and_directors,
 )
 
@@ -602,7 +602,7 @@ def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = No
     marked = observed_staff_marks(running=running)
     if isinstance(selected, MemberFound):
         # A retained row still needs pane liveness checks when cleanup is retried.
-        found = retained_unit_marks(marked, selected.row, slug, record=record, sources=sources)
+        found = retained_session_labels(marked, selected.row, slug, record=record, sources=sources)
     else:
         found = group_marked_units(marked, record=record, sources=sources)
     if fault := found.faults.get(slug, {}).get(name):

@@ -229,7 +229,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             if mac_failure:
                 self.assertIn("promote", failed.stdout)
             else:
-                self.assertIn(f"{self.promote}: M src/alpha.txt", failed.stdout)
+                self.assertIn('promotion refused: tracked edits overlap promotion: "src/alpha.txt"', failed.stdout)
             merge_head = self.git("rev-parse", "HEAD")
             self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge_head)
             receipt, = self.receipts()
@@ -714,10 +714,13 @@ with lock.open("a") as held:
         self.gate = False
         self.production_doc()
         sha = self.checkpoint()
+        self.write(self.promote, "src/beta.txt", "staged local edit\n")
+        _ = self.git("add", "src/beta.txt", cwd=self.promote)
+        self.write(self.promote, "src/beta.txt", "local edit\n")
         self.write(self.promote, "src/alpha.txt", "local edit\n")
         failed = self.run_checkpoint(sha)
         self.assertIn("failed", failed.process.stdout)
-        self.assertIn("src/alpha.txt", failed.process.stdout)
+        self.assertIn('promotion refused: tracked edits overlap promotion: "src/alpha.txt"', failed.process.stdout)
         pushed = self.git("rev-parse", "refs/heads/production", cwd=self.origin)
         self.assertEqual(self.git("rev-parse", "HEAD"), pushed)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), failed.before)
@@ -730,6 +733,8 @@ with lock.open("a") as held:
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), pushed)
         self.assertIn(f"into: {self.promote} (main)", resumed.process.stdout)
         self.assertNotIn("unblocks: G1", resumed.process.stdout)
+        self.assertEqual((self.promote / "src/beta.txt").read_text(), "local edit\n")
+        self.assertEqual(self.git("show", ":src/beta.txt", cwd=self.promote), "staged local edit")
     def test_mac_rc_failure_is_reported_after_local_promotion(self) -> None:
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()

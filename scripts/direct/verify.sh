@@ -230,6 +230,7 @@ final_pass_finish() {
     FINAL_PASS_START=""
 }
 STEP_RECORD_ACTIVE=0
+STEP_RECORD_ARGS=()
 STEP_RUNS_ON=natedev_only
 STEP_TARGET_TABLE=""
 HOLD_LINT=0
@@ -264,8 +265,69 @@ step_was_killed_for_memory() {
     memory_kill_in_journal "$started" "$ended"
 }
 
+step_writes_tree() {
+    if [[ "${1:-}" == env ]]; then
+        shift
+        while [[ "${1:-}" == *=* || "${1:-}" == -u ]]; do
+            if [[ "$1" == -u ]]; then shift 2; else shift; fi
+        done
+    fi
+    [[ "${1:-}" == cargo ]] || return 1
+    shift
+    if [[ "${1:-}" == +* ]]; then shift; fi
+    case "${1:-}" in
+        fmt) return 0 ;;
+        mend|clippy)
+            shift
+            while (( $# )); do
+                [[ "$1" != -- ]] || break
+                [[ "$1" != --fix ]] || return 0
+                shift
+            done
+            ;;
+    esac
+    return 1
+}
+
+finish_step_token() {
+    local held_before=$1 status=$2
+    if [[ "${TOKEN_USED:-0}" == 1 ]]; then
+        sync_token_state
+        if [[ "$held_before" == 0 ]] && ! release_token; then
+            (( status != 0 )) || status=1
+        fi
+    fi
+    return "$status"
+}
+
 run() {
+    if [[ "${TOKEN_USED:-0}" == 1 ]]; then sync_token_state; fi
+    local held_before=${TOKEN_HELD:-0} status=0
+    run_step "$@" || status=$?
+    finish_step_token "$held_before" "$status" || status=$?
+    if [[ "${STEP_RECORD_ACTIVE:-0}" == 1 ]] && step_writes_tree "$@"; then
+        env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" --state local_noncompiling || exit 2
+    fi
+    if [[ "$status" != 0 && -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
+        exit "$status"
+    fi
+    return "$status"
+}
+
+run_step() {
     local attempt status started ended step_log monitor=0
+    local STEP_WRITES_TREE=0
+    if step_writes_tree "$@"; then
+        STEP_WRITES_TREE=1
+        # Keep the call's decision for the next step.
+        if [[ "${STEP_RECORD_ACTIVE:-0}" == 1 ]]; then
+            env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" \
+                --runs-on natedev_only --reason 'step writes the tree' --state local_noncompiling || exit 2
+        fi
+        # Both queue hooks must keep this step in the original tree.
+        local LINT_QUEUE_LEAVE_HOOK=false BUILDLOG_MAC_IDLE_HOOK=false
+        export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
+    fi
     RUN_LAST_ATTEMPT_KILLED=0
     step_log="$(mktemp)"
     for attempt in 1 2; do
@@ -290,10 +352,15 @@ run() {
         set -m
         (
             set +m
-            if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] && buildlog_step_compiles "$@"; then
+            if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only && "$STEP_WRITES_TREE" == 0 ]] && buildlog_step_compiles "$@"; then
                 export LINT_QUEUE_LEAVE_HOOK="$(ssh_retry_hook)"
             fi
-            if run_once "$@" 2>&1 | tee "$step_log"; then
+            if (
+                step_token_before=${TOKEN_HELD:-0}
+                # The pipeline shell owns tokens taken during memory admission.
+                trap 'status=$?; finish_step_token "$step_token_before" "$status"; exit $?' EXIT
+                run_once "$@"
+            ) 2>&1 | tee "$step_log"; then
                 exit 0
             else
                 exit "${PIPESTATUS[0]}"
@@ -323,7 +390,7 @@ run() {
         # must end the call even when that tool's caller handles failures.
         if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
             rm -f "$step_log"
-            exit "$status"
+            return "$status"
         fi
         # A Mac copy that finished first stopped this step: no memory retry.
         if [[ -n "${VERIFY_STEP_INFO_FILE:-}" && -e "$VERIFY_STEP_INFO_FILE.stopped" ]]; then
@@ -929,6 +996,14 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
         4) exit 4 ;;
         *) echo "verify.sh: mesh_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
     esac
+fi
+
+# Set the run identity after detachment so the run owns its queue place.
+if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
+    BUILDLOG_RUN_START="$("$PY" "$STEP_RECORD_SCRIPT" start "$$")"
+    if [[ -n "$BUILDLOG_RUN_START" ]]; then
+        export BUILDLOG_RUN="$$:$BUILDLOG_RUN_START"
+    fi
 fi
 
 CMD="${1:-}"
@@ -1685,14 +1760,14 @@ initialize_step_record() {
             fi
         done <<< "$table"
     fi
-    local record_args=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
+    STEP_RECORD_ARGS=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
         --repo "$(git rev-parse --show-toplevel)" --kind "$CMD"
         --runs-on "$STEP_RUNS_ON" --reason "$decision_reason" --state waiting_hold)
     if [[ "$STEP_RUNS_ON" == ssh_allowed ]]; then
-        record_args+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
+        STEP_RECORD_ARGS+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
     fi
-    if [[ "$CMD" == test ]]; then record_args+=(--package "$PKG"); fi
-    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${record_args[@]}" || exit 2
+    if [[ "$CMD" == test ]]; then STEP_RECORD_ARGS+=(--package "$PKG"); fi
+    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" || exit 2
     STEP_RECORD_ACTIVE=1
     export BUILDLOG_MEM_WAIT_FIRST_FILE="${BUILDLOG_MEM_WAIT_FIRST_FILE:-$HOLD_WAIT_DIR/first-queued-at}"
     if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
@@ -1718,6 +1793,13 @@ route_compiling_step() {
     STEP_RAN_ON_MAC=0
     step_state waiting_hold
     check_routing_hold || admission=$?
+    if [[ "${STEP_WRITES_TREE:-0}" == 1 ]]; then
+        case "$admission" in
+            0) return 0 ;;
+            10) build_hold_wait_local "$@"; return $? ;;
+            *) return "$admission" ;;
+        esac
+    fi
     case "$admission" in
         0)
             if [[ "$STEP_RUNS_ON" != ssh_allowed && "$STEP_FORCE_MAC" == 0 ]]; then return 0; fi
@@ -1751,7 +1833,7 @@ route_compiling_step() {
         while (( $# )); do
             case "$MAC_VERB:$1" in
                 doc:--no-deps|clippy:--all-targets|mend-check:--all-targets|mend-check:--fail-on-warn) shift ;;
-                clippy:--fix|clippy:--allow-dirty|clippy:--allow-staged|clippy:--allow-no-vcs|mend-check:--fix) shift ;;
+                clippy:--allow-dirty|clippy:--allow-staged|clippy:--allow-no-vcs) shift ;;
                 doc:--jobs) shift 2 ;;
                 *) MAC_VERB_ARGS+=("$1"); shift ;;
             esac
@@ -1873,6 +1955,7 @@ ssh_reserve_hook() {
 }
 
 ssh_retry_hook() {
+    [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || { printf 'false'; return; }
     [[ "$STEP_RUNS_ON" != natedev_only && "$LOCAL_ONLY" == 0 ]] || { printf 'false'; return; }
     local name eligibility reason settings pivot=-1 index
     local names=() candidates=()
@@ -2228,6 +2311,8 @@ user_clock() {
 
 cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
+    # A lost token gives no verdict about the tree.
+    (( EXIT_STATUS != 125 )) || return 1
     key="$(tree_key)"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then

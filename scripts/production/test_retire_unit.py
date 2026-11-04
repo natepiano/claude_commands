@@ -60,6 +60,7 @@ from scripts.production import staff, unit_config
 from scripts.production.rename_rerun_test_support import saved_fixture
 from scripts.issue_score.selection import UseConfiguredValue
 from scripts.lib import conf
+from scripts.copies import copies
 from scripts.agents import worker_lifecycle
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
@@ -86,6 +87,34 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 
 @final
 class RetireUnitTests(unittest.TestCase):
+    def test_retirement_refuses_a_named_checkout_holder_then_removes_its_trees(self) -> None:
+        before = self.doc.read_bytes()
+        with copies.standing("alpha-unit", self.checkout, "HEAD") as tree:
+            with mock.patch.object(sessions, "running_sessions", return_value=[
+                    session("checkout-session", "gate-reviewer", os.getpid())]):
+                code, output = self.retire()
+            self.assertEqual(code, 1, output)
+            self.assertIn("left running:", output)
+            self.assertIn("gate-reviewer", output)
+            self.assertIn(str(tree), output)
+            self.assertEqual(self.doc.read_bytes(), before)
+            self.assertTrue(self.worktree.exists())
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(tree.exists())
+        self.assertFalse(self.worktree.exists())
+
+    def test_busy_editable_checkout_names_the_session_before_retirement(self) -> None:
+        with copies.workspace("alpha-unit", self.checkout, "HEAD", name="worker", branch="worker") as tree:
+            with mock.patch.object(sessions, "running_sessions", return_value=[
+                    session("checkout-session", "editable-reviewer", os.getpid())]):
+                code, output = self.retire()
+            self.assertEqual(code, 1, output)
+            self.assertIn("left running:", output)
+            self.assertIn("editable-reviewer", output)
+            self.assertIn(str(tree), output)
+            self.assertTrue(self.worktree.exists())
+
     def test_retirement_uses_the_staff_worktree_without_a_worktree_column(self) -> None:
         plan = self.worktree / "docs/plans/alpha.md"
         plan.parent.mkdir(parents=True, exist_ok=True)
@@ -404,6 +433,13 @@ class RetireUnitTests(unittest.TestCase):
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.limits()
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
+            "COPIES_CONFIG": str(Path(copies.__file__).resolve().parents[2] / "config/copies.conf"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
+            "SCRATCH_HOLDS": str(self.root / "copy-holds.json"),
+        }))
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)

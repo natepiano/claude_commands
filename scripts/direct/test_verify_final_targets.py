@@ -4,11 +4,33 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import test_verify_untested_examples as example_workspace
 
 
 class FinalTargetTests(example_workspace.ExampleWorkspaceFixture):
+    def test_cleanup_stops_admission_before_removing_configuration(self) -> None:
+        case = example_workspace.ExampleWorkspaceFixture()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        fixture = caller_admission(case, case.root, case.environment)
+        configuration = case.root / "lint.conf"
+        close = fixture.server.close
+
+        def close_with_configuration() -> None:
+            self.assertTrue(configuration.is_file())
+            close()
+
+        case.tearDown()
+        self.assertTrue(configuration.is_file())
+        with mock.patch.object(fixture.server, "close", side_effect=close_with_configuration) as stopped:
+            case.doCleanups()
+        stopped.assert_called_once_with()
+        self.assertTrue(fixture.server.closed)
+        self.assertFalse(case.root.exists())
+
     def workspace_with_example(self, source: str = "fn main() {}\n") -> None:
         _ = (self.root / "Cargo.toml").write_text(
             '[workspace]\nmembers = ["sample"]\nresolver = "2"\n'

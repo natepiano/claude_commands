@@ -35,6 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import session_staff, staff, staff_sources, unit_config
 from scripts.shutdown.remote import local_machine
 from scripts.lib import process_group, conf
+from scripts.copies import copies
+from scripts.lib import scratch
 from scripts.issue_score.selection import UseConfiguredValue
 from scripts.agents import worker_lifecycle
 
@@ -998,6 +1000,17 @@ def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
     if left:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")
+        return 1
+    try:
+        copies.remove_trees(unit.name)
+    except copies.BusyCopy as error:
+        description = error.description({item["pid"]: item["name"]
+                                         for item in sessions.running_sessions() if item["name"]})
+        print(f"left running: {description}")
+        print(f"{unit.name} is not retired: rerun once these stop")
+        return 1
+    except (copies.CopyError, OSError, scratch.ScratchError) as error:
+        print(f"{unit.name} is not retired: checkout cleanup: {error}")
         return 1
     # All writers are stopped; include commits made during shutdown.
     saved = preserve_branch(unit, saved, settings=settings)
