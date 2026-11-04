@@ -411,7 +411,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
    - **Where the types sit.** `TestPhaseCharge` is one more `ChargeBasis` variant, beside `RampPromise` and Phase 24's `LifetimePromise`. It is not a promise: Phase 24's `RampPromise | LifetimePromise | NoPromise` on `MeasuredMemory` does not change. `TestPhaseNeed` is not a `NeedBasis` variant: `NeedBasis` explains the admission `need`, and this phase does not change `need`. So the charge after the mark has one type, and N has one type.
 4. **The history row.** Phase 24's one finalizer, `finalize_reservation` (`memory_admit.py` :2953), adds three fields to the `anon_peaks.jsonl` row, from the same `test_phase_path` read: `test_phase_peak_bytes` and `test_phase_started_at` when the window is observed, and `test_phase_need` (tagged JSON) when the reservation has one. With no file or no window, the row has no window fields. N's history starts at this merge: coverage grows over about a day, and until then a family has no N and keeps today's charge.
    - **Saved before the first append.** `record.py` deletes the test-phase file after it reads it (`_delete_step_sources`, `scripts/buildlog/record.py` :729), so a retry cannot read it again. Snapshot the observed test-phase fields and the stored test-phase need into the existing `FinalizationIntent` (`memory_admit.py` :241, Phase 24) before the first history append. Every retry publishes that saved evidence through the same finalizer, also after `record.py` has removed the file.
-5. **Build-why words.** `build_why.charge_text` (:51) ends in `assert_never`, so the new variant needs its text: `tests since <HH:MM>: peak so far <GiB>, need <GiB> (<form>, p90 of <runs> runs at width <width>), × 1.2`.
+5. **Queue evidence words.** `queue_evidence.charge_text` (:31) ends in `assert_never`, so the new variant needs its text: `tests since <HH:MM>: peak so far <GiB>, need <GiB> (<form>, p90 of <runs> runs at width <width>), × 1.2`.
 6. **Tests.** In `scripts/lint/test_memory_admit.py`, on `MemoryQueueFixture` (:1286) with `fake_memory_readings`. Extend `MemoryQueueFixture.running` (:1315) to take a sidecar, a `.max` peak and a test-phase file; write no second reservation writer. Write history rows through one module-level row writer, and move the three writers that the classes have today (`HistoryTests.add_measured` :158, `FilteredPromiseTests.samples` :263, `RepositoryHistoryTests.samples` :934) onto it. One test for each case:
    - `test_nextest_charge_falls_to_test_phase_need_at_mark`: `.max` 11 GiB, a mark with peak 0.4 GiB, N 2 GiB: the charge is 2.4 GiB, and a held 12 GiB waiter is admitted.
    - `test_test_phase_charge_follows_peak_so_far`: peak so far 5 GiB, N 2 GiB: the charge is 6 GiB.
@@ -424,7 +424,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
    - The one reader: N's rows come through Phase 33's reader; the existing estimate-consumer tests pass unchanged.
    - The saved evidence (Spec 4): a failed append and an interrupted append, each followed by the removal of the test-phase file and then a retry, and owner-gone cleanup after the file is gone: each ends with exactly one history row that carries the saved `test_phase_peak_bytes`, `test_phase_started_at` and `test_phase_need`.
    - The codec (Spec 2): every `NeedBasis` variant, `TestPhaseNeed` and each `NoTestPhaseNeed` reason round-trip through the one codec; a missing field reads as its field's named unknown state.
-   - In `scripts/build_queue/test_build_why.py`: `charge_text` for `TestPhaseCharge`.
+   - In `scripts/build_queue/test_queue_evidence.py`: `charge_text` for `TestPhaseCharge`.
 
    Every test fakes both memory readings.
 7. **Docs.** `docs/as-built/build-memory-admission.md`: the mark read, N with its key, width forms and floor, the charge after the mark and its margin, the history row fields, and the replay table.
@@ -442,23 +442,23 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Files:**
 - `scripts/lint/memory_admit.py` — Specs 1–4.
 - `scripts/lint/test_memory_admit.py` — Spec 6.
-- `scripts/build_queue/build_why.py` — Spec 5 (owner queue-unit; trial-merge against `origin/builds-queue`).
-- `scripts/build_queue/test_build_why.py` — Spec 6, the charge text test (owner queue-unit).
+- `scripts/build_queue/queue_evidence.py` — Spec 5 (owner queue-unit; trial-merge against `origin/builds-queue`).
+- `scripts/build_queue/test_queue_evidence.py` — Spec 6, the charge text test (owner queue-unit).
 - `docs/as-built/build-memory-admission.md` — Spec 7.
 
 The replay and 24 h check scripts live in the run folder (`phases/15/`), not in the repository; both call Spec 2's rule.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — `memory_admit.py` (including the finalization-intent extension, Spec 4, and the one codec, Spec 2), `build_why.py`, docs, the replay and the follow-up measurement (the 24 h check).
-- `test` — `test_memory_admit.py` with its shared fixture (`MemoryQueueFixture`) and the one module-level history row writer (Spec 6), the retry regressions (failed and interrupted appends, owner-gone cleanup), and `test_build_why.py`.
+- `impl` — `memory_admit.py` (including the finalization-intent extension, Spec 4, and the one codec, Spec 2), `queue_evidence.py`, docs, the replay and the follow-up measurement (the 24 h check).
+- `test` — `test_memory_admit.py` with its shared fixture (`MemoryQueueFixture`) and the one module-level history row writer (Spec 6), the retry regressions (failed and interrupted appends, owner-gone cleanup), and `test_queue_evidence.py`.
 
 **Acceptance gate:**
-- The memory admission and build-why tests pass; `basedpyright` over `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `scripts/build_queue/build_why.py` and `scripts/build_queue/test_build_why.py` reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- The memory admission and queue evidence tests pass; `basedpyright` over `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `scripts/build_queue/queue_evidence.py` and `scripts/build_queue/test_queue_evidence.py` reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
 - The finalization retry tests (Spec 6) pass: a failed or interrupted append, the removal of the test-phase file, then a retry or owner-gone cleanup, leaves exactly one history row with the saved test-phase evidence (Phase 33's one-row guarantee, extended by Spec 4).
 - A test phase is above its charge when its `test_phase_peak_bytes` is above N × 1.2, its charge at the mark. The replay on 4c data uses natedev build-log rows with `test_phase_peak_bytes`, each with N from earlier rows by Spec 2's rule. For every repository, at most 2.3 % of test phases with an N are above their charge. The table (per repository: test phases, test phases with an N, test phases above the charge, worst excess in GiB) goes in the checkpoint notice. If a repository is above 2.3 %, the numbers go to the builds showrunner before the checkpoint.
-- The notice has an `also touches scripts/build_queue/build_why.py, test_build_why.py (owner queue-unit)` line, tested against `origin/builds-queue`.
+- The notice has an `also touches scripts/build_queue/queue_evidence.py, test_queue_evidence.py (owner queue-unit)` line, tested against `origin/builds-queue`.
 - The 24 h check, 24 h after the merge reaches main: from `anon_peaks.jsonl` rows with `test_phase_peak_bytes` and `test_phase_need`, per repository, the nextest steps that got a `TestPhaseCharge` and the test phases above their charge; the `steps.mem_wait_s` total against the 24 h before the merge; earlyoom kills (journal) and `calls.mem_kills` in both windows. The phase report records when the check is due; the result goes in a follow-up notice.
-- Change-Review line: a nextest step's charge falls to its test-phase need once its tests start | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` two times; during the second run, after its compile, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the step's charge reads `tests since …` with its need and width form, below its compile peak.
+- Change-Review line: a nextest step's charge falls to its test-phase need once its tests start | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` two times; during the second run, after its compile, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py` | the step's charge reads `tests since …` with its need and width form, below its compile peak.
 
 ### Phase 16 — Python test gates take a place in the shared admission queue  · status: done
 
@@ -1135,7 +1135,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** Treating all scanned bytes as independently takeable; copying all `scan.links` entries per target; using mtime or pid alone as hold identity; recording invalidation after deletion; saving delivery before a successful send.
 
-### Phase 39 — A build's memory promise fits the build's size, so a big build does not wait for a promise it never uses  · status: todo
+### Phase 39 — A build's memory promise fits the build's size, so a big build does not wait for a promise it never uses  · status: done
 **Depends on:** Phase 26 (`scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`). Runs before Phase 20 (same file; director's order 2026-10-31, a one-line revert), so Phase 20's replay calibrates against the adopted dev rule.
 
 **Approved:** builds showrunner GO 2026-10-31, after the head-memory-wait answer; the director's measurement is quoted below.
@@ -1150,7 +1150,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 1. **The headroom fits the build's size.** Replace the single dev multiplier with a headroom rule that covers small builds without scaling their ratio onto large ones (for example a fixed margin plus a smaller factor, or a factor that falls with the peak). Fit the rule by replay on the same 126-build cohort that fit `DEV_HEADROOM`, plus every build in the last 3 days. Each replayed promise caps at the build budget in force when its build ran (`[memory] build_budget_gib` in `config/lint.conf` on main at that time, else `FALLBACK_BUILD_BUDGET_BYTES`); the fit and the report name the budget of each cohort, so a budget change does not read as the new rule's effect. Keep `RELEASE_HEADROOM` unless the replay shows the same defect for release builds; say so in the summary either way.
 2. **One source.** The rule and its fitted numbers live in one place in `memory_admit.py`, with a comment that names the replay (cohort, date, the build that limits each number). The need basis row records the rule so `need_basis` still reads back (`read_need_basis` (written by `need_basis_record`); a basis saved before this phase still reads back). No second copy of the shape logic anywhere, tests included: tests import the constants.
-   - **The basis keeps the cap it applied.** `CappedAtBudget` (:211) holds only `uncapped`. `_need_record` (:1997, behind `need_basis_record` :2091) writes only that, `_read_need_record` (:2023, behind `read_need_basis` :2095) refuses a row whose `uncapped` is at or below today's `build_budget_bytes()` (:2052), and `queue_evidence.need_text` uses the reply budget as the cap. So a basis saved under one budget does not read back under another: uncapped 22 GiB under a 21 GiB budget becomes `BasisNotRecorded` under a 24 GiB budget. Make it `CappedAtBudget(uncapped, cap)` with `cap: int | CapNotRecorded`. `build_expected_peak` (:1956) stores the budget it applied. The codec writes `cap` and checks `uncapped > cap`, never today's budget. A saved row with no `cap` decodes to `CapNotRecorded()` and checks only `uncapped > 0`. `need_text` prints the saved cap, and for `CapNotRecorded` prints `capped at the build budget of that time (uncapped <GiB>)`.
+   - **The basis keeps the cap it applied.** `CappedAtBudget` (:211) holds only `uncapped`. `_need_record` (:1997, behind `need_basis_record` :2091) writes only that, `_read_need_record` (:2023, behind `read_need_basis` :2095) refuses a row whose `uncapped` is at or below today's `build_budget_bytes()` (:2052), and `queue_evidence.need_text` prints the `budget` its caller passes, today's budget, as the cap (`scripts/build_queue/queue_evidence.py`, `need_text`). So a basis saved under one budget does not read back under another: uncapped 22 GiB under a 21 GiB budget becomes `BasisNotRecorded` under a 24 GiB budget. Make it `CappedAtBudget(uncapped, cap)` with `cap: int | CapNotRecorded`. `build_expected_peak` (:1956) stores the budget it applied. The codec writes `cap` and checks `uncapped > cap`, never today's budget. A saved row with no `cap` decodes to `CapNotRecorded()` and checks only `uncapped > 0`. `need_text` prints the saved cap (drop its `budget` parameter if no other text needs it), and for `CapNotRecorded` prints `capped at the build budget of that time (uncapped <GiB>)`.
    - **Old factors read back.** The factor decode compares a saved factor with today's constant (`RELEASE_HEADROOM` :2073, `DEV_HEADROOM` :2075), so a dev basis saved with the old factor decodes to a named old-rule state after the rule changes, never to `BasisNotRecorded`.
 3. **The kill retry stays.** The existing retry after a memory kill stays the safety for a build that goes over its promise. Do not change it.
 4. **Replay report.** The phase ships a replay over the last 3 days of natedev step rows: for each build, the old promise, the new promise and the measured peak. The report gives how many builds would have gone over their new promise, and by how much (each one, and the largest).
@@ -1162,7 +1162,7 @@ Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlie
 
 **Files:**
 - `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `docs/as-built/build-memory-admission.md` — items 1-5.
-- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/test_queue_evidence.py` — `need_text` renders `DevHeadroom`'s multiplier today; the new rule is a named basis variant with its own text, and an old saved basis keeps its text. `need_text` must print the saved cap instead of the reply budget.
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/test_queue_evidence.py` — `need_text` renders `DevHeadroom`'s multiplier today; the new rule is a named basis variant with its own text, and an old saved basis keeps its text. `need_text` prints the saved cap, not today's budget. Queue-unit owns these files: name them as `also touches` in the notice, tested against the queue tip.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `memory_admit.py`, `queue_evidence.py`, the replay and the doc.

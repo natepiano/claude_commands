@@ -1739,7 +1739,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
         bases: tuple[gate.NeedBasis | gate.BasisNotRecorded, ...] = (
             "measured", "buildlog", "pooled", "fallback", gate.BasisNotRecorded(),
             gate.ShapeP90(10, gate.FailedPeakFloor(4 * GIB, HISTORY_AT.isoformat()),
-                          gate.DevHeadroom(), gate.CappedAtBudget(25 * GIB)),
+                          gate.DevHeadroom(), gate.CappedAtBudget(25 * GIB, gate.CapNotRecorded())),
             gate.ShapeLargest(2, factor=gate.ReleaseHeadroom()), gate.ShapeFallback())
         for basis in bases:
             with self.subTest(basis=basis):
@@ -2174,6 +2174,38 @@ class BuildPromiseFixture(MemoryQueueFixture):
 
 
 class BuildShapePromiseTests(BuildPromiseFixture):
+    def test_dev_history_uses_size_headroom_below_the_cap(self) -> None:
+        for base, binary in ((0.5, "hana-small"), (6.3, "hana")):
+            shape = build_shape(["cargo", "build", "--bin", binary])
+            previous_count = 0
+            for count in (1, 9):
+                for _ in range(count - previous_count):
+                    self.sample(base, shape=shape)
+                previous_count = count
+                with self.subTest(base=base, runs=count):
+                    peak = self.estimate(shape)
+                    basis = self.same_shape_basis(peak)
+                    self.assertEqual(peak.count, count)
+                    self.assertIsInstance(basis, gate.ShapeLargest)
+                    self.assertIsInstance(basis.cap, gate.UnderBudget)
+                    self.assertIsInstance(basis.factor, gate.DevSizeHeadroom)
+                    self.assertEqual(basis.factor, gate.DevSizeHeadroom())
+                    self.assertEqual(peak.bytes, gate.shape_headroom_bytes(int(base * GIB), gate.DevSizeHeadroom()))
+                    if base == 6.3:
+                        self.assertGreaterEqual(peak.bytes, int(7.8 * GIB))
+                        self.assertLess(peak.bytes, 21 * GIB)
+                    self.assertEqual(gate.read_need_basis(gate.need_basis_record(basis)), basis)
+
+    def test_dev_size_headroom_fits_the_s2_build(self) -> None:
+        self.assertEqual(gate.shape_headroom_bytes(int(6.3 * GIB), gate.DevSizeHeadroom()), 8_622_146_848)
+
+    def test_small_dev_history_still_covers_the_limiting_build(self) -> None:
+        shape = build_shape(["cargo", "build", "--bin", "cargo-berth"])
+        self.sample(0.34, shape=shape)
+        peak = self.estimate(shape)
+        self.assertGreaterEqual(peak.bytes, math.ceil(1.41 * GIB))
+        self.assertIsInstance(self.same_shape_basis(peak).cap, gate.UnderBudget)
+
     def test_unfinished_rows_do_not_enter_build_shape_history(self) -> None:
         self.sample(3)
         assert_unfinished_history_ignored(
@@ -2199,9 +2231,9 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             with self.subTest(profile=shape.profile):
                 peak = self.estimate(shape)
                 self.assertEqual((peak.bytes, peak.count), (21 * GIB, 0))
-                self.assertEqual(peak.basis, gate.ShapeFallback(cap=gate.CappedAtBudget(24 * GIB)))
+                self.assertEqual(peak.basis, gate.ShapeFallback(cap=gate.CappedAtBudget(24 * GIB, 21 * GIB)))
                 self.assertEqual(gate.need_basis_record(peak.basis), {
-                    "kind": "shape_fallback", "cap": {"kind": "budget", "uncapped": 24 * GIB},
+                    "kind": "shape_fallback", "cap": {"kind": "budget", "uncapped": 24 * GIB, "cap": 21 * GIB},
                 })
 
     def test_release_history_matches_repository_features_and_target(self) -> None:
@@ -2249,29 +2281,21 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.sample(2, shape=build_shape(["cargo", "build", "--release", "--lib"]))
         self.assertEqual(self.estimate().bytes, 12 * GIB)
 
-    def test_headroom_applies_only_to_the_release_profile(self) -> None:
-        for arguments, factor in ((RELEASE_BUILD, 1.314), (["cargo", "build"], gate.DEV_HEADROOM),
-                                  (["cargo", "build", "--profile", "small"], 1.0)):
+    def test_each_build_profile_uses_its_headroom_rule(self) -> None:
+        for arguments, rule in (
+            (RELEASE_BUILD, gate.ReleaseHeadroom()),
+            (["cargo", "build", "--profile", "release", "--bin", "hana"], gate.ReleaseHeadroom()),
+            (["cargo", "build"], gate.DevSizeHeadroom()),
+            (["cargo", "build", "--profile", "small"], gate.NoHeadroom()),
+        ):
             shape = build_shape(arguments)
             self.sample(10, shape=shape)
-            with self.subTest(profile=shape.profile):
+            with self.subTest(arguments=arguments):
                 peak = self.estimate(shape)
-                self.assertEqual(peak.bytes, min(21 * GIB, math.ceil(10 * GIB * factor)))
-                expected = (gate.ReleaseHeadroom() if shape.profile == "release" else
-                            gate.DevHeadroom() if shape.profile == "dev" else gate.NoHeadroom())
+                self.assertEqual(peak.bytes, min(21 * GIB, gate.shape_headroom_bytes(10 * GIB, rule)))
                 basis = self.same_shape_basis(peak)
                 assert isinstance(basis, gate.ShapeLargest)
-                self.assertEqual(basis.factor, expected)
-
-    def test_dev_history_gets_measured_headroom_below_the_cap(self) -> None:
-        shape = build_shape(["cargo", "build", "--bin", "hana"])
-        self.sample(0.5, shape=shape)
-        peak = self.estimate(shape)
-        self.assertEqual(peak.bytes, math.ceil((GIB // 2) * gate.DEV_HEADROOM))
-        basis = self.same_shape_basis(peak)
-        assert isinstance(basis, gate.ShapeLargest)
-        self.assertEqual(basis.factor, gate.DevHeadroom())
-        self.assertEqual(gate.read_need_basis(gate.need_basis_record(basis)), basis)
+                self.assertEqual(basis.factor, rule)
 
     def test_build_promises_never_exceed_21_gib(self) -> None:
         for arguments in (RELEASE_BUILD, ["cargo", "build"]):
@@ -2280,8 +2304,9 @@ class BuildShapePromiseTests(BuildPromiseFixture):
             with self.subTest(profile=shape.profile):
                 peak = self.estimate(shape)
                 self.assertEqual(peak.bytes, 21 * GIB)
-                factor = 1.314 if shape.profile == "release" else gate.DEV_HEADROOM
-                self.assertEqual(self.same_shape_basis(peak).cap, gate.CappedAtBudget(math.ceil(30 * GIB * factor)))
+                rule = gate.ReleaseHeadroom() if shape.profile == "release" else gate.DevSizeHeadroom()
+                self.assertEqual(self.same_shape_basis(peak).cap,
+                                 gate.CappedAtBudget(gate.shape_headroom_bytes(30 * GIB, rule), 21 * GIB))
 
     def test_old_history_matches_a_copy_with_a_different_checkout_name(self) -> None:
         self.index_build("copied-build", RELEASE_BUILD)
@@ -2661,6 +2686,62 @@ class BuildFinalizerTests(BuildPromiseFixture):
 
 
 class BuildNeedBasisTests(BuildPromiseFixture):
+    def test_recorded_budget_cap_survives_a_larger_current_budget(self) -> None:
+        basis = gate.ShapeFallback(gate.CappedAtBudget(22 * GIB, 21 * GIB))
+        encoded = gate.need_basis_record(basis)
+        self.assertEqual(encoded, {
+            "kind": "shape_fallback",
+            "cap": {"kind": "budget", "uncapped": 22 * GIB, "cap": 21 * GIB},
+        })
+        with patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "24"}):
+            self.assertEqual(gate.read_need_basis(encoded), basis)
+
+    def test_legacy_budget_cap_does_not_consult_the_current_budget(self) -> None:
+        encoded = {"kind": "shape_fallback", "cap": {"kind": "budget", "uncapped": 22 * GIB}}
+        for budget in ("21", "24"):
+            with self.subTest(budget=budget), patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": budget}):
+                basis = gate.read_need_basis(encoded)
+                self.assertEqual(basis, gate.ShapeFallback(gate.CappedAtBudget(22 * GIB, gate.CapNotRecorded())))
+                self.assertEqual(gate.read_need_basis(gate.need_basis_record(basis)), basis)
+
+    def test_old_dev_factor_remains_readable_after_the_rule_changes(self) -> None:
+        encoded: dict[str, object] = {
+            "kind": "shape_largest", "runs": 2,
+            "floor": {"kind": "none"},
+            "factor": {"kind": "dev", "factor": gate.DEV_HEADROOM},
+            "cap": {"kind": "none"},
+        }
+        basis = gate.read_need_basis(encoded)
+        self.assertEqual(basis, gate.ShapeLargest(2, factor=gate.DevHeadroom()))
+        self.assertEqual(gate.need_basis_record(basis), encoded)
+
+    def test_recorded_budget_cap_requires_a_positive_cap_below_the_uncapped_need(self) -> None:
+        for cap in (0, -GIB, 22 * GIB, 23 * GIB, True, "21"):
+            with self.subTest(cap=cap):
+                self.assertEqual(gate.read_need_basis({
+                    "kind": "shape_fallback",
+                    "cap": {"kind": "budget", "uncapped": 22 * GIB, "cap": cap},
+                }), gate.BasisNotRecorded())
+
+    def test_dev_factor_overflow_is_not_a_recorded_basis(self) -> None:
+        self.assertEqual(gate.read_need_basis({
+            "kind": "shape_largest", "runs": 2,
+            "floor": {"kind": "none"},
+            "factor": {"kind": "dev", "factor": 10 ** 400},
+            "cap": {"kind": "none"},
+        }), gate.BasisNotRecorded())
+
+    def test_release_factor_keeps_its_saved_value(self) -> None:
+        encoded: dict[str, object] = {
+            "kind": "shape_largest", "runs": 2,
+            "floor": {"kind": "none"},
+            "factor": {"kind": "release", "factor": 1.5},
+            "cap": {"kind": "none"},
+        }
+        basis = gate.read_need_basis(encoded)
+        self.assertEqual(basis, gate.ShapeLargest(2, factor=gate.ReleaseHeadroom(1.5)))
+        self.assertEqual(gate.need_basis_record(basis), encoded)
+
     def test_waiter_records_tagged_basis_and_queue_reads_the_same_basis(self) -> None:
         for _ in range(9):
             self.sample(10)
@@ -2703,9 +2784,11 @@ class BuildNeedBasisTests(BuildPromiseFixture):
 
     def test_every_shape_tier_round_trips_with_floor_factor_and_cap(self) -> None:
         floor = gate.FailedPeakFloor(16 * GIB, "2026-10-05T12:00:00Z")
-        for basis in (gate.ShapeP90(10, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(24 * GIB)),
+        for basis in (gate.ShapeP90(10, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(24 * GIB, 21 * GIB)),
                       gate.ShapeLargest(2, floor, gate.ReleaseHeadroom(), gate.UnderBudget()),
-                      gate.ShapeFallback(gate.CappedAtBudget(24 * GIB))):
+                      gate.ShapeLargest(2, factor=gate.DevSizeHeadroom(1.25, 2 * GIB)),
+                      gate.ShapeFallback(gate.CappedAtBudget(24 * GIB, 21 * GIB)),
+                      gate.ShapeFallback(gate.CappedAtBudget(24 * GIB, gate.CapNotRecorded()))):
             with self.subTest(basis=basis):
                 peak = gate.ExpectedPeak(GIB, "shape", 1, basis)
                 self.assertEqual(gate.read_need_basis(gate.need_basis_record(peak.basis)), basis)

@@ -1943,7 +1943,7 @@ class CutoverServiceTests(unittest.TestCase):
                     running.step.step), "merge gate promise: holds until the step ends")
                 self.assertEqual(queue_evidence.need_text(gate.RecordedNeed("cap", 0, gate.HISTORY_DAYS,
                     "full", "", (), gate.WidthNotRecorded(), gate.read_need_basis(waiter.get("need_basis"))),
-                    budget=explained.explanation.limits.budget, zone=user_zone()),
+                    zone=user_zone()),
                     "the merge gate's memory cap")
                 self.assertEqual(fixture.server.reservations[request.episode].need, 6 * GIB)
 

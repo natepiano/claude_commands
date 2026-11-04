@@ -208,16 +208,16 @@ class QueueEvidenceTests(unittest.TestCase):
                 self.assertEqual(queue_evidence.free_text(check),
                     f"Free memory: free {available:.1f} GiB {relation} need 6.0 + earlyoom 3.0 + promise not yet used 2.0 = 11.0 GiB: {result}")
 
-    def test_capped_need_uses_the_reply_budget_without_configuration_reads(self) -> None:
+    def test_capped_need_uses_the_saved_budget_without_configuration_reads(self) -> None:
         source = gate.RecordedNeed("shape", 10, 14, "full", "", (), gate.WidthNotRecorded(),
             gate.ShapeP90(10, gate.FailedPeakFloor(16 * GIB, "2026-10-30T01:40:00Z"),
-                          gate.ReleaseHeadroom(), gate.CappedAtBudget(30 * GIB)))
+                          gate.ReleaseHeadroom(), gate.CappedAtBudget(30 * GIB, 19 * GIB)))
         zone = user_zone()
         with mock.patch.object(gate, "build_budget_bytes", side_effect=AssertionError("live budget")), \
              mock.patch.object(gate, "memory_config", side_effect=AssertionError("live policy")), \
              mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("live policy")), \
              mock.patch("conf.read", side_effect=AssertionError("live configuration")):
-            text = queue_evidence.need_text(source, budget=19 * GIB, zone=zone)
+            text = queue_evidence.need_text(source, zone=zone)
         for value in ("19.0 GiB", "30.0 GiB", "16.0 GiB", "1.314", "14 days"):
             self.assertIn(value, text)
         self.assertNotIn("21.0 GiB", text)
@@ -584,7 +584,7 @@ class QueueEvidenceTests(unittest.TestCase):
             with self.subTest(basis=basis):
                 source = gate.RecordedNeed("shape", 12 if isinstance(basis, gate.ShapeP90) else 3,
                                            14, "full", "", (), gate.WidthNotRecorded(), basis)
-                text = queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone())
+                text = queue_evidence.need_text(source, zone=user_zone())
                 for word in (*words, "14 days"):
                     self.assertIn(word, text)
                 if not isinstance(basis, gate.ShapeP90):
@@ -594,13 +594,13 @@ class QueueEvidenceTests(unittest.TestCase):
         ended_at = "2026-10-29T09:09:52Z"
         floor = gate.FailedPeakFloor(gib(15.76), ended_at)
         for tier in (
-            gate.ShapeP90(10, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24))),
-            gate.ShapeLargest(2, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24))),
-            gate.ShapeFallback(gate.CappedAtBudget(gib(24))),
+            gate.ShapeP90(10, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24), 21 * GIB)),
+            gate.ShapeLargest(2, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24), 21 * GIB)),
+            gate.ShapeFallback(gate.CappedAtBudget(gib(24), 21 * GIB)),
         ):
             with self.subTest(tier=tier):
                 text = queue_evidence.need_text(gate.RecordedNeed(
-                    "shape", 10, 14, "full", "", (), gate.WidthNotRecorded(), tier), budget=21 * GIB, zone=user_zone())
+                    "shape", 10, 14, "full", "", (), gate.WidthNotRecorded(), tier), zone=user_zone())
                 words = (("cap", "21.0 GiB", "24.0 GiB", "no headroom factor")
                          if isinstance(tier, gate.ShapeFallback) else
                          ("floor", "15.8 GiB", "05:09", "1.314", "cap", "21.0 GiB", "24.0 GiB"))
@@ -608,11 +608,29 @@ class QueueEvidenceTests(unittest.TestCase):
                     self.assertIn(word, text)
 
     def test_fallback_need_text_names_its_base_and_cap_without_a_floor_or_factor(self) -> None:
-        basis = gate.ShapeFallback(cap=gate.CappedAtBudget(gib(24)))
+        basis = gate.ShapeFallback(cap=gate.CappedAtBudget(gib(24), 21 * GIB))
         source = gate.RecordedNeed("shape", 0, 14, "full", "", (), gate.WidthNotRecorded(), basis)
-        self.assertEqual(queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone()),
+        self.assertEqual(queue_evidence.need_text(source, zone=user_zone()),
                          "same-shape fallback: no runs; heavier of fallback and same-profile builds, last 14 days"
                          + "; no headroom factor; capped at 21.0 GiB (uncapped 24.0 GiB)")
+
+    def test_need_text_names_saved_caps_and_dev_size_headroom(self) -> None:
+        for basis, words in (
+            (gate.ShapeFallback(gate.CappedAtBudget(22 * GIB, 21 * GIB)),
+             ("capped at 21.0 GiB (uncapped 22.0 GiB)",)),
+            (gate.ShapeFallback(gate.CappedAtBudget(22 * GIB, gate.CapNotRecorded())),
+             ("capped at the build budget of that time (uncapped 22.0 GiB)",)),
+            (gate.ShapeLargest(2, factor=gate.DevSizeHeadroom(1.25, 2 * GIB)),
+             ("dev", "1.25", "margin", "2.0 GiB", "under build budget")),
+        ):
+            with self.subTest(basis=basis):
+                source = gate.RecordedNeed("shape", 2, 14, "full", "", (), gate.WidthNotRecorded(), basis)
+                text = queue_evidence.need_text(source, zone=user_zone())
+                for word in words:
+                    self.assertIn(word, text)
+                self.assertNotIn("4.203", text)
+                if isinstance(basis, gate.ShapeFallback):
+                    self.assertEqual(text.split("; ")[-1], words[0])
 
     def test_cap_need_text_uses_the_program_in_the_recorded_basis(self) -> None:
         for program, words in (("merge-gate", "the merge gate's memory cap"),
@@ -620,7 +638,7 @@ class QueueEvidenceTests(unittest.TestCase):
             with self.subTest(program=program):
                 basis = gate.read_need_basis(gate.need_basis_record(gate.ProgramMemoryCap(program)))
                 source = gate.RecordedNeed("cap", 0, 14, "full", "", (), gate.WidthNotRecorded(), basis)
-                self.assertEqual(queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone()), words)
+                self.assertEqual(queue_evidence.need_text(source, zone=user_zone()), words)
 
     def test_gate_cap_need_and_charge_text_stay_the_same_after_head_seconds(self) -> None:
         self.reset_running(available=40, need=20)
@@ -639,7 +657,7 @@ class QueueEvidenceTests(unittest.TestCase):
             head = reading.explanation.head
             assert isinstance(head, gate.HeadExplanation)
             running, = reading.explanation.running
-            lines.append((queue_evidence.need_text(head.need_source, budget=reading.explanation.limits.budget, zone=user_zone()), queue_evidence.charge_text(
+            lines.append((queue_evidence.need_text(head.need_source, zone=user_zone()), queue_evidence.charge_text(
                 running.basis, user_zone(), reading.explanation.policy, running.step.step)))
             self.assertEqual(running.charged, 6 * GIB)
         self.assertEqual(lines[0], lines[1])
@@ -753,13 +771,13 @@ class QueueEvidenceTests(unittest.TestCase):
         basis = gate.ShapeLargest(1, gate.FailedPeakFloor(gib(15.76), "2026-10-29T02:09:52Z"))
         source = gate.RecordedNeed("shape", 1, 14, "full", "", (), gate.WidthNotRecorded(), basis)
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
-            text = queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone())
+            text = queue_evidence.need_text(source, zone=user_zone())
         self.assertEqual(text.split("; ")[1], "failed-build floor 15.8 GiB from 22:09")
 
     def test_dev_shape_names_its_measured_promise_factor(self) -> None:
         source = gate.RecordedNeed("shape", 2, 14, "full", "", (), gate.WidthNotRecorded(),
                                    gate.ShapeLargest(2, factor=gate.DevHeadroom()))
-        text = queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone())
+        text = queue_evidence.need_text(source, zone=user_zone())
         self.assertEqual(text.split("; ")[2], "dev promise factor × 4.203")
         self.assertNotIn("release headroom", text)
 

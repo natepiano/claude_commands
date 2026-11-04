@@ -162,8 +162,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
             + f"queue arrival {clock(model, head.waiter.since)}; "
             + f"waiting {age(head.waiter.since, explanation.now)} min; "
             + f"need {queue_evidence.gib(head.waiter.need)}")
-    add("Need source: " + queue_evidence.need_text(head.need_source,
-        budget=explanation.limits.budget, zone=model.zone))
+    add("Need source: " + queue_evidence.need_text(head.need_source, zone=model.zone))
     add(queue_evidence.need_details(head.need_source))
     if isinstance(model.facts, head_facts.HeadFacts):
         facts = model.facts

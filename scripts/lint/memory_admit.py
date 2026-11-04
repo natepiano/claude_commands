@@ -107,10 +107,14 @@ HISTORY_DAYS = 14
 # Option C, 126 builds over 14 days to 2026-10-30: 1.314 covered every
 # replayed release step (including the 15.76 GiB incident).
 RELEASE_HEADROOM = 1.314
-# Repair replay, same 126-build cohort to 2026-10-30: this smallest factor
-# covers all 81 dev steps with prior shape history. The limiting cargo-berth
-# build used 1.412826538 GiB after a 0.336112976 GiB same-shape peak.
+# Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
+# Phase 39 replay, 2026-11-04: the original 126 builds and 64 recent builds.
+# Cargo-berth used 1.412826538 GiB after 0.336112976 GiB; its increase sets
+# the 1.1 GiB margin. S2 used 7.8 GiB after 6.3 GiB; it sets the 1.1 factor.
+# Each value rounds upward to one decimal place.
+DEV_SIZE_FACTOR = 1.1
+DEV_SIZE_MARGIN_BYTES = math.ceil(1.1 * GIB)
 
 
 @dataclass(frozen=True)
@@ -200,7 +204,28 @@ class ReleaseHeadroom:
 
 @dataclass(frozen=True)
 class DevHeadroom:
+    """The multiplier recorded before the dev size rule."""
+
     factor: float = DEV_HEADROOM
+
+
+@dataclass(frozen=True)
+class DevSizeHeadroom:
+    factor: float = DEV_SIZE_FACTOR
+    margin_bytes: int = DEV_SIZE_MARGIN_BYTES
+
+
+HeadroomRule = ReleaseHeadroom | DevHeadroom | DevSizeHeadroom | NoHeadroom
+HEADROOM_FACTOR_CLASSES: dict[str, type[ReleaseHeadroom | DevHeadroom | DevSizeHeadroom]] = {
+    "release": ReleaseHeadroom,
+    "dev": DevHeadroom,
+    "dev_size": DevSizeHeadroom,
+}
+
+
+@dataclass(frozen=True)
+class CapNotRecorded:
+    pass
 
 
 @dataclass(frozen=True)
@@ -211,13 +236,14 @@ class UnderBudget:
 @dataclass(frozen=True)
 class CappedAtBudget:
     uncapped: int
+    cap: int | CapNotRecorded
 
 
 @dataclass(frozen=True)
 class ShapeP90:
     runs: int
     floor: FailedPeakFloor | NoFloor = NoFloor()
-    factor: ReleaseHeadroom | DevHeadroom | NoHeadroom = NoHeadroom()
+    factor: HeadroomRule = NoHeadroom()
     cap: CappedAtBudget | UnderBudget = UnderBudget()
 
 
@@ -225,7 +251,7 @@ class ShapeP90:
 class ShapeLargest:
     runs: int
     floor: FailedPeakFloor | NoFloor = NoFloor()
-    factor: ReleaseHeadroom | DevHeadroom | NoHeadroom = NoHeadroom()
+    factor: HeadroomRule = NoHeadroom()
     cap: CappedAtBudget | UnderBudget = UnderBudget()
 
 
@@ -1977,6 +2003,15 @@ def build_peaks(repository: RepositoryIdentity, host: str, now: datetime, root: 
     return peaks
 
 
+def shape_headroom_bytes(base: int, rule: HeadroomRule) -> int:
+    """Apply the recorded headroom rule to the same-shape base."""
+    if isinstance(rule, DevSizeHeadroom):
+        return math.ceil(base * rule.factor + rule.margin_bytes)
+    if isinstance(rule, (ReleaseHeadroom, DevHeadroom)):
+        return math.ceil(base * rule.factor)
+    return base
+
+
 def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape,
                         host: str, now: datetime, root: Path, first_peak_bytes: int, budget: int) -> ExpectedPeak:
     rows = build_peaks(repository, host, now, root) if isinstance(repository, RepositoryIdentity) else []
@@ -2001,17 +2036,17 @@ def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape
     if isinstance(basis, (ShapeP90, ShapeLargest)):
         if isinstance(floor, FailedPeakFloor):
             base = max(base, floor.peak)
-        factor: ReleaseHeadroom | DevHeadroom | NoHeadroom = NoHeadroom()
+        factor: HeadroomRule = NoHeadroom()
         if isinstance(shape, BuildShape):
             if shape.profile == "release":
                 factor = ReleaseHeadroom()
             elif shape.profile == "dev":
-                factor = DevHeadroom()
-        uncapped = math.ceil(base * factor.factor) if isinstance(factor, (ReleaseHeadroom, DevHeadroom)) else base
+                factor = DevSizeHeadroom()
+        uncapped = shape_headroom_bytes(base, factor)
         basis = replace(basis, floor=floor, factor=factor)
     else:
         uncapped = base
-    cap: CappedAtBudget | UnderBudget = (CappedAtBudget(uncapped)
+    cap: CappedAtBudget | UnderBudget = (CappedAtBudget(uncapped, budget)
                                        if uncapped > budget else UnderBudget())
     basis = replace(basis, cap=cap)
     return ExpectedPeak(min(uncapped, budget), "shape", count, basis)
@@ -2028,16 +2063,22 @@ def _need_record(basis: NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPha
         return {"kind": basis if isinstance(basis, str) else "not_recorded"}
     if isinstance(basis, ProgramMemoryCap):
         return {"kind": "program_memory_cap", "program": basis.program}
-    cap: dict[str, object] = ({"kind": "budget", "uncapped": basis.cap.uncapped}
-                              if isinstance(basis.cap, CappedAtBudget) else {"kind": "none"})
+    cap: dict[str, object] = {"kind": "none"}
+    if isinstance(basis.cap, CappedAtBudget):
+        cap = {"kind": "budget", "uncapped": basis.cap.uncapped}
+        if isinstance(basis.cap.cap, int):
+            cap["cap"] = basis.cap.cap
     if isinstance(basis, ShapeFallback):
         return {"kind": "shape_fallback", "cap": cap}
     floor: dict[str, object] = ({"kind": "failed_peak", "peak": basis.floor.peak, "ended_at": basis.floor.ended_at}
                                 if isinstance(basis.floor, FailedPeakFloor) else {"kind": "none"})
     factor: dict[str, object] = {"kind": "none"}
-    if isinstance(basis.factor, (ReleaseHeadroom, DevHeadroom)):
-        factor = {"kind": "release" if isinstance(basis.factor, ReleaseHeadroom) else "dev",
-                  "factor": basis.factor.factor}
+    for factor_kind, factor_class in HEADROOM_FACTOR_CLASSES.items():
+        if isinstance(basis.factor, factor_class):
+            factor = {"kind": factor_kind, "factor": basis.factor.factor}
+            if isinstance(basis.factor, DevSizeHeadroom):
+                factor["margin_bytes"] = basis.factor.margin_bytes
+            break
     kind = "shape_p90" if isinstance(basis, ShapeP90) else "shape_largest"
     return {"kind": kind, "runs": basis.runs,
             "floor": floor, "factor": factor, "cap": cap}
@@ -2082,7 +2123,13 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
             uncapped = cap_row["uncapped"]
             if type(uncapped) is not int or uncapped <= 0:
                 return BasisNotRecorded()
-            cap = CappedAtBudget(uncapped)
+            saved_cap: int | CapNotRecorded = CapNotRecorded()
+            if "cap" in cap_row:
+                cap_bytes = cap_row["cap"]
+                if type(cap_bytes) is not int or not 0 < cap_bytes < uncapped:
+                    return BasisNotRecorded()
+                saved_cap = cap_bytes
+            cap = CappedAtBudget(uncapped, saved_cap)
         elif cap_row["kind"] != "none":
             return BasisNotRecorded()
         if kind == "shape_fallback":
@@ -2100,12 +2147,26 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
             floor = FailedPeakFloor(peak, ended_at)
         elif floor_row["kind"] != "none":
             return BasisNotRecorded()
-        factor: ReleaseHeadroom | DevHeadroom | NoHeadroom = NoHeadroom()
-        if factor_row["kind"] == "release" and factor_row.get("factor") == RELEASE_HEADROOM:
-            factor = ReleaseHeadroom()
-        elif factor_row["kind"] == "dev" and factor_row.get("factor") == DEV_HEADROOM:
-            factor = DevHeadroom()
-        elif factor_row["kind"] != "none":
+        factor: HeadroomRule = NoHeadroom()
+        factor_kind = factor_row["kind"]
+        factor_class = HEADROOM_FACTOR_CLASSES.get(factor_kind) if isinstance(factor_kind, str) else None
+        if factor_class is not None:
+            saved_factor = factor_row.get("factor")
+            if isinstance(saved_factor, bool) or not isinstance(saved_factor, (float, int)):
+                return BasisNotRecorded()
+            try:
+                value = float(saved_factor)
+            except OverflowError:
+                return BasisNotRecorded()
+            if not math.isfinite(value) or value < 1:
+                return BasisNotRecorded()
+            factor = factor_class(value)
+            if isinstance(factor, DevSizeHeadroom):
+                margin = factor_row.get("margin_bytes")
+                if type(margin) is not int or margin < 0:
+                    return BasisNotRecorded()
+                factor = replace(factor, margin_bytes=margin)
+        elif factor_kind != "none":
             return BasisNotRecorded()
         runs = row["runs"]
         if not isinstance(runs, int) or runs < 0:

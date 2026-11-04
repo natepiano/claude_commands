@@ -220,7 +220,28 @@ Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory 
 Both the budget charge and free-memory growth term use that promise.
 
 Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
-Build estimates retain same-shape history, failed-build floors, and the configured budget cap.
+Build estimates use completed same-shape history from the last 14 days.
+Ten or more earlier runs supply p90. One to nine earlier runs supply their largest peak.
+The newest failed-build floor can raise that base.
+A dev build uses `ceil(base × DEV_SIZE_FACTOR + DEV_SIZE_MARGIN_BYTES)`.
+`memory_admit.py` defines the factor as 1.1 and the margin as 1.1 GiB, rounded upward to bytes.
+The Phase 39 replay uses the original 126-build cohort and the 64 measured builds from the latest three days.
+The cargo-berth increase sets the margin. The measured S2 build sets the factor.
+The S2 history peak of 6.3 GiB gives a promise of 8.03 GiB before the budget cap.
+Release builds retain their 1.314 factor. A build without same-shape history retains the same-profile fallback without headroom.
+The retry after a memory kill stays unchanged.
+
+Each estimate stores its rule and the budget cap it applies.
+`DevSizeHeadroom` stores its factor and margin. `DevHeadroom` retains the older multiplier for saved records.
+`CappedAtBudget` stores the uncapped need and the applied cap.
+The reader checks those saved values without reading today's budget.
+An older record without a saved cap becomes `CapNotRecorded`.
+The queue then prints `capped at the build budget of that time` with the uncapped need.
+The original 126-build cohort uses a 21 GiB budget. No dev build exceeds its new promise.
+One release build exceeds its promise by 3.76 GiB.
+The recent 64-build cohort uses a 24 GiB budget. No dev build exceeds its new promise.
+Two release builds exceed their promises. The largest excess is 0.19 GiB.
+All three release excesses use fallback estimates without same-shape history.
 `peak_activity` labels cargo compilation as `compiling` and other work as `running`.
 The policy's ramp, pressure, recovery, head-window, and per-kind peak-hold values apply at each pass.
 The merge-gate peak hold is 180 seconds. Other kinds inherit `peak_hold_seconds`, currently 1500 seconds.
