@@ -12,9 +12,18 @@ from scripts.build_queue.queue_lines import plain
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
+from scripts.message.unit_labels import UnitLabels
 
 
 class QueueCardTests(QueueFixtureTests):
+    def test_unit_override_card_heading_matches_golden(self) -> None:
+        model = self.fixture.model()
+        waiting = model.reading.view.waiting
+        step = replace(waiting[0], unit="queue-unit", step="merge-gate")
+        model = replace(model, labels={**model.labels, step.session_id: UnitLabels("gate", "builds")},
+            reading=replace(model.reading, view=replace(model.reading.view, waiting=(step, *waiting[1:]))))
+        heading = plain(queue_card.render_selection(model, "1", 140)).splitlines()[0]
+        self.assertEqual(heading + "\n", (GOLDEN / "unit_override_card.txt").read_text())
     def test_behind_head_check_survives_missing_optional_head_facts(self) -> None:
         model = self.fixture.model()
         follower = replace(model.reading.view.waiting[1], reason=gate.BehindHead("head", NOW - 600, "head-id"))
@@ -56,14 +65,16 @@ class QueueCardTests(QueueFixtureTests):
         model = replace(model, reading=replace(model.reading,
             view=replace(model.reading.view, running=(step,)),
             explanation=replace(model.reading.explanation, running=(running,))))
+        model = replace(model, labels={**model.labels, "run-owner": UnitLabels("worker", "builds", "run-unit")})
         view = queue_view.render_view(model, 400, selector="run-owner")
         card = queue_card.render_selection(model, "run-owner", 400)
         text = plain([*view, (), *card])
         self.assertIn("▸", text)
         self.assertNotIn("(unowned)", text)
-        self.assertIn("run-owner", text)
+        self.assertIn("run-unit", text)
+        self.assertNotIn("run-owner", text)
         self.assertNotIn("No waiting or running step matches", text)
-        self.assertEqual(text.count("run-owner"), 1)
+        self.assertEqual(text.count("run-unit"), 1)
         self.assertIn("between steps", plain(view))
         self.assertIn("5.0", plain(view))
         self.assertNotIn("run-owner", plain(card))

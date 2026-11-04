@@ -93,6 +93,8 @@ instead of copying their contents. Do not load style. Derive verification per
 <VerificationContract/>.
 If State is supplied, put it after Workers and name the lasting writes or `none`.
 
+Use `build_folders.py run --owner O --name N -- CMD...` for a build experiment.
+
 Build the fallback prompt only from this unit's own Work Order, plan and
 conversation. Never read, copy or transform another unit's prompt files under
 `/tmp/claude/unit/*`: they are another session's state. When this unit's Work

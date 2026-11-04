@@ -19,9 +19,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
+    from ..lint.memory_test_support import config_environment, write_config_fixture
 else:
-    from memory_test_support import write_config_fixture
+    from memory_test_support import config_environment, write_config_fixture
 
 import targets
 import build_hold
@@ -95,6 +95,7 @@ class IsolatedTargetTest(unittest.TestCase):
         (self.root / "sessions").mkdir()
         _ = write_config_fixture(self.settings, "host=test-mac\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
             "BUILD_HOLD_DIR": str(self.holders),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
@@ -108,7 +109,7 @@ class IsolatedTargetTest(unittest.TestCase):
         _ = os.environ.pop("BUILD_TARGETS_CONFIG", None)
         home_config = self.root / ".claude/config"
         home_config.mkdir(parents=True)
-        _ = (home_config / "build_targets.conf").write_text(SHIPPED_CONFIG.read_text())
+        _ = config_environment(home_config)
         _ = (home_config / "mac_test.conf").write_text(self.settings.read_text())
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch(
@@ -175,10 +176,11 @@ class ConfigurationTests(IsolatedTargetTest):
                 target = target_config.SshTarget(name, platform, self.root / filename)
                 self.assertEqual(target_config.is_aws_target(target), expected)
 
-    def test_shipped_config_reads_mac_then_natedev(self) -> None:
+    def test_shipped_config_reads_mac_then_natedev_then_aws(self) -> None:
         self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (
             targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
             targets.LocalTarget("natedev", "linux"),
+            targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf")),
         ))
 
     def test_order_follows_targets_key(self) -> None:

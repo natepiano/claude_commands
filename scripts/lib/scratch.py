@@ -71,6 +71,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import copy_record  # noqa: E402
+from scripts.lib.build_folders import BuildFolderSpec, build_folder_path  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
@@ -524,7 +525,8 @@ def target(task: str, word: str, visible: bool) -> Path:
         return path
     suffix = "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(SUFFIX_LENGTH))
     slug = f"{match['kind']}-{match['name'].replace('/', '-')}"
-    return copy_record.root() / "-".join(part for part in (slug, word, suffix) if part)
+    return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=SUFFIX_LENGTH,
+                                            purpose="-".join(part for part in (slug, word) if part), suffix=suffix))
 
 
 def maker() -> str:

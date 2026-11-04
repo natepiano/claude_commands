@@ -539,7 +539,8 @@ Rules:
   worker got the phase-wide run, its 13 warnings were in the test worker's
   files, and the test worker had to be launched again.
 - Prove any claimed pre-existing failure on the pre-phase tree before mentioning
-  it. Do not stash; use the existing clean tree or a scratch checkout.
+  it. Do not stash; use the existing clean tree.
+  Use `build_folders.py run --owner O --name N -- CMD...` for a build experiment.
 - Re-run suspected environment failures unsandboxed before classifying them.
   Nested Swift `sandbox-exec` failures and missing GPU adapters are environment
   failures, not dependency or code defects.
