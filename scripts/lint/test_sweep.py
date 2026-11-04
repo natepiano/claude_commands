@@ -2638,17 +2638,23 @@ class FloorTests(SweepCase):
 
     def base(self) -> Path:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        config = base / "copies.conf"
+        configured = (Path(__file__).resolve().parents[2] / "config/copies.conf").read_text()
+        _ = config.write_text("\n".join(f"root={base / 'gates'}" if line.startswith("root=") else line
+                                           for line in configured.splitlines()) + "\n")
         self.enterContext(mock.patch.dict(os.environ, {
             sweep.tmp_sweep.STATE_ENV: str(base),
             "BUILDLOG_DIR": str(base / "buildlog"),
             "BUILD_HOLD_DIR": str(base / "build-hold"),
+            "COPIES_CONFIG": str(config),
         }))
         _ = self.enterContext(mock.patch.object(sweep, "output_device", return_value=base.stat().st_dev))
         _ = self.enterContext(mock.patch.object(build_hold, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", return_value={}))
         _ = write_config_fixture(conf.path("lint"),
-                                 f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n")
+                                 f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n"
+                                 + f"sweep_floor_roots={base}\n")
         _ = self.enterContext(mock.patch.object(
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         _ = self.enterContext(mock.patch.object(

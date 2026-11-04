@@ -106,7 +106,7 @@ class ColorTests(unittest.TestCase):
 
     def test_direct_jq_colors_the_entire_staff_assignment(self) -> None:
         line = status_lines({"session_id": UNIT.id}, colors=SHIPPED_COLORS, staff_text=staff_text(OWNER, UNIT))[0]
-        self.assertEqual(line.split(" | ")[0], "\x1b[33munit for show\x1b[0m")
+        self.assertEqual(line.split(" | ")[0], "\x1b[33mtrunk unit for show\x1b[0m")
 
     def test_direct_jq_with_invalid_or_non_object_staff_text_keeps_both_lines(self) -> None:
         payload = {**limits({"used_percentage": 38}, {"used_percentage": 60}),
@@ -134,12 +134,12 @@ class ColorTests(unittest.TestCase):
                              staff_text=staff_text(
                                  staff.StaffRow(OWNER.id, "showrunner", "hana", None, current_session=OWNER.id),
                                  staff.StaffRow(UNIT.id, "unit", "cables", OWNER.id, current_session=UNIT.id)), STAFF_ID=UNIT.id)
-        self.assertEqual(lines[0], "unit for hana | ~/rust/hana_catalyst_cables")
+        self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables")
 
     def test_shipped_role_colors_and_plain_worker_and_unassigned(self) -> None:
         cases = (
             ("\x1b[38;5;141mshow showrunner\x1b[0m", OWNER.id),
-            ("\x1b[33munit for show\x1b[0m", UNIT.id),
+            ("\x1b[33mtrunk unit for show\x1b[0m", UNIT.id),
             ("worker", WORKER.id),
             ("unassigned", ""),
         )
@@ -460,7 +460,7 @@ class RoleTests(unittest.TestCase):
         _ = path.write_text(staff_text(*rows), encoding="utf-8")
         return path
 
-    def test_production_and_plan_follow_the_current_staff_sessions(self) -> None:
+    def test_the_unit_label_is_its_staff_name_and_never_its_plan(self) -> None:
         runner = replace(OWNER, name="production", current_session=staff.StaffId("0c373d45-68b5-4292-85bb-2223c0ffe5b5"))
         unit = replace(UNIT, current_session=staff.StaffId("59a78f32-fccb-4988-ae0a-a740b45a9859"),
                        worktree=staff.PresentWorktree(remote.local_machine(), self.home))
@@ -472,7 +472,7 @@ class RoleTests(unittest.TestCase):
             with self.subTest(shell=shell):
                 self.assertEqual(self.first_line(runner.current_session, shell=shell), "production showrunner | ~")
                 self.assertEqual(self.first_line(unit.current_session, shell=shell),
-                                 "roles unit for production | ~")
+                                 "trunk unit for production | ~")
 
     def test_staff_assignment_survives_a_restart_without_any_environment_labels(self) -> None:
         _ = self.write_staff(OWNER, UNIT)
@@ -480,7 +480,7 @@ class RoleTests(unittest.TestCase):
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 line = self.command_lines({"session_id": UNIT.id}, shell=shell)[0]
-                self.assertEqual(line.split(" | ")[0], "\x1b[33munit for show\x1b[0m")
+                self.assertEqual(line.split(" | ")[0], "\x1b[33mtrunk unit for show\x1b[0m")
                 self.assertEqual(self.command_lines({"session_id": "other-id"}, shell=shell)[0].split(" | ")[0],
                                  "unassigned")
 
@@ -490,7 +490,7 @@ class RoleTests(unittest.TestCase):
             for shell in SHELLS:
                 with self.subTest(name=name, shell=shell):
                     self.assertEqual(ANSI.sub("", self.command_lines({"session_id": UNIT.id}, shell=shell)[0]),
-                                     f"unit for {name} | ~")
+                                     f"trunk unit for {name} | ~")
 
     def test_staff_identity_wins_over_stale_environment_and_the_registry_name(self) -> None:
         _ = self.write_staff(OWNER, UNIT, WORKER)
@@ -526,14 +526,14 @@ class RoleTests(unittest.TestCase):
 
     def test_missing_parent_keeps_the_unit_role_without_inventing_a_parent_name(self) -> None:
         _ = self.write_staff(UNIT)
-        self.assertEqual(ANSI.sub("", self.command_lines({"session_id": UNIT.id})[0]), "unit | ~")
+        self.assertEqual(ANSI.sub("", self.command_lines({"session_id": UNIT.id})[0]), "trunk unit | ~")
 
     def test_staff_file_override_is_the_same_as_the_python_reader(self) -> None:
         path = self.write_staff(OWNER, UNIT)
         moved = self.home / "moved-staff.json"
         _ = path.rename(moved)
         self.assertEqual(ANSI.sub("", self.command_lines({"session_id": UNIT.id}, STAFF_FILE=str(moved))[0]),
-                         "unit for show | ~")
+                         "trunk unit for show | ~")
 
     def test_jq_and_queue_reader_agree_on_identity_unique_names_and_ambiguity(self) -> None:
         other = staff.StaffRow(staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), "showrunner", "other", None, current_session=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"))
@@ -562,7 +562,7 @@ class RoleTests(unittest.TestCase):
                         parent = reader.record.by_id(row.parent) if row.parent is not None else None
                         self.assertIsNotNone(parent)
                         assert parent is not None
-                        self.assertEqual(role, f"unit for {parent.name}")
+                        self.assertEqual(role, f"trunk unit for {parent.name}")
 
     def test_python_and_jq_share_timer_folder_and_name_precedence(self) -> None:
         machine = remote.local_machine()
@@ -614,7 +614,7 @@ class RoleTests(unittest.TestCase):
                 self.assertEqual(row.id if row is not None else "", expected)
                 self.showrunner_record(os.getpid(), name, session_id=session_id)
                 role = ("worker" if row is not None and row.kind == "worker"
-                        else "material unit for hana" if row is not None and row.kind == "unit"
+                        else "geometry-material unit for hana" if row is not None and row.kind == "unit"
                         else f"{row.name} showrunner" if row is not None else "unassigned")
                 for shell in SHELLS:
                     rendered = self.command_lines({"session_id": session_id, "cwd": cwd}, shell=shell, **environment)
@@ -645,7 +645,7 @@ class RoleTests(unittest.TestCase):
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
         _ = self.write_staff(OWNER, UNIT)
         self.assertEqual(self.command_lines({**payload, "session_id": UNIT.id}, CLAUDE_CONFIG_DIR=str(config)), [
-            "\x1b[33munit for show\x1b[0m | /tmp/project",
+            "\x1b[33mtrunk unit for show\x1b[0m | /tmp/project",
             "\x1b[38;5;208mclaude4\x1b[0m | Opus | \x1b[91m90,000\x1b[0m | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[92m11% left\x1b[0m",
         ])
 
