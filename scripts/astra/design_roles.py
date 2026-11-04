@@ -17,7 +17,7 @@ import shlex
 import socket
 import subprocess
 import sys
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
@@ -76,6 +76,7 @@ class AstraCensusProjection(Protocol):
     def hold(self, role: Literal['designer', 'reviewer'], thread: str, home: str, *,
              manager: str, design_id: str, role_id: str) -> object: ...
     def release(self, thread: str) -> None: ...
+    def live_roles(self) -> Sequence[Mapping[str, object]]: ...
 
 
 def _mesh_transport() -> MeshLifecycleTransport:
@@ -985,7 +986,10 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
             if isinstance(reach, HolderUnavailable):
                 raise RoleRefused(reach.reason)
             context = mesh_directory(design_id) / 'design_context.json'
-            if not pending and context.exists() and _read(context) == _mesh_context_fields(design, reach):
+            threads = {role['thread_id'] for role in _census_projection().live_roles()}
+            if (not pending and context.exists() and _read(context) == _mesh_context_fields(design, reach)
+                    and all(isinstance(role.lifecycle, (RoleNotOpened, RoleEnded))
+                            or role.lifecycle.thread_id in threads for role in design.roles)):
                 return design
         else:
             if design.placement.generation != expected_generation:
@@ -1394,11 +1398,7 @@ def render_roles(report: dict[str, object]) -> str:
         thread = ' | thread ' + _text(lifecycle, 'thread_id') if lifecycle.get('thread_id') else ''
         lines.append(f"{entry['instance_id']} | {entry['role']} | {_text(lifecycle, 'kind')} | "
                      + f"{holder_name} | {route}{thread} | {entry['document']}")
-    if not lines:
-        lines.append('no held roles')
-    for problem in cast(list[dict[str, str]], report['problems']):
-        lines.append(f"problem: {problem['path']}: {problem['reason']}")
-    return '\n'.join(lines)
+    return '\n'.join(lines) if lines else 'no held roles'
 
 
 def _resolved_binding(binding: Binding, repository: str) -> Binding:
@@ -1411,14 +1411,10 @@ def _has_live_roles(fields: dict[str, object]) -> bool:
     roles = fields.get('roles')
     if not isinstance(roles, list):
         return False
-    for value in cast(list[object], roles):
-        if not isinstance(value, dict):
-            continue
-        lifecycle = cast(dict[str, object], value).get('lifecycle')
-        if isinstance(lifecycle, dict) and cast(dict[str, object], lifecycle).get('kind') in (
-                'RoleOpen', 'RolePausedForMove', 'RoleNeedsRecovery'):
-            return True
-    return False
+    return any(isinstance(value, dict)
+               and isinstance(lifecycle := cast(dict[str, object], value).get('lifecycle'), dict)
+               and cast(dict[str, object], lifecycle).get('kind') in ('RoleOpen', 'RolePausedForMove', 'RoleNeedsRecovery')
+               for value in cast(list[object], roles))
 
 
 def _held_by(fields: dict[str, object], *holders: Holder) -> bool:
@@ -1492,7 +1488,7 @@ def unbind_run(run_directory: str) -> None:
         directory = cast(dict[str, object], binding).get('run_directory')
         return isinstance(directory, str) and Path(directory) == Path(run_directory)
 
-    for design in _read_designs(relevant):
+    for design in _read_designs(relevant, refuse_matching_damage=True):
         if isinstance(design.binding, DesignBoundToPhase) and Path(design.binding.run_directory) == Path(run_directory):
             _ = rebind(design.placement.design_id, expected_generation=design.placement.generation,
                        reason='run ended after reservation release', binding=DesignUnbound())
@@ -1771,6 +1767,8 @@ def main(argv: list[str]) -> int:
             print(json.dumps(_authority_local(argument('operation'), _object(cast(object, json.load(sys.stdin))))))
         else:
             report = list_roles()
+            for problem in cast(list[dict[str, str]], report['problems']) if not args.get('json') else ():
+                print(f"problem: {problem['path']}: {problem['reason']}", file=sys.stderr)
             print(json.dumps(report) if args.get('json') else render_roles(report))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, configparser.Error) as error:
         damaged = (error.__cause__ if isinstance(error, worker_lifecycle.WorkerStateUnreadable)

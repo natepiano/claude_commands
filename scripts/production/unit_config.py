@@ -392,6 +392,15 @@ def write(worktree: Path, config: UnitConfig) -> Published | AlreadyCurrent:
         return _publish(worktree / ".unit.toml", desired, formatted)
 
 
+def set_plan(worktree: Path, plan: Path) -> None:
+    """Change only the plan in the existing unit configuration."""
+    with writer_lock():
+        config = read(worktree, cleanup=False)
+        if isinstance(config, ConfigMissing):
+            raise staff.StaffUnreadable(config.reason)
+        _ = write(worktree, replace(config, plan=PlanFile(plan)))
+
+
 def first_difference(left: UnitConfig, right: UnitConfig) -> str:
     for key in ("plan", "port", "responsibilities"):
         if getattr(left, key) != getattr(right, key):

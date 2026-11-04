@@ -115,7 +115,8 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_wrap_accepts_production_and_unit_names_that_cannot_own_copies(self) -> None:
         doc = self.doc("Done_Name", "wrapped")
-        _ = doc.write_text(doc.read_text() + "\n| Unit | Plan |\n| --- | --- |\n| Alpha_unit | standby |\n")
+        owner = fixture_member("showrunner", name="Done_Name", doc=staff.WrappedDoc("natedev", doc))
+        _ = fixture_member("unit", name="Alpha_unit", parent=owner.id)
         state = self.state_files("Done_Name")
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
