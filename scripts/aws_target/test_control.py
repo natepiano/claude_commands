@@ -18,6 +18,8 @@ from scripts.aws_target import aws_target, config as settings_config, ledger, re
 from scripts.aws_target.control_test_support import ControlFixture
 from scripts.mac_test import mac_test
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.direct import step_record
+from scripts.mac_test import offload
 
 
 class ControlTests(ControlFixture):
@@ -36,6 +38,41 @@ class ControlTests(ControlFixture):
 
     def demand(self) -> None:
         self.snapshot(self.waiter(101, step="check"), self.waiter(102, step="doc"))
+
+    def pinned_step(self, target: str = "aws", kind: str = "test") -> None:
+        self.enterContext(mock.patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(self.root / "steps")}))
+        self.enterContext(mock.patch.object(offload, "repository_identity")).return_value = (
+            offload.KnownRepository("hana", "https://example.invalid/team/hana"))
+        pid = os.getpid()
+        step_record.write(step_record.StepRecord("pinned", pid, step_record.process_start(pid), self.root,
+            kind, "hana", step_record.SshAllowed((target,)), step_record.StepState.WAITING_SSH,
+            "2026-01-15T12:00:00Z", selection=step_record.Pinned(target)))
+
+    def test_one_new_pinned_step_starts_capacity_without_local_queue_demand(self) -> None:
+        self.pinned_step()
+        self.assertEqual(self.controller().tick().state, "starting")
+        self.assertEqual(self.aws.count("start-instances"), 1)
+        decision = ledger.CostLedger(self.state).read_snapshot().decision
+        self.assertEqual(decision["status"], "allowed")
+
+    def test_pinned_step_cannot_start_capacity_when_either_spending_cap_refuses(self) -> None:
+        self.pinned_step()
+        for key in ("daily_limit_usd", "monthly_limit_usd"):
+            with self.subTest(key=key):
+                self.replace(key, "3")
+                self.assertEqual(self.controller().tick().state, "refused")
+                self.assertEqual(self.aws.count("start-instances"), 0)
+                self.replace(key, "20" if key == "daily_limit_usd" else "400")
+
+    def test_foreign_completed_and_local_only_pins_do_not_start_aws(self) -> None:
+        self.pinned_step("spare")
+        self.assertEqual(self.controller().tick().state, "stopped")
+        self.pinned_step(kind="build")
+        self.assertEqual(self.controller().tick().state, "stopped")
+        self.pinned_step()
+        step_record.state("pinned", step_record.StepState.ON_SSH, "aws")
+        self.assertEqual(self.controller().tick().state, "stopped")
+        self.assertEqual(self.aws.count("start-instances"), 0)
 
     def retained_claim(self) -> Path:
         return self.claim(mac_test.state_paths("aws"), generation="i-fixture:" + self.aws.generation)
