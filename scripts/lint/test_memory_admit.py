@@ -5168,6 +5168,53 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.assertEqual(reading.swap_bytes, GIB)
         self.assertEqual(gate.growth_headroom(reading), 0)
 
+    def test_idle_ci_excludes_inactive_file_cache_and_keeps_swap(self) -> None:
+        _ = (self.ci / "memory.current").write_text(str(10 * GIB))
+        _ = (self.ci / "memory.stat").write_text(f"anon 1024\nfile {9 * GIB}\ninactive_file {8 * GIB}\n")
+        _ = (self.ci / "memory.swap.current").write_text(str(GIB))
+        reading = self.reading()
+        self.assertEqual(reading.bytes, 3 * GIB)
+        self.assertEqual(gate.build_charge(reading), 3 * GIB)
+        self.assertEqual(reading.swap_bytes, GIB)
+        _ = (self.ci / "memory.stat").write_text(f"inactive_file {11 * GIB}\n")
+        self.assertEqual(self.reading().bytes, GIB)
+
+    def test_unowned_build_scope_uses_the_same_working_set(self) -> None:
+        scope = self.root / "builds.slice/unowned.scope"
+        scope.mkdir(parents=True)
+        _ = (scope / "memory.current").write_text(str(10 * GIB))
+        _ = (scope / "memory.stat").write_text(f"inactive_file {8 * GIB}\n")
+        _ = (scope / "memory.swap.current").write_text(str(GIB))
+        _ = (scope / "cgroup.procs").write_text("")
+        reading, = gate.unowned_slice_memory([], {}, self.proc)
+        self.assertEqual(reading.bytes, 3 * GIB)
+        self.assertEqual(gate.build_charge(reading), 3 * GIB)
+        (scope / "memory.stat").unlink()
+        self.assertEqual(gate.unowned_slice_memory([], {}, self.proc), ())
+
+    def test_running_job_adds_margin_to_the_working_set(self) -> None:
+        _ = (self.proc / "123/comm").write_text("Runner.Worker\n")
+        _ = (self.ci / "memory.current").write_text(str(10 * GIB))
+        _ = (self.ci / "memory.stat").write_text(f"inactive_file {8 * GIB}\n")
+        _ = (self.ci / "memory.swap.current").write_text(str(GIB))
+        reading = self.reading()
+        self.assertEqual(reading.bytes, 3 * GIB)
+        self.assertEqual(reading.promise, gate.LifetimePromise(9 * GIB))
+        self.assertEqual(gate.build_charge(reading), 9 * GIB)
+        _ = (self.ci / "memory.max").write_text(str(5 * GIB))
+        self.assertEqual(gate.build_charge(self.reading()), 5 * GIB)
+
+    def test_unreadable_or_invalid_memory_stat_refuses_the_reading(self) -> None:
+        stat = self.ci / "memory.stat"
+        stat.unlink()
+        with self.assertRaisesRegex(gate.SliceMemoryUnavailable, "hana-ci.slice.*memory.stat"):
+            _ = self.reading()
+        for content in ("anon 1024\n", "inactive_file invalid\n"):
+            with self.subTest(content=content):
+                _ = stat.write_text(content)
+                with self.assertRaisesRegex(gate.SliceMemoryUnavailable, "hana-ci.slice.*memory.stat"):
+                    _ = self.reading()
+
     def test_running_job_reserves_the_margin_and_free_memory_growth(self) -> None:
         _ = (self.proc / "123/comm").write_text("Runner.Worker\n")
         reading = self.reading()
