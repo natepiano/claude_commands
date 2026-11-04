@@ -355,7 +355,7 @@ with open(sys.argv[1], 'a') as lock:
                 ("machine", "family", "parent_id", "agent_id", "at"),
                 ("machine", "family", "parent_id", "agent_id", "at"),
             ),
-            "cursors": (("machine", "path", "offset"), ("machine", "path")),
+            "cursors": (("machine", "path", "offset", "context"), ("machine", "path")),
             "role_log_sources": (("machine", "problems", "state", "read_at"), ("machine",)),
             "turn_sources": (("machine", "family", "state", "read_at", "last_complete_at"), ("machine", "family")),
         }

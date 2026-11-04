@@ -91,7 +91,7 @@ class RowUnitReadingTests(unittest.TestCase):
         destination, _ = self.production("new-owner", "new-alias")
         tree = self.root / "old-prefix-renderer"
         unit = recorded_unit("old-owner", "renderer", tree, old_doc)
-        _ = staff.move(unit.id, destination.id)
+        _ = staff.move(unit.id, staff.ReportsTo(destination.id))
         units, problems = self.staff_units()
         self.assertEqual([(unit.production, unit.name, unit.worktree) for unit in units],
                          [("new-alias", "renderer", str(tree))])
@@ -139,7 +139,7 @@ class RowUnitReadingTests(unittest.TestCase):
         destination, _ = self.production("new-owner", "new-alias")
         tree = self.root / "old-prefix-renderer"
         unit = recorded_unit("old-owner", "renderer", tree, doc)
-        _ = staff.move(unit.id, destination.id)
+        _ = staff.move(unit.id, staff.ReportsTo(destination.id))
         _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", tree), expected=unit.worktree)
         history = self.root / "history"
         history.mkdir()
@@ -3701,9 +3701,10 @@ class CanonicalQuestionWaitingTests(RegistrationFixture):
         problems: list[log_records.SourceProblem] = []
         with patch.dict(os.environ, self.env), production_paths(self.env):
             waiting = m.read_waiting(self.state, self.root / "vault", [], problems)
+            opened = log_records.moment("2026-10-05T12:00")
         questions = [item for item in waiting if item.kind == "questions"]
         self.assertEqual(len(questions), 1)
-        self.assertEqual(questions[0].opened, log_records.moment("2026-10-05T12:00"))
+        self.assertEqual(questions[0].opened, opened)
         question_sources = (str(self.doc), str(self.root / "issues"), self.env["STAFF_FILE"],
                             "question", "staff")
         self.assertEqual([

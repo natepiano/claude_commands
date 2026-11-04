@@ -23,7 +23,8 @@ from scripts.lib.git_test_support import commit_repository
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_member, isolated_staff_file
 
 
 class SimplifyDispatchTests(NixFixture):
@@ -53,6 +54,11 @@ class SimplifyDispatchTests(NixFixture):
                          "CODEX_THREAD_ID": fixture_runtime_id("simplify-director"),
                          "TZ": "UTC", "USER_ZONE": "UTC"})
         self.env["AGENT_NOTES_DIR"] = str(self.root / "notes")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
+        owner = fixture_member("showrunner", name="simplify-owner")
+        _ = fixture_member("unit", name="simplify-unit", parent=owner.id,
+                       runtime_id=self.env["CODEX_THREAD_ID"],
+                       worktree=staff.PresentWorktree("natedev", self.work))
         self.claude_quota("claude1", 100)
         _ = subprocess.run(["git", "init", "-b", "simplify-fixture", str(self.work)],
                            env=self.env, capture_output=True, text=True,

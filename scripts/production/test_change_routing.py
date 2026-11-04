@@ -27,7 +27,7 @@ class StaffRoutingTests(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.top = staff.StaffRow(staff.StaffId(""), "showrunner", "", None, current_session=staff.StaffId(""))
+        self.top = staff.StaffRow(staff.StaffId(""), "showrunner", "", staff.StaffRoot(), current_session=staff.StaffId(""))
         self.alert = mock.Mock()
         self.child = self.top
         self.unit = self.top
@@ -396,7 +396,7 @@ class StaffRoutingTests(unittest.TestCase):
                 runner = staff.snapshot().by_path("builds")
                 parent = staff.snapshot().by_path("natedev")
                 assert runner is not None and parent is not None
-                _ = staff.move(runner.id, parent.id)
+                _ = staff.move(runner.id, staff.ReportsTo(parent.id))
                 import change_review as cli_review
                 with (mock.patch.object(change_review, "lists_directory", return_value=root), mock.patch.object(cli_review, "lists_directory", return_value=root),
                       mock.patch.object(showrunners, "timer_docs", return_value=docs)):
