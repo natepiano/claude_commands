@@ -44,6 +44,71 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 SCRIPT = Path(__file__).with_name("rename.py")
 
 
+class RenameDisplays:
+    """Keep private display state while the real retitle methods run."""
+
+    def __init__(self, row: staff.StaffRow, *, live: bool = True, backend: str = "claude") -> None:
+        self.row: staff.StaffRow = row
+        self.live: bool = live
+        self.backend: str = backend
+        self.pane: str = "previous"
+        self.tab: str = "previous"
+        self.workspace: str = "previous"
+        self.commands: list[tuple[str, ...]] = []
+
+    def listed(self, kind: str, *_arguments: str, **_keywords: object) -> list[dict[str, object]]:
+        if kind == "pane":
+            return ([{"pane_id": "probe-pane", "tab_id": "probe-tab", "workspace_id": "probe-space",
+                      "terminal_id": "probe-terminal", "label": self.pane,
+                      "agent_session": {"value": self.row.current_session}}] if self.live else [])
+        if kind == "tab":
+            return [{"tab_id": "probe-tab", "workspace_id": "probe-space", "label": self.tab}]
+        if kind == "workspace":
+            return [{"workspace_id": "probe-space", "label": self.workspace}]
+        raise AssertionError(f"unexpected listing: {kind}")
+
+    def run(self, *arguments: str, **_keywords: object) -> str:
+        self.commands.append(arguments)
+        if len(arguments) == 4 and arguments[1] == "rename":
+            if arguments[0] == "pane":
+                self.pane = arguments[3]
+            elif arguments[0] == "tab":
+                self.tab = arguments[3]
+            elif arguments[0] == "workspace":
+                self.workspace = arguments[3]
+            else:
+                raise AssertionError(arguments)
+            return ""
+        raise AssertionError(arguments)
+
+    def result(self, *arguments: str, **_keywords: object) -> dict[str, object]:
+        if arguments[:2] != ("pane", "process-info"):
+            raise AssertionError(arguments)
+        return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": 998041,
+                "foreground_processes": [{"pid": 998041, "name": self.backend, "argv": [self.backend]}]}}
+
+    def native_result(self, arguments: list[str], **_keywords: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(arguments, 0, json.dumps({"result": self.result(*arguments[3:])}), "")
+
+    @contextmanager
+    def installed(self) -> Generator[None]:
+        """Replace backend reads and writes, and retain the real retitle behavior."""
+        from scripts.herdr import herdr
+
+        with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              mock.patch.object(herdr.Herdr, "listed", side_effect=self.listed),
+              mock.patch.object(herdr.Herdr, "run", side_effect=self.run),
+              mock.patch.object(herdr.Herdr, "result", side_effect=self.result),
+              mock.patch.object(herdr, "run_program", side_effect=self.native_result),
+              mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  self.row.current_session, "probe-generation", {})),
+              mock.patch.object(herdr, "_LayoutLock"),
+              mock.patch.object(herdr.Herdr, "order_tabs", return_value=False),
+              mock.patch.object(herdr.Herdr, "save_layout")):
+            yield
+
+
+
 class FolderMoveBackend:
     """A private backend keeps the terminal while its session stops and resumes."""
 

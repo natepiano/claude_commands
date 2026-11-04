@@ -1203,17 +1203,27 @@ def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
 
 def rename(staff_id: StaffId, new_name: str) -> StaffRow:
     if not is_owner():
-        return _remote_row(["rename", staff_id, f"--name={new_name}"])
+        renamed = _remote_row(["rename", staff_id, f"--name={new_name}"])
+    else:
+        def edit(rows: list[StaffRow]) -> StaffRow:
+            row = _required(rows, staff_id)
+            renamed = replace(row, name=new_name)
+            rows[rows.index(row)] = renamed
+            return renamed
 
-    def edit(rows: list[StaffRow]) -> StaffRow:
-        row = _required(rows, staff_id)
-        if row.kind == "worker":
-            raise StaffRefused("a worker name is set once")
-        renamed = replace(row, name=new_name)
-        rows[rows.index(row)] = renamed
-        return renamed
+        renamed = _transaction(edit)
+    if renamed.kind == "worker":
+        herdr = import_module("scripts.herdr.herdr")
+        client = cast(Callable[[str], object], herdr.Herdr)
+        shared_session = cast(Callable[[], str], herdr.shared_session)
+        display_failure = cast(type[Exception], herdr.HerdrFailure)
 
-    return _transaction(edit)
+        try:
+            retitle = cast(Callable[[str], bool], getattr(client(shared_session()), "retitle_row"))
+            _ = retitle(renamed.id)
+        except (OSError, ValueError, display_failure) as error:
+            print(f"anomaly: worker display: {error}", file=sys.stderr)
+    return renamed
 
 
 def move(staff_id: StaffId, new_parent: StaffId | None) -> StaffRow:

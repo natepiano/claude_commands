@@ -69,6 +69,67 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_worker_rename_cli_keeps_identity_for_each_backend_and_holder(self) -> None:
+        from scripts.production.cli_fixture import invoke_cli
+        from scripts.production.rename_test_support import RenameDisplays
+
+        runner, unit, _ = self.tree()
+        for backend in ("claude", "codex"):
+            for holder in (runner, unit):
+                for live in (False, True):
+                    with self.subTest(backend=backend, holder=holder.kind, live=live):
+                        name = f"cli-{backend}-{holder.kind}-{'live' if live else 'stopped'}"
+                        worker = fixture_worker(name, holder.id)
+                        worker = staff.update_current_session(worker.current_session,
+                            staff.native_id(fixture_runtime_id(name + "-current")))
+                        displays = RenameDisplays(worker, live=live, backend=backend)
+                        arguments = ["rename", worker.id, "--name", name + "-renamed", "--json"]
+                        with displays.installed():
+                            result = invoke_cli(staff, lambda: staff.main(arguments), arguments, dict(os.environ), self.root)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            renamed = staff.StaffRow.from_json(cast(object, json.loads(result.stdout)))
+                            self.assertEqual(renamed, replace(worker, name=name + "-renamed"))
+                            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+                            rerun = invoke_cli(staff, lambda: staff.main(arguments), arguments, dict(os.environ), self.root)
+                        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+                        self.assertIn("unchanged", rerun.stderr)
+                        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+                        self.assertEqual(displays.commands,
+                                         [("pane", "rename", "probe-pane", renamed.name)] if live else [])
+                        self.assertEqual(displays.tab, "previous")
+                        self.assertEqual(staff.by_id(holder.id), holder)
+
+
+    def test_worker_rename_keeps_identity_for_each_backend_and_holder(self) -> None:
+        from scripts.production.rename_test_support import RenameDisplays
+
+        runner, unit, _ = self.tree()
+        for backend in ("claude", "codex"):
+            for holder in (runner, unit):
+                for live in (False, True):
+                    with self.subTest(backend=backend, holder=holder.kind, live=live):
+                        name = f"{backend}-{holder.kind}-{'live' if live else 'stopped'}"
+                        worker = fixture_worker(name, holder.id)
+                        current = staff.native_id(fixture_runtime_id(name + "-current"))
+                        worker = staff.update_current_session(worker.current_session, current)
+                        displays = RenameDisplays(worker, live=live, backend=backend)
+                        layout = self.root / (name + "-layout.json")
+                        self.write_json(layout, {"row_id": worker.id, "terminal_id": "probe-terminal"})
+                        before = layout.read_bytes(), layout.stat().st_mtime_ns
+                        with displays.installed():
+                            renamed = staff.rename(worker.id, name + "-renamed")
+                            self.assertEqual(renamed, replace(worker, name=name + "-renamed"))
+                            self.assertEqual(displays.pane, renamed.name if live else "previous")
+                            settled = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+                            self.assertEqual(staff.rename(worker.id, renamed.name), renamed)
+                        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), settled)
+                        self.assertEqual((layout.read_bytes(), layout.stat().st_mtime_ns), before)
+                        self.assertEqual(displays.commands,
+                                         [("pane", "rename", "probe-pane", renamed.name)] if live else [])
+                        self.assertEqual(displays.tab, "previous")
+                        self.assertEqual(staff.by_id(holder.id), holder)
+
+
     def test_guarded_cli_adds_an_agent_without_a_parent_and_reads_its_locations(self) -> None:
         identity = fixture_runtime_id("morty-agent")
         for field, state in (("worktree", "present"), ("doc", "live")):
@@ -1085,7 +1146,7 @@ class StaffTests(StaffTestCase):
             lambda: staff.move(showrunner.id, showrunner.id),
             lambda: staff.move(unit.id, worker.id),
             lambda: staff.move(unit.id, MISSING_ID),
-            lambda: staff.rename(worker.id, "test1"),
+            lambda: staff.rename(worker.id, "impl0"),
             lambda: staff.move(worker.id, unit.id),
             lambda: staff.retire(showrunner.id),
         )
@@ -1398,7 +1459,7 @@ class StaffTests(StaffTestCase):
     def test_cli_maps_refused_unreadable_and_missing_mutations(self) -> None:
         _, unit, worker = self.tree()
         before = self.staff_file.read_bytes()
-        refused = self.cli("rename", worker.id, "--name=test1", "--json", code=2)
+        refused = self.cli("rename", worker.id, f"--name={worker.id}", "--json", code=2)
         self.assertTrue(refused.stderr.strip())
         self.assertEqual(self.staff_file.read_bytes(), before)
         missing = self.cli("move", MISSING_ID, f"--parent={unit.parent}", "--json", code=1)
