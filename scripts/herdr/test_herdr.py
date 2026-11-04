@@ -898,6 +898,32 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 
+    def test_bridge_status_system_turn_makes_the_destination_ready(self) -> None:
+        self.ready_at = 60
+        row = {"type": "system", "subtype": "bridge_status",
+               "timestamp": (self.launched_at + timedelta(seconds=1)).isoformat()}
+        write_text_atomic(self.path, json.dumps(row) + "\n")
+        state = self.client.prompt_input_state("destination:p1", self.transcript, self.launched_at)
+        self.assertIsInstance(state, herdr.PromptInputReady)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_bridge_status_requires_a_system_turn_and_an_empty_composer(self) -> None:
+        self.ready_at = 60
+        for kind, screen in (
+            ("user", "────────\n❯ \n────────"),
+            ("assistant", "────────\n❯ \n────────"),
+            ("system", "Restoring conversation"),
+            ("system", "────────\n❯ another task\n────────"),
+        ):
+            with self.subTest(kind=kind, screen=screen):
+                row = {"type": kind, "subtype": "bridge_status",
+                       "timestamp": (self.launched_at + timedelta(seconds=1)).isoformat()}
+                write_text_atomic(self.path, json.dumps(row) + "\n")
+                self.screen = screen
+                state = self.client.prompt_input_state("destination:p1", self.transcript, self.launched_at)
+                self.assertIsInstance(state, herdr.PromptInputNotReady)
+                self.assertEqual((self.typed, self.enters), ([], []))
+
     def test_remote_control_signal_still_requires_a_visible_empty_composer(self) -> None:
         self.ready_at = 60
         self.write_turn("/remote-control is active", kind="system")

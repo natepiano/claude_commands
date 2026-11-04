@@ -866,15 +866,15 @@ class _WorkerSources:
         try:
             self.inputs.add(str(path.absolute()))
             design = design_roles.read_design(design_id)
-            holder = design.holder
-            owner = self.owner(UnitMember(holder.production_slug, holder.unit_name)
-                               if isinstance(holder, design_roles.UnitHolder)
-                               else ShowrunnerMember(holder.production_slug))
             for instance in design.roles:
                 if isinstance(instance.lifecycle, (design_roles.RoleEnded, design_roles.RoleNotOpened)):
                     continue
-                fields = {"thread_id": instance.lifecycle.thread_id}
-                identity = self.backend(owner, instance.name, fields)
+                parent = design_roles.worker_parent(design, instance.role, self.record)
+                owner = WorkerOwner(f"staff:{parent.id}", parent)
+                row = self.record.by_member_reference(instance.lifecycle.thread_id)
+                assert row is not None
+                fields = {"staff_id": str(row.id), "thread_id": row.current_session}
+                identity = self.backend(owner, row.name, fields)
                 if isinstance(identity, BackendUnavailable):
                     _problem(path, f"{instance.name}: worker backend is unavailable")
                 else:

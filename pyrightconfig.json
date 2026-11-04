@@ -146,6 +146,7 @@
     {
       "root": "scripts/build_targets",
       "extraPaths": [
+        ".",
         "scripts/build_targets",
         "scripts/build_hold",
         "scripts/mac_test",

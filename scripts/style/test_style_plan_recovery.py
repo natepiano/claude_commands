@@ -373,7 +373,7 @@ class StylePlanTests(StylePlanFixture):
         _ = ledger.reconcile("main", "style/main")
         with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
             code, output, errors = self.run_next()
-        self.assertEqual((code, errors), (3, ""))
+        self.assertEqual((code, errors), (3, "style: names-unit: the unit worktree has a detached HEAD\n"))
         self.assertIn("discarded names-unit-1: dropped", output)
         self.assertNotIn("### Phase 1 — names-unit-1", self.plan.read_text())
 
