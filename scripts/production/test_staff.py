@@ -634,12 +634,17 @@ class StaffTests(StaffTestCase):
         self.assertEqual(record.by_path("unfilled/removed"), units[2])
         self.assertCountEqual(record.find(), [*runners, *units])
 
-    def test_local_and_remote_retire_refuse_owners_and_remove_only_the_selected_worker(self) -> None:
+    def test_local_and_remote_retire_keep_owners_and_remove_selected_workers_and_agents(self) -> None:
         runner, unit, worker = self.tree()
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
                 for row in (runner, unit):
                     self.assert_refused(lambda: staff.retire(row.id))
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                agent = fixture_member("agent", name="test-agent-" + machine)
+                self.assertEqual(staff.retire(agent.id), agent)
+                self.assertIsNone(staff.by_id(agent.id))
         self.assertEqual(staff.retire(worker.id), worker)
         self.assertEqual(staff.by_id(unit.id), unit)
         self.assertEqual(staff.by_id(runner.id), runner)
