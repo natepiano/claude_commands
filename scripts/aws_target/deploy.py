@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.aws_target import ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
 from scripts.aws_target.config import (
-    DeploymentSettings, deployment_price, money, read_control_settings, read_deployment_settings, read_settings,
+    BudgetNotificationAddress, DeploymentSettings, deployment_price, money, read_budget_notification_address,
+    read_control_settings, read_deployment_settings, read_settings,
 )
 from scripts.lib import conf
 from scripts.mac_test import offload
@@ -43,7 +44,8 @@ class PreparedDeployment:
     parameters: dict[str, str]
 
 
-def deployment_parameters(path: Path, settings: DeploymentSettings, bootstrap_path: Path) -> dict[str, str]:
+def deployment_parameters(path: Path, settings: DeploymentSettings, bootstrap_path: Path,
+                          notification: BudgetNotificationAddress) -> dict[str, str]:
     spending = read_settings(path)
     bootstrap = bootstrap_path.read_text()
     if not bootstrap.startswith('#!'):
@@ -56,7 +58,7 @@ def deployment_parameters(path: Path, settings: DeploymentSettings, bootstrap_pa
     return {
         'InstanceType': settings.instance_type, 'AmiId': settings.ami_id,
         'AvailabilityZone': settings.availability_zone, 'VpcId': settings.vpc_id, 'SubnetId': settings.subnet_id,
-        'NotificationEmail': settings.notification_email, 'RootDeviceName': settings.root_device_name,
+        'NotificationEmail': notification.value, 'RootDeviceName': settings.root_device_name,
         'RootVolumeGiB': str(settings.root_volume_gib), 'DataVolumeGiB': str(settings.data_volume_gib),
         'DataVolumeIops': str(settings.data_volume_iops), 'DataVolumeThroughput': str(settings.data_volume_throughput),
         'SpotMaxPrice': str(settings.spot_max_usd_per_hour), 'MonthlyLimitUsd': str(spending.monthly_limit_usd),
@@ -148,11 +150,12 @@ class Deployment:
         book.resolve_compute_request(request, ledger.ComputeInstanceConfirmed(observation.at, stack['InstanceId']))
         return stack
 
-    def _load(self, *, refresh: bool = False) -> tuple[DeploymentSettings, dict[str, str]]:
+    def _load(self, notification: BudgetNotificationAddress, *, refresh: bool = False
+              ) -> tuple[DeploymentSettings, dict[str, str]]:
         settings = read_deployment_settings(self.settings_path)
         if refresh:
             self._refresh_observation(settings)
-        parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh')
+        parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification)
         self._before_request(settings, parameters)
         return settings, parameters
 
@@ -165,7 +168,8 @@ class Deployment:
             settings = read_deployment_settings(self.settings_path)
             now = int(self.clock())
             price_at, price = deployment_price(self.settings_path, now)
-            parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh')
+            notification = read_budget_notification_address(self.settings_path)
+            parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification)
             spending = read_settings(self.settings_path)
             book = ledger.CostLedger(self.directory)
             state = book.read_snapshot() if book.path.exists() else ledger.LedgerEvidence()
@@ -259,7 +263,8 @@ class Deployment:
 
     def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
         current = read_deployment_settings(self.settings_path)
-        current_parameters = deployment_parameters(self.settings_path, current, self.output / 'bootstrap.sh')
+        notification = BudgetNotificationAddress(parameters['NotificationEmail'])
+        current_parameters = deployment_parameters(self.settings_path, current, self.output / 'bootstrap.sh', notification)
         preflight = remote.read_record(self.output / 'preflight.json')
         at = ledger.instant(preflight, 'at')
         template = TEMPLATE.read_bytes()
@@ -282,7 +287,12 @@ class Deployment:
         """Restart the deployed instance for user setup while admission stays disabled."""
         self._authorize(approve_resources)
         with control_lock(self.directory):
-            settings, parameters = self._load(refresh=True)
+            prepared = cast(object, json.loads((self.output / 'parameters.json').read_text()))
+            notifications = [ledger.text(row, 'ParameterValue') for row in ledger.rows({'parameters': prepared}, 'parameters')
+                             if row.get('ParameterKey') == 'NotificationEmail']
+            if len(notifications) != 1:
+                raise DeploymentRefused('setup requires one prepared NotificationEmail parameter; run prepare again')
+            settings, parameters = self._load(BudgetNotificationAddress(notifications[0]), refresh=True)
             previous = remote.read_record(self.directory / 'deployment.json')
             stack = self._stack(settings)
             saved_outputs = ledger.mapping(previous.get('outputs'))
@@ -312,7 +322,7 @@ class Deployment:
     def apply(self, *, approve_resources: bool = False) -> dict[str, str]:
         self._authorize(approve_resources)
         with control_lock(self.directory):
-            settings, parameters = self._load(refresh=True)
+            settings, parameters = self._load(read_budget_notification_address(self.settings_path), refresh=True)
             stack = self._stack(settings)
             previous_path = self.directory / 'deployment.json'
             if previous_path.exists():

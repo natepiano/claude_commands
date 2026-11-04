@@ -9,6 +9,8 @@ import unittest
 from unittest import mock
 from pathlib import Path
 from typing import final
+from scripts.production.cli_fixture import production_paths
+from scripts.shutdown import pane_record
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from merge_checkpoint import CodeCheckpoint, LastMerged, MergeEntry, NoMerge, ShrinkCommit, merge_branch_history, merge_history, request_from
@@ -188,7 +190,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIsInstance(last_any.kind, ShrinkCommit)
         self.assertEqual(last_code.merge_hash, code_merge)
         self.assertIsInstance(last_code.kind, CodeCheckpoint)
-        with mock.patch.dict(os.environ, {"PATH": self.env["PATH"]}):  # Merge tests names a stub on the test PATH
+        with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
+              mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
                 production=str(self.doc), unit="alpha-unit", phase="2", hash=code,
                 also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
@@ -211,7 +214,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual((entry.unit, entry.phase, entry.short), ("alpha-unit", "2", code[:7]))
         self.assertTrue(history.has_code_merge("alpha-unit", "2"))
         self.assertIsInstance(history.last_for_unit("old-alpha-unit"), NoMerge)
-        with mock.patch.dict(os.environ, {"PATH": self.env["PATH"]}):  # Merge tests names a stub on the test PATH
+        with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
+              mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
                 production=str(self.doc), unit="alpha-unit", phase="3", hash=code,
                 also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,

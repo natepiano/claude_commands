@@ -204,6 +204,42 @@ class AssertionGuardTests(AssertionFindingFixture):
                             self.assertIn("assertion guard: 1 blocking;", result.stdout)
 
 
+    def test_prefix_ruling_rules_two_removed_tests(self) -> None:
+        before = self.python("assert value == 1", "test_recovery_first")
+        before += self.python("assert value == 2", "test_recovery_second")
+        self.change("test_value.py", before, "# Recovery deleted.\n")
+        result = self.guard("--rulings", "-", stdin=(
+            "Assertion-Change: test_value.py::test_recovery_* — Recovery deleted"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        for test in ("test_recovery_first", "test_recovery_second"):
+            line = next(line for line in result.stdout.splitlines() if test in line)
+            self.assertIn("test removed", line)
+            self.assertIn("— ruled: Recovery deleted", line)
+
+    def test_prefix_ruling_does_not_rule_assertions_in_kept_tests(self) -> None:
+        for kind, after in (("weaker", "self.assertTrue(value)"), ("removed", "pass")):
+            with self.subTest(kind=kind):
+                before = self.python("self.assertEqual(value, 1)", "test_recovery_kept")
+                before += self.python("pass", "test_recovery_deleted")
+                self.change("test_value.py", before, self.python(after, "test_recovery_kept"))
+                result = self.guard("--rulings", "-", stdin=(
+                    "Assertion-Change: test_value.py::test_recovery_* — Recovery deleted"))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                line = next(line for line in result.stdout.splitlines() if "test_recovery_kept" in line)
+                self.assertIn(kind + ":", line)
+                self.assertNotIn("— ruled:", line)
+                self.assertIn("assertion guard: 1 blocking;", result.stdout)
+
+    def test_prefix_ruling_without_a_removed_test_blocks(self) -> None:
+        self.change("test_value.py", self.python("pass", "test_recovery_kept"),
+                    self.python("pass", "test_recovery_kept"))
+        ruling = "Assertion-Change: test_value.py::test_recovery_* — Recovery deleted"
+        result = self.guard("--rulings", "-", stdin=ruling)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(ruling + " — matched no removed test", result.stdout)
+        self.assertIn("assertion guard: 1 blocking;", result.stdout)
+
     def test_removed_test_functions_in_both_languages(self) -> None:
         for annotation in ("#[test]", "#[tokio::test]", "#[rstest]"):
             with self.subTest(annotation=annotation):

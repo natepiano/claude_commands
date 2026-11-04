@@ -142,7 +142,6 @@ def local_targets() -> tuple[str, ...]:
     return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
 
 
-
 @dataclass(frozen=True)
 class LocalStepIdentity:
     targets: tuple[str, ...]
@@ -334,7 +333,7 @@ def write_launch_line(record_data: Mapping[str, object]) -> bool:
     return True
 
 
-def pending_launches_root() -> Path:
+def pending_launch_root() -> Path:
     return store.root() / "pending-launches"
 
 
@@ -357,7 +356,7 @@ def _save_pending_record(path: Path, fields: Mapping[str, object], *, replace_ex
 
 
 def _pending_launch_path(row: LaunchStep) -> Path:
-    return pending_launches_root() / _launch_row_path(row).with_suffix(".json").name
+    return pending_launch_root() / _launch_row_path(row).with_suffix(".json").name
 
 
 def _save_pending_launch(row: LaunchStep) -> Path:
@@ -1061,7 +1060,6 @@ def ssh_attempt(attempt: SshAttempt) -> None:
         "id": f"{host}-{time.time_ns()}-{secrets.token_hex(4)}", "host": host,
         "at": store.utc_iso(at),
     })
-
 
 
 @dataclass(frozen=True)

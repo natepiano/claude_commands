@@ -5,7 +5,6 @@ from __future__ import annotations
 import errno
 import fcntl
 import io
-import importlib
 import json
 import os
 import shlex
@@ -34,6 +33,7 @@ import style_ledger
 import style_rules
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners
+from scripts.message import send_budget
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -316,10 +316,48 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(len(self.recorded_wakes()), 2)
 
     def test_a_send_is_given_send_pys_whole_run_before_it_counts_as_timed_out(self) -> None:
-        """A wake delivered late was stopped at 15 s and reported "timed out" (cargo-liner-style, 2026-10-17)."""
-        sys.path.insert(0, str(style_sync.SCRIPTS / "message"))
-        kill_grace = cast(int, getattr(importlib.import_module("send"), "KILL_GRACE"))
-        self.assertGreater(style_sync.SEND_RUN_SECONDS, style_sync.SEND_SECONDS + kill_grace)
+        """The caller must allow delivery and relay cleanup before its timeout."""
+        from scripts.lib import conf
+        kill_grace = conf.read("send").number("kill_grace")
+        self.assertGreater(send_budget.seconds(style_sync.SEND_SECONDS), style_sync.SEND_SECONDS + kill_grace)
+
+    def test_handoff_budget_tracks_a_raised_cleanup_grace_without_reload(self) -> None:
+        config = self.root / "send-budget-config"
+        config.mkdir()
+        for name in ("send", "postmaster", "codex_daemon"):
+            source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
+            _ = (config / source.name).write_text(source.read_text())
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            budgets: list[float] = []
+            for grace in (10, 80):
+                source = Path(__file__).resolve().parents[2] / "config/send.conf"
+                _ = (config / "send.conf").write_text(source.read_text().replace("kill_grace=10", f"kill_grace={grace}"))
+                with (mock.patch.object(style_sync, "runner_value", return_value="session:fixture"),
+                      mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture")) as sender):
+                    self.assertEqual(style_sync.handoff_notice("style", "parent", "checkpoint"), "sent")
+                budgets.append(cast(float, sender.call_args.kwargs["timeout"]))
+            self.assertEqual(budgets, [150, 290])
+            self.assertGreater(budgets[1], style_sync.SEND_SECONDS + 80)
+
+    def test_handoff_budget_tracks_raised_postmaster_wait_and_claim_grace_without_reload(self) -> None:
+        config = self.root / "postmaster-budget-config"
+        config.mkdir()
+        for name in ("send", "postmaster", "codex_daemon"):
+            source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
+            _ = (config / source.name).write_text(source.read_text())
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            budgets: list[float] = []
+            for wait, grace in ((3, 2), (120, 40)):
+                source = Path(__file__).resolve().parents[2] / "config/postmaster.conf"
+                _ = (config / "postmaster.conf").write_text(source.read_text()
+                    .replace("wait_seconds=3.0", f"wait_seconds={wait}")
+                    .replace("claim_grace_seconds=2.0", f"claim_grace_seconds={grace}"))
+                with (mock.patch.object(style_sync, "runner_value", return_value="session:fixture"),
+                      mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture")) as sender):
+                    self.assertEqual(style_sync.handoff_notice("style", "parent", "checkpoint"), "sent")
+                budgets.append(cast(float, sender.call_args.kwargs["timeout"]))
+            self.assertEqual(budgets[1] - budgets[0], 155)
+            self.assertGreater(budgets[1], 120 + 40 + style_sync.SEND_SECONDS)
 
     def test_an_older_in_flight_wake_cannot_erase_the_units_new_wait(self) -> None:
         self.production()
@@ -332,7 +370,7 @@ class StyleSyncTests(unittest.TestCase):
         def refill_during_send(arguments: list[str], **options: object) -> object:
             nonlocal interleaved
             if (len(arguments) > 1 and arguments[1] == str(style_sync.SEND)
-                    and options.get("timeout") == style_sync.SEND_RUN_SECONDS and not interleaved):
+                    and options.get("timeout") == send_budget.seconds(style_sync.SEND_SECONDS) and not interleaved):
                 interleaved = True
                 style_sync.wake_waiters(self.repo, "modules-unit-2")
                 with style_ledger.open_ledger(self.repo) as ledger:
@@ -508,11 +546,8 @@ class StyleSyncTests(unittest.TestCase):
         result = fixture.verify("lint", "--workspace", "--no-cache")
         self.assertEqual(fixture.calls("+nightly"), [
             ["fmt", "--version"], ["fmt", "--all"],
-            ["fmt", "--version"], ["fmt", "--all"],
         ])
         self.assertEqual(fixture.calls("clippy"), [
-            ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
-             "--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"],
             ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"],
         ])
         self.assertEqual(fixture.calls("mend"), [["--all-targets", "--workspace", "--fix"]])

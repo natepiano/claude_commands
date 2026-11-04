@@ -298,7 +298,7 @@ def paths(home):
     assert note_file.notes_dir() == home / "rust/hanadocs/agents"
     assert dailies_render.READINGS_LOG == home / ".local/state/agent-notes/readings.jsonl"
     assert showrunners.NOTIFIER_STATE_DIR == home / ".local/state/notifier"
-    assert showrunners.SESSIONS_DIR == home / ".claude/sessions"
+    assert showrunners.sessions_directory() == home / ".claude/sessions"
     assert showrunners.SHOWRUNNER_STATE_DIR == home / ".local/state/showrunner"
 for name in ("first", "second"):
     home = caller.parent / name

@@ -32,6 +32,7 @@ import rules
 import style_ledger
 import style_rules
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 
 
 REAL_RUN = subprocess.run
@@ -124,6 +125,11 @@ class StylePlanFixture(unittest.TestCase):
             fake_fmt.STATE: str(self.root / "fmt"),
             "PATH": str(self.root / "bin") + os.pathsep + os.environ.get("PATH", ""),
         })))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
+        owner = recorded_showrunner("sample-style", self.doc)
+        _ = fixture_unit_location(owner, "names-unit", self.unit)
+        _ = fixture_unit_location(owner, "modules-unit", self.root / "modules")
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
         _ = self.enterContext(mock.patch.object(berth_board, "read_board", return_value=self.board()))
         _ = self.enterContext(mock.patch.object(style_proposals, "renumber"))
@@ -313,6 +319,7 @@ class StylePlanFixture(unittest.TestCase):
         _ = plan.write_text(self.plan_header().replace("names-unit", "types-unit"))
         _ = self.doc.write_text(self.doc.read_text() +
                                 f"| types-unit | docs/style-production/units/types-unit.md | {types} | demo-style-types |\n")
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "types-unit", types)
         return plan
 
     def names_files(self) -> set[str]:

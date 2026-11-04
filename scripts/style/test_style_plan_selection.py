@@ -21,6 +21,8 @@ import style_proposals
 import berth_board
 import rules
 import style_ledger
+import unit_files
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 
 from style_plan_test_support import StylePlanFixture
 from unit_plans import AllCrates
@@ -36,6 +38,7 @@ class StylePlanTests(StylePlanFixture):
         _ = plan.write_text(self.plan_header().replace("names-unit", "values-unit"))
         _ = self.doc.write_text(self.doc.read_text() +
                                 f"| values-unit | docs/style-production/units/values-unit.md | {worktree} | demo-style-values |\n")
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "values-unit", worktree)
         return plan
 
     def select_for_family(self, family: rules.Family, plan: Path) -> style_ledger.TicketRecord:
@@ -336,12 +339,25 @@ class StylePlanTests(StylePlanFixture):
         _ = (product / self.sources[2]).write_text("dirty\n")
         parent = self.repo / "docs/product-production.md"
         _ = parent.write_text(parent.read_text() + f"| product-unit | docs/product.md | {product} | product-change |\n")
+        _ = fixture_unit_location(recorded_showrunner("sample", parent), "product-unit", product)
         ledger = self.ledger()
         ledger.ticket_add("modules-unit-1", "modules-unit", "read", "names", "crates/beta", [self.sources[3]], [rule])
         ledger.ticket_assign("modules-unit-1", "demo-style-modules")
         self.assertEqual(self.candidates(blocked=(self.sources[0],)), ())
         ledger.ticket_drop("modules-unit-1")
         self.assertEqual(tuple(path for ticket in self.candidates(blocked=(self.sources[0],)) for path in ticket.files), (self.sources[3],))
+
+    def test_held_files_follow_staff_when_the_worktree_cell_names_another_checkout(self) -> None:
+        stale = self.root / "stale-names"
+        _ = self.git("worktree", "add", "-q", "-b", "stale-names", str(stale))
+        staff_file, stale_file = self.sources[:2]
+        _ = (self.unit / staff_file).write_text("staff location change\n")
+        _ = (stale / stale_file).write_text("stale cell change\n")
+        _ = self.doc.write_text(self.doc.read_text().replace(str(self.unit), str(stale)))
+
+        holders = unit_files.unit_file_holders(self.repo, self.doc, self.ledger())
+
+        self.assertEqual(holders["names-unit"], frozenset({staff_file}))
 
     def test_slices_preserve_directories_and_split_oversized_directories_with_bounds(self) -> None:
         files: list[str] = []

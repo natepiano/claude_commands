@@ -3232,7 +3232,6 @@ class PhaseTableTests(unittest.TestCase):
         with (
             patch.dict(os.environ, self.environment()),
             patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier_dir),
-            patch.object(showrunners, "SESSIONS_DIR", self.sessions_dir),
             patch.object(os, "fchmod", side_effect=create_competing_note),
             patch.object(sys, "argv", arguments),
             redirect_stderr(errors),
@@ -3343,7 +3342,6 @@ class PhaseTableTests(unittest.TestCase):
         with (
             patch.dict(os.environ, self.environment()),
             patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier_dir),
-            patch.object(showrunners, "SESSIONS_DIR", self.sessions_dir),
             patch.object(
                 sessions,
                 "live_sessions",

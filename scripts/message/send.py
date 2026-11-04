@@ -8,8 +8,6 @@ every message follows are /message (~/.claude/commands/message.md).
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
-  send.py --to user --summary TITLE [--need note|decision|blocked]
-          (--action TEXT | --no-action) ...                              the user
   send.py --to user --text-id ID --value KEY=VALUE ...    a registered push; --help lists
                                                           the ones a session or script sends
   send.py ack KEY       later sends with KEY are skipped
@@ -43,7 +41,7 @@ Only the configured Morty ID adds `Authority: morty (speaks for the user)`.
 Queues and SSH forwarding retain the original sender ID.
 `--here` checks only this machine. `--machine` runs this script on HOST over ssh.
 
-`--to user` reaches the user wherever they are; `--summary` is the title. `--need`
+`--to user` requires a registered `--text-id`. The template supplies the title and action. `--need`
 says what they must do: `note` nothing, `decision` decide while work goes on,
 `blocked` act before work can go on, repeated until they acknowledge it. How
 it reaches them is `user()`'s business: no caller names the channel.
@@ -68,7 +66,7 @@ An emergency push stops by itself when its cause is fixed. `--clears-when CMD` g
 command, run on this machine, that exits 0 when the cause is gone (`--clears-when github-warm-status`).
 A sent push with it is recorded in STATE/emergencies.json: key, sender, check, machine (the host
 that posted the push: this one, or --machine HOST), sent and expires (sent + pushover.EXPIRE_S).
-`clear-check` runs each record's check with no stdin and a CHECK_TIMEOUT_S limit. On exit 0 it
+`clear-check` runs each record's check with no stdin and a check_timeout() limit. On exit 0 it
 retires the push as `retire --to user` does (on the posting host over ssh when that is another
 host) and removes the record; it drops an expired record; it never pushes. It prints one line per
 record: `retired: KEY from SENDER: ...`, `kept: KEY from SENDER: ...`, `dropped: KEY from SENDER: ...`,
@@ -128,6 +126,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
@@ -138,6 +137,8 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_names
 from scripts.lib import conf
+from scripts.notify import decision_priority
+from scripts.message import send_budget
 from scripts.message.send_result import (
     Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
     OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
@@ -153,6 +154,7 @@ if TYPE_CHECKING:
     from ..accounts import accounts
     from ..whoami.account import named_account_environment
 import push_texts  # noqa: E402
+import push_reference
 import rca  # noqa: E402
 import repeat_guard  # noqa: E402
 import review  # noqa: E402
@@ -180,8 +182,6 @@ AUTO_MODE_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --
                   + ' [--value "rule=<the allow rule>"]')
 # The push shows a longer refused command cut to its first 89 characters and "…".
 REFUSED_COMMAND_LENGTH = 90
-# The cold-read review of an auto_mode.refused waits sentence holds the alert back at most this long.
-WAITS_REVIEW_SECONDS = 30
 PAID_CREDITS_TEXT = "quota.paid_credits"
 PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id quota.paid_credits'
                      + ' --value account=<account> --value machine=<machine> --value credits=<paid credits left>'
@@ -204,6 +204,8 @@ NEEDS_GO_HELD = ("not sent: this push asks the user to type a go. Send it with t
                  + NEEDS_GO_CALL)
 # Registered pushes a session or script sends with --text-id; `send.py --help` lists them.
 SESSION_TEMPLATES = {
+    "decision.choices": "a decision with structured choices and a recommendation; see review.py show decision.choices.",
+    "review_watch.acknowledge": "a reminder to acknowledge a review report; see review.py show review_watch.acknowledge.",
     AUTO_MODE_TEXT: "auto mode refused a command and the session waits for the user. " + AUTO_MODE_CALL,
     PAID_CREDITS_TEXT: ("an account now spends paid credits; a script with no Claude session names itself with --from. "
                         + PAID_CREDITS_CALL),
@@ -226,9 +228,6 @@ RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT})
 AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
                   + AUTO_MODE_CALL)
 PERMISSION_MODE = "auto"
-# One relay took 9 s when measured; quota_alert.py's budget is built on this.
-TIMEOUT = 40
-KILL_GRACE = 10
 # Exec preserves this PID: Claude's cc-socks/<pid>.sock belongs to the recorded process.
 # Publish before Claude starts, so even an immediate reply can resolve its sender.
 RELAY_EXEC = f"""import os, sys
@@ -238,19 +237,39 @@ from relay_identity import publish_relay_identity
 publish_relay_identity(os.getpid(), sys.argv[2], Path(sys.argv[1]))
 os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 """
-# Above pushover.TIMEOUT_S, so Pushover's own timeout reports first.
-USER_CANCEL_TIMEOUT = 30
-# A --clears-when check that runs longer is stopped, and its push is kept.
-CHECK_TIMEOUT_S = 20
-# The far retire's cancel limit, the ssh connect timeout and its start-up.
-REMOTE_RETIRE_TIMEOUT = USER_CANCEL_TIMEOUT + 30
 EMERGENCIES = "emergencies.json"
 NO_CLEAR_STEP = ("an emergency push (--need blocked) repeats on the phone until it is cancelled, and this one has no"
                  + ' way to clear. Add --clears-when "<command that exits 0 when fixed>", such as'
                  + " --clears-when github-warm-status: send.py then cancels the push when that command exits 0")
 
+
+def waits_review_seconds() -> float:
+    """Push review budget in seconds."""
+    return conf.read("send").number("waits_review_seconds")
+
+
+def delivery_timeout() -> float:
+    """Default delivery budget in seconds."""
+    return conf.read("send").number("delivery_timeout")
+
+
+def kill_grace() -> float:
+    """Relay shutdown grace in seconds."""
+    return conf.read("send").number("kill_grace")
+
+
+def user_cancel_timeout() -> float:
+    """Emergency cancellation budget in seconds."""
+    return conf.read("send").number("user_cancel_timeout")
+
+
+def check_timeout() -> float:
+    """Emergency check budget in seconds."""
+    return conf.read("send").number("check_timeout")
+
+
 Need = Literal["note", "decision", "blocked"]
-CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
+CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "0", "blocked": "2"}
 _ACKNOWLEDGED_AT = " acknowledged at "
 
 
@@ -445,10 +464,13 @@ class FailedPush:
     reviewed: bool = False
     need: Need = "note"
     held: bool = False
+    text_id: str = ""
+    sender: str = ""
 
     @property
     def fallback_allowed(self) -> bool:
-        return (self.reviewed and not self.held) or self.need == "blocked"
+        return (self.reviewed and not self.held and self.need == "blocked"
+                and any(entry.id == self.text_id for entry in push_texts.catalog()))
 
     @property
     def message(self) -> str:
@@ -457,13 +479,8 @@ class FailedPush:
 
     @property
     def text(self) -> str:
-        line = " ".join((self.title + " — " + first_line(self.action, split_session(self.body)[0])).split())
-        if len(line) <= 200:
-            return line
-        shortened = line[:199]
-        if not line[199].isspace() and " " in shortened:
-            shortened = shortened.rsplit(" ", 1)[0]
-        return shortened.rstrip() + "…"
+        return (f"Title: {self.title}\n{self.message}\n\n"
+                + f"Sent by: {self.sender} · Template: {self.text_id}")
 
 
 @dataclass(frozen=True)
@@ -483,6 +500,8 @@ class ReviewedPushRecord(TypedDict):
     held_source: NotRequired[str]
     held_identity: NotRequired[str]
     held_machine: NotRequired[str]
+    text_id: NotRequired[str]
+    sender: NotRequired[str]
 
 
 class FailedPushRecord(ReviewedPushRecord):
@@ -498,15 +517,15 @@ class FailedPushTransportRecord(ReviewedPushRecord):
     need: Need
 
 
-UNREVIEWED_FALLBACK = ("This push was never reviewed, so it cannot go out as a fallback. "
-    "Bring it to the user in your reply, or resend it with send.py once the failure is fixed.")
+UNREVIEWED_FALLBACK = ("Only a reviewed blocked push with a registered template can use a fallback. "
+    "Use send.py with a registered template after you repair the delivery failure.")
 
 
 HELD_FALLBACK = "This push was not sent because it failed review. Revise it and resend it with send.py; no fallback is allowed."
 
 
 def failure_detail(reason: str, failed: FailedPush) -> str:
-    if failed.held and failed.need != "blocked":
+    if failed.held:
         return reason.partition(" fallback text:")[0] + " " + HELD_FALLBACK
     reason = reason.partition(" fallback text:")[0].partition(" " + UNREVIEWED_FALLBACK)[0]
     return reason + (" fallback text:\n" + failed.text if failed.fallback_allowed else " " + UNREVIEWED_FALLBACK)
@@ -692,6 +711,8 @@ class Options(NamedTuple):
     no_accounting: bool = False
     report_recipient: bool = False
     sender_origin: RuntimeSender | ForwardedSender = RuntimeSender()
+    due: str = ""
+    reference: push_reference.PushReference = push_reference.NO_REFERENCE
 
     @property
     def to(self) -> str:
@@ -963,7 +984,7 @@ def retire(to: str, sender: str, key: str) -> int:
 def cancel_user_push(sender: str, key: str) -> tuple[int, str]:
     """Stop the user's emergency push sent with key, through the same channel user() sends on."""
     code, out, err = run([sys.executable, str(USER_CHANNEL), "cancel", "--source", sender, key], "",
-                         USER_CANCEL_TIMEOUT)
+                         user_cancel_timeout())
     if code == 0 and "pushover: nothing to cancel" in out:
         return 0, f"nothing to cancel: no emergency push for {key} is repeating"
     if code == 0:
@@ -1057,7 +1078,7 @@ def retire_record(record: Emergency) -> tuple[int, str]:
     forget_sent(record["key"], USER)
     forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"]])
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", record["machine"], f"{REMOTE} {forwarded}"]
-    code, out, err = run(command, "", REMOTE_RETIRE_TIMEOUT)
+    code, out, err = run(command, "", user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
     last = (out.strip().splitlines() or [""])[-1]
     if code == 0:
         return 0, f"on {record['machine']}: {last}"
@@ -1078,11 +1099,16 @@ def clear_check_turn() -> Generator[bool]:
         yield True
 
 
-def clear_check(timeout: float = CHECK_TIMEOUT_S) -> tuple[int, list[str]]:
+class ConfiguredCheckTimeout(Enum):
+    CURRENT = "current"
+
+
+def clear_check(timeout: float | ConfiguredCheckTimeout = ConfiguredCheckTimeout.CURRENT) -> tuple[int, list[str]]:
     """Retire each live emergency push whose check passes and drop the expired ones; never pushes.
 
     The lock is not held while checks and retires run: a retire takes it, and a send must not wait on a check.
     """
+    timeout = check_timeout() if isinstance(timeout, ConfiguredCheckTimeout) else timeout
     if not (STATE / EMERGENCIES).exists():
         return 0, []
     with clear_check_turn() as turn:
@@ -1168,7 +1194,7 @@ class RepeatPending:
 
 def pending_deliveries(state: KeyState) -> dict[str, PendingDelivery]:
     """Read legacy pending timestamps with the default delivery limit."""
-    return {recipient: PendingDelivery(started=mark, limit_seconds=TIMEOUT) if isinstance(mark, str) else mark
+    return {recipient: PendingDelivery(started=mark, limit_seconds=delivery_timeout()) if isinstance(mark, str) else mark
             for recipient, mark in state.get("pending", {}).items()}
 
 
@@ -1478,7 +1504,7 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
             started = now()
             append_record(STATE / "socket-recovery-attempts.jsonl",
                           SocketRecoveryAttempt(key=identity, time=started.isoformat()), durable=True)
-            result = relay_socket(message, TIMEOUT, records, metadata, membership=membership)
+            result = relay_socket(message, delivery_timeout(), records, metadata, membership=membership)
             log(message, result, started)
             if result.outcome != "sent":
                 lines.append(f"FAILED: socket queue {path}: {result.detail}; kept for retry")
@@ -1804,13 +1830,14 @@ def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | No
     A timeout stops the process group. Notice deliveries instead inherit their
     supervisor's group, whose whole-job deadline also stops descendants.
     """
+    grace = kill_grace()
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, env=env, cwd=cwd, start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1") as process:
         try:
             out, err = process.communicate(stdin, timeout=timeout)
             return process.returncode, out, err
         except subprocess.TimeoutExpired:
-            for sig, wait in ((signal.SIGTERM, KILL_GRACE), (signal.SIGKILL, None)):
+            for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
                 try:
                     if os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1":
                         process.send_signal(sig)
@@ -1819,7 +1846,7 @@ def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | No
                 except ProcessLookupError:
                     pass
                 try:
-                    out, err = process.communicate(timeout=KILL_GRACE if wait is None and os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1" else wait)
+                    out, err = process.communicate(timeout=grace if wait is None and os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1" else wait)
                     return None, out, err
                 except subprocess.TimeoutExpired:
                     continue
@@ -2017,31 +2044,40 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
             hold: RevisionHold = (HeldRevision(source, identity, machine)
                                   if isinstance(source, str) and source and isinstance(identity, str) and identity
                                   else NO_HELD_REVISION)
-            reviewed = record.get("reviewed") is True if remote_record else True
+            reviewed = record.get("reviewed") is True if remote_record else record.get("reviewed") is not False
             need = record.get("need") if remote_record else original.need
             if need not in ("note", "decision", "blocked"):
                 need = original.need
             session = record.get("session")
             if isinstance(session, str):
                 body = session_prefix(SessionLine(session)) + body
-            return FailedPush(title, action, body, hold, reviewed=reviewed, need=need, held=record.get("held") is True)
+            return FailedPush(title, action, body, hold, reviewed=reviewed, need=need, held=record.get("held") is True,
+                              text_id=as_str(record.get("text_id")) or original.text_id,
+                              sender=as_str(record.get("sender")) or original.sender)
         return original
     return original
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = ()) -> Result:
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
     key = ["--key", message.key] if message.key else []
-    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender, *key,
+    selected_priority = decision_priority.priority(need, due)
+    command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
                *(["--answerable"] if answerable else []), *action_arguments(action), message.summary, message.text]
     if text_id:
-        command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender, *key,
-                   "--text-id", text_id]
+        command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
+                   "--text-id", text_id, *(["--answerable"] if answerable else [])]
         for value in values:
             command.extend(["--value", value])
+    if due:
+        command[2:2] = ["--due", due]
+    if reference["kind"] != "none":
+        command[2:2] = ["--push-reference", json.dumps(reference)]
+    if remote_forward:
+        command[2:2] = ["--ssh-forwarded-reference"]
     code, out, err = run(command, "", timeout)
     if code == 6:
-        failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True))
+        failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True, text_id=text_id, sender=message.sender))
         return Result("held", "not sent, failed review: " + (err.removeprefix("pushover: not sent: ").strip() or "review failed"), failed)
     if code == 5:
         return Result("replaced", "a newer version replaced this push; nothing was sent")
@@ -2067,7 +2103,7 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
     if code == 2 and f"{REFUSED_BEFORE_SENDING}:" in err:
         return Result("refused", why)
-    failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need))
+    failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, text_id=text_id, sender=message.sender))
     return Result("failed", failure_detail(f"the user was not reached: {why}", failed), failed)
 
 
@@ -2129,7 +2165,7 @@ def deliver_template_fix(text_id: str, recipient: str, text: str) -> None:
     command = [sys.executable, str(Path(__file__).resolve()), "--to", recipient, "--from", "push template review",
                "--summary", "Fix push template " + text_id, "--text", text]
     try:
-        code, out, err = run(command, "", TIMEOUT + 40)
+        code, out, err = run(command, "", send_budget.seconds())
         if code != 0:
             log_template_fix_error(text_id, (err or out).strip() or ("timed out" if code is None else f"exit {code}"))
     except OSError as error:
@@ -2161,6 +2197,10 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--key", message.key]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if options.reference["kind"] != "none":
+            forwarded += ["--push-reference", json.dumps(options.reference)]
+        if options.due:
+            forwarded += ["--due", options.due]
         if options.need == "blocked":
             # This host refused a push with no clear step and keeps its --clears-when record.
             forwarded += ["--self-clearing"]
@@ -2181,13 +2221,13 @@ def remote(message: Message, host: str, options: Options) -> Result:
         # This host's claim holds the emergency's lifetime window; the run on host must not apply it again.
         forwarded += ["--repeat-minutes", "0"]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
-    code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
+    code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
     receiver, err = recipient_report(err)
     failure: FailureText = NO_FAILED_PUSH
     if message.to == USER and "send.py: failed push JSON: " in err:
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need),
+        failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need, text_id=options.text_id, sender=message.sender),
                                    prefix="send.py: failed push JSON: ", machine=host, remote_record=True)
     outcome = send_outcome(code, out)
     if isinstance(outcome, UnconfirmedSendOutcome):
@@ -2205,12 +2245,12 @@ def remote(message: Message, host: str, options: Options) -> Result:
 # ---------------------------------------------------------------------------
 
 
-def user_failure(message: Message, action: MessageUserAction, result: Result, need: Need) -> Result:
+def user_failure(message: Message, action: MessageUserAction, result: Result, need: Need, text_id: str = "") -> Result:
     if isinstance(action, NoUserRecipient):
         raise AssertionError("a user message must state its action")
     failed = result.failure
     if isinstance(failed, NoFailedPush):
-        failed = FailedPush(message.summary, action, message.text, need=need)
+        failed = FailedPush(message.summary, action, message.text, need=need, text_id=text_id, sender=message.sender)
     result = Result("held" if failed.held else "failed", failure_detail(result.detail, failed), failed)
     try:
         pid = os.environ.get("CLAUDE_PID", "")
@@ -2222,7 +2262,8 @@ def user_failure(message: Message, action: MessageUserAction, result: Result, ne
             entry: FailedPushRecord = {"time": time.time(), "title": failed.title,
                 "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
                 "body": failed.body, "message": failed.message, "fallback": failed.text,
-                "reviewed": failed.reviewed, "need": failed.need, "held": failed.held}
+                "reviewed": failed.reviewed, "need": failed.need, "held": failed.held,
+                "text_id": failed.text_id, "sender": failed.sender}
             if isinstance(failed.hold, HeldRevision):
                 entry["held_source"] = failed.hold.source
                 entry["held_identity"] = failed.hold.identity
@@ -2289,16 +2330,17 @@ def auto_mode_key(session: str, commands: tuple[str, ...]) -> str:
 
 
 def reviewed_waits(options: Options) -> Options:
-    """An auto_mode.refused alert keeps its waits sentence, a value the session writes, only when the
-    cold-read review passes the alert within WAITS_REVIEW_SECONDS. A timeout, a failure or no reviewer
-    sends the alert without it: a slow review never holds the alert back longer."""
+    """Review the waits sentence within the configured budget.
+
+    Keep the sentence only when the reviewer approves it. Send the alert without the sentence if the review fails.
+    """
     values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
     if not values.get("waits_line") or review.switched_off():
         return options
     rendered = push_texts.render(AUTO_MODE_TEXT, **values)
-    draft = review.Draft(rendered.sender, CHANNEL_PRIORITY[options.need], rendered.title, rendered.action,
+    draft = review.Draft(rendered.sender, decision_priority.priority(options.need, options.due), rendered.title, rendered.action,
                          rendered.body, False, rendered.session)
-    outcome = review.review(draft, False, limit=WAITS_REVIEW_SECONDS)
+    outcome = review.review(draft, False, limit=waits_review_seconds())
     if isinstance(outcome, review.Approved):
         return options
     why = outcome.why if isinstance(outcome, review.Unreviewed | review.Withheld) else ", ".join(outcome.failed_rules)
@@ -2401,6 +2443,9 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--priority", choices=("0", "1", "2"), help=argparse.SUPPRESS)
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
                             help="to `user`: what they must do (default note: nothing)")
+    _ = parser.add_argument("--question", default="", help="the open question record for decision.choices")
+    _ = parser.add_argument("--push-reference", default="", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--due", default="", help="decision deadline in ISO 8601 with an explicit offset")
     _ = parser.add_argument("--action", help="to `user`: what the user does")
     _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
     clears = parser.add_mutually_exclusive_group()
@@ -2417,13 +2462,31 @@ def parse(argv: list[str]) -> Options:
     _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
     _ = parser.add_argument("--codex", action="store_true", help="the recipient is a codex_mesh.py thread")
     _ = parser.add_argument("--session-dir", help="the codex_mesh.py session directory")
-    _ = parser.add_argument("--timeout", type=float, default=TIMEOUT, help=f"delivery seconds (default {TIMEOUT})")
+    _ = parser.add_argument("--timeout", type=float, default=delivery_timeout(), help=f"delivery seconds (default {delivery_timeout():g})")
     body = parser.add_mutually_exclusive_group()
     _ = body.add_argument("--text")
     _ = body.add_argument("--file")
     args = parser.parse_args(argv)
+    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
+    origin: RuntimeSender | ForwardedSender = RuntimeSender()
+    if forwarded_stamp is not None:
+        if attr(args, "here") is not True:
+            parser.error("--forwarded-sender-stamp needs --here")
+        if "SSH_CONNECTION" not in os.environ:
+            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
+        try:
+            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
+        except ValueError as error:
+            parser.error(str(error))
     to = as_str(attr(args, "to"))
     text_id = as_str(attr(args, "text_id"))
+    try:
+        reference = push_reference.admission_reference(text_id, as_str(attr(args, "question")), as_str(attr(args, "push_reference")),
+            remote_forward=isinstance(origin, ForwardedSender))
+    except (OSError, ValueError) as error:
+        usage_error(str(error).replace("\n", " "))
+    if reference["kind"] == "question" and attr(args, "key") is None:
+        args.key = "question:" + reference["path"]
     raw_values = cast(list[str], attr(args, "value"))
     # Only auto_mode.refused repeats a key: one command value for each refused command.
     commands: list[str] = []
@@ -2474,6 +2537,13 @@ def parse(argv: list[str]) -> Options:
     priority = optional_str(attr(args, "priority"))
     if priority is not None:
         args.need = {"0": "note", "1": "decision", "2": "blocked"}[priority]
+    due = as_str(attr(args, "due"))
+    try:
+        _ = decision_priority.read_due(due)
+    except ValueError as error:
+        parser.error(str(error))
+    if due and (to != USER or attr(args, "need") != "decision"):
+        parser.error("--due needs --to user and --need decision")
     action_text = optional_str(attr(args, "action"))
     no_action = attr(args, "no_action") is True
     if to != USER:
@@ -2498,26 +2568,15 @@ def parse(argv: list[str]) -> Options:
     forwarded_sender = optional_str(attr(args, "forwarded_shown_sender"))
     if forwarded_sender is not None and (attr(args, "here") is not True or not forwarded_sender):
         parser.error("--forwarded-shown-sender needs --here and nonempty sending-machine display text")
-    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
-    origin: RuntimeSender | ForwardedSender = RuntimeSender()
-    if forwarded_stamp is not None:
-        if attr(args, "here") is not True:
-            parser.error("--forwarded-sender-stamp needs --here")
-        if "SSH_CONNECTION" not in os.environ:
-            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
-        try:
-            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
-        except ValueError as error:
-            parser.error(str(error))
     scope: RecipientResolutionScope = (
         NamedMachine(host) if host is not None else
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
     get = {name: attr(args, name) for name in Options._fields
-           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin"}}
+           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin", "reference"}}
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
-                      scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
+                      scope=scope, timeout=optional_float(get["timeout"]) or delivery_timeout(),
                       need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
                       file=optional_str(get["file"]), answerable=get["answerable"] is True, text_id=text_id, values=tuple(raw_values),
                       commands=tuple(commands), clears_when=optional_str(get["clears_when"]) or "",
@@ -2525,7 +2584,7 @@ def parse(argv: list[str]) -> Options:
                       human=get["human"] is True, no_accounting=get["no_accounting"] is True,
                       report_recipient=get["report_recipient"] is True,
                       shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
-                      sender_origin=origin)
+                      sender_origin=origin, due=due, reference=reference)
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -2678,6 +2737,8 @@ def delivered_text(message: Message, entry_id: str) -> str:
 def send(options: Options) -> Result:
     import roster
 
+    if options.to == USER and not options.text_id:
+        return Result("refused", push_texts.TEMPLATE_REQUIRED)
     if options.to == USER:
         options = options._replace(timeout=max(options.timeout, review.user_send_seconds()))
     if options.text_id == AUTO_MODE_TEXT:
@@ -2773,7 +2834,7 @@ def send(options: Options) -> Result:
     elif isinstance(route, UserDelivery):
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values)
+        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender))
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
             _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexWorkerRecipient):
@@ -2850,7 +2911,7 @@ def send(options: Options) -> Result:
         record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
                                    sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat()))
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
-        result = user_failure(message, options.action, result, options.need)
+        result = user_failure(message, options.action, result, options.need, options.text_id)
     if not options.no_accounting:
         log(message, result, started, log_route)
     if options.report_recipient:
@@ -2862,7 +2923,7 @@ def repeat_notice_owner(sender: str) -> str:
     """Follow staff parents to the sender's showrunner."""
     membership = staff.snapshot()
     member = resolve_staff_recipient(sender, membership)
-    if isinstance(member, NoStaffRecipient):
+    if isinstance(member, NoStaffRecipient) or isinstance(member, staff.StaffRow) and member.kind == "agent":
         return rca.owner_address("")
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
@@ -2916,10 +2977,15 @@ def attempt_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.
 
 
 def main(argv: list[str]) -> int:
+    user_target = "--to=user" in argv or any(left == "--to" and right == USER for left, right in zip(argv, argv[1:]))
+    has_template = "--text-id" in argv or any(value.startswith("--text-id=") and value != "--text-id=" for value in argv)
+    if user_target and not has_template and argv[:1] != ["retire"]:
+        print("REFUSED: " + push_texts.TEMPLATE_REQUIRED)
+        return EXIT["refused"]
     match argv:
         case ["repeat-notices"]:
             repeat_guard.drain(Path(os.environ.get("SEND_REPEAT_STATE", str(STATE / "repeats"))), attempt_repeat_notice, now().timestamp(),
-                               cleanup_seconds=2 * KILL_GRACE)
+                               cleanup_seconds=2 * kill_grace())
         case ["repeat-notice-attempt"]:
             request = as_dict(loads(sys.stdin.read()))
             state = repeat_guard.decode(json.dumps(request["state"]))
@@ -2979,7 +3045,8 @@ def main(argv: list[str]) -> int:
                 failed = result.failure
                 record: FailedPushTransportRecord = {"title": failed.title,
                     "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
-                    "body": failed.body, "reviewed": failed.reviewed, "need": failed.need, "held": failed.held}
+                    "body": failed.body, "reviewed": failed.reviewed, "need": failed.need, "held": failed.held,
+                    "text_id": failed.text_id, "sender": failed.sender}
                 if isinstance(failed.hold, HeldRevision):
                     record["held_source"] = failed.hold.source
                     record["held_identity"] = failed.hold.identity

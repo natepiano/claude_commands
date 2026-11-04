@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sys
+import io
+from contextlib import redirect_stdout
 import tempfile
 import subprocess
 import os
@@ -26,6 +28,7 @@ from scripts.production.staff_test_support import isolated_staff_file, recorded_
 
 import escalate  # five_hour puts scripts/message on the path
 import quota_alert
+import push_texts
 import send
 import sessions
 from quota_alert import Config, Showrunner
@@ -292,9 +295,11 @@ class WatchTests(unittest.TestCase):
             concurrent.append(self.watch([report("Claude", 90)]))
 
         with (patch.object(five_hour, "recipients", return_value=["natedev"]),
-              patch.object(five_hour, "relay", side_effect=relay)):
+              patch.object(five_hour, "relay", side_effect=relay),
+              redirect_stdout(io.StringIO()) as output):
             self.assertEqual(self.watch([report("Claude", 90)]),
                              ["5-hour limit: Claude 10% left -> natedev"])
+        self.assertEqual(output.getvalue(), f"already claimed by {os.getpid()}\n")
         self.assertEqual(concurrent, [[]])
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
@@ -407,7 +412,7 @@ class AccountHoldTests(unittest.TestCase):
     def test_swap_cancels_outgoing_and_legacy_holds_without_recovery_and_keeps_other_tools(self) -> None:
         a = self.readings(1)
         _ = five_hour.watch([a.checked_homes[0].report], now=self.now, codex_readings=a)
-        _ = escalate.hold("five-hour-codex", escalate.SessionPush("Old Codex", "old", NoActionRequired(), "note"))
+        _ = escalate.hold("five-hour-codex", push_texts.render("nate.adhoc", sender="quota", title="Old Codex", description="old"))
         _ = escalate.hold("five-hour-claude", escalate.SessionPush("Claude", "other", NoActionRequired(), "note"))
         self.sent.clear()
         b = self.readings(2, None)

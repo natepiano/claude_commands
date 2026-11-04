@@ -6,13 +6,10 @@
 # `test` selects the package's test targets; examples are never test targets.
 # `build` builds one package's binaries, or one bin or example, so a smoke run
 # or live shot can launch it, and prints each binary's path.
-# `lint` runs clippy with --all-targets --all-features to match CI, and mend
-# also uses --all-targets. It checks TOML formatting with taplo at the workspace
-# root. `example` runs clippy on one named example while
-# iterating. `final` is the plan-final full gate, run by the unit director,
-# never by a phase worker. It checks all targets, including examples, then
-# runs nextest with --tests so no example is linked. No tests are lost:
-# the scan first refuses examples that hold a test or set test = true.
+# Lint checks all targets and features. Taplo checks workspace TOML files.
+# `example` checks one example. The director runs `final` with all targets.
+# `final` rejects examples with tests before nextest runs with --tests.
+# `build` prints binary paths for smoke checks.
 #
 # Package selection is always --workspace. Non-release check, test, final,
 # doc and build add workspace.metadata.dev.features to Work Order features.
@@ -39,11 +36,8 @@
 # changed during the run records nothing.
 # Records outlive worker sessions and are pruned after 14 days on each write.
 #
-# The lint stages — mend, fmt, clippy fix, fmt, clippy judgment — use
-# config/lint.conf (edit it with /lint_config). Taplo fmt --check always runs
-# at the workspace root. A gated-off check prints a SKIPPED line and exits 0.
-# Scope is never configurable. cargo check, cargo nextest and the checkpoint
-# rustdoc check are correctness gates and cannot be switched off.
+# Use config/lint.conf to select lint stages. Taplo always checks the workspace.
+# Check, test, and checkpoint rustdoc always run. Clippy judges before repairs.
 #
 # A worker session remembers passes. With UNIT_RUN_DIR or
 # UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
@@ -283,6 +277,15 @@ run() {
         if buildlog_step_compiles "$@"; then
             step_state on_natedev
         else
+            # A Mac step can release the token inside a lint pipeline.
+            # Read its shared mark before starting a local formatter.
+            if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
+                release_token || { status=$?; rm -f "$step_log"; return "$status"; }
+            fi
+            acquire_token local || { status=$?; rm -f "$step_log"; return "$status"; }
+            if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+                printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+            fi
             step_state local_noncompiling
         fi
         export BUILDLOG_TARGET=natedev
@@ -2583,6 +2586,7 @@ token_wait_superseded() {
 # the 3600 s hold already free a dead or stuck holder, and the queue above
 # drops a waiter whose verify.sh ended. Sets TOKEN_WAITED to the seconds it
 # waited.
+# The local argument disables remote routing for a local formatter.
 acquire_token() {
     TOKEN_WAITED=0
     [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
@@ -2642,10 +2646,10 @@ acquire_token() {
             TOKEN_WAITER_PID=""
             (( status != 4 )) || token_wait_orphaned
         fi
-        if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]] \
+        if [[ "${1:-}" != local && "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]] \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             try_reserved_target
-        elif [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] \
+        elif [[ "${1:-}" != local && "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             STEP_FORCE_MAC=1
             return "$LINT_LEFT_QUEUE_STATUS"
@@ -2776,9 +2780,8 @@ buildlog_exec() {
 }
 
 release_token() {
-    # A step that gave the token back and left for the Mac did so in run()'s
-    # subshell; its mark tells this shell the token is no longer held. A step
-    # killed as its acquire returned may hold it all the same, so free that.
+    # A subshell records its release for the parent shell.
+    # A killed acquisition can still hold the token, so release that token too.
     if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
         rm -f "${TOKEN_WAIT_FILE}.given_back"
         if [[ "${TOKEN_HELD}" -eq 1 ]]; then
@@ -2794,6 +2797,9 @@ release_token() {
     # new holder owns the token; the old step's result remains authoritative.
     (( release_status == 0 || release_status == 3 )) || return "$release_status"
     TOKEN_HELD=0
+    if [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        : > "${TOKEN_WAIT_FILE}.given_back"
+    fi
 }
 
 # One try for the token, with no wait. Status 0 when it is held. A call that
@@ -3130,7 +3136,6 @@ case "$CMD" in
             fi
             exit "$lint_status"
         fi
-        # Order: mend, fmt, taplo, clippy fix, fmt, clippy judgment.
         # Cargo stages are gated by lint.conf; the Taplo check always runs.
         # mend passes --all-targets because it needs the test and example
         # targets to see every import and visibility site. It covers the
@@ -3212,24 +3217,26 @@ case "$CMD" in
         fi
         if lint_config_enabled clippy; then
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
-            clippy_tree_before="$(tree_key)"
-            for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
-                invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
-                fmt_cargo "${FMT_SCOPE[@]}"
-                clippy_tree_after="$(tree_key)"
-                if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
-                    break
-                fi
-                # An empty key cannot prove that the tree stopped changing.
-                if (( clippy_fix_pass == 3 )); then
-                    CLIPPY_FIX_LIMIT_REACHED=1
-                fi
-                clippy_tree_before="$clippy_tree_after"
+            for clippy_judgment in 1 2; do
+                start_tree_watch
+                clippy_status=0
+                invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
+                finish_tree_watch
+                (( clippy_status != 0 && clippy_judgment == 1 )) || break
+                clippy_tree_before="$(tree_key)"
+                for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
+                    invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
+                    fmt_cargo "${FMT_SCOPE[@]}"
+                    clippy_tree_after="$(tree_key)"
+                    if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
+                        break
+                    fi
+                    if (( clippy_fix_pass == 3 )); then
+                        CLIPPY_FIX_LIMIT_REACHED=1
+                    fi
+                    clippy_tree_before="$clippy_tree_after"
+                done
             done
-            start_tree_watch
-            clippy_status=0
-            invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
-            finish_tree_watch
             (( clippy_status == 0 )) || exit "$clippy_status"
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else

@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import send_result
+from scripts.message import send_budget
 
 NoticeStatus = Literal["pending", "accepted"]
 NoticeHistory = dict[str, dict[str, NoticeStatus]]
@@ -61,9 +62,6 @@ def record(root: Path, machine: str, keys: list[str]) -> None:
 
 def deliver(root: Path, machine: str) -> None:
     """Retry pending notices with the same sender identity."""
-    # The clean filter does not import the sender or resolve its configuration.
-    from scripts.message.send import TIMEOUT
-
     path = root / LEDGER
     if not path.exists():
         return
@@ -84,7 +82,7 @@ def deliver(root: Path, machine: str) -> None:
         accepted = False
         try:
             sent = subprocess.run(command, input="", text=True, capture_output=True,
-                                  check=False, timeout=TIMEOUT + 40)
+                                  check=False, timeout=send_budget.seconds())
             outcome = send_result.send_outcome(sent.returncode, sent.stdout)
             accepted = (isinstance(outcome, send_result.ConfirmedSendOutcome)
                         and outcome.header.outcome in {"sent", "skipped", "queued"})

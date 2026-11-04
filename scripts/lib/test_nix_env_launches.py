@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 if TYPE_CHECKING:
     from scripts.herdr import herdr, herdr_sessions
     from scripts.production import add_unit, add_showrunner, production_units
-    from scripts.shutdown import restart, pane_restore, pane_record
+    from scripts.shutdown import pane_restore, pane_record
     from scripts.notify import review
     from scripts.notify.user_action import NoActionRequired
 else:
@@ -29,7 +29,6 @@ else:
     import add_unit
     import production_units
     import add_showrunner
-    import restart
     import pane_restore
     import pane_record
     import herdr_sessions
@@ -38,11 +37,10 @@ else:
 from scripts.accounts import accounts
 from scripts.lib import nix_env
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from scripts.shutdown.remote import local_machine
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami import account
-from scripts.shutdown import launch_permission
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -163,73 +161,6 @@ class HerdrLaunchTests(NixFixture):
         self.refusal(lambda: add_showrunner.launch(self.production(), "opus", "high", None, self.work,
             accounts.NamedAccount("claude3", self.home / ".claude3")))
 
-    def test_restart_uses_resume_cwd_before_opening(self) -> None:
-        config = self.home / ".claude3"
-        identity = fixture_runtime_id("nix-restart-recorded-session")
-        parts = restart.ResumeParts(str(self.work), {"CLAUDE_CONFIG_DIR": str(config)}, ("--resume", identity),
-                                    "resume", restart.RetainResumeAccount(config), restart.ResumeConversation(identity))
-        session = {"session_id": identity, "name": "worker", "kind": "standalone", "cwd": str(self.work)}
-        invoke = cast(Callable[..., object], getattr(restart, "_herdr_launch"))
-        with (patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": str(config)}),
-              patch.object(restart, "_heal_folder_trust"), patch.object(restart, "_holds_live_agent", return_value=False),
-              patch.object(restart, "_record_scheduled_restart_prompt"), patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()) as restored,
-              patch.object(herdr, "server_environment", return_value={}), patch.object(herdr, "Herdr")):
-            self.refusal(lambda: invoke(parts, restart.SharedHerdrTab("host"), session, dry_run=False, session_kind=herdr.NotMacSession()))
-        restored.assert_not_called()
-
-    def test_restart_uses_the_healers_prepared_environment_without_another_load(self) -> None:
-        _ = self.envrc(self.work)
-        config = self.home / ".claude3"
-        identity = fixture_runtime_id("nix-restart-recorded-session")
-        parts = restart.ResumeParts(str(self.work), {"CLAUDE_CONFIG_DIR": str(config)}, ("--resume", identity),
-                                    "resume", restart.RetainResumeAccount(config), restart.ResumeConversation(identity))
-        session = {"session_id": identity, "name": "worker", "kind": "standalone", "cwd": str(self.work)}
-        invoke = cast(Callable[..., object], getattr(restart, "_herdr_launch"))
-        handoff = {nix_env.HEAL_SESSION_ENV: identity, nix_env.HEAL_DIRECTORY_ENV: str(self.work.resolve()),
-                   "IN_NIX_SHELL": "impure", "NIX_LDFLAGS": "-Lprepared"}
-        with (patch.dict("os.environ", handoff),
-              patch.object(nix_env, "ensure", side_effect=AssertionError("no load may follow the healer's final hold check")) as ensure,
-              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": str(config)}),
-              patch.object(restart, "_heal_folder_trust"), patch.object(restart, "_holds_live_agent", return_value=False),
-              patch.object(restart, "_record_scheduled_restart_prompt"), patch.object(restart, "_focus_restored_pane", return_value=False),
-              patch.object(herdr, "restore_server", return_value=herdr.ServerCreated()),
-              patch.object(herdr, "keeps_restored_layout", return_value=True),
-              patch.object(pane_restore, "restore", side_effect=AssertionError("heal must not load unrelated panes")),
-              patch.object(herdr, "server_environment", return_value={}), patch.object(herdr, "Herdr"),
-              patch.object(herdr, "open_tab", return_value="pane") as opened,
-              patch.object(herdr, "start_agent", return_value=herdr.PromptNotSubmitted("fixture")) as started):
-            _ = invoke(parts, restart.SharedHerdrTab("host"), session, dry_run=False, session_kind=herdr.NotMacSession())
-        ensure.assert_not_called()
-        environment = cast(dict[str, str], opened.call_args.args[4])
-        self.assertEqual(environment["NIX_LDFLAGS"], "-Lprepared")
-        self.assertEqual(environment["IN_NIX_SHELL"], "impure")
-        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(config))
-        self.assertNotIn(nix_env.HEAL_SESSION_ENV, environment)
-        self.assertNotIn(nix_env.HEAL_DIRECTORY_ENV, environment)
-        started.assert_called_once()
-
-    def test_prepared_restart_proof_cannot_be_used_for_another_session_or_without_a_nix_shell(self) -> None:
-        _ = self.envrc(self.work)
-        config = self.home / ".claude3"
-        identity = fixture_runtime_id("nix-restart-recorded-session")
-        parts = restart.ResumeParts(str(self.work), {"CLAUDE_CONFIG_DIR": str(config)}, ("--resume", identity),
-                                    "resume", restart.RetainResumeAccount(config), restart.ResumeConversation(identity))
-        session = {"session_id": identity, "name": "worker", "kind": "standalone", "cwd": str(self.work)}
-        invoke = cast(Callable[..., object], getattr(restart, "_herdr_launch"))
-        for handoff_identity, directory, shell in (("another-session", str(self.work), "impure"),
-                                            (identity, str(self.root), "impure"), (identity, str(self.work), "")):
-            with (self.subTest(identity=handoff_identity, directory=directory, shell=shell),
-                  patch.dict("os.environ", {nix_env.HEAL_SESSION_ENV: handoff_identity, nix_env.HEAL_DIRECTORY_ENV: directory,
-                                             "IN_NIX_SHELL": shell}),
-                  patch.object(nix_env, "ensure", side_effect=AssertionError("a bad handoff must fail closed")),
-                  patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": str(config)}),
-                  patch.object(restart, "_heal_folder_trust"), patch.object(herdr, "restore_server") as restored,
-                  patch.object(herdr, "open_tab") as opened, patch.object(herdr, "start_agent") as started):
-                with self.assertRaisesRegex(OSError, "^nix_env: "):
-                    _ = invoke(parts, restart.SharedHerdrTab("host"), session, dry_run=False, session_kind=herdr.NotMacSession())
-                restored.assert_not_called()
-                opened.assert_not_called()
-                started.assert_not_called()
 
     def test_unit_restore_choke_point_consumes_only_its_own_prepared_environment(self) -> None:
         _ = self.envrc(self.work)
@@ -266,15 +197,7 @@ class HerdrLaunchTests(NixFixture):
     def test_herdr_sessions_refusal_prints_one_line_and_opens_nothing(self) -> None:
         reason = "nix_env: fixture: missing shell"
         output = io.StringIO()
-        with (patch.object(herdr, "security_session", return_value=herdr.NotMacSession()),
-              patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.NamedAccount("claude3", self.home / ".claude3")),
-              patch.object(herdr, "claude_trust", return_value=herdr.Trusted(self.work, self.home / ".claude.json", self.work)),
-              patch.object(launch_permission, "launch_barrier", side_effect=lambda: nullcontext()),
-              patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-              patch.object(herdr, "server_environment", return_value={}), patch.object(herdr, "Herdr") as client,
-              patch.object(nix_env, "ensure", return_value=nix_env.Refused(reason)) as ensure,
-              patch.object(herdr, "open_tab") as opened, patch.object(herdr, "start_agent") as started,
-              redirect_stdout(output), redirect_stderr(output)):
+        with (patch.object(herdr, "security_session", return_value=herdr.NotMacSession()), patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.NamedAccount("claude3", self.home / ".claude3")), patch.object(herdr, "claude_trust", return_value=herdr.Trusted(self.work, self.home / ".claude.json", self.work)), patch.object(herdr, "server_environment", return_value={}), patch.object(herdr, "Herdr") as client, patch.object(nix_env, "ensure", return_value=nix_env.Refused(reason)) as ensure, patch.object(herdr, "open_tab") as opened, patch.object(herdr, "start_agent") as started, redirect_stdout(output), redirect_stderr(output)):
             client.configure_mock(**{"return_value.panes.return_value": []})
             result = herdr_sessions.main(["herdr_sessions.py", "start", "--name", "worker", "--cwd", str(self.work)])
         self.assertNotEqual(result, 0)

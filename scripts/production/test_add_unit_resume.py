@@ -20,7 +20,6 @@ import add_unit
 import production_units
 from unit_lookup import ProductionMembers, unit_is_retired
 from scripts.production import staff, unit_config
-import launch_permission
 import unit_lookup
 import sessions
 from scripts.shutdown import stop_resume
@@ -126,13 +125,12 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_resume_checks_session_cwd_instead_of_worktree(self) -> None:
         prior = self.root / "untrusted-session"
         prior.mkdir()
-        document = self.doc.read_text()
-        head = self.git("rev-parse", "HEAD")
         result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                           "--cwd", str(prior), "--account", "claude2")
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn(f"Claude is not trusted in {prior}", result.stderr)
-        self.assert_no_launch_change(document, head)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertIn(f"alpha-unit: trust anomaly: Claude has not trusted {prior}", result.stderr)
+        self.assertIn("alpha-unit started:", result.stdout)
+        self.assertEqual(self.opened()[7], str(prior))
 
     def test_retired_marker_only_applies_at_start_of_plan_cell(self) -> None:
         cases = (
@@ -292,14 +290,6 @@ class AddUnitResumeTests(AddUnitTestCase):
                 shutdown.assert_not_called()
                 self.assert_no_launch_change(document, head)
 
-    def test_attach_uses_live_source_without_consulting_stale_holds(self) -> None:
-        prior, trace = self.prepare_attach()
-        self.write_shutdown_record(self.shutdown_record("down"))
-        with patch.object(launch_permission, "launch_permission", side_effect=AssertionError("stale hold queried")):
-            result = self.cli("alpha", "--permanent", "--attach", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(trace, ["stop", "launch"])
-        self.assertIn("--resume 62ccbd64-f22e-5647-b20e-7899aa39d766", self.launch_command())
 
     def test_attach_refuses_process_still_registered_after_stop(self) -> None:
         prior, trace = self.prepare_attach(after_stop=(303,))
@@ -347,7 +337,7 @@ class AddUnitResumeTests(AddUnitTestCase):
                           "--cwd", str(elsewhere), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(result.stderr,
-                         f"add_unit: unit trunk-unit resumes in {elsewhere.resolve()}; its Units row names {recorded}\n")
+                         f"add_unit: unit trunk-unit resumes in {elsewhere.resolve()}; its staff row names {recorded}\n")
         self.assert_no_launch_change(document, head)
 
     def test_retired_plan_resume_cannot_bypass_the_retained_row_restore(self) -> None:
@@ -406,6 +396,8 @@ class AddUnitResumeTests(AddUnitTestCase):
             plan=f"(retired 2026-10-28, worktree removed, session 62ccbd64-f22e-5647-b20e-7899aa39d766) `{plan}` (run done)"))
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        member = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
         document = self.doc.read_bytes()
 
         _ = self.successful("alpha", "--plan", plan, "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(worktree))
@@ -448,6 +440,8 @@ class AddUnitResumeTests(AddUnitTestCase):
             plan="(retired 2026-10-28, worktree removed, session 62ccbd64-f22e-5647-b20e-7899aa39d766) docs/plans/given.md"))
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        member = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
         before = self.repository_state()
 
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",

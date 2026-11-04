@@ -10,6 +10,7 @@ class VerifyLintScopeTests(support.VerifyLintCacheFixture):
     def test_passing_judgment_at_fix_pass_limit_is_cached(self) -> None:
         cache = self.dirty_cache()
         self.environment["TEST_FIX_APPEND"] = "// fix pass\n"
+        self.environment["TEST_CLIPPY_STATUSES"] = "[101, 0]"
         _ = self.verify("lint", "sample")
         self.assert_fix_and_judgment_calls(fix_passes=3)
         self.assertEqual(len(list(cache.glob("*.pass"))), 1)

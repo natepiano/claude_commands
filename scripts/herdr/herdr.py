@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pane_launch
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.script_envelope import script_prompt
 from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
@@ -1016,6 +1017,8 @@ LAYOUT_PLACEHOLDER = "restoring"
 class SavedName(TypedDict):
     name: str
     seen: float
+    row_id: NotRequired[str]
+    terminal_id: NotRequired[str]
 
 
 class SavedSpace(TypedDict):
@@ -1073,7 +1076,12 @@ def _seen(value: object) -> float:
 
 def _saved_name(value: object) -> SavedName:
     item = json_object(value, "herdr layout tab")
-    return SavedName(name=json_text(item.get("name"), "herdr layout tab name"), seen=_seen(item.get("seen")))
+    result = SavedName(name=json_text(item.get("name"), "herdr layout tab name"), seen=_seen(item.get("seen")))
+    if isinstance(item.get("row_id"), str):
+        result["row_id"] = json_text(item["row_id"], "herdr layout staff row")
+    if isinstance(item.get("terminal_id"), str):
+        result["terminal_id"] = json_text(item["terminal_id"], "herdr layout terminal")
+    return result
 
 
 def merged_order(saved: list[SavedName], live: list[str], now: float) -> list[SavedName]:
@@ -1081,14 +1089,19 @@ def merged_order(saved: list[SavedName], live: list[str], now: float) -> list[Sa
 
     A saved name unseen for longer than LAYOUT_KEEP_SECONDS is dropped.
     """
-    result = [SavedName(name=name, seen=now) for name in live]
+    known = {entry["name"]: entry for entry in saved}
+    result: list[SavedName] = []
+    for name in live:
+        entry = known[name].copy() if name in known else SavedName(name=name, seen=now)
+        entry["seen"] = now
+        result.append(entry)
     placed = set(live)
     for index, entry in enumerate(saved):
         if entry["name"] in placed or now - entry["seen"] > LAYOUT_KEEP_SECONDS:
             continue
         before = next((earlier["name"] for earlier in reversed(saved[:index]) if earlier["name"] in placed), None)
         at = 0 if before is None else next(place for place, item in enumerate(result) if item["name"] == before) + 1
-        result.insert(at, SavedName(name=entry["name"], seen=entry["seen"]))
+        result.insert(at, entry.copy())
         placed.add(entry["name"])
     return result
 
@@ -1419,7 +1432,74 @@ class Herdr:
         live = [space for space in live if space.tabs]
         if not live:
             return
-        _write_layout(self.session, merged_layout(saved_layout(self.session), live, time.time()))
+        saved = saved_layout(self.session)
+        merged = merged_layout(saved, live, time.time())
+        _write_layout(self.session, merged)
+
+    def remember_row_tab(self, row_id: str, pane: str) -> None:
+        """Keep a staff row's position in herdr's layout."""
+        with _LayoutLock(self.session):
+            self.record_layout()
+            panes = [json_object(item, "herdr pane") for item in json_items(
+                self.result("pane", "list").get("panes"), "herdr panes")]
+            selected = next((item for item in panes if item.get("pane_id") == pane), None)
+            if selected is None:
+                raise HerdrFailure(f"{row_id}: no tab for pane {pane}")
+            tabs = [json_object(item, "herdr tab") for item in json_items(
+                self.result("tab", "list").get("tabs"), "herdr tabs")]
+            target = next((item for item in tabs if item.get("tab_id") == selected.get("tab_id")), None)
+            if target is None:
+                raise HerdrFailure(f"{row_id}: tab is unavailable")
+            title = target.get("label")
+            spaces = [json_object(item, "herdr workspace") for item in json_items(
+                self.result("workspace", "list").get("workspaces"), "herdr workspaces")]
+            workspace = next((item.get("label") for item in spaces
+                              if item.get("workspace_id") == selected.get("workspace_id")), None)
+            saved = saved_layout(self.session)
+            for space in saved["workspaces"]:
+                for tab in space["tabs"]:
+                    if tab.get("row_id") == row_id:
+                        _ = tab.pop("row_id", None)
+                    if space["name"] == workspace and tab["name"] == title:
+                        tab["row_id"] = row_id
+                        tab["terminal_id"] = json_text(selected.get("terminal_id", ""), "terminal id")
+            _write_layout(self.session, saved)
+
+    def saved_row_tab(self, row_id: str, title: str) -> NewTab | SplitPane | ExistingPane:
+        """Find the saved tab position by staff row ID."""
+        saved = saved_layout(self.session)
+        for space in saved["workspaces"]:
+            for tab in space["tabs"]:
+                if tab.get("row_id") != row_id:
+                    continue
+                spaces = [json_object(item, "herdr workspace") for item in json_items(
+                    self.result("workspace", "list").get("workspaces"), "herdr workspaces")]
+                workspace = next((item.get("workspace_id") for item in spaces if item.get("label") == space["name"]), None)
+                tabs = [json_object(item, "herdr tab") for item in json_items(
+                    self.result("tab", "list").get("tabs"), "herdr tabs")]
+                found = next((item for item in tabs if item.get("label") == tab["name"] and
+                              item.get("workspace_id") == workspace), None)
+                if found is not None:
+                    panes = [json_object(item, "herdr pane") for item in json_items(
+                        self.result("pane", "list").get("panes"), "herdr panes")]
+                    members = [item for item in panes if item.get("tab_id") == found.get("tab_id")]
+                    for pane in members:
+                        identity = json_text(pane.get("pane_id"), "pane id")
+                        terminal = json_text(pane.get("terminal_id", ""), "terminal id")
+                        if terminal and terminal == tab.get("terminal_id") and isinstance(self.pane_activity(identity), PaneAtShell):
+                            return ExistingPane(identity, terminal)
+                    if members:
+                        return SplitPane(json_text(members[0].get("pane_id"), "pane id"), "right", 0.5, title)
+                if tab["name"] != title:
+                    with _LayoutLock(self.session):
+                        current = saved_layout(self.session)
+                        for workspace in current["workspaces"]:
+                            for entry in workspace["tabs"]:
+                                if entry.get("row_id") == row_id:
+                                    entry["name"] = title
+                        _write_layout(self.session, current)
+                return NewTab(space["name"], title)
+        return NewTab(shared_session(), title)
 
     def retitle(self, pane: str, title: str) -> bool:
         """Give the tab and pane the session's current name.
@@ -1656,8 +1736,7 @@ class Herdr:
         matches: list[pane_launch.PaneLaunch] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
             process = json_object(value, "Codex launch process")
-            argv = [json_text(value, "Codex launch argument")
-                    for value in json_items(process.get("argv"), "Codex launch argv")]
+            argv = _foreground_arguments(process)
             if not is_codex_process(argv):
                 continue
             pid = process.get("pid")
@@ -1822,9 +1901,10 @@ class Herdr:
         agent_pids: list[int] = []
         for value in json_items(info.get("foreground_processes"), "startup foreground processes"):
             process = json_object(value, "startup foreground process")
+            arguments = _foreground_arguments(process)
+            if not arguments:
+                continue
             commands.append(json_text(process.get("name"), "startup process name"))
-            arguments = [json_text(arg, "startup process argument")
-                         for arg in json_items(process.get("argv"), "startup process argv")]
             if _is_agent_process(arguments, kind):
                 agent_present = True
                 pid = process.get("pid")
@@ -1858,8 +1938,7 @@ class Herdr:
         processes: list[NativeAgentProcess] = []
         for value in json_items(info.get("foreground_processes"), "native foreground processes"):
             process = json_object(value, "native foreground process")
-            arguments = [json_text(arg, "native process argument")
-                         for arg in json_items(process.get("argv"), "native process argv")]
+            arguments = _foreground_arguments(process)
             if not _is_agent_process(arguments, kind):
                 continue
             pid = process.get("pid")
@@ -1948,6 +2027,7 @@ class Herdr:
                               timeout_ms: int) -> PromptSubmitOutcome:
         if timeout_ms <= 0 or not opening.text.strip():
             return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
+        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt)
         deadline = time.monotonic() + timeout_ms / 1000
         cursor = (TranscriptCursor(opening.transcript, launched_at)
                   if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
@@ -2046,7 +2126,7 @@ class Herdr:
                         if rejections > 1:
                             if fallback is None:
                                 return failure(f"Claude answered Unknown command: {_slash_command(current)}")
-                            current = fallback
+                            current = script_prompt(fallback)
                         elif (remaining := deadline - time.monotonic()) > 0:
                             time.sleep(min(PROMPT_SETTLE_SECONDS, remaining))
                         if time.monotonic() >= deadline:
@@ -2118,13 +2198,12 @@ class Herdr:
             return failure(str(error))
 
     def prompt(self, pane: str, text: str) -> None:
-        """Type a prompt, recorded first so that the prompt hook does not count it as the user's."""
+        """Mark generated prose; retain slash-command evidence after uncertain delivery."""
         import script_prompts
 
-        try:
+        text = script_prompt(text)
+        if text.lstrip().startswith("/"):
             script_prompts.record(pane, text)
-        except OSError as error:
-            print(f"herdr: script prompt not recorded: {error}", file=sys.stderr)
         _ = self.run("agent", "prompt", pane, text)
 
     def wait_until(self, pane: str, state: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
@@ -2300,7 +2379,6 @@ def _repository_key(directory: Path, flag: str) -> Path:
         raise HerdrFailure(f"{directory}: git returned no absolute {flag} path for project trust")
     path = Path(found)
     return path.parent if flag == "--git-common-dir" else path
-
 
 
 def live_sessions() -> list[SessionEntry]:
@@ -2689,7 +2767,9 @@ def rename_saved_tab(session: str, workspace: str, old_titles: Set[str], title: 
             for tab in space["tabs"]:
                 if tab["name"] in old_titles:
                     if not renamed:
-                        tabs.append(SavedName(name=title, seen=seen))
+                        entry = tab.copy()
+                        entry.update(name=title, seen=seen)
+                        tabs.append(entry)
                         renamed = True
                 elif tab["name"] != title:
                     tabs.append(tab)
@@ -2878,14 +2958,11 @@ def _open_codex_rollouts(pid: int) -> dict[Path, str]:
     return files
 
 
-def codex_rollout_thread(pid: int) -> str:
-    """Prove the current thread from one stable open rollout."""
+def codex_rollout_threads(pid: int) -> set[str]:
+    """Read every thread from stable open rollouts of one process."""
     started = _process_birth(pid)
     files = _open_codex_rollouts(pid)
     identities: set[str] = set()
-    targets = set(files.values())
-    if len(targets) > 1:
-        raise ValueError(f"pid {pid}: current Codex rollout is ambiguous")
     for path in files:
         before = path.stat()
         with path.open(encoding="utf-8") as stream:
@@ -2911,6 +2988,12 @@ def codex_rollout_thread(pid: int) -> str:
         raise ValueError(f"pid {pid}: current Codex rollout or process changed")
     if not files:
         raise NoOpenCodexRollout(f"pid {pid}: current Codex rollout is unavailable")
+    return identities
+
+
+def codex_rollout_thread(pid: int) -> str:
+    """Prove one current thread for a targeted process action."""
+    identities = codex_rollout_threads(pid)
     if len(identities) != 1:
         raise ValueError(f"pid {pid}: current Codex rollout is unavailable or ambiguous")
     return next(iter(identities))
@@ -2987,7 +3070,10 @@ def running_codex_threads(*, thread_host: Callable[[list[str]], bool]) -> set[st
     for pid, arguments in candidates:
         if is_codex_process(arguments) and not thread_host(arguments):
             try:
-                identities.add(native_process(pid, "codex").identity)
+                try:
+                    identities.update(codex_rollout_threads(pid))
+                except NoOpenCodexRollout:
+                    identities.add(native_process(pid, "codex").identity)
             except ProcessLookupError:
                 continue
             except (HerdrFailure, OSError, ValueError):
@@ -3004,6 +3090,14 @@ def process_environment(pid: int) -> dict[str, str]:
 
 def _process_arguments(process: Path) -> list[str]:
     return [value for value in process.joinpath("cmdline").read_bytes().decode(errors="replace").split("\0") if value]
+
+
+def _foreground_arguments(process: dict[str, object]) -> list[str]:
+    """Treat a process without an argv list as an exited process."""
+    arguments = process.get("argv")
+    if not isinstance(arguments, list):
+        return []
+    return [json_text(value, "foreground process argument") for value in cast(list[object], arguments)]
 
 
 def _is_agent_process(arguments: list[str], kind: str) -> bool:
@@ -4187,7 +4281,7 @@ def agent_base_environment(environment: dict[str, str], unset_environment: froze
     for key in tuple(base_env):
         # scripts/lib/unit_env.sh and unit_runs.environ map every PLAN_DELEGATE_ alias to UNIT_.
         if (key.startswith(("HERDR_", "CODEX_", "UNIT_", "PLAN_DELEGATE_", "SHOWRUNNER_", "CLAUDE_", "STAFF_", "NIX_HEAL_"))
-                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE", "SHUTDOWN_PARENT_LAUNCH_CLAIM"}):
+                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE"}):
             del base_env[key]
     base_env.update(environment)
     for identity in ("STAFF_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
@@ -4267,8 +4361,6 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             script = (f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_')))} && export {exports}")
             client.run_in_pane(pane, ["eval", script])
-        from scripts.shutdown.launch_permission import claim_launch_pane
-        claim_launch_pane(name, pane)
         start_requested = True
         outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
     except (HerdrFailure, OSError, subprocess.SubprocessError):
