@@ -208,6 +208,7 @@ def private_scope_start() -> None:
 
 class QueuePlaceFixture(ExitStack):
     """Private config, ledger and memory files shared by all helper scenarios."""
+
     def __init__(self, *, private_slice: str = "") -> None:
         super().__init__()
         self.private_slice: str = private_slice or f"queueplacetest{os.getpid()}{time.monotonic_ns()}.slice"
@@ -359,6 +360,16 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_program_admission_carries_the_unit_override(self) -> None:
+        with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {gate.BUILDLOG_UNIT: "queue-unit"}):
+            with queue.queue_place("rust-analyzer", fixture.root):
+                _, row = fixture.reservation()
+                self.assertIn("queue_waiter", row)
+                assert "queue_waiter" in row
+                waiter = row["queue_waiter"]
+                self.assertEqual(waiter.get("unit"), "queue-unit")
+                self.assertEqual(waiter.get("session_id"), gate.waiter_identity("", "")["session_id"])
+
     def analyzer(self, fixture: QueuePlaceFixture, source: str) -> Path:
         executable = fixture.root / "rust-analyzer"
         _ = executable.write_text(f"#!{sys.executable}\n" + source)
