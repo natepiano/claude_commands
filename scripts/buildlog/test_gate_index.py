@@ -23,12 +23,12 @@ if TYPE_CHECKING:
     from . import record, store
     from ..test_times import gate_record
     from ..test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
-    from ..test_times.test_gate_record import gate_run
+    from ..test_times.gate_record_test_support import gate_run
 else:
     from scripts.buildlog import record, store
     from scripts.test_times import gate_record
     from scripts.test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
-    from scripts.test_times.test_gate_record import gate_run
+    from scripts.test_times.gate_record_test_support import gate_run
 
 EPOCH = 1_793_700_000.0
 STARTED = "2026-11-03T12:00:00.000Z"

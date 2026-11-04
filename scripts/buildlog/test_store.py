@@ -26,6 +26,49 @@ class StoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
 
+    def test_locked_rows_read_whole_objects_from_the_offset_and_ignore_an_absent_file(self) -> None:
+        path = self.root / "history.jsonl"
+        self.assertEqual(list(store.locked_rows(path)), [])
+        path.parent.mkdir(parents=True)
+        first = b'{"id":"first"}\n'
+        damaged = b'broken\nnull\n[]\n{"id":"\xff"}\n'
+        _ = path.write_bytes(first + damaged + b'{"id":"last"}\n{"id":"unfinished"}')
+        for start, expected in ((0, [{"id": "first"}, {"id": "last"}]),
+                                (len(first), [{"id": "last"}]),
+                                (2, [{"id": "last"}]),
+                                (path.stat().st_size, [])):
+            with self.subTest(start=start):
+                self.assertEqual(list(store.locked_rows(path, start)), expected)
+
+    def test_locked_rows_wait_for_an_appender_and_keep_the_lock_until_closed(self) -> None:
+        path = self.root / "history.jsonl"
+        path.parent.mkdir(parents=True)
+        flock = fcntl.flock
+        with path.open("wb", buffering=0) as appender:
+            flock(appender.fileno(), fcntl.LOCK_EX)
+            _ = appender.write(b'{"id":"before"}\n')
+
+            def acquire_after_append(fd: int, operation: int) -> None:
+                self.assertEqual(operation, fcntl.LOCK_SH)
+                with self.assertRaises(BlockingIOError):
+                    flock(fd, operation | fcntl.LOCK_NB)
+                _ = appender.write(b'{"id":"after"}\n')
+                flock(appender.fileno(), fcntl.LOCK_UN)
+                flock(fd, operation)
+
+            iterator = store.locked_rows(path)
+            try:
+                with mock.patch.object(fcntl, "flock", side_effect=acquire_after_append):
+                    self.assertEqual(next(iterator), {"id": "before"})
+                with path.open("rb") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(list(iterator), [{"id": "after"}])
+            finally:
+                _ = list(iterator)
+            with path.open("rb") as contender:
+                flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_sample_record_lands_in_separate_host_month_file(self) -> None:
         epoch = datetime(2026, 10, 2, 12, tzinfo=UTC).timestamp()
         with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}):
