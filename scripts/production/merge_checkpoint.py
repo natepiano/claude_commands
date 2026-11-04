@@ -649,7 +649,7 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
         permitted = (*request.unit.owns, *request.also, *hubs)
         unexpected = [path for path in paths if not allowed(path, permitted)]
         if unexpected:
-            raise Stop("scope", "held", f"outside Owns: {', '.join(unexpected)}",
+            raise Stop("scope", "held", f"outside responsibilities: {', '.join(unexpected)}",
                        f"explain why these paths changed: {', '.join(unexpected)}")
     report("scope", "ok", f"{len(paths)} changed paths are allowed"
            + (f"; {imported} came from origin merge branches" if imported else ""))
