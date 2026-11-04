@@ -375,6 +375,16 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertEqual(agent_accounts.workers_home(), target.home)
         self.assertIn("direct=codex", registry_view())
 
+    def test_unreadable_next_list_reports_an_anomaly_without_losing_its_entry(self) -> None:
+        entry = next_moves.add_next_move("workers", 1, "codex2")
+        output = io.StringIO()
+        with (patch.object(next_moves, "read_next_moves", side_effect=OSError("fixture unreadable")),
+              redirect_stdout(output)):
+            self.assertFalse(quota_alert.workers_entry_pending())
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        self.assertEqual(output.getvalue().splitlines(),
+            ["account moves: anomaly: cannot read workers entries: fixture unreadable"])
+
     def test_unreadable_workers_journal_preserves_queue_and_roles_and_blocks_fallback_reminders(self) -> None:
         source, target = self.account(1), self.account(2)
         entry = next_moves.add_next_move("workers", 1, "codex2")

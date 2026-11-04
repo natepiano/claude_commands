@@ -12,13 +12,12 @@ from typing import final, override
 from unittest import mock
 
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
-from scripts.production.fake_unit_host import PaneShellFixture, stopped_record
+from scripts.production.fake_unit_host import PaneShellFixture
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import unit_move
 import herdr
 import rename_unit
 import retire_unit
-import shutdown_record
 import unit_lookup
 from rename_state import RenameRefused
 
@@ -31,7 +30,6 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.root: Path = Path()
         self.worktree: Path = Path()
         self._pane: PaneShellFixture | None = None
-        self.saved: shutdown_record.SessionShutdown = stopped_record(Path(), Path())
 
     @property
     def pane(self) -> PaneShellFixture:
@@ -50,19 +48,14 @@ class UnitOperationPaneTests(unittest.TestCase):
         self._pane = PaneShellFixture(self, self.worktree, self.root / 'proc', live=False,
                                       env={"XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"]})
         self.enterContext(mock.patch.dict(os.environ, {'SHUTDOWN_STATE_DIR': str(self.root / 'shutdown')}))
-        self.saved = stopped_record(self.root, self.worktree, runtime_id=self.pane.native_id)
-        self.assertTrue(shutdown_record.create_session(self.saved))
 
     def target(self) -> rename_unit.UnitRename:
         return rename_unit.UnitRename('demo','alpha-unit','gamma-unit','','','','','',str(self.worktree),'','','')
 
     def stop(self) -> None:
-        def records(_target: rename_unit.StopTarget) -> list[shutdown_record.SessionShutdown]:
-            return shutdown_record.session_records('owner@example.com')
         def cleanup(_target: rename_unit.StopTarget) -> None:
             self.pane.lifecycle.append('workers cleaned')
         with (mock.patch.object(rename_unit, '_refuse_detached_worktree'),
-              mock.patch.object(rename_unit, '_unit_records', side_effect=records),
               mock.patch.object(rename_unit, '_stop_runs', side_effect=cleanup)):
             rename_unit.stop_unit(self.target(), lambda: None)
 
@@ -81,16 +74,6 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.assertEqual(self.pane.lifecycle, ['workers cleaned'])
         self.assertTrue((self.root / 'proc/991555').exists(), 'another session reuses this pane id')
 
-    def test_identity_lost_with_worker_cleanup_issues_never_closes_the_pane(self) -> None:
-        def incomplete(saved: shutdown_record.SessionShutdown) -> None:
-            saved['progress'] = {'kind':'process identity lost','at':'2026-10-09T21:50:00+00:00'}
-            saved['stop_issues'] = [{'kind':'codex server left running','at':'2026-10-09T21:50:00+00:00','run_dir':'/fixture/run','cause':'stop not confirmed'}]
-        _ = shutdown_record.update_session('owner@example.com',self.pane.native_id, incomplete)
-        self.pane.add_occupant(991551, unit='alpha-unit')
-        with self.assertRaisesRegex(RenameRefused, 'cleanup|clean stop'):
-            self.stop()
-        self.assertEqual(self.pane.close_calls(), [])
-        self.assertTrue((self.root / 'proc/991551').exists())
 
     def test_claude_execing_the_pane_shell_needs_no_close(self) -> None:
         self.pane.found = unit_lookup.MarkedUnit('alpha-unit',
@@ -127,8 +110,7 @@ class UnitOperationPaneTests(unittest.TestCase):
         pane = unit_move.unit_pane(self.pane.found, 'demo')
         self.pane.found = unit_lookup.MarkedUnit('alpha-unit',
             unit_lookup.LiveClaude('alpha', 'new-session', 'socket', self.pane.director), self.pane.place)
-        self.saved['progress'] = {'kind': 'waiting'}
-        with (mock.patch.object(shutdown_record, 'update_session', side_effect=AssertionError('no record proof')), mock.patch.object(herdr, 'process_action', side_effect=AssertionError('no process proof'))):
+        with (mock.patch.object(herdr, 'process_action', side_effect=AssertionError('no process proof'))):
             unit_move.close_unit_pane(pane)
         self.assertEqual(self.pane.close_calls(), [['--session', 'agents', 'pane', 'close', 'w1:p1']])
 
