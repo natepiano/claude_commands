@@ -20,6 +20,7 @@ import sessions
 from scripts.production import staff, unit_move
 from scripts.lib import nix_env
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
+from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
 
@@ -156,7 +157,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
     if kind == "claude":
         arguments.extend(["--name", row.name])
     result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
-        arguments, herdr.NoOpeningPrompt(),
+        trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),
         int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000), agent=row.name)
     try:
         client.remember_row_tab(str(row.id), result.pane)

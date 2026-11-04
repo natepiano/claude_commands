@@ -30,6 +30,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 import herdr
 import pane_record
 from scripts.shutdown.launch_names import LaunchNames
+from scripts.shutdown.codex_trust import trust_arguments
 import pane_launch
 from scripts.lib.resume_message import (
     ResumeWorkers as ResumeWorkers,
@@ -228,7 +229,7 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     return ["env", "-u", "HERDR_TAB_ID", "-u", "STAFF_ID", *(f"{key}={value}" for key, value in environment.items()),
             "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
             sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-            *pane_record.resume_arguments(entry)]
+            *trust_arguments(pane_launch.agent_kind(entry), entry["cwd"], pane_record.resume_arguments(entry))]
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,

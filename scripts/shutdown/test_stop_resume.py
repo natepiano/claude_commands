@@ -309,6 +309,14 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
         self.assertEqual(self.entry["name"], "alpha")
 
+    def test_pane_command_trusts_the_codex_folder(self) -> None:
+        folder = str(self.root / 'a.b "folder"')
+        entry = pane_record.launch("w1:p2", "thread", folder, {"CODEX_HOME": "/account"}, ["codex"], kind="codex")
+        command = stop_resume._pane_command(  # pyright: ignore[reportPrivateUsage]
+            herdr.TabSession("w1:p2", "test", "w1", "thread"), entry, "workers")
+        self.assertEqual(command[-4:], ["-c", 'projects={' + json.dumps(folder)
+            + '={trust_level="trusted"}}', "resume", "thread"])
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
