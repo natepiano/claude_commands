@@ -14,7 +14,7 @@ from typing import TypedDict, cast
 import unittest
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.shell_test_support import shell_function
+from scripts.lib.shell_test_support import shell_function, shell_functions
 
 
 DIRECT = Path(__file__).resolve().parent
@@ -118,7 +118,6 @@ class VerifyMetadataTests(unittest.TestCase):
 
 class VerifyShellHelperTests(unittest.TestCase):
     def test_waiter_hash_preserves_scope_without_python(self) -> None:
-        source = (DIRECT / "verify.sh").read_text()
         for tool in ("sha256sum", "shasum"):
             executable = shutil.which(tool)
             if executable is None:
@@ -128,7 +127,7 @@ class VerifyShellHelperTests(unittest.TestCase):
                 (folder / tool).symlink_to(executable)
                 script = "\n".join((
                     "set -euo pipefail", 'PATH="$1"', 'PY=false',
-                    shell_function(source, "token_waiters_key"),
+                    shell_functions(DIRECT / "verify.sh", "hash_stream", "token_waiters_key"),
                     "CMD=lint; ARGS=(alpha --check); token_waiters_key",
                     "CMD=lint; ARGS=(beta --check); token_waiters_key",
                     "CMD=test; ARGS=(alpha --filter 'case_one'); token_waiters_key",

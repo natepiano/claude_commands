@@ -14,17 +14,13 @@ from unittest import mock
 
 from scripts.direct import verify_lint_scope_test_support as lint_support
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
-from scripts.lib.shell_test_support import shell_function
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, BOARD, VERIFY
 from scripts.direct.wait_for_test_state import wait_until
 
 SCRIPTS = VERIFY.parent.parent
-
-
-def shell_functions(path: Path, *names: str) -> str:
-    return "\n".join(shell_function(path.read_text(), name) for name in names) + "\n"
 
 
 def token_renewal_functions() -> str:

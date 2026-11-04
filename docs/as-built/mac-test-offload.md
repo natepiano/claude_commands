@@ -80,6 +80,15 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 
 ### The offload runner — `scripts/mac_test/offload.py`
 
+Nextest accepts repeated `--env NAME` arguments and one `--fetch FOLDER` argument. Other verbs and `--copy` refuse these arguments.
+The runner forwards only named variables. Quoted assignments precede the fixed runner assignments, so the fixed assignments take priority.
+A fetch folder must have a plain relative path. The runner removes that folder in the mirror before the test starts.
+After a reported test result, the runner measures the folder and copies it before releasing the claim.
+This also applies after test failure or when no tests match. A lost or declined run copies nothing.
+The runner uses `rsync -rlp --safe-links` and publishes the completed copy through an atomic rename.
+Files return to `~/.local/state/mac-test/fetched/<call id>/<folder>`. Existing destinations are refused. A failure or signal removes the partial copy.
+A fetch result adds `fetch=fetched|missing|too_large|failed|not_run` to the result file.
+
 - `offload.py run --repo-root DIR [--package PKG] [--verb nextest|check|clippy|mend-check|doc] --call-id ID [--settings FILE] [--last-decline busy|blocked] [--filter-run] [--result FILE] -- <verb arguments>` exits 0 on a Mac pass, 75 for local fallback, and the step's own status on a Mac failure. The default verb is `nextest`. Claims use `--what "<verb> <package or workspace>"`. `lint check` runs Cargo check; `lint mend-check` runs mend with `--fail-on-warn`; remote doc sets `LINT_CONFIG_FORCE=1`. Workspace verbs use the same manifest-based Linux-only check as `eligible --kind`. `--settings` selects that target's config. `--last-decline` suppresses an unchanged retry notice. `write_result` writes `mac=`, `reason=`, `seconds=` from `PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline`. A busy result alone adds `holder=`: the claim's `what`, `leftovers`, or `unreadable`; `KnownMacJob | LostRunLeftovers | UnreadableMacHolder` gives that value its meaning. Missing or contradictory results are unusable. Declined, lost and invalid results return the record to `waiting_mac` before the next wait.
 - Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests (user, 2026-10-18). An app open on the Mac does not exclude a test.
 - The probe reads the hostname and free GiB against `free_floor_gib`, with no power or process check. Coordination records decide whether the Mac is held or busy.
@@ -92,6 +101,27 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 - Every ssh call takes `ssh_options(config)`: `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
+
+`test <package> --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
+A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
+Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
+A Mac-only call never runs on natedev, takes a local build token, enters memory admission, or starts a copy watcher.
+TERM, INT and HUP end the wait and record the caller's signal.
+
+`--env NAME` and `--fetch <folder>` require `--mac`. These flags can appear anywhere after the verb.
+Verify removes them before constructing Cargo arguments, cache keys and call records.
+Variable names must be valid and exported by the caller. Empty values are allowed.
+Verify saves the caller's values before assigning its own variables. A pipe transfers the values to Python without placing them on argv.
+The runner refuses `PATH`, `HOME`, `MACOSX_DEPLOYMENT_TARGET`, `RUSTFLAGS` and `RUSTDOCFLAGS` at the verify interface.
+It also refuses prefixes `BUILDLOG_`, `LINT_`, `CARGO_`, `RUSTC`, `NEXTEST_`, `DYLD_`, `MAC_TEST_` and `VERIFY_` there.
+The fetch folder must be git-ignored and relative to the mirror root. Empty, `.` and `..` path parts are refused.
+One trailing slash is removed. Tests must write to that root-relative folder, even when nextest runs them inside a package folder.
+A Mac-only call reuses only a Mac pass. Forwarding or fetch disables cache reads and writes.
+If tests pass but fetch fails, the call exits 2 and retains the Mac pass evidence.
+A test failure retains the runner's status. No forwarded name, value or folder is added to the build log.
+
+A new admission wait clears an inherited queue identity. A rejoining step restores its own identity after sourcing the gate.
+An interrupted run stops and reaps both log readers after recording its result. This also handles a blocked output pipe.
 
 - `--local "<why>"` sets `LOCAL_ONLY` and records `declined` / `local_flag`, with the reason exported as `BUILDLOG_LOCAL_REASON`. It takes the next argument as a required reason and exits 2 before any work when that is missing, blank or starts with `--`. It also exits 2 before any work when the reason names a reservation: any of the whole words reserve, reserved, reservation, hold, holds, held, blocked, claim, claims, busy, showrunner or ruling, in any case. The message points to `/build:hold hold <why> target mac`, the one way to keep tests off the Mac. A reservation in a `--local` reason is recorded nowhere and never ends: on 2026-10-18 a unit's 'Mac reserved for demo', a day old, kept its tests waiting on a held natedev while the Mac was free (user, 2026-10-18). The reason never enters `tree_key` or the cargo words. Use it only for a test that must run on Linux. Otherwise, when the runner exists, `try_mac_test()` runs between the first cache lookup and the cargo token: `"$PY" "$MAC_RUNNER" run --repo-root <top level> --package <pkg> --call-id "$BUILDLOG_CALL_ID" --result <temp file> [--filter-run] -- "${NEXTEST_ARGS[@]}"` (`compose_nextest_args()` builds the words; `VERIFY_MAC_RUNNER` substitutes the runner in tests).
 - `declined` and `lost` allow a local run. No usable result is recorded as `declined` / `runner`. While natedev waits for memory or a hold, each temporary result keeps the Mac leave hook. Routing and local waits share `remember_mac_retry` and `mac_retry_hook`: `busy` and `blocked` use the normal poll; other temporary results, including `lost` and `runner`, set a monotonic deadline 180 s after the attempt ends. Each repeated result sets a new deadline. One stderr line explains the delay per call. A local step that can start proceeds at once. Permanent exclusions (`no_tests`, `off`, `repo`, `linux_only`, `local_flag`) stop Mac retries. A target excluded by configuration is never tried. A `passed` ends the call (`verify.sh: PASS on the Mac (macOS), so nothing ran on natedev.`), exit 0, recorded as `passed_full`, or `passed_filter` on a `--filter` run. Its output is captured and kept as the call's pass record, marked `host=mac` and judged on the tree read just before the Mac run; an edit made meanwhile leaves nothing recorded. A `--local` call does not reuse a `host=mac` record; its natedev pass replaces it. `failed` records the call and exits with the runner's status.
@@ -134,6 +164,10 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 `offload.py` reads `treekey.tree_key` immediately before and after a successful copy. It sends `BUILDLOG_SENT_TREE_KEY` only when both keys are known and equal. `record.step` uses it for a `verify-mac` step whose own keys are unavailable, preserves an own verified key, and never fills a changed tree. A file read raising `OSError` gives no key and leaves the run able to proceed. `Mac failures with a natedev pass of the same tree` counts failed Mac calls with a keyed nextest step and a passing natedev nextest step of the same package, command and key; filtered commands match only the same filter. Steps from before the install still count as `without a tree key`. All windows share one step read, with a 24-hour lookback.
 
 ## Config — `config/mac_test.conf`
+
+`fetch_limit_mib` limits one returned folder (default 512 MiB).
+`fetch_retention_days` sets the retention period for completed and partial fetch folders (default 14 days).
+Both values use the existing configuration reader.
 
 `offload=on`; `host=mac`; `free_floor_gib=100`; `mac_budget_gib=24` and `mac_budget_gib.hana=56` (size limits of each mirror's build folder, not memory); `linux_only.hana=hana_video,hana_clerestory`; `mac_skip.hana=test(world_panel_words_match_drawn_pixels)`; `ci_repo=natepiano/hana`, `ci_variable=MACOS_CI`, `ci_workflow=ci.yml`, `ci_job=macOS: Compile and Test`; `gh_timeout_s`, `block_hours`, `block_max_hours`, `block_warn_minutes`; `claim_idle_minutes=15`, `claim_poll_seconds=60`. `leftover_timeout_s` is not set, so the leftover check uses 10 s. `free_floor_gib` serves both the probe's disk decline and the cleanup's keep-or-remove test. A repository needs a `linux_only.<repo>` key, even empty, before it runs on the Mac. `MAC_TEST_CONFIG` selects another file.
 

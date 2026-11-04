@@ -27,10 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 if TYPE_CHECKING:
     from ..lib.socket_test_support import short_socket_directory
-    from ..lib.shell_test_support import shell_function
+    from ..lib.shell_test_support import shell_function, shell_functions
 else:
     from scripts.lib.socket_test_support import short_socket_directory
-    from scripts.lib.shell_test_support import shell_function
+    from scripts.lib.shell_test_support import shell_function, shell_functions
 
 import record as recorder
 import step_context
@@ -417,7 +417,7 @@ class RecordTests(unittest.TestCase):
 
         shell = "\n".join(shell_function(invoke.read_text(), name) for name in
                           ("buildlog_read_context", "buildlog_now", "buildlog_begin", "buildlog_write_step", "buildlog_end"))
-        shell += "\n" + shell_function(verify.read_text(), "refresh_test_build_inputs") + "\n"
+        shell += "\n" + shell_functions(verify, "set_verdict_keys", "refresh_test_build_inputs")
         shell += 'tree_key() { printf key; }\n'
         home = self.base / "shell-home"
         launcher = home / ".claude/scripts/lib/py"
