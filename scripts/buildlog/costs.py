@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
+from pathlib import Path
 
 import index
 import mac_outcome
 import moments
+import store
 
 
 type Cause = Literal["Memory wait", "Cold rebuilds", "Reruns after a pass", "Failed runs", "Cancelled CI", "Mac idle while natedev waits"]
+
+
+@dataclass(frozen=True)
+class CostUnavailable:
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -23,6 +31,7 @@ class RankedCost:
     cause: Cause
     seconds: float
     unknown_seconds: float = 0.0
+    missing_waits: int = 0
 
 
 @dataclass(frozen=True)
@@ -118,78 +127,225 @@ def idle_seconds(events: list[tuple[float, int, int]]) -> float:
     return total
 
 
-def collect_costs(connection: sqlite3.Connection, start: datetime, end: datetime) -> BuildCosts:
-    """Read each window step once; keep only pair history and interval endpoints."""
+@dataclass(frozen=True)
+class CostContribution:
+    at: float
+    machine: str
+    cause: Cause
+    seconds: float | CostUnavailable
+
+
+@dataclass(frozen=True)
+class SourceObservation:
+    at: float
+    machine: str
+
+
+@dataclass(frozen=True)
+class IndexedSourceCoverage:
+    machine: str
+    start: float
+    end: float
+
+
+def source_coverage(connection: sqlite3.Connection, observations: Sequence[SourceObservation]) -> tuple[IndexedSourceCoverage, ...]:
+    """Recognize complete indexed monthly logs through their latest recorded event."""
+    latest: dict[str, float] = {}
+    for observation in observations:
+        latest[observation.machine] = max(latest.get(observation.machine, 0), observation.at)
+    rows = cast(list[tuple[str, int]], connection.execute("SELECT path, offset FROM files").fetchall())
+    coverage: list[IndexedSourceCoverage] = []
+    legacy_hosts: dict[str, str] = {}
+    for name, offset in rows:
+        path = Path(name)
+        if len(path.parts) != 2:
+            continue
+        try:
+            low = datetime.strptime(path.name, "%Y-%m.jsonl").replace(tzinfo=UTC)
+            high = (low.replace(day=28)+timedelta(days=4)).replace(day=1)
+            if (store.root()/path).stat().st_size != offset:
+                continue
+        except (ValueError, OSError):
+            continue
+        machine = "CI" if path.parent.name == "ci" else machine_name(None, path.parent.name, legacy_hosts)
+        through = min(high.timestamp(), latest.get(machine, 0))
+        if through > low.timestamp():
+            coverage.append(IndexedSourceCoverage(machine, low.timestamp(), through))
+    merged: list[IndexedSourceCoverage] = []
+    for item in sorted(coverage, key=lambda span: (span.machine, span.start)):
+        if merged and item.machine == merged[-1].machine and item.start <= merged[-1].end:
+            previous = merged.pop()
+            merged.append(IndexedSourceCoverage(item.machine, previous.start, max(previous.end, item.end)))
+        else:
+            merged.append(item)
+    return tuple(merged)
+
+
+@dataclass(frozen=True)
+class IdleSpan:
+    start: float
+    end: float
+    part: Literal["execution", "hold", "unknown", "known"]
+
+
+@dataclass(frozen=True)
+class CostReading:
+    contributions: tuple[CostContribution, ...]
+    observations: tuple[SourceObservation, ...]
+    idle_spans: tuple[IdleSpan, ...]
+    phases: tuple[moments.ProgressFinish, ...]
+    coverage: tuple[IndexedSourceCoverage, ...] = ()
+
+
+def sweep_idle(events: list[tuple[float, int, int, int, int]],
+               coverage: Sequence[IndexedSourceCoverage]) -> tuple[IdleSpan, ...]:
+    """Sweep the full timeline before any bucket clips its disjoint spans."""
+    waiting = running = held = unknown = covered = 0
+    timeline = [(*event, 0) for event in events]
+    for span in coverage:
+        if span.machine == "mac":
+            timeline.extend(((span.start, 0, 0, 0, 0, 1), (span.end, 0, 0, 0, 0, -1)))
+    previous = 0.0
+    spans: list[IdleSpan] = []
+    for at, wait_delta, run_delta, hold_delta, unknown_delta, coverage_delta in sorted(timeline):
+        if waiting > 0 and at > previous:
+            part: Literal["execution", "hold", "unknown", "known"] = "execution" if running else "hold" if held else "unknown" if unknown or not covered else "known"
+            spans.append(IdleSpan(previous, at, part))
+        waiting += wait_delta
+        running += run_delta
+        held += hold_delta
+        unknown += unknown_delta
+        covered += coverage_delta
+        previous = at
+    return tuple(spans)
+
+
+def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *,
+               boundary_context: bool = False) -> CostReading:
+    """Read and pair costs once; retain timestamps for either presentation."""
     if end <= start:
         raise ValueError("cost window must have positive duration")
-    parameters = moments.window_parameters(start, end)
-    # The calls CTE shadows main.calls for index.COUNTED_FAILURE.
-    # The unbounded fragment took 764 ms over 14,460 window rows.
+    parameters: dict[str, str | int | float] = dict(moments.window_parameters(start, end))
+    lower, upper = start.timestamp(), end.timestamp()
+    parameters.update(lower_epoch=lower, upper_epoch=upper, lower_us=int(lower * 1_000_000))
+    legacy_hosts: dict[str, str] = {}
+    context_sql = ""
+    selected_sql = "SELECT id FROM window_steps"
+    if boundary_context:
+        _ = machine_name(None, None, legacy_hosts)
+        parameters["legacy_hosts"] = json.dumps(legacy_hosts)
+        machine_sql = "coalesce(nullif(target,''), json_extract(:legacy_hosts, '$.' || json_quote(host)), host, 'unknown')"
+        context_sql = (
+            ", seed_keys AS (SELECT DISTINCT session, " + machine_sql
+            + " AS machine FROM window_steps WHERE step='nextest' AND session IS NOT NULL)"
+            + ", context_ids AS MATERIALIZED (SELECT (SELECT id FROM steps AS prior"
+            + " WHERE step='nextest' AND session=seed_keys.session AND started_at_us < :lower_us"
+            + " AND " + machine_sql + " = seed_keys.machine"
+            + " ORDER BY started_at_us DESC, id DESC LIMIT 1) AS id FROM seed_keys)"
+        )
+        selected_sql += (
+            " UNION SELECT id FROM context_ids WHERE id IS NOT NULL"
+            + " UNION SELECT id FROM steps WHERE duration_s > 0"
+            + " AND unixepoch(started_at,'subsec')+duration_s > :lower_epoch"
+            + " AND unixepoch(started_at,'subsec') < :lower_epoch"
+            + " UNION SELECT id FROM steps WHERE mem_wait_s > 0"
+            + " AND unixepoch(started_at,'subsec') >= :upper_epoch"
+            + " AND unixepoch(started_at,'subsec')-mem_wait_s < :upper_epoch"
+        )
     rows = cast(Sequence[tuple[str | None, str | None, str, float | None, float | None, int | None,
                                int | None, str | None, str | None, str | None, str | None,
                                str | None, float, int, str | None, str | None, str | None, float | None, str | None]],
         connection.execute(
-            "WITH window_steps AS MATERIALIZED (SELECT target,host,step,duration_s,mem_wait_s,status,crates_compiled,session,"
-            + " worktree,repo,build_base,tree_key,started_at,caller,call_id,id FROM steps WHERE "
-            + moments.window_bounds("started_at") + "),"
-            + " calls AS MATERIALIZED (SELECT c.id,c.copy,c.mac,c.mac_reason,c.local_reason,c.mac_s,c.outcome"
-            + " FROM window_steps s CROSS JOIN main.calls c WHERE c.id = s.call_id GROUP BY c.id)"
+            "WITH window_steps AS MATERIALIZED (SELECT id,target,host,session,step FROM steps WHERE "
+            + moments.window_bounds("started_at") + ")" + context_sql
+            + ", selected_ids AS (" + selected_sql + ")"
             + " SELECT target, host, step, duration_s, mem_wait_s, status, crates_compiled, session,"
-            + " worktree, repo, build_base, tree_key, unixepoch(started_at, 'subsec'), (" + index.COUNTED_FAILURE + "),"
+            + " worktree, repo, build_base, tree_key, unixepoch(started_at, 'subsec'),"
+            + " CASE WHEN unixepoch(started_at,'subsec') >= :lower_epoch THEN (" + index.COUNTED_FAILURE + ") ELSE 0 END,"
             + " c.mac,c.mac_reason,c.local_reason,c.mac_s,c.outcome"
-            + " FROM window_steps AS steps LEFT JOIN calls c ON c.id = steps.call_id"
+            + " FROM steps LEFT JOIN"
+            + " (SELECT id,mac,mac_reason,local_reason,mac_s,outcome FROM main.calls) c"
+            + " ON c.id = steps.call_id AND unixepoch(started_at,'subsec') >= :lower_epoch"
+            + " WHERE steps.id IN (SELECT id FROM selected_ids)"
             + " ORDER BY unixepoch(started_at, 'subsec'), steps.id", parameters).fetchall())
-    totals: defaultdict[tuple[str, Cause], float] = defaultdict(float)
+    contributions: list[CostContribution] = []
+    observations: list[SourceObservation] = []
     sessions: dict[tuple[str, str], tuple[moments.PreviousNextest, moments.RecordedBuildTree | moments.UnrecordedIdentity]] = {}
     intervals: list[tuple[float, int, int]] = []
-    lower, upper = start.timestamp(), end.timestamp()
-    legacy_hosts: dict[str, str] = {}
     for target, host, kind, duration, wait, status, crates, session, worktree, repo, base, tree, at, failed, mac, reason, local_reason, mac_s, outcome_text in rows:
         machine = machine_name(target, host, legacy_hosts)
         seconds, wait_s = max(0.0, duration or 0.0), max(0.0, wait or 0.0)
-        totals[machine, "Memory wait"] += wait_s
-        if crates is not None and crates >= moments.COLD_BUILD_MIN_CRATES:
-            totals[machine, "Cold rebuilds"] += seconds
-        if failed:
-            totals[machine, "Failed runs"] += seconds
-        if machine == "mac" and seconds:
+        selected = lower <= at < upper
+        if selected:
+            observations.append(SourceObservation(at, machine))
+            if kind != "launch":
+                wait_value = CostUnavailable("memory wait not recorded") if wait is None else wait_s
+                contributions.append(CostContribution(at, machine, "Memory wait", wait_value))
+            if crates is not None and crates >= moments.COLD_BUILD_MIN_CRATES:
+                contributions.append(CostContribution(at, machine, "Cold rebuilds", seconds))
+            if failed:
+                contributions.append(CostContribution(at, machine, "Failed runs", seconds))
+        if machine == "mac" and seconds and at < upper and at + seconds > lower:
             intervals.extend(((max(lower, at), 0, 1), (min(upper, at + seconds), 0, -1)))
-        decision = mac_outcome.offload_record(mac, reason, local_reason, mac_s, outcome_text)
-        if machine == "natedev" and wait_s and mac_outcome.is_mac_candidate(decision):
-            intervals.extend(((max(lower, at - wait_s), 1, 0), (min(upper, at), -1, 0)))
+        if machine == "natedev" and wait_s and at > lower and at - wait_s < upper:
+            decision = mac_outcome.offload_record(mac, reason, local_reason, mac_s, outcome_text)
+            if mac_outcome.is_mac_candidate(decision):
+                intervals.extend(((max(lower, at - wait_s), 1, 0), (min(upper, at), -1, 0)))
         if kind != "nextest" or session is None:
             continue
         key = (moments.RecordedBuildTree(repo or "", worktree, base, tree)
                if worktree and base and tree else moments.UnrecordedIdentity())
         preceding = sessions.get((machine, session))
-        if (preceding is not None
+        if (selected and preceding is not None
                 and moments.passed_tree_rerun(preceding[0], moments.nextest_outcome(status), at - wait_s, preceding[1], key)):
-            totals[machine, "Reruns after a pass"] += seconds
+            contributions.append(CostContribution(at, machine, "Reruns after a pass", seconds))
         sessions[machine, session] = (moments.previous_nextest(at, duration, moments.nextest_outcome(status)), key)
-    candidate_wait = idle_seconds([(event[0], event[1], 0) for event in intervals if event[1]])
-    idle = idle_seconds(intervals)
-    execution_overlap = candidate_wait - idle
-    hold_seconds = unknown_seconds = 0.0
-    if idle > 0:
+    timeline = [(at, wait, run, 0, 0) for at, wait, run in intervals]
+    if idle_seconds(intervals) > 0:
         holds = mac_hold_events(connection, start, end)
-        intervals.extend(holds.recorded)
-        after_holds = idle_seconds(intervals)
-        hold_seconds = idle - after_holds
-        idle = after_holds
-        unknown_seconds = idle - idle_seconds(intervals + holds.unknown)
-    mac_idle = MacIdleEstimate(candidate_wait, execution_overlap, hold_seconds, idle, unknown_seconds)
-    totals["mac", "Mac idle while natedev waits"] = idle
-    ci_rows = cast(Sequence[tuple[str, float]], connection.execute(
+        timeline.extend((event[0], 0, 0, event[2], 0) for event in holds.recorded)
+        timeline.extend((event[0], 0, 0, 0, event[2]) for event in holds.unknown)
+    ci_rows = cast(Sequence[tuple[str | None, float, float]], connection.execute(
         "SELECT r.conclusion, coalesce((SELECT sum(j.duration_s) FROM ci_jobs j"
-        + " WHERE j.run_id = r.run_id AND j.attempt = r.attempt AND j.run_state = 'ran'), r.duration_s, 0)"
-        + " FROM ci_runs r WHERE " + moments.window_bounds("r.started_at")
-        + " AND r.conclusion IN ('cancelled', 'failure')", parameters).fetchall())
-    for conclusion, seconds in ci_rows:
-        totals["CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs"] += max(0, seconds)
-    ranked = tuple(sorted((RankedCost(host, cause, seconds, unknown_seconds if cause == "Mac idle while natedev waits" else 0.0)
-                           for (host, cause), seconds in totals.items() if seconds > 0),
+        + " WHERE j.run_id = r.run_id AND j.attempt = r.attempt AND j.run_state = 'ran'), r.duration_s, 0),"
+        + " unixepoch(r.started_at,'subsec') FROM ci_runs r WHERE " + moments.window_bounds("r.started_at"),
+        parameters).fetchall())
+    for conclusion, seconds, at in ci_rows:
+        observations.append(SourceObservation(at, "CI"))
+        if conclusion in ("cancelled", "failure"):
+            contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds)))
+    coverage = source_coverage(connection, observations)
+    return CostReading(tuple(contributions), tuple(observations), sweep_idle(timeline, coverage),
+                       finished_phases(start, end), coverage)
+
+
+def aggregate_costs(reading: CostReading, start: datetime, end: datetime) -> BuildCosts:
+    totals: defaultdict[tuple[str, Cause], float] = defaultdict(float)
+    lower, upper = start.timestamp(), end.timestamp()
+    missing: defaultdict[tuple[str, Cause], int] = defaultdict(int)
+    for row in reading.contributions:
+        if lower <= row.at < upper:
+            key = row.machine, row.cause
+            if isinstance(row.seconds, CostUnavailable):
+                missing[key] += 1
+                totals[key] += 0
+            else:
+                totals[key] += row.seconds
+    parts: defaultdict[str, float] = defaultdict(float)
+    for span in reading.idle_spans:
+        parts[span.part] += max(0.0, min(upper, span.end)-max(lower, span.start))
+    idle = parts["known"] + parts["unknown"]
+    mac_idle = MacIdleEstimate(sum(parts.values()), parts["execution"], parts["hold"], idle, parts["unknown"])
+    totals["mac", "Mac idle while natedev waits"] = idle
+    ranked = tuple(sorted((RankedCost(host, cause, seconds, parts["unknown"] if cause == "Mac idle while natedev waits" else 0.0, missing[host, cause])
+                           for (host, cause), seconds in totals.items() if seconds > 0 or missing[host, cause]),
                           key=lambda row: (-row.seconds, row.machine, row.cause)))
-    return BuildCosts(start, end, finished_phases(start, end), ranked, mac_idle)
+    phases = tuple(phase for phase in reading.phases if lower <= phase.timestamp_epoch < upper)
+    return BuildCosts(start, end, phases, ranked, mac_idle)
+
+
+def collect_costs(connection: sqlite3.Connection, start: datetime, end: datetime) -> BuildCosts:
+    return aggregate_costs(read_costs(connection, start, end), start, end)
 
 
 def phase_line(label: str, phases: Sequence[moments.ProgressFinish]) -> str:
@@ -211,6 +367,8 @@ def render_costs(build_costs: BuildCosts) -> str:
         per_phase = f"{row.seconds / 3600 / count:.3f} h/phase" if count else "unavailable h/phase (no finished phases)"
         uncertainty = (f" upper bound; {row.unknown_seconds / 3600 / days:.2f} h/day unknown"
                        if row.unknown_seconds > 0 else "")
+        if row.missing_waits:
+            uncertainty += f"; subtotal with {row.missing_waits} applicable waits missing"
         lines.append(f"{row.machine}: {row.cause}: {row.seconds / 3600 / days:.2f} h/day; {per_phase}{uncertainty}.")
     if len(build_costs.ranked) > MAX_RANKED_ROWS:
         lines.append(f"{len(build_costs.ranked) - MAX_RANKED_ROWS} smaller machine/cause costs omitted.")

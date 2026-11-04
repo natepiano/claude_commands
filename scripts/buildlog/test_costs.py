@@ -224,7 +224,10 @@ class CostTests(unittest.TestCase):
                         hold_event("began", "held", (fixtures.START + timedelta(seconds=later_start)).isoformat(), "mac"),
                         hold_event("ended", "held", (fixtures.START + timedelta(seconds=later_end)).isoformat(), "mac"),
                     ))
-                with closing(self.fixture.connection(*records)) as connection:
+                with closing(self.fixture.connection(*records)) as connection, mock.patch.object(
+                    costs, "source_coverage", return_value=(costs.IndexedSourceCoverage(
+                        "mac", fixtures.START.timestamp(), fixtures.END.timestamp()),),
+                ):
                     result = costs.collect_costs(connection, fixtures.START, fixtures.END)
                 self.assertEqual([(row.seconds, row.unknown_seconds) for row in result.ranked
                                   if row.cause == "Mac idle while natedev waits"], [(upper_bound, unknown)])
@@ -280,6 +283,34 @@ class CostTests(unittest.TestCase):
         self.assertLess(len(text.splitlines()), 25)
         self.assertIn("16 smaller machine/cause costs omitted.", text)
         self.assertIn("host-29: Memory wait:", text)
+
+    def test_partial_mac_coverage_splits_residual_waits_without_using_individual_events(self) -> None:
+        origin = fixtures.START.timestamp()
+        for coverage, known, unknown in (
+            ((), 0, 3600),
+            ((costs.IndexedSourceCoverage("mac", origin+3600, origin+4500),), 900, 2700),
+        ):
+            with self.subTest(coverage=coverage), closing(self.fixture.connection(
+                call("eligible", mac="declined", mac_reason="busy", mac_s=0.0),
+                fixtures.build("wait", 7200, target="natedev", mem_wait_s=3600, call_id="eligible"),
+                fixtures.build("mac-later", 8000, target="mac", duration_s=60),
+            )) as connection, mock.patch.object(costs, "source_coverage", return_value=coverage):
+                result = costs.collect_costs(connection, fixtures.START, fixtures.END)
+            self.assertEqual(result.mac_idle.unknown_seconds, unknown)
+            self.assertEqual(result.mac_idle.upper_bound_seconds-unknown, known)
+
+    def test_execution_and_complete_holds_reduce_waits_without_proving_other_coverage(self) -> None:
+        with closing(self.fixture.connection(
+            call("eligible", mac="declined", mac_reason="busy", mac_s=0.0),
+            fixtures.build("wait", 7200, target="natedev", mem_wait_s=3600, call_id="eligible"),
+            fixtures.build("mac", 4500, target="mac", duration_s=900),
+            hold_event("began", "complete", (fixtures.START+timedelta(seconds=5400)).isoformat(), "mac"),
+            hold_event("ended", "complete", (fixtures.START+timedelta(seconds=6300)).isoformat(), "mac"),
+            hold_event("began", "incomplete", (fixtures.START+timedelta(seconds=6300)).isoformat(), "mac"),
+        )) as connection:
+            result = costs.collect_costs(connection, fixtures.START, fixtures.END)
+        self.assertEqual(result.mac_idle, costs.MacIdleEstimate(3600, 900, 900, 1800, 1800))
+        self.assertIn("upper bound", costs.render_costs(result))
 
 
 if __name__ == "__main__":

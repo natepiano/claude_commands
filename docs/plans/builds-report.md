@@ -216,7 +216,7 @@ Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the ha
 
 **Files:** `scripts/buildlog/costs.py`, `scripts/buildlog/number_option.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/holds.py`, `scripts/buildlog/mac_report.py`, `scripts/buildlog/mac_outcome.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `docs/plans/builds-report-rounds.md`.
 
-### Phase 8 — Build history as charts  · status: todo
+### Phase 8 — Build history as charts  · status: done
 **Depends on:** Phase 7
 
 The user, 2026-11-03: tables do not work for them. Lower priority. Design a chart view of the build history (costs and phase time over time, each build change marked). Design first; the build waits for the user's go.
@@ -227,6 +227,8 @@ Constraints from Phase 7 (the design must answer each one):
 2. Uncertainty: keep the Mac idle upper bound and its unknown part (`MacIdleEstimate`), missing phase times and unavailable per-phase costs visible in each chart. Never show them as zero. Test each state.
 3. Readers: reuse `moments.progress_events()` and the costs readers. Read history once per chart set, read-only. Set a measured speed limit for the full series.
 4. Do not restore `/build:report`.
+
+Design: `docs/plans/builds-report-charts-design.md`. The user, 2026-11-03, relayed by builds: "go" on the browser page. Build it as designed: `buildlog charts`, daily buckets, 7-day default, start-based cost attribution.
 
 ### Phase 9 — Round 1: find why natedev rebuilds cold  · status: done
 **Depends on:** Phase 7
