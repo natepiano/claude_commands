@@ -227,3 +227,8 @@ Constraints from Phase 7 (the design must answer each one):
 2. Uncertainty: keep the Mac idle upper bound and its unknown part (`MacIdleEstimate`), missing phase times and unavailable per-phase costs visible in each chart. Never show them as zero. Test each state.
 3. Readers: reuse `moments.progress_events()` and the costs readers. Read history once per chart set, read-only. Set a measured speed limit for the full series.
 4. Do not restore `/build:report`.
+
+### Phase 9 — Round 1: find why natedev rebuilds cold  · status: done
+**Depends on:** Phase 7
+
+Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second largest cost. Find the cause before a fix. Query the index for cold steps: worktree, target folder, and the event before each (new clone, branch switch, toolchain or flag change, sweep deletion). Write the cause with counts and hours to `docs/plans/builds-report-rounds.md`, then send it to the showrunner, which names the owner. No code changes.
