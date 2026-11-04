@@ -23,7 +23,7 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol, cast, override
+from typing import TYPE_CHECKING, BinaryIO, Literal, cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -109,13 +109,7 @@ class SnapshotCompatibilityTests(unittest.TestCase):
                 }, gate.RunningStep)
 
 
-class BuildStepRecorder(Protocol):
-    store: gate.BuildLogStore
-
-    def step(self, arguments: list[str]) -> None: ...
-
-
-buildlog_record = cast(BuildStepRecorder, cast(object, gate.record))
+buildlog_record = gate.record
 
 GIB = gate.GIB
 NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
@@ -987,8 +981,8 @@ class FreshTestPromiseTests(unittest.TestCase):
                     patch.object(buildlog_record, "git_facts", return_value={"worktree": str(self.worktree)}), \
                     patch("treekey.tree_key", return_value=ending_source), \
                     patch.object(buildlog_record, "rustc_version", return_value="rustc fixture"), \
-                    patch.object(buildlog_record.store, "host_name", return_value=self.host), \
-                    patch.object(buildlog_record.store, "host_file", return_value=path):
+                    patch.object(store, "host_name", return_value=self.host), \
+                    patch.object(store, "host_file", return_value=path):
                 ended = NOW.timestamp() - seconds
                 buildlog_record.step(["0", str(ended - 5), str(ended), "1", "", "",
                                       "cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"])

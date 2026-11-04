@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import fcntl
-from contextlib import AbstractContextManager, closing
+from contextlib import closing
 import importlib
 import json
 import math
@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
 from functools import lru_cache
 from itertools import chain
 from types import UnionType, MappingProxyType
@@ -41,60 +41,23 @@ import conf
 
 
 from test_phase import (
-    NoTestPhaseRecord,
     ObservedTestPhase,
     TestPhaseRecord,
     UnobservedTestPhase,
-    UnreadableTestPhaseRecord,
 )
 
+if TYPE_CHECKING:
+    from ..buildlog import parse
+    from ..buildlog import record as record
+    from ..buildlog import store as store
+    from ..buildlog import index
 
-class GitFacts(TypedDict):
-    repo_path: str | None
-    worktree: str | None
-    branch: str | None
-    sha: str | None
-
-
-class StepParser(Protocol):
-    def step_name(self, argv: list[str]) -> str: ...
-
-
-class GitIdentityReader(Protocol):
-    def read_test_phase(self, path: Path) -> TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord: ...
-
-    def git_directory(self, argv: list[str], cwd: str) -> str: ...
-    def git_facts(self, directory: str) -> GitFacts: ...
-    def queue_priority(self, action: Literal["set", "clear"], unit: str,
-                       why: str, set_by: str, at: float, *, transition_id: str = "", start: int = 0) -> None: ...
-    def head_admission(self, action: Literal["set", "admitted", "lapsed"], unit: str,
-                       step: str, need: int, free: int, reserve: int, why: str,
-                       set_by: str, at: float) -> None: ...
-
-
-class BuildLogStore(Protocol):
-    INDEX_NAME: str
-    UNKNOWN_IDENTITY: str
-
-    def root(self) -> Path: ...
-    def host_name(self) -> str: ...
-    def utc_iso(self, epoch: float) -> str: ...
-    def append_line(self, path: Path, record: object) -> None: ...
-    def locked_append(self, path: Path) -> AbstractContextManager[BinaryIO]: ...
-    def append_locked(self, handle: BinaryIO, record: object) -> None: ...
-    def whole_rows(self, handle: BinaryIO, start: int) -> Iterator[dict[str, object]]: ...
-    def read_last_whole_row_end(self, path: Path) -> int: ...
-    def host_file(self, host: str, epoch: float) -> Path: ...
-
-
-class BuildLogFileMarks(Protocol):
-    def marks(self, handle: BinaryIO, offset: int) -> str: ...
-
-
-parse: StepParser = cast(StepParser, cast(object, importlib.import_module("parse")))
-record: GitIdentityReader = cast(GitIdentityReader, cast(object, importlib.import_module("record")))
-store: BuildLogStore = cast(BuildLogStore, cast(object, importlib.import_module("store")))
-file_marks: BuildLogFileMarks = cast(BuildLogFileMarks, cast(object, importlib.import_module("index")))
+    file_marks = index
+else:
+    import parse
+    import record
+    import store
+    import index as file_marks
 
 GIB = 1 << 30
 # 111 natedev filtered single-test runs with no recompilation in the 14 days

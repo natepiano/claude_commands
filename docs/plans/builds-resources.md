@@ -1585,7 +1585,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `scripts/lib/scratch.py`, `scripts/production/mac_run.sh` — test clone owner
 - `scripts/lib/cargo_output_test_support.py` — shared Cargo output fixture
 - `scripts/buildlog/index.py`, `scripts/buildlog/record.py` — index schema 30
-### Phase 56 — Build holds and memory admission catch store interface errors before they run  · status: todo
+### Phase 56 — Build holds and memory admission catch store interface errors before they run  · status: done
 **Depends on:** Phase 20. Land before Phase 11. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files.
 
 #### Work Order
