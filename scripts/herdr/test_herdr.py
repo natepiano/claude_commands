@@ -5084,6 +5084,17 @@ class RowTabsHerdr(LayoutHerdr):
         self.count: int = 100
 
     @override
+    def run(self, *arguments: str, deadline: float = math.inf) -> str:
+        if arguments[:2] == ("pane", "focus"):
+            raise herdr.HerdrFailure("usage: herdr pane focus --direction left|right|up|down [--pane ID|--current]")
+        result = super().run(*arguments, deadline=deadline)
+        if arguments[:2] == ("tab", "focus"):
+            members = [pane for pane in self.tabs if pane["tab_id"] == arguments[2]]
+            if not any(pane["pane_id"] == self.focused_pane for pane in members):
+                self.focused_pane = members[0]["pane_id"]
+        return result
+
+    @override
     def socket_request(self, method: str, **params: object) -> dict[str, object]:
         if method == "layout.export":
             self.commands.append((method, *(str(value) for value in params.values())))
@@ -5205,7 +5216,8 @@ class RowTabTests(StaffTestCase):
                 self.assertEqual(self.client.trees[panes["terminal-0"]["tab_id"]], expected)
                 if grid:
                     self.assertEqual(len({pane["tab_id"] for pane in self.client.tabs}), 1)
-                self.assertEqual(self.client.focused_pane, panes["terminal-1"]["pane_id"])
+                focused = next(pane for pane in self.client.tabs if pane["pane_id"] == self.client.focused_pane)
+                self.assertEqual(focused["tab_id"], panes["terminal-1"]["tab_id"])
                 self.assertEqual({pane["terminal_id"] for pane in self.client.tabs}, terminals)
                 self.assertFalse({"p0", "p1", "p2", "p3"} & {pane["pane_id"] for pane in self.client.tabs})
                 self.assertCountEqual(self.bindings(), [(self.rows["parent"].name, row.id)
@@ -5216,6 +5228,24 @@ class RowTabTests(StaffTestCase):
                 self.assertFalse(any(command[:2] in (("pane", "close"), ("agent", "start"), ("tab", "close"))
                                      for command in self.client.commands))
                 self.assert_complete_rerun()
+
+    def test_transfer_restores_the_focused_tab_with_the_supported_command(self) -> None:
+        self.client.tabs = self.client.tabs[:2]
+        self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        moved = next(pane for pane in self.client.tabs if pane["terminal_id"] == "terminal-1")
+        self.assertEqual(moved["workspace_id"], "w2")
+        self.assertIn(("tab", "focus", moved["tab_id"]), self.client.commands)
+        focused = next(pane for pane in self.client.tabs if pane["pane_id"] == self.client.focused_pane)
+        self.assertEqual(focused["tab_id"], moved["tab_id"])
+
+    def test_focus_restore_failure_keeps_the_tab_move_result(self) -> None:
+        self.client.tabs = self.client.tabs[:2]
+        with self.refused_command("run", ("tab", "focus"), "private focus failure\nsecond line") as errors:
+            self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+        self.assertEqual(self.client.tabs[0]["workspace_id"], "w2")
+        self.assertIn((self.rows["parent"].name, self.rows["unit"].id), self.bindings())
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("focus restore failed: private focus failure second line", errors.getvalue())
 
     def test_unknown_native_evidence_writes_bindings_and_never_reports_unchanged(self) -> None:
         self.client.tabs = self.client.tabs[:1]
@@ -5285,7 +5315,9 @@ class RowTabTests(StaffTestCase):
 
         with patch.object(self.client, "socket_request", side_effect=refuse), self.assertRaisesRegex(herdr.HerdrFailure, "private order failure"):
             _ = self.client.move_row_tabs(self.rows["unit"].id)
-        self.assertEqual(self.client.focused_pane, selected)
+        focused = next(pane for pane in self.client.tabs if pane["pane_id"] == self.client.focused_pane)
+        selected_tab = next(pane["tab_id"] for pane in self.client.tabs if pane["pane_id"] == selected)
+        self.assertEqual(focused["tab_id"], selected_tab)
         self.assertTrue(next(space for space in self.client.listed("workspace") if space["workspace_id"] == "w2")["focused"])
         self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
         self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", "w2")],
@@ -5294,7 +5326,7 @@ class RowTabTests(StaffTestCase):
         self.assertFalse(any(pane["label"] == herdr.LAYOUT_PLACEHOLDER for pane in self.client.tabs))
         self.assert_complete_rerun()
 
-    def test_an_unrelated_focused_split_survives_destination_ordering(self) -> None:
+    def test_an_unrelated_focused_tab_survives_destination_ordering(self) -> None:
         for index, name in enumerate(("zulu", "alpha"), 3):
             row = fixture_member("showrunner", name=name)
             self.client.tabs.append({"pane_id": f"p{index}", "tab_id": f"t{index}", "workspace_id": "w2",
@@ -5305,7 +5337,8 @@ class RowTabTests(StaffTestCase):
                 for ident in [self.rows["unit"].id, self.rows["worker"].id, *layout_row_ids(["alpha", "zulu"])]] )]))
         self.client.focused_pane = "p5"
         self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
-        self.assertEqual(self.client.focused_pane, "p5")
+        focused = next(pane for pane in self.client.tabs if pane["pane_id"] == self.client.focused_pane)
+        self.assertEqual(focused["tab_id"], "t3")
         self.assertEqual(next(pane["tab_id"] for pane in self.client.tabs if pane["pane_id"] == "p5"), "t3")
         self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", "w2")],
                          [self.rows["unit"].name, self.rows["worker"].name, "alpha", "zulu"])

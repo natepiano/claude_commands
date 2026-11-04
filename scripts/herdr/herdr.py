@@ -1568,15 +1568,19 @@ class Herdr:
                     changed = self._close_placeholders(workspace) or changed
             finally:
                 if focused:
-                    current = next((pane for pane in self.listed("pane") if pane.get("pane_id") == focused), None)
-                    if current is not None:
-                        destination = json_text(current.get("workspace_id"), "workspace id")
-                        active = any(space.get("workspace_id") == destination and space.get("focused") is True
-                                     for space in self.listed("workspace"))
-                        if not active:
-                            self.focus_workspace(destination)
-                        if not active or current.get("focused") is not True:
-                            _ = self.run("pane", "focus", focused)
+                    try:
+                        current = next((pane for pane in self.listed("pane") if pane.get("pane_id") == focused), None)
+                        if current is not None:
+                            destination = json_text(current.get("workspace_id"), "workspace id")
+                            active = any(space.get("workspace_id") == destination and space.get("focused") is True
+                                         for space in self.listed("workspace"))
+                            if not active:
+                                self.focus_workspace(destination)
+                            if not active or current.get("focused") is not True:
+                                _ = self.run("tab", "focus", json_text(current.get("tab_id"), "tab id"))
+                    except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                        detail = str(error).replace("\n", " ")
+                        print(f"herdr {self.session}: focus restore failed: {detail}; tab move result retained", file=sys.stderr)
             return changed or bound
 
     def _move_row_tab(self, selected: dict[str, object], workspace: str, title: str,
