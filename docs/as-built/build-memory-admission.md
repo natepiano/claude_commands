@@ -268,6 +268,65 @@ Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory 
 Both the budget charge and free-memory growth term use that promise.
 
 Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
+Cargo estimates separate compile history from no-compile history.
+`index_step_evidence` joins each anonymous peak by host, call id, and step.
+`StepEvidence` keeps its shape and compile count independent.
+Missing argv does not remove a compile count. A saved shape does not prove compilation.
+`CompiledCrates` identifies a compile run. `NoCratesCompiled` identifies known zero-count attempts.
+The join combines repeated attempts. Any positive count keeps the call in compile history.
+An unknown count or a missing join keeps the peak usable until the index supplies a known count.
+The peak's completion time controls its history window, including failed-build floors.
+Merge-gate peaks keep their separate class and remain in the anonymous history.
+The gate uses its own cap, so Cargo estimates do not use those peaks.
+
+Five keyed rows exclude the older unkeyed rows for the same repository.
+With one to four own rows, a non-build estimate uses their largest peak or a lower pool p90.
+A repository without own history keeps the pool and fallback order.
+Filtered compile estimates use exact filters, then package filters, then check or build compile peaks.
+A full-suite estimate does not cap a filtered compile estimate.
+The 1 GiB filtered floor applies when the repository has no usable compile history.
+Fresh nextest estimates retain `fresh_test_peak` and its 1 GiB floor.
+Freshness still requires both Cargo output roots to survive.
+
+#### Phase 11 replay comparison
+
+The replay covers 2026-10-21 through 2026-11-04 with the same frozen inputs.
+It evaluates 15,053 runs and omits 195 runs without an index match.
+Another 617 merge-gate rows retain their separate cap class.
+Each estimate uses its historical budget: 21 GiB or 24 GiB.
+Under-half means below half the measured peak. Over-three means above three times the measured peak.
+
+| Compile class | Budget GiB | Runs | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|---:|---:|
+| compile | 21 | 11,360 | 458 | 402 | 1,162 | 1,152 |
+| compile | 24 | 2,300 | 18 | 12 | 332 | 358 |
+| no compile | 21 | 1,185 | 12 | 12 | 937 | 937 |
+| no compile | 24 | 208 | 3 | 4 | 174 | 173 |
+| **Total** | | **15,053** | **491** | **430** | **2,605** | **2,620** |
+
+These repositories have a higher count. Each row combines their steps, compile classes, and budgets.
+
+| Repository | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|
+| cargo-liner | 27 | 8 | 1,754 | 1,804 |
+| check-only | 1 | 2 | 5 | 3 |
+| clone | 1 | 2 | 15 | 14 |
+| clone85 | 1 | 2 | 0 | 0 |
+| fix | 3 | 3 | 20 | 22 |
+| hana | 71 | 31 | 592 | 595 |
+| lintproof_fix | 0 | 1 | 6 | 1 |
+| p31-gates-834aebb04-8015c7caf3 | 1 | 2 | 3 | 1 |
+| src | 0 | 2 | 46 | 40 |
+| work | 1 | 2 | 0 | 0 |
+
+Bar missed: under-half falls by 61, but over-three rises by 15.
+At least one count rises in 10 repositories and 19 repository, step, and compile-class groups.
+The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 to 7, over-three 101 to 166.
+A filtered compile run takes its estimate from compile history, and the full-run estimate no longer caps it.
+The showrunner accepted the miss (2026-11-04): an under-promise risks an out-of-memory kill; an over-promise only delays parallel starts.
+The next phase makes a filtered compile estimate use that filter's own compile history before the package pool.
+Run `phases/11/replay.py before` and `after` in the session folder to regenerate the full grouped data for `replay_groups.md`.
+
 Build estimates use completed same-shape history from the last 14 days.
 Ten or more earlier runs supply p90. One to nine earlier runs supply their largest peak.
 The newest failed-build floor can raise that base.
@@ -281,7 +340,7 @@ Release builds use `release_headroom`, currently 1.314. A build without same-sha
 The retry after a memory kill stays unchanged.
 
 Each estimate stores its rule and the budget cap it applies.
-`DevSizeHeadroom` stores its factor and margin. `DevHeadroom` retains the older multiplier for saved records.
+`DevSizeHeadroom` stores its factor and margin. `LegacyDevMultiplierHeadroom` retains the older multiplier for saved records.
 `CappedAtBudget` stores the uncapped need and the applied cap.
 The reader checks those saved values without reading today's budget.
 An older record without a saved cap becomes `CapNotRecorded`.
