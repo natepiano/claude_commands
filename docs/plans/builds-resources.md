@@ -1719,7 +1719,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - The runner home, `_actions` and `_diag` resolve to paths under `/var/lib/hana-ci` in the built unit files.
 - After the rebuild, each idle runner service shows `memory.swap.current` under 64 MiB.
 
-### Phase 60 — A filtered compile run's promise comes near what that run uses  · status: todo
+### Phase 60 — A filtered compile run's promise comes near what that run uses  · status: done
 **Depends on:** Phase 11 (compile classification, `index_step_evidence`, the replay). Runs next after Phase 11 and before Phase 17 (showrunner ruling 2026-11-04). Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8.
 
 #### Work Order
