@@ -678,25 +678,14 @@ Every tool takes a unit's location from its staff row. A stale or absent Units W
 **Gotchas:** `SessionNotFound` and `NotRunning` do not prove the saved pid stopped; restart checks that pid. `unchanged` and `resumed` distinguish move rerun outcomes.
 **Ruled out:** Absolute-Plan routing, worker-folder copies, transcript relocation, rename journals, and old-name sweeps.
 
-### Phase 4n — Reviewer naming reads the staff folder  · status: todo
+### Phase 4n — Reviewer naming reads the staff folder  · status: done
 
-**Depends on:** Phase 4w.
+#### As-built
 
-Source: resources-unit, 2026-11-04. `assign.sh --role review` fails with `workers: invalid worker state: missing working_dir` (exit 3). Phase 4w removed `working_dir` from unit-owned progress state, but `workers._reviewer_destination` still reads it there. Others wait on this fix; it ships as its own checkpoint off main.
-
-#### Work Order
-
-**Goal:** `assign.sh --role review` names the unit's reviewer from the unit's staff folder.
-
-**Spec:**
-1. `workers._reviewer_destination` reads the folder through `plan_history.staff_directory` with one staff snapshot, as `progress_history._start_run` does. The launcher `--working-dir` stays the fallback for a run with no unit row.
-2. Change the existing reviewer tests to a unit-owned state with no `working_dir`. Add no new copy of the folder.
+`workers._reviewer_destination` reads the unit folder through `plan_history.staff_directory` with one staff snapshot. The launcher `--working-dir` stays the fallback for a run with no unit row. Checkpoint 5535d493e on `sdlc-devtools-reviewer`, off main b4cff7692.
 
 **Files:**
-- `scripts/direct/workers.py` — the reviewer folder read.
-- `scripts/direct/test_workers.py` — reviewer naming fixtures.
-
-**Acceptance gate:** a unit-owned run state with no `working_dir` names its reviewer from the staff row; `scripts/direct/test_workers.py` passes; basedpyright `0 errors, 0 warnings, 0 notes`.
+- `scripts/direct/{workers.py,test_workers.py}` — the reviewer folder read and its fixtures.
 
 ### Phase 4g — Both promotions use one rule for local edits  · status: done
 
@@ -875,20 +864,16 @@ Retire stops the unit and worker staff rows by `current_session`. It refuses unc
 **Files:**
 - `scripts/lib/{main_sync.py,test_main_sync.py}`, `config/send.conf` — send-once through send.py and its regressions.
 
-### Phase 4m — Assigning a unit a plan writes the staff plan  · status: todo
+### Phase 4m — Assigning a unit a plan writes the staff plan  · status: done
 
-**Depends on:** none (sdlc, 2026-11-04). Own checkpoint off main 3ffe2193f.
+#### As-built
 
-#### Work Order
-
-**Goal:** `progress_history.py start-run` writes the run's plan into the unit's `.unit.toml`, so as-built scope follows the plan the unit ran.
-
-**Spec:**
-1. The plan's one home is `.unit.toml` (`unit_config.UnitConfig.plan`); staff holds no plan (sdlc ruling, 2026-11-04). Add `unit_config.set_plan`; `_start_run` calls it for a unit's run. No staff operation, no copy.
-2. phases-unit edits its own `.unit.toml` plan for its as-built; no tool run from this unit.
+The plan has one home, `.unit.toml`; staff holds no plan. `unit_config.set_plan` changes only the plan in the existing `.unit.toml`, and `progress_history.py start-run` calls it for a unit run with a plan doc. phases-unit edits its own `.unit.toml` for its as-built. Checkpoint a63d95e05 on `sdlc-devtools-plan`, off main 3ffe2193f.
 
 **Files:**
-- `scripts/production/unit_config.py`, `scripts/direct/{progress_history.py,test_progress_history.py}` — the fix and its regression.
+- `scripts/production/unit_config.py`, `scripts/direct/{progress_history.py,test_progress_history.py}` — the plan write and its regression.
+
+**Ruled out:** a staff `set-plan` operation.
 
 ### Phase 4r — One config read serves many settings  · status: done
 
