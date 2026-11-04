@@ -159,19 +159,17 @@ refuses a name that another session of the same account also has.
   source; omit the section if none>
 ```
 
-A production doc has no Units table. The staff row holds the unit's name, parent production and worktree.
-Git holds its branch. `.unit.toml` holds its plan, app port and responsibilities.
-List a production's units in staff row order. Staff holds no port.
+A production doc has no list of units. A unit is its staff row.
+The row gives its name, parent and worktree; git there gives the repository and branch.
+The units appear in staff.json row order. Untracked `.unit.toml` at the worktree root gives
+the plan, app port and responsibilities.
 
 The unit id (`<name>-unit`) names the unit everywhere: in the log, the dailies, the waits and
-every tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's herdr session carries the production's
-slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
+every tool's arguments. A unit's session name can change, so find the unit at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
 session name now. `<slug>` is this doc's file name without `-production.md`; a former
-slug from the Formerly line also works, and a mark set before a rename is found under
-the current slug.
+slug from the Formerly line also works.
 
 To rename a unit, run `/showrunner:rename_unit <old> <new>` from the showrunner session,
 between phases. Never edit the staff row or `.unit.toml` by hand. The rename stops the unit,
@@ -183,7 +181,7 @@ To retire a unit, run `/showrunner:retire_unit <unit>` from the showrunner sessi
 while the unit has uncommitted work or a checkpoint not merged. It stops everything the unit owns
 (its sessions, Codex workers, reviewers, holds, reservations, Mac claims and processes), records a
 removed worktree in its staff row, and removes the worktree and branch. `--dry-run` lists all of it
-and changes nothing. The retirement record names the director's last session.
+and changes nothing. The parked `.unit.toml` keeps the director's last session.
 `/showrunner:resume_unit <unit>` makes the worktree again at the same path from the merge branch,
 resumes that session and records the worktree as present again.
 
@@ -209,8 +207,8 @@ Each gated phase carries its gate directly under the phase heading:
 <ProductionUnit>
 Applies to a `/unit:direct` run whose plan header carries a
 `> **Production:**` line. Read the production doc it names at the start of the
-run and after every compaction. Your staff row gives your name and branch; the
-`.unit.toml` in your worktree gives your plan, port and the files you own.
+run and after every compaction. Your staff row gives your name and worktree; git there gives the branch.
+The untracked `.unit.toml` in your worktree gives your plan, port and responsibilities.
 
 A turn with nothing for the user replies with just "—": never "No update for
 you." or the like (user, 2026-10-14).
@@ -225,7 +223,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    from the showrunner session is a peer's. Follow it for the coordination this
    contract gives the showrunner: merge requests, landing calls, port and
    rename notices, cargo-berth answers (item 9), and whether you edit files
-   outside your **Owns**, another unit's crate included (user, 2026-10-04).
+   outside your `.unit.toml` responsibilities, including another unit's crate (user, 2026-10-04).
 
    The showrunner's word also settles your designs and your add-ons. User,
    2026-10-12, to the showrunner: "when it comes to designs you absolutely

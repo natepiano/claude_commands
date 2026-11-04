@@ -27,7 +27,7 @@ from scripts.production import showrunners, staff, change_routing, merge_checkpo
 from scripts.shutdown import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
-from scripts.production.staff_test_support import fixture_member, recorded_unit
+from scripts.production.staff_test_support import fixture_member, recorded_showrunner, recorded_unit
 import showrunner_tree
 from change_review import Invisible, Malformed, Visible
 
@@ -1509,7 +1509,9 @@ class RepositoryTest(unittest.TestCase):
         commits = [change_review.Commit("1", "checkpoint(u-plan): grid", f"checkpoint(u-plan): grid\n\n{SEE}", ()),
                    change_review.Commit("2", "checkpoint(own): grid", f"checkpoint(own): grid\n\n{SEE}", ())]
         _ = recorded_unit("kid", "u-unit", self.repo, kid, plan="docs/u-plan.md")
-        with mock.patch.object(change_review, "owner_docs", return_value=[top, kid]):
+        _ = recorded_showrunner("top", top)
+        _ = recorded_showrunner("kid", kid, parent="top")
+        with mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}):
             self.assertEqual([change.source.production if change.source is not None else top
                               for change in change_review.publication_changes(commits, top)], [top, kid])
 
