@@ -14,7 +14,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents.claude_result import claude_result
 from scripts.lib import conf
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.atomic_file import write_text_atomic
 
 

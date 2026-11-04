@@ -14,6 +14,7 @@ from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.lib import scratch
 from scripts.production import change_review, merge_gate, staff
 from scripts.lint import memory_admit
 from scripts.production.test_change_review import ProducerFixture
@@ -56,7 +57,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
             self.assertEqual(repo, checkout)
-            with (repo / ".claude-busy").open("a") as contender:
+            with scratch.busy_path(repo).open("a") as contender:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(contender, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -71,7 +72,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         excludes = (checkout / ".git/info/exclude").read_text().splitlines()
         self.assertEqual(excludes.count("/.claude-busy"), 1)
         self.assertEqual(excludes.count("/.scratch.json"), 1)
-        with (checkout / ".claude-busy").open("a") as contender:
+        with scratch.busy_path(checkout).open("a") as contender:
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_checkpoint_names_its_unit_before_admission_and_suites(self) -> None:

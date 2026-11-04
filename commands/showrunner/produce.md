@@ -812,15 +812,17 @@ files for a small fix checkpoint. Log each point and its result. Pass
 `--no-ci` to both calls when the production rules say CI does not apply.
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
-in the background: `zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
+in the background: `HANA_TEST_PURPOSE="CI promotion smoke" zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
 It builds, checks hana stays up 60 s, and stops it, then builds and runs each
 demo example (list in the script) for 20 s with the command you would type, so
-each starts at once from the clone `~/rust/hana_catalyst_mac`. Exit 3 means the
+each starts from a task-owned scratch clone. The script ends its `gate:` task
+and removes the clone when the run ends. Exit 3 means the
 Mac is unreachable: skip it. Exit 9 means the Mac is blocked, busy with a test,
 or its coordination state cannot be read: skip the run; it is not an outage.
 It never gates a merge; a failure (7 hana, 8 an example) goes to the unit whose
-merge it was. Never skip it: the user demos
-from that clone. User, 2026-10-04, 2026-10-05 and 2026-10-06.
+merge it was. Never skip it. For a separate test clone on either machine,
+use `copies.py clone <source> --task gate:<id>` and `scratch.py end --task gate:<id>`
+when the test ends; a phase task must name a real phase.
 </CIPoint>
 
 ---
@@ -833,7 +835,7 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    background with `dangerouslyDisableSandbox: true`:
 
    ```sh
-   bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
+   HANA_TEST_PURPOSE="promotion smoke" bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
    ```
 
    It builds `hana`, starts it on port 15790 with an empty config directory,
@@ -1217,8 +1219,8 @@ condition: wrap neither waits on it nor retires its worktree or branch.
     lock, run fewer at once, never none. User, 2026-10-06, replacing the
     2026-10-01 one-phase rule.
 - **Disk.** Units keep saved run output under a few GB (`/unit:direct` →
-  <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
-  find the large output before anything else. User, 2026-10-04.
+  <ToolingContract/>). When builds turn cold for no reason, check `df -h /` and, when present, `df -h /build`.
+  Find the large output before any other action. User, 2026-10-04.
 - Never ask the user to review until <DesignCheck/> passed on the shots.
 - Never pass on a unit director's claim without checking it.
 - Updates hold only what the schedule prompt allows.

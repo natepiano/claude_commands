@@ -33,12 +33,12 @@ import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
     from ..copies import copies
-    from ..lib import scratch
+    from ..lib import cargo_output, scratch
     from ..notify import review
     from ..notify.push_texts import RenderedPush
 else:
     from scripts.copies import copies
-    from scripts.lib import scratch
+    from scripts.lib import cargo_output, scratch
     import review
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
@@ -149,8 +149,19 @@ def run_process(args: list[str], cwd: Path | None, env: dict[str, str], timeout:
 
 
 def free_space_gib() -> float:
-    disk = os.statvfs(Path.home())
-    return disk.f_bavail * disk.f_frsize / GIB
+    paths = [Path.home(), copies.gates_root(), HANA]
+    roots = cargo_output.read_cargo_output_roots(HANA)
+    if isinstance(roots, cargo_output.CargoOutputRoots):
+        paths.extend((roots.target_directory, roots.build_directory))
+    devices: dict[int, float] = {}
+    for path in paths:
+        while not path.exists() and path != path.parent:
+            path = path.parent
+        device = path.stat().st_dev
+        if device not in devices:
+            disk = os.statvfs(path)
+            devices[device] = disk.f_bavail * disk.f_frsize / GIB
+    return min(devices.values())
 
 
 def build_hold_active(folder: Path = HOLD_DIR) -> bool:
@@ -309,6 +320,18 @@ def directory_gib(path: Path) -> float:
     return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file()) / GIB if path.exists() else 0.0
 
 
+def trial_output_gib(clone: Path) -> tuple[float, float]:
+    """Count each physical output root once, including saved external intermediates."""
+    saved = scratch.save_cargo_outputs(clone)
+    roots = {clone / "target"}
+    for output in saved:
+        roots.update((output.roots.target_directory, output.roots.build_directory))
+    mend = clone / "mend-target"
+    roots = {root.resolve() for root in roots if not root.resolve().is_relative_to(mend.resolve())}
+    outer = [root for root in roots if not any(root != parent and root.is_relative_to(parent) for parent in roots)]
+    return sum(directory_gib(root) for root in outer), directory_gib(mend)
+
+
 def trial_step_was_killed(result: subprocess.CompletedProcess[str]) -> bool:
     if result.returncode == 0:
         return False
@@ -336,8 +359,7 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
             result = run_command(args, cwd, step_env, timeout)
         finally:
             if cwd is not None:
-                target_gib = directory_gib(cwd / "target")
-                mend_target_gib = directory_gib(cwd / "mend-target")
+                target_gib, mend_target_gib = trial_output_gib(cwd)
                 mend_target = cwd / "mend-target"
                 if mend_target.is_dir() and not mend_target.is_symlink():
                     scratch.mark_cargo_cache(mend_target)
@@ -363,6 +385,7 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
         if held():
             raise TrialDeferred("build hold active")
         with copies.standing("toolchain-trial", HANA, revision.stdout.strip()) as checkout:
+            _ = scratch.save_cargo_outputs(checkout)
             clippy_env = env | {
                 "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": str(checkout / "target"),
                 "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3",
@@ -373,7 +396,8 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
             warnings, warning_crates, errors, error_crates = diagnostic_counts(clippy.stdout)
             if clippy.returncode and errors == 0:
                 return failed(first_error(clippy))
-            mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(checkout / "mend-target")}
+            mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(checkout / "mend-target"),
+                              "CARGO_BUILD_BUILD_DIR": str(checkout / "mend-target/intermediates")}
             mend = run("cargo-mend", ["cargo", f"+{version}", "install", "--path",
                                       str(Path.home() / "rust/cargo-liner/crates/cargo-mend"),
                                       "--root", str(checkout / "target" / "mend-root")], checkout, mend_env, 3600)

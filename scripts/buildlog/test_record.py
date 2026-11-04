@@ -21,7 +21,7 @@ import unittest
 from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, BinaryIO, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -203,6 +203,32 @@ class RecordTests(unittest.TestCase):
         for path in sorted(self.root.glob("*/*.jsonl")):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
+
+    def test_step_records_resolved_target_and_build_directories(self) -> None:
+        cargo = self.base / "tools" / "cargo"
+        target, build = self.repo / "artifacts", self.base / "intermediates"
+        payload = json.dumps({"workspace_root": str(self.repo), "target_directory": str(target),
+                              "build_directory": str(build)})
+        _ = cargo.write_text("#!/bin/sh\nif [ \"$1\" = metadata ]; then\n  printf '%s\\n' '" + payload + "'\nelse\n  exit 99\nfi\n")
+        cargo.chmod(0o755)
+        captured = str(self.repo / "captured-output")
+        row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TARGET_FOLDER": captured})
+        self.assertEqual(row["target_directory"], str(target))
+        self.assertEqual(row["build_directory"], str(build))
+        self.assertIn("target_dir", row)
+        self.assertEqual(row["target_dir"], captured)
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            indexed = connection.execute(
+                "SELECT target_folder, build_history_group, target_directory, build_directory FROM steps"
+            ).fetchall()
+        self.assertEqual(indexed, [(captured, "folder:" + captured, str(target), str(build))])
+
+    def test_floor_scan_records_filesystem_identity_without_changing_old_rows(self) -> None:
+        recorder.floor_scan(1, 2, [], START, filesystem="8-1:/outputs")
+        row, = self.records()
+        self.assertEqual(row["filesystem"], "8-1:/outputs")
+        self.assertEqual(row["shortfall"], 1)
 
     def test_package_and_script_entry_points_work_without_pythonpath(self) -> None:
         repository = SCRIPT.resolve().parents[2]
@@ -540,6 +566,33 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual([row["action"] for row in rows], ["set", "clear"])
         self.assertEqual([row["id"] for row in rows], ["priority-set", "priority-clear"])
         self.assertTrue(all(row["at"] == store.utc_iso(START) for row in rows))
+
+    def test_priority_append_retries_from_its_saved_offset_without_reading_the_old_log(self) -> None:
+        path = store.host_file(store.host_name(), START)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        prefix = b"old month content is not JSON\n" * 128
+        _ = path.write_bytes(prefix)
+        append = store.append_locked
+
+        def stop_after_append(handle: BinaryIO, row: object) -> None:
+            append(handle, row)
+            raise OSError("fixture stopped after priority append")
+
+        with mock.patch.object(json, "loads", wraps=json.loads) as decoded:
+            with mock.patch.object(store, "append_locked", side_effect=stop_after_append), \
+                 self.assertRaises(OSError):
+                recorder.queue_priority("set", "resources", "finish work", "showrunner-id", START,
+                    transition_id="bounded-priority", start=len(prefix))
+            for attempt in range(2):
+                recorder.queue_priority("set", "resources", "finish work", "showrunner-id", START + attempt + 1,
+                    transition_id="bounded-priority", start=len(prefix))
+            self.assertNotIn(mock.call(prefix.splitlines(keepends=True)[0]), decoded.call_args_list)
+            self.assertNotIn(mock.call(prefix.splitlines(keepends=True)[0].decode()), decoded.call_args_list)
+        contents = path.read_bytes()
+        self.assertEqual(contents[:len(prefix)], prefix)
+        row, = [cast(Record, json.loads(line)) for line in contents[len(prefix):].splitlines()]
+        self.assertEqual((row["id"], row["action"], row["unit"], row["at"]),
+                         ("bounded-priority", "set", "resources", store.utc_iso(START)))
 
     def handoff(self) -> Path:
         path = self.base / "handoff.log"

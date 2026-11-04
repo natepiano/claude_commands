@@ -312,9 +312,10 @@ class UnitWatchdogTests(unittest.TestCase):
             return (sessions.LiveSessionProcess(pid) if any(entry["pid"] == pid for entry in self.fixture.live)
                     else sessions.SessionNotLive())
 
-        def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
+        def native_process(pid: int, kind: str, *, resume_id: str = "") -> herdr.NativeAgentProcess:
             self.assertEqual(kind, "claude")
             owner = next(entry for entry in self.fixture.live if entry["pid"] == pid)
+            self.assertEqual(resume_id, owner["sessionId"])
             return herdr.NativeAgentProcess(owner["sessionId"], "fixture-start", {})
 
         with (patch.object(herdr, "shared_session", return_value="shared"),
@@ -323,6 +324,8 @@ class UnitWatchdogTests(unittest.TestCase):
               patch.object(stop_resume, "_tab_of", side_effect=tab),
               patch.object(sessions, "process_start", return_value="fixture-start"),
               patch.object(sessions, "process_liveness", side_effect=process),
+              # This fixture supplies signals; shutdown tests check the workspace guard.
+              patch.object(stop_resume, "_signal_process", side_effect=signal_claude),
               patch.object(os, "kill", side_effect=signal_claude)):
             yield
 
