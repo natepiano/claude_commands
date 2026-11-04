@@ -355,3 +355,21 @@ def log_facts(step: str, text: str) -> LogFacts:
     if step == "sweep":
         facts["sweep_freed_bytes"] = sweep_freed(lines)
     return facts
+
+def test_threads(argv: list[str]) -> int | None:
+    """Return nextest's explicitly requested test width, when it is numeric."""
+    for index, argument in enumerate(argv):
+        value: str | None = None
+        if argument in ("--test-threads", "-j"):
+            if index + 1 < len(argv):
+                value = argv[index + 1]
+        elif argument.startswith("--test-threads="):
+            value = argument.removeprefix("--test-threads=")
+        elif argument.startswith("-j") and len(argument) > 2:
+            value = argument[2:]
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None

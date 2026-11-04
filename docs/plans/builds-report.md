@@ -317,7 +317,7 @@ Each fix returns as a new Change-Review row.
 
 **Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `docs/as-built/` (Definitions).
 
-### Phase 16 — Each build step spends less CPU to write its build-log row  · status: todo
+### Phase 16 — Each build step spends less CPU to write its build-log row  · status: done
 **Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
 
 verify-unit measured 71 ms of CPU each time `verify.sh` starts `record.py`, on every step.
