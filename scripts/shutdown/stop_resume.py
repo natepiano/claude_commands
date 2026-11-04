@@ -171,20 +171,20 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             for pane in client.panes():
                 if pane["session_id"] == identity and not isinstance(
                         client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
-                    if pid := client.codex_launch(pane["pane_id"]).get("pid"):
+                    if pid := client.codex_launch(pane["pane_id"], ["resume", identity]).get("pid"):
                         live, kind = sessions.LiveSessionProcess(pid), "codex"
                         break
         if isinstance(live, sessions.SessionNotLive):
             return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        proved = herdr.native_process(live.pid, kind)
+        proved = herdr.native_process(live.pid, kind, resume_id=identity)
         if proved.identity != identity:
             return StopFailed(identity, "process runs another conversation; no signal sent")
         started = proved.started
         if not _same_process(live.pid, started):
             return NotRunning(identity)
-        if herdr.native_process(live.pid, kind) != proved:
+        if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
             return StopFailed(identity, "process identity changed; no signal sent")
         os.kill(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
@@ -196,7 +196,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         else:
             return Stopped(identity, live.pid)
         if _same_process(live.pid, started):
-            if herdr.native_process(live.pid, kind) != proved:
+            if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
                 return StopFailed(identity, "process identity changed; no signal sent")
             os.kill(live.pid, signal.SIGKILL)
             deadline = monotonic() + KILL_GRACE_SECONDS
