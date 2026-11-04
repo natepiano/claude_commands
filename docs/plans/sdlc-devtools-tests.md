@@ -678,6 +678,26 @@ Every tool takes a unit's location from its staff row. A stale or absent Units W
 **Gotchas:** `SessionNotFound` and `NotRunning` do not prove the saved pid stopped; restart checks that pid. `unchanged` and `resumed` distinguish move rerun outcomes.
 **Ruled out:** Absolute-Plan routing, worker-folder copies, transcript relocation, rename journals, and old-name sweeps.
 
+### Phase 4n — Reviewer naming reads the staff folder  · status: todo
+
+**Depends on:** Phase 4w.
+
+Source: resources-unit, 2026-11-04. `assign.sh --role review` fails with `workers: invalid worker state: missing working_dir` (exit 3). Phase 4w removed `working_dir` from unit-owned progress state, but `workers._reviewer_destination` still reads it there. Others wait on this fix; it ships as its own checkpoint off main.
+
+#### Work Order
+
+**Goal:** `assign.sh --role review` names the unit's reviewer from the unit's staff folder.
+
+**Spec:**
+1. `workers._reviewer_destination` reads the folder through `plan_history.staff_directory` with one staff snapshot, as `progress_history._start_run` does. The launcher `--working-dir` stays the fallback for a run with no unit row.
+2. Change the existing reviewer tests to a unit-owned state with no `working_dir`. Add no new copy of the folder.
+
+**Files:**
+- `scripts/direct/workers.py` — the reviewer folder read.
+- `scripts/direct/test_workers.py` — reviewer naming fixtures.
+
+**Acceptance gate:** a unit-owned run state with no `working_dir` names its reviewer from the staff row; `scripts/direct/test_workers.py` passes; basedpyright `0 errors, 0 warnings, 0 notes`.
+
 ### Phase 4g — Both promotions use one rule for local edits  · status: done
 
 #### As-built
@@ -749,43 +769,19 @@ Fixture staff rows hold unit folders; add-unit assertions read staff and expect 
 **Binds later work:** Checkpoints merge into the unit's staff parent preserves status-0 judging and changes the separate `merge_checkpoint.test_passed` judge.
 **Gotchas:** `merge_checkpoint.test_passed` still accepts status 3.
 
-### Phase 4u — Units tables have no Worktree column  · status: todo
+### Phase 4u — Units tables are gone  · status: done
 
-**Depends on:** Phase 4s
+#### As-built
 
-Source: split from Phase 4s (director, 2026-11-03). After 4s no tool reads the cell. This phase stops writing it and removes it from existing documents.
-
-#### Work Order
-
-**Goal:** new and existing Units tables have no Worktree column, and the format guide says the staff row owns the location.
-
-**Spec:**
-1. One heading-based operation in `scripts/production/unit_table.py` removes the complete Worktree column after the caller proves item 3. Remove the header, separator cell, and every row cell together. Keep other tables, extra columns, retirement notes, and other text. A second run changes nothing.
-2. Writers stop writing the cell: `add_unit.desired_row` (`add_unit.py:439`) and `append_row` (`:759`), `rename_unit._units_display` (`rename_unit.py:91`), `rename._unit_doc` (`rename.py:773-784`), `transfer_unit.apply` (`transfer_unit.py:74`, both table layouts; today it writes a dash), `style/add_style._unit_row` (`add_style.py:190`), `_production_text` (`:209`) and its pilot-row replacement. Each writer that edits an existing table removes the column through the operation in item 1.
-3. Before removal, the caller checks every Units row against one staff snapshot. Each row needs its matching member and a typed location (`PresentWorktree` or `RemovedWorktree`). If any member or location is unavailable, keep the entire Worktree column, including its header and separator. Name each unavailable row for repair; never remove only some cells. Admission can precede membership publication (`add_unit.py:1428-1446`); keep the column during that pending state. A new proposed location does not prove published membership. Test mixed valid and `WorktreeUnfilled` rows, missing membership, unreadable staff, and admission before publication. After all required facts are published, remove the column once; a rerun changes nothing.
-4. `docs/production_format.md:143` and `:158`, `commands/producer/to_production.md:105` and `commands/showrunner/rename.md:35` say the staff row owns the location.
-5. Test fixtures change to the new layout. Some legacy fixtures stay for the tests that read an old table.
-
-**Review amendment (Phase 4w plan review, 2026-11-03):** the unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`). Drop every rule that routes by an absolute Plan path or keeps a worker folder copy. Replace the Plan-routing test (`test_merge_checkpoint.py:74`) with assertions on the folder each command runs in.
+No production doc has a Units table, and no tool writes one. `retire_unit.py` lost its Units row rewrite; main had already removed the other writers, and `unit_table.py` was gone. `docs/production_format.md` says the staff row holds identity, parent and worktree, and `.unit.toml` holds plan, port and responsibilities. No port needed a copy into `.unit.toml`. Checkpoint f26c05f0e on `sdlc-devtools`.
 
 **Files:**
-- `scripts/production/unit_table.py` — column removal.
-- `scripts/production/add_unit.py`, `rename_unit.py`, `rename.py`, `transfer_unit.py`, `scripts/style/add_style.py` — writers.
+- `scripts/production/retire_unit.py` — the last Units row writer deleted.
 - `docs/production_format.md`, `commands/producer/to_production.md`, `commands/showrunner/rename.md` — format text.
-- `scripts/production/test_unit_table.py` — both layouts, repeated removal, extra columns, other tables, and mixed valid and unavailable rows.
-- `scripts/production/test_add_unit.py`, `scripts/production/test_add_unit_rerun.py` — admission before membership publication preserves the complete legacy column.
-- `scripts/style/test_add_style.py` — the new layout.
-- `scripts/production/add_unit_test_support.py`, `merge_checkpoint_test_support.py`, `production_lifecycle_test_support.py`, `rename_test_support.py`, `rename_unit_test_support.py`, `staff_test_support.py`, `transfer_unit_test_support.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/style/style_plan_test_support.py` — fixture builders in the new layout.
+- `docs/plans/{builds,sdlc,natedev}-production.md` — Units tables deleted.
+- `scripts/production/test_tidy_wrapped.py`, `scripts/style/test_style_plan_borrowing.py` — fixtures without Units tables.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the source and format files.
-- `test` — the tests and fixtures.
-
-**State:** a writer removes the complete Worktree column only after every row has its required staff facts. A pending admission or unavailable row preserves the complete column.
-
-**Constraints from prior phases:** Phase 4s readers ignore the cell. `staff_sources` reads it only during legacy import. Keep Delegation Context → Ownership and Test runs. Staff rows hold canonical unit names from `unit_names.name`. A missing absolute Plan folder is unavailable (`staff.StaffUnreadable`; `unit_lookup.py:107-108`). A requested checkpoint refuses with the unit and folder; unrelated rows do not block it (`merge_checkpoint.py:277-306`). Read-only consumers report the bad row and keep the other rows. Keep `test_unit_lookup.py`, the requested-checkpoint regressions in `test_merge_checkpoint.py`, and the partial-report regressions.
-
-**Acceptance gate:** fully populated tables lose the complete Worktree column. Mixed valid and unfilled rows preserve the complete column. Admission before membership publication preserves it; publication permits removal. A second removal changes nothing. Each writer runs `python3 -m unittest` on its named test files. Require `0 errors, 0 warnings, 0 notes` from `basedpyright` for each slot. One director gate.
+**Binds later work:** the plan's one home is `.unit.toml`; staff holds no plan or port.
 
 ### Phase 4x — Checkpoints merge into the unit's staff parent  · status: todo
 
@@ -878,6 +874,21 @@ Retire stops the unit and worker staff rows by `current_session`. It refuses unc
 
 **Files:**
 - `scripts/lib/{main_sync.py,test_main_sync.py}`, `config/send.conf` — send-once through send.py and its regressions.
+
+### Phase 4m — Assigning a unit a plan writes the staff plan  · status: todo
+
+**Depends on:** none (sdlc, 2026-11-04). Own checkpoint off main 3ffe2193f.
+
+#### Work Order
+
+**Goal:** `progress_history.py start-run` writes the run's plan into the unit's `.unit.toml`, so as-built scope follows the plan the unit ran.
+
+**Spec:**
+1. The plan's one home is `.unit.toml` (`unit_config.UnitConfig.plan`); staff holds no plan (sdlc ruling, 2026-11-04). Add `unit_config.set_plan`; `_start_run` calls it for a unit's run. No staff operation, no copy.
+2. phases-unit edits its own `.unit.toml` plan for its as-built; no tool run from this unit.
+
+**Files:**
+- `scripts/production/unit_config.py`, `scripts/direct/{progress_history.py,test_progress_history.py}` — the fix and its regression.
 
 ### Phase 4r — One config read serves many settings  · status: done
 
