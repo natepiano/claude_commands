@@ -30,6 +30,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import cache, cached_property
+from importlib import import_module
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from datetime import datetime, timezone
@@ -3272,9 +3273,10 @@ def conversation_note(observed: UnknownConversation) -> None:
 
 
 def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
-    from scripts.agents import codex_mesh
     from scripts.lib import unit_runs
 
+    # A static import would close the cycle codex_mesh -> session_staff -> herdr -> codex_mesh.
+    loaded_threads = cast(Callable[[Path, float], set[str]], import_module("scripts.agents.codex_mesh").loaded_threads)
     candidates: list[tuple[int, list[str]]] = []
     unknown: list[str] = []
     try:
@@ -3301,7 +3303,7 @@ def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
     live: dict[str, tuple[int, ...]] = {}
     runs: set[Path] = set()
     for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
-        runs.update(path.parent for path in root.glob(f"*/{codex_mesh.SERVER_FILE}"))
+        runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue
@@ -3328,7 +3330,7 @@ def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
     deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
     for run in sorted(runs):
         try:
-            for identity in codex_mesh.loaded_threads(run, deadline):
+            for identity in loaded_threads(run, deadline):
                 _ = live.setdefault(identity, ())
         except (OSError, ValueError) as error:
             unknown.append(f"{run.name} (Codex hosted threads unknown: {error})")
