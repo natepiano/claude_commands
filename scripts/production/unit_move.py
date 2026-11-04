@@ -15,9 +15,10 @@ import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from subprocess import Popen
 from typing import NamedTuple, cast
@@ -37,7 +38,7 @@ from scripts.lib import unit_runs  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.herdr.pane_launch import agent_kind  # noqa: E402
 from scripts.production import staff  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.shutdown import remote, stop_resume  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
 
@@ -526,6 +527,16 @@ def folder_move_lock(unit: staff.StaffId) -> Generator[None]:
         yield
 
 
+def _start_folder_row(unit: staff.StaffId) -> None:
+    start_row = cast(Callable[[staff.StaffRow, staff.StaffSnapshot, herdr.Herdr], None],
+                     import_module("scripts.shutdown.restart").start_row)
+    record = staff.snapshot()
+    row = record.by_id(unit)
+    if row is None:
+        raise ValueError(f"{unit}: no staff row")
+    start_row(row, record, herdr.Herdr(herdr.shared_session()))
+
+
 def move_folder(unit: staff.StaffId, destination: Path) -> None:
     """Stop, move, publish the location, and resume the unit."""
     destination = destination.expanduser().resolve()
@@ -564,6 +575,12 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
             launch = folder_launch(row)
             if isinstance(launch, FolderLaunch):
                 _ = stop_folder_session(row, launch)
+            else:
+                stopped = stop_resume.stop(row.current_session)
+                if isinstance(stopped, stop_resume.StopFailed):
+                    print(f"unit_move: {stopped.reason}", file=sys.stderr)
+                elif isinstance(stopped, stop_resume.SessionNotFound):
+                    print(f"unit_move: session not found: {stopped.name}", file=sys.stderr)
         except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
             print(f"unit_move: {error}", file=sys.stderr)
         pause_folder_workers(runs)
@@ -572,9 +589,12 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
             try:
                 _ = git(old, "worktree", "move", str(old), str(destination))
             except RenameRefused:
-                if was_live and isinstance(launch, FolderLaunch):
+                if was_live:
                     try:
-                        resume_folder_session(row, launch, old, old, runs)
+                        if isinstance(launch, FolderLaunch):
+                            resume_folder_session(row, launch, old, old, runs)
+                        else:
+                            _start_folder_row(unit)
                     except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
                         print(f"unit_move: {error}", file=sys.stderr)
                 raise
@@ -586,6 +606,11 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                 print(f"unit_move: {error}", file=sys.stderr)
         else:
             resume_folder_workers(row, runs, old, destination)
+            if was_live:
+                try:
+                    _start_folder_row(unit)
+                except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
+                    print(f"unit_move: {error}", file=sys.stderr)
         print(f"moved {unit}: {old} -> {destination}")
 
 

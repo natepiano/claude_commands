@@ -23,7 +23,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import FolderMoveBackend, FolderMoveFixture
 from scripts.production.add_unit_test_support import AddUnitTestCase
 from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
-from scripts.shutdown import pane_record
+from scripts.shutdown import pane_record, restart, stop_resume
 from scripts.message import sessions
 import herdr
 import unit_move
@@ -282,11 +282,35 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(command[command.index("--resume") + 1], self.owner.current_session)
 
     def test_missing_launch_record_prints_one_line_and_finishes_the_move(self) -> None:
-        backend = self.folder_backend()
+        backend = self.folder_backend(live=True)
         entries = pane_record.read("agents")
         del entries["w1:p1"]
         pane_record.save("agents", entries)
-        result = self.move_folder()
+        stopped: list[str] = []
+        started: list[str] = []
+
+        def stop(session: str) -> stop_resume.Stopped:
+            self.assertEqual(session, self.owner.current_session)
+            self.assertTrue(self.old_folder.is_dir())
+            self.assertTrue(backend.live)
+            backend.live = False
+            stopped.append(session)
+            return stop_resume.Stopped(session, backend.pid)
+
+        def start(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr) -> None:
+            self.assertEqual(row.current_session, self.owner.current_session)
+            self.assertEqual(record.by_id(row.id), row)
+            self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.new_folder))
+            self.assertTrue(self.new_folder.is_dir())
+            self.assertFalse(backend.live)
+            self.assertIs(client, backend)
+            backend.live = True
+            started.append(row.current_session)
+
+        with (mock.patch.object(stop_resume, "stop", side_effect=stop),
+              mock.patch.object(restart, "start_row", side_effect=start),
+              mock.patch.object(herdr, "shared_session", return_value="agents")):
+            result = self.move_folder()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("no retained launch", result.stderr)
@@ -297,7 +321,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(selected.worktree,
                          staff.PresentWorktree("natedev", self.new_folder))
         self.assertEqual(pane_record.read("agents"), entries)
-        self.assertEqual((backend.starts, backend.stops), ([], []))
+        self.assertEqual(stopped, [self.owner.current_session])
+        self.assertEqual(started, [self.owner.current_session])
 
     def test_failed_worker_pause_prints_one_line_and_finishes_the_move(self) -> None:
         backend = self.folder_backend(live=True)
