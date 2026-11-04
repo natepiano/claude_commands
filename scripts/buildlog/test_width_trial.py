@@ -19,6 +19,7 @@ from typing import NamedTuple, cast, override
 from unittest.mock import patch
 
 import store
+import index
 import width_trial as trial
 from test_index import use_test_log
 
@@ -57,7 +58,7 @@ class WidthTrialTests(unittest.TestCase):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         self.root.mkdir()
-        self.index = self.root / store.INDEX_NAME
+        self.index = index.index_path_in(self.root)
         self.peaks = self.root / "admission" / "anon_peaks.jsonl"
         home = Path(temporary) / "home"
         hana = home / "rust/hana"
