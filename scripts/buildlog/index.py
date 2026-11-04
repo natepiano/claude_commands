@@ -1,28 +1,26 @@
 """The SQLite index over the build log's JSON lines.
 
-<root>/index.sqlite is derived and disposable: the JSON lines are the record,
-and `buildlog reindex` rebuilds this from nothing, as does a schema version
-change. Every query first brings it up to date: for each <root>/*/*.jsonl it
-reads only the complete lines past the offset it stopped at last time. sync
-replaces a file by rename, so a file is known by its path, its first bytes and
-the bytes just before its offset, never by its inode: a file that shrank, or
-whose bytes there changed, is read again from the start, its old rows dropped
-first. The first bytes hold the first record's id, so a file that started over
-differs there even when its records end alike.
+Each schema has a derived index file. The JSON lines are the permanent record.
+`buildlog reindex` rebuilds the current schema from those lines.
+Each query updates the index with complete rows after its saved file offsets.
+File marks detect replacement or truncation and force a new read from the start.
 
-One updater at a time: an exclusive flock on <root>/index.lock, then BEGIN
-IMMEDIATE with a busy timeout, so a reader never waits on a half-made index.
+An exclusive flock on <root>/index.lock permits one updater at a time.
+BEGIN IMMEDIATE and a busy timeout protect index transactions.
 """
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
+import re
 import sqlite3
+import time
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -30,19 +28,24 @@ from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, BinaryIO, TypedDict, cast
 from urllib.parse import quote
 
-import store
-import parse
+if __package__:
+    from . import store, parse
+else:
+    import store
+    import parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
+    from ..lib import conf
     from ..test_times.gate_record import TYPE_CHECK_JOB
 else:
+    from scripts.lib import conf
     from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 SCHEMA_VERSION = 31
 
 
-# These indexes extend the current schema without rebuilding the recorded rows.
+# These indexes support repeated queries over the current schema.
 COST_INDEXES = (
     "CREATE INDEX IF NOT EXISTS steps_session_previous ON steps (session, started_at_us DESC, id DESC) WHERE step = 'nextest'",
     "CREATE INDEX IF NOT EXISTS steps_execution_end ON steps ((unixepoch(started_at,'subsec') + duration_s)) WHERE duration_s > 0",
@@ -54,6 +57,13 @@ COST_INDEXES = (
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
+INDEX_PREFIX = "index"
+INDEX_SUFFIX = ".sqlite"
+INDEX_PATTERN = re.compile(rf"{INDEX_PREFIX}(-[0-9a-f]{{64}})?{re.escape(INDEX_SUFFIX)}")
+BOOKKEEPING_TABLES = {
+    "meta": "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)",
+    "files": "CREATE TABLE files (path TEXT PRIMARY KEY, offset INTEGER, marks TEXT)",
+}
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
 # A Mac "no tests to run" (status 4) and a natedev nextest step stopped because
@@ -568,11 +578,19 @@ WHERE j.run_state != 'carried_over' GROUP BY day, j.workflow, j.name""",
 
 
 def index_path() -> Path:
-    return store.root() / store.INDEX_NAME
+    """Return the current schema path in the build log root."""
+    return index_path_in(store.root())
 
 
-def read_only_uri() -> str:
-    return f"file:{quote(str(index_path()))}?mode=ro"
+def index_path_in(root: Path) -> Path:
+    """Name the index by its schema SQL and version within the selected root."""
+    schema = json.dumps((SCHEMA_VERSION, schema_statements()), separators=(",", ":"))
+    digest = hashlib.sha256(schema.encode("utf-8")).hexdigest()
+    return root / f"{INDEX_PREFIX}-{digest}{INDEX_SUFFIX}"
+
+
+def read_only_uri(root: Path) -> str:
+    return f"file:{quote(str(index_path_in(root)))}?mode=ro"
 
 
 @contextmanager
@@ -587,9 +605,9 @@ def update_lock() -> Generator[None]:
         os.close(descriptor)
 
 
-def create_schema(connection: sqlite3.Connection) -> None:
-    statements = ["CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)"]
-    statements.append("CREATE TABLE files (path TEXT PRIMARY KEY, offset INTEGER, marks TEXT)")
+def schema_statements() -> list[str]:
+    """Return the SQL that defines every table, column, index, and view."""
+    statements = list(BOOKKEEPING_TABLES.values())
     for table, (columns, key, _) in TABLES.items():
         body = [f"{name} {kind}" for name, kind, _ in columns]
         if key:
@@ -614,25 +632,29 @@ def create_schema(connection: sqlite3.Connection) -> None:
     for view, (_, select) in VIEWS.items():
         statements.append(f"CREATE VIEW {view} AS {select}")
     statements.extend(COST_INDEXES)
-    for statement in statements:
+    return statements
+
+
+def create_schema(connection: sqlite3.Connection) -> None:
+    for statement in schema_statements():
         _ = connection.execute(statement)
     _ = connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
-def open_for_update() -> sqlite3.Connection:
-    """The index at the current schema; any other version is deleted and made again."""
-    path = index_path()
+def open_for_update(path: Path) -> sqlite3.Connection:
+    """Open the current schema file and rebuild it when its version or tables differ."""
     connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
     version = cast(tuple[int], connection.execute("PRAGMA user_version").fetchone())[0]
-    if version != SCHEMA_VERSION:
+    tables = {row[0] for row in cast(list[tuple[str]], connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall())}
+    if version != SCHEMA_VERSION or not (set(TABLES) | set(BOOKKEEPING_TABLES)).issubset(tables):
         connection.close()
         path.unlink(missing_ok=True)
         connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
         _ = connection.execute("BEGIN IMMEDIATE")
         create_schema(connection)
         _ = connection.execute("COMMIT")
-    for statement in COST_INDEXES:
-        _ = connection.execute(statement)
     _ = connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 
@@ -1033,13 +1055,32 @@ def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple
     return lines
 
 
+def cleanup_unused_indexes(root: Path, current: Path) -> None:
+    """Delete old schema files; deletion between stat and unlink costs only one rebuild."""
+    candidates = [path for path in root.iterdir()
+                  if path != current and INDEX_PATTERN.fullmatch(path.name)]
+    if not candidates:
+        return
+    unused_days = conf.read("buildlog").number("INDEX_UNUSED_DAYS")
+    cutoff = time.time() - unused_days * 24 * 60 * 60
+    for path in candidates:
+        with suppress(FileNotFoundError):
+            changed = path.stat()
+            if max(changed.st_atime, changed.st_mtime) < cutoff:
+                path.unlink()
+
+
 def update() -> int:
     """Bring the index up to date with the JSON lines; returns the lines read."""
     root = store.root()
     root.mkdir(parents=True, exist_ok=True)
     with update_lock():
-        connection = open_for_update()
+        current = index_path_in(root)
+        connection = open_for_update(current)
         try:
+            now = time.time()
+            if now - current.stat().st_mtime > 86400:
+                os.utime(current, (now, now))
             _ = connection.execute("BEGIN IMMEDIATE")
             known = {
                 path: (offset, stored)
@@ -1065,6 +1106,7 @@ def update() -> int:
             raise
         finally:
             connection.close()
+        cleanup_unused_indexes(root, current)
     return lines
 
 
@@ -1075,6 +1117,6 @@ def reindex() -> int:
 
 
 def read_only() -> sqlite3.Connection:
-    connection = sqlite3.connect(read_only_uri(), uri=True, timeout=BUSY_TIMEOUT_MS / 1000)
+    connection = sqlite3.connect(read_only_uri(store.root()), uri=True, timeout=BUSY_TIMEOUT_MS / 1000)
     _ = connection.execute("PRAGMA query_only = ON")
     return connection

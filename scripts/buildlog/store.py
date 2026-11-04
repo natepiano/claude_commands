@@ -26,7 +26,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO, cast
 
-INDEX_NAME = "index.sqlite"
 UNKNOWN_IDENTITY = "unknown"
 CI_DIR = "ci"
 LOGS_DIR = "logs"
@@ -93,15 +92,11 @@ def last_whole_row_end(handle: BinaryIO) -> int:
         return contents.rfind(b"\n") + 1
 
 
-def whole_rows(handle: BinaryIO, start: int) -> Iterator[dict[str, object]]:
-    """Read complete object rows from an already locked binary file.
-
-    A start inside a row skips that row. Invalid rows and the unfinished tail
-    do not count as records. The caller keeps its shared or exclusive flock.
-    """
+def _whole_row_bytes(handle: BinaryIO, start: int) -> bytearray:
+    """Copy complete row bytes while the caller holds the file lock."""
     end = last_whole_row_end(handle)
     if start >= end:
-        return
+        return bytearray()
     _ = handle.seek(max(0, start - 1))
     contents = bytearray()
     while handle.tell() < end:
@@ -111,7 +106,15 @@ def whole_rows(handle: BinaryIO, start: int) -> Iterator[dict[str, object]]:
         contents.extend(block)
     if start > 0:
         contents = contents.partition(b"\n")[2]
-    for line in contents.split(b"\n")[:-1]:
+    return contents
+
+
+def _object_rows(contents: bytearray) -> Iterator[dict[str, object]]:
+    """Decode complete object rows and skip invalid rows."""
+    position = 0
+    while (end := contents.find(b"\n", position)) != -1:
+        line = contents[position:end]
+        position = end + 1
         try:
             decoded = cast(object, json.loads(line.decode("utf-8")))
         except (UnicodeDecodeError, ValueError):
@@ -120,14 +123,24 @@ def whole_rows(handle: BinaryIO, start: int) -> Iterator[dict[str, object]]:
             yield cast(dict[str, object], decoded)
 
 
+def whole_rows(handle: BinaryIO, start: int) -> Iterator[dict[str, object]]:
+    """Read complete object rows from an already locked binary file.
+
+    A start inside a row skips that row. Invalid rows and the unfinished tail
+    do not count as records. The caller keeps its shared or exclusive flock.
+    """
+    yield from _object_rows(_whole_row_bytes(handle, start))
+
+
 def locked_rows(path: Path, start: int = 0) -> Iterator[dict[str, object]]:
-    """Read complete rows under a shared lock; an absent file has no rows."""
+    """Copy bytes under a shared lock, then decode rows; an absent file has no rows."""
     try:
         with path.open("rb") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-            yield from whole_rows(handle, start)
+            contents = _whole_row_bytes(handle, start)
     except FileNotFoundError:
         return
+    yield from _object_rows(contents)
 
 
 def read_last_whole_row_end(path: Path) -> int:

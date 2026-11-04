@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing
 import json
 import os
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -100,6 +101,19 @@ class GateIndexTests(unittest.TestCase):
     def snapshot(self) -> dict[str, list[Record]]:
         return {table: table_rows(table) for table in GATE_TABLES}
 
+    def test_missing_gate_tables_recover_all_recorded_attempts(self) -> None:
+        source = self.write_run("recovered", fixture_run())
+        self.assertEqual(index.update(), 1)
+        before = self.snapshot()
+        original = (self.root / source).read_bytes()
+        table = GATE_TABLES[0]
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute(f"DROP TABLE {table}")
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(index.update(), 0)
+        self.assertEqual((self.root / source).read_bytes(), original)
+
     def test_gate_rows_preserve_fields_attempts_and_last_attempt_totals(self) -> None:
         run = fixture_run()
         source = self.write_run("gate-one", run)
@@ -148,7 +162,7 @@ class GateIndexTests(unittest.TestCase):
         removed = self.write_run("remove", fixture_run(), host="first-host")
         kept = self.write_run("keep", fixture_run(), host="second-host")
         self.assertEqual(index.update(), 2)
-        with closing(index.open_for_update()) as connection:
+        with closing(index.open_for_update(index.index_path())) as connection:
             index.forget(connection, removed)
         for table in GATE_TABLES:
             with self.subTest(table=table):
