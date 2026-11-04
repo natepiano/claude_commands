@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from functools import cached_property
+from contextlib import closing
 import gzip
 import json
 import os
@@ -26,10 +27,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 if TYPE_CHECKING:
     from ..lib.socket_test_support import short_socket_directory
+    from ..lib.shell_test_support import shell_function
 else:
     from scripts.lib.socket_test_support import short_socket_directory
+    from scripts.lib.shell_test_support import shell_function
 
 import record as recorder
+import step_context
+import index
+import report
 import sample
 import store
 from cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
@@ -49,6 +55,7 @@ else:
     from scripts.lib import test_hang_guard
 
 SCRIPT = Path(__file__).with_name("record.py")
+CONTEXT_SCRIPT = SCRIPT.with_name("step_context.py")
 TESTDATA = Path(__file__).with_name("testdata")
 START = datetime(2026, 10, 2, 12, 0, tzinfo=UTC).timestamp()
 CALL_ID = "natedev-20261002T120000-abcdef"
@@ -76,6 +83,10 @@ AMBIENT = (
     "BUILDLOG_TREE_START",
     "BUILDLOG_SENT_TREE_KEY",
     "BUILDLOG_MEM_WAIT_S",
+    "BUILDLOG_TARGET_FOLDER",
+    "BUILDLOG_KNOWN_TARGET_DIR",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_TARGET_DIR",
 )
 Record = dict[str, object]
 
@@ -164,11 +175,12 @@ class RecordTests(unittest.TestCase):
         return result.stdout.strip()
 
     def record(
-        self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None
+        self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None, input: str = ""
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *args],
+            [sys.executable, str(CONTEXT_SCRIPT if args[0] == "step-context" else SCRIPT), *args],
             cwd=cwd or self.repo,
+            input=input,
             env=self.environment(**(extra or {})),
             capture_output=True,
             text=True,
@@ -177,10 +189,11 @@ class RecordTests(unittest.TestCase):
         )
 
     def step(
-        self, status: int, tty: str, handoff: str, peak: str, argv: list[str], extra: dict[str, str] | None = None
+        self, status: int, tty: str, handoff: str, peak: str, argv: list[str], extra: dict[str, str] | None = None,
+        *, cwd: Path | None = None
     ) -> Record:
         result = self.record(
-            "step", str(status), str(START), str(START + 12.5), tty, handoff, peak, *argv, extra=extra
+            "step", str(status), str(START), str(START + 12.5), tty, handoff, peak, *argv, extra=extra, cwd=cwd
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.records()[-1]
@@ -198,16 +211,306 @@ class RecordTests(unittest.TestCase):
                               "build_directory": str(build)})
         _ = cargo.write_text("#!/bin/sh\nif [ \"$1\" = metadata ]; then\n  printf '%s\\n' '" + payload + "'\nelse\n  exit 99\nfi\n")
         cargo.chmod(0o755)
-        row = self.step(0, "1", "", "", NEXTEST)
+        captured = str(self.repo / "captured-output")
+        row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TARGET_FOLDER": captured})
         self.assertEqual(row["target_directory"], str(target))
         self.assertEqual(row["build_directory"], str(build))
         self.assertIn("target_dir", row)
+        self.assertEqual(row["target_dir"], captured)
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            indexed = connection.execute(
+                "SELECT target_folder, build_history_group, target_directory, build_directory FROM steps"
+            ).fetchall()
+        self.assertEqual(indexed, [(captured, "folder:" + captured, str(target), str(build))])
 
     def test_floor_scan_records_filesystem_identity_without_changing_old_rows(self) -> None:
         recorder.floor_scan(1, 2, [], START, filesystem="8-1:/outputs")
         row, = self.records()
         self.assertEqual(row["filesystem"], "8-1:/outputs")
         self.assertEqual(row["shortfall"], 1)
+
+    def test_package_and_script_entry_points_work_without_pythonpath(self) -> None:
+        repository = SCRIPT.resolve().parents[2]
+        workspace = self.base / "cargo-workspace"
+        workspace.mkdir()
+        _ = (workspace / "Cargo.toml").write_text('[workspace]\nmembers = []\n', encoding="utf-8")
+        (workspace / "scripts").symlink_to(repository / "scripts", target_is_directory=True)
+        environment = self.environment(CARGO_HOME=str(self.base / "cargo-home"))
+        _ = environment.pop("PYTHONPATH", None)
+        for statement in ("from scripts.test_times import gate_record", "import scripts.buildlog.record"):
+            with self.subTest(entry_point=statement):
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c", statement], cwd=repository, env=environment,
+                    capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for entry_point in (["-m", "scripts.buildlog.step_context"], [str(CONTEXT_SCRIPT.resolve())]):
+            with self.subTest(entry_point=entry_point):
+                result = subprocess.run(
+                    [sys.executable, "-B", *entry_point, "step-context", "cargo", "check"],
+                    cwd=workspace, env=environment, input="", capture_output=True, text=True,
+                    check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(len(lines), 2, result.stdout + result.stderr)
+                self.assertEqual(lines[1], str(workspace / "target"))
+
+    def folder_context(self, argv: list[str], *, extra: dict[str, str] | None = None,
+                       cwd: Path | None = None, metadata: str = "") -> str:
+        result = self.record("step-context", *argv, cwd=cwd, input=metadata,
+                             extra={"CARGO_HOME": str(self.base / "cargo-home"), **(extra or {})})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 2, result.stdout + result.stderr)
+        self.assertNotEqual(lines[1], "")
+        return lines[1]
+
+    def assert_folder_record(self, argv: list[str], expected: str, *, extra: dict[str, str] | None = None,
+                             cwd: Path | None = None, metadata: str = "") -> Record:
+        captured = self.folder_context(argv, extra=extra, cwd=cwd, metadata=metadata)
+        errors = self.root / "errors.log"
+        self.assertEqual(captured, expected, errors.read_text() if errors.exists() else "")
+        row = self.step(0, "1", "", "", argv,
+                        {**(extra or {}), "BUILDLOG_TARGET_FOLDER": captured}, cwd=cwd)
+        self.assertEqual(row["target_dir"], expected)
+        return row
+
+    def resolved_folder(self, argv: list[str], *, extra: dict[str, str] | None = None,
+                        cwd: Path | None = None, metadata: str = "") -> str:
+        environment = self.environment(CARGO_HOME=str(self.base / "cargo-home"), **(extra or {}))
+        return step_context.target_folder_text(step_context.resolve_target_folder(
+            argv, str(cwd or self.repo), environment, metadata))
+
+    def test_each_cargo_step_records_its_cli_folder(self) -> None:
+        for kind in ("build", "check", "clippy", "mend", "doc", "nextest"):
+            with self.subTest(kind=kind):
+                folder = str(self.repo / (kind + " output"))
+                self.assertEqual(self.resolved_folder(["cargo", kind, "--target-dir", folder],
+                                                     extra={"CARGO_TARGET_DIR": "ignored"}), folder)
+
+    def test_environment_precedence_and_relative_paths_reach_the_writer(self) -> None:
+        cases = (
+            ({"CARGO_TARGET_DIR": "relative", "CARGO_BUILD_TARGET_DIR": "lower"}, self.repo / "relative"),
+            ({"CARGO_BUILD_TARGET_DIR": str(self.base / "absolute")}, self.base / "absolute"),
+        )
+        for environment, expected in cases:
+            with self.subTest(environment=environment):
+                self.assertEqual(self.resolved_folder(NEXTEST, extra=environment), str(expected))
+
+    def test_target_flag_equals_stops_at_separator_and_uses_selected_toolchain(self) -> None:
+        self.assertEqual(self.resolved_folder(["/usr/bin/cargo", "+nightly", "clippy", "--target-dir=chosen",
+                                               "--", "--target-dir=ignored"]), str(self.repo / "chosen"))
+
+    def test_env_wrapper_assignments_removals_and_directory_select_the_folder(self) -> None:
+        other = self.base / "directory with spaces"
+        other.mkdir()
+        self.assertEqual(self.resolved_folder(["/usr/bin/env", "-u", "CARGO_TARGET_DIR", "-C", str(other),
+                                               "CARGO_BUILD_TARGET_DIR=wrapped", "cargo", "check"],
+                                              extra={"CARGO_TARGET_DIR": "ignored"}), str(other / "wrapped"))
+
+    def test_config_ancestors_override_cargo_home_with_their_own_relative_base(self) -> None:
+        cargo_home = self.base / "cargo-home"
+        cargo_home.mkdir()
+        _ = (cargo_home / "config.toml").write_text('[build]\ntarget-dir = "home-output"\n')
+        self.assertEqual(self.resolved_folder(NEXTEST), str(self.base / "home-output"))
+        config = self.repo / ".cargo"
+        config.mkdir()
+        _ = (config / "config.toml").write_text('[build]\ntarget-dir = "repo-output"\n')
+        member = self.repo / "crates" / "member"
+        member.mkdir(parents=True)
+        _ = self.assert_folder_record(NEXTEST, str(self.repo / "repo-output"), cwd=member)
+        self.assertEqual(self.resolved_folder(NEXTEST, cwd=member, extra={"CARGO_TARGET_DIR": "env-output"}),
+                         str(member / "env-output"))
+
+    def test_existing_metadata_and_known_folder_avoid_cargo_discovery(self) -> None:
+        metadata = json.dumps({"workspace_root": str(self.repo), "target_directory": str(self.base / "metadata")})
+        self.assertEqual(self.resolved_folder(["/missing/cargo", "build"], metadata=metadata), str(self.base / "metadata"))
+        self.assertEqual(self.resolved_folder(["/missing/cargo", "nextest", "run"],
+                                             extra={"BUILDLOG_KNOWN_TARGET_DIR": str(self.base / "known")}),
+                         str(self.base / "known"))
+
+    def test_workspace_default_reads_manifests_for_members_and_external_manifests(self) -> None:
+        _ = (self.repo / "Cargo.toml").write_text('[workspace]\nmembers = ["member"]\nresolver = "2"\n')
+        member = self.repo / "member"
+        member.mkdir()
+        _ = (member / "Cargo.toml").write_text('[package]\nname = "member"\nversion = "0.1.0"\n')
+        (member / "src").mkdir()
+        _ = (member / "src/lib.rs").write_text("")
+        _ = self.assert_folder_record(["/missing/cargo", "check"], str(self.repo / "target"), cwd=member)
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        _ = self.assert_folder_record(["/missing/cargo", "check", "--manifest-path=" + str(member / "Cargo.toml")],
+                                      str(self.repo / "target"), cwd=elsewhere)
+        metadata = json.dumps({"workspace_root": str(elsewhere), "target_directory": str(elsewhere / "wrong")})
+        _ = self.assert_folder_record(["/missing/cargo", "check"], str(self.repo / "target"), cwd=member, metadata=metadata)
+
+    def test_external_package_workspace_redirect_selects_the_workspace_default(self) -> None:
+        member = self.base / "redirected-package"
+        (member / "src").mkdir(parents=True)
+        _ = (member / "src/lib.rs").write_text("")
+        _ = (member / "Cargo.toml").write_text(
+            '[package]\nname = "redirected"\nversion = "0.1.0"\nworkspace = "../hana"\n')
+        _ = (self.repo / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["../redirected-package"]\nresolver = "2"\n')
+        _ = self.assert_folder_record(["/missing/cargo", "check"], str(self.repo / "target"), cwd=member)
+
+    def test_workspace_default_reads_manifests_without_starting_cargo(self) -> None:
+        _ = (self.repo / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("Cargo must not start")):
+            self.assertEqual(self.resolved_folder(["/missing/cargo", "+nightly", "check"]), str(self.repo / "target"))
+        _ = self.assert_folder_record(["/missing/cargo", "check"], str(self.repo / "target"))
+
+    def test_env_separator_keeps_assignments_before_the_cargo_command(self) -> None:
+        argv = ["env", "--", "CARGO_TARGET_DIR=/x", "cargo", "check"]
+        self.assertEqual(self.resolved_folder(argv), "/x")
+        _ = self.assert_folder_record(argv, "/x")
+
+    def test_changed_target_environment_rejects_the_callers_metadata(self) -> None:
+        _ = (self.repo / "Cargo.toml").write_text('[workspace]\n')
+        metadata = json.dumps({"workspace_root": str(self.repo), "target_directory": "/stale"})
+        for variable in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+            for wrapper in (["-u", variable], [variable + "="], [variable + "=changed"]):
+                with self.subTest(variable=variable, wrapper=wrapper):
+                    argv = ["env", *wrapper, "cargo", "check"]
+                    expected = self.repo / ("changed" if wrapper == [variable + "=changed"] else "target")
+                    self.assertEqual(self.resolved_folder(argv, extra={variable: "/stale"}, metadata=metadata), str(expected))
+        _ = self.assert_folder_record(["env", "-u", "CARGO_TARGET_DIR", "cargo", "check"], str(self.repo / "target"),
+                                      extra={"CARGO_TARGET_DIR": "/stale", "BUILDLOG_KNOWN_TARGET_DIR": "/stale"},
+                                      metadata=metadata)
+
+    def test_unresolved_steps_never_read_or_establish_warm_history(self) -> None:
+        argv = ["cargo", "check", "--manifest-path", str(self.base / "missing/Cargo.toml")]
+        captured = self.folder_context(argv)
+        self.assertEqual(captured, "unresolved")
+        for number in range(2):
+            handoff = self.base / f"build-{number}.log"
+            _ = handoff.write_text('    Finished `dev` profile target(s) in 1.0s\n')
+            result = self.record("step", "0", str(START + number * 20), str(START + number * 20 + 1),
+                                 "0", str(handoff), "", *argv, extra={"BUILDLOG_TARGET_FOLDER": captured})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            row = self.records()[-1]
+            self.assertEqual(row["target_dir"], "unresolved")
+            self.assertEqual(row["finished_s"], 1.0)
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            rows = connection.execute("SELECT target_folder, build_history_group, " + report.warm_step_clause()
+                                      + " FROM steps").fetchall()
+        self.assertEqual(rows, [(None, None, 0), (None, None, 0)])
+
+    def test_steps_without_cargo_output_record_none_despite_inherited_folder(self) -> None:
+        for argv in (["cargo", "+nightly", "fmt", "--all"], ["taplo", "fmt"], SWEEP, ["python3", "tool.py"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.resolved_folder(argv, extra={"CARGO_TARGET_DIR": "inherited"}), "none")
+        fields: Record = {"pid": 123, "port": 15803, "binary": "/tmp/existing-app",
+                          "started": "2026-10-02T12:00:00+00:00"}
+        source = self.base / "launch.json"
+        _ = source.write_text(json.dumps(fields))
+        self.assertTrue(recorder.launch(source, self.repo))
+        self.assertEqual(self.records()[-1]["target_dir"], "none")
+
+    def test_malformed_config_records_unresolved_and_an_error(self) -> None:
+        config = self.repo / ".cargo"
+        config.mkdir()
+        _ = (config / "config.toml").write_text('[build\n')
+        _ = self.assert_folder_record(NEXTEST, "unresolved")
+        self.assertIn("target folder:", (self.root / "errors.log").read_text())
+
+    def test_captured_folder_survives_config_change_and_pending_retry(self) -> None:
+        config = self.repo / ".cargo"
+        config.mkdir()
+        file = config / "config.toml"
+        _ = file.write_text('[build]\ntarget-dir = "first"\n')
+        captured = self.folder_context(NEXTEST)
+        self.assertEqual(captured, str(self.repo / "first"))
+        _ = file.write_text('[build]\ntarget-dir = "second"\n')
+        environment = self.environment(BUILDLOG_TARGET_FOLDER=captured)
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(os, "getcwd", return_value=str(self.repo)), \
+                mock.patch.object(recorder, "write_step_line", side_effect=OSError("delayed publication")):
+            recorder.step(["0", str(START), str(START + 1), "1", "", "", *NEXTEST])
+        pending = list(recorder.pending_steps_root().glob("*.json"))
+        self.assertEqual(len(pending), 1)
+        with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "changed"}):
+            _ = recorder.finish_pending_step(pending[0])
+        self.assertEqual(self.records()[-1]["target_dir"], captured)
+        self.assertEqual(self.folder_context(NEXTEST), str(self.repo / "second"))
+
+    def test_shell_completion_branches_preserve_the_folder_and_refresh_saved_arguments(self) -> None:
+        invoke = SCRIPT.parent.parent / "lint/invoke.sh"
+        verify = SCRIPT.parent.parent / "direct/verify.sh"
+
+        shell = "\n".join(shell_function(invoke.read_text(), name) for name in
+                          ("buildlog_read_context", "buildlog_now", "buildlog_begin", "buildlog_write_step", "buildlog_end"))
+        shell += "\n" + shell_function(verify.read_text(), "refresh_test_build_inputs") + "\n"
+        shell += 'tree_key() { printf key; }\n'
+        home = self.base / "shell-home"
+        launcher = home / ".claude/scripts/lib/py"
+        launcher.parent.mkdir(parents=True)
+        socket_root = Path(self.enterContext(short_socket_directory()))
+        address = socket_root / "completion"
+        listener = self.enterContext(socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM))
+        listener.bind(str(address))
+        listener.settimeout(test_hang_guard.TEST_HANG_GUARD_SECS)
+        _ = launcher.write_text('#!' + sys.executable + '\nimport socket, subprocess, sys\n'
+                                + 'result = subprocess.run([sys.executable, *sys.argv[1:]], check=False)\n'
+                                + 'if sys.argv[2] == "step":\n'
+                                + '    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:\n'
+                                + f'        channel.sendto(b"done", {str(address)!r})\n'
+                                + 'raise SystemExit(result.returncode)\n')
+        launcher.chmod(0o755)
+        hold = self.base / "hold-context"
+        hold.mkdir()
+        command = shell + r'''
+export CARGO_TARGET_DIR="$TEST_FIRST_FOLDER"
+buildlog_begin cargo check
+export CARGO_TARGET_DIR="$TEST_CHANGED_FOLDER"
+buildlog_end 0 "" 0 cargo check
+export CARGO_TARGET_DIR="$TEST_FIRST_FOLDER"
+buildlog_begin cargo check --target-dir refresh-output
+refresh_test_build_inputs
+printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
+unset CARGO_TARGET_DIR
+GATE_METADATA="$TEST_METADATA"
+buildlog_read_context /missing/cargo check
+printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
+GATE_METADATA="" BUILD_TARGET_DIR="$TEST_KNOWN_FOLDER"
+buildlog_read_context /missing/cargo build
+printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
+BUILD_TARGET_DIR="" BUILDLOG_TEST_TARGET_DIR="$TEST_KNOWN_FOLDER"
+buildlog_read_context /missing/cargo nextest run
+printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
+'''
+        completion, refresh = command.split('export CARGO_TARGET_DIR="$TEST_FIRST_FOLDER"', 2)[1:]
+        environment = self.environment(HOME=str(home), BUILDLOG_RECORD=str(SCRIPT),
+            BUILDLOG_SCOPE="0", PY=sys.executable, HOLD_WAIT_DIR=str(hold),
+            TEST_FIRST_FOLDER=str(self.repo / "first"), TEST_CHANGED_FOLDER=str(self.repo / "changed"),
+            TEST_METADATA=json.dumps({"workspace_root": str(self.repo),
+                                      "target_directory": str(self.repo / "metadata-output")}),
+            TEST_KNOWN_FOLDER=str(self.repo / "known-output"))
+        for sync in ("1", "0"):
+            with self.subTest(sync=sync):
+                first = str(self.repo / f"first-{sync}")
+                environment.update(BUILDLOG_SYNC=sync, TEST_FIRST_FOLDER=first)
+                result = subprocess.run(["bash", "-eu", "-c", shell + 'export CARGO_TARGET_DIR="$TEST_FIRST_FOLDER"' + completion], cwd=self.repo, env=environment,
+                                        capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(listener.recv(32), b"done")
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.records()[-1]["target_dir"], first)
+
+        result = subprocess.run(["bash", "-eu", "-c", shell + 'export CARGO_TARGET_DIR="$TEST_FIRST_FOLDER"' + refresh],
+                                cwd=self.repo, env=environment, capture_output=True, text=True,
+                                timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [str(self.repo / "refresh-output"),
+            str(self.repo / "metadata-output"), str(self.repo / "known-output"), str(self.repo / "known-output")])
+
+    def test_older_callers_without_a_captured_folder_record_unresolved(self) -> None:
+        argv = ["cargo", "check", "--target-dir", "older-output"]
+        row = self.step(0, "1", "", "", argv, {"CARGO_TARGET_DIR": "ignored"})
+        self.assertEqual(row["target_dir"], "unresolved")
 
     def test_floor_scan_records_free_space_shortfall_and_the_idle_target_inventory(self) -> None:
         targets: list[recorder.IdleFloorTarget] = [
@@ -725,9 +1028,9 @@ class RecordTests(unittest.TestCase):
         self.assertEqual((record["cwd"], record["repo_path"], record["branch"]), (str(elsewhere), str(self.repo), "main"))
 
     def key(self, *argv: str, cwd: Path | None = None) -> str:
-        result = self.record("key", *argv, cwd=cwd)
+        result = self.record("step-context", *argv, cwd=cwd)
         self.assertEqual(result.returncode, 0, result.stderr)
-        return result.stdout.strip()
+        return result.stdout.splitlines()[0]
 
     def test_tree_key_kept_only_when_the_files_held_still(self) -> None:
         key = self.key(*NEXTEST)

@@ -13,15 +13,7 @@ it changes, and say so in one line.
 
 ## Steps
 
-1. **Set top priority.** Run `/build:queue bump <position|session|folder>` in the showrunner session.
-   The command selects a waiting step and gives its real unit priority.
-   For a unit without a waiting step, use the service client:
-   `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py priority-set --why "<what>" -- "<unit>"`.
-   Use a real unit label from the local roster.
-   The no-unit display placeholder is not a unit.
-   The pane displays unknown-unit refusals from the `build queue: ` stdout protocol with exit 3.
-   A second urgent request replaces the current priority.
-   Give the work top priority across the production.
+1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py bump <position|session|folder>` for a waiting step of the bumped unit. It gives that unit the queue priority until step 5 clears it; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
    Log it in `LOG` as `bump: <unit> <what>`. Tell every other unit director in
    one line: the bumped unit's merge goes first, and a build hold may come. Do
    not wait for the next update tick.

@@ -14,13 +14,11 @@ import json
 import math
 import os
 from pathlib import Path
-import runpy
 import signal
 import subprocess
 import sys
 import time
-from types import SimpleNamespace
-from typing import NotRequired, Protocol, TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
@@ -42,17 +40,6 @@ class Metadata(TypedDict):
     packages: list[Package]
     workspace_members: list[str]
     target_directory: NotRequired[str]
-
-
-class AssertionGuard(Protocol):
-    """The configured guard defines its own base and ruling inputs."""
-
-    GuardError: type[Exception]
-
-    def commit_bases(self, repo: Path, selected_bases: tuple[str, ...] = ("HEAD",), *,
-                     head: str = "", staged: bool = True) -> tuple[str, ...]: ...
-    def git(self, repo: Path, *arguments: str) -> str: ...
-    def read_rulings(self, sources: list[str], messages: str) -> dict[tuple[str, str], str]: ...
 
 
 def run(*args: str | bytes) -> bytes:
@@ -88,13 +75,6 @@ class TreeInputs:
         split = args.index("--")
         self.files: list[str] = args[:split]
         self.words: list[str] = args[split + 1:]
-        self.guard_files: list[str] = self.files[1:2] if self.files[:1] == ["--assertion-guard"] else []
-        self.rulings_folders: list[str] = []
-        if self.guard_files:
-            self.files = self.files[2:]
-            while self.files[:1] == ["--rulings"]:
-                self.rulings_folders.append(self.files[1])
-                self.files = self.files[2:]
         self.package: str = self.files[1] if self.files[:1] == ["--package"] else ""
         if self.package:
             self.files = self.files[2:]
@@ -188,24 +168,6 @@ class TreeInputs:
             key = hashlib.sha256(self.top + b"\0" + run("git", "--no-optional-locks", "-C", self.top, "rev-parse", "HEAD^{tree}"))
             for path in changed:
                 key.update(path + b"\0" + content(os.path.join(self.top, path)))
-        if self.guard_files:
-            # Use the invoked guard's selector for both comparison trees and
-            # ruling ranges. An unresolved base leaves no reusable cache key.
-            assertion_guard = cast(AssertionGuard, cast(object, SimpleNamespace(
-                **runpy.run_path(self.guard_files[0]))))
-            repo = Path(os.fsdecode(self.top))
-            explicit = os.environ.get("VERIFY_ASSERTION_BASE", "")
-            try:
-                for base in assertion_guard.commit_bases(repo, (explicit,) if explicit else (), staged=False):
-                    key.update(b"\0guard-base=" + base.encode())
-                    key.update(assertion_guard.git(repo, "log", "--format=%B", base + "..HEAD", "--").encode())
-                key.update(assertion_guard.git(repo, "rev-parse", "HEAD").encode())
-                rulings = assertion_guard.read_rulings(self.rulings_folders, "")
-            except assertion_guard.GuardError:
-                raise SystemExit(1)
-            for name in self.guard_files:
-                key.update(content(os.fsencode(name)))
-            key.update(json.dumps(sorted(rulings.items()), separators=(",", ":")).encode())
         key.update(run("rustc", "-vV"))
         for name in self.files:
             key.update(content(os.fsencode(name)))

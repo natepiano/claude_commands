@@ -618,7 +618,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
     def test_clean_check_mode_records_all_tools_passing_and_returns_zero(self) -> None:
         verify = self.root / "verify.sh"
-        metadata = self.lint_temp / f"{style_sync.LINT_PREFIX}*"
+        metadata = self.lint_temp / f"{style_sync.lint_prefix()}*"
         _ = verify.write_text(f"#!/bin/bash\ncp {metadata}/owner.json {self.root / 'owner-seen'}\n"
                               + f"cp {metadata}/{style_sync.VERIFIER_FILE} {self.root / 'verifier-seen'}\n"
                               + f"echo $$ > {self.root / 'verify-pid'}\ncat <<'OUTPUT'\n" + CLEAN_LINT + "OUTPUT\n")
@@ -661,7 +661,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         return code, output.getvalue()
 
     def stale_dir(self, name: str, owner: int | None, *, registered: bool, verifier_group: int = 0) -> Path:
-        directory = self.lint_temp / f"{style_sync.LINT_PREFIX}{name}"
+        directory = self.lint_temp / f"{style_sync.lint_prefix()}{name}"
         directory.mkdir()
         if owner is not None:
             common_dir = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
@@ -1014,7 +1014,7 @@ with Path('.claude-busy').open('r+') as lock:
         common_dir = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
         style_sync.OwnerRecord(dead, common_dir).write(planted_target)
         _ = (planted_target / "kept").write_text("kept\n")
-        planted = self.lint_temp / f"{style_sync.LINT_PREFIX}planted"
+        planted = self.lint_temp / f"{style_sync.lint_prefix()}planted"
         planted.symlink_to(planted_target)
         with redirect_stdout(io.StringIO()):
             style_sync.sweep_stale_lint_dirs()

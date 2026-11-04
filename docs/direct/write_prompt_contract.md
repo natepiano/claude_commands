@@ -67,7 +67,6 @@ Codex review prompts also include section 3's command block.
 5. `## Project Context`: include the current context. Omit plan **Style** metadata.
 6. `## Work Specification`: include the following instructions verbatim.
    "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
-   The next Work Order rejects the change or records `Assertion-Change: <path>::<test> — <why>` for `assertion_guard.py`.
    For tests, prohibit constant comparisons, implementation copies, library tests, configured mock tests, existence checks, and duplicate behavior tests.
    Include these repair rules:
    - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.
@@ -145,6 +144,8 @@ its work (`review`, `fix2`), keep it for reuse, and end it only with
 `test` opens against the **specification, not the implementation**. The Work
 Order defines the behavior, so tests can be written before any of it exists;
 a tester that waits for `impl` has converted a parallel team back into a queue.
+In each edit round, `test` also runs the existing tests of the callers of the
+changed code, so a caller red shows before the full gate.
 
 **Every worker carries its own pass kind, which is its assigned role**, so a team
 phase records two passes. The recorder keys them by slot and closes only that slot's stale pass;

@@ -12,13 +12,9 @@ port_lint.py writes its own call records through write_call() here.
       the original row and sources for collect() to finish after a failed
       save. BUILDLOG_TEST_PHASE_FILE names the step's sampled test-phase
       sidecar, retained with those sources; missing observations are unknown.
-      BUILDLOG_TREE_START is the tree key `key` printed
+      BUILDLOG_TREE_START is the tree key step_context.py printed
       before the step; the key taken here, after it, decides tree_key and
       tree_changed.
-  record.py key ARGV...
-      From invoke.sh's run(), before every step: print the tree key
-      (treekey.py) of the worktree the step would be recorded under, or
-      nothing.
   record.py test-phase-context SAMPLING_CONTEXT ARGV...
       Before release, print the reservation's repository and filter metadata
       with the actual post-share argv's test width. The sampler adds its window.
@@ -83,10 +79,11 @@ from test_phase import (
 )
 
 if __package__:
-    from . import cgroup_capture, store
+    from . import cgroup_capture, store, step_context
 else:
     import cgroup_capture
     import store
+    import step_context
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -134,6 +131,30 @@ RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
 LAUNCH_LOCK_NAME = "launches.lock"
 CPU_SIDECAR, IO_SIDECAR = ".cpu.stat", ".io.stat"
+
+
+def git_directory(argv: list[str], cwd: str) -> str:
+    """Keep the directory helper available to memory admission callers."""
+    return step_context.git_directory(argv, cwd)
+
+
+def transcript_target_folder(metadata: Mapping[str, object], parameters: Mapping[str, object]) -> step_context.StepTargetFolder:
+    """Use saved build facts without the collector's current Cargo settings."""
+    target = metadata.get("target_directory")
+    if isinstance(target, str) and Path(target).is_absolute():
+        return step_context.CargoTargetFolder(Path(target))
+    binary, profile = metadata.get("binary_path"), metadata.get("profile") or parameters.get("profile")
+    if isinstance(binary, str) and Path(binary).is_absolute() and profile in ("debug", "release"):
+        path = Path(binary)
+        if metadata.get("launched_as") == "example" and path.parent.name == "examples":
+            path = path.parent
+        if path.parent.name == profile:
+            folder = path.parent.parent
+            if folder.name == "target":
+                return step_context.CargoTargetFolder(folder)
+    return step_context.UnresolvedTargetFolder()
+
+
 def sync_config() -> dict[str, str]:
     """Read peer settings when a sync or report needs them."""
     path = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(Path(__file__).resolve().parents[2]
@@ -229,6 +250,7 @@ class LaunchStep(GitFacts):
     ended_at: str
     duration_s: None
     step: Literal["launch"]
+    target_dir: str
     argv: list[str]
     cwd: str
     caller: Literal["hana-shot"]
@@ -313,7 +335,7 @@ def hana_launch_record(fields: Mapping[str, object], directory: str) -> LaunchSt
         started_at=started, ended_at=started, duration_s=None, step="launch", argv=[binary], cwd=directory,
         **facts, caller="hana-shot", session=identity["session"], worker=identity["worker"],
         unit_session=identity["unit_session"], mem_wait_s=None,
-        slice="none", tty=False, status=0,
+        slice="none", tty=False, status=0, target_dir="none",
     )
 
 
@@ -491,18 +513,6 @@ def git_facts(directory: str) -> GitFacts:
         sha = output(["git", "-C", directory, "rev-parse", "--short", "HEAD"], directory, GIT_TIMEOUT_S)
         facts["sha"] = sha.strip() if sha else None
     return facts
-
-
-def git_directory(argv: list[str], cwd: str) -> str:
-    """The manifest's folder when the step names one, so a cargo-port run from elsewhere still finds its repo."""
-    import parse
-
-    manifest = parse.manifest_path(argv) or os.environ.get("MANIFEST_PATH")
-    if manifest:
-        folder = (Path(cwd) / manifest).parent
-        if folder.is_dir():
-            return str(folder)
-    return cwd
 
 
 def caller(tty: bool) -> str:
@@ -931,8 +941,8 @@ def step(args: list[str]) -> None:
             "step": name,
             "argv": argv,
             "cwd": cwd,
-            "target_dir": str((Path(cwd) / os.environ["CARGO_TARGET_DIR"]).resolve())
-                          if "CARGO_TARGET_DIR" in os.environ else TARGET_DIR_UNSET,
+            "target_dir": step_context.target_folder_text(
+                step_context.captured_target_folder(os.environ.get("BUILDLOG_TARGET_FOLDER", ""))),
             **({"target_directory": str(output_roots.target_directory),
                 "build_directory": str(output_roots.build_directory)}
                if isinstance(output_roots, CargoOutputRoots) else {}),
@@ -1066,6 +1076,7 @@ class HoldEventRecord(TypedDict):
 
 
 class SshAttempt(TypedDict):
+    reason: NotRequired[str]
     call_id: str
     target: str
     repo_identity: str
@@ -1313,12 +1324,6 @@ def main(argv: list[str]) -> int:
         if command == "step":
             detach()
             step(rest)
-        elif command == "key":
-            import treekey
-
-            found = treekey.tree_key(git_directory(rest, os.getcwd()))
-            if found:
-                print(found)
         elif command == "test-phase-context":
             print(json.dumps(test_phase_context(rest[0], rest[1:]), separators=(",", ":")))
         elif command == "hold-event":

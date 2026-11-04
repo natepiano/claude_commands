@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -624,6 +624,17 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
                           env={**os.environ, **environment}, check=False).returncode
 
 
+def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[str, str], pin_file: str) -> str:
+    """Name each tool mismatch and the configured file that controls its version."""
+    differences = [f"{name} box={actual.get(name, 'unavailable')} natedev={expected[name]}"
+                   for name in ('rustc', 'nextest', 'mend')
+                   if expected.get(name) and actual.get(name) != expected[name]]
+    if not differences:
+        return ''
+    hint = f'; move the box pins in {pin_file}' if pin_file else ''
+    return f'{target} version mismatch: ' + '; '.join(differences) + hint
+
+
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
         words: tuple[str, ...], call_id: str, tree_key: str) -> int:
     if verb not in ('nextest', 'check', 'doc'):
@@ -668,12 +679,29 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     if verb == 'doc':
         environment['LINT_CONFIG_FORCE'] = '1'
     assignments = ' '.join(f'{key}={shlex.quote(value)}' for key, value in environment.items())
-    parity: list[str] = []
+    parity: list[str] = ["mismatches=()"]
     for name, invocation in (('rustc', 'rustc -V'), ('nextest', 'cargo nextest --version'),
                              ('mend', 'cargo mend --version')):
         expected = values.get(f'parity.{name}', '')
         if expected:
-            parity.append(f'[ "$({invocation})" = {shlex.quote(expected)} ] || exit 75')
+            parity.extend([
+                f'actual=$({invocation} 2>/dev/null) || actual=unavailable',
+                "actual=${actual//$\'\\n\'/ }",
+                f'if [ "$actual" != {shlex.quote(expected)} ]; then',
+                f'  mismatches+=("{name} box=$actual natedev="{shlex.quote(expected)})',
+                'fi',
+            ])
+    target_name = values.get('selected_target', '')
+    hint = values.get('version_pin_file', '')
+    advice = '; move the box pins in ' + hint if hint else ''
+    parity.extend([
+        'if (( ${#mismatches[@]} )); then',
+        f'  printf \'%s version mismatch: %s\' {shlex.quote(target_name)} "${{mismatches[0]}}" >&2',
+        '  for mismatch in "${mismatches[@]:1}"; do printf \'; %s\' "$mismatch" >&2; done',
+        f'  printf \'%s\\n\' {shlex.quote(advice)} >&2',
+        '  exit 75',
+        'fi',
+    ])
     command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
                + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
                + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'

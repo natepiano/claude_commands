@@ -15,7 +15,6 @@ from typing import cast, override
 from scripts.direct.test_tree_watch import write_workspace
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
-from scripts.direct.verify_assertion_guard_test_support import write_guard
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -130,7 +129,6 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.write_tool(stubs / "cargo", CARGO)
         self.write_shell_tool(stubs / "taplo", "exit 0\n")
         self.write_shell_tool(stubs / "rustc", "printf 'rustc fixture\\n'\n")
-        write_guard(stubs / "assertion-guard")
         # Keep real heartbeat/board sleeps; only controlled memory transitions
         # use already-published routing readiness or the meminfo change event.
         sleep = shutil.which("sleep")
@@ -145,7 +143,6 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             "TEST_HANG_GUARD_SECS": str(TEST_HANG_GUARD_SECS),
             "PACKAGE_ROOT": str(self.workspace), "TEST_METADATA": json.dumps(metadata),
             "TEST_CONTROL": str(self.control), "VERIFY_TREE_WATCH_S": "0.2",
-            "VERIFY_ASSERTION_GUARD_SCRIPT": str(stubs / "assertion-guard"),
             "UNIT_RUN_DIR": str(self.board), "UNIT_SESSION_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test", "CLAUDE_PYTHON": sys.executable,
             "PYTHONPATH": str(VERIFY.resolve().parents[2]), "BUILDLOG_SYNC": "1",

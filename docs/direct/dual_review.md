@@ -166,14 +166,11 @@ this, verbatim:
 List each existing assertion or test that the diff removes, weakens, changes
 (same assertion, other expected value) or turns off (ignore, skip, xfail), with
 its path, test name, old text and new text. If there is none, write "none".
-Each one that the work order does not name in an "Assertion-Change:" line is a
-finding.
+Each one that the work order does not call for is a finding.
 ```
 
-`assertion_guard.py` finds the same list mechanically, and it blocks lint and
-the checkpoint; the reviewer judges whether a ruled change is correct. In
-cargo-liner-tile checkpoint e21d5b93, a weakened `assert_eq!` in a 6,000-line
-diff passed every review (user, 2026-10-28).
+In cargo-liner-tile checkpoint e21d5b93, a weakened `assert_eq!` in a
+6,000-line diff passed every review (user, 2026-10-28).
 </ReviewPromptContract>
 
 <BroadReviewPrompt>

@@ -570,6 +570,7 @@ class FolderAuditTests(unittest.TestCase):
         self.assertTrue((clone / "checkout" / "target" / "build").exists())
 
     def test_common_build_names_keep_their_cleanup_classification(self) -> None:
+        verify_name = tmp_sweep.verify_temp_name()
         for kind, template in build_folders.FOLDER_PREFIXES.items():
             prefix = template.format(owner="123")
             with self.subTest(kind=kind, prefix=prefix):
@@ -581,7 +582,7 @@ class FolderAuditTests(unittest.TestCase):
                 current = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
                     prefix, build_folders.ExplicitBuildParent(parent)))
                 _ = (current / "Cargo.toml").write_text("fixture")
-                self.assertEqual(folder_audit.kept_in_temp(current), folder_audit.kept_in_temp(previous),
+                self.assertEqual(folder_audit.kept_in_temp(current, verify_name), folder_audit.kept_in_temp(previous, verify_name),
                                  f"{prefix} must retain its cleanup reader")
 
     def test_copies_root_keeps_an_old_open_phase_copy(self) -> None:

@@ -95,14 +95,16 @@ class ShutdownStatusTests(ShutdownTestCase):
                 return {"result": {"thread": {"status": next(replies)}}}
             return {"result": {"data": ["current-thread"] if method == "thread/loaded/list" else []}}
         cast(Mock, client.call).side_effect = reply
-        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+        with (patch("scripts.shutdown.restart.live_rows", return_value=[]),
+              patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(codex_mesh, "_running_servers", return_value=[codex_mesh.WebSocketServer(10, 20, 1)]),
               patch.object(codex_mesh, "Client", return_value=client),
               patch.object(time, "sleep") as wait,
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["held-sessions"]), 0)
         wait.assert_called_once_with(1)
-        self.assertEqual(output.getvalue().splitlines(), ["test-worker: current-thread: waiting for worker turn"])
+        self.assertRegex(output.getvalue().splitlines()[0], r"^saved 0 rows for restart at \d{2}:\d{2}$")
+        self.assertEqual(output.getvalue().splitlines()[1:], ["test-worker: current-thread: waiting for worker turn"])
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)

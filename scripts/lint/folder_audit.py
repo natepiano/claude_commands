@@ -189,11 +189,11 @@ def expected_rust_names(path: Path = RUST_ROOTS_FILE) -> frozenset[str] | None:
     return frozenset(name for line in lines if (name := line.split("#", 1)[0].strip()))
 
 
-def kept_in_temp(entry: Path) -> bool:
+def kept_in_temp(entry: Path, verify_name: re.Pattern[str]) -> bool:
     name = entry.name
     if name in KEPT_NAMES or name.startswith(KEPT_PREFIXES) or TEMPFILE_NAME.fullmatch(name):
         return True
-    return tmp_sweep.holds_no_file(str(entry)) or tmp_sweep.VERIFY_TEMP_NAME.fullmatch(name) is not None
+    return tmp_sweep.holds_no_file(str(entry)) or verify_name.fullmatch(name) is not None
 
 
 def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None, *,
@@ -205,9 +205,10 @@ def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None, *
     def kept_in_rust(entry: Path) -> bool:
         return expected is None or entry == visible_root or entry.name in expected or entry.name in KEPT_NAMES
 
+    verify_name = tmp_sweep.verify_temp_name()
     roots: list[tuple[Path, Callable[[Path], bool]]] = [
         (rust, kept_in_rust), (rust / RUST_SCRATCH_NAME, lambda _entry: False),
-        *((temp, kept_in_temp) for temp in temps)]
+        *((temp, lambda entry: kept_in_temp(entry, verify_name)) for temp in temps)]
     found: list[Path] = []
     for root, keep in roots:
         try:

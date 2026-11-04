@@ -32,13 +32,17 @@ from urllib.parse import quote
 import store
 import parse
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
+
+
 # These indexes extend the current schema without rebuilding the recorded rows.
 COST_INDEXES = (
     "CREATE INDEX IF NOT EXISTS steps_session_previous ON steps (session, started_at_us DESC, id DESC) WHERE step = 'nextest'",
     "CREATE INDEX IF NOT EXISTS steps_execution_end ON steps ((unixepoch(started_at,'subsec') + duration_s)) WHERE duration_s > 0",
     "CREATE INDEX IF NOT EXISTS steps_wait_started ON steps ((unixepoch(started_at,'subsec'))) WHERE mem_wait_s > 0",
     "CREATE INDEX IF NOT EXISTS calls_copy ON calls (copy, id)",
+    "CREATE INDEX IF NOT EXISTS steps_build_group_history ON steps"
+    + " (host, build_history_group, build_base, started_at_us) WHERE finished_s IS NOT NULL",
 )
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
@@ -76,8 +80,8 @@ STEP_COLUMNS: list[Column] = [
     ("build_base", "TEXT", "normalized cargo command, profile, target, package scope and features; NULL for non-cargo"),
     ("build_items", "TEXT", "sorted JSON target selectors; [] for cargo's default selection, NULL for non-cargo"),
     ("cwd", "TEXT", "where it ran"),
-    ("target_dir", "TEXT NOT NULL", "absolute CARGO_TARGET_DIR, unset when absent, unknown for older records"),
-    ("target_folder", "TEXT", "target_dir when an absolute path, else worktree, else cwd"),
+    ("target_dir", "TEXT NOT NULL", "absolute target folder, none, unresolved, or legacy unknown/unset"),
+    ("target_folder", "TEXT", "absolute target_dir, NULL when the folder is not known"),
     ("repo_identity", "TEXT NOT NULL", "admission's repository key, or unknown"),
     ("repo_path", "TEXT", "the repo every worktree shares (parent of the git common dir)"),
     ("repo", "TEXT", "repo_path's folder name: hana, cargo-port, ..."),
@@ -125,6 +129,7 @@ STEP_COLUMNS: list[Column] = [
     ("target", "TEXT", "the configured build target; NULL for legacy records"),
     ("target_directory", "TEXT NOT NULL", "resolved Cargo artifact root, or unknown for older records"),
     ("build_directory", "TEXT NOT NULL", "resolved Cargo intermediate root; artifact root for legacy records"),
+    ("build_history_group", "TEXT", "real folder or legacy checkout group; NULL for none or unresolved"),
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -492,7 +497,6 @@ def create_schema(connection: sqlite3.Connection) -> None:
     statements.append("CREATE INDEX hold_events_target_at ON hold_events (target, at)")
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
     statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
-    statements.append("CREATE INDEX steps_build_history ON steps (host, target_folder, build_base, started_at_us)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
     statements.append("CREATE INDEX steps_call ON steps (call_id)")
     statements.append("CREATE INDEX tests_step ON tests (step_id)")
@@ -661,10 +665,10 @@ def build_keys(argv: list[str]) -> CargoBuildKey | NonCargoBuild:
 
 def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     argv = record.get("argv")
-    target_dir = record.get("target_dir")
-    target_directory = record.get("target_directory") or (
-        target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute()
-        else store.UNKNOWN_IDENTITY)
+    target_dir = record.get("target_dir") or store.UNKNOWN_IDENTITY
+    folder = target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute() else None
+    target_directory = record.get("target_directory") or folder or store.UNKNOWN_IDENTITY
+    checkout = record.get("worktree") or record.get("cwd")
     key = (build_keys(cast(list[str], argv))
            if isinstance(argv, list) and all(isinstance(word, str) for word in cast(list[object], argv))
            else NonCargoBuild())
@@ -678,8 +682,9 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
         "target_directory": target_directory,
         "build_directory": record.get("build_directory") or target_directory,
         "repo_identity": record.get("repo_identity") or store.UNKNOWN_IDENTITY,
-        "target_folder": (target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute()
-                          else record.get("worktree") or record.get("cwd")),
+        "target_folder": folder,
+        "build_history_group": ("folder:" + folder if folder else
+                                "legacy:" + str(checkout) if checkout and target_dir in ("unknown", "unset") else None),
         "build_base": key.base if isinstance(key, CargoBuildKey) else None,
         "build_items": list(key.items) if isinstance(key, CargoBuildKey) else None,
     }

@@ -44,7 +44,6 @@ else:
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
 
-
 MacVerb = Literal["nextest", "check", "clippy", "mend-check", "doc"]
 
 
@@ -181,6 +180,7 @@ class DeclinedMacRun:
 
     reason: NonBusyMacDeclineReason
     seconds: float
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -547,6 +547,11 @@ class ReportedMacStatus:
     cleanup: CleanupOutcome = CleanupUnconfirmed()
 
 
+@dataclass(frozen=True)
+class ToolVersionMismatch:
+    reason: str
+
+
 class MissingMacStatus:
     """The remote command ended without a usable test status."""
 
@@ -561,12 +566,15 @@ class InterruptedTargetStatus:
     generation: str
 
 
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus
+RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus | ToolVersionMismatch
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
+@dataclass(frozen=True)
 class UnavailableProbe:
     """A probe that did not return a complete availability snapshot."""
+
+    detail: str = ""
 
 
 ProbeResult = ProbeSnapshot | UnavailableProbe | UnresolvedSlotStartup | InterruptedTargetStatus
@@ -733,9 +741,14 @@ class ProcessController:
         status: RemoteRunStatus = MISSING_MAC_STATUS
         cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
+        mismatch = ""
         try:
             for line in output:
                 marker = line.rstrip("\r\n")
+                if re.match(r"[A-Za-z0-9_-]+ version mismatch: ", marker):
+                    mismatch = marker
+                    print(line, end="", flush=True)
+                    continue
                 if marker == "linux_startup=unresolved":
                     status = UnresolvedSlotStartup()
                     held_status_line = ""
@@ -775,6 +788,8 @@ class ProcessController:
         finally:
             self.active = IDLE_PROCESS
             output.close()
+        if mismatch and not isinstance(status, (ReportedMacStatus, InterruptedTargetStatus)):
+            return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup)
         if isinstance(status, (UnresolvedSlotStartup, InterruptedTargetStatus)):
@@ -942,7 +957,7 @@ def write_result(
         print(f"mac_test: the link to the {label} dropped; running on natedev instead")
     else:
         mac = "declined"
-        reason = result.reason
+        reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
         status = 75
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the {label} ({reason})")
@@ -1187,12 +1202,9 @@ def expected_linux_parity(controller: ProcessController, config: OffloadConfig) 
 
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
-    """Send tracked scripts and named public configuration without Git metadata."""
+    """Send every tracked script and config file without Git metadata."""
     root = Path(__file__).resolve().parents[2]
-    listing = controller.capture(["git", "-C", str(root), "ls-files", "-z", "scripts",
-                                  "config/lint.conf", "config/build_targets.conf",
-                                  "config/aws_target.conf", "config/mac_test.conf",
-                                  "config/user_zone.conf"])
+    listing = controller.capture(["git", "-C", str(root), "ls-files", "-z", "scripts", "config"])
     if not isinstance(listing, CommandOutput) or listing.status != 0:
         return False
     paths = [path for path in listing.stdout.split("\0") if path]
@@ -1284,6 +1296,17 @@ def probe_mac(
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
             if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == value for key, value in expected.items()):
                 return probe
+            if TYPE_CHECKING:
+                from . import linux_runner
+            else:
+                import linux_runner
+            detail = (linux_runner.version_mismatch(target, values,
+                      {"rustc": expected["rustc"], "nextest": expected["nextest"], "mend": expected["mend"]},
+                      config.values.get("version_pin_file", ""))
+                      if not isinstance(expected, UnavailableToolParity) else "")
+            if detail:
+                print(detail, file=sys.stderr, flush=True)
+                return UnavailableProbe(detail)
             print(f"mac_test: {target} is not ready: public tools or tracked scripts differ", file=sys.stderr)
             return UNAVAILABLE_PROBE
         reason = "the probe answer could not be read"
@@ -1686,6 +1709,8 @@ def claimed_run(
                 report_leftover_check(checked, request)
                 if isinstance(checked, LeftoversRemain):
                     return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+                if probe.detail:
+                    return DeclinedMacRun("state", elapsed_seconds(started), probe.detail)
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
             if probe.free_gib < config.free_floor_gib:
@@ -1731,6 +1756,8 @@ def claimed_run(
             report_leftover_check(checked, request)
             if isinstance(remote_status, InterruptedTargetStatus):
                 return InterruptedTargetRun(remote_status.generation, elapsed_seconds(started))
+            if isinstance(remote_status, ToolVersionMismatch):
+                return DeclinedMacRun("state", elapsed_seconds(started), remote_status.reason)
             if linux and isinstance(remote_status, UnresolvedSlotStartup):
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
             return LostMacRun(elapsed_seconds(started))
@@ -2023,6 +2050,8 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         "unresolved_count": evidence.unresolved_count if isinstance(evidence.unresolved_count, int) else None,
         "evidence_at": evidence.evidence_at or time.time(),
     }
+    if isinstance(result, (DeclinedMacRun, BusyMacDecline)):
+        attempt["reason"] = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
     record.ssh_attempt(attempt)
 
 

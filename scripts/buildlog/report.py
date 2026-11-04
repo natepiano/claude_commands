@@ -653,13 +653,15 @@ def held_target_waits(connection: sqlite3.Connection, day: str) -> tuple[WaitMea
 
 
 def warm_step_clause() -> str:
-    """Same-folder finished history must cover the selected targets or defaults."""
+    """Match real folders or legacy checkout groups before checking target coverage."""
     # A sweep can delete these outputs without a build-log row. That loss is
     # intentionally invisible until the floor sweeper records its removals.
+    # Legacy checkout groups preserve history without claiming a real folder.
     earlier = (
-        "prior.host = steps.host AND prior.target_folder = steps.target_folder"
-        " AND prior.build_base = steps.build_base AND prior.started_at_us < steps.started_at_us"
-        " AND prior.finished_s IS NOT NULL"
+        "prior.host = steps.host"
+        + " AND prior.build_history_group = steps.build_history_group"
+        + " AND prior.build_base = steps.build_base AND prior.started_at_us < steps.started_at_us"
+        + " AND prior.finished_s IS NOT NULL"
     )
     group_coverage = " OR ".join(
         f"(built.value = '{group}' AND wanted.value LIKE '{member} %')"
@@ -667,7 +669,8 @@ def warm_step_clause() -> str:
                               ("--examples", "--example"), ("--benches", "--bench"))
     )
     return (
-        "(steps.build_base IS NOT NULL AND steps.target_folder IS NOT NULL AND steps.build_items IS NOT NULL AND CASE"
+        "(steps.build_base IS NOT NULL AND steps.build_items IS NOT NULL"
+        + " AND steps.build_history_group IS NOT NULL AND CASE"
         + " WHEN steps.build_items = '[]' THEN EXISTS (SELECT 1 FROM steps AS prior WHERE "
         + earlier + " AND (prior.build_items = '[]' OR EXISTS (SELECT 1 FROM json_each(prior.build_items) AS built"
         + " WHERE built.value = '--all-targets')))"
