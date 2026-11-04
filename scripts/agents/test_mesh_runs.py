@@ -24,6 +24,7 @@ from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
 from scripts.astra import design_roles
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
@@ -773,16 +774,19 @@ sys.exit(1)
         self.assertEqual(record.get("exit_code"), 76)
 
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
+        limits = conf.read("mesh_runs")
+        line_chars = limits.whole("RESULT_LINE_CHARS")
+        text_chars = limits.whole("RESULT_TEXT_CHARS")
         script = "print('x' * 1_100_000)\nfor n in range(30): print(str(n) * 5_000)\nprint('last line')"
         _ = self.supervise(self.record([sys.executable, "-c", script]))
         message = cast(list[str], self.pending()["messages"])[0]
-        self.assertLessEqual(len(message), mesh_runs.RESULT_TEXT_CHARS)
-        self.assertIn(f"{'29' * (mesh_runs.RESULT_LINE_CHARS // 2)} [cut: {10_000 - mesh_runs.RESULT_LINE_CHARS} more characters]", message)
+        self.assertLessEqual(len(message), text_chars)
+        self.assertIn(f"{'29' * (line_chars // 2)} [cut: {10_000 - line_chars} more characters]", message)
         self.assertTrue(message.endswith("\nlast line"))
         _ = self.supervise(self.record([sys.executable, "-c", "print('x' * 1_100_000)"]))
         message = cast(list[str], self.pending()["messages"])[-1]
-        self.assertIn(f"{'x' * mesh_runs.RESULT_LINE_CHARS} [cut: {1_100_000 - mesh_runs.RESULT_LINE_CHARS} more characters]", message)
-        self.assertLessEqual(len(message), mesh_runs.RESULT_TEXT_CHARS)
+        self.assertIn(f"{'x' * line_chars} [cut: {1_100_000 - line_chars} more characters]", message)
+        self.assertLessEqual(len(message), text_chars)
 
     def test_result_text_caps_the_total_size_including_the_header(self) -> None:
         record = cast(mesh_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
@@ -792,6 +796,16 @@ sys.exit(1)
         text = mesh_runs.result_text(record, 1)
 
         self.assertLessEqual(len(text), 2_000)
+        self.assertIn("Result: FAIL (exit 1)", text)
+        self.assertIn(f"Log: {record['log']}", text)
+        self.assertTrue(text.endswith("\nlast line"))
+
+        config = self.root / "config/mesh_runs.conf"
+        _ = config.write_text(config.read_text().replace("RESULT_LINE_CHARS=300", "RESULT_LINE_CHARS=100")
+                              .replace("RESULT_TEXT_CHARS=2000", "RESULT_TEXT_CHARS=1200"))
+        text = mesh_runs.result_text(record, 1)
+        self.assertLessEqual(len(text), 1_200)
+        self.assertIn(f"{'x' * 100} [cut: {5_000 - 100} more characters]", text)
         self.assertIn("Result: FAIL (exit 1)", text)
         self.assertIn(f"Log: {record['log']}", text)
         self.assertTrue(text.endswith("\nlast line"))

@@ -96,6 +96,7 @@ class UnitRenameFixture(StaffTestCase):
             **config_environment(self.root),
             "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
             "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
+            "UNIT_RUN_ROOT": str(self.root / "sessions"),
             "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(config),
             "CODEX_HOME": str(self.root / "codex-home"),
             "XDG_CONFIG_HOME": str(self.home / ".config"), "XDG_STATE_HOME": str(self.root / "state"),

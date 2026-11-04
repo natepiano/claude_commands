@@ -446,7 +446,7 @@ class StopResumeTests(unittest.TestCase):
         old, current = str(self.root / "old folder"), str(self.root / "staff folder")
         command = ["bash", str(stop_resume.SCRIPTS / "direct/review.sh"), "--lens", "contract",
                    "--phase", "4w", run, old, "old prompt.md", "review", "check the contract", "reviewing", "3"]
-        seat = PausedSeat(run_dir=run, seat="review2", role="review", thread_id="same-thread",
+        seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="019b3a40-4250-7000-8000-000000000104",
                           turn_live=True, launcher_command=command)
         rebuilt = shlex.split(stop_resume.resume_worker_command(seat, current))
         self.assertEqual(rebuilt, [*command[:6], "--to", "review2", run, current,

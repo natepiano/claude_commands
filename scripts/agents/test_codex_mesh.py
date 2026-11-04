@@ -4314,6 +4314,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(_as_test_dict(requests[0]["params"]).get("threadId"), THREAD_ID)
         self.assertEqual(requests[1]["params"], {
             "threadId": THREAD_ID, "sandbox": "read-only", "approvalPolicy": "never",
+            "cwd": str(self.session_dir),
         })
         self.assertEqual(requests[2]["params"], {
             "threadId": self.fork_thread_id, "name": "natedev · models · code reviewer 2"})
@@ -4371,6 +4372,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         for request in resumes:
             self.assertEqual(request["params"], {
                 "threadId": THREAD_ID,
+                "cwd": str(self.session_dir),
                 "developerInstructions": path.read_text(encoding="utf-8"),
                 "sandbox": "read-only", "approvalPolicy": "never",
             })
@@ -4422,6 +4424,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         resumes = [request for request in new.requests if request.get("method") == "thread/resume"]
         self.assertEqual([request["params"] for request in resumes], [{
             "threadId": THREAD_ID, "developerInstructions": path.read_text(encoding="utf-8"),
+            "cwd": str(self.session_dir),
             "sandbox": "read-only", "approvalPolicy": "never",
         }])
         self.assertEqual(self.worker_record().get("instructions_file"), str(path))
@@ -4572,6 +4575,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         resumes = [request for request in new.requests if request.get("method") == "thread/resume"]
         self.assertEqual(resumes[0]["params"], {
             "threadId": THREAD_ID, "developerInstructions": path.read_text(encoding="utf-8"),
+            "cwd": str(self.session_dir),
             "sandbox": "read-only", "approvalPolicy": "never",
         })
         starts = [request for request in new.requests if request.get("method") == "turn/start"]
@@ -4604,6 +4608,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.methods("thread/fork")[0]["params"], {
             "threadId": THREAD_ID, "sandbox": "read-only", "approvalPolicy": "never",
+            "cwd": str(self.session_dir),
             "developerInstructions": path.read_text(encoding="utf-8"),
         })
         self.assertEqual(_as_test_dict(self.roster()["reviewer"]).get("instructions_file"), str(path))
@@ -4699,7 +4704,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 resumes = self.methods("thread/resume")
                 self.assertTrue(resumes)
                 for request in resumes:
-                    self.assertEqual(request["params"], {"threadId": THREAD_ID})
+                    self.assertEqual(request["params"], {"threadId": THREAD_ID, "cwd": str(self.session_dir)})
 
     def test_unreadable_standing_instructions_fail_before_any_turn(self) -> None:
         self.configure_context()
@@ -4823,7 +4828,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 self.assertNotIn("launcher_pid", self.worker_record())
                 self.assertTrue(self.claim_review_follow(), "failure must release reset ownership")
 
-    def test_start_namespace_keeps_cwd_on_thread_start_and_out_of_turn_start(self) -> None:
+    def test_start_namespace_uses_the_staff_cwd_for_thread_and_turn_start(self) -> None:
         code, errors = self.run_start()
 
         self.assertEqual((code, errors), (0, ""))
@@ -4833,6 +4838,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         })
         self.assertEqual(self.methods("turn/start")[0]["params"], {
             "threadId": THREAD_ID,
+            "cwd": str(self.session_dir),
             "input": [{"type": "text", "text": "Original worker task"}],
             "model": "gpt-test", "effort": "high", "sandboxPolicy": WRITE_POLICY, "serviceTier": "default",
         })
@@ -5038,6 +5044,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 self.assertEqual(len(starts), 1)
                 self.assertEqual(starts[0]["params"], {
                     "threadId": THREAD_ID,
+                    "cwd": str(self.session_dir),
                     "input": [{"type": "text", "text": "Review the second worktree"}],
                     "sandboxPolicy": WRITE_POLICY,
                     "serviceTier": "default",
@@ -5055,6 +5062,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(len(starts), 1)
         self.assertEqual(starts[0]["params"], {
             "threadId": THREAD_ID,
+            "cwd": str(self.session_dir),
             "input": [{"type": "text", "text": "Review the second worktree"}],
             "sandboxPolicy": WRITE_POLICY,
             "serviceTier": "default",
@@ -5171,6 +5179,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 self.assertEqual(len(starts), 1)
                 self.assertEqual(starts[0]["params"], {
                     "threadId": THREAD_ID,
+                    "cwd": str(self.session_dir),
                     "input": [{"type": "text", "text": "Review the second worktree"}],
                     "sandboxPolicy": WRITE_POLICY,
                     "serviceTier": "default",
@@ -5294,7 +5303,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertNotIn("paused_turn", record)
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual([request["params"] for request in self.methods("thread/resume")],
-                         [{"threadId": THREAD_ID}])
+                         [{"threadId": THREAD_ID, "cwd": str(self.session_dir)}])
 
     def test_reopen_recovers_an_ended_thread_and_follow_resumes_it(self) -> None:
         self.write_pool_roster({"worker": {

@@ -113,8 +113,8 @@ class DurableRolesTests(unittest.TestCase):
         production_membership("demo", "design-unit")
         self.repository = self.root / "checkout"
         self.repository.mkdir()
-        _ = document.write_text(document.read_text().replace("## Units",
-            f"- **Merge branch:** main\n- **Showrunner checkout:** {self.repository}\n- **Log:** log.md\n\n## Units"))
+        _ = document.write_text(document.read_text()
+            + f"- **Merge branch:** main\n- **Showrunner checkout:** {self.repository}\n- **Log:** log.md\n")
         _ = (self.repository / "design.md").write_text("# Design\n")
         self.launches, self.dispatches, self.releases = [], [], []
         self.holder_session, self.lose_creation_ack, self.fail_dispatch = '17759e5d-1377-577b-b283-19888bbfc1f5', False, False

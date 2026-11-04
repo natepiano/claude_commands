@@ -417,6 +417,10 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     environment.update(STAFF_FILE=str(case.staff_file), STAFF_TEST_OWNER_FILE=str(case.staff_file))
     _ = case.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
     _ = case.enterContext(isolated_source_readers())
+    roots = tuple(Path(root) for root in environment.get(
+        "PROGRESS_SESSION_ROOTS", environment.get("UNIT_RUN_ROOT", str(case.root / "runs"))).split(":"))
+    _ = case.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", roots))
+    _ = case.enterContext(mock.patch("progress_history.SESSION_ROOTS", roots))
     for name, attribute, reader in (
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
         ("unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),

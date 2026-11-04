@@ -78,9 +78,6 @@ NOT_A_MESH_WORKER = 3
 LIVE_RUN_LIMIT_REACHED = 4
 # Lines of the log the result message carries.
 RESULT_TAIL_LINES = 20
-# Limit relay messages and individual lines.
-RESULT_LINE_CHARS = 300
-RESULT_TEXT_CHARS = 2_000
 # verify.sh's VERIFY_SUPERSEDED_STATUS: a newer call of the same verb from the same worker in the
 # same worktree replaced this one while it waited for the cargo token. It ran nothing, so it is
 # neither a pass nor a failure, and the newer call's result answers instead.
@@ -413,9 +410,10 @@ def _exit_status(returncode: int) -> int:
 
 
 def _cut_line(line: str) -> str:
-    if len(line) <= RESULT_LINE_CHARS:
+    limit = conf.read("mesh_runs").whole("RESULT_LINE_CHARS")
+    if len(line) <= limit:
         return line
-    return f"{line[:RESULT_LINE_CHARS]} [cut: {len(line) - RESULT_LINE_CHARS} more characters]"
+    return f"{line[:limit]} [cut: {len(line) - limit} more characters]"
 
 
 def _tail(path: Path, count: int, budget: int) -> list[str]:
@@ -451,8 +449,8 @@ def result_text(record: RunRecord, exit_code: int | None) -> str:
                else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
                else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS else f"FAIL (exit {exit_code})")
     heading = "Run ended with no result" if exit_code is None else "Run finished"
-    lines = [_cut_line(line) for line in
-             (f"{heading}: {record['label']}", f"Result: {verdict}", f"Log: {record['log']}")]
+    lines = [f"{heading}: ", f"Result: {verdict}", f"Log: {record['log']}"]
+    cancellation = ""
     if exit_code == TREE_CHANGED_STATUS:
         # Keep the cancellation instruction when cleanup moves it outside the tail.
         try:
@@ -462,14 +460,19 @@ def result_text(record: RunRecord, exit_code: int | None) -> str:
         except OSError:
             cancellation = ""
         if cancellation:
-            lines.extend(["", _cut_line(cancellation)])
+            lines.extend(["", cancellation])
     header = "\n".join(lines)
-    tail_heading = f"\n\nLast log lines (lines over {RESULT_LINE_CHARS} characters are cut):\n"
+    limits = conf.read("mesh_runs")
+    tail_heading = f"\n\nLast log lines (lines over {limits.whole('RESULT_LINE_CHARS')} characters are cut):\n"
     tail = _tail(Path(record["log"]), RESULT_TAIL_LINES,
-                 RESULT_TEXT_CHARS - len(header) - len(tail_heading))
-    if tail:
-        return header + tail_heading + "\n".join(tail)
-    return header
+                 limits.whole("RESULT_TEXT_CHARS") - len(header) - len(tail_heading))
+    if cancellation:
+        tail = [line for line in tail if line != _cut_line(cancellation)]
+    body = tail_heading + "\n".join(tail) if tail else ""
+    label_budget = max(0, limits.whole("RESULT_TEXT_CHARS") - len(header) - len(body))
+    lines[0] += record["label"][:label_budget]
+    header = "\n".join(lines)
+    return header + body
 
 
 @dataclass(frozen=True)

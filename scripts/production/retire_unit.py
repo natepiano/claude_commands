@@ -520,6 +520,8 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
         _ = unit_config.write_parked(row.id, replace(config, retired=facts))
     owned = members(unit, record)
     for member in owned:
+        if isinstance(record.backends.get(member.id), staff.CodexBackend):
+            continue
         try:
             outcome = stop_resume.stop(member.current_session)
             if isinstance(outcome, stop_resume.StopFailed):

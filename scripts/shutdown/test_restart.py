@@ -436,10 +436,10 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(json.dumps(session), saved)
 
     def test_restart_skips_an_unknown_unit_folder_and_starts_the_other_rows(self) -> None:
-        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "parent", None,
+        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "parent", staff.StaffRoot(),
                                current_session=staff.StaffId("parent-session"),
                                doc=staff.LiveDoc("natedev", self.root / "production.md"))
-        self.rows = (replace(self.rows[0], parent=parent.id, worktree=staff.WORKTREE_UNFILLED), *self.rows[1:])
+        self.rows = (replace(self.rows[0], parent=staff.ReportsTo(parent.id), worktree=staff.WORKTREE_UNFILLED), *self.rows[1:])
         record = staff.StaffSnapshot((*self.rows, parent))
         self.running.clear()
         shutdown_record.save([str(row.id) for row in self.rows])

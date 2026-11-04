@@ -337,6 +337,7 @@ def _main(argv: list[str]) -> int:
     retained = record.by_current_session(native)
     if (retained is not None and retained.kind == "showrunner"
             and (retained.name, retained.parent, retained.doc) == (name, staff.ReportsTo(parent_row.id), document)):
+        print("unchanged", file=sys.stderr)
         new_member = staff_sources.MemberFound(retained)
     else:
         new_member = staff_sources.MemberFound(staff.promote_unit(

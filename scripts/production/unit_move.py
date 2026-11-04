@@ -580,10 +580,7 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                 move_run(history, old, destination, git(destination, "branch", "--show-current"))
             except (OSError, ValueError, RenameRefused) as error:
                 print(f"unit_move: {history}: {error}", file=sys.stderr)
-        try:
-            _ = staff.set_worktree(unit, staff.PresentWorktree(row.worktree.machine, destination), expected=row.worktree)
-        except (staff.StaffRefused, staff.StaffNotFound, OSError, ValueError) as error:
-            print(f"unit_move: {error}", file=sys.stderr)
+        _ = staff.set_worktree(unit, staff.PresentWorktree(row.worktree.machine, destination), expected=row.worktree)
         if isinstance(launch, FolderLaunch):
             try:
                 resume_folder_session(row, launch, old, destination, runs)

@@ -81,7 +81,7 @@ class StaffOperationTests(StaffTestCase):
             return run([sys.executable, "-c", "import signal; signal.pause()"],
                        capture_output=True, text=True, check=False, timeout=timeout)
 
-        with (mock.patch.object(staff, "_is_owner", return_value=False),
+        with (mock.patch.object(staff, "is_owner", return_value=False),
               mock.patch.object(subprocess, "run", side_effect=blocked_remote),
               worker_lifecycle.operation_deadline(timeout=0.1)):
             with self.assertRaises(worker_lifecycle.OperationDeadlineExpired):
