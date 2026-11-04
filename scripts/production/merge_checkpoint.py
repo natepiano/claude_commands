@@ -37,7 +37,7 @@ from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
 from scripts.direct import progress_history  # noqa: E402
-from scripts.production import production_doc, staff, staff_sources, unit_lookup  # noqa: E402
+from scripts.production import merge_gate, production_doc, staff, staff_sources, unit_lookup  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
@@ -1024,6 +1024,9 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
             _ = good(git(checkout, "push", "origin", "main"), "promote")
             return PromotionOriginPushed(tip)
         return PromotionAlreadyAtTip(tip)
+    if conflict := merge_gate.promotion_edit_conflict(checkout, tip):
+        raise Stop("promote", "failed", conflict,
+                   "clear the listed checkout paths and rerun this checkpoint")
     result = git(checkout, "merge", "--ff-only", tip)
     if result.returncode:
         status = git(checkout, "status", "--short").stdout.strip()

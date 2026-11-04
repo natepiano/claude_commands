@@ -37,6 +37,7 @@ from datetime import UTC, datetime
 from enum import Enum, auto
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -1138,39 +1139,39 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     return run
 
 
-# Use a fresh index for the file comparison. The live index can hide edits
-# with assume-unchanged or skip-worktree flags. Never change that index.
-PROMOTION_TRACKED_CHECK = '''import json, os, subprocess, tempfile
-from pathlib import Path
+def promotion_edit_conflict(repo: Path, target: str) -> str:
+    """Name local edits on paths that the promotion changes."""
+    environment = dict(os.environ)
+    _ = environment.pop("GIT_INDEX_FILE", None)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
 
-environment = dict(os.environ)
-environment.pop("GIT_INDEX_FILE", None)
-environment["GIT_OPTIONAL_LOCKS"] = "0"
+    def git(*arguments: str, index: str = "") -> bytes:
+        return subprocess.run(["git", *arguments], cwd=repo,
+                              env={**environment, **({"GIT_INDEX_FILE": index} if index else {})},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
 
-def git(*arguments, env=environment):
-    return subprocess.run(["git", *arguments], env=env, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, check=True).stdout
-
-try:
-    staged = git("diff", "--cached", "--no-ext-diff", "--name-only", "-z", "HEAD", "--")
-    with tempfile.TemporaryDirectory(prefix="promotion-index-") as temporary:
-        private = {**environment, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
-        git("read-tree", "HEAD", env=private)
-        files = git("diff", "--no-ext-diff", "--name-only", "-z", "HEAD", "--", env=private)
-    changed = sorted({os.fsdecode(path) for path in (staged + files).split(b"\\0") if path})
-    if changed:
-        print("tracked edits differ from HEAD: " + "; ".join(json.dumps(path) for path in changed))
-        raise SystemExit(1)
-except (OSError, subprocess.SubprocessError) as error:
-    print("tracked edit check failed: " + str(error))
-    raise SystemExit(1)
-'''
+    try:
+        staged = git("diff", "--cached", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--")
+        # A fresh index exposes edits hidden by the live index flags.
+        with tempfile.TemporaryDirectory(prefix="promotion-index-") as temporary:
+            index = str(Path(temporary) / "index")
+            _ = git("read-tree", "HEAD", index=index)
+            files = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--", index=index)
+        promoted = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", target, "--")
+        conflicts = sorted(set((staged + files).split(b"\0")) & set(promoted.split(b"\0")) - {b""})
+        if conflicts:
+            return "promotion refused: tracked edits overlap promotion: " + "; ".join(
+                json.dumps(os.fsdecode(path)) for path in conflicts)
+    except (OSError, subprocess.SubprocessError) as error:
+        return "promotion refused: tracked edit check failed: " + str(error)
+    return ""
 
 
-def require_clean_promotion(repo: Path) -> None:
-    result = command([sys.executable, "-c", PROMOTION_TRACKED_CHECK], repo)
-    if result.returncode:
-        raise GateRefused("promotion refused: " + failure_detail(result))
+# Send the same function to a Mac without repository Python modules.
+PROMOTION_TRACKED_CHECK = ("import json, os, subprocess, sys, tempfile\nfrom pathlib import Path\n"
+                           + inspect.getsource(promotion_edit_conflict)
+                           + "reason = promotion_edit_conflict(Path.cwd(), sys.argv[1])\n"
+                           + "if reason: print(reason)\nraise SystemExit(bool(reason))\n")
 
 
 @dataclass(frozen=True)
@@ -1241,7 +1242,6 @@ def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
-    require_clean_promotion(main_repo)
     hold = BuildHoldWait()
     hold.wait_until_free()
     wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
@@ -1263,7 +1263,8 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
         raise GateRefused("main is not an ancestor of the merge branch")
     hold.wait_until_free()
-    require_clean_promotion(main_repo)
+    if conflict := promotion_edit_conflict(main_repo, target):
+        raise GateRefused(conflict)
     write_push_record(path, RecordedPush(origin, target, target))
     _ = checked_git(main_repo, "merge", "--ff-only", target)
     _ = checked_git(main_repo, "push", "origin", "main")
@@ -1271,8 +1272,8 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK)
-    remote = (f"(cd {remote_path} && {remote_check} && "
+    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
               f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
