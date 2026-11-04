@@ -33,11 +33,8 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         waiting = self.root / "waiting-for-token"
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n")
-        sleep = self.root / "stubs" / "sleep"
-        _ = sleep.write_text("#!/bin/sh\n"
-                             + 'if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then : > "$TEST_WAITING"; fi\n'
+        self.write_wait_sleep('if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then : > "$TEST_WAITING"; fi\n'
                              + 'exit 0\n')
-        sleep.chmod(0o755)
         environment = {**self.environment, "UNIT_RUN_DIR": str(board),
                        "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
         output = self.root / "waiter.out"
@@ -91,11 +88,8 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         real_sleep = shutil.which("sleep")
         if real_sleep is None:
             self.fail("the token wait test needs sleep on PATH")
-        sleep = self.root / "stubs" / "sleep"
-        _ = sleep.write_text("#!/bin/sh\n"
-                             + 'if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then : > "$TEST_WAITING"; fi\n'
+        self.write_wait_sleep('if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then : > "$TEST_WAITING"; fi\n'
                              + 'exit 0\n')
-        sleep.chmod(0o755)
         environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
                        "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1",
                        "TEST_REAL_SLEEP": real_sleep, "TEST_WAITING": str(waiting)}
@@ -139,11 +133,9 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
             + 'if [[ "$1" == acquire && " $* " == *" --wait 0 "* ]]; then exit 1; fi\n'
             + 'if [[ "$1" == acquire ]]; then printf "token\\n" >> "$TEST_SLEEP_LOG"; fi\n'
             + 'exec bash "$TEST_REAL_BOARD" "$@"\n')
-        sleep = self.root / "stubs" / "sleep"
-        _ = sleep.write_text('#!/bin/sh\nprintf "sleep %s\\n" "$*" >> "$TEST_SLEEP_LOG"\n'
+        self.write_wait_sleep('printf "sleep %s\\n" "$*" >> "$TEST_SLEEP_LOG"\n'
                              + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"\n'
                              + 'exit 0\n')
-        sleep.chmod(0o755)
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 0 kB\n")
         log = self.root / "sleep-log"
         environment = {**self.environment, "HOME": str(home),

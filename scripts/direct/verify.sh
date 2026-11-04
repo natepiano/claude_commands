@@ -284,6 +284,18 @@ else
     PY="${HOME}/.claude/scripts/lib/py"
 fi
 
+lint_code_key() {
+    "$PY" -c 'import hashlib, pathlib, sys
+key = hashlib.sha256()
+for name in sys.argv[1:]:
+    path = pathlib.Path(name)
+    key.update(path.read_bytes() if path.is_file() else b"absent")
+    key.update(b"\0")
+print(key.hexdigest())' "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
+        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" 2>/dev/null || true
+}
+LINT_LOADED_CODE_KEY="$(lint_code_key)"
+
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
 # shellcheck source=/dev/null
@@ -413,9 +425,7 @@ run_step() {
             step_state on_natedev
         else
             acquire_token local || { status=$?; rm -f "$step_log"; return "$status"; }
-            if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-                printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
-            fi
+            record_token_wait
             step_state local_noncompiling
         fi
         export BUILDLOG_TARGET=natedev
@@ -1155,6 +1165,7 @@ if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
 fi
 RUN_LOG=""
 VERDICT_KEY=""
+VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
 RUN_STARTED=0
 CALL_NOTED=0
@@ -1185,7 +1196,15 @@ if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
 fi
 
 tree_key() {
-    local words=("$CMD" "${ARGS[@]}") names=() name scope=() key_options=("$@")
+    local words=("$CMD" "${ARGS[@]}") names=() name scope=() key_options=() scripts=()
+    local option content=0
+    for option in "$@"; do
+        if [[ "$option" == --tree-content ]]; then content=1; else key_options+=("$option"); fi
+    done
+    if [[ "$content" == 0 ]]; then
+        scripts=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh"
+            "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
+    fi
     if [[ "$CMD" == lint ]]; then
         if [[ ${#ARGS[@]} -eq 1 ]]; then words=(lint); fi
     elif [[ "${FILTER_RUN}" -eq 1 ]]; then
@@ -1213,8 +1232,7 @@ tree_key() {
         key_options+=(--without-lint-versions)
     fi
     VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
-    "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
-        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
+    "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
         <<< "${GATE_METADATA}" 2>/dev/null || true
 }
 
@@ -1271,6 +1289,7 @@ start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-tree --owner "$$")"
     VERDICT_KEY="$(tree_key --watch-start "$TREE_WATCH_DIR/start")"
+    VERDICT_TREE_KEY="$(tree_key --tree-content)"
     [[ -s "$TREE_WATCH_DIR/start" ]] || { rm -rf "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
     local scope=()
     if [[ "$CMD" == test ]]; then scope=(--package "${ARGS[0]}"); fi
@@ -1558,6 +1577,7 @@ try_mac_test() {
         mac_owns_watch=1
     elif [[ -n "${CACHE_DIR}" && -z "$TREE_WATCH_PID" ]]; then
         VERDICT_KEY="$(tree_key)"
+        VERDICT_TREE_KEY="$(tree_key --tree-content)"
     fi
     MAC_LOG_FILE="$(mktemp)"
     if [[ "$selected_is_mac" == 1 ]]; then step_state on_mac; else
@@ -2349,10 +2369,15 @@ cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
     # A lost token gives no verdict about the tree.
     (( EXIT_STATUS != 125 )) || return 1
+    if [[ "$CMD" == lint ]]; then
+        [[ -n "$LINT_LOADED_CODE_KEY" && "$(lint_code_key)" == "$LINT_LOADED_CODE_KEY" ]] || return 1
+    fi
     key="$(tree_key)"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then
-        echo "verify.sh: the tree changed while ${CMD} ran, so this result was not recorded; the next ${CMD} runs again."
+        if [[ -z "$VERDICT_TREE_KEY" || "$(tree_key --tree-content)" != "$VERDICT_TREE_KEY" ]]; then
+            echo "verify.sh: the tree changed while ${CMD} ran, so this result was not recorded; the next ${CMD} runs again."
+        fi
         return 1
     fi
     if [[ "${kind}" == fail ]]; then
@@ -2551,6 +2576,12 @@ TOKEN_HELD=0
 # A step routed to the Mac skips its first token acquisition.
 TOKEN_WAITED=0
 TOKEN_WAITER_PID=""
+# shellcheck source=/dev/null
+source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
+TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)" || exit 2
+TOKEN_RENEW_S="$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)" || exit 2
+TOKEN_RENEW_S=$(awk -v interval="$TOKEN_RENEW_S" -v hold="$TOKEN_HOLD_S" \
+    'BEGIN { if (interval > hold / 3) interval = hold / 3; print interval }')
 token_wait_clock() {
     # Tests can advance a disposable clock while acquisition still blocks on
     # the real board. Normal calls retain Bash's elapsed-seconds clock.
@@ -2722,11 +2753,15 @@ token_acquired() {
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
 }
 
-# Waits until this run holds the token, with no time limit: the pid reclaim and
-# the 3600 s hold already free a dead or stuck holder, and the queue above
-# drops a waiter whose verify.sh ended. Sets TOKEN_WAITED to the seconds it
-# waited.
+# Dead holders release the token. The queue removes waiters whose verify.sh ended.
+# TOKEN_WAITED records the elapsed wait in seconds.
 # The local argument disables remote routing for a local formatter.
+record_token_wait() {
+    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+    fi
+}
+
 acquire_token() {
     sync_token_state
     TOKEN_WAITED=0
@@ -2770,7 +2805,7 @@ acquire_token() {
             # Two tries 3 s apart, then the queue is read again.
             pause=1
             bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-                --pid $$ --hold 3600 --wait 3 >/dev/null 2>&1 &
+                --pid $$ --hold "$TOKEN_HOLD_S" --wait 3 >/dev/null 2>&1 &
             TOKEN_WAITER_PID=$!
             status=0
             wait "$TOKEN_WAITER_PID" || status=$?
@@ -2897,8 +2932,9 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
     except OSError:
         recorded = ""
     if recorded != holder:
-        print("verify.sh: this run lost the cargo token before its step started; run it again.",
-              file=sys.stderr)
+        lost_file = os.environ.get("VERIFY_TOKEN_LOST_FILE")
+        if lost_file:
+            Path(lost_file).write_text("lost")
         sys.exit(125)
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))
@@ -2911,16 +2947,100 @@ sys.exit(shell_status(subprocess.call(command)))
 # Preserve the shared invocation policy (including systemd scopes and its
 # fallback), changing only the command it launches while this token is held.
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
+renew_token() {
+    local status=0
+    bash "${BOARD_HELPER}" renew "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+        --pid $$ --hold "$TOKEN_HOLD_S" >/dev/null 2>&1 || status=$?
+    # Status 2 means the guard cannot confirm ownership. Continue renewal.
+    (( status == 0 || status == 2 ))
+}
+
+# Each span owns one renewer. Nested spans use the same renewer.
+# Release stops the renewer before ownership changes.
+start_token_renewer() {
+    [[ "${TOKEN_HELD:-0}" -eq 1 ]] || return 0
+    renew_token || return 1
+    local renew_parent=${BASHPID:-$$}
+    (
+        delay_pid=""
+        trap 'if [[ -n "$delay_pid" ]]; then
+            kill "$delay_pid" 2>/dev/null || true
+            wait "$delay_pid" 2>/dev/null || true
+        fi; exit 0' INT TERM HUP
+        while kill -0 "$$" 2>/dev/null && kill -0 "$renew_parent" 2>/dev/null; do
+            sleep "$TOKEN_RENEW_S" &
+            delay_pid=$!
+            wait "$delay_pid" || break
+            delay_pid=""
+            renew_token || break
+        done
+    ) &
+    TOKEN_RENEWER_PID=$!
+}
+
+stop_token_renewer() {
+    [[ -n "${TOKEN_RENEWER_PID:-}" ]] || return 0
+    kill "$TOKEN_RENEWER_PID" 2>/dev/null || true
+    wait "$TOKEN_RENEWER_PID" 2>/dev/null || true
+    TOKEN_RENEWER_PID=""
+}
+
+with_token_renewal() {
+    # A nested call must keep its caller's renewer.
+    if [[ -n "${TOKEN_RENEWER_PID:-}" ]] && kill -0 "$TOKEN_RENEWER_PID" 2>/dev/null; then
+        "$@"
+        return $?
+    fi
+    local TOKEN_RENEWER_PID="" status=0
+    # Admission or the command guard handles confirmed ownership loss.
+    start_token_renewer || true
+    "$@" || status=$?
+    stop_token_renewer
+    return "$status"
+}
+
+# Routing can retain the token during remote waits. Renew it during those waits.
+eval "$(declare -f route_test | sed '1s/route_test/route_test_without_renewal/')"
+route_test() {
+    with_token_renewal route_test_without_renewal
+}
+
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
-            "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
+        local TOKEN_RENEWER_PID="" step_status=0
+        if ! start_token_renewer; then
+            printf lost > "${HOLD_WAIT_DIR:?}/token-lost"
+            return 125
+        fi
+        VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
+            VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
+                "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
+        stop_token_renewer
+        return "$step_status"
     else
         buildlog_exec_unowned "$@"
     fi
 }
 
+# Retry only when the ownership guard started no command.
+# run_once releases the reservation and sampler before this call.
+buildlog_retry_unstarted_step() {
+    BUILDLOG_RETRY_STEP=0
+    [[ -s "$HOLD_WAIT_DIR/token-lost" ]] || return 0
+    rm -f "$HOLD_WAIT_DIR/token-lost"
+    # shellcheck disable=SC2034 # invoke.sh reads this callback result.
+    BUILDLOG_RETRY_STEP=1
+    TOKEN_HELD=0
+    if buildlog_step_compiles "$@"; then
+        TOKEN_RETRY_ADMISSION=1
+    else
+        acquire_token local || return $?
+        record_token_wait
+    fi
+}
+
 release_token() {
+    stop_token_renewer
     # A subshell records its release for the parent shell.
     # A killed acquisition can still hold the token, so release that token too.
     if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
@@ -2933,8 +3053,7 @@ release_token() {
     local release_status=0
     bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null \
         || release_status=$?
-    # An expired hold may be reclaimed while this step is still running. The
-    # new holder owns the token; the old step's result remains authoritative.
+    # An ownership identity change permits reclaim. Preserve the original step result.
     (( release_status == 0 || release_status == 3 )) || return "$release_status"
     TOKEN_HELD=0
     if [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
@@ -2950,7 +3069,7 @@ try_token_now() {
     count_token_waiters_ahead
     (( TOKEN_WAITERS_AHEAD == 0 )) || return 1
     bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-        --pid $$ --hold 3600 --wait 0 >/dev/null 2>&1 || return 1
+        --pid $$ --hold "$TOKEN_HOLD_S" --wait 0 >/dev/null 2>&1 || return 1
     token_acquired
 }
 
@@ -2963,31 +3082,45 @@ try_token_now() {
 # gate again with the token held. The step runs in run()'s subshell, so its
 # token wait reaches the call record through TOKEN_WAIT_FILE.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
-buildlog_wait_for_memory() {
-    local memory_wait
-    step_state waiting_hold
-    release_token || return $?
-    buildlog_wait_for_memory_only "$@" || return $?
-    [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
-    TOKEN_WAITED=0
-    if ! try_token_now; then
-        buildlog_token_wait || return $?
+admit_with_token() {
+    local waited=0 memory_wait=$BUILDLOG_MEM_WAIT_S token_back_at
+    while :; do
         acquire_token || return $?
-        local token_back_at
+        waited=$(( waited + TOKEN_WAITED ))
         buildlog_now
         token_back_at=$BUILDLOG_NOW
-        memory_wait=$BUILDLOG_MEM_WAIT_S
-        # The second pass keeps the step's place in the memory queue from its first wait.
-        BUILDLOG_MEM_TOKEN_BACK_AT=$token_back_at BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
-        BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
-        if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
-            release_token || return $?
-            return 0
+        BUILDLOG_MEM_TOKEN_BACK_AT=$token_back_at BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM \
+            with_token_renewal buildlog_wait_for_memory_only "$@" || return $?
+        memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+        [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || break
+        if [[ "${TOKEN_USED}" == 0 ]] || renew_token; then break; fi
+        buildlog_token_wait || return $?
+        TOKEN_HELD=0
+    done
+    BUILDLOG_MEM_WAIT_S=$memory_wait
+    TOKEN_WAITED=$waited
+}
+
+buildlog_wait_for_memory() {
+    step_state waiting_hold
+    TOKEN_WAITED=0
+    if [[ "${TOKEN_RETRY_ADMISSION:-0}" == 1 ]]; then
+        TOKEN_RETRY_ADMISSION=0
+        admit_with_token "$@" || return $?
+    else
+        release_token || return $?
+        buildlog_wait_for_memory_only "$@" || return $?
+        [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
+        if ! try_token_now; then
+            buildlog_token_wait || return $?
+            admit_with_token "$@" || return $?
         fi
     fi
-    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+    if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
+        release_token || return $?
+        return 0
     fi
+    record_token_wait
     step_state on_natedev
 }
 
@@ -3001,6 +3134,7 @@ refresh_test_build_inputs() {
     # buildlog_begin takes its source key after that wait.
     rm -f "$HOLD_WAIT_DIR/test-build-inputs"
     VERDICT_KEY="$(VERIFY_COMPUTE_TEST_BUILD=1 tree_key)"
+    VERDICT_TREE_KEY="$(tree_key --tree-content)"
     export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR=""
     if [[ -f "$HOLD_WAIT_DIR/test-build-inputs" ]]; then
         { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR; } \
@@ -3035,9 +3169,7 @@ build_hold_wait_local() {
     phase_wait_finish hold
     [[ "$status" == 0 ]] || return "$status"
     acquire_token || return $?
-    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
-    fi
+    record_token_wait
     if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
     return "$status"
 }
@@ -3318,6 +3450,7 @@ case "$CMD" in
         # Record the tree Taplo reads; clippy fix and fmt update the key below.
         if [[ -n "${RUN_LOG}" ]]; then
             VERDICT_KEY="$(tree_key)"
+            VERDICT_TREE_KEY="$(tree_key --tree-content)"
         fi
         # Cargo's workspace root can differ from the caller's directory.
         # Run there so Taplo uses the same config and scope as the push gate.
@@ -3346,11 +3479,11 @@ case "$CMD" in
                 invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
                 finish_tree_watch
                 (( clippy_status != 0 && clippy_judgment == 1 )) || break
-                clippy_tree_before="$(tree_key)"
+                clippy_tree_before="$(tree_key --tree-content)"
                 for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
                     invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
                     fmt_cargo "${FMT_SCOPE[@]}"
-                    clippy_tree_after="$(tree_key)"
+                    clippy_tree_after="$(tree_key --tree-content)"
                     if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
                         break
                     fi
