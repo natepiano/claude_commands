@@ -1050,6 +1050,7 @@ class HoldEventRecord(TypedDict):
 
 
 class SshAttempt(TypedDict):
+    reason: NotRequired[str]
     call_id: str
     target: str
     repo_identity: str
