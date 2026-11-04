@@ -176,39 +176,68 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
         return []
 
 
-def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = ()) -> int:
+def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False) -> list[staff.StaffRow]:
     import remote
 
+    selected: list[staff.StaffRow] = []
+    try:
+        live = {session["sessionId"]: (session["name"] or session["sessionId"]) +
+            (f" in {folder}" if (folder := session.get("cwd")) else "") for session in sessions.running_sessions()}
+    except (OSError, ValueError) as error:
+        print(f"restart: Claude liveness anomaly: {error}", file=sys.stderr)
+        live = {}
+    try:
+        codex_live = herdr.running_codex_threads(thread_host=lambda _arguments: False)
+    except (OSError, ValueError, herdr.HerdrFailure) as error:
+        print(f"restart: Codex liveness anomaly: {error}", file=sys.stderr)
+        codex_live = set[str]()
+    for identity in codex_live:
+        _ = live.setdefault(identity, identity)
+    for identity in sorted(live.keys() - {row.current_session for row in record.rows}):
+        print(f"{' '.join(live[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
+    for row in record.rows:
+        try:
+            machine, _folder = row_folder(row, record)
+            if machine == remote.local_machine() and row.current_session in live:
+                selected.append(row)
+        except (OSError, ValueError) as error:
+            _anomaly(row, error)
+    if save_tabs:
+        try:
+            client.save_layout()
+        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+            print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+        for row, pane in row_panes(selected, client):
+            try:
+                client.remember_row_tab(str(row.id), pane)
+            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+                _anomaly(row, error)
+    return selected
+
+
+def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = ()) -> int:
     record = staff.initial_snapshot()
     client = herdr.Herdr(herdr.shared_session())
     selected: list[staff.StaffRow] = []
     if stop_all:
-        live = {session["sessionId"]: (session["name"] or session["sessionId"]) +
-                (f" in {folder}" if (folder := session.get("cwd")) else "") for session in sessions.running_sessions()}
-        try:
-            codex_live = herdr.running_codex_threads(thread_host=lambda _arguments: False)
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
-            print(f"restart: Codex liveness anomaly: {error}", file=sys.stderr)
-            codex_live = set[str]()
-        for identity in codex_live:
-            _ = live.setdefault(identity, identity)
-        for identity in sorted(live.keys() - {row.current_session for row in record.rows}):
-            print(f"{' '.join(live[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
-        for row in record.rows:
-            try:
-                machine, _folder = row_folder(row, record)
-                if machine == remote.local_machine() and row.current_session in live:
-                    selected.append(row)
-            except (OSError, ValueError) as error:
-                _anomaly(row, error)
+        selected = live_rows(record, client, save_tabs=not dry_run)
     else:
-        for reference in only or tuple(shutdown_record.read()):
+        pending_ids = list(only) if only else shutdown_record.read()
+        if dry_run and not only:
+            path = shutdown_record.record_path()
+            saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
+            print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
+            for row in live_rows(record, client):
+                if str(row.id) not in pending_ids:
+                    print(f"{row.name}: live, not in the restart record")
+        for reference in pending_ids:
             row = record.by_member_reference(reference)
             if row is None:
                 matches = [item for item in record.rows if item.name == reference]
                 row = matches[0] if len(matches) == 1 else None
             if row is None:
-                print(f"{reference}: unknown or ambiguous staff row", file=sys.stderr)
+                print(f"{reference}: in the restart record, no staff row" if dry_run and not only else
+                      f"{reference}: unknown or ambiguous staff row", file=sys.stderr)
                 continue
             selected.append(row)
     if dry_run:
@@ -238,15 +267,6 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             except (OSError, staff.StaffRefused) as error:
                 _anomaly(row, error)
         if stop_all:
-            try:
-                client.save_layout()
-                for row, pane in row_panes(locked, client):
-                    try:
-                        client.remember_row_tab(str(row.id), pane)
-                    except errors as error:
-                        _anomaly(row, error)
-            except errors as error:
-                print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
             for row in locked:
                 try:
                     _ = stop_row(row, client)
