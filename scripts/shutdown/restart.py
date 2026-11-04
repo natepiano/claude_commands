@@ -122,6 +122,10 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
     if machine != remote.local_machine():
         raise ValueError(f"{row.name}: session is on {machine}")
     kind, environment, arguments = session_launch(str(row.current_session))
+    if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
+        from scripts.accounts import accounts
+
+        target_account = accounts.role_account(row.kind).label
     if target_account and kind == "claude":
         from scripts.accounts import accounts
 
