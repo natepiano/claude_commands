@@ -170,7 +170,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Ruled out:** a `scripts/production/test_modules.py` light module — the name matches the gate's test pattern.
 
-### Phase 5 — The two slowest direct modules run in half their time  · status: todo
+### Phase 5 — The two slowest direct modules run in half their time  · status: done
 **Depends on:** Phase 2, Phase 4
 
 #### Work Order
