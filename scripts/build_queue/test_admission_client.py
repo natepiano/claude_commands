@@ -440,6 +440,31 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(output.getvalue(), "")
                     self.doCleanups()
 
+    def test_grant_sent_during_a_slow_leave_hook_is_read_before_the_next_hook(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", running_pass_seconds="5")
+            interval = gate.read_memory_config().running_pass_seconds
+            request = fixture.request()
+            exchange = Exchange(reply_bytes(WAIT), TimeoutError())
+            transport = self.use_transport(fixture, exchange)
+            hooks: list[float] = []
+
+            def decline_after_grant() -> bool:
+                hooks.append(fixture.clock.monotonic())
+                self.assertEqual(len(hooks), 1, "the client must read the grant before another hook")
+                fixture.clock.advance(interval)
+                exchange.events.append(reply_bytes(GRANTED))
+                fixture.clock.advance(interval)
+                return False
+
+            with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "slow-decline"}), \
+                    mock.patch.object(client, "_leave_queue", side_effect=decline_after_grant):
+                result = client.admit(request, lambda _reply: None, lambda: request)
+            self.assertEqual(result, GRANTED)
+            self.assertEqual(hooks, [interval])
+            self.assertEqual(transport.requests, [request])
+            self.assertEqual(exchange.events, [])
+
     def test_split_grant_survives_a_declined_leave_hook(self) -> None:
         for kind, partial_at_deadline in (("admit", False), ("launch", False), ("admit", True), ("launch", True)):
             with self.subTest(kind=kind, partial_at_deadline=partial_at_deadline), AdmissionFixture() as fixture:
