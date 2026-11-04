@@ -37,6 +37,7 @@ from scripts.production import showrunners
 from scripts.message import send_budget
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 
 class RecordedCall(TypedDict):
@@ -123,6 +124,7 @@ class StyleSyncTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="style-sync-test-")))
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"
@@ -682,6 +684,15 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertEqual((target / "artifact").read_text(), "previous")
         code, output = self.run_lint('[[ $(cat target/artifact) == previous ]] || exit 2\n')
         self.assertEqual(code, 0, output)
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
+
+    def test_lint_keeps_intermediates_with_the_standing_warm_target(self) -> None:
+        target = self.standing_target()
+        code, output = self.run_lint(
+            '[[ "$CARGO_BUILD_BUILD_DIR" == "$(realpath target)/intermediates" ]] || exit 2\n'
+            + 'printf warm > "$CARGO_BUILD_BUILD_DIR/intermediate"\n')
+        self.assertEqual(code, 0, output)
+        self.assertEqual((target / "intermediates/intermediate").read_text(), "warm")
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
     def test_lint_keeps_its_own_warm_target_after_metadata_cleanup(self) -> None:

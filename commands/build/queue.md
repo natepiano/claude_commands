@@ -27,3 +27,9 @@ An unmatched selector exits 3 with `build queue: no waiting step matches <select
 `admit-head <why>` permits the current head to exceed the budget when free memory permits its start.
 These commands work from any session or a plain shell. Priority preserves order among steps with the same rank.
 Use `/build:status` for holds and target state.
+
+A step waiting for the cargo token keeps its place but holds no head room.
+The first eligible step is the head, even when its position exceeds one.
+A queue containing only token waiters still shows those waiters.
+The pane passes its session id to each mutation command explicitly.
+Unknown units use the same refusal protocol: exit 3 and a stdout line starting `build queue: `.

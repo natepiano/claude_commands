@@ -66,7 +66,7 @@ def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo, policy: gate.AdmissionP
 
 
 def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
-              budget: int, zone: ZoneInfo) -> str:
+              zone: ZoneInfo) -> str:
     if isinstance(source, gate.NeedSourceNotRecorded):
         return "source not recorded"
     basis = source.basis
@@ -91,12 +91,17 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
                 text += "; no failed-build floor"
             if isinstance(basis.factor, gate.ReleaseHeadroom):
                 text += f"; release headroom × {basis.factor.factor:.3f}"
+            elif isinstance(basis.factor, gate.DevSizeHeadroom):
+                text += (f"; dev size headroom × {basis.factor.factor:.3f}"
+                         + f" + margin {gib(basis.factor.margin_bytes)}")
             elif isinstance(basis.factor, gate.DevHeadroom):
                 text += f"; dev promise factor × {basis.factor.factor:.3f}"
             else:
                 text += "; no headroom factor"
         if isinstance(basis.cap, gate.CappedAtBudget):
-            text += f"; capped at {gib(budget)} (uncapped {gib(basis.cap.uncapped)})"
+            limit = ("the build budget of that time" if isinstance(basis.cap.cap, gate.CapNotRecorded)
+                     else gib(basis.cap.cap))
+            text += f"; capped at {limit} (uncapped {gib(basis.cap.uncapped)})"
         else:
             text += "; under build budget"
         return text
@@ -178,6 +183,8 @@ def release_text(release: gate.HeadAfterEnd, explanation: gate.QueueExplanation,
         text = estimate_refresh_text(release, zone)
     elif isinstance(release, gate.HeadStillHeld):
         text = "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
+    elif isinstance(release, gate.TokenWaitersOnly):
+        text = "all waiting steps are waiting for the cargo token"
     elif isinstance(release, gate.ReadingUnavailable):
         text = "admission memory reading unavailable"
     else:

@@ -54,6 +54,8 @@ else
     echo "Warning: could not resolve the main worktree; staying in $PWD"
 fi
 
+"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-save "$WORKTREE_PATH"
+
 echo "Removing worktree: $WORKTREE_PATH"
 if ! git worktree remove "$WORKTREE_PATH" 2>/dev/null; then
     echo "Standard removal failed, forcing..."
@@ -69,6 +71,8 @@ if [[ -e "$WORKTREE_PATH" ]]; then
     echo "Error: Worktree path still exists after cleanup: $WORKTREE_PATH"
     exit 1
 fi
+
+"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-clean "$WORKTREE_PATH"
 
 echo ""
 echo "Deleting branch: $BRANCH_NAME"
