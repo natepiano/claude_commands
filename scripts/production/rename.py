@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production.production_doc import Refusal, cell_value, read_production  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
-import stall_watch  # noqa: E402
 import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402
@@ -42,7 +41,6 @@ class RenamePlan:
     plans: tuple[Path, ...]
     timer: PathMove
     state: tuple[PathMove, ...]
-    stall: tuple[PathMove, ...]
     staff_id: staff.StaffId
 
     @property
@@ -177,7 +175,6 @@ def plan(old: str, new: str) -> RenamePlan:
         units, _plans(rows, production.checkout), PathMove(instance.with_name(f"showrunner-{old}"), instance.with_name(f"showrunner-{new}")),
         tuple(PathMove(source, destination) for source, destination in
               zip(tidy_wrapped.owned_paths(old), tidy_wrapped.owned_paths(new), strict=True)),
-        tuple(PathMove(stall_watch.stretch_path(old, unit), stall_watch.stretch_path(new, unit)) for unit in units),
         staff_id)
 
 
@@ -200,8 +197,6 @@ def _describe(plan: RenamePlan) -> list[str]:
     parents = [plan.state[-1].source.parent / child / "parent"
                for child in showrunner_tree.stored_children(plan.old)]
     headers = [f"2. Production header {path}: {plan.old} -> {plan.new}" for path in plan.plans]
-    stretches = [f"5. stall-watch {unit}: {moves(move)}"
-                 for unit, move in zip(plan.units, plan.stall, strict=True)]
     return [f"1. prepare doc/CHECK; git mv {plan.old_doc} -> {plan.new_doc}; Formerly: `{plan.old}`",
             *(headers or ["2. Production headers: no unit plans"]),
             f"3. notifier {moves(plan.timer)}; CHECK {plan.old_doc} -> {plan.new_doc}",
@@ -210,12 +205,10 @@ def _describe(plan: RenamePlan) -> list[str]:
             *(f"4. parent {path}: {plan.old} -> {plan.new}" for path in parents),
             f"4. held design roles: holder {plan.old} showrunner -> {plan.new} showrunner",
             *rename_outside.describe(plan.old, plan.new, plan.old_doc, plan.new_doc),
-            *(stretches or ["5. stall-watch: no units"]),
             (f"6. merge branch {plan.merge_branch} -> {plan.new} (git branch -m); commit {plan.message!r}; "
              + f"push origin {plan.new}" if plan.renames_branch else
              f"6. merge branch {plan.merge_branch} kept (not named for the production); commit {plan.message!r}; "
-             + f"push origin {plan.merge_branch}"),
-            f"7. phase notes: {plan.old} -> {plan.new_doc}"]
+             + f"push origin {plan.merge_branch}")]
 
 
 def _rename_doc(plan: RenamePlan) -> None:
@@ -297,11 +290,6 @@ def _move_held_roles(old: design_roles.Holder, new: design_roles.Holder, old_che
         raise RenameRefused(f"held roles: {error}") from error
 
 
-def _rename_stall_watch(plan: RenamePlan) -> None:
-    for move in plan.stall:
-        unit_move.move(move)
-
-
 def _rename_unit_workers(plan: RenamePlan) -> None:
     from scripts.direct import workers
     root = workers.ledger_path(plan.old, "unused").parent
@@ -327,12 +315,6 @@ def _rename_branch(plan: RenamePlan) -> None:
     _ = unit_move.git(plan.checkout, "push", "--set-upstream", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
-def _retarget_phase_notes(plan: RenamePlan) -> None:
-    from scripts.direct import phase_table
-
-    _ = phase_table.retarget_phase_notes(plan.old, plan.new_doc)
-
-
 def _set_displays(plan: RenamePlan) -> None:
     """Show the new name on the showrunner's herdr tab."""
     row = staff.by_id(plan.staff_id)
@@ -342,14 +324,14 @@ def _set_displays(plan: RenamePlan) -> None:
             _ = client.retitle(pane["pane_id"], row.name)
 
 
-STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state, _rename_stall_watch,
-         _rename_unit_workers, _retarget_phase_notes, _rename_branch, _set_displays)
+STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state,
+         _rename_unit_workers, _rename_branch, _set_displays)
 
 
 def _pending(plan: RenamePlan) -> bool:
     """Whether a copy of the old name is left: the staff row, a file, a plan header, the branch or its push."""
     row = staff.by_id(plan.staff_id)
-    moves = (PathMove(plan.old_doc, plan.new_doc), plan.timer, *plan.state, *plan.stall)
+    moves = (PathMove(plan.old_doc, plan.new_doc), plan.timer, *plan.state)
     paths = [_relative(plan, path) for path in (plan.old_doc, plan.new_doc, *plan.plans)]
     return (row is None or row.name != plan.new
             or (not isinstance(row.doc, staff.DocUnfilled) and row.doc.path != plan.new_doc)

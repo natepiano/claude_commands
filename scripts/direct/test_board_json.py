@@ -161,6 +161,10 @@ class BoardJsonTests(unittest.TestCase):
         showrunner_launch(row, row.id, self.environment)
         return fixture
 
+    def cache_path(self, slug: str) -> Path:
+        row = next(row for row in staff.find(kind="showrunner") if row.name == slug)
+        return self.output / f"{row.id}.json"
+
     def plan(self, fixture: ProductionFixture, *, gate: str = "", all_done: bool = False) -> None:
         status = "done" if all_done else "todo"
         _ = fixture.plan.write_text("\n".join((
@@ -377,10 +381,10 @@ class BoardJsonTests(unittest.TestCase):
 
         response, documents = self.generate("--session", unit.id, cwd=nested)
 
-        self.assertEqual(response["files"], [str(self.output / "show.json")])
+        self.assertEqual(response["files"], [str(self.cache_path("show"))])
         self.assertNotIn("focus", response)
         self.assertEqual([document["production"] for document in documents], [fixture.slug])
-        self.assertFalse((self.output / f"{other.slug}.json").exists())
+        self.assertFalse(self.cache_path(other.slug).exists())
 
     def test_showrunner_session_and_production_select_the_same_three_level_subtree(self) -> None:
         root = self.production("z-root")
@@ -394,7 +398,7 @@ class BoardJsonTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 response, documents = self.generate(*arguments)
 
-                self.assertEqual(response["files"], [str(self.output / f"{slug}.json")
+                self.assertEqual(response["files"], [str(self.cache_path(slug))
                                                      for slug in (root.slug, child.slug, grandchild.slug)])
                 self.assertEqual([doc["production"] for doc in documents],
                                  [root.slug, child.slug, grandchild.slug])
@@ -407,7 +411,7 @@ class BoardJsonTests(unittest.TestCase):
                     unit = object_fields(array_items(document["units"])[0])
                     self.assertEqual(unit["key"], "alpha")
                     self.assertEqual(unit["plan"], str(fixture.plan))
-                self.assertFalse((self.output / f"{other.slug}.json").exists())
+                self.assertFalse(self.cache_path(other.slug).exists())
 
         response, documents = self.generate("--session", fixture_runtime_id("showrunner::m-child"))
         self.assertEqual([doc["production"] for doc in documents], [child.slug, grandchild.slug])
@@ -420,7 +424,7 @@ class BoardJsonTests(unittest.TestCase):
 
         response, documents = self.generate("--session", fixture_runtime_id("showrunner::show"), cwd=unrelated)
 
-        self.assertEqual(response["files"], [str(self.output / "show.json")])
+        self.assertEqual(response["files"], [str(self.cache_path("show"))])
         self.assertEqual([document["production"] for document in documents], [fixture.slug])
         unit = object_fields(array_items(documents[0]["units"])[0])
         self.assertEqual(unit["plan"], str(fixture.plan))
@@ -433,7 +437,7 @@ class BoardJsonTests(unittest.TestCase):
             with self.subTest(cwd=cwd):
                 _, documents = self.generate("--session", fixture_runtime_id("showrunner::session-production"), cwd=cwd)
                 self.assertEqual([document["production"] for document in documents], [fixture.slug])
-                self.assertFalse((self.output / f"{other.slug}.json").exists())
+                self.assertFalse(self.cache_path(other.slug).exists())
 
     def test_showrunner_session_selects_its_subtree_without_parents_or_siblings(self) -> None:
         parent = self.production("parent", running=False)
@@ -450,10 +454,10 @@ class BoardJsonTests(unittest.TestCase):
 
         self.assertEqual([document["production"] for document in documents],
                          [root.slug, child.slug, grandchild.slug])
-        self.assertEqual(response["files"], [str(self.output / f"{slug}.json")
+        self.assertEqual(response["files"], [str(self.cache_path(slug))
                                              for slug in (root.slug, child.slug, grandchild.slug)])
-        self.assertFalse((self.output / f"{parent.slug}.json").exists())
-        self.assertFalse((self.output / f"{sibling.slug}.json").exists())
+        self.assertFalse(self.cache_path(parent.slug).exists())
+        self.assertFalse(self.cache_path(sibling.slug).exists())
 
     def test_unknown_session_stays_empty_even_in_a_production_checkout(self) -> None:
         fixture = self.production(running=False)
@@ -484,8 +488,8 @@ class BoardJsonTests(unittest.TestCase):
                 _, documents = self.generate("--session", session)
                 self.assertEqual([doc["production"] for doc in documents],
                                  [root.slug, child.slug, grandchild.slug])
-                self.assertFalse((self.output / f"{parent.slug}.json").exists())
-                self.assertFalse((self.output / f"{sibling.slug}.json").exists())
+                self.assertFalse(self.cache_path(parent.slug).exists())
+                self.assertFalse(self.cache_path(sibling.slug).exists())
 
     def test_same_named_units_follow_the_newest_launch_staff_id(self) -> None:
         first = self.production("first", running=False)
@@ -502,7 +506,7 @@ class BoardJsonTests(unittest.TestCase):
         _, documents = self.generate("--session", moved.id)
 
         self.assertEqual([doc["production"] for doc in documents], [second.slug])
-        self.assertFalse((self.output / f"{first.slug}.json").exists())
+        self.assertFalse(self.cache_path(first.slug).exists())
 
     def test_timer_target_without_a_launch_staff_id_does_not_place_a_session(self) -> None:
         _ = self.production(running=False)
@@ -555,7 +559,7 @@ class BoardJsonTests(unittest.TestCase):
         _, documents = self.generate("--session", fixture_runtime_id("showrunner::root"))
 
         self.assertEqual([doc["production"] for doc in documents], [root.slug, child.slug])
-        self.assertFalse((self.output / f"{sibling.slug}.json").exists())
+        self.assertFalse(self.cache_path(sibling.slug).exists())
 
     def test_unreadable_staff_prints_one_error_and_no_boards(self) -> None:
         _ = self.production(running=False)
@@ -615,7 +619,7 @@ class BoardJsonTests(unittest.TestCase):
                                              "--session", fixture_runtime_id("showrunner::session-production"))
 
                 self.assertEqual([document["production"] for document in documents], expected)
-                self.assertFalse((self.output / f"{other.slug}.json").exists())
+                self.assertFalse(self.cache_path(other.slug).exists())
 
     def test_attach_and_detach_change_a_watched_directory_and_refresh_the_subtree(self) -> None:
         root = self.production("root")
@@ -682,8 +686,8 @@ class BoardJsonTests(unittest.TestCase):
         with patch.object(showrunners, "timer_for", side_effect=read_timer):
             with self.assertRaisesRegex(OSError, "fixture lookup failed"):
                 _ = board_json.main(["--production", root.slug])
-        self.assertFalse((self.output / "root.json").exists())
-        self.assertFalse((self.output / "child.json").exists())
+        self.assertFalse(self.cache_path("root").exists())
+        self.assertFalse(self.cache_path("child").exists())
 
     def test_descendant_not_in_the_registered_showrunners_is_left_out(self) -> None:
         root = self.production("root")
@@ -744,9 +748,9 @@ class BoardJsonTests(unittest.TestCase):
         self.assertNotIn("focus", response)
         self.assertEqual(response["files"], [])
         self.assertEqual(documents, [])
-        self.assertFalse((self.output / "show.json").exists())
-        self.assertFalse((self.output / "other.json").exists())
-        self.assertFalse((self.output / "stopped.json").exists())
+        self.assertFalse(self.cache_path("show").exists())
+        self.assertFalse(self.cache_path("other").exists())
+        self.assertFalse(self.cache_path("stopped").exists())
 
     def test_no_registered_production_resolves_without_output_files(self) -> None:
         response, documents = self.generate("--session", "unlisted-session")
@@ -767,10 +771,81 @@ class BoardJsonTests(unittest.TestCase):
         fixture = self.production()
         _ = self.environment.pop("UNIT_BOARD_DIR")
         response, _ = self.generate("--production", fixture.slug)
-        self.assertEqual(response["files"], [str(self.root / "state/unit-board/show.json")])
+        self.assertEqual(response["files"], [str(self.root / "state/unit-board" / self.cache_path("show").name)])
         _ = self.environment.pop("XDG_STATE_HOME")
         response, _ = self.generate("--production", fixture.slug)
-        self.assertEqual(response["files"], [str(self.root / ".local/state/unit-board/show.json")])
+        self.assertEqual(response["files"], [str(self.root / ".local/state/unit-board" / self.cache_path("show").name)])
+
+    def test_cache_key_survives_rename_transfer_and_session_clear(self) -> None:
+        fixture = self.production(running=False)
+        parent = self.production("parent", running=False)
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == fixture.slug)
+        parent_row = next(row for row in staff.find(kind="showrunner") if row.name == parent.slug)
+        before, _ = self.generate("--production", fixture.slug)
+        _ = staff.rename(owner.id, "renamed")
+        _ = staff.move(owner.id, parent_row.id)
+        current = staff.native_id(fixture_runtime_id("cleared-showrunner"))
+        _ = staff.update_current_session(owner.current_session, current)
+        after, documents = self.generate("--session", current)
+        self.assertEqual(after["files"], before["files"])
+        self.assertEqual(after["files"], [str(self.output / f"{owner.id}.json")])
+        self.assertEqual([document["production"] for document in documents], [fixture.slug])
+        changed = staff.by_id(owner.id)
+        assert changed is not None
+        self.assertEqual(changed.current_session, current)
+
+    def test_cache_migration_resumes_after_first_file_and_preserves_unknown_files(self) -> None:
+        _ = self.production("first", running=False)
+        _ = self.production("second", running=False)
+        self.output.mkdir()
+        for slug in ("first", "second", "unknown"):
+            _ = (self.output / f"{slug}.json").write_text(slug)
+        record = staff.snapshot()
+        real_unlink = Path.unlink
+        calls = 0
+
+        def interrupt(source: Path, missing_ok: bool = False) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("migration interrupted")
+            real_unlink(source, missing_ok=missing_ok)
+
+        with self.source_readers(), patch.object(Path, "unlink", interrupt):
+            with self.assertRaisesRegex(OSError, "migration interrupted"):
+                _ = board_json.migrate_cache(self.output, record)
+        self.assertEqual(self.invoke("--migrate-cache").returncode, 1)
+        self.assertEqual((self.output / "unknown.json").read_text(), "unknown")
+        self.assertEqual(self.cache_path("first").read_text(), "first")
+        self.assertEqual(self.cache_path("second").read_text(), "second")
+        self.assertFalse((self.output / "first.json").exists())
+        self.assertFalse((self.output / "second.json").exists())
+        (self.output / "unknown.json").unlink()
+        before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in self.output.iterdir()}
+        result = self.invoke("--migrate-cache")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in self.output.iterdir()})
+        clean = self.root / "clean-cache"
+        clean.mkdir()
+        for slug in ("first", "second"):
+            _ = (clean / f"{slug}.json").write_text(slug)
+        with self.source_readers():
+            self.assertEqual(board_json.migrate_cache(clean, record), 0)
+        self.assertEqual({path.name: path.read_bytes() for path in clean.iterdir()},
+                         {path.name: path.read_bytes() for path in self.output.iterdir()})
+
+    def test_cache_migration_refuses_to_replace_a_different_staff_cache(self) -> None:
+        _ = self.production(running=False)
+        self.output.mkdir()
+        source = self.output / "show.json"
+        _ = source.write_text("old")
+        target = self.cache_path("show")
+        _ = target.write_text("current")
+        with self.source_readers():
+            with self.assertRaisesRegex(FileExistsError, "staff cache already differs"):
+                _ = board_json.migrate_cache(self.output, staff.snapshot())
+        self.assertEqual(source.read_text(), "old")
+        self.assertEqual(target.read_text(), "current")
 
     def test_each_pass_kind_has_its_user_facing_stage(self) -> None:
         fixture = self.production()
@@ -1849,7 +1924,7 @@ class BoardJsonTests(unittest.TestCase):
         fixture = self.production()
         _ = self.write_run(fixture, self.delivery_events())
         _ = self.unit(fixture)
-        target = self.output / "show.json"
+        target = self.cache_path("show")
         previous = target.read_bytes()
         captured: list[dict[str, object]] = []
         real_replace = os.replace

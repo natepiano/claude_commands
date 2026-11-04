@@ -182,6 +182,16 @@ class ChangePageTests(unittest.TestCase):
         return subprocess.run(["git", "-C", str(self.repo), *arguments],
                               capture_output=True, text=True, check=True).stdout.strip()
 
+    def test_an_open_owner_cell_uses_the_current_staff_production_without_a_list_write(self) -> None:
+        doc = self.temporary / "destination.md"
+        _ = doc.write_text("# Destination\n")
+        owner = fixture_member("showrunner", name="destination", doc=staff.LiveDoc("natedev", doc))
+        before = self.review_list.read_bytes()
+        row = change_review.pending(self.review_list)[0]
+        _ = staff.move(self.unit.id, owner.id)
+        self.assertEqual(change_page.row_production(self.page, row), doc)
+        self.assertEqual(self.review_list.read_bytes(), before)
+
     @override
     def setUp(self) -> None:
         self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="change-page-test-")))
@@ -954,8 +964,9 @@ class ChangePageTests(unittest.TestCase):
 
     def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
         other = self.temporary / "change-review - another.md"
+        owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc("natedev", self.production))
         _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read the proof", "It agrees")],
-                                      date(2026, 11, 2), "", self.production)
+                                      date(2026, 11, 2), "", self.production, producers=[owner.id])
         path = urlsplit(change_browser.publish()).path
         with patch.object(change_review, "read", wraps=change_review.read) as reads:
             reply = self.request(path, {})
@@ -1013,8 +1024,9 @@ class ChangePageTests(unittest.TestCase):
 
     def test_tabs_with_waiting_changes_keep_their_order_before_empty_tabs(self) -> None:
         other = self.temporary / "change-review - zeta.md"
+        owner = fixture_member("showrunner", name="zeta", doc=staff.LiveDoc("natedev", self.production))
         _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read", "Proof")],
-                                      date(2026, 11, 2), "", self.production)
+                                      date(2026, 11, 2), "", self.production, producers=[owner.id])
         path, forms, body = self.browser()
         browser = change_browser.page_at(self.root, path)
         prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
@@ -1135,8 +1147,12 @@ class ChangePageTests(unittest.TestCase):
         foreign = self.temporary / "sdlc-production.md"
         _ = foreign.write_text(self.production.read_text())
         _ = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", foreign))
-        _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown unit", "Read", "Proof")],
+        written = change_review.append_rows(self.review_list, [change_review.Visible("Unknown unit", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", foreign)
+        owner = staff.snapshot().by_path("sdlc")
+        assert owner is not None
+        _ = self.review_list.write_text(self.review_list.read_text().replace(
+            written[0], written[0].replace(str(owner.id), "sdlc")))
         path, forms, body = self.browser()
         del path, body
         self.assertEqual(forms.tabs["page-owner/C4"], "page-owner")
@@ -1872,7 +1888,7 @@ class ChangePageTests(unittest.TestCase):
         demo = fixture_member("showrunner", name="demo")
         _ = staff.set_doc(demo.id, staff.LiveDoc("natedev", self.production))
         _ = change_review.append_rows(earlier, [change_review.Visible("Earlier change", "Run it", "Proof")],
-                                      date(2026, 11, 1), "", self.production)
+                                      date(2026, 11, 1), "", self.production, producers=[demo.id])
         _ = change_review.set_row_kind(earlier, "C1", "Read only", self.production)
         path = urlsplit(change_page.publish(self.production, earlier, ["C1"])).path
         page = change_page.page_at(self.root, path)

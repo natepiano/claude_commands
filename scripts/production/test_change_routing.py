@@ -47,7 +47,7 @@ class StaffRoutingTests(unittest.TestCase):
         return change_routing.StaffRouting(record or staff.snapshot(), {})
 
     def test_a_stored_unit_id_routes_without_history_and_ignores_production_and_merge(self) -> None:
-        row = {"#": "C1", "Producer": self.unit.id, "Production": "top", "Merged": "unknown"}
+        row = {"#": "C1", "Producer": self.unit.id, "Production": self.top.id, "Merged": "unknown"}
         owner = self.router().owner(row, self.root / "change-review - top.md")
         self.assertEqual(owner, change_routing.StaffRoutedChange(self.unit.id, self.child.id, "child"))
 
@@ -390,12 +390,15 @@ class StaffRoutingTests(unittest.TestCase):
                 _ = listing.write_text("## To review\n\n| # | Change | Production |\n| --- | --- | --- |\n| C1 | Known | natedev |\n")
                 docs = {name: root / f"{name}-production.md" for name in ("natedev", "builds")}
                 producer_rows(root, docs, {listing: "natedev"})
-                _ = change_review.append_rows(listing, [change_review.Visible("Unknown AWS change", "Read", "Proof")],
+                written = change_review.append_rows(listing, [change_review.Visible("Unknown AWS change", "Read", "Proof")],
                                                date(2026, 11, 2), "e41fa2a4", docs["builds"])
                 _ = listing.write_text(listing.read_text().replace("| C2 |", "| C777 |"))
                 runner = staff.snapshot().by_path("builds")
                 parent = staff.snapshot().by_path("natedev")
                 assert runner is not None and parent is not None
+                _ = listing.write_text(listing.read_text().replace(
+                    written[0].replace("| C2 |", "| C777 |"),
+                    written[0].replace("| C2 |", "| C777 |").replace(str(runner.id), "builds")))
                 _ = staff.move(runner.id, parent.id)
                 import change_review as cli_review
                 with (mock.patch.object(change_review, "lists_directory", return_value=root), mock.patch.object(cli_review, "lists_directory", return_value=root),

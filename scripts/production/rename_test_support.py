@@ -1,7 +1,6 @@
 """Private Git fixtures and in-process production rename commands."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shlex
@@ -33,7 +32,6 @@ import merge_checkpoint
 from scripts.production.production_doc import Production, read_production
 import rename
 from scripts.production import showrunners
-import stall_watch
 import tidy_wrapped
 import unit_move
 import unit_names
@@ -371,7 +369,6 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
                            "SHOWRUNNER_STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"])}),
             (tidy_wrapped, {"STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"]),
                             "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"])}),
-            (stall_watch, {"STATE_DIR": Path(environment["STALL_WATCH_STATE_DIR"])}),
         ):
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
@@ -474,7 +471,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.new_doc: Path = Path()
         self.notifier: Path = Path()
         self.state: Path = Path()
-        self.stall: Path = Path()
         self.worktrees: Path = Path()
         self.env: dict[str, str] = {}
         self.old_tip: str = ""
@@ -523,7 +519,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.new_doc = self.doc.with_name("new-production.md")
         self.notifier = self.root / "state/notifier"
         self.state = self.root / "state/showrunner"
-        self.stall = self.root / "state/stall-watch"
         self.worktrees = self.home / "worktrees"
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
@@ -538,7 +533,6 @@ class ProductionRenameFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
-            "STALL_WATCH_STATE_DIR": str(self.stall),
             "SHOWRUNNERS_CONFIG": str(self.home / ".claude/showrunners.json"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -554,7 +548,7 @@ class ProductionRenameFixture(StaffTestCase):
         })
 
     def build_fixture(self) -> None:
-        for path in (self.home, self.checkout, self.notifier, self.stall, self.worktrees):
+        for path in (self.home, self.checkout, self.notifier, self.worktrees):
             path.mkdir(parents=True)
         config = self.home / ".claude"
         config.mkdir()
@@ -595,9 +589,6 @@ class ProductionRenameFixture(StaffTestCase):
             self.write(self.state / relative, content)
         self.write(self.state / "child/parent", "old\n")
         self.write(self.state / "other/parent", "oldish\n")
-        for unit in UNITS:
-            self.write(self.stall_path(OLD, unit), json.dumps({"unit": unit, "stretch": 17}) + "\n")
-        self.write(self.stall_path("unrelated", "alpha-unit"), '{"stretch": 99}\n')
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -611,10 +602,6 @@ class ProductionRenameFixture(StaffTestCase):
 
     def plan_path(self, unit: str) -> Path:
         return self.checkout / "docs/plans" / f"{unit}.md"
-
-    def stall_path(self, slug: str, unit: str) -> Path:
-        digest = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
-        return self.stall / f"{digest}.json"
 
     def production_doc(self) -> str:
         return "\n".join([
@@ -685,9 +672,6 @@ class ProductionRenameFixture(StaffTestCase):
             self.assertIn("Historical example: old stays in ordinary prose.", plan)
             self.assertEqual(self.git("rev-parse", f"old-{unit}"), self.old_tip)
             self.assertTrue((self.worktrees / unit / ".git").exists())
-            self.assertFalse(self.stall_path(OLD, unit).exists())
-            stretch = cast(object, json.loads(self.stall_path(NEW, unit).read_text()))
-            self.assertEqual(stretch, {"unit": unit, "stretch": 17})
         self.assertFalse((self.notifier / "showrunner-old").exists())
         conf = (self.notifier / "showrunner-new/conf").read_text(encoding="utf-8")
         self.assertIn(str(self.new_doc), conf)
@@ -702,7 +686,6 @@ class ProductionRenameFixture(StaffTestCase):
             self.assertEqual(new_path.read_text(), content)
         self.assertEqual((self.state / "child/parent").read_text(), "new\n")
         self.assertEqual((self.state / "other/parent").read_text(), "oldish\n")
-        self.assertEqual(self.stall_path("unrelated", "alpha-unit").read_text(), '{"stretch": 99}\n')
         self.assertEqual(self.git("for-each-ref", "--format=%(refname)", f"refs/heads/{OLD}"), "")
         self.assertEqual(self.git("rev-parse", "new^"), self.old_tip)
         self.assertEqual(self.git("log", "-1", "--format=%s", NEW), "chore(new): rename production from old")

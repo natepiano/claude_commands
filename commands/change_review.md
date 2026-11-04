@@ -101,12 +101,10 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 When the user asks to review changes, follow [Bare command](#bare-command).
 
 The page contains every waiting change, with staff-based showrunner tabs.
-Each row stores its producer's fixed staff id in the Producer cell.
-The reader follows that id to the unit's current staff showrunner.
-An empty cell belongs to the list's showrunner.
-A showrunner id belongs to that showrunner.
-Names come from the staff record at use.
-Renamed and retired units keep their ids.
+An open Production cell holds the unit's fixed staff id or the showrunner's fixed staff id.
+The reader follows a unit's current staff parent and displays current names.
+Reviewed rows keep the production name recorded at the verdict.
+Renames and transfers do not rewrite these cells.
 The `unrouted` tab shows an unknown id or a broken staff parent chain.
 Verdicts save without sending a message.
 This tab offers no question control, and the server refuses question submissions without saving.
@@ -232,10 +230,15 @@ counted among the open questions. It goes on this list, and the user asks for
 
 ### Producer ids
 
-The merge writer matches each checkpoint branch to a unit staff row and stores that row's id in Producer.
-A unit with no staff row leaves the cell empty and prints one named note.
+Producer retains the unit's fixed staff id for verdict delivery.
+Unknown units leave Producer empty and print one named note.
 For `add`, `--repo` selects the directory; the default is `.`.
-A unit worktree stores its id.
-A showrunner directory or an unowned directory leaves the cell empty.
-The page, status line, and `/next` use one staff routing rule.
-The owner's staff showrunner supplies the production document, even when the list's document reference is missing.
+A showrunner directory or an unowned directory records a production-owned change.
+
+## Migrate owner cells
+
+Run `migrate-owners [--list <list>]` to list conversions and unknown names.
+Add `--write` to replace known names with fixed staff ids.
+Without `--list`, the command reads all change review lists.
+Unknown names and reviewed rows remain unchanged.
+A retry completes interrupted work; a finished retry writes nothing.

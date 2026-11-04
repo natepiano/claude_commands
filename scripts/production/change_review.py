@@ -1,65 +1,19 @@
 #!/usr/bin/env python3
-"""The change-review list: the trailer every checkpoint commit carries, and the rows a merge adds.
+"""Read checkpoint trailers and write change review rows.
 
-    change_review.py check --repo R --checkpoint C --previous P --merge-branch B
-    change_review.py append --repo R [--production DOC] [--list L] --merged M --checkpoint C --previous P --merge-branch B
-    change_review.py drift --repo R --merge-branch B [--production DOC] [--list L] --since YYYY-MM-DD
-    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>] [--hold <folder> ...]
-    change_review.py edit [--production DOC] [--list L] --row ID --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
-    change_review.py show [--production DOC] [--list L]
-    change_review.py verdict [--production DOC] [--list L] --row ID --verdict "<the user's words>"
-    change_review.py set-kind [--production DOC] [--list L] --row ID --kind "See in action|Read only"
-    change_review.py mark-important [--production DOC] [--list L] --row ID
-    change_review.py list-path [--production DOC]
-    change_review.py showrunner [--production DOC]
-    change_review.py backfill-production [--list L] [--write]
+A visible trailer has three fields: Change-Review: <change> | <check> | <result>.
+An invisible change uses Change-Review: none — <reason>.
+See commands/change_review.md for actions, list selection, urgency, verdicts, and scratch folders.
 
-A checkpoint(...) commit tells a person with no context what changed, how to try it and what they
-see, one line each: `Change-Review: <what changed for you> | <how to try it: where and what to type> |
-<what you see>`, three parts split on " | ", where "where" names the machine (natedev or the Mac) and
-the session (a terminal, a showrunner session, a unit session or any Claude session). For example:
-`Change-Review: Panels keep their shields | In a natedev terminal, run `hana` | Each panel shows its
-shield`. A line with another number of parts, or an empty part, is refused. `Change-Review: none —
-<why nothing visible changes>` names a change the user cannot see. A checkpoint that changes only
-Markdown needs none. A later checkpoint covers a pushed checkpoint that missed its line. It carries
-the lines and `Change-Review-Covers: <hash>`. The later checkpoint must be a plain commit, not a merge:
-a merge may carry only `Change-Review: none` lines. The merge gate refuses a unit's checkpoint without
-its line, then adds one row per visible line under the list's "## To review":
-the next C number, the push date and the merged hash, the How to check cell `<how to try it> You
-see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
-row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
-its id, Merged cell and position; `show` prints the current row and how many wait after it; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
-date, and removes the row's scratch folders and held folders (task `row:<showrunner>-C<n>`,
-scripts/lib/scratch.py) whichever way the verdict goes; `add --hold <folder>` holds a folder the user
-checks the row in, where it is, until that verdict; `mark-important` marks a row the user called important.
+An open Production cell holds its unit's fixed staff id or its showrunner's fixed staff id.
+Readers resolve current names and the unit's current parent.
+Reviewed rows retain the production name recorded at the verdict.
+Unknown owner names remain unresolved.
 
-Each row's Production cell names the production whose change it is: the production with a unit staff
-row on the branch of the checkpoint that carries the row's line (`publication_changes`), else the
-merging one. `backfill-production` fills the empty cells of older rows under To review, in the list
---list names or in every list, from the row's merge hash: the checkpoint that names the row's
-change, else the one production of every checkpoint the merge brought in. It prints each cell it
-fills and each row it cannot trace, with why, and writes only with --write.
-
-To review keeps the order of urgency.py, rewritten on every write: the row `show` last printed
-first until its verdict, then by urgency, then by C number. A row's Urgency cell holds its level,
-due time and prerequisite (`soon, due 2026-10-22, after C3`); it is empty for a normal row, and a
-list gains the column on its first row that needs it. Every write holds a lock on the list's directory, and the first write to a missing list
-creates it from the skeleton. Every write sets the frontmatter's date_modified and adds the
-writing production's doc to its productions. A list in a git work tree is committed alone after
-each write, still under the lock, and never pushed; a refused commit warns and the next write
-commits it.
-
-Each top-level showrunner keeps one list, `change-review/change-review - <showrunner>.md`, and a
-child production's rows go to its root's list. A production opts in with a `- **Change review:**
-<path>` line in its Production Context. While the root showrunner runs, its session name names the
-list; otherwise the line's path does. `list-path` prints the list and `showrunner` the name, each
-from the calling showrunner's update timer when no doc is given; add, show and verdict find the
-list the same way unless --list names one; edit does too. Every write names its production, the same way.
-For edit, verdict and mark-important, --row takes the ID /next printed: C434 selects the current
-list; production/C9 selects that production's named list. An explicit --list must match that name.
-With a production, show reads its current and earlier lists and keeps the same pin as /next.
-Rows in other lists carry their list name; current-list rows keep their plain IDs. Without a
-production, show --list reads every row in that explicit list.
+Run migrate-owners [--list PATH] [--write] to convert known names once.
+The migration leaves unknown names and reviewed rows unchanged.
+Run backfill-production [--list PATH] [--write] to resolve empty cells from recorded merge history.
+List writes hold the directory lock. Normal writes update metadata and commit only the list.
 """
 from __future__ import annotations
 
@@ -69,7 +23,8 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Generator, Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import Enum
@@ -102,7 +57,7 @@ SECTION = "## To review"
 REVIEWED = "## Reviewed"
 CHECK = "How to check"
 URGENCY = "Urgency"
-# The production a row's change is from: its slug. A row from before the column is the root's.
+# Open rows hold the owner's fixed staff id. Reviewed rows keep their recorded production.
 PRODUCTION = "Production"
 PRODUCER = change_routing.PRODUCER
 KIND = "Kind"
@@ -469,9 +424,7 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
     frontmatter for `production` on `day`. `what` names the write in the commit subject.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        fcntl.flock(directory, fcntl.LOCK_EX)
+    with _list_lock(path):
         text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
         lines = text.splitlines(keepends=True)
         result = write(lines)
@@ -483,8 +436,6 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
         write_text_atomic(path, "".join(lines))
         _commit(path, what(result))
         return result
-    finally:
-        os.close(directory)
 
 
 def _commit(path: Path, what: str) -> None:
@@ -627,6 +578,10 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
     row_producers = [change.producer if isinstance(change, PublicationChange)
                      else producers[index] if producers else UnknownProducer() for index, change in enumerate(changes)]
 
+    record = staff.initial_snapshot()
+    identities = [str(producer) if isinstance(producer, str) else row_production(owner, record)
+                  for owner, producer in zip(row_owners, row_producers)]
+
     def write(lines: list[str]) -> list[str]:
         if rank:
             _add_column(path, lines, SECTION, URGENCY)
@@ -640,7 +595,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank),
                                      KIND: "", PRODUCER: str(row_producers[offset]) if isinstance(row_producers[offset], str) else "",
-                                     PRODUCTION: _cell(row_production(row_owners[offset]))})
+                                     PRODUCTION: _cell(identities[offset])})
                 for offset, item in enumerate(items)]
         _insert(lines, end, rows)
         return rows
@@ -835,10 +790,10 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
     return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
 
 
-def row_production(production: Path) -> str:
-    """The Production cell for a change of the production doc `production`: the slug of the production
-    it is credited to (`credited`)."""
-    return slug_of(credited(production))
+def row_production(production: Path, record: staff.StaffSnapshot) -> str:
+    """Read the fixed showrunner id for a production-owned change."""
+    owner = record.by_doc(remote.local_machine(), credited(production))
+    return str(owner.id) if owner is not None else slug_of(production)
 
 
 def credited(production: Path) -> Path:
@@ -1131,12 +1086,13 @@ def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[
     filled: dict[str, str] = {}
     untraced: dict[str, str] = {}
     owners: dict[str, Path] = {}
+    record = staff.snapshot()
     for row in pending(path):
         if row.get(PRODUCTION, "").strip():
             continue
         found = trace(row, tree)
         if isinstance(found, Path):
-            filled[row["#"]], owners[row["#"]] = row_production(found), found
+            filled[row["#"]], owners[row["#"]] = row_production(found, record), found
         else:
             untraced[row["#"]] = found
     if not write or not filled:
@@ -1149,33 +1105,60 @@ def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[
     return filled, untraced
 
 
-def rename_production(path: Path, production: Path, old: str, new: str) -> list[str]:
-    """Rewrite each Production cell under To review that names `old` to `new`; return the rows changed.
+@contextmanager
+def _list_lock(path: Path) -> Generator[None]:
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
-    A production rename keeps its rows on the list (`/showrunner:rename`). `production` is the renamed
-    doc, which stamps the write. A list with no such cell is not written.
-    """
-    if not path.exists() or not any(row.get(PRODUCTION) == old for row in pending(path)):
-        return []
 
-    def rewrite(lines: list[str]) -> list[str]:
-        columns, first, end = _table(path, lines, SECTION)
-        at = columns.index(PRODUCTION)
-        changed: list[str] = []
-        for index in range(first, end):
-            cells = _cells(lines[index])
-            if at < len(cells) and _plain(cells[at]) == old:
-                cells[at] = _cell(new)
-                lines[index] = _join_cells(cells) + "\n"
-                changed.append(cells[0])
-        return changed
-
-    return _edit(path, production, today(), rewrite, lambda rows: f"production {old} renamed {new} in {len(rows)} rows")
+def migrate_owners(paths: Iterable[Path], *, write: bool) -> list[str]:
+    """Replace open name cells with fixed ids. Leave unknown names and reviewed rows unchanged."""
+    messages: list[str] = []
+    for path in paths:
+        with _list_lock(path):
+            record = staff.snapshot()
+            lines = read(path).splitlines(keepends=True)
+            rows = _review_table(path, lines, SECTION)
+            replacements: dict[str, str] = {}
+            for row in rows:
+                value = row.get(PRODUCER) or row.get(PRODUCTION, "")
+                member = record.by_id(staff.StaffId(value)) or record.by_path(value)
+                if member is None or member.kind not in ("unit", "showrunner"):
+                    messages.append(f"{path}: {row['#']}: no staff row for {value!r}")
+                elif row.get(PRODUCTION) != member.id:
+                    replacements[row['#']] = str(member.id)
+            if not replacements:
+                continue
+            _add_column(path, lines, SECTION, PRODUCTION)
+            columns, first, end = _table(path, lines, SECTION)
+            at = columns.index(PRODUCTION)
+            for index in range(first, end):
+                cells = _cells(lines[index])
+                if cells[0] in replacements:
+                    cells[at] = _cell(replacements[cells[0]])
+                    lines[index] = _join_cells(cells) + "\n"
+            if write:
+                write_text_atomic(path, "".join(lines))
+            messages.extend(f"{path}: {row}: {identity}" for row, identity in replacements.items())
+    return messages
 
 
 def describe(row: dict[str, str]) -> str:
     """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
-    rest = [f"  {column}: {value}" for column, value in row.items() if column not in ("#", "Change", CHECK) and value]
+    record = staff.initial_snapshot()
+    shown = dict(row)
+    member = record.by_id(staff.StaffId(row.get(PRODUCTION, "")))
+    if member is not None and not row.get("Verdict"):
+        parent = record.by_id(member.parent) if member.kind == "unit" and member.parent is not None else member
+        shown[PRODUCTION] = parent.name if parent is not None else member.name
+    producer = record.by_id(staff.StaffId(row.get(PRODUCER, "")))
+    if producer is not None:
+        shown[PRODUCER] = producer.name
+    rest = [f"  {column}: {value}" for column, value in shown.items() if column not in ("#", "Change", CHECK) and value]
     return "\n".join([f"{row.get('#', '')} {row.get('Change', '')}", f"  {CHECK}: {row.get(CHECK, '')}", *rest])
 
 
@@ -1275,10 +1258,17 @@ def record_verdict(path: Path, row: str, verdict: str, day: date,
                 return VerdictAlreadyRecorded(verdict, _plain(cells.get("Date", "")), row_merge(cells))
             return VerdictConflict(_plain(cells.get("Verdict", "")), _plain(cells.get("Date", "")))
         cells = dict(zip(columns, _cells(lines.pop(index))))
+        identity = staff.initial_snapshot()
+        member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
+        if member is not None:
+            parent = identity.by_id(member.parent) if member.kind == "unit" and member.parent is not None else member
+            cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
         if not any(line.strip() == REVIEWED for line in lines):
             reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
             _insert(lines, len(lines), reviewed_rows)
         _add_column(path, lines, REVIEWED, "Merged")
+        if member is not None:
+            _add_column(path, lines, REVIEWED, PRODUCTION)
         if PRODUCER in cells:
             _add_column(path, lines, REVIEWED, PRODUCER)
         # Page rows retain their description and proof in the same record after
@@ -1567,6 +1557,10 @@ def _backfill_targets(options: CommandLine) -> tuple[list[Path], list[Path]]:
 
 def _run(options: CommandLine) -> int:
     match options.action:
+        case "migrate-owners":
+            paths = [Path(options.list).expanduser()] if options.list else sorted(lists_directory().glob(PREFIX + "*.md"))
+            for message in migrate_owners(paths, write=options.write):
+                print(message)
         case "add":
             item, rank = _visible(options), _rank_option(options)
             path = _list(options)
@@ -1655,7 +1649,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
-                                                   "backfill-production"))
+                                                   "backfill-production", "migrate-owners"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
                  "row", "verdict", "production", "urgency", "due", "after", "kind"):

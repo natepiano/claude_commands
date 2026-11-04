@@ -1,15 +1,6 @@
-"""Production rename, apply step 4: the production's state outside the showrunner state folder.
+"""Move a production's state outside the showrunner state folder.
 
-Each part is safe to repeat, so a refused step 4 resumes by running every part again:
-
-- /next pins: `next-`, `proposal-` and `question-<slug>` queues, and their all-below forms, take the
-  new slug, and each item key `<old>: ...` becomes `<new>: ...`.
-- change review: each Production cell on the production's list that names the old slug.
-- children: a child production doc whose Parent production line names the old doc.
-- bevy upgrade watch: its record, lock and notifier job, whose check names the doc.
-- unit board: the old slug's board file is derived output; it is removed and rebuilt on demand.
-- log: a Log line naming `<old>-log.md` takes `<new>-log.md`; the log and its `-recovered` copy move, and
-  an info/exclude line naming an old one also names the new one. Both stay untracked (log_paths).
+Each operation supports repeated execution after an interruption.
 """
 from __future__ import annotations
 
@@ -23,11 +14,10 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import change_review  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import unit_move  # noqa: E402
-from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
+from rename_state import read_json, write_json, write_text  # noqa: E402
 from unit_move import PathMove  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -105,13 +95,6 @@ def destinations(old: str, new: str, doc: Path) -> list[Path]:
     return [move.destination for move in moves if unit_move.exists(move.source)]
 
 
-def _change_list(doc: Path) -> Path | None:
-    try:
-        return change_review.scope_list(doc)
-    except (change_review.ChangeReviewError, OSError):
-        return None
-
-
 def _parent_line(doc: Path) -> int | None:
     lines = doc.read_text(encoding="utf-8").splitlines()
     return next((index for index, line in enumerate(lines) if line.startswith(PARENT_LINE)), None)
@@ -137,11 +120,6 @@ def describe(old: str, new: str, old_doc: Path, new_doc: Path) -> list[str]:
     """Plan lines for step 4's outside state; reads only."""
     lines = [f"4. /next pin {move.source} -> {move.destination}"
              for move in pin_moves(old, new) if unit_move.exists(move.source)]
-    listed = _change_list(old_doc)
-    rows = ([row["#"] for row in change_review.pending(listed) if row.get(change_review.PRODUCTION) == old]
-            if listed is not None and listed.exists() else [])
-    if rows:
-        lines.append(f"4. change review {listed}: Production {old} -> {new} in {len(rows)} rows")
     lines.extend(f"4. Parent production {doc}: {old_doc} -> {new_doc}"
                  for doc in _children_naming(old_doc, showrunner_tree.children_of(old)))
     for move in (bevy_record(old, new), bevy_job(old, new)):
@@ -229,12 +207,6 @@ def _move_log(old: str, new: str, doc: Path) -> None:
 def apply(old: str, new: str, old_doc: Path, new_doc: Path) -> None:
     """Move the production's outside state to the new slug and doc. Runs after the parent files moved."""
     _move_pins(old, new)
-    listed = _change_list(new_doc)
-    if listed is not None:
-        try:
-            _ = change_review.rename_production(listed, new_doc, old, new)
-        except change_review.ChangeReviewError as error:
-            raise RenameRefused(f"change review: {error}") from error
     _rewrite_children(new, old_doc, new_doc)
     _move_bevy_watch(old, new, old_doc, new_doc)
     board_file(old).unlink(missing_ok=True)

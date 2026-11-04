@@ -370,9 +370,15 @@ def unit(unit_name: str, worktree: Path, plan_text: str, clock: BoardClock, sour
 
 
 @dataclass(frozen=True)
+class BoardProduction:
+    owner: staff.StaffRow
+    runner: showrunners.Showrunner
+
+
+@dataclass(frozen=True)
 class BoardSubtree:
     record: staff.StaffSnapshot
-    runners: tuple[showrunners.Showrunner, ...]
+    runners: tuple[BoardProduction, ...]
 
 
 @dataclass(frozen=True)
@@ -404,13 +410,13 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
     slugs = {row.id: slug for slug, row in members.items()}
     if root is None or root.id not in slugs:
         return NoBoardSubtree()
-    boards: list[showrunners.Showrunner] = []
+    boards: list[BoardProduction] = []
     level = [root]
     while level:
         for row in level:
             slug = slugs.get(row.id, "")
             if slug in by_slug:
-                boards.append(by_slug[slug])
+                boards.append(BoardProduction(row, by_slug[slug]))
         level = sorted((child for row in level for child in staff.active(record, "showrunner")
                         if child.parent == row.id and child.id in slugs),
                        key=lambda row: slugs.get(row.id, row.name))
@@ -469,22 +475,53 @@ def write_board(path: Path, board: dict[str, object]) -> None:
             Path(temporary).unlink(missing_ok=True)
 
 
+def migrate_cache(root: Path, record: staff.StaffSnapshot) -> int:
+    """Move exact timer slugs to staff ids. Retain files without a recorded owner."""
+    owners: dict[str, staff.StaffId] = {}
+    for row in record.find(kind="showrunner"):
+        timer = showrunners.timer_for(row, record)
+        if isinstance(timer, showrunners.Timer):
+            owners[timer.slug] = row.id
+    ids = {row.id for row in record.find(kind="showrunner")}
+    unknown: list[str] = []
+    for source in sorted(root.glob("*.json")):
+        if source.stem in ids:
+            continue
+        owner = owners.get(source.stem)
+        if owner is None:
+            unknown.append(str(source))
+            continue
+        target = root / f"{owner}.json"
+        try:
+            target.hardlink_to(source)
+        except FileExistsError:
+            if source.read_bytes() != target.read_bytes():
+                raise FileExistsError(f"{source}: staff cache already differs: {target}") from None
+        source.unlink()
+    for path in unknown:
+        print(f"board_json: no recorded cache owner: {path}", file=sys.stderr)
+    return int(bool(unknown))
+
+
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    _ = parser.add_argument("--migrate-cache", action="store_true", help="Move cache files to staff ids.")
     _ = parser.add_argument("--session", default="")
     _ = parser.add_argument("--production", default="")
     args = parser.parse_args(arguments)
     session, production = cast(str, args.session), cast(str, args.production)
+    root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
+    if cast(bool, args.migrate_cache):
+        return migrate_cache(root, staff.snapshot())
     if not session and not production:
         parser.error("--session or --production is required")
     subtree = resolve(production, session)
-    root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
     files: list[str] = []
     if isinstance(subtree, BoardSubtree):
         resolver = session_staff.RowResolver(subtree.record)
-        for runner in subtree.runners:
-            path = root / f"{runner['slug']}.json"
-            write_board(path, build(runner, record=subtree.record, resolver=resolver))
+        for production_board in subtree.runners:
+            path = root / f"{production_board.owner.id}.json"
+            write_board(path, build(production_board.runner, record=subtree.record, resolver=resolver))
             files.append(str(path))
     watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
     if isinstance(subtree, BoardSubtree):

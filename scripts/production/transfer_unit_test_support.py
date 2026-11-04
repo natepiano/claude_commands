@@ -1,7 +1,6 @@
 """Use private staff records and Git repositories for unit transfer tests."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shlex
@@ -98,7 +97,6 @@ class UnitTransferFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state/showrunner"),
-            "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "SHOWRUNNERS_SEND": str(self.root / "fake_send.py"),
@@ -158,7 +156,6 @@ class UnitTransferFixture(StaffTestCase):
                    "EVERY=15\nTARGET=session:8f83b18e-2d35-5935-a408-9f483d34afff\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh",
                                  str(self.giving / "docs/plans/demo-production.md")]) + "\n")
-        self.write(self.stall_path("demo", "alpha-unit"), '{"stretch": 17}\n')
 
     def production_doc(self, slug: str, checkout: Path) -> str:
         return "\n".join(["# Production — " + slug, "", "## Production Context", "",
@@ -175,9 +172,6 @@ class UnitTransferFixture(StaffTestCase):
         self.assertEqual(result.returncode, 0, (arguments, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def stall_path(self, slug: str, unit: str) -> Path:
-        digest = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
-        return self.root / "state/stall-watch" / f"{digest}.json"
 
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

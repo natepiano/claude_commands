@@ -139,12 +139,11 @@ class ProductionRenameTests(support.ProductionRenameFixture):
                      *(self.state / directory / slug for directory in ("footers-off", "") for slug in (OLD, NEW)),
                      *(self.state / directory / f"{slug}.json"
                        for directory in ("review-paused", "outstanding") for slug in (OLD, NEW)),
-                     self.state / "child/parent",
-                     *(self.stall_path(slug, unit) for unit in UNITS for slug in (OLD, NEW))):
+                     self.state / "child/parent"):
             self.assertIn(str(path), result.stdout)
         self.assertIn(f"{self.state}/*/parent", result.stdout)
         steps = [int(line.split(".", 1)[0]) for line in result.stdout.splitlines()]
-        self.assertEqual(set(steps), set(range(1, 8)))
+        self.assertEqual(set(steps), {1, 2, 3, 4, 6})
         self.assertEqual(steps, sorted(steps))
         self.assertIn("merge branch old -> new", result.stdout)
         self.assertIn("push origin new", result.stdout)
@@ -154,7 +153,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assert_success(self.run_rename("apply"))
         self.assert_applied()
 
-    def test_apply_moves_pins_change_cells_child_parent_line_and_bevy_watch(self) -> None:
+    def test_apply_moves_pins_child_parent_line_and_bevy_watch_and_preserves_change_ids(self) -> None:
         listed = self.root / "lists/change-review - old.md"
         self.write(self.doc, self.doc.read_text().replace(
             "## Production Context\n", f"## Production Context\n\n- **Change review:** `{listed}`\n").replace(
@@ -165,12 +164,15 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "Name the change review list")
         _ = self.git("push", "origin", OLD)
+        owner = self.production_row().id
+        child = next(row.id for row in staff.find(kind="showrunner") if row.name == "child")
         rows = ["| # | Change | Merged | How to check | Production |", "| --- | --- | --- | --- | --- |",
-                "| C1 | own | m | try | old |", "| C2 | child's | m | try | child |", "| C3 | root's | m | try |  |"]
+                f"| C1 | own | m | try | {owner} |", f"| C2 | child's | m | try | {child} |", f"| C3 | root's | m | try | {owner} |"]
         self.write(listed, "\n".join([
             "---", "date_created: 2026-10-27", "date_modified: 2026-10-27", "---", "",
             "# old showrunner: changes to review", "", "## To review", "", *rows, "",
             "## Reviewed", "", "| # | Change | Verdict | Date |", "| --- | --- | --- | --- |", ""]))
+        review_before = listed.read_bytes()
         pins = self.home / ".local/state/next"
         question = {"current": "old: first", "ended": {"old: earlier": "2026-10-27T01:00:00"}, "moved": ["oldish: kept"]}
         self.write(pins / "question-old.json", json.dumps(question))
@@ -189,7 +191,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.write(board, "{}\n")
         planned = self.run_rename("plan")
         self.assert_success(planned)
-        for expected in ("/next pin", "change review", "in 1 rows", f"Parent production {child_doc}",
+        for expected in ("/next pin", f"Parent production {child_doc}",
                          "bevy upgrade watch", "remove derived unit board", "production log"):
             self.assertIn(expected, planned.stdout)
         self.assert_success(self.run_rename("apply"))
@@ -200,9 +202,10 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(json.loads((pins / "next-new-all-below.json").read_text()),
                          {"current": "C1", "source": "change-old"})
         text = listed.read_text()
-        self.assertIn("| C1 | own | m | try | new |", text)
-        self.assertIn("| C2 | child's | m | try | child |", text)
-        self.assertRegex(text, r"\| C3 \| root's \| m \| try \| *\|")
+        self.assertEqual(listed.read_bytes(), review_before)
+        self.assertIn(f"| C1 | own | m | try | {owner} |", text)
+        self.assertIn(f"| C2 | child's | m | try | {child} |", text)
+        self.assertIn(f"| C3 | root's | m | try | {owner} |", text)
         self.assertIn(f"- **Parent production:** {self.new_doc}\n", child_doc.read_text())
         self.assertFalse((bevy / "old.json").exists())
         self.assertFalse((bevy / "old.lock").exists())
@@ -247,18 +250,14 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(production_docs, ["docs/plans/new-production.md"])
         self.assert_applied()
 
-    def test_a_retired_unit_has_no_plan_but_its_stall_state_moves(self) -> None:
+    def test_a_retired_unit_has_no_plan(self) -> None:
         _ = fixture_member("unit", name="retired", parent=self.production_row().id,
                            worktree=staff.RemovedWorktree("natedev", self.worktrees / "retired"))
-        self.write(self.stall_path(OLD, "retired-unit"), '{"stretch": 23}\n')
         before = self.snapshot()
         planned = self.run_rename("plan")
         self.assert_success(planned)
         self.assertEqual(self.snapshot(), before)
-        self.assertIn(str(self.stall_path(NEW, "retired-unit")), planned.stdout)
         self.assert_success(self.run_rename("apply"))
-        self.assertFalse(self.stall_path(OLD, "retired-unit").exists())
-        self.assertEqual(self.stall_path(NEW, "retired-unit").read_text(), '{"stretch": 23}\n')
         committed = self.git("diff-tree", "--no-commit-id", "--name-only", "-r", NEW).splitlines()
         self.assertEqual(set(committed), {"docs/plans/old-production.md", "docs/plans/new-production.md",
                                          *(f"docs/plans/{unit}.md" for unit in UNITS)})
