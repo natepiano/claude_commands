@@ -96,7 +96,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 1. **One staff record (user, 2026-10-30).** `scripts/production/staff.py` and one file, `~/.local/state/staff/staff.json` on natedev, hold every showrunner, unit director and worker: a stable id, a short name, the kind, and the parent row's id. So the record maps each short name to an id and holds the relationships (worker → unit → showrunner); production and unit come from the parent chain. A rename changes only the name and a transfer only the parent; the id never changes. There is no separate worker ledger: the unit worker ledger, `mesh_roster.json`, the run `workers` log and the slot claim files retire into this record. Live state (pane, socket, running or not) is never stored; it comes from herdr and the session records at read time. No such record exists today: the hierarchy is joined at each read from update timers, parent files, Units tables, pane marks and the worker ledgers (Reference → Staff record readers).
 2. **One command starts or resumes a worker (user, 2026-10-30).** `worker_panes.py start-or-resume <short name> --role <role>`. The role is the recorded role on the worker's staff row, written once at admission by `staff.ensure_worker(name, parent, role)` (Phase 3n); no code parses a role from the name, and a launcher name such as `impl2` can hold any recorded role. A worker's herdr agent name and its Claude or Codex session name are its staff id. Both Claude Code and Codex resume a conversation by its name (user, 2026-10-30), so the command resumes by id and keeps no conversation id. At every start or resume it looks up kind, model, effort, service tier and sandbox for that role in the model registry, and only then (user, 2026-10-30, option A): a `/model` typed by hand holds, no dispatch compares the model, and a config change does not restart a running worker. This replaces 710a6adb's per-turn lookup. The director picks the number: `impl1`, then `impl2` for a second implementer. The name is set once, when the row is made.
-3. **Idle panes close at phase end (user, 2026-10-30).** The conversation stays. To bring a worker back, the director calls `start-or-resume` again. This settles the keep-open question.
+3. **Idle panes close at phase end (user, 2026-10-30).** A pane closes when its role is idle (its dispatch is done and nothing is queued) and reopens by `current_session` at the next dispatch. This applies to workers, designers and reviewers (user, 2026-11-03 via sdlc: the codex-mesh retires). The conversation stays. To bring a worker back, the director calls `start-or-resume` again. This settles the keep-open question.
 4. **The worker's final reply signals completion, and the transcript is the receipt; herdr's state only wakes the launcher.** Every dispatch has a dispatch id, and the one line the launcher types carries it (decision 7). The worker's own transcript then holds the proof of each step: the typed line with the id proves the submission, and a final reply that ends with `DONE <dispatch id>` proves completion. The launcher writes the status file only from that reply. A rerun reads the transcript before it types anything, so it never types a pass twice (Phase 8). No other record of a submission exists, and the prompt file is never changed. The launcher writes the status file today (`implement.sh:629`); the worker writes only its summary. This works the same for read-only reviewers, which cannot write a file (`review.sh:689` starts them with `--sandbox read-only`): the launcher writes their findings file from the reply, as the mesh does today.
 5. **The launcher's whole wait is one background `herdr agent prompt <id> "<line>" --wait`, with no `--timeout` and no `--until`.** herdr then waits for its default settled set, `idle`, `done` or `blocked`, after it sees the turn start (herdr skill, "For normal agent work, `--wait` is enough"). `blocked` wakes the launcher, so a worker at an approval dialog never stalls the director. The director runs the launcher in the background, as today, and the task notification is the wake-up.
 6. **A dispatch refuses a busy worker; a message queues.** A dispatch is a new pass that a launcher waits on, so it needs an `idle` or `done` worker, under the worker's dispatch lock. A message (`send.py`, a detached-run result, review Stage 2) is typed at once, also during a turn: Codex and Claude queue typed input. A blocked or closed worker's message goes to its director. `pending.json` drops.
@@ -111,6 +111,8 @@ Each item is my call under the decision criteria unless it names the user. A one
 15. **One way to find a row: the `unit_marks` join (herdr-unit, 2026-10-30; showrunner, 2026-10-30).** The join is `unit_marks.MemberSources.member` (`unit_marks.py:77`, built by `member_sources` :136); `staff_sources.member` (`staff_sources.py:42`) is its entry point and keeps no join of its own (Delegation Context → One identity join). `unit_marks.py` and `staff_sources.py` import `showrunners.py`, so `showrunners.py` never imports either, and no lazy import or copy of `member` goes around that rule. `staff.py` imports none of today's sources (Phase 1 As-built). Row names are workspace and tab names, not slugs: seed keeps slug `sdlc` as row `tools` (`scripts/production/test_staff_sources.py:28`), so no code finds a showrunner or unit row with `staff.by_path(<slug>)`. Code that needs a member's row calls `staff_sources.member(selector, staff.snapshot())`; a `showrunners.py` function that works on rows takes the row or the `StaffSnapshot` from its caller and never looks a member up itself. Tests use a slug that differs from its workspace name. One exception (showrunner, 2026-10-30): `showrunners.py main`'s attach and detach branch imports `showrunner_parent` inside that branch, so users keep one command; the module has no load-time import of it. The showrunner tree readers live in `showrunner_tree.py`, which imports `staff`, `staff_sources` and `showrunners` (sdlc, 2026-10-30; Phase 3c item 5); `showrunners.py main` imports it inside the branch that needs it, under the same exception.
 16. **The row holds what the user's design needs (herdr-unit, 2026-10-30; worker role, sdlc 2026-10-31; corrected 2026-10-31 for decision 17).** The row is id, kind, short name and parent: a map from short name to id and who reports to whom (Phase 1 As-built). A worker row also holds its recorded role, set once at admission (Phase 3n). Phase 3q adds two fields: a unit row holds its worktree (`PresentWorktree | RemovedWorktree`) and a showrunner row holds its production doc (`LiveDoc | WrappedDoc`). The row gains no session, socket, zone or Units-table field; a worker's backend identity is a separate `"backends"` section of the same `staff.json` (Phase 3n), not a row field. A retired unit keeps its row with `RemovedWorktree`, and a wrapped production keeps its showrunner row with `WrappedDoc` (user, 2026-10-31); this supersedes the Phase 1 rule that a retired member has no row (Phase 3r). A reader keeps reading the timer fields (session, socket, zone, interval) from the update timer, joined to the row by the doc, never by a name: a row's name is not its slug (decision 15, `sdlc` → `tools`), so until Phase 4a the one join is `showrunners.timer_for(row, snapshot)`, which matches the timer whose doc is the row's doc (`StaffSnapshot.by_doc`); from Phase 4a the timer folder is keyed by the staff id and the join reads it directly. Its doc comes from the row. Every reader phase keeps a fixture whose slug differs from its row name. A unit's branch comes from git in its worktree, its plan and port from `.unit.toml`, and its pane and running state from herdr. A row with no timer on this machine has no timer fields here, and the reader shows it without them. The Units-table cells and the old Phases 16 and 17 are no longer the plan: Phases 3s-3w move the readers, and Phase 4c deletes the Units table.
 17. **Staff design (user via the sdlc showrunner, 2026-10-31).** The unit row holds its worktree, and repository and branch come from git in it. Plan, port and responsibilities are in an untracked `.unit.toml` at the worktree root; retire parks it under `~/.local/state/staff/units/<staff id>.toml` and `resume_unit` puts it back. No folder is worked out from a name. Owns, the Units table, the `showrunners.json` lists, `Showrunner session`, `Parent production`, `Formerly` and the review pool are deleted. The approved pane-first order is in Phases → Critical path (sdlc, 2026-10-31 15:5x EDT). After each landing all live tools still work. Shared gates cover the exact final batch. Each state change keeps its real proof and rerun checks. Each delete names a check that proves nothing still reads the thing. Retired units are backfilled, and a missing fact is listed for sdlc, never filled from a likely value. Only `STAFF_ID` stays in the pane environment and the pane launch record (Delegation Context → Staff design (2026-10-31)). The term "unit marks" retires: text says "session labels" (the unit name and staff id a session carries), and `unit_marks.py` becomes `session_labels.py` in Phase 3s (user via sdlc, 2026-10-31).
+18. **A herdr pane starts in its worktree's dev shell (C380, models-unit via sdlc, 2026-11-03).** When the codex-mesh retires, a worker, designer or reviewer pane starts inside its worktree's direnv dev shell, as the Codex app-servers do today. One test covers it.
+19. **A run result reaches its owner after the launcher exits (models-unit via sdlc, 2026-11-03).** Today the mesh relay holds a detached-run result for an attached launcher, and drops it when no launcher is attached. A worker pane's run result goes to its owner with no launcher attached. One test covers it. Evidence: session cc8dddb8, runs 20261103T193124, 20261103T164054 and 20261103T200357-1248016-79f7.
 
 ## Questions for the user
 
@@ -1233,7 +1235,7 @@ It supports reruns and is deleted in Phase 18.
 Test a `/clear` during migration: resolve current ownership again, report unavailable evidence, and preserve fixed store keys.
 Make no unproved write and create no second row.
 
-### Phase 4r — Stop, resume, restart and move refuse only a catastrophe  · status: todo
+### Phase 4r — Stop, resume, restart and move refuse only a catastrophe  · status: done
 
 **Depends on:** Phase 5. Lands before 4b (natedev, 2026-11-03).
 
@@ -1244,22 +1246,30 @@ The user, 2026-11-03: "moving should be very simple - it should look for very fe
 **Goal:** herdr-unit's stop, resume, restart and move code refuses only to prevent a catastrophe: lost work, a live session killed, or data destroyed. Every other refusal goes, and the code gets shorter.
 
 **Spec:**
-1. The keep list comes from the read-only inventory (`phases/4r/refusal_inventory.md` in the run folder), agreed with natedev before the edit.
+1. The keep list is section 4 of sdlc's spec `docs/plans/staff-lifecycle.md` (2026-11-03), and nothing more: the target folder exists (git's own error); a second operation on the same row runs at the same time (one lock for each row); a second copy of a running session would start; uncommitted work would be deleted; a signal, keystroke or pane close would reach a process that is not the target (item 7). The read-only inventory (`phases/4r/review_findings_3.txt` in the run folder) maps each refusal in the code to keep or delete.
 2. Each refusal not on the keep list is deleted. Unknown or stale evidence prints a named note and the action continues.
 3. Each kept refusal names its catastrophe in its message.
 4. A check that only an out-of-scope caller needs (shutdown-unit, devtools-unit, accounts-unit) goes to that owner as a notice, not an edit.
+5. The pane launch records (`~/.local/state/herdr-panes/<session>.json`, `pane_launch.py`) go: a pane is found as the herdr pane whose process runs the row's `current_session` (sdlc, 2026-11-03).
+6. The tab order list (`layout-agents.json`) stores staff row ids, not tab titles. Restart reads each title from the staff row's `name`.
+7. One target check (spec section 4 item 5, sdlc and natedev 2026-11-03): before a signal, a keystroke or a pane close, confirm that the target process runs the row's `current_session`. The 19 `herdr.py` sites that guard a signal, a keystroke or a close (inventory KEEP items 1-19) call it; their separate checks go.
+8. The code that goes with no caller change (survey, SAFE NOW): `trust_survey.py`; `staff_check.py` and its tests; `test_one_session.py`; the dead parts of `herdr.py` and `test_herdr.py`; the dead reader and role allowlist in `worker_admission.py`.
 
 **Files:**
 - `scripts/herdr/herdr.py`, `scripts/herdr/pane_launch.py`, `scripts/herdr/herdr_sessions.py`, `scripts/herdr/place.py` — the refusals.
+- `scripts/herdr/trust_survey.py`, `scripts/herdr/test_one_session.py`, `scripts/production/staff_check.py`, `scripts/production/test_staff_check.py` — deleted.
+- `scripts/production/worker_admission.py`, `scripts/production/test_worker_admission.py` — the dead reader and the role allowlist go.
 - `scripts/herdr/test_herdr.py`, `scripts/herdr/test_herdr_sessions.py`, `scripts/herdr/fake_herdr.py` — their tests and the fake.
 
 **Workers:** `1 writer + 1 tester` — `impl`: the source files; `test`: the test files and `fake_herdr.py`.
 
 **State:** fewer refusals; none changes a stored record.
 
-**Acceptance gate:** each deleted refusal has a test that the action now runs (or prints its note and runs); each kept refusal has a test that names its catastrophe; the herdr suite passes on natedev and the Mac; basedpyright 0/0/0 on changed files and callers; full gate green. Rerun test: a stop, resume or restart run twice gives the same result as one run.
+**Acceptance gate:** the phase deletes more lines than it adds, in source and in tests (sdlc, 2026-11-03: every staff and lifecycle phase deletes more than it adds). The tests of each deleted refusal go; a test changes only where it asserted a deleted refusal. Each kept refusal keeps one test that names its catastrophe. The herdr suite passes on natedev and the Mac; basedpyright 0/0/0 on changed files and callers; full gate green. The existing rerun tests stay green; no new rerun test.
 
-### Phase 4b — Owns and `production_tree.py` deleted  · status: todo
+### Phase 4b — `production_tree.py` deleted  · status: todo
+
+**Scope (sdlc, 2026-11-03):** only the `production_tree.py` deletion stays here. The Owns and Hub deletions moved to Phase 4c, which devtools-unit owns.
 
 **Depends on:** the readers and writers of each deleted thing (3s, 3t, 3u, 3v, 3w); 6b (the herdr suite passes on the Mac); 3h's native-id and location completeness proof. `production_tree.py` deletion alone waits for the handler unit's reader switch (Phase 3n item 6).
 
@@ -1353,7 +1363,9 @@ The user, 2026-11-03: "moving should be very simple - it should look for very fe
 Interrupt the guarded repair before and after publication; reruns preserve retirement facts and responsibilities.
 Test unchanged reruns and refusal when the recorded old value differs.
 
-### Phase 4c — Units table deleted  · status: todo
+### Phase 4c — Units table deleted  · status: moved: devtools-unit owns it (sdlc, 2026-11-03)
+
+**Hand-off (sdlc, 2026-11-03):** the work order is `phases/4c/work_order_for_devtools.md` in the herdr run folder. Rulings: the Port audit copies each cell into `.unit.toml`, then deletes the cell; the row order is the `staff.json` row order; historical members with no staff row drop; the Owns and Hub deletions move here from Phase 4b.
 
 **Depends on:** 4b's Owns and Hub deletions; 4m (the Port audit); 3h's native-id and location completeness proof.
 
@@ -1469,30 +1481,30 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 **Retained launch contract:** preserve `pane_launch`'s validated kind, strict retirement, and restore completion checks.
 
-### Phase 4f — A transfer is the parent change and the tab move  · status: todo
+### Phase 4f — A transfer moves the unit's tabs into the new production's group  · status: todo
 
-**Depends on:** 4c, 3x, 3y, 3z, and 4a. Not on the rename path.
+**Depends on:** 4r. The `transfer_unit.py` call lands after devtools 4b (5c895adae) is on main.
 
 #### Work Order
 
-**Goal:** `transfer_unit.py` changes the unit row's parent and moves the live tab; it keeps no journal and moves no state. This absorbs old Phases 3j and 3m.
+**Goal:** after `transfer_unit.py` writes `parent` (devtools 4w), the unit tab and its worker tabs move into the new production's tab group (spec `staff-lifecycle.md` section 3 item 6; user, 2026-11-03 via sdlc: "the unit has to move its position in the herdr spaces").
 
-**Spec:** Every state the journal moved is now keyed by staff id (Phases 3x-4a), the Units-table commits are gone (Phase 4c) and the pool is gone (Phase 3p). Delete `journal`, `STEPS`, `_load`, `_migrate_journal`, `_load_fields`, `_save`, `_completed_requests`, `_resumed`, `_check_journals`, `staff_move.PinnedUnit` when unused, and their tests and doc lines (Reference → Transfer journal inventory). A transfer is `staff.move` of the row, the herdr tab move to the new showrunner's workspace, and its messages. **Transfer operation record (Phase 3h review, 2026-11-01; sdlc approved).** The record holds only the operation id, its steps and their delivery state, never a copy of unit facts. A rerun with the same operation id changes nothing and exits 0. One record per transfer, `~/.local/state/staff/transfers/<operation id>.json`, written through `atomic_file` before the parent changes. It holds the unit's id, the old and new parent ids (so the old sender survives the parent change) and one entry per recipient (the unit, the new showrunner, the old showrunner), written after that message is sent. Delivery is at least once: a crash between a send and its entry repeats that one message on rerun, and each message names the operation id so its reader sees the same transfer. A→B, then B→A, then A→B are three operations with three records. **Old journals drain first.** Before the journal code goes, a check lists every `transfer_unit.json` whose steps are not all done; each is finished with the old tool, and the delete waits until the list is empty. A rerun after the parent changed moves only a tab still in the old workspace, sends no message twice, prints `unchanged` when all is done, and exits 0.
+**Spec:**
+1. Reuse `order_tabs` and `SavedLayout`, the order that `restart --all` uses. Add no record.
+2. `transfer_unit.py` calls the tab move after it writes `parent`.
+3. A rerun with the tabs already in place prints `unchanged`.
+4. The journal is gone (devtools 4w deleted it; sdlc, 2026-11-03), so this phase adds no journal and no journal gate.
 
 **Files:**
-- `scripts/production/transfer_unit.py`, `scripts/production/staff_move.py`, `docs/as-built/unit-transfer.md`, `commands/showrunner/transfer_unit.md` — the transfer and its text.
-- `scripts/production/test_transfer_unit.py`, `scripts/production/transfer_unit_test_support.py`, `scripts/production/rename_test_support.py`, `scripts/production/test_staff_move.py` — fixtures and regressions.
+- `scripts/herdr/herdr.py` — the tab move.
+- `scripts/production/transfer_unit.py` — the call.
+- `scripts/herdr/test_herdr.py`, `scripts/production/test_transfer_unit.py` — the tests.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — the non-test files; hub: `scripts/production/staff_move.py`.
-- `test` — the tests and fixtures.
 
-**State:** the old `transfer_unit.json` files are no longer read or written, and are removed.
+**State:** none.
 
-**Constraints from prior phases:** Phases 3x-4a keyed every moved store by staff id; Phase 4c removed the table commits. Lifecycle reruns keep the pane.
-- Phase 3h review (2026-11-01): tests stop a transfer between a send and its entry, and run A→B→A→B.
-
-**Acceptance gate:** `grep -nE '\bSTEPS\b|transfer_unit\.json|_migrate_journal' scripts/production/transfer_unit.py scripts/production/transfer_unit_test_support.py scripts/production/test_transfer_unit.py` finds nothing (`rename_unit.py` keeps its own `STEPS` until Phase 4g); the old-journal check lists none; tests stop a transfer after each message and show that a rerun sends each remaining message once; a real transfer of a throwaway unit moves its row parent and tab, keeps the same pane and terminal, and its stall alert, change rows and dailies follow with no rewrite; a transfer stopped after the row move finishes on rerun with each party told once; a rerun after it changes nothing and exits 0; full gate green.
+**Acceptance gate:** the phase deletes more lines than it adds; a test moves a unit tab and its worker tabs into the new group; a rerun prints `unchanged`; full gate green.
 
 ### Phase 4h — A unit folder moves with no rename  · status: done
 

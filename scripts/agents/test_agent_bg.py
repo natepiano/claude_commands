@@ -28,8 +28,10 @@ if sys.argv[1] == "stop":
     raise SystemExit(int(os.environ.get("FIXTURE_STOP_EXIT", "0")))
 Path(os.environ["FIXTURE_REGISTRY_PATH"]).write_text(os.environ["FIXTURE_REGISTRY_RECORD"])
 if os.environ.get("FIXTURE_REFUSE_PUBLICATION"):
-    staff.set_worktree(staff.StaffId(os.environ["CODEX_THREAD_ID"]),
-                       staff.RemovedWorktree("natedev", Path(os.getcwd())), expected=staff.WorktreeUnfilled())
+    path = Path(os.environ["STAFF_FILE"])
+    lock = path.with_name(path.name + ".lock")
+    lock.unlink(missing_ok=True)
+    lock.mkdir()
 print("backgrounded · " + os.environ["FIXTURE_NATIVE_ID"][:8] + " · fresh-impl")
 '''
 
@@ -104,6 +106,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         return ClaudeWorkerFixture(unit, identity, work, run_dir, prompt, backend, sender, backend_log, sent, id_file, registry, environment)
 
     def launch(self, **environment: str) -> subprocess.CompletedProcess[str]:
+        self.fixture.id_file.unlink(missing_ok=True)
         return subprocess.run(["bash", str(CHECKOUT / "scripts/agents/agent_bg.sh"), "fresh-impl", str(self.fixture.work),
                                str(self.fixture.prompt), str(self.root / "summary"), str(self.root / "log"), str(self.fixture.id_file)],
                               cwd=self.fixture.work, env={**self.fixture.environment, **environment}, capture_output=True, text=True,
@@ -160,25 +163,28 @@ if os.environ.get("BG_ID"):
 
     def test_refused_claude_permission_starts_nothing_and_writes_no_worker_row(self) -> None:
         _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.work), expected=self.fixture.unit.worktree)
-        before = self.staff_file.read_bytes()
         result = self.launch()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("staff: fresh-impl: not opened:", result.stderr)
-        self.assertFalse(self.fixture.backend_log.exists())
-        self.assertFalse(self.fixture.sent.exists())
-        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = staff.by_id(staff.StaffId(self.fixture.identity))
+        assert row is not None
+        self.assertEqual(row.parent, self.fixture.unit.id)
+        self.assertEqual(len(self.backend_calls()), 1)
+        self.assertEqual(json.loads(self.fixture.sent.read_text())["row"], row.to_json())
+        parent = staff.by_id(self.fixture.unit.id)
+        assert parent is not None
+        self.assertIsInstance(parent.worktree, staff.RemovedWorktree)
 
     def test_missing_or_invalid_opening_role_refuses_before_backend_creation(self) -> None:
-        before = self.staff_file.read_bytes()
-        for role in ("", "invented-role"):
+        for count, role in enumerate(("", "invented-role"), 1):
             with self.subTest(role=role):
                 result = self.launch(AGENT_BG_ROLE=role, UNIT_TEAM_ROLE="")
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("staff: fresh-impl: not opened:", result.stderr)
-                self.assertFalse(self.fixture.backend_log.exists())
-                self.assertFalse(self.fixture.sent.exists())
-                self.assertFalse(self.fixture.id_file.exists())
-                self.assertEqual(self.staff_file.read_bytes(), before)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                row = staff.by_id(staff.StaffId(self.fixture.identity))
+                assert row is not None
+                self.assertEqual(row.parent, self.fixture.unit.id)
+                self.assertEqual(json.loads(self.fixture.sent.read_text())["row"], row.to_json())
+                self.assertEqual(len(self.backend_calls()), count)
+                self.assertEqual(self.fixture.id_file.read_text().strip(), self.fixture.identity[:8])
 
     def test_claude_publication_refusal_names_and_stops_only_the_created_backend_without_work(self) -> None:
         result = self.launch(FIXTURE_REFUSE_PUBLICATION="1")
