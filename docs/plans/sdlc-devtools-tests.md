@@ -325,96 +325,20 @@ Dropped 2026-10-30 by its own rule: no module that natedev's condition allows to
 
 **Gotchas:** The markerless identical-retry shortcut checks launch context before returning; matching context alone does not prove census publication finished. Scan warnings use the decoded reason (`missing or invalid repository` for an empty binding repository), while strict CLI refusals include `binding.repository`.
 
-### Phase 7g — Run cleanup and the role list skip another unit's damaged record  · status: todo
-**Depends on:** Phase 7f (same file; it checkpoints first)
+### Phase 7g — Run cleanup and the role list skip another unit's damaged record  · status: done
 
-Source: Phase 7f already skips unrelated damaged records through `_read_designs`.
-Remaining defects affect matching damage, list diagnostics, markerless publication retries, and domain types.
+#### As-built
 
-#### Work Order
-
-**Goal:** a run's cleanup unbind and the role list are not stopped by another unit's damaged record.
-
-**Spec:**
-1. Preserve the holder-aware scan and its single named warning for each damaged record.
-2. Refuse matching damaged records during `unbind-run`, including records with ended or unopened roles.
-3. Print plain-text list diagnostics on stderr.
-4. Keep plain-text stdout limited to valid roles or `no held roles`.
-5. Preserve the structured `roles` and `problems` fields from `list_roles()` and `list --json`.
-6. Keep a repeated successful `unbind-run` free of writes.
-7. Complete census publication before a markerless repair retry reports success.
-8. Preserve the generation and lifecycle effects during publication retries.
-9. Replace optional holder and binding arguments with explicit keep/change types.
-10. Convert omitted CLI arguments to `KeepHolder` and `KeepBinding` at the CLI boundary.
-11. Represent explicit unbinding as `ChangeBinding(DesignUnbound())`.
-12. Replace `held_document()` absence with `NoHeldDocument`.
-13. Preserve `HeldDesign` as the successful lookup result.
-14. Update `astra_review.py` to select held and standalone reviews through those result types.
-
-Assertion-Change: scripts/astra/test_design_roles.py::test_list_prints_empty_inventory_and_record_problems
-— replace the two-line stdout expectation with exactly `no held roles\n`.
-Move the damaged-record path and nonempty-reason assertions to stderr.
-Require exactly one warning line.
-Keep the JSON inventory and problem assertions unchanged.
+`unbind_run` reads with `_read_designs(..., refuse_matching_damage=True)`, so a damaged record that matches the run refuses by name even with no live role. `list` prints each record problem on stderr; plain stdout holds only roles or `no held roles`, and `--json` keeps `problems`. A markerless `rebind` retry returns early only when the census lists every open role thread. The keep/change type refactor was dropped (sdlc, 2026-11-04: delete more than you add). Checkpoint d2b280ea2 on `sdlc-devtools-roles`.
 
 **Files:**
-- `scripts/astra/design_roles.py` — cleanup, diagnostics, publication retries, and semantic domain results
-- `scripts/astra/astra_review.py` — the held-document lookup consumer
-- `scripts/astra/test_design_roles.py` — domain and CLI regressions
-- `scripts/astra/test_astra_review.py` — held and standalone review selection
+- `scripts/astra/{design_roles.py,test_design_roles.py}` — the three defects and their regressions.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `scripts/astra/design_roles.py`, `scripts/astra/astra_review.py`
-- `test` — `scripts/astra/test_design_roles.py`, `scripts/astra/test_astra_review.py`, from this Spec alone
+### Phase 7h — The group-kill guard reads commands, not text  · status: done
 
-**State:** design-role records (tests use a temporary state root only).
+#### As-built
 
-**Constraints from prior phases:** `unbind_run` (`scripts/astra/design_roles.py:1480`) already reads through `_read_designs` and has tests that skip another unit's damage; this phase keeps that, refuses matching damage also when no role is live, fixes the `list` diagnostics, and completes markerless publication (the early return at `design_roles.py:981` remains). `rebind` (`:949`) takes `Holder | None` and `Binding | None`, where absence means "keep the current value" and also decides whether damaged-record repair is allowed: replace both with explicit keep/change types (convert the argument parser's absence at the CLI boundary) and test that keeping a binding differs from an explicit unbind. Acceptance adds: matching damage with ended or unopened roles is refused; a markerless retry that publishes the context, fails the census publication, then retries again ends published.
-
-**Acceptance gate:** tests with a temporary state root and a planted damaged record of another unit show that `unbind-run` unbinds this run's records, prints one named stderr line, and exits 0; a rerun writes nothing; `list` prints the named line on stderr and nothing about the record on stdout. Also: matching damage with no live role refuses by name; the markerless retry publishes the census before it reports success; the CLI cases for `KeepHolder`/`ChangeHolder` and `KeepBinding`/`ChangeBinding` stay green. Each changed test file runs green in its own `python3 -m unittest discover -s <its folder> -p <file>` run, and the full merged-tree gate (`merge_gate.py --tests-only`) is green before the checkpoint.
-Test omitted holder and binding arguments separately from explicit changes.
-Test explicit unbinding and damaged-binding repair.
-Test a markerless retry that saves context, fails census publication, and then completes census publication.
-Test `NoHeldDocument` and `HeldDesign` results through the review caller.
-Run `python3 -m unittest scripts.astra.test_design_roles scripts.astra.test_astra_review`.
-Run `basedpyright` on all four owned Python files.
-Require `0 errors, 0 warnings, 0 notes`.
-
-### Phase 7h — The group-kill guard reads commands, not text  · status: todo
-**Depends on:** Phase 7e (same test file; it checkpoints first)
-
-Source: Phase 7e already added Python AST checks and shell tokenization.
-Remaining gaps include shell command positions, executable Python aliases, and shell parse failures.
-
-#### Work Order
-
-**Goal:** the guard finds every group signal outside `process_group.py` by the meaning of the code, not by its spelling.
-
-**Spec:**
-1. Python files and Python text inside other files are parsed with `ast`: any reference to `killpg` (attribute or name, through any alias or assignment) outside `scripts/lib/process_group.py` fails the guard.
-2. Shell text is split into commands with a real shell tokenizer (`shlex` in punctuation mode), so a `kill` in any command position (after `;`, `&&`, `||`, `then`, `else`, `do`, a pipe, or inside `bash -c '…'`) is found; a target of `0`, `-0`, or a negative group fails the guard unless the command is the process_group CLI.
-3. Parse complete executable units before treating a parse failure as unsafe.
-   Report an unparseable executable unit with its path.
-   Preserve valid multiline commands and literal fixture data.
-4. Add planted cases for an `else` command and a Python heredoc assignment alias.
-   Add malformed executable shell text.
-   Keep the existing direct, imported-alias, zero-group, negative-group, nested-shell, continuation, and shared-sender cases.
-5. Extend the existing AST and `shlex` implementation.
-   Distinguish executable fragments from literal fixture data.
-   Keep the sole raw-send exception inside `send_process_group`.
-   Send no real signal in these tests.
-
-**Files:**
-- `scripts/lib/test_process_group.py` — the guard and its planted cases
-
-**Workers:** 1 writer
-- `test` — `test_process_group.py`
-
-**State:** none (a temporary tree only; no signal is sent, `os.killpg` stays patched).
-
-**Constraints from prior phases:** the guard exempts only the one send inside `send_process_group` in `scripts/lib/process_group.py`, not every reference in that file; its planted fixture already rejects a second raw call there, and that stays. Keep the shell-helper failure and fallback tests. The caller baseline is da15fa97 (codex_mesh, signal_test_support, herdr_upkeep and repeat_guard all route through `send_process_group`). Plain Python AST detection and several zero and nested-shell cases already exist; a read-only probe shows the shell `else` branch case still escapes.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/lib -p test_process_group.py` passes on the real tree, and every planted case named in the Spec fails the guard; the full merged-tree gate (`merge_gate.py --tests-only`) is green before the checkpoint.
+Dropped, not built (sdlc, 2026-11-04): it grows a guard, and a phase deletes more than it adds.
 
 ### Phase 7i — Retire keeps the work, and resume brings it back  · status: done
 
@@ -678,6 +602,15 @@ Every tool takes a unit's location from its staff row. A stale or absent Units W
 **Gotchas:** `SessionNotFound` and `NotRunning` do not prove the saved pid stopped; restart checks that pid. `unchanged` and `resumed` distinguish move rerun outcomes.
 **Ruled out:** Absolute-Plan routing, worker-folder copies, transcript relocation, rename journals, and old-name sweeps.
 
+### Phase 4n — Reviewer naming reads the staff folder  · status: done
+
+#### As-built
+
+`workers._reviewer_destination` reads the unit folder through `plan_history.staff_directory` with one staff snapshot. The launcher `--working-dir` stays the fallback for a run with no unit row. Checkpoint 5535d493e on `sdlc-devtools-reviewer`, off main b4cff7692.
+
+**Files:**
+- `scripts/direct/{workers.py,test_workers.py}` — the reviewer folder read and its fixtures.
+
 ### Phase 4g — Both promotions use one rule for local edits  · status: done
 
 #### As-built
@@ -749,80 +682,32 @@ Fixture staff rows hold unit folders; add-unit assertions read staff and expect 
 **Binds later work:** Checkpoints merge into the unit's staff parent preserves status-0 judging and changes the separate `merge_checkpoint.test_passed` judge.
 **Gotchas:** `merge_checkpoint.test_passed` still accepts status 3.
 
-### Phase 4u — Units tables have no Worktree column  · status: todo
+### Phase 4u — Units tables are gone  · status: done
 
-**Depends on:** Phase 4s
+#### As-built
 
-Source: split from Phase 4s (director, 2026-11-03). After 4s no tool reads the cell. This phase stops writing it and removes it from existing documents.
-
-#### Work Order
-
-**Goal:** new and existing Units tables have no Worktree column, and the format guide says the staff row owns the location.
-
-**Spec:**
-1. One heading-based operation in `scripts/production/unit_table.py` removes the complete Worktree column after the caller proves item 3. Remove the header, separator cell, and every row cell together. Keep other tables, extra columns, retirement notes, and other text. A second run changes nothing.
-2. Writers stop writing the cell: `add_unit.desired_row` (`add_unit.py:439`) and `append_row` (`:759`), `rename_unit._units_display` (`rename_unit.py:91`), `rename._unit_doc` (`rename.py:773-784`), `transfer_unit.apply` (`transfer_unit.py:74`, both table layouts; today it writes a dash), `style/add_style._unit_row` (`add_style.py:190`), `_production_text` (`:209`) and its pilot-row replacement. Each writer that edits an existing table removes the column through the operation in item 1.
-3. Before removal, the caller checks every Units row against one staff snapshot. Each row needs its matching member and a typed location (`PresentWorktree` or `RemovedWorktree`). If any member or location is unavailable, keep the entire Worktree column, including its header and separator. Name each unavailable row for repair; never remove only some cells. Admission can precede membership publication (`add_unit.py:1428-1446`); keep the column during that pending state. A new proposed location does not prove published membership. Test mixed valid and `WorktreeUnfilled` rows, missing membership, unreadable staff, and admission before publication. After all required facts are published, remove the column once; a rerun changes nothing.
-4. `docs/production_format.md:143` and `:158`, `commands/producer/to_production.md:105` and `commands/showrunner/rename.md:35` say the staff row owns the location.
-5. Test fixtures change to the new layout. Some legacy fixtures stay for the tests that read an old table.
-
-**Review amendment (Phase 4w plan review, 2026-11-03):** the unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`). Drop every rule that routes by an absolute Plan path or keeps a worker folder copy. Replace the Plan-routing test (`test_merge_checkpoint.py:74`) with assertions on the folder each command runs in.
+No production doc has a Units table, and no tool writes one. `retire_unit.py` lost its Units row rewrite; main had already removed the other writers, and `unit_table.py` was gone. `docs/production_format.md` says the staff row holds identity, parent and worktree, and `.unit.toml` holds plan, port and responsibilities. No port needed a copy into `.unit.toml`. Checkpoint f26c05f0e on `sdlc-devtools`.
 
 **Files:**
-- `scripts/production/unit_table.py` — column removal.
-- `scripts/production/add_unit.py`, `rename_unit.py`, `rename.py`, `transfer_unit.py`, `scripts/style/add_style.py` — writers.
+- `scripts/production/retire_unit.py` — the last Units row writer deleted.
 - `docs/production_format.md`, `commands/producer/to_production.md`, `commands/showrunner/rename.md` — format text.
-- `scripts/production/test_unit_table.py` — both layouts, repeated removal, extra columns, other tables, and mixed valid and unavailable rows.
-- `scripts/production/test_add_unit.py`, `scripts/production/test_add_unit_rerun.py` — admission before membership publication preserves the complete legacy column.
-- `scripts/style/test_add_style.py` — the new layout.
-- `scripts/production/add_unit_test_support.py`, `merge_checkpoint_test_support.py`, `production_lifecycle_test_support.py`, `rename_test_support.py`, `rename_unit_test_support.py`, `staff_test_support.py`, `transfer_unit_test_support.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/style/style_plan_test_support.py` — fixture builders in the new layout.
+- `docs/plans/{builds,sdlc,natedev}-production.md` — Units tables deleted.
+- `scripts/production/test_tidy_wrapped.py`, `scripts/style/test_style_plan_borrowing.py` — fixtures without Units tables.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the source and format files.
-- `test` — the tests and fixtures.
+**Binds later work:** the plan's one home is `.unit.toml`; staff holds no plan or port.
 
-**State:** a writer removes the complete Worktree column only after every row has its required staff facts. A pending admission or unavailable row preserves the complete column.
+### Phase 4x — Checkpoints merge into the unit's staff parent  · status: done
 
-**Constraints from prior phases:** Phase 4s readers ignore the cell. `staff_sources` reads it only during legacy import. Keep Delegation Context → Ownership and Test runs. Staff rows hold canonical unit names from `unit_names.name`. A missing absolute Plan folder is unavailable (`staff.StaffUnreadable`; `unit_lookup.py:107-108`). A requested checkpoint refuses with the unit and folder; unrelated rows do not block it (`merge_checkpoint.py:277-306`). Read-only consumers report the bad row and keep the other rows. Keep `test_unit_lookup.py`, the requested-checkpoint regressions in `test_merge_checkpoint.py`, and the partial-report regressions.
+#### As-built
 
-**Acceptance gate:** fully populated tables lose the complete Worktree column. Mixed valid and unfilled rows preserve the complete column. Admission before membership publication preserves it; publication permits removal. A second removal changes nothing. Each writer runs `python3 -m unittest` on its named test files. Require `0 errors, 0 warnings, 0 notes` from `basedpyright` for each slot. One director gate.
-
-### Phase 4x — Checkpoints merge into the unit's staff parent  · status: todo
-
-**Depends on:** Phase 4s
-
-Source: sdlc showrunner ask, 2026-11-03 04:5x; design accepted 05:0x; second worker pair authorized by the user via sdlc 07:1x ("fix these things in parallel"). Runs in `/home/natepiano/worktrees/devtools-lane2` on branch `sdlc-devtools-lane2`, beside Phase 4v.
-
-#### Work Order
-
-**Goal:** `merge_checkpoint.py` merges a checkpoint into the production that the unit's staff row names as its parent, and the 4s tip is green with `origin/main` merged.
-
-**Spec:**
-0. Make the 4s tip green with `origin/main`:
-   1. Merge `origin/main` into `sdlc-devtools-lane2` with `git merge --no-ff`. Resolve the conflicts in `scripts/direct/assertion_guard.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/direct/test_verify_lint_guard_key.py` and `scripts/usage/{outcomes,test_outcomes,test_usage_report,test_waste_watch,usage_report}.py`. Keep both sides' behavior.
-   2. `merge_checkpoint.py` reads the staff record once for each run. Today `other_units` (`merge_checkpoint.py:296`), `run` (`:702`) and `change_review.publication_changes` (`change_review.py:974`, called at `merge_checkpoint.py:1499`) each take a snapshot; `parse_units` reads no staff. Take one snapshot and pass it through parent selection, folder lookup, reporting and publication. An unreadable record keeps 17l's stop text and pushes nothing.
-   3. The `test_merge_checkpoint_rerun.py` tests write the staff rows they read, as Phase 4s tests do. The five tests that fail with "cannot read staff record" or "invalid staff JSON" pass. Change the tests that let publication run with no readable staff or no registered unit (`test_merge_checkpoint_rerun.py:154`): they cannot prove staff-parent routing.
-1. `merge_checkpoint.py` takes the production from the unit's staff parent. When the named production differs from the parent, it refuses before any merge and names the parent. A rerun after a refusal changes nothing.
-2. A Units row holds plan and branch data only. A unit row in a production doc that is not its staff parent is a doc-check refusal that names the row and the parent.
-3. `transfer_unit.py apply` changes only the staff parent and the Units rows (Phase 4w, `transfer_unit.py:61`). Keep that, and keep the staff-first transfer tests (`test_transfer_unit.py:74`, `:89`). Add no herdr, shutdown or style row moves.
-4. No change to `pm.sh`.
-5. Delete the basedpyright status-3 acceptance in `merge_checkpoint.test_passed` (`merge_checkpoint.py:924-933`) and its docstring text: after Phase 4y, basedpyright exits 0 on a clean tree. A basedpyright Merge tests command passes on status 0 with its clean summary line. Change the tests that assert status 3 is green, and `docs/as-built/showrunner-automation.md:274`.
+`merge_checkpoint.request_from` reads the staff record once. `MergeRequest.staff_record` carries that snapshot to unit lookup, `record_publication_changes`, `change_review.publication_changes` and `change_review.foreign_units`. A unit whose staff parent is not the named production's owner refuses before any merge with `unit <name>: staff parent is <parent>; use that production`; a rerun changes nothing. `change_review` finds child productions through `showrunner_tree.descendants_of` with the same snapshot. `test_passed` accepts only status zero; the basedpyright status-3 acceptance is gone. Checkpoint f48d505ae on `sdlc-devtools-parent`.
 
 **Files:**
-- `scripts/production/merge_checkpoint.py` — one staff snapshot; staff-parent routing.
-- `scripts/production/change_review.py` — accepts the snapshot (step 0.2), when its signature needs it.
-- `scripts/production/test_merge_checkpoint_rerun.py`, `scripts/production/test_merge_checkpoint.py`, `scripts/production/test_merge_checkpoint_validation.py`, `scripts/production/merge_checkpoint_test_support.py` — staff rows, parent routing and refusal tests.
-- `scripts/direct/assertion_guard.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/direct/test_verify_lint_guard_key.py`, `scripts/usage/outcomes.py`, `scripts/usage/test_outcomes.py`, `scripts/usage/test_usage_report.py`, `scripts/usage/test_waste_watch.py`, `scripts/usage/usage_report.py` — the step 0.1 conflict files.
+- `scripts/production/{merge_checkpoint,change_review}.py` — one snapshot, the parent refusal, the status-zero judge.
+- `scripts/production/{test_merge_checkpoint,test_merge_checkpoint_rerun,test_change_review,merge_checkpoint_test_support}.py` — the refusal, one-snapshot and status tests.
+- `docs/as-built/showrunner-automation.md` — the judge text.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the merge (step 0.1) and the source files.
-- `test` — the test and test-support files.
-
-**State:** `merge_checkpoint.py` reads the staff record once per run and writes nothing new.
-
-**Constraints from prior phases:** Phase 4s readers take the worktree from staff and ignore the Units Worktree cell. A requested checkpoint refuses with the unit and folder; unrelated rows do not block it (`merge_checkpoint.py:277-306`). Keep the requested-checkpoint regressions in `test_merge_checkpoint.py`. Phase 4v (beside this phase, in `/home/natepiano/worktrees/devtools`) owns `staff.py`, `unit_move.py`, `herdr.py`, `pane_launch.py` and `merge_gate.py`: read only here.
-
-**Acceptance gate:** the merged tree passes the five `test_merge_checkpoint_rerun.py` tests. A checkpoint for a unit whose named production differs from its staff parent refuses before any merge and names the parent; a matching one merges. A row in a non-parent doc fails the doc check. Each writer runs `python3 -m unittest` on at most 4 named test files per run. Require `0 errors, 0 warnings, 0 notes` from `basedpyright` for each slot. One director gate (`merge_gate.py --tests-only --full`).
+**Binds later work:** a Merge tests command must exit 0; a basedpyright line that exits 3 is red.
 
 ### Phase 4q — The folder move uses its owners' readers  · status: done
 
@@ -879,6 +764,17 @@ Retire stops the unit and worker staff rows by `current_session`. It refuses unc
 **Files:**
 - `scripts/lib/{main_sync.py,test_main_sync.py}`, `config/send.conf` — send-once through send.py and its regressions.
 
+### Phase 4m — Assigning a unit a plan writes the staff plan  · status: done
+
+#### As-built
+
+The plan has one home, `.unit.toml`; staff holds no plan. `unit_config.set_plan` changes only the plan in the existing `.unit.toml`, and `progress_history.py start-run` calls it for a unit run with a plan doc. phases-unit edits its own `.unit.toml` for its as-built. Checkpoint a63d95e05 on `sdlc-devtools-plan`, off main 3ffe2193f.
+
+**Files:**
+- `scripts/production/unit_config.py`, `scripts/direct/{progress_history.py,test_progress_history.py}` — the plan write and its regression.
+
+**Ruled out:** a staff `set-plan` operation.
+
 ### Phase 4r — One config read serves many settings  · status: done
 
 #### As-built
@@ -910,6 +806,15 @@ Retire stops the unit and worker staff rows by `current_session`. It refuses unc
 - `commands/showrunner/produce.md` — the rule, its one source.
 
 **Binds later work:** messaging-unit's `send.py` sender check changes the rule's last point in its own commit.
+
+### Phase 7n — The proposals table widths live in config  · status: done
+
+#### As-built
+
+`config/proposals_table.conf` holds `title_width = 110` and `state_width = 140`. `proposals_table.table` reads both through `conf.read("proposals_table")` at use; the `TITLE_WIDTH` and `STATE_WIDTH` constants are gone. Checkpoint fa006856e on `sdlc-devtools-width`.
+
+**Files:**
+- `scripts/production/proposals_table.py`, `config/proposals_table.conf`, `scripts/production/test_proposals_table.py` — the config reads and a test that a changed width moves the cut.
 
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
