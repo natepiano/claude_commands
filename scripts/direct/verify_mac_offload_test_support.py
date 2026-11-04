@@ -98,6 +98,37 @@ def processes_carrying(marker: str) -> set[int]:
     return found
 
 
+def wait_for_marker_exit(marker: str, timeout: float) -> set[int]:
+    """Wait for marked processes to exit. Return survivors without a signal."""
+    deadline = time.monotonic() + timeout
+    while children := processes_carrying(marker):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        descriptors: list[int] = []
+        poll_exits = False
+        try:
+            for pid in children:
+                try:
+                    descriptors.append(os.pidfd_open(pid))
+                except ProcessLookupError:
+                    pass
+                except AttributeError:
+                    poll_exits = True
+                except OSError as error:
+                    if error.errno not in (errno.ENOSYS, errno.ENOTSUP, errno.EPERM):
+                        raise
+                    poll_exits = True
+            if descriptors:
+                _ = select.select(descriptors, [], [], min(0.01, remaining) if poll_exits else remaining)
+            elif poll_exits:
+                time.sleep(min(0.01, remaining))
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+    return processes_carrying(marker)
+
+
 def reap(marker: str) -> set[int]:
     """Kill every process carrying `marker` and wait until none is left.
 
@@ -1050,32 +1081,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         # as a cargo run for as long as it lives.
         # Lint recorders intentionally detach from their caller. Wait for their
         # exit events; a two-second grace period races their work under load.
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-        while children := processes_carrying(self.child_marker()):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            descriptors: list[int] = []
-            poll_exits = False
-            try:
-                for pid in children:
-                    try:
-                        descriptors.append(os.pidfd_open(pid))
-                    except ProcessLookupError:
-                        pass
-                    except AttributeError:
-                        poll_exits = True
-                    except OSError as error:
-                        if error.errno not in (errno.ENOSYS, errno.ENOTSUP, errno.EPERM):
-                            raise
-                        poll_exits = True
-                if descriptors:
-                    _ = select.select(descriptors, [], [], min(0.01, remaining) if poll_exits else remaining)
-                elif poll_exits:
-                    time.sleep(min(0.01, remaining))
-            finally:
-                for descriptor in descriptors:
-                    os.close(descriptor)
+        _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
         survivors = reap(self.child_marker())
         if survivors:
             self.fail(f"processes outlived the test: {sorted(survivors)}")

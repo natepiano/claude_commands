@@ -3211,13 +3211,19 @@ if [[ "$CMD" == test ]]; then
     # The common path calculates once; a later hold refreshes after its wait.
     refresh_test_build_inputs
 fi
+run_log_tee() {
+    # Keep the readers alive while verify_interrupted reports and stops the step.
+    # A reader that exits first can cause SIGPIPE before cleanup finishes.
+    trap '' INT TERM HUP
+    exec tee -i -a "$RUN_LOG"
+}
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
     if [[ "$CMD" != test ]]; then set_verdict_keys; fi
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
-    exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
+    exec > >(run_log_tee) 2> >(run_log_tee >&2)
 fi
 
 ACTIVITY_ACTIVE=0

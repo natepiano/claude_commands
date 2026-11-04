@@ -24,7 +24,9 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB
+from scripts.direct.verify_mac_offload_test_support import (
+    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit,
+)
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -272,6 +274,33 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     def stop_process(self, process: subprocess.Popen[str]) -> None:
         self.fixture.stop_verify(process)
+
+    def start_memory_queued_lint(self) -> subprocess.Popen[str]:
+        """Keep the real admission client waiting behind a private memory limit."""
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        with admission.loop_turn():
+            admission.free(0)
+        _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
+            'lint_config_enabled() {\n'
+            + '    [[ "$1" == clippy ]] || return 1\n'
+            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
+            + '}\n'
+            + 'lint_config_skip_notice() { :; }\n')
+        self.fixture.environment.update({
+            "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",
+            "LINT_SKIP_SWEEP": "1",
+        })
+        process = self.start("lint", "sample")
+        self.wait_for_call(process, "waiting for memory since")
+        return process
+
+    def memory_queue_pids(self) -> set[int]:
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        with admission.loop_turn():
+            return {waiting.request.owner.pid for waiting in admission.server.waiters.values()}
+
+    def wait_for_owned_exit(self, timeout: float) -> set[int]:
+        return wait_for_marker_exit(self.fixture.child_marker(), timeout)
 
     def wait_for_call(self, process: subprocess.Popen[str], announcement: str = VERIFY_WAITING) -> None:
         self.wait_for_waiting_diagnostic(process, announcement)
