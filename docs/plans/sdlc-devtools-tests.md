@@ -870,6 +870,15 @@ Retire stops the unit and worker staff rows by `current_session`. It refuses unc
 
 **Binds later work:** Checkpoints merge into the unit's staff parent and Production tools read the row and `.unit.toml` preserve this identity-based restart path.
 
+### Phase 4l — Main sync sends a blocked state once per window  · status: done
+
+#### As-built
+
+`main_sync.py` keeps no blocked marker; `record()` only appends the log line. Each blocked run with `--notify` sends through `send.py --key main-sync-<host>-<state> --repeat-minutes <M>`, with `<M>` from `send.conf` `main_sync_repeat_minutes`. The fetch-failed text advises `github-warmup` only when `github-warm-status` fails, is missing or passes its 5-second limit; at exit 0 it names a likely GitHub incident. Checkpoint 5e796820d on `sdlc-devtools-sync`, off main 48dc96882.
+
+**Files:**
+- `scripts/lib/{main_sync.py,test_main_sync.py}`, `config/send.conf` — send-once through send.py and its regressions.
+
 ### Phase 4r — One config read serves many settings  · status: done
 
 #### As-built
