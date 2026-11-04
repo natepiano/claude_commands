@@ -346,25 +346,32 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
         if not isinstance(value, dict):
             raise ValueError(f"invalid {group} account")
         fields = cast(dict[str, object], value)
-        if (not isinstance(fields.get("label"), str) or not isinstance(fields.get("move_id"), str)
-                or not fields["move_id"] or fields.get("cause") not in ("by hand", "refusal", "auto")
-                or fields.get("window") not in ("weekly", "five_hour", "unknown")):
-            raise ValueError(f"invalid {group} transition")
-        if re.fullmatch(r"claude ?[1-9][0-9]*", str(fields["label"])) is None:
+        if re.fullmatch(r"claude ?[1-9][0-9]*", str(fields.get("label", ""))) is None:
             raise ValueError(f"invalid {group} account")
-        if "reset" in fields:
-            reset = fields["reset"]
-            if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
-                raise ValueError(f"invalid {group} reset")
-        if "why" in fields and not isinstance(fields["why"], str):
-            raise ValueError(f"invalid {group} reason")
+        if (not isinstance(fields.get("move_id"), str) or not fields["move_id"]
+                or fields.get("cause") not in ("by hand", "refusal", "auto")
+                or fields.get("window") not in ("weekly", "five_hour", "unknown")):
+            print(f"accounts: anomaly: invalid {group} transition metadata", file=sys.stderr)
+            groups[group] = cast(str, fields["label"])
+            continue
         selected = StoredGroupSelection(label=cast(str, fields["label"]), move_id=cast(str, fields["move_id"]),
             cause=cast(Literal["by hand", "refusal", "auto"], fields["cause"]),
             window=cast(Literal["weekly", "five_hour", "unknown"], fields["window"]))
         if "reset" in fields:
-            selected["reset"] = cast(str, fields["reset"])
+            try:
+                reset = fields["reset"]
+                if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
+                    raise ValueError
+            except ValueError:
+                print(f"accounts: anomaly: invalid {group} reset", file=sys.stderr)
+            else:
+                selected["reset"] = reset
         if "why" in fields:
-            selected["why"] = cast(str, fields["why"])
+            why = fields["why"]
+            if isinstance(why, str):
+                selected["why"] = why
+            else:
+                print(f"accounts: anomaly: invalid {group} reason", file=sys.stderr)
         groups[group] = selected
     return groups
 
@@ -693,7 +700,7 @@ def recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoMoveHis
     try:
         worker_names.recover_pending_journal(path, role_history=True)
     except (OSError, ValueError) as error:
-        print(f"account moves: cannot read recorded auto moves: {error}")
+        print(f"account moves: anomaly: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()
     return _read_recorded_auto_moves(path)
 
@@ -705,7 +712,7 @@ def _read_recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoM
     except FileNotFoundError:
         return RecordedAutoMoves(frozenset())
     except (OSError, ValueError) as error:
-        print(f"account moves: cannot read recorded auto moves: {error}")
+        print(f"account moves: anomaly: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()
     consumed: set[str] = set()
     try:
@@ -725,7 +732,7 @@ def _read_recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoM
                     and isinstance(why, str) and why.startswith("auto: ")):
                 consumed.add(why.removeprefix("auto: "))
     except ValueError as error:
-        print(f"account moves: cannot read recorded auto moves: {error}")
+        print(f"account moves: anomaly: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()
     return RecordedAutoMoves(frozenset(consumed))
 
@@ -773,5 +780,5 @@ def repair_selected_auto_moves(entries: tuple[AutoMoveTarget, ...], now: datetim
                         append_journal_line(output.fileno(), json.dumps(row, sort_keys=True), valid_row=lambda _row: True)
             return RecordedAutoMoves(frozenset(consumed))
     except (OSError, ValueError) as error:
-        print(f"account moves: cannot read recorded auto moves: {error}")
+        print(f"account moves: anomaly: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()

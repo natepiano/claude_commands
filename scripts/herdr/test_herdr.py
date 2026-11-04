@@ -127,6 +127,25 @@ def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, objec
 
 
 class NativePaneSessionTests(StaffTestCase):
+    def test_foreground_process_without_argv_does_not_hide_the_agent(self) -> None:
+        identity = fixture_runtime_id("foreground-agent")
+        observation = herdr.NativeAgentProcess(identity, "same-start", {"CODEX_HOME": str(self.root / ".codex2")})
+        info: dict[str, object] = {"shell_pid": 998070, "foreground_process_group_id": 998075,
+                "foreground_processes": [{"pid": 998074},
+                    {"pid": 998075, "name": "codex", "argv": ["codex"], "cwd": str(self.root)}]}
+        completed = subprocess.CompletedProcess[str]([], 0, json.dumps({"result": {"process_info": info}}), "")
+        client = herdr.Herdr("agents")
+        with (patch.object(herdr, "run_program", return_value=completed),
+              patch.object(herdr, "native_process", return_value=observation) as native,
+              native_process_commands(998075),
+              patch.object(client, "result", return_value={"process_info": info})):
+            self.assertEqual(client.native_pane_process("w1:p1", "codex", 1), observation)
+            startup = client.startup_processes("w1:p1", "codex", 1)
+            self.assertIsInstance(startup.activity, herdr.AgentProcessPresent)
+            launch = client.codex_launch("w1:p1")
+            self.assertEqual(launch["session_id"], identity)
+        self.assertEqual(native.call_args_list, [call(998075, "codex"), call(998075, "codex")])
+
     def test_native_pane_process_returns_the_proved_account_and_launch_identity_for_the_exact_codex_pid(self) -> None:
         current = fixture_runtime_id("pane-current-thread")
         launch = fixture_runtime_id("pane-launch-thread")
@@ -223,12 +242,38 @@ class NativePaneSessionTests(StaffTestCase):
 
 
 class CodexAnomalyNameTests(StaffTestCase):
+    def test_daemon_rollouts_prove_threads_without_notes_from_its_tui_clients(self) -> None:
+        proc = self.root / "proc"
+        process = proc / "42"
+        (process / "fd").mkdir(parents=True)
+        _ = (process / "cmdline").write_bytes(b"codex\0app-server\0")
+        identities = {fixture_runtime_id("thread-one"), fixture_runtime_id("thread-two")}
+        for index, identity in enumerate(sorted(identities)):
+            rollout = self.root / f"rollout-{identity}.jsonl"
+            _ = rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+            (process / "fd" / str(index)).symlink_to(rollout)
+        for pid, argv in enumerate((["codex"], ["codex", "resume", "thread"],
+                ["codex", "-m", "model", "-C", "/tmp", "--profile", "work", "resume", "thread"],
+                ["codex", "--model=model", "-C/tmp", "--profile=work", "resume", "thread"],
+                ["codex", "-c", "key=value", "app-server", "--listen", "unix://"],
+                ["codex", "app-server", "daemon", "pid-update-loop"]), 43):
+            (proc / str(pid) / "fd").mkdir(parents=True)
+            _ = (proc / str(pid) / "cmdline").write_bytes("\0".join(argv).encode())
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(sessions, "process_start", return_value="fixture-start"),
+              redirect_stderr(io.StringIO()) as output):
+            self.assertEqual(herdr.running_codex_threads(thread_host=lambda _arguments: False), identities)
+            self.assertEqual(output.getvalue(), "")
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                _ = herdr.codex_rollout_thread(42)
+
     def assert_unknown_codex_note(self, source: Literal["tab", "registry", "pid"]) -> None:
         pid = 998071
         proc = self.root / "unknown-codex-proc"
         process = proc / str(pid)
         (process / "fd").mkdir(parents=True)
-        _ = (process / "cmdline").write_bytes(b"codex\0")
+        _ = (process / "cmdline").write_bytes(b"codex\0--no-daemon\0")
         _ = (process / "environ").write_bytes(b"")
         records: list[sessions.SessionRecord] = [{
             "pid": pid + 1, "sessionId": fixture_runtime_id("unrelated-registry-process"),
@@ -247,11 +292,10 @@ class CodexAnomalyNameTests(StaffTestCase):
               redirect_stderr(output)):
             if source == "tab":
                 placement.return_value = herdr.HerdrPlace("agents", "w1:p1")
-                result.side_effect = [{"panes": [
-                    {"pane_id": "w1:p2", "tab_id": "w1:t2"},
-                    {"pane_id": "w1:p1", "tab_id": "w1:t1"}]}, {"tabs": [
-                    {"tab_id": "w1:t2", "label": "other-tab"},
-                    {"tab_id": "w1:t1", "label": "morty"}]}]
+                result.side_effect = [{"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}]},
+                    {"tabs": [{"tab_id": "w1:t2", "label": "other-tab", "workspace_id": "w1"},
+                              {"tab_id": "w1:t1", "label": "morty", "workspace_id": "w1"}]},
+                    {"workspaces": [{"workspace_id": "w1", "label": "agents"}]}]
             else:
                 placement.side_effect = herdr.HerdrFailure("placement is unavailable")
             if source == "pid":
@@ -264,7 +308,7 @@ class CodexAnomalyNameTests(StaffTestCase):
             placement.assert_called_once_with(pid)
             if source == "tab":
                 self.assertNotIn(str(pid), output.getvalue())
-                self.assertEqual(result.call_args_list, [call("pane", "list"), call("tab", "list")])
+                self.assertEqual(result.call_args_list, [call("pane", "list"), call("tab", "list"), call("workspace", "list")])
                 registry.assert_not_called()
             else:
                 result.assert_not_called()

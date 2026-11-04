@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import os
 import shlex
@@ -13,7 +14,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Generator
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import IOBase
 from datetime import UTC, datetime
 from dataclasses import dataclass
@@ -358,6 +359,8 @@ class StaffTestCase(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(redirect_stdout(io.StringIO()))
+        _ = self.enterContext(redirect_stderr(io.StringIO()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.staff_file = self.root / "owner" / "staff.json"
         self.mac_file = self.root / "mac" / ".local/state/staff/staff.json"

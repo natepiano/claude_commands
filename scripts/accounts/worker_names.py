@@ -95,10 +95,8 @@ def migrate_locked_journal(source: TextIO, path: Path) -> list[str]:
 
 def role_history_lines(path: Path) -> list[str]:
     """Read canonical role history while earlier processes may append old names."""
-    if not path.exists():
-        raise FileNotFoundError(path)
-    with roles_lock():
-        with path.open("r+", encoding="utf-8") as source:
+    with path.open("r+", encoding="utf-8") as source:
+        with roles_lock():
             fcntl.flock(source.fileno(), fcntl.LOCK_EX)
             return migrate_locked_journal(source, path)
 

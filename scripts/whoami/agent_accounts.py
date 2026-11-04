@@ -1143,7 +1143,7 @@ async def codex_live(home: Path) -> Report:
         numbered = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name)
         if not initialized and home.parent == Path.home() and numbered is not None:
             report.codex_startup = CodexStartupFailure(
-                home, f"/showrunner:accounts setup codex{numbered.group(1)}",
+                home, f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex{numbered.group(1)}",
             )
             report.problem = report.codex_startup.problem
         elif report.email is None:

@@ -161,6 +161,12 @@ class PushTextTests(unittest.TestCase):
                         self.assertLess(len(text), 500)
                     self.assertLess(len(push.title), 45)
 
+    def test_decision_argv_carries_the_question_record_path(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        argv = push_texts.user_send_argv(push, question="/tmp/question-layout.md")
+        self.assertEqual(argv[argv.index("--question") + 1], "/tmp/question-layout.md")
+
     def test_decision_choices_builds_the_approved_rows_and_keeps_structured_values(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
         push = push_texts.render_entry(entry, entry.examples[0].values)
