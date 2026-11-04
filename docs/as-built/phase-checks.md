@@ -1,6 +1,6 @@
 # Phase checks
 
-**What it is.** Every `/unit:direct` phase runs one named step, `<PhaseChecks/>`, made of seven checks: the assertion guard, cargo mend `--fix`, fmt, taplo, clippy, rustdoc and the style review. Each check has one place in the phase. Lint can repeat clippy and fmt to apply multiply-add repairs. The phase's workers fix the remaining failures. Run end does not repeat lint or style review. Each Cargo checkpoint needs its rustdoc pass. There is no separate `/clippy` skill.
+**What it is.** Every `/unit:direct` phase runs one named step, `<PhaseChecks/>`, made of six checks: cargo mend `--fix`, fmt, taplo, clippy, rustdoc and the style review. Each check has one place in the phase. Lint can repeat clippy and fmt to apply multiply-add repairs. The phase's workers fix the remaining failures. Run end does not repeat lint or style review. Each Cargo checkpoint needs its rustdoc pass. There is no separate `/clippy` skill.
 
 ## How it works
 
@@ -8,7 +8,6 @@
 
 | Check | Runs in | Over |
 | --- | --- | --- |
-| assertion guard (`scripts/direct/assertion_guard.py`) | the first stage of every `verify.sh lint`, and the checkpoint commit hook | `.rs` and `.py` changes against explicit bases or the newer upstream/production merge-branch base (nearest remote without upstream), plus independent merged-in parents throughout the judged history and pending merge heads for staged changes; findings must appear against every base; uniquely bound same-file bare `const` names pair outside nested macros (also range-pattern endpoints in the second trusted `matches!` argument) for exact `&str`/`&'static str` string, char or bool literals, or unsigned numeric spelling with a proven matching primitive type (suffix, or default i32/f64); Rust binding renames pair only when the whole test has equal tokens under one unique name map, including every initializer. The proof reads plain `let` and single-name `for` declarations. Each renamed read must remain within its binding scope. Nested blocks and line wrapping retain the proof. Bare `vec!` arguments and the first `matches!` argument can contain proved reads. Changed checks, literals, macros or removed assertions still produce reports. Shadowing, other patterns, parameters, format captures, observing macros, member names, paths, types and ambiguous maps refuse the proof; glob census only refuses names; non-ASCII code, raw identifiers, extern-crate aliases, incomplete macro paths, trusted macro-name imports, `macro_use`, definitions and untrusted item/statement macros refuse pairing; other typed bindings, byte strings, imports, statics and qualified paths stay written |
 | cargo mend `--fix` | the workers' last `verify.sh lint` | the workspace |
 | fmt (nightly) | the same `lint` | the named package plus every member that differs from HEAD |
 | taplo fmt `--check` | the same `lint` | the workspace TOML, run from the cargo workspace root |
@@ -16,10 +15,8 @@
 | rustdoc `-D warnings` | `verify.sh doc`, run by the unit director as the last command before the checkpoint commit | the workspace |
 | style review | the reviewer worker assigned by `<ReviewPromptContract/>` | the phase range selected under `<ReviewPromptContract/>` |
 
-`verify.sh lint` runs its stages in this order: assertion guard, mend, fmt, taplo, clippy. The assertion guard reads one `git diff -U0` and the commit messages from the base, and reports removed, weaker, changed (a note that does not block), test removed and test turned off; it judges a multi-line assertion as one whole statement and ignores whitespace, so a reflow or a move is no finding. A finding blocks unless an `Assertion-Change: <path>::<test> — <why>` line in the run's work orders (`UNIT_SESSION_DIR`) or a commit message names it. It takes about 0.5 s on the 87,000-line cargo-liner-tile checkpoint e21d5b93. On that checkpoint it reports 73 blocking findings, four of them weaker, among them `draw.rs:2644`; `grep -e weaker -e blocking` on its output keeps only the weaker lines and the total. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Workspace rustdoc runs separately through `verify.sh doc` after staging, immediately before the checkpoint commit; its exact-tree pass record is mandatory. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
+`verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Workspace rustdoc runs separately through `verify.sh doc` after staging, immediately before the checkpoint commit; its exact-tree pass record is mandatory. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
 
-Use `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted` beside the per-test form.
-This form covers deleted tests with the same prefix in that path.
 The prefix rules only `test removed` findings.
 It does not rule assertions in tests that remain.
 A prefix that matches no removed test blocks.

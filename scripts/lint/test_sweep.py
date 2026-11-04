@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sweep
+import cargo_target_config
 from scripts.lib import file_lock
 import conf
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
@@ -940,6 +941,31 @@ class ProcessUseTests(SweepCase):
                 fake_process(self.proc, 10, exe="/usr/bin/cargo", cwd=str(self.workspace), argv=argv, environ=environ)
                 self.assertEqual(self.uses(), {str(self.other): f"runs cargo-nextest in {self.workspace}"})
                 shutil.rmtree(self.proc)
+
+    def test_nextest_shared_reader_keeps_legacy_override_and_invalid_config_behavior(self) -> None:
+        config = self.workspace / ".cargo"
+        config.mkdir()
+        legacy = config / "config"
+        _ = legacy.write_text('[build]\ntarget-dir = ' + json.dumps(str(self.other)) + '\n')
+        _ = (config / "config.toml").write_text('[build]\ntarget-dir = ' + json.dumps(str(self.hana)) + '\n')
+        cases = (
+            (["cargo", "nextest", "run"], self.other),
+            (["cargo", "nextest", "run", "--config", 'build.target-dir=' + json.dumps(str(self.hana))], self.hana),
+            (["cargo", "nextest", "run", "--config", 'build.target-dir=' + json.dumps(str(self.hana)),
+              "--target-dir", str(self.other)], self.other),
+        )
+        for argv, folder in cases:
+            with self.subTest(argv=argv):
+                fake_process(self.proc, 10, exe="/usr/bin/cargo", cwd=str(self.workspace), argv=tuple(argv))
+                with mock.patch.object(sweep, "cargo_folder_settings", wraps=cargo_target_config.cargo_folder_settings) as reader:
+                    self.assertEqual(self.uses(), {str(folder): f"runs cargo-nextest in {self.workspace}"})
+                    self.assertEqual(reader.call_count, 1)
+                shutil.rmtree(self.proc)
+        _ = legacy.write_text('[build\n')
+        fake_process(self.proc, 10, exe="/usr/bin/cargo", cwd=str(self.workspace), argv=("cargo", "nextest", "run"))
+        with mock.patch.object(sweep, "cargo_folder_settings", wraps=cargo_target_config.cargo_folder_settings) as reader:
+            self.assertEqual(self.uses(), {str(self.hana): f"runs cargo-nextest in {self.workspace}"})
+            self.assertEqual(reader.call_count, 1)
 
     def test_without_proc_nothing_is_in_use(self) -> None:
         self.assertEqual(self.uses(), {})

@@ -63,6 +63,13 @@ The target is live. The user approved go-live on 2026-11-03. The stacks exist in
   Both paths require guard permission and an ended backoff. Unpinned steps keep their queue thresholds. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
 - `remote.py` publishes an `AdmissionEnvelope` (target, purpose, generation, decision time, expiry) only after a confirmed guard write. The runner checks it before and after shell preparation. Other Linux targets use `IndependentLinuxExecution` and need no AWS permission.
 - On the box, `RemoteAgent` stops the instance after `idle_stop_minutes` idle and polls IMDSv2 every `interruption_poll_s`. An interrupted slot prints `aws_interrupted=<generation>` once, after `mac_exit` and `mac_cleanup`, and exits with the child status. Offload reads it as `InterruptedTargetRun` and records `ON_NATEDEV` before local work.
+- The controller also stops a running instance after `idle_stop_minutes` without published permission when no target claim remains.
+  It saves the first unpublished time for each generation in `controller.json`.
+  A successful publication or a new generation resets the timer. The stop reason is `unpublished_idle`.
+- `copy_tracked_scripts` sends every tracked file under `scripts/` and `config/`, including `config/build_folders.conf`.
+  The remote service and Linux runner need this config during import.
+- A version refusal names the target, each mismatched tool, both versions, and the file set by `version_pin_file`.
+  The verify output and the step attempt record keep this reason.
 - `release_stopped_claims` releases only claims bound to the stopped host and generation, and writes `release-evidence/`.
 
 ### Status and report
