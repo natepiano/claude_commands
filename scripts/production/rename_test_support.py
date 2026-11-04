@@ -102,7 +102,8 @@ class RenameDisplays:
               mock.patch.object(herdr.Herdr, "result", side_effect=self.result),
               mock.patch.object(herdr, "run_program", side_effect=self.native_result),
               mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-                  self.row.current_session, "probe-generation", {})),
+                  herdr.RolloutThread(self.row.current_session) if self.backend == "codex" else
+                  herdr.EnvironmentThread(self.row.current_session), "probe-generation", {})),
               mock.patch.object(herdr, "_LayoutLock"),
               mock.patch.object(herdr.Herdr, "order_tabs", return_value=False),
               mock.patch.object(herdr.Herdr, "save_layout")):
