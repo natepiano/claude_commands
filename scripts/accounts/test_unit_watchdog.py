@@ -417,6 +417,20 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(self.notices, [])
         self.assertEqual({item["sessionId"] for item in self.fixture.live}, {"alpha"})
 
+    def test_crashed_unit_without_a_pane_launch_record_reports_no_saved_launch(self) -> None:
+        _ = self.add_unit("alpha")
+        _ = pane_record.forget_unit("alpha")
+        self.die("alpha")
+        lines = self.pass_at(0)
+        self.assertEqual(self.pass_at(2, dry_run=True),
+                         ["watchdog: would restart alpha; no pane launch is saved for this unit"])
+        self.assertEqual(self.pending, [])
+        for minute in (2, 4):
+            lines.extend(self.pass_at(minute))
+        self.assertTrue(any(line.endswith("no pane launch; no pane launch is saved for this unit") for line in lines), lines)
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.fixture.live, [])
+
     def test_older_launch_without_an_end_mark_still_recovers_its_conversation(self) -> None:
         _ = self.add_unit("alpha")
         path = pane_record.record_path("shared")
