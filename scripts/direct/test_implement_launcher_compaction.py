@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import unittest
+import socket
+from concurrent.futures import ThreadPoolExecutor
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct import implement_launcher_test_support as support
 from scripts.lint.memory_test_support import commit_config_fixture
 from typing import cast
@@ -10,6 +13,50 @@ import json
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    def test_compaction_does_not_block_another_worker_in_the_unit(self) -> None:
+        session = self.start_phase("parallel-compaction")
+        self.assertEqual(self.mesh_launch(session).returncode, 0)
+        self.assertEqual(self.mesh_launch(session, slot="test").returncode, 0)
+        roster = cast(dict[str, dict[str, object]], json.loads(
+            (session / "mesh_roster.json").read_text()))
+        first, second = roster
+        self.set_mesh_context(session, first, 100001)
+        mesh = self.root / "scripts/agents/codex_mesh.py"
+        _ = mesh.write_text(mesh.read_text().replace(
+            "elif verb == 'compact':",
+            "elif verb == 'compact':\n"
+            + "    import socket\n"
+            + "    with socket.socket(socket.AF_UNIX) as gate:\n"
+            + "        gate.connect(str(session / 'compact.sock'))\n"
+            + "        gate.sendall(b'r')\n"
+            + "        gate.recv(1)\n"
+            + "    roster = json.loads(roster_path.read_text())"))
+        with socket.socket(socket.AF_UNIX) as gate, ThreadPoolExecutor() as dispatches:
+            gate.bind(str(session / "compact.sock"))
+            gate.listen()
+            gate.settimeout(TEST_HANG_GUARD_SECS)
+            pending = dispatches.submit(self.mesh_launch, session, to=first)
+            connection = gate.accept()[0]
+            with connection:
+                connection.settimeout(TEST_HANG_GUARD_SECS)
+                try:
+                    self.assertEqual(connection.recv(1), b"r")
+                    claim = cast(dict[str, object], json.loads(
+                        (session / "impl_claim_impl.json").read_text()))
+                    self.assertEqual(claim["worker"], first)
+                    refused = self.mesh_launch(session, to=first)
+                    self.assertEqual(refused.returncode, 2, refused.stderr)
+                    self.assertIn("is claimed by launcher", refused.stderr)
+                    result = self.mesh_launch(session, to=second, slot="test")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(pending.done())
+                finally:
+                    connection.sendall(b"x")
+            result = pending.result(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((session / "impl_claim_impl.json").exists())
+        self.assertFalse((session / "impl_claim_test.json").exists())
+
     def test_worker_compaction_uses_the_private_config_instead_of_the_home_config(self) -> None:
         _ = self.config_file.write_text(
             self.config_file.read_text(encoding="utf-8").replace(
@@ -51,6 +98,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
 
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("still has a live turn after compaction; end the worker", result.stderr)
+        self.assertFalse((session_dir / "impl_claim_impl.json").exists())
         self.assertFalse((session_dir / "follow_message.txt").exists())
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("follow-up not sent", board)
@@ -125,7 +173,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertIn("compaction failed", board)
         self.assertIn("continuing follow-up", board)
 
-    def test_follow_up_compacts_above_the_context_threshold_before_claiming(self) -> None:
+    def test_follow_up_compacts_above_the_context_threshold_before_following(self) -> None:
         session_dir = self.start_phase("compact-above")
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)

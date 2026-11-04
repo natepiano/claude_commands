@@ -1,61 +1,15 @@
 #!/usr/bin/env bash
-# implement.sh — Invoke the configured worker agent to implement code changes.
-#
-# Usage: implement.sh [--to <worker>] [--phase <id>] [--fix-cause <text>] <session_dir> [working_dir] [prompt_file] [task]
-#                     [role_description] [pass_kind] [pass_activity] [fix_pass]
-#                     <team_role> [mesh_prefix]
-#   role_description — 1-2 lines describing this dispatch's responsibility,
-#   written as a header block into the shared heartbeat log
-#   pass_kind — required; impl, test, fix, or review. Every worker carries one.
-#   It is the worker's opening role, stamped on its board register line
-#   pass_activity — short user-facing description for the progress header
-#   fix_pass — required pass count when pass_kind is fix
-#   team_role — required; which member of the phase team this is (impl, test,
-#   review). Every dispatch is a team member -- the only two callers are
-#   the implementation and fix phases, and both run a team -- so there is one
-#   artifact layout rather than a solo one and a team one. Several launchers
-#   run at once against one session directory, so every artifact below is
-#   written per role, and every member records its own progress pass: the
-#   recorder keys passes by worker and closes only that worker's stale pass, so
-#   concurrent passes describe their own workers rather than whichever
-#   happened to finish last.
-#
-# Produces:
-#   <session_dir>/impl_status_<role>      — "implementing" while running, "implemented" on success, "error" on failure
-#   <session_dir>/impl_summary_<role>.txt — the implementation summary, written
-#                                     by the worker itself as its last act
-#   <session_dir>/impl_reply_<role>.txt   — the worker's chat replies, in order,
-#                                     on the codex paths; the summary file is
-#                                     filled from the last one only when the
-#                                     worker left it empty
-#   <session_dir>/impl_agent_<role>.log   — full agent log
-#   <session_dir>/impl_agent_<role>       — resolved task, family, agent, and effort
-#   <session_dir>/impl_bg_id_<role>       — the background session's short id, on
-#                                     the claude path only. The session is left
-#                                     alive when its turn ends so a peer's message
-#                                     can resume it. Absent on the codex path,
-#                                     whose address is a thread id in
-#                                     <session_dir>/mesh_roster.json instead.
-#   <session_dir>/workers             — every background session this run launched,
-#                                     `<id>\t<name>`, appended at launch;
-#                                     remove_workers.py removes them at phase end
-#   <session_dir>/board.log         — shared coordination board; this launcher
-#                                     posts each member's start and end so peers
-#                                     learn of them without the unit director,
-#                                     which is asleep between progress ticks
-#   <session_dir>/heartbeat.log     — shared liveness log for every dispatch in
-#                                     this session: a role header block at start,
-#                                     [wrapper] beats every 60s while the agent
-#                                     pid is alive (each carrying an activity
-#                                     digest from the agent log)
+# Invoke a worker to implement code changes.
+# Usage: implement.sh [--to WORKER] [--phase ID] [--fix-cause TEXT]
+#   SESSION_DIR WORKING_DIR PROMPT_FILE TASK ROLE_DESCRIPTION PASS_KIND
+#   PASS_ACTIVITY FIX_PASS TEAM_ROLE [MESH_PREFIX]
+# Write each worker's artifacts in SESSION_DIR, or phases/ID when the phase is set.
 
 set -euo pipefail
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 FOLLOW_TO=""
-# A phase running beside another names itself: start-pass stamps its pass with it, and its
-# per-role files go to <session_dir>/phases/<id>/.
 PHASE_ID=""
 FIX_CAUSE=""
 while [[ "${1:-}" == --* ]]; do
@@ -69,9 +23,6 @@ while [[ "${1:-}" == --* ]]; do
 done
 
 SESSION_DIR="${1:?Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
-# Two phases running the same role would otherwise write one status, summary and log.
-# Run-wide files -- the board, heartbeat, recorder and ledger state, worker identities -- stay
-# in the session.
 ARTIFACT_DIR="${SESSION_DIR}"
 if [[ -n "${PHASE_ID}" ]]; then
   # The directory keeps only the id's letters, digits, `.`, `_` and `-`: `ad hoc` is `adhoc`.
@@ -91,16 +42,6 @@ PASS_ACTIVITY="${7:-${ROLE_DESC%%$'\n'*}}"
 FIX_PASS="${8:-0}"
 TEAM_ROLE="${9:?Usage: implement.sh needs a team_role (impl, test, review) as its 9th argument}"
 
-# Every worker carries a kind, so an empty one is a dropped argument rather than a
-# choice. It used to be tolerated: the launcher skipped start-pass, ran the agent
-# normally, and left the worker's previous pass standing. A repair round dispatched
-# with the kind on `impl` alone then produced a phase whose ledger held one live
-# window and two records closed `error` an hour earlier -- and when that one
-# window closed, the recorder refused every progress call for having none open
-# while two agents were still posting to the board. Nothing in that sequence
-# looked like a launch fault, which is why it costs the run its ledger. Refuse
-# it at the argument instead. Whether a pass is *recorded* stays a property of
-# the session having recorder state, tested where start-pass is called.
 case "${PASS_KIND}" in
   impl|test|fix|review) ;;
   *)
@@ -110,12 +51,6 @@ case "${PASS_KIND}" in
     ;;
 esac
 
-# Resolving a repair round is an explicit assignment, never a property of the
-# pass kind. Keying it off `fix` is what forced workers to misreport their work:
-# every repairing worker should record `fix`, but a second one doing so
-# would mark one round landed several times over and hand the next review defects
-# pre-labelled as repaired. So the unit director names exactly one resolver, and
-# the kind goes back to being only a name for the work.
 if [[ -n "${UNIT_RESOLVES_ROUND+set}" ]]; then
   RESOLVES_ROUND="${UNIT_RESOLVES_ROUND}"
 elif [[ "${PASS_KIND}" == "fix" && "${TEAM_ROLE}" == "impl" ]]; then
@@ -129,8 +64,6 @@ else
 fi
 TASK="direct.${SUBTASK}"
 
-# The role indexes file paths and board fields, so hold it to a character set
-# that can escape neither.
 if [[ ! "${TEAM_ROLE}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; then
   echo "ERROR: team_role must be alphanumeric/_- and 1-32 chars; got '${TEAM_ROLE}'." >&2
   exit 2
@@ -138,21 +71,10 @@ fi
 SLOT="_${TEAM_ROLE}"
 BEAT_TAG="${SUBTASK}:${TEAM_ROLE}"
 BOARD_AGENT="${TEAM_ROLE}"
-# Exported here rather than beside the other launcher exports below, because
-# start-pass runs well before that point and the recorder reads this to label
-# which team slot owns the one pass a phase records. Set it late and the label
-# is silently empty rather than wrong, which is worse.
 export UNIT_TEAM_ROLE="${TEAM_ROLE}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# The address peers type to reach this member: `<project>-<slot>`, or
-# `<project>-fix` for a repair worker. worker_name.sh owns the rule, because the
-# unit director writes the same name into each peer's prompt before this runs.
-# A run whose unit director loaded the earlier rule tells its peers
-# `<session dir basename>-<slot>`, and its board already registers a worker under
-# that prefix, so it keeps the prefix for the rest of the run. Remove once no
-# run predating worker_name.sh can still be running.
 MESH_PREFIX="${10:-}"
 LEGACY_PREFIX="$(basename "${SESSION_DIR}")"
 if [[ -z "${MESH_PREFIX}" ]] && grep -qF "mesh=${LEGACY_PREFIX}-" "${SESSION_DIR}/board.log" 2>/dev/null; then
@@ -164,20 +86,12 @@ else
   MESH_NAME="$(bash "${SCRIPT_DIR}/worker_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
 fi
 
-# python3 goes through the repo shim, which picks an interpreter by VERSION
-# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.12.
 PY="${SCRIPT_DIR}/../lib/py"
 SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
-# Truncate at launch: the "done" post below names this path unconditionally, so a
-# worker that reports on the board without writing a summary would otherwise leave
-# the previous round's file sitting at exactly the path the board line points to.
 REPLY_FILE="${ARTIFACT_DIR}/impl_reply${SLOT}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/impl_status${SLOT}"
 LOG_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}.log"
 AGENT_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}"
-# Backend observations follow the durable worker address, including a repair
-# worker dispatched through the original implementation slot.
 BG_ID_KEY="$("$PY" - "${SCRIPT_DIR}" "${SESSION_DIR}" "${MESH_NAME}" "${TEAM_ROLE}" "${PASS_KIND}" <<'PY'
 import sys
 from pathlib import Path
@@ -210,15 +124,12 @@ else
   USE_CODEX_MESH=0
 fi
 
-# One lock covers identity, live-state validation, and the claim. The identity
-# written at the original launch is independent of the short-id workers ledger
-# and of impl_agent_<slot>, which this launcher rewrites for every pass.
+# Lock identity checks and claim writes. Compact after the claim releases the lock.
 worker_record() {
   "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
   "${AGENT_FAMILY}" "${AGENT_MODEL}" "${BG_ID_FILE}" \
   "${USE_CODEX_MESH}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
   "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${PASS_KIND}" <<'PY'
-import fcntl
 import json
 import os
 import subprocess
@@ -330,38 +241,6 @@ with worker_claim_lock(root):
                 fail(f"{name}: TransferringRole; use its destination holder")
             if entry.get("held_design_id"):
                 fail(f"{name}: held roles resume through design_roles.py")
-            context_tokens = entry.get("context_tokens")
-            if isinstance(context_tokens, int) and context_tokens > compact_above:
-                compact = subprocess.run(
-                    [sys.executable, mesh_script, "compact", "--session-dir", root_text,
-                     "--to", name],
-                    capture_output=True, text=True,
-                )
-                if compact.returncode == 0:
-                    line = compact.stdout.strip() or f"compacted {name}"
-                    post(f"launcher: {line}")
-                else:
-                    detail = (compact.stderr.strip() or compact.stdout.strip()
-                              or f"exit {compact.returncode}").splitlines()[-1]
-                    # Exit 3: a turn is still live on the worker's thread, so a follow-up would be refused.
-                    if compact.returncode == 3:
-                        post(f"launcher: {name} still has a live turn after compaction: {detail}; "
-                             "follow-up not sent")
-                        fail(f"{name} still has a live turn after compaction; end the worker "
-                             f"(codex_mesh.py end --to {name}) and start a fresh one")
-                    if compact.returncode == 4:
-                        post(f"launcher: {detail}; follow-up not sent")
-                        fail(f"{name}: roster changed during compaction; follow-up not sent; "
-                             f"inspect the worker and use codex_mesh.py reopen --to {name} if idle")
-                    post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
-            check = subprocess.run(
-                [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
-                 "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"],
-                 "--role", pass_kind],
-                capture_output=True, text=True,
-            )
-            if check.returncode != 0:
-                fail(check.stderr.strip() or f"{name} is busy or not followable")
         else:
             claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
             try:
@@ -397,6 +276,41 @@ with worker_claim_lock(root):
             claim["turn_id"] = turn_id
             claim_file.write_text(json.dumps(claim))
             print(turn_id)
+if action == "claim" and family == "codex":
+    context_tokens = entry.get("context_tokens")
+    if isinstance(context_tokens, int) and context_tokens > compact_above:
+        compact = subprocess.run(
+            [sys.executable, mesh_script, "compact", "--session-dir", root_text,
+             "--to", name],
+            capture_output=True, text=True,
+        )
+        if compact.returncode == 0:
+            line = compact.stdout.strip() or f"compacted {name}"
+            post(f"launcher: {line}")
+        else:
+            detail = (compact.stderr.strip() or compact.stdout.strip()
+                      or f"exit {compact.returncode}").splitlines()[-1]
+            # Exit 3 indicates a live turn after compaction.
+            if compact.returncode == 3:
+                post(f"launcher: {name} still has a live turn after compaction: {detail}; "
+                     "follow-up not sent")
+                fail(f"{name} still has a live turn after compaction; end the worker "
+                     f"(codex_mesh.py end --to {name}) and start a fresh one")
+            if compact.returncode == 4:
+                post(f"launcher: {detail}; follow-up not sent")
+                fail(f"{name}: roster changed during compaction; follow-up not sent; "
+                     f"inspect the worker and use codex_mesh.py reopen --to {name} if idle")
+            post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
+    with worker_claim_lock(root):
+        check = subprocess.run(
+            [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
+             "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"],
+             "--role", pass_kind],
+            capture_output=True, text=True,
+        )
+        if check.returncode != 0:
+            fail(check.stderr.strip() or f"{name} is busy or not followable")
+
 PY
 }
 
@@ -412,8 +326,8 @@ mkdir -p "${ARTIFACT_DIR}"
 
 if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
-  AGENT_MODEL="$(worker_record claim)"
   trap 'worker_record release' EXIT
+  AGENT_MODEL="$(worker_record claim)"
 fi
 
 # A phase claims its files before any worker edits them, wherever the worker runs
