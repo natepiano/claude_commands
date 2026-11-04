@@ -19,9 +19,15 @@ import time
 import unittest
 import uuid
 from unittest import mock
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 
 from scripts.lint import memory_admit as gate
+
+if TYPE_CHECKING:
+    from ..buildlog import store
+else:
+    import store
+
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_service as service
@@ -513,7 +519,7 @@ class AdmissionFixture(ExitStack):
 
     def history(self) -> list[dict[str, object]]:
         path = self.state_dir / "anon_peaks.jsonl"
-        return list(gate.anonymous_history_rows(path)) if path.exists() else []
+        return list(gate.anonymous_history_rows(path))
 
     def legacy_token_wait(self) -> tuple[wire.AdmitRequest, Path, gate.Waiter]:
         """Prepare a scoped legacy reservation with a sampled peak and a token intent."""
@@ -526,7 +532,7 @@ class AdmissionFixture(ExitStack):
         _ = reservation.write_text(json.dumps({
             "pid": request.owner.pid, "start_time": request.owner.start_time,
             "need": GIB, "repo": "fixture", "step": "check", "worktree": "tree",
-            "sidecar": str(sidecar), "admitted_at": gate.store.utc_iso(self.clock.now()),
+            "sidecar": str(sidecar), "admitted_at": store.utc_iso(self.clock.now()),
             "test_threads": None, "call_id": None,
         }))
         intent = self.state_dir / "retry.token-wait"

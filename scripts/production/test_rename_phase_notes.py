@@ -252,7 +252,7 @@ class ProductionRenamePhaseNoteTests(unittest.TestCase):
         fixture.write(plan, fixture.plan_path("alpha-unit").read_text())
         session = fixture.root / "phase-session"
         fixture.write(session / "progress_history_state.json", json.dumps({
-            "working_dir": str(worktree),
+            "production": "new", "unit": "alpha-unit",
             "project_plan_doc": str(plan),
             "status": "active", "phase": None,
         }))

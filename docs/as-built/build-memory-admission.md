@@ -271,6 +271,10 @@ Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
 Cargo estimates separate compile history from no-compile history.
 `index_step_evidence` joins each anonymous peak by host, call id, and step.
 `StepEvidence` keeps its shape and compile count independent.
+For a test step (`TEST_STEPS`: `nextest`, `test`, `t`), it also keeps the decoded argv as `arguments`.
+`history_selection` gives each anonymous row its package, scope and filter set.
+A recorded field wins. Only a missing field is parsed from `arguments`, once, through `test_selection`.
+A row with neither keeps the recorder defaults: no package, `full`, no filters.
 Missing argv does not remove a compile count. A saved shape does not prove compilation.
 `CompiledCrates` identifies a compile run. `NoCratesCompiled` identifies known zero-count attempts.
 The join combines repeated attempts. Any positive count keeps the call in compile history.
@@ -282,7 +286,11 @@ The gate uses its own cap, so Cargo estimates do not use those peaks.
 Five keyed rows exclude the older unkeyed rows for the same repository.
 With one to four own rows, a non-build estimate uses their largest peak or a lower pool p90.
 A repository without own history keeps the pool and fallback order.
-Filtered compile estimates use exact filters, then package filters, then check or build compile peaks.
+A full test estimate with a package keeps only rows whose package and scope match.
+Other steps, and requests with no package, keep the recorded scope rule.
+A filtered compile estimate (`filtered_peak`) takes the larger of two anonymous p90 values:
+the exact filter set's rows and the package's filtered rows.
+Indexed peaks times `ANON_SHARE` come next, exact filter first. Check or build compile peaks come last.
 A full-suite estimate does not cap a filtered compile estimate.
 The 1 GiB filtered floor applies when the repository has no usable compile history.
 Fresh nextest estimates retain `fresh_test_peak` and its 1 GiB floor.
@@ -324,8 +332,44 @@ At least one count rises in 10 repositories and 19 repository, step, and compile
 The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 to 7, over-three 101 to 166.
 A filtered compile run takes its estimate from compile history, and the full-run estimate no longer caps it.
 The showrunner accepted the miss (2026-11-04): an under-promise risks an out-of-memory kill; an over-promise only delays parallel starts.
-The next phase makes a filtered compile estimate use that filter's own compile history before the package pool.
+Phase 60 found the promise source of these over-three runs and fixed it there; see the Phase 60 replay below.
 Run `phases/11/replay.py before` and `after` in the session folder to regenerate the full grouped data for `replay_groups.md`.
+
+#### Phase 60 replay comparison
+
+The Phase 60 replay (`phases/60/replay.py`) rebuilds the Phase 11 replay with the same frozen inputs.
+It classifies each call through `index_step_evidence` and `combine_compile_counts`. The baseline is `82f5c90d4`, the Phase 11 checkpoint.
+The shared classification moves 51 runs from no compile to compile, so its class totals differ from the Phase 11 table.
+
+The cause is in the selection of history rows, not in the tier order:
+1. Anonymous rows recorded before 2026-10-29 have no package, scope or filter fields.
+   `filtered_peak` rejected them, so 90 high promises came from indexed peaks times `ANON_SHARE`.
+   Indexed peaks count memory outside the anonymous peak, so those promises were too high.
+2. A full test estimate with a package mixed every package and older filtered rows: 79 high promises.
+3. Three high promises came from large earlier samples. The fix keeps them.
+
+The fix recovers the missing fields from the indexed argv, selects full test rows by package and scope,
+and takes the larger of the exact-filter and package p90 before any indexed tier.
+
+| Compile class | Budget GiB | Runs | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|---:|---:|
+| compile | 21 | 11,411 | 402 | 367 | 1,171 | 1,071 |
+| compile | 24 | 2,300 | 12 | 12 | 358 | 361 |
+| no compile | 21 | 1,134 | 12 | 12 | 918 | 920 |
+| no compile | 24 | 208 | 4 | 4 | 173 | 173 |
+| **Total** | | **15,053** | **430** | **395** | **2,620** | **2,525** |
+
+Bar met: cargo-liner nextest compile runs at 21 GiB go from under-half 7 to 0 and over-three 166 to 65 (bar: 101 or lower, under-half 7 or lower).
+At 24 GiB, the same group goes from over-three 6 to 2.
+Hana over-three rises 595 to 607 while its under-half falls 31 to 23. Six other repositories rise by one or two runs in one count.
+Run `phases/60/run_after.py` in the session folder to regenerate `after.json`.
+
+#### Phase 17 compile-band measurement (not adopted)
+
+Phase 17 replayed nextest promises split by compile count (bands 1–5, 6–20, 21–50 and more than 50 crates) against checkpoint `e88fb841d`.
+The band chosen from the last compile count of the same worktree and step was right for 54% of compile requests.
+Promises under half the peak rose from 395 to 423, and ten repositories got worse. Promises over three times the peak fell from 2,525 to 2,485.
+The adopt rule needs fewer under-half promises in total and no rise in any repository, so bands are not adopted and the estimate is unchanged.
 
 Build estimates use completed same-shape history from the last 14 days.
 Ten or more earlier runs supply p90. One to nine earlier runs supply their largest peak.

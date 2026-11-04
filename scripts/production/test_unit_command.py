@@ -83,18 +83,18 @@ class UnitCommandTests(StaffTestCase):
         write_text_atomic(self.folder / ".unit.toml",
                           f'plan = "{self.plan}"\nresponsibilities = ["member"]\n')
         runner = staff.StaffRow(
-            staff.StaffId(fixture_runtime_id("command-root")), "showrunner", "tools", None,
+            staff.StaffId(fixture_runtime_id("command-root")), "showrunner", "tools", staff.StaffRoot(),
             doc=staff.LiveDoc("natedev", self.root / "production.md"),
             current_session=staff.StaffId(fixture_runtime_id("command-root-current")))
         unit = staff.StaffRow(
-            staff.StaffId(fixture_runtime_id("command-unit")), "unit", "panes", runner.id,
+            staff.StaffId(fixture_runtime_id("command-unit")), "unit", "panes", staff.ReportsTo(runner.id),
             worktree=staff.PresentWorktree("natedev", self.folder),
             current_session=staff.StaffId(fixture_runtime_id("command-unit-current")))
         worker = staff.StaffRow(
-            staff.StaffId(fixture_runtime_id("command-worker")), "worker", "impl", unit.id,
+            staff.StaffId(fixture_runtime_id("command-worker")), "worker", "impl", staff.ReportsTo(unit.id),
             current_session=staff.StaffId(fixture_runtime_id("command-worker-current")))
         runner_worker = staff.StaffRow(
-            staff.StaffId(fixture_runtime_id("command-runner-worker")), "worker", "review", runner.id,
+            staff.StaffId(fixture_runtime_id("command-runner-worker")), "worker", "review", staff.ReportsTo(runner.id),
             current_session=staff.StaffId(fixture_runtime_id("command-runner-worker-current")))
         self.record = staff.StaffSnapshot((runner, unit, worker, runner_worker))
         _ = self.write_document({"schema": 2, "rows": [row.to_json() for row in self.record.rows],

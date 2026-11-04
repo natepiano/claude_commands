@@ -499,6 +499,8 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "memory_snapshots": (MEMORY_SNAPSHOT_COLUMNS, "", "slice and zram counters at a requested instant"),
 }
 
+GATE_TABLES = tuple(table for table in TABLES if table.startswith("gate_"))
+
 VIEWS: dict[str, tuple[str, str]] = {
     "holds": (
         "one interval per began row; ends when the next row of its key is ended; a next began or no later row leaves ended_at NULL; an ended row without a preceding began has began_at NULL; previous_at and next_at bound missing events; later_row is 1 when a later row exists; no row proves a hold is in force now",
@@ -831,7 +833,7 @@ class LatestGateModuleAttempt:
 def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     """Replace a gate run and all its suite, module, and test rows."""
     run_id = record.get("id")
-    for table in ("gate_suites", "gate_modules", "gate_tests"):
+    for table in GATE_TABLES[1:]:
         _ = connection.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
     module_rows = entries(record, "modules")
     latest_attempts: dict[tuple[str, str], LatestGateModuleAttempt] = {}
@@ -1045,7 +1047,9 @@ def update() -> int:
                     list[tuple[str, int, str]], connection.execute("SELECT path, offset, marks FROM files").fetchall()
                 )
             }
-            _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('root', ?)", (str(root),))
+            stored_root = cast(tuple[str] | None, connection.execute("SELECT value FROM meta WHERE key = 'root'").fetchone())
+            if stored_root != (str(root),):
+                _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('root', ?)", (str(root),))
             lines = 0
             present: set[str] = set()
             for path in sorted(root.glob("*/*.jsonl")):

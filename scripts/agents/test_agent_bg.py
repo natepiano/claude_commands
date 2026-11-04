@@ -10,23 +10,29 @@ from pathlib import Path
 import subprocess
 import sys
 from typing import cast, override
+from unittest.mock import patch
 
 from scripts.message import sessions
 from scripts.production import staff
-from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id
+from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 BACKEND = '''import json, os, sys
 from pathlib import Path
 sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
-from scripts.production import staff
 log = Path(os.environ["FIXTURE_BACKEND_LOG"])
 with log.open("a") as output:
-    output.write(json.dumps({"arguments": sys.argv[1:], "STAFF_ID": os.environ.get("STAFF_ID", "")}) + "\\n")
+    output.write(json.dumps({"arguments": sys.argv[1:], "STAFF_ID": os.environ.get("STAFF_ID", ""),
+        "row_locks": [key for key in os.environ if key.startswith("STAFF_ROW_FD_")],
+        "lock_fds": [str(path.resolve()) for path in Path("/proc/self/fd").glob("*")
+                     if "/rows/" in str(path.resolve()) and str(path.resolve()).endswith(".lock")]}) + "\\n")
 if sys.argv[1] == "stop":
     raise SystemExit(int(os.environ.get("FIXTURE_STOP_EXIT", "0")))
 Path(os.environ["FIXTURE_REGISTRY_PATH"]).write_text(os.environ["FIXTURE_REGISTRY_RECORD"])
+transcript = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))) / "projects/fixture" / (os.environ["FIXTURE_NATIVE_ID"] + ".jsonl")
+transcript.parent.mkdir(parents=True, exist_ok=True)
+transcript.touch()
 if os.environ.get("FIXTURE_REFUSE_PUBLICATION"):
     path = Path(os.environ["STAFF_FILE"])
     lock = path.with_name(path.name + ".lock")
@@ -39,10 +45,11 @@ SEND = '''import json, os, sys
 from pathlib import Path
 sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production import staff
-row = staff.by_id(staff.StaffId(os.environ["FIXTURE_NATIVE_ID"]))
+row = staff.by_current_session(os.environ["FIXTURE_NATIVE_ID"])
 if row is None:
     raise SystemExit("opening prompt preceded staff publication")
-Path(os.environ["FIXTURE_SENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "row": row.to_json()}))
+prompt = Path(sys.argv[sys.argv.index("--file") + 1]).read_text()
+Path(os.environ["FIXTURE_SENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "row": row.to_json(), "prompt": prompt}))
 print("SENT: fixture")
 '''
 
@@ -58,7 +65,6 @@ class ClaudeWorkerFixture:
     sender: Path
     backend_log: Path
     sent: Path
-    id_file: Path
     registry: Path
     environment: dict[str, str]
 
@@ -66,6 +72,8 @@ class ClaudeWorkerFixture:
 class NativeClaudeWorkerTests(StaffTestCase):
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": os.environ.get("PATH", os.defpath),
+            "HERDR_BIN": "/nonexistent/herdr"}, clear=True)))
         super().setUp()
         _ = self.fixture
 
@@ -90,7 +98,6 @@ class NativeClaudeWorkerTests(StaffTestCase):
         _ = sender.write_text(SEND)
         backend_log = self.root / "backend.jsonl"
         sent = self.root / "sent.json"
-        id_file = self.root / "backend-id"
         registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
         record: dict[str, object] = {"pid": os.getpid(), "procStart": sessions.process_start(os.getpid()),
                   "sessionId": identity, "name": "fresh-impl", "entrypoint": "cli",
@@ -103,12 +110,12 @@ class NativeClaudeWorkerTests(StaffTestCase):
             "FIXTURE_REGISTRY_PATH": str(registry), "FIXTURE_REGISTRY_RECORD": json.dumps(record)}
         _ = environment.pop("CLAUDE_CONFIG_DIR", None)
 
-        return ClaudeWorkerFixture(unit, identity, work, run_dir, prompt, backend, sender, backend_log, sent, id_file, registry, environment)
+        return ClaudeWorkerFixture(unit, identity, work, run_dir, prompt, backend, sender, backend_log, sent, registry, environment)
 
     def launch(self, **environment: str) -> subprocess.CompletedProcess[str]:
-        self.fixture.id_file.unlink(missing_ok=True)
-        return subprocess.run(["bash", str(CHECKOUT / "scripts/agents/agent_bg.sh"), "fresh-impl", str(self.fixture.work),
-                               str(self.fixture.prompt), str(self.root / "summary"), str(self.root / "log"), str(self.fixture.id_file)],
+        self.fixture.sent.unlink(missing_ok=True)
+        return subprocess.run(["bash", str(CHECKOUT / "scripts/agents/agent_bg.sh"), "--run", str(self.fixture.run_dir), "fresh-impl", str(self.fixture.work),
+                               str(self.fixture.prompt), str(self.root / "summary"), str(self.root / "log")],
                               cwd=self.fixture.work, env={**self.fixture.environment, **environment}, capture_output=True, text=True,
                               check=False, timeout=TEST_HANG_GUARD_SECS)
 
@@ -120,7 +127,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = staff.by_id(staff.StaffId(self.fixture.identity))
         assert row is not None
-        self.assertEqual((row.name, row.parent), ("fresh-impl", self.fixture.unit.id))
+        self.assertEqual((row.name, row.parent), ("fresh-impl", staff.ReportsTo(self.fixture.unit.id)))
         sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
         self.assertEqual(sent["row"], row.to_json())
         self.assertEqual(cast(list[str], sent["arguments"])[:2], ["--to", "session:" + self.fixture.identity])
@@ -128,6 +135,39 @@ class NativeClaudeWorkerTests(StaffTestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn("--session-id", cast(list[str], calls[0]["arguments"]))
         self.assertEqual(calls[0]["STAFF_ID"], "")
+
+    def test_codex_to_claude_stops_the_source_and_publishes_before_the_transcript_opening(self) -> None:
+        old = fixture_worker("fresh-impl", self.fixture.unit.id,
+                             backend=staff.CodexBackend(self.root / "source-codex"))
+        source, evidence = transcript_fixture(old, staff.CodexBackend(self.root / "source-codex"))
+        before = self.staff_file.read_bytes()
+        modules = stopped_worker_module(self.root / "switch-modules")
+        stopped = self.root / "stopped.json"
+        parent = self.root / "parent-session"
+        parent.mkdir()
+        roster = parent / "mesh_roster.json"
+        _ = roster.write_text('{"parent": {"staff_id": "parent-worker"}}\n')
+        saved = roster.read_bytes()
+        result = self.launch(UNIT_RUN_DIR=str(parent), PLAN_DELEGATE_BOARD_DIR=str(parent),
+                             PYTHONPATH=os.pathsep.join((str(modules), str(CHECKOUT))),
+                             FIXTURE_STOPPED=str(stopped), CODEX_HOME=str(self.root / "source-codex"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = staff.by_id(old.id)
+        self.assertEqual(json.loads(stopped.read_text()), old.to_json())
+        self.assertEqual({path.name: path.read_bytes() for path in parent.iterdir()}, {"mesh_roster.json": saved})
+        private = cast(dict[str, dict[str, object]], json.loads((self.fixture.run_dir / "mesh_roster.json").read_text()))
+        self.assertEqual(private["fresh-impl"]["dispatch_state"], "accepted")
+        sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
+        assert current is not None
+        self.assertEqual(sent["row"], current.to_json())
+        prompt = str(sent["prompt"])
+        extract = self.fixture.run_dir / f"{old.id}.handoff.md"
+        self.assertLess(prompt.index(str(extract)), prompt.index(str(source)))
+        self.assertIn(self.fixture.prompt.read_text(), prompt)
+        self.assertIn(evidence[0][0], extract.read_text())
+        self.assertEqual(self.backend_calls()[0]["row_locks"], [])
+        self.assertEqual(self.backend_calls()[0]["lock_fds"], [])
+        self.assert_only_current_session_changed(before, old, self.fixture.identity)
 
     def test_worker_waits_for_its_registry_record_after_the_banner_then_publishes(self) -> None:
         fake_modules = self.root / "fake-modules"
@@ -157,7 +197,7 @@ if os.environ.get("BG_ID"):
         self.assertEqual(reads.read_text().splitlines(), ["empty", "empty", "ready"])
         row = staff.by_id(staff.StaffId(self.fixture.identity))
         assert row is not None
-        self.assertEqual((row.name, row.parent), ("fresh-impl", self.fixture.unit.id))
+        self.assertEqual((row.name, row.parent), ("fresh-impl", staff.ReportsTo(self.fixture.unit.id)))
         self.assertTrue(self.fixture.sent.exists())
         self.assertEqual(len(self.backend_calls()), 1)
 
@@ -167,24 +207,23 @@ if os.environ.get("BG_ID"):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = staff.by_id(staff.StaffId(self.fixture.identity))
         assert row is not None
-        self.assertEqual(row.parent, self.fixture.unit.id)
+        self.assertEqual(row.parent, staff.ReportsTo(self.fixture.unit.id))
         self.assertEqual(len(self.backend_calls()), 1)
         self.assertEqual(json.loads(self.fixture.sent.read_text())["row"], row.to_json())
         parent = staff.by_id(self.fixture.unit.id)
         assert parent is not None
         self.assertIsInstance(parent.worktree, staff.RemovedWorktree)
 
-    def test_missing_or_invalid_opening_role_refuses_before_backend_creation(self) -> None:
+    def test_each_claude_launch_delivers_work_with_a_missing_or_invalid_task_role(self) -> None:
         for count, role in enumerate(("", "invented-role"), 1):
             with self.subTest(role=role):
                 result = self.launch(AGENT_BG_ROLE=role, UNIT_TEAM_ROLE="")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 row = staff.by_id(staff.StaffId(self.fixture.identity))
                 assert row is not None
-                self.assertEqual(row.parent, self.fixture.unit.id)
+                self.assertEqual(row.parent, staff.ReportsTo(self.fixture.unit.id))
                 self.assertEqual(json.loads(self.fixture.sent.read_text())["row"], row.to_json())
                 self.assertEqual(len(self.backend_calls()), count)
-                self.assertEqual(self.fixture.id_file.read_text().strip(), self.fixture.identity[:8])
 
     def test_claude_publication_refusal_names_and_stops_only_the_created_backend_without_work(self) -> None:
         result = self.launch(FIXTURE_REFUSE_PUBLICATION="1")
@@ -203,4 +242,3 @@ if os.environ.get("BG_ID"):
         self.assertEqual(json.loads(self.fixture.registry.read_text())["sessionId"], self.fixture.identity)
         self.assertFalse(self.fixture.sent.exists())
         self.assertIsNone(staff.by_id(staff.StaffId(self.fixture.identity)))
-        self.assertEqual(self.fixture.id_file.read_text().strip(), self.fixture.identity[:8])

@@ -15,7 +15,7 @@ import sys
 import time
 import threading
 from queue import SimpleQueue, Empty
-from typing import Callable, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Protocol, cast
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -26,6 +26,12 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lint import memory_admit as gate
+
+if TYPE_CHECKING:
+    from scripts.buildlog import store
+else:
+    import store
+
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeActivityReader, ScopeProcesses
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import write_text_atomic
@@ -431,7 +437,7 @@ def estimate_worker(jobs: SimpleQueue[EstimateJob | StopEstimates], results: Sim
                 return
             try:
                 fault("before_test_phase_need")
-                need = gate.test_phase_need(job.row, gate.store.host_name(), job.now, job.root,
+                need = gate.test_phase_need(job.row, store.host_name(), job.now, job.root,
                     history_path=job.root / "anon_peaks.jsonl", config=job.config)
                 result = EstimateResult(job.episode, job.revision, job.width, need)
             except Exception:
@@ -1202,7 +1208,7 @@ class AdmissionServer:
             while any(record.path == str(stem) for record in self.reservations.values()):
                 stem = stem.with_name(stem.name + "0")
             record = ReservationRecord(request.episode, str(stem), request.owner, profile.peak.bytes,
-                profile.repo, profile.step, profile.worktree, gate.store.utc_iso(now), request.sidecar,
+                profile.repo, profile.step, profile.worktree, store.utc_iso(now), request.sidecar,
                 request.test_width, request.call, stem.name, gate.stored_waiter(waiting.row),
                 profile.repository.key if isinstance(profile.repository, gate.RepositoryIdentity) else "",
                 profile.scope, gate.test_package(list(request.argv)), tuple(gate.test_filters(list(request.argv))),
@@ -1361,7 +1367,7 @@ class AdmissionServer:
             at = self.clock.now()
             priority["transition"] = gate.PendingPriorityTransition(key,
                 "set" if isinstance(request, wire.PrioritySetRequest) else "clear", at,
-                gate.store.read_last_whole_row_end(gate.store.host_file(gate.store.host_name(), at)))
+                store.read_last_whole_row_end(store.host_file(store.host_name(), at)))
             self.priority = priority
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
             self.persist()
@@ -1934,7 +1940,7 @@ def export_priority(directory: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("command", choices=("serve", "drain-check", "export-priority"))
-    default_state_dir = gate.store.root() / "admission"
+    default_state_dir = store.root() / "admission"
     _ = parser.add_argument("--state-dir", type=Path, default=default_state_dir)
     _ = parser.add_argument("--service", action="store_true")
     class Arguments(argparse.Namespace):

@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 from typing import cast
 
-from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, grant_call
 
 
@@ -41,9 +42,9 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_review_with_an_empty_slot_records_its_active_pass_wait(self) -> None:
         self.set_hold_routing("natedev_only")
         history = self.record_phase()
-        self.fixture.environment.update({"UNIT_TEAM_ROLE": "", "CODEX_THREAD_ID": "thread-review"})
-        _ = (Path(self.fixture.environment["UNIT_RUN_DIR"]) / "mesh_roster.json").write_text(json.dumps({
-            "fixture-impl": {"thread_id": "thread-impl"}, "fixture-review": {"thread_id": "thread-review"}}))
+        self.fixture.environment.update({"UNIT_TEAM_ROLE": "", "CODEX_THREAD_ID": fixture_runtime_id("thread-review")})
+        record_wait_workers(self.fixture.root, Path(self.fixture.environment["UNIT_RUN_DIR"]), self.fixture.environment,
+                            {"fixture-impl": "thread-impl", "fixture-review": "thread-review"})
         session = self.fixture.environment["UNIT_RUN_DIR"]
         result = invoke_recorder([
             "start-pass", "--session-dir", session, "--phase-id", "6", "--pass-kind", "review",

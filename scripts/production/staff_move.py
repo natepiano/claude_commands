@@ -64,7 +64,7 @@ def move_unit(slug: str, unit: str, new_showrunner: str, *, identity: UnitIdenti
             raise staff.StaffRefused(f"{slug}/{unit}: no matching unit staff row")
         if isinstance(parent, staff_sources.NoSuchMember) or parent.row.kind != "showrunner":
             raise staff.StaffRefused(f"{new_showrunner}: no matching showrunner staff row")
-        row = found.row if found.row.parent == parent.row.id else staff.move(found.row.id, parent.row.id)
+        row = found.row if found.row.parent == staff.ReportsTo(parent.row.id) else staff.move(found.row.id, staff.ReportsTo(parent.row.id))
         try:
             current = staff.StaffSnapshot(tuple(row if member.id == row.id else member for member in record.rows))
             changed = _place_tab(row, current)

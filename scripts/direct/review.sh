@@ -200,7 +200,6 @@ PASS_STARTED=0
 mkdir -p "${ARTIFACT_DIR}"
 # Every dispatch names the run's director in the run folder (unit_runs.py), which the
 # production tree reads: a marker names one run per director, and a director runs phases side by side.
-"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
 SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"
@@ -431,24 +430,20 @@ import sys
 from pathlib import Path
 
 root_text, slot, name, family, model, helper_dir = sys.argv[1:]
+sys.path.insert(0, str(Path(helper_dir).resolve().parents[1]))
+from scripts.production import worker_admission
 sys.path.insert(0, helper_dir)
 from worker_state import worker_claim_lock, worker_record_path
 root = Path(root_text)
 with worker_claim_lock(root):
-    try:
-        roster = json.loads((root / "mesh_roster.json").read_text())
-    except (OSError, ValueError):
-        roster = {}
-    entry = roster.get(name, {}) if isinstance(roster, dict) else {}
-    worker_id = entry.get("thread_id", "") if isinstance(entry, dict) else ""
-    if not isinstance(worker_id, str) or not worker_id:
+    member = worker_admission.member(root, name)
+    if member is None:
         raise SystemExit(1)
+    worker_id = member.current_session
     identity = {
-        "name": name,
+        "staff_id": member.id,
         "slot": slot,
-        "family": family,
         "model": model,
-        "worker_id": worker_id,
     }
     worker_record_path(root, name, slot, role="review").write_text(json.dumps(identity))
 PY
@@ -490,16 +485,15 @@ PY
 
 refresh_turn_thread_id() {
   TURN_THREAD_ID="$("$PY" - "${MESH_SESSION_DIR}" "${REVIEW_WORKER}" \
-    "${TURN_THREAD_ID}" "${TURN_PROGRESS}" <<'PY'
+    "${TURN_THREAD_ID}" "${TURN_PROGRESS}" "${SCRIPT_DIR}" <<'PY'
 import json
 import sys
 from pathlib import Path
-root, reviewer, known, progress = sys.argv[1:]
-try:
-    roster = json.loads((Path(root) / "mesh_roster.json").read_text(encoding="utf-8"))
-except (OSError, ValueError):
-    roster = {}
-print(roster.get(reviewer, {}).get("thread_id") or known or json.loads(progress).get("thread_id", ""))
+root, reviewer, known, progress, helper_dir = sys.argv[1:]
+sys.path.insert(0, str(Path(helper_dir).resolve().parents[1]))
+from scripts.production import worker_admission
+member = worker_admission.member(Path(root), reviewer)
+print(member.current_session if member else known or json.loads(progress).get("thread_id", ""))
 PY
 )"
 }
@@ -606,10 +600,12 @@ if [[ "${RECORDS_TURN}" -eq 1 ]]; then
   TURN_STARTED_AT="$(date +%s)"
   # The record joins to the phase --phase names, the same phase start-pass stamps:
   # with phases open side by side, the newest open phase is often another one.
-  TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${SESSION_DIR}" "${FOLLOW_TO}" "${PHASE_ID}" <<'PY'
+  TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${SESSION_DIR}" "${FOLLOW_TO}" "${PHASE_ID}" "${SCRIPT_DIR}" <<'PY'
 import json
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[5]).resolve().parents[1]))
+from scripts.production import worker_admission
 try:
     state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 except (OSError, ValueError):
@@ -618,14 +614,11 @@ phase = state.get("phase") or {}
 named = [record for record in [phase, *(state.get("open_phases") or [])]
          if sys.argv[4] and record.get("status") == "active" and record.get("id") == sys.argv[4]]
 phase = named[0] if named else phase
-try:
-    roster = json.loads((Path(sys.argv[2]) / "mesh_roster.json").read_text(encoding="utf-8"))
-except (OSError, ValueError):
-    roster = {}
+member = worker_admission.member(Path(sys.argv[2]), sys.argv[3])
 print(json.dumps({"unit": state.get("unit", ""), "phase": phase.get("id", ""),
                   "phase_instance_id": phase.get("instance_id", ""),
                   "history_file": state.get("history_file", ""),
-                  "thread_id": roster.get(sys.argv[3], {}).get("thread_id", "")}))
+                  "thread_id": member.current_session if member else ""}))
 PY
 )"
   trap finish_review_exit EXIT
@@ -684,8 +677,7 @@ TREE_BASELINE_READY=0
 TURN_IMAGE_ARGS=()
 
 if [[ -n "${REVIEW_WORKER}" ]]; then
-  CODEX_MESH="${UNIT_CODEX_MESH:-$(_models_registry_get direct.options codex_mesh)}"
-  if [[ "${AGENT_FAMILY}" != "codex" || "${CODEX_MESH}" != "1" ]]; then
+  if [[ "${AGENT_FAMILY}" != "codex" ]]; then
     echo "ERROR: review worker ${REVIEW_WORKER} requires the Codex mesh." >&2
     exit 2
   fi
@@ -818,7 +810,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
 elif [[ -n "${NEW_SLOT}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
     --session-dir "${SESSION_DIR}" --name "${REVIEW_WORKER}" --role review "${LENS_ARGS[@]}" \
-    --cwd "${WORKING_DIR}" --sandbox read-only --prompt-file "${PROMPT_FILE}" \
+    --sandbox read-only --prompt-file "${PROMPT_FILE}" \
     --summary-file "${FINDINGS_FILE}" --reply-file "${REPLY_FILE}" \
     --log-file "${LOG_FILE}" --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
