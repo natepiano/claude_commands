@@ -11,7 +11,7 @@ import { QueueView } from './queue';
 import type { QueuePaneState, QueueLines, QueueSelection } from '../types/queue';
 
 const PANE = 'unit-board';
-const ACCOUNTS = 'accounts-board';
+const ACCOUNTS = 'accounts';
 const ACCOUNT_PANES = { plugin: 'unit-board', key: 'accountsPanes' } as const;
 const QUEUE = 'build-queue';
 const QUEUE_PANES = { plugin: 'unit-board', key: 'queuePanes' } as const;
@@ -369,7 +369,6 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const accountsGeneration = accounts.checkpoint();
     const queueGeneration = queue.checkpoint();
-    await $.command.register({ name: ACCOUNTS, description: 'Show the stored accounts pane' });
     const panes = await $.ui.panes();
     if (panes.some(pane => pane.id === PANE)) {
       startTimer($, opened, PANE, await $.session.id());
@@ -415,7 +414,7 @@ export const register: Register = on => {
     } finally { active.busy = false; }
     return { text: 'Unit board opened.' };
   });
-  on('command.run', { command: ACCOUNTS }, async ($, e) => {
+  on('command.run', { command: 'showrunner:accounts' }, async ($, e) => {
     if (e.args.trim() === 'close') {
       await $.ui.close({ id: ACCOUNTS });
       return { text: 'Accounts closed.' };
