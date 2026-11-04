@@ -932,9 +932,10 @@ class StopResumeTests(unittest.TestCase):
         self.process.side_effect = self.alive_until_kill
         self.client.process_info = {"foreground_processes": [
             {"pid": 123, "argv": ["codex", "resume", identity], "cwd": str(self.root)}]}
-        def native_process(pid: int, kind: str, *, resume_id: str = "") -> herdr.NativeAgentProcess:
+        def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (123, "codex"))
-            if resume_id != identity:
+            processes = herdr.json_items(self.client.process_info["foreground_processes"], "fixture foreground processes")
+            if herdr.json_object(processes[0], "fixture Codex process")["argv"] != ["codex", "resume", identity]:
                 raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
             return herdr.NativeAgentProcess(identity, "generation-1", {})
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
@@ -943,7 +944,7 @@ class StopResumeTests(unittest.TestCase):
               patch.object(herdr, "native_process", side_effect=native_process) as native):
             self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
-        self.assertEqual(native.call_args_list, [call(123, "codex", resume_id=identity)] * 4)
+        self.assertEqual(native.call_args_list, [call(123, "codex")] * 4)
 
     def test_registry_removal_does_not_resume_until_the_saved_process_exits(self) -> None:
         self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),

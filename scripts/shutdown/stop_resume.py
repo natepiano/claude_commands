@@ -179,13 +179,13 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        proved = herdr.native_process(live.pid, kind, resume_id=identity)
+        proved = herdr.native_process(live.pid, kind)
         if proved.identity != identity:
             return StopFailed(identity, "process runs another conversation; no signal sent")
         started = proved.started
         if not _same_process(live.pid, started):
             return NotRunning(identity)
-        if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
+        if herdr.native_process(live.pid, kind) != proved:
             return StopFailed(identity, "process identity changed; no signal sent")
         os.kill(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
@@ -197,7 +197,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         else:
             return Stopped(identity, live.pid)
         if _same_process(live.pid, started):
-            if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
+            if herdr.native_process(live.pid, kind) != proved:
                 return StopFailed(identity, "process identity changed; no signal sent")
             os.kill(live.pid, signal.SIGKILL)
             deadline = monotonic() + KILL_GRACE_SECONDS
