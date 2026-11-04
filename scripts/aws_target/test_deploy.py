@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextlib import redirect_stdout
 import base64
 from datetime import UTC, datetime
 from decimal import Decimal
 import gzip
-from io import BytesIO
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from typing import ClassVar, cast, override
 from unittest import mock
 from urllib.request import Request
@@ -101,6 +103,7 @@ class DeploymentTests(CostFixture):
     bundle: Path = Path()
     credentials: Path = Path()
     notification_file: Path = Path()
+    price_file: Path = Path()
     patch_sections: ClassVar[dict[str, str]] = {}
 
     @override
@@ -132,6 +135,9 @@ class DeploymentTests(CostFixture):
         self.notification_file = self.root / 'notification-email'
         _ = self.notification_file.write_text('build@example.invalid\n')
         self.text_setting('notification_email_file', str(self.notification_file))
+        self.price_file = self.root / 'deployment-price'
+        self.text_setting('deployment_price_file', str(self.price_file))
+        self.write_price()
         values = {
             'offload': 'off', 'deployment_profile': 'build-admin', 'stack_name': 'fixture-build',
             'ami_id': 'ami-fixture', 'ami_owner_id': '123456789012', 'nixos_release': '26.05',
@@ -147,8 +153,7 @@ class DeploymentTests(CostFixture):
             'root_volume_gib': '32', 'data_volume_gib': '500', 'data_volume_iops': '6000',
             'data_volume_throughput': '500', 'spot_max_usd_per_hour': '0.5',
             'budget_notice_low_percent': '50', 'budget_notice_high_percent': '80', 'budget_stop_percent': '100',
-            'deployment_timeout_s': '30', 'preflight_max_age_s': '300', 'deployment_price_at': str(self.now),
-            'deployment_price_usd_per_hour': '0.1', 'fixed_usd_per_month': '0.001',
+            'deployment_timeout_s': '30', 'preflight_max_age_s': '300', 'fixed_usd_per_month': '0.001',
             'retained_storage_usd_per_month': '0', 'root_storage_usd_per_month': '0',
             'ipv4_usd_per_month': '0', 'gp3_iops_usd_per_month': '0', 'gp3_throughput_usd_per_month': '0',
             'region': 'us-east-1', 'instance_id': 'i-fixture',
@@ -172,6 +177,10 @@ class DeploymentTests(CostFixture):
         self.now = at
         _ = (self.root / 'clock').write_text(str(at))
 
+    def write_price(self, price: str = '0.1') -> None:
+        _ = self.price_file.write_text(f'deployment_price_usd_per_hour={price}\n'
+                                       + f'deployment_price_at={self.now}\n')
+
     def deployment(self) -> deploy.Deployment:
         return deploy.Deployment(self.settings, self.state, self.bundle, clock=lambda: self.now,
                                  notify=lambda _event: True)
@@ -183,7 +192,8 @@ class DeploymentTests(CostFixture):
 
     def prepare_stopped_instance(self) -> int:
         self.set_clock(int(datetime(2026, 1, 15, 12, tzinfo=UTC).timestamp()))
-        for key, value in (('deployment_price_at', str(self.now)), ('fallback_usd_per_hour', '1'),
+        self.write_price()
+        for key, value in (('fallback_usd_per_hour', '1'),
                            ('price_max_age_seconds', '86400'), ('observation_max_age_seconds', '86400'),
                            ('cost_explorer_read_usd', '0')):
             self.replace(key, value)
@@ -226,7 +236,7 @@ class DeploymentTests(CostFixture):
         self.assertEqual((self.state / 'deployment.json').exists(), failure == 'instance')
         self.set_clock(start + 7200)
         self.assertEqual(self.instance_intervals(self.now), [(start, self.now, Decimal('2'), 0)])
-        self.replace('deployment_price_at', str(self.now))
+        self.write_price()
         with self.assertRaises(aws_target.AwsUnavailable):
             _ = subject.prepare()
         self.assertEqual(len(book.pending_compute_requests()), 1)
@@ -286,7 +296,7 @@ class DeploymentTests(CostFixture):
         book.observe(ledger.InstanceObservation(start + 60, 'terminated', 'old instance deletion'))
         self.assertEqual(self.instance_intervals(start + 3600), [(start, start + 3600, Decimal('1'), 0)])
         self.set_clock(start + 3600)
-        self.replace('deployment_price_at', str(self.now))
+        self.write_price()
         _ = (self.root / 'describe-instances.json').write_text(json.dumps({
             'Reservations': [{'Instances': [{'InstanceId': outputs['InstanceId'], 'LaunchTime': 'old-boot',
                                             'State': {'Name': 'terminated'}}]}]}))
@@ -302,7 +312,7 @@ class DeploymentTests(CostFixture):
             'Reservations': [{'Instances': [{'InstanceId': 'i-new', 'LaunchTime': 'replacement-boot',
                                             'State': {'Name': 'running'}}]}]}))
         self.set_clock(start + 7200)
-        self.replace('deployment_price_at', str(self.now))
+        self.write_price()
         _ = subject.prepare()
         self.assertEqual(ledger.mapping(remote.read_record(self.state / 'deployment.json')['outputs'])['InstanceId'], 'i-new')
         self.assertEqual(book.pending_compute_requests(), ())
@@ -315,7 +325,7 @@ class DeploymentTests(CostFixture):
             _ = self.failing_compute('timeout').apply(approve_resources=True)
         (self.root / 'fake-stack.json').unlink()
         self.set_clock(start + 3600)
-        self.replace('deployment_price_at', str(self.now))
+        self.write_price()
         _ = self.deployment().prepare()
         self.assertEqual(ledger.CostLedger(self.state).pending_compute_requests(), ())
         self.assertEqual(self.instance_intervals(self.now + 3600), [(start, self.now, Decimal('1'), 0)])
@@ -392,6 +402,103 @@ class DeploymentTests(CostFixture):
                 requests = [r for r in costs.intervals if r.source == 'unconfirmed compute request']
                 self.assertEqual([(r.start, r.end, r.usd, r.confirmed_uptime_s) for r in requests],
                                  [(start, midnight, Decimal('6'), 0), (midnight, self.now, Decimal('6.5'), 0)])
+
+    def test_price_command_writes_private_state_for_the_selected_zone_and_profile(self) -> None:
+        path = self.root / '.config/aws-build/deployment-price'
+        self.replace('deployment_price_file', '~/.config/aws-build/deployment-price')
+        settings = self.settings.read_bytes()
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                if existing:
+                    path.chmod(0o644)
+                output = StringIO()
+                before = int(time.time())
+                with (mock.patch.object(sys, 'argv', ['deploy.py', 'price', '--settings', str(self.settings)]),
+                      redirect_stdout(output)):
+                    self.assertEqual(deploy.main(), 0)
+                after = int(time.time())
+                result = ledger.mapping(cast(object, json.loads(output.getvalue())))
+                at = ledger.instant(result, 'deployment_price_at')
+                self.assertGreaterEqual(at, before)
+                self.assertLessEqual(at, after)
+                self.assertEqual(result['deployment_price_usd_per_hour'], '0.1')
+                self.assertEqual(result['file'], str(path))
+                self.assertEqual(aws_config.deployment_price(self.settings, at), (at, Decimal('0.1')))
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(self.settings.read_bytes(), settings)
+        calls = self.commands()
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            args = cast(list[str], call['args'])
+            self.assertEqual(args[args.index('--profile') + 1], 'build-admin')
+            self.assertEqual(args[args.index('--region') + 1], 'us-east-1')
+            self.assertIn('describe-spot-price-history', args)
+            self.assertEqual(args[args.index('--instance-types') + 1], 'm7a.4xlarge')
+            self.assertEqual(args[args.index('--availability-zone') + 1], 'us-east-1a')
+            self.assertEqual(args[args.index('--product-descriptions') + 1], 'Linux/UNIX')
+            self.assertIn('--start-time', args)
+
+    def test_price_command_requires_private_credentials_before_any_aws_read(self) -> None:
+        self.credentials.chmod(0o644)
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'AWS_SHARED_CREDENTIALS_FILE'):
+            _ = self.deployment().price()
+        self.assertEqual(self.commands(), [])
+
+    def test_price_command_preserves_saved_price_after_an_invalid_reply(self) -> None:
+        saved = self.price_file.read_bytes()
+        for prices in ([], [{'SpotPrice': '0'}], [{'SpotPrice': '-1'}], [{'SpotPrice': 'NaN'}]):
+            with self.subTest(prices=prices):
+                _ = (self.root / 'describe-spot-price-history.json').write_text(json.dumps({'SpotPriceHistory': prices}))
+                with self.assertRaises(ValueError):
+                    _ = self.deployment().price()
+                self.assertEqual(self.price_file.read_bytes(), saved)
+
+    def test_prepare_refuses_a_missing_price_file_with_the_refresh_command(self) -> None:
+        self.price_file.unlink()
+        with self.assertRaisesRegex(ValueError, 'deploy.py price') as failure:
+            _ = self.deployment().prepare()
+        self.assertIn('deployment_price_file', str(failure.exception))
+        self.assertIn(str(self.price_file), str(failure.exception))
+        self.assertEqual(self.commands(), [])
+
+    def test_prepare_refuses_price_paths_inside_the_public_repository(self) -> None:
+        tracked_path = Path(__file__).resolve()
+        self.price_file.unlink()
+        self.price_file.symlink_to(tracked_path)
+        for path in (tracked_path, self.price_file):
+            with self.subTest(path=path):
+                self.replace('deployment_price_file', str(path))
+                with self.assertRaisesRegex(ValueError, 'outside the public repository') as failure:
+                    _ = self.deployment().prepare()
+                self.assertIn('deployment_price_file', str(failure.exception))
+                self.assertIn(str(tracked_path), str(failure.exception))
+        self.assertEqual(self.commands(), [])
+
+    def test_prepare_refuses_a_stale_price_file(self) -> None:
+        self.set_clock(self.now + aws_config.read_settings(self.settings).price_max_age_seconds + 1)
+        with self.assertRaisesRegex(ValueError, 'fresh positive public price'):
+            _ = self.deployment().prepare()
+        self.assertEqual(self.commands(), [])
+
+    def test_bootstrap_renders_without_a_price_file(self) -> None:
+        self.price_file.unlink()
+        rendered = self.reviewed_bundle()
+        self.assertIn('aws-build-first-boot-stop', rendered)
+        self.assertIn('/etc/aws-build/remote.conf', rendered)
+        self.assertEqual(self.commands(), [])
+
+    def test_apply_and_setup_start_require_the_saved_price_after_preparation(self) -> None:
+        subject = self.deployment()
+        _ = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        self.price_file.unlink()
+        for action in (subject.apply, subject.setup_start):
+            with self.subTest(action=action.__name__):
+                with self.assertRaisesRegex(ValueError, 'deploy.py price'):
+                    _ = action(approve_resources=True)
+        self.assertEqual(len(self.commands('deploy')), 2)
+        self.assertEqual(self.commands('start-instances'), [])
 
     def test_bootstrap_renders_without_a_notification_address_file(self) -> None:
         self.notification_file.unlink()
@@ -632,10 +739,11 @@ class DeploymentTests(CostFixture):
         self.assertNotIn('AccessKey', json.dumps(template))
         self.assertNotIn('mkfs', json.dumps(template))
 
-    def test_repository_defaults_leave_control_and_exchange_inactive(self) -> None:
+    def test_repository_configuration_enables_approved_aws_control_and_exchange(self) -> None:
         root = Path(__file__).resolve().parents[2]
-        self.assertEqual(conf.read(root / 'config/aws_target.conf').text('offload'), 'off')
-        self.assertNotIn('aws', conf.read(root / 'config/build_targets.conf').text('targets').split(','))
+        self.assertEqual(conf.read(root / 'config/aws_target.conf').text('offload'), 'on')
+        self.assertEqual(conf.read(root / 'config/build_targets.conf').text('targets').split(','),
+                         ['mac', 'natedev', 'aws'])
 
     def refuse_command(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                        timeout: float, check: bool) -> subprocess.CompletedProcess[str]:

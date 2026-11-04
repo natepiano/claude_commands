@@ -909,6 +909,7 @@ def step(args: list[str]) -> None:
             "id": record_id,
             "host": host,
             "target": recorded_target(host),
+            "pinned": bool(os.environ.get("BUILDLOG_PINNED_TARGET")),
             "started_at": started_at,
             "ended_at": ended_at,
             "duration_s": round(end - start, 3),
@@ -1020,6 +1021,7 @@ def call(args: list[str]) -> None:
         "local_reason": os.environ.get("BUILDLOG_LOCAL_REASON", ""),
         "mac_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_S", "")),
         "target": os.environ.get("BUILDLOG_TARGET", ""),
+        "pinned": bool(os.environ.get("BUILDLOG_PINNED_TARGET")),
         "hold_wait_s": optional_nonnegative_number(os.environ.get("BUILDLOG_HOLD_WAIT_S", "")),
         "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
         "copy_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_COPY_S", "")),
@@ -1067,6 +1069,7 @@ def ssh_attempt(attempt: SshAttempt) -> None:
     at = time.time()
     store.append_line(store.host_file(host, at), {
         **attempt, "kind": "ssh_attempt", "v": RECORD_VERSION,
+        "pinned": bool(os.environ.get("BUILDLOG_PINNED_TARGET")),
         "id": f"{host}-{time.time_ns()}-{secrets.token_hex(4)}", "host": host,
         "at": store.utc_iso(at),
     })

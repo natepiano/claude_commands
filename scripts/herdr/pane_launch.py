@@ -15,9 +15,9 @@ from enum import Enum
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
 
-import sessions
+from scripts.message import sessions
 from place import HerdrPlace
-from probe_session import PROBE_ENV
+from scripts.lib.probe_session import PROBE_ENV
 from scripts.lib import atomic_file
 from scripts.production import staff
 
@@ -145,14 +145,12 @@ class StaffLabelsRead(Enum):
 
 
 class RecordedLabels:
-    """One discovery read: each terminal's launch file is opened at most once."""
+    """Resolve process labels from the staff record without pane records."""
 
     def __init__(self, membership: StaffLabels | StaffLabelsRead = StaffLabelsRead.PENDING) -> None:
-        self.entries: dict[str, dict[str, PaneLaunch]] = {}
         self.membership: StaffLabels | StaffLabelsRead = membership
 
-    def resolve(self, pid: int, environment: Mapping[str, str],
-                pane_place: Callable[[], object]) -> dict[str, str]:
+    def resolve(self, pid: int, environment: Mapping[str, str]) -> dict[str, str]:
         # Raw discovery already has these process labels. Ownership projections
         # pass their staff snapshot explicitly and still require native proof.
         if isinstance(self.membership, StaffLabelsRead) and all(environment.get(key) for key in UNIT_MARKS):
@@ -170,19 +168,6 @@ class RecordedLabels:
             except (staff.StaffUnreadable, OSError, ValueError):
                 self.membership = StaffLabelsRead.UNAVAILABLE
         values = dict(environment)
-        place = pane_place()
-        if isinstance(place, HerdrPlace):
-            if place.session not in self.entries:
-                self.entries[place.session] = read(record_directory() / f"{place.session}.json")
-            entries = self.entries[place.session]
-            entry = matching_launch(entries, place, record["sessionId"])
-            if entry is None and not isinstance(self.membership, StaffLabelsRead):
-                owner = self.membership.record.by_current_session(record["sessionId"])
-                if owner is not None:
-                    entry = matching_launch(entries, place, owner.id)
-            if entry is not None:
-                values = {**{key: value for key, value in entry.get("environment", {}).items()
-                             if key in MEMBER_MARKS}, **values}
         if not isinstance(self.membership, StaffLabelsRead):
             values = self.membership.environment(values, record["sessionId"])
         return values
@@ -233,11 +218,6 @@ class UnpublishedResume:
 
 
 UNPUBLISHED_RESUME = UnpublishedResume()
-
-
-@dataclass(frozen=True)
-class NoOriginalLaunch:
-    """The failed start did not replace a retained launch."""
 
 
 @dataclass(frozen=True)
@@ -308,25 +288,25 @@ def retire_launch(path: Path, pane_id: str, original: PaneLaunch, *,
 
 @overload
 def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
-                   outcome: PreparedAccountMove, *, close: Callable[[str], None]) -> LaunchPublication: ...
+                   outcome: PreparedAccountMove, *, close: Callable[[str], bool]) -> LaunchPublication: ...
 
 
 @overload
-def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt: ResumeAttempt,
-                   outcome: VerifiedResume | FailedResume, *, close: Callable[[str], None]) -> None: ...
+def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
+                   outcome: VerifiedResume | FailedResume, *, close: Callable[[str], bool]) -> None: ...
 
 
-def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt: ResumeAttempt,
+def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
                    outcome: VerifiedResume | FailedResume | PreparedAccountMove, *,
-                   close: Callable[[str], None]) -> LaunchPublication | None:
+                   close: Callable[[str], bool]) -> LaunchPublication | None:
     """Keep one proved launch, or retire a failed attempt after confirmed closure.
 
     The close callback must confirm that the selected tab is closed.
     A same-pane resume keeps its pane on success and failure.
     """
-    same_pane = not isinstance(original, NoOriginalLaunch) and original["pane_id"] == attempt.pane_id
+    same_pane = original["pane_id"] == attempt.pane_id
     if isinstance(outcome, PreparedAccountMove):
-        if isinstance(original, NoOriginalLaunch) or not same_pane:
+        if not same_pane:
             raise ValueError("an account move requires its original retained pane")
         with locked(path):
             entries = read_strict(path)
@@ -342,7 +322,8 @@ def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt:
     if isinstance(outcome, FailedResume):
         if same_pane:
             return
-        close(attempt.pane_id)
+        if close(attempt.pane_id) is not True:
+            return
         if not isinstance(attempt.publication, UnpublishedResume):
             retire_launch(path, attempt.pane_id, attempt.publication,
                            replacement=ResumeAttempt(attempt.pane_id, UnpublishedResume()))
@@ -352,22 +333,21 @@ def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt:
             entries = read_strict(path)
             replacement = entries.get(attempt.pane_id)
             if replacement is None:
-                raise ValueError(f"{attempt.pane_id}: replacement launch was not published")
+                raise ValueError(f"{attempt.pane_id}: replacement launch was not published; would delete the only resume record")
             _usable_replacement(path, attempt, replacement, outcome, same_pane=same_pane)
             if same_pane:
                 if replacement.get("ended", False):
                     replacement["ended"] = False
                     save(path, entries)
                 return
-            if isinstance(original, NoOriginalLaunch):
-                raise ValueError("a successful restore requires an original launch")
             if entries.get(original["pane_id"]) != original:
                 raise ValueError(f"{original['pane_id']}: retained launch changed before replacement")
             retained = ResumeAttempt(attempt.pane_id, replacement.copy())
     except (OSError, ValueError):
         finish_restore(path, original, attempt, FailedResume(), close=close)
         raise
-    close(original["pane_id"])
+    if close(original["pane_id"]) is not True:
+        return
     retire_launch(path, original["pane_id"], original, replacement=retained)
 
 

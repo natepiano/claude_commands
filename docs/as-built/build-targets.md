@@ -8,7 +8,7 @@ Each machine that can run a build job is a build target with its own rules. nate
 
 ### Targets: `config/build_targets.conf` and `scripts/build_targets/target_config.py`
 
-- The config is in the `key=value` form `scripts/lib/conf.py` reads. `targets=mac,natedev` lists the targets in the order a job tries them. natedev is `kind.natedev=local`, `platform.natedev=linux`. The Mac is `kind.mac=ssh`, `platform.mac=macos`, `settings.mac=mac_test.conf`; its own settings (host, mirror, size budgets, CI switch, disk floor, `linux_only.<repo>`) stay in `config/mac_test.conf`.
+- The config is in the `key=value` form `scripts/lib/conf.py` reads. `targets=mac,natedev,aws` lists the targets in the order a job tries them. natedev is `kind.natedev=local`, `platform.natedev=linux`. AWS is `kind.aws=ssh`, `platform.aws=linux`, `settings.aws=aws_target.conf`. The Mac is `kind.mac=ssh`, `platform.mac=macos`, `settings.mac=mac_test.conf`; its own settings (host, mirror, size budgets, CI switch, disk floor, `linux_only.<repo>`) stay in `config/mac_test.conf`.
 - `target_config.py` imports only `sweep`. It holds `Platform = Literal["linux", "macos"]`, the frozen dataclasses `LocalTarget(name, platform)` and `SshTarget(name, platform, settings: Path)`, `Target = LocalTarget | SshTarget`, `ConfigError(ValueError)` and `read_targets(path=None) -> tuple[Target, ...]`. Target names must be distinct and non-empty; a missing or unsupported `kind`, `platform` or `settings` key, or a settings file that does not exist, is a `ConfigError` naming the key. `BUILD_TARGETS_CONFIG` replaces the path, for tests.
 - `targets.py` re-exports those names, so callers import them from one place. `build_hold.py` imports `read_targets` from `target_config` directly; going through `targets` would form the import cycle `build_hold` → `targets` → `build_hold`.
 - A new `ssh` target is a new entry plus its own settings file, and it reuses the same runner (probe, copy, run, release). `mac_test.state_paths(target)` gives each target its own claim, block and backoff state: the Mac keeps `~/.local/state/mac-test`, and every other target uses `~/.local/state/build-targets/<target>/`. The AWS target is one such entry; see [builds-aws-target.md](builds-aws-target.md).
@@ -56,7 +56,11 @@ Every command checks holds through `target_state`. The sole holder may run its o
 
 ### Where a job runs: `scripts/direct/verify.sh`
 
-- `check`, `build`, `lint`, `doc`, `example` and `final` run on natedev only. Only `test` routes.
+- `test`, `check`, and staged `doc` can use configured SSH targets. Other steps run on natedev.
+- `verify.sh test PACKAGE --target aws` pins one step to AWS. `check` and `doc` also accept `--target`.
+  A pin keeps admission, spending, and version checks. It takes no natedev grant or cargo token.
+  A refusal ends the step with a nonzero status. The step never returns to natedev.
+  Remote step records include `target=aws`, `host=aws-build`, and `pinned=true`.
 - `route_test` runs after the per-call wait files and cleanup trap exist, and before the per-call `wait-local` and the cargo token. It reads the `eligible` table and records an excluded Mac at once (`BUILDLOG_MAC=declined`, and its reason in `BUILDLOG_MAC_REASON` and `BUILDLOG_LOCAL_REASON` unless `--local` was given), also when `offload.py` is never called. It then visits the eligible targets in config order:
   - natedev: `check_routing_hold` (`register-local`). Exit 0 sends the test to natedev. Exit 10 or 12 goes on to the next target, so a filtered test can still pass on the Mac when natedev's hold state cannot be read.
   - an `ssh` target: `try_mac_test <settings>` runs `offload.py run --settings <path>`. A pass or failure ends the call with the Mac's status. A pass prints `verify.sh: PASS on the Mac (macOS), so nothing ran on natedev.` and records `passed_full` or `passed_filter` with `host=mac`. A temporary decline or a lost run keeps the target on the retry list. Permanent exclusions (`no_tests`, `off`, `repo`, `linux_only`, `local_flag`) stop retries for that target.
@@ -281,13 +285,16 @@ the log does not record that connection. Journal retention also limits the evide
 
 ### Copy records and lifetime
 
-Copies seed their own build folders. The unused per-repository Cargo folder
-helper was removed: the verify-copies measurement (2026-10-30, case D) spent
-68.7 of 69.0 s waiting on that folder's build lock. New copy records do not
-write its path; old records still load and the old field has no effect.
-The `style-sync-target` still outlives its production task and keeps
-`sync.lock` across checkout creation, lint and cleanup. The sweep still reads
-Cargo's general `build.build-dir` templates.
+Standing gate checkouts build cold once and retain their own build folders;
+no target seed is copied. The unused per-repository Cargo folder helper was
+removed: the verify-copies measurement (2026-10-30, case D) spent 68.7 of 69.0 s
+waiting on that folder's build lock. Legacy copy records still load and their
+old shared-folder field has no effect.
+Style lint uses a standing gate checkout with its own real `target/` and holds
+`.claude-busy` through verification and cleanup. The checkout and cache survive
+the run; the floor sweep discovers the configured gates root and may reclaim
+idle marked caches. See `gate-checkouts.md` for configuration and removal.
+The sweep still reads Cargo's general `build.build-dir` templates.
 
 `/tmp/claude/copies` is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 

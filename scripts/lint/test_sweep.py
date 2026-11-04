@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sweep
 import cargo_target_config
+from scripts.lib import file_lock
 import conf
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from memory_test_support import write_config_fixture
@@ -37,21 +38,22 @@ if TYPE_CHECKING:
 else:
     from scripts.lib import test_hang_guard
 if TYPE_CHECKING:
+    from ..copies import copies
+    from ..production.cli_fixture import ImmutableGitSeed
     from ..build_hold import build_hold
     from ..buildlog import record, store
     from ..lib import scratch
-    from ..style import style_sync
     from ..message import process_table, sessions
     from ..notify import review
     from ..notify.push_texts import RenderedPush, catalog, render, render_entry
     from ..notify.user_action import ActionRequired
 else:
+    from scripts.copies import copies
+    from scripts.production.cli_fixture import ImmutableGitSeed
     import build_hold
     import record
     import scratch
     import store
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
-    import style_sync
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import process_table
     import sessions
@@ -1774,61 +1776,83 @@ class FloorTests(SweepCase):
         self.assertTrue(outside_cargo_home.exists(), "Unknown expansion must also keep caches outside Cargo home")
         self.assertEqual(self.trim_rows(), [])
 
-    def test_floor_keeps_a_style_target_only_while_its_sync_lock_is_held(self) -> None:
+    def test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy(self) -> None:
         base = self.base()
-        common = base / "workspace" / ".git"
-        common.mkdir(parents=True)
-        with mock.patch.dict(os.environ, {scratch.HOLDS_ENV: str(base / "holds.json")}):
-            target = style_sync.lint_target(common)
-        output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
-        lock = target / scratch.STYLE_LOCK_NAME
-        driver = """import fcntl, sys
-with open(sys.argv[1], 'a') as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    print('locked', flush=True)
-    sys.stdin.readline()
-"""
-        holder = subprocess.Popen(
-            [sys.executable, "-c", driver, str(lock)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
-            assert holder.stdout is not None
-            self.assertEqual(cast(str, holder.stdout.readline()).strip(), "locked")
-            with (mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
-                  mock.patch.object(sweep, "lock_holder", return_value=holder.pid),
-                  mock.patch.object(sweep, "send_floor_alert", return_value=True),
-                  mock.patch.object(sweep, "send_holder_message", return_value=False)):
-                status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB - 1])
-            self.assertEqual(status, 0, text)
-            self.assertTrue(output.exists(), "The floor removed a style target between Cargo commands")
-            self.assertEqual(self.trim_rows(), [])
-        finally:
-            _, errors = holder.communicate("release\n", timeout=10)
-            self.assertEqual(holder.returncode, 0, errors)
-        self.assertTrue(lock.is_file())
-        with mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()):
-            status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+        seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
+                                       {"source.txt": "style source\n"})
+        with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
+            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+                target = checkout / "target"
+                output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
+                with (mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
+                      mock.patch.object(sweep, "lock_holder", return_value=os.getpid()),
+                      mock.patch.object(sweep, "send_floor_alert", return_value=True),
+                      mock.patch.object(sweep, "send_holder_message", return_value=False)):
+                    status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB - 1])
+                self.assertEqual(status, 0, text)
+                self.assertTrue(output.exists(), "The floor removed a standing target between Cargo commands")
+                self.assertEqual(self.trim_rows(), [])
+            self.assertTrue((checkout / scratch.BUSY).is_file())
+            with mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()):
+                status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
         self.assertEqual(status, 0, text)
-        self.assertFalse(output.exists(), "An unlocked sync.lock must permit reclaim")
+        self.assertFalse(output.exists(), "An idle standing checkout must permit target reclaim")
         row, = self.trim_rows()
         self.assertEqual((row["folder"], row["cause"]), (str(target), "floor take"))
 
-    def test_floor_finds_and_reclaims_an_idle_retained_style_target(self) -> None:
+    def test_floor_finds_and_reclaims_an_idle_retained_standing_target(self) -> None:
         base = self.base()
-        common = base / "workspace" / ".git"
-        common.mkdir(parents=True)
-        with mock.patch.dict(os.environ, {scratch.HOLDS_ENV: str(base / "holds.json")}):
-            target = style_sync.lint_target(common)
-        output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
-        # Cargo may omit rustc-info when its caller made the target directory.
-        self.assertFalse((target / sweep.RUSTC_INFO).exists())
-        self.assertEqual(sweep.target_dirs([str(base)]), [str(target)])
-        with mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()):
-            status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+        seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
+                                       {"source.txt": "style source\n"})
+        with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
+            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+                target = checkout / "target"
+            output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
+            # Cargo may omit rustc-info when its caller made the target directory.
+            self.assertFalse((target / sweep.RUSTC_INFO).exists())
+            self.assertEqual(sweep.target_dirs([str(base)]), [str(target)])
+            with mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()):
+                status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
         self.assertEqual(status, 0, text)
         self.assertFalse(output.exists())
         row, = self.trim_rows()
         self.assertEqual((row["folder"], row["extent"], row["cause"]), (str(target), "whole", "floor take"))
+
+    def test_default_floor_discovers_configured_standing_targets_and_respects_busy_use(self) -> None:
+        base = self.base()
+        pool = base / "configured-pool"
+        config = base / "copies.conf"
+        configured = (Path(__file__).resolve().parents[2] / "config/copies.conf").read_text()
+        _ = config.write_text("\n".join(f"root={pool}" if line.startswith("root=") else line
+                                           for line in configured.splitlines()))
+        seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
+                                       {"source.txt": "standing source\n"})
+        discover = sweep.target_dirs
+
+        def configured_targets(roots: Sequence[str]) -> list[str]:
+            # Avoid scanning the host's other roots; retain real cache discovery
+            # only if the production default roots include the configured pool.
+            return discover([str(pool)] if str(pool) in roots else [])
+
+        with (mock.patch.dict(os.environ, {"COPIES_CONFIG": str(config), "HOME": str(base),
+                                          scratch.HOLDS_ENV: str(base / "holds.json")}),
+              mock.patch.object(sweep, "target_dirs", side_effect=configured_targets),
+              mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True),
+              mock.patch.object(sweep, "send_holder_message", return_value=False),
+              redirect_stdout(io.StringIO())):
+            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+                target = checkout / "target"
+                output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
+                with mock.patch.object(sweep, "free_bytes", return_value=0):
+                    self.assertEqual(sweep.hold_floor(GIB, False, lock=str(base / "floor.lock")), 0)
+                self.assertTrue(output.exists(), "A busy configured standing target must survive")
+                self.assertEqual(self.trim_rows(), [])
+            with mock.patch.object(sweep, "free_bytes", side_effect=[0, 0, GIB]):
+                self.assertEqual(sweep.hold_floor(GIB, False, lock=str(base / "floor.lock")), 0)
+        self.assertFalse(output.exists(), "The default floor must reclaim an idle configured standing target")
+        row, = self.trim_rows()
+        self.assertEqual(row["folder"], str(target))
 
     def test_partial_unlink_failure_still_records_successfully_freed_bytes(self) -> None:
         for caller in ("budget", "floor"):
@@ -4105,9 +4129,9 @@ class LockHolderTests(unittest.TestCase):
         def never_held(*_args: object, **_kwargs: object) -> io.StringIO:
             return io.StringIO(other)
 
-        with mock.patch.object(sweep, "open", create=True, side_effect=skip_once):
+        with mock.patch.object(file_lock, "open", create=True, side_effect=skip_once):
             self.assertEqual(sweep.lock_holder(str(lock), "locks"), 4242)
-        with mock.patch.object(sweep, "open", create=True, side_effect=never_held) as opened:
+        with mock.patch.object(file_lock, "open", create=True, side_effect=never_held) as opened:
             self.assertIsNone(sweep.lock_holder(str(lock), "locks"))
         self.assertEqual(opened.call_count, sweep.PROC_LOCKS_READS)
 

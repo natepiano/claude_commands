@@ -206,7 +206,7 @@ def _fix(session_id: str, pid: int, proc_start: str, clock: Clock) -> RemoteCont
                     if clock.monotonic() >= deadline:
                         return failed("Remote Control did not become active before the deadline")
                     try:
-                        session_pane.type_place(place, "/remote-control")
+                        session_pane.type_place(place, "/remote-control", target=session_id)
                     except AgentBlocked:
                         pass
                     except (OSError, session_pane.HerdrFailure) as error:

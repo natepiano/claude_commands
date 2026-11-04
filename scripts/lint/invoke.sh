@@ -447,8 +447,13 @@ sweep_after_step() {
             --parent "$parent" --name "$name" >/dev/null || return 0
     fi
     printf '%s\n' "$now" > "$stamp" || return 0
-    # Detached work and its descendants do not own verify.sh's foreground step.
-    ( trap '' HUP; TOKEN_HELD=0; invoke_sweep </dev/null >/dev/null 2>&1 & )
+    # Cargo locks protect the sweep. It must not take the board token.
+    (
+        trap '' HUP
+        TOKEN_HELD=0
+        run() { run_once "$@"; }
+        invoke_sweep </dev/null >/dev/null 2>&1 &
+    )
 }
 
 have_nextest() {

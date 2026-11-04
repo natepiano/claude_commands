@@ -25,7 +25,7 @@ from scripts.production import showrunners
 from scripts.herdr import herdr
 from scripts.message import sessions
 from scripts.herdr.fake_herdr import CommandResponse
-from scripts.production.fake_unit_host import confirm_tab_close, native_claude
+from scripts.production.fake_unit_host import private_process_registry, confirm_tab_close, native_claude, process as write_process
 
 SCRIPT = Path(__file__).with_name("add_showrunner.py")
 SHARED = herdr.SHARED_SESSION
@@ -113,6 +113,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         self.herdr_overrides = {}
         self.processes = []
         self.addCleanup(self.close_processes)
+        _ = self.enterContext(private_process_registry())
         self.live(PARENT_SESSION, "top")
 
     def build_fixture(self) -> None:
@@ -134,11 +135,29 @@ class AddShowrunnerFixture(unittest.TestCase):
             'responses.get(" ".join(argv[2:4]), responses.get("default", {"stdout": "", "code": 0}))')
         source = source.replace('raise SystemExit(main(sys.argv[1:]))', 'raise SystemExit(submitting_main(sys.argv[1:]))')
         hook = r'''def submitting_main(argv):
+    if argv[2:4] == ["pane", "process-info"]:
+        pid = int(os.environ["FAKE_CLAUDE_PID"])
+        live = (Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json").exists()
+        foreground = pid if live else 998040
+        command = "claude" if live else "zsh"
+        path = Path(os.environ["FAKE_HERDR_RESPONSES"])
+        responses = json.loads(path.read_text())
+        responses[" ".join(argv)] = {"code": 0, "stdout": json.dumps({"result": {"process_info": {
+            "shell_pid": 998040, "foreground_process_group_id": foreground,
+            "foreground_processes": [{"pid": foreground, "name": command, "argv": [command]}]}}})}
+        path.write_text(json.dumps(responses))
     result = main(argv)
     if result == 0 and argv[2:4] == ["agent", "start"]:
         sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
         from scripts.production.staff_test_support import record_fixture_claude_start
-        record_fixture_claude_start(argv)
+        from scripts.production.fake_unit_host import private_process_registry, process
+        from scripts.message import sessions
+        pid = int(os.environ["FAKE_CLAUDE_PID"])
+        process(os.environ, pid, 998040, ["claude"],
+                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": argv[argv.index("--pane") + 1]},
+                started=sessions.process_start(pid) or "1")
+        with private_process_registry():
+            record_fixture_claude_start(argv)
     if result == 0 and argv[2:4] == ["agent", "prompt"]:
         from datetime import datetime, timezone
         calls = [json.loads(line) for line in Path(os.environ["FAKE_HERDR_LOG"]).read_text().splitlines()]
@@ -241,7 +260,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
                                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.processes.append(process)
-        native_claude(self.env, process.pid)
+        native_claude(self.env, process.pid, kernel_process=True)
         return (str(self.root / "sessions" / f"{process.pid}.json"),
                 json.dumps({"pid": process.pid, "procStart": sessions.process_start(process.pid),
                             "name": name or f"{session}-name", "sessionId": session, "updatedAt": 1,
@@ -334,7 +353,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         """Fake herdr answers a launch of `slug`'s showrunner as a tab of the shared session, which has
         a boot unit; the agent prompt brings the session up. While the shared session is live, it holds
         a tab named `slug`."""
-        _ = self.env.setdefault("FAKE_CLAUDE_PID", str(os.getpid()))
+        _ = self.env.setdefault("FAKE_CLAUDE_PID", "998041")
         native_claude(self.env, int(self.env["FAKE_CLAUDE_PID"]))
         _ = self.env.setdefault("FAKE_CLAUDE_SESSION_ID", fixture_runtime_id("showrunner::" + slug))
         self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
@@ -354,9 +373,7 @@ class AddShowrunnerFixture(unittest.TestCase):
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {
                 "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
-        responses[f"--session {SHARED} pane process-info --pane w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
-            "result": {"process_info": {"foreground_processes": [
-                {"pid": int(self.env["FAKE_CLAUDE_PID"]), "name": "claude", "argv": ["claude"]}]}}}))
+        write_process(self.env, 998040, 1, ["zsh"], {"HERDR_SESSION": SHARED, "HERDR_PANE_ID": "w1:p1"})
         responses[f"--session {SHARED} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
             "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
         responses[f"--session {SHARED} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
@@ -413,7 +430,7 @@ class AddShowrunnerFixture(unittest.TestCase):
 
     def resume_record(self) -> None:
         _ = (self.root / "sessions/resume.json").write_text(json.dumps({
-            "pid": 991001,
+            "pid": 991001, "procStart": "1",
             "sessionId": "cfc4564d-fed3-5803-9a4c-e3119733bb53",
             "name": "kid",
             "messagingSocketPath": "",

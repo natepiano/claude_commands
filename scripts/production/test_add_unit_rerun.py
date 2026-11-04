@@ -174,7 +174,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             assert row is not None
             self.assertEqual((row.name, row.worktree), ("alpha", staff.PresentWorktree("natedev", path.parent)))
             submitted.append(row.id)
-            client.prompt(pane, opening.text)
+            client.prompt(pane, opening.text, target=opening.transcript.session_id)
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
 
         with patch.object(herdr.Herdr, "submit_opening_prompt", submit):

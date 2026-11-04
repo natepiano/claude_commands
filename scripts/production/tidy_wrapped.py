@@ -18,6 +18,9 @@ from typing import TYPE_CHECKING
 
 import production_units
 from scripts.production import staff
+from scripts.copies import copies
+from scripts.lib import scratch
+from scripts.production.unit_table import unit_spellings
 from proposals_folder import issues_folder
 
 if TYPE_CHECKING:
@@ -67,6 +70,15 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
                 close_questions(document, identities)
         except staff.StaffRefused as error:
             raise TidyRefused(str(error)) from error
+    owners = {slug}
+    if document is not None:
+        lines = document.read_text(encoding="utf-8").splitlines()
+        owners.update(unit_spellings(lines).values())
+    try:
+        for owner in sorted(owners):
+            copies.remove_trees(owner)
+    except (copies.CopyError, OSError, scratch.ScratchError) as error:
+        raise TidyRefused(str(error)) from error
     removed: list[Path] = []
     for path in paths:
         if path.is_dir() and not path.is_symlink():

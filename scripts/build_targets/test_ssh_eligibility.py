@@ -143,6 +143,39 @@ class SshEligibilityTests(unittest.TestCase):
         args.recover_only = recover_only
         return build_targets.command_reserve(args)
 
+    def test_pinned_stopped_aws_defers_reachability_until_the_controller_starts_it(self) -> None:
+        paths = mac_test.state_paths("aws")
+        paths.directory.mkdir(parents=True, exist_ok=True)
+        _ = (paths.directory / "controller.json").write_text('{"state":"stopped"}')
+        args = build_targets.CliArguments()
+        args.target, args.kind, args.repo_root, args.package = "aws", "test", str(self.root), "linux-part"
+        output = io.StringIO()
+        self.reachable = False
+        with redirect_stdout(output):
+            self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 0)
+        self.assertIn("aws\texcluded\tstarting\t", output.getvalue())
+        self.assertEqual(self.commands, [])
+        _ = (paths.directory / "controller.json").write_text('{"state":"running"}')
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 2)
+        self.assertTrue(self.commands)
+
+    def test_pinned_stopped_aws_still_refuses_a_spending_limit(self) -> None:
+        paths = mac_test.state_paths("aws")
+        paths.directory.mkdir(parents=True, exist_ok=True)
+        _ = (paths.directory / "controller.json").write_text('{"state":"stopped"}')
+        numeric_settings(self.root / "aws_target.conf", {"monthly_limit_usd": "0.001"})
+        book = ledger.CostLedger(paths.directory)
+        book.record_inventory(ledger.ResourceInventory(self.now - 86400,
+            (ledger.PricedResource("retained-storage", Decimal("1")),), "fixture inventory"))
+        args = build_targets.CliArguments()
+        args.target, args.kind, args.repo_root, args.package = "aws", "test", str(self.root), "linux-part"
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 2)
+        self.assertIn("spending", errors.getvalue())
+        self.assertEqual(self.commands, [])
+
     def test_a_mac_block_stops_a_memory_wait_from_reusing_its_reservation(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
         self.assertEqual(self.reserve("mac"), 0)

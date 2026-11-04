@@ -21,7 +21,8 @@ from unittest.mock import Mock, call, patch
 
 from scripts.accounts import accounts
 from scripts.whoami import account
-from scripts.shutdown import stop_resume
+from scripts.shutdown import restart, stop_resume
+from scripts.shutdown.stop_results import ClaudeStartState
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
 from scripts.shutdown.inventory import PausedSeat
@@ -40,6 +41,32 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_resume_without_a_pane_record_starts_the_staff_row(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-row"), "unit", "alpha", None,
+                             current_session=staff.StaffId(identity))
+        record = staff.StaffSnapshot((row,))
+        pane_record.save("agents", {})
+        for target in (None, "claude4"):
+            for panes in (self.client.rows, []):
+                with (self.subTest(target=target, panes=bool(panes)),
+                      patch.object(staff, "initial_snapshot", return_value=record),
+                      patch.object(self.client, "rows", panes),
+                      patch.object(restart, "start_row", return_value="w1:p2") as start,
+                      patch.object(stop_resume, "_running_on_account", side_effect=[
+                          sessions.SessionNotLive(), stop_resume.ClaudeUp(identity, "w1:p2", target or "claude3")])):
+                    result = stop_resume.resume(str(row.id), to=target)
+                self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", target or "claude3"))
+                assert isinstance(result, stop_resume.ClaudeUp)
+                self.assertEqual(result.start_state, ClaudeStartState.STARTED)
+                start.assert_called_once_with(row, record, self.client, target_account=target or "")
+
+    def test_resume_without_a_staff_row_or_pane_record_finds_no_session(self) -> None:
+        identity = self.entry["session_id"]
+        pane_record.save("agents", {})
+        result = stop_resume._resume_once(identity, why="test", names=LaunchNames(staff.StaffSnapshot(())))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(result, stop_resume.SessionNotFound(identity))
+
     def test_admitted_pane_run_with_no_start_fails_after_one_attempt(self) -> None:
         with patch.object(self.client, "run", self.start):
             result = stop_resume.resume("alpha", why="maintenance")
@@ -338,6 +365,8 @@ class StopResumeTests(unittest.TestCase):
         cast(Mock, cast(Mock, self.wait.return_value).wait).side_effect = self.advance
         _ = self.enterContext(patch.object(self.client, "run", self.pane_run))
         _ = self.enterContext(patch.object(self.client, "result", self.pane_result))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})))
+        _ = self.enterContext(self.client.empty_shell(998042, self.root))
         _ = self.enterContext(patch.object(stop_resume, "monotonic", lambda: self.clock.elapsed))
         _ = self.enterContext(patch.object(time, "sleep", self.advance))
         _ = self.enterContext(patch("unit_runs.held", return_value=[]))
@@ -872,6 +901,20 @@ class StopResumeTests(unittest.TestCase):
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         self.assertEqual(stop_resume.stop("019b3a40-4250-7000-8000-000000000102"), stop_resume.Stopped("019b3a40-4250-7000-8000-000000000102", 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
+
+    def test_stop_proves_the_staff_current_codex_process_without_a_claude_registry(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", None,
+                             current_session=staff.StaffId(identity))
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))),
+              patch.object(self.client, "codex_launch", return_value={**self.entry, "pid": 123}),
+              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  identity, "generation-1", {})) as native):
+            self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
+        self.kill.assert_called_once_with(123, signal.SIGTERM)
+        self.assertTrue(all(item == call(123, "codex") for item in native.call_args_list))
 
     def test_registry_removal_does_not_resume_until_the_saved_process_exits(self) -> None:
         self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),

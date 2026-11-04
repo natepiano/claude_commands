@@ -170,13 +170,6 @@ class ProducerFixture(unittest.TestCase):
         _ = self.git("merge", "--no-ff", name, "-m", f"Merge {name}")
         return self.git("rev-parse", "HEAD")
 
-    def old_row(self, merge: str, change: str = "A visible change", *, reviewed: bool = False) -> None:
-        _ = change_review.append_rows(self.listing, [change_review.Visible(change, "Read", "Proof")],
-                                     date(2026, 11, 2), merge, self.doc)
-        if reviewed:
-            _ = change_review.record_verdict(self.listing, "C1", "not works", date(2026, 11, 2), self.doc)
-
-
 class ProducerWriterTests(ProducerFixture):
     def colliding_units(self) -> staff.StaffRow:
         runner = staff.snapshot().by_path("top")

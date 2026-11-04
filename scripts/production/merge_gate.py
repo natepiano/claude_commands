@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.copies import copies
 from scripts.lib import build_folders
 from scripts.production import change_review  # noqa: E402
 from scripts.production.affected_modules import (  # noqa: E402
@@ -1388,8 +1389,16 @@ def merge_checkpoint(args: GateArguments) -> int:
         if merged != baseline:
             write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
                               RecordedPush(baseline, merged, checkpoint))
-        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
-                            source="checkpoint", full=args.full)
+        previous_unit = os.environ.get(memory_admit.BUILDLOG_UNIT)
+        os.environ[memory_admit.BUILDLOG_UNIT] = args.unit
+        try:
+            suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
+                                source="checkpoint", full=args.full)
+        finally:
+            if previous_unit is None:
+                _ = os.environ.pop(memory_admit.BUILDLOG_UNIT, None)
+            else:
+                os.environ[memory_admit.BUILDLOG_UNIT] = previous_unit
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         fetch_branches(repo, "main")
@@ -1452,34 +1461,37 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
         print(f"Change review drift: {line}", file=sys.stderr, flush=True)
 
 
-def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> None:
+def nightly_owner(args: GateArguments) -> str:
     from scripts.production import showrunners
     from scripts.production.production_units import Refusal, production_field
 
     try:
-        try:
-            doc = change_review.production_doc(args.production)
-        except change_review.ChangeReviewError:
-            # A user timer has no calling Claude session. Its merge branch
-            # identifies a registered production without assuming slug == branch.
-            matching: list[Path] = []
-            for candidate in showrunners.timer_docs().values():
-                try:
-                    branch = production_field(candidate.read_text().splitlines(), "Merge branch")
-                except Refusal:
-                    continue
-                if branch == args.merge_branch:
-                    matching.append(candidate)
-            if len(matching) != 1:
-                raise ValueError(f"cannot identify one production for {args.merge_branch}; pass --production <doc>")
-            doc = matching[0]
-        slug = showrunners.production_slug(str(doc))
-        outcome = showrunners.tell(slug, f"merge-gate-nightly:{tree}",
+        doc = change_review.production_doc(args.production)
+    except change_review.ChangeReviewError:
+        matching: list[Path] = []
+        for candidate in showrunners.timer_docs().values():
+            try:
+                branch = production_field(candidate.read_text().splitlines(), "Merge branch")
+            except Refusal:
+                continue
+            if branch == args.merge_branch:
+                matching.append(candidate)
+        if len(matching) != 1:
+            return copies.fallback_owner("nightly")
+        doc = matching[0]
+    return showrunners.production_slug(str(doc))
+
+
+def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> None:
+    from scripts.production import showrunners
+
+    try:
+        outcome = showrunners.tell(nightly_owner(args), f"merge-gate-nightly:{tree}",
                                    f"Nightly merge gate is red: {args.merge_branch} tree {tree}. "
                                    + f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
                                    + "Every gate now requires the full suite until a full run passes.")
         print(f"Nightly notice: {outcome}", flush=True)
-    except (change_review.ChangeReviewError, OSError, ValueError) as error:
+    except (GateRefused, change_review.ChangeReviewError, OSError, ValueError) as error:
         print(f"Nightly notice could not be sent: {error}; full-required marker kept", flush=True)
 
 
@@ -1499,10 +1511,7 @@ def nightly(args: GateArguments) -> int:
     _ = nightly_git(repo, "fetch", "origin",
                     f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
     commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["merge-gate-nightly"])) as temporary:
-        clone = temporary / "checkout"
-        _ = nightly_git(repo, "clone", "--shared", "--no-checkout", "--", str(repo), str(clone))
-        _ = nightly_git(clone, "checkout", "--detach", commit)
+    with copies.standing(nightly_owner(args), repo, commit) as clone:
         tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
         try:
             run = run_suites(clone, args.memory_cap_mib, args.type_dirs,
@@ -1577,7 +1586,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 promote(args)
                 return 0
             return merge_checkpoint(args)
-    except (GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+    except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
 
