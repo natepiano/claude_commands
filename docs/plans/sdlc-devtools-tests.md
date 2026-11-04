@@ -696,34 +696,18 @@ No production doc has a Units table, and no tool writes one. `retire_unit.py` lo
 
 **Binds later work:** the plan's one home is `.unit.toml`; staff holds no plan or port.
 
-### Phase 4x — Checkpoints merge into the unit's staff parent  · status: todo
+### Phase 4x — Checkpoints merge into the unit's staff parent  · status: done
 
-**Depends on:** Phase 4s
+#### As-built
 
-Source: sdlc showrunner ask, 2026-11-03 04:5x; design accepted 05:0x; second worker pair authorized by the user via sdlc 07:1x ("fix these things in parallel"). Phase 4v is done.
-
-#### Work Order
-
-Rewritten 2026-11-04 to current main (112db35c8). The 11-03 merge of old main and the Units-row items are gone: Phase 4u deleted the Units tables. Earlier partial work is in the run scratchpad as `lane2_4x_work.patch`, for reference only. Runs in `/home/natepiano/worktrees/devtools-lane2` on branch `sdlc-devtools-parent`, off main.
-
-**Goal:** `merge_checkpoint.py` merges a checkpoint into the production that the unit's staff row names as its parent.
-
-**Spec:**
-1. `merge_checkpoint.py` reads the staff record once per run and passes that snapshot to parent selection, folder lookup, reporting and `change_review.publication_changes`. An unreadable record keeps its stop text and pushes nothing.
-2. `merge_checkpoint.py` takes the production from the unit's staff parent. When the named production differs from the parent, it refuses before any merge and names the parent. A rerun after a refusal changes nothing.
-3. Delete the basedpyright status-3 acceptance in `merge_checkpoint.test_passed` and its docstring text. Change the tests that assert status 3 is green, and `docs/as-built/showrunner-automation.md`.
-4. Delete more than you add. Add no guards.
+`merge_checkpoint.request_from` reads the staff record once. `MergeRequest.staff_record` carries that snapshot to unit lookup, `record_publication_changes`, `change_review.publication_changes` and `change_review.foreign_units`. A unit whose staff parent is not the named production's owner refuses before any merge with `unit <name>: staff parent is <parent>; use that production`; a rerun changes nothing. `change_review` finds child productions through `showrunner_tree.descendants_of` with the same snapshot. `test_passed` accepts only status zero; the basedpyright status-3 acceptance is gone. Checkpoint f48d505ae on `sdlc-devtools-parent`.
 
 **Files:**
-- `scripts/production/merge_checkpoint.py` — one staff snapshot; staff-parent routing; status-0 judge.
-- `scripts/production/change_review.py` — takes the snapshot.
-- `scripts/production/test_merge_checkpoint.py`, `scripts/production/test_merge_checkpoint_rerun.py`, `scripts/production/merge_checkpoint_test_support.py` — staff rows and the parent refusal test.
-- `docs/as-built/showrunner-automation.md` — the basedpyright judge text.
+- `scripts/production/{merge_checkpoint,change_review}.py` — one snapshot, the parent refusal, the status-zero judge.
+- `scripts/production/{test_merge_checkpoint,test_merge_checkpoint_rerun,test_change_review,merge_checkpoint_test_support}.py` — the refusal, one-snapshot and status tests.
+- `docs/as-built/showrunner-automation.md` — the judge text.
 
-**Workers:** `1 writer`
-- `impl` — all files.
-
-**Acceptance gate:** a checkpoint for a unit whose named production differs from its staff parent refuses before any merge and names the parent; a matching one merges (named tests in `test_merge_checkpoint.py`). `test_merge_checkpoint`, `test_merge_checkpoint_rerun` and `test_change_review` pass. basedpyright `0 errors, 0 warnings, 0 notes`. One director gate (`merge_gate.py --tests-only`).
+**Binds later work:** a Merge tests command must exit 0; a basedpyright line that exits 3 is red.
 
 ### Phase 4q — The folder move uses its owners' readers  · status: done
 
@@ -822,6 +806,33 @@ The plan has one home, `.unit.toml`; staff holds no plan. `unit_config.set_plan`
 - `commands/showrunner/produce.md` — the rule, its one source.
 
 **Binds later work:** messaging-unit's `send.py` sender check changes the rule's last point in its own commit.
+
+### Phase 7n — The proposals table widths live in config  · status: todo
+
+Source: sdlc 2026-11-03 (natedev-efficiency found it; morty #16 asked again 2026-11-04). The user rule: tunables live in config, read at use.
+
+**Depends on:** nothing.
+
+#### Work Order
+
+**Goal:** `proposals_table.py` reads its title and state cell widths from config, with the same values as now (110 and 140).
+
+**Spec:**
+1. Add `config/proposals_table.conf` with `title_width = 110` and `state_width = 140`, in the format the other `config/*.conf` files use.
+2. Delete the `TITLE_WIDTH` and `STATE_WIDTH` constants (`proposals_table.py:68-69`). Read each value with `conf.read("proposals_table")` at the place that uses it.
+3. Change no other behavior and add no fallback value: a missing key is the error `conf.py` already gives.
+
+**Files:**
+- `scripts/production/proposals_table.py` — the two reads.
+- `config/proposals_table.conf` — new.
+- `scripts/production/test_proposals_table.py` — one test that a changed config width changes where a cell is cut.
+
+**Workers:** `1 writer`.
+- `impl` — all three files.
+
+**State:** none.
+
+**Acceptance gate:** `basedpyright scripts/production/proposals_table.py scripts/production/test_proposals_table.py` gives `0 errors, 0 warnings, 0 notes`. `python3 -m unittest scripts/production/test_proposals_table.py` passes. The full merge gate passes, except reds that main also has.
 
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
