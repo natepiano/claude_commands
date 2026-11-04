@@ -85,8 +85,8 @@ config = offload.read_config(Path(args.settings))
 controller = offload.ProcessController()
 root = Path(os.environ["TEST_RUNNER_STATE"])
 mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
-if mode == "disk-once":
-    mode = "passed" if (root / "ssh-events.jsonl").exists() else "disk"
+if mode in ("disk-once", "lost-once"):
+    mode = "passed" if (root / "ssh-events.jsonl").exists() else mode.removesuffix("-once")
 actions = []
 initial = mac_test.read_claims(mac_test.state_paths(request.target))
 before = {claim.path: claim.record for claim in initial}
@@ -348,6 +348,12 @@ class VerifySshTargetsTests(VerifyMacOffloadFixture):
                 self.assertEqual(self.attempts()[-1]["reason"], reason)
 
     def test_pinned_wait_keeps_its_live_record_until_aws_becomes_available(self) -> None:
+        self.assert_pinned_wait_keeps_its_live_record("test")
+
+    def test_pinned_check_waits_until_aws_becomes_available(self) -> None:
+        self.assert_pinned_wait_keeps_its_live_record("check")
+
+    def assert_pinned_wait_keeps_its_live_record(self, kind: str) -> None:
         self.configure("natedev,aws")
         control = self.home / ".local/state/build-targets/aws/controller.json"
         _ = control.write_text('{"state":"stopped"}')
@@ -361,7 +367,7 @@ row = json.loads(records[0].read_text())
 Path(os.environ["TEST_RUNNER_STATE"], "waiting-step.json").write_text(json.dumps(row))
 Path(os.environ["HOME"], ".local/state/build-targets/aws/controller.json").write_text('{"state":"running"}')
 ''')
-        result = self.verify("test", "sample", "--target", "aws")
+        result = self.verify(kind, "sample", "--target", "aws")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = cast(dict[str, object], json.loads((self.runner_state / "waiting-step.json").read_text()))
         self.assertEqual((row["pinned_target"], row["state"]), ("aws", "waiting_ssh"))
@@ -678,7 +684,7 @@ steps_path.write_text(json.dumps(steps))
         self.enable_mac()
         _ = self.control_routing_clock()
         self.release_memory_after_polls(advance_clock=True)
-        result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"mac":"disk-once"}'})
+        result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"mac":"lost-once"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         first, second = self.ssh_events()
         self.assertEqual((first["clock"], second["clock"]), ("100", "281"))
