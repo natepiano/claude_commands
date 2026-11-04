@@ -192,7 +192,7 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - In a worktree, `./scripts/buildlog/buildlog` execs the live `~/.claude` CLI; render the worktree's report with `python3 scripts/buildlog/cli.py report <day>`.
 - `test_report.py` has no `sys.path` setup and runs only under `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
 - `disk.py` puts `scripts/lint` at the front of `sys.path` to import `sweep`; basedpyright finds it through `extraPaths`.
-- `basedpyright scripts/buildlog` exits 3 in every checkout because `pyrightconfig.json` names a `.venv` that is absent; the gate is its `0 errors, 0 warnings` line, not its exit code.
+- `basedpyright scripts/buildlog` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 

@@ -511,7 +511,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 - **Live scripts.** Units run `~/.claude/scripts/direct/board.sh` and `verify.sh` while they change, and bash reads a script as it runs: replace either by writing a temp file beside it, setting its mode, and `mv`ing it over.
 - **A target with neither marker.** A folder made before a build that runs with `CARGO_CACHE_RUSTC_INFO=0` has no `.rustc_info.json` and no `CACHEDIR.TAG`; the floor and the disk measurement do not see it. Nothing on natedev sets that variable.
 - **Cargo's tag is not only on targets.** `~/.cargo/registry` and `~/.cargo/git` carry the same `CACHEDIR.TAG` text, and other tools write the file with their own text; the tag counts only with cargo's line and a build tree beside it.
-- **basedpyright** exits 3 in every checkout (`pyrightconfig.json` names an absent `.venv`); 0 errors and 0 warnings in its output is the gate.
+- **basedpyright** exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 

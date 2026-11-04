@@ -7,7 +7,7 @@ The staff row owns the current unit folder. Other records must use the staff ide
 | Staff location | `staff.json`: `rows[].worktree.path` | `production/staff.py:set_worktree` | `session_staff.RowResolver`, `unit_lookup`, all unit location readers |
 | Pane launch | `herdr-panes/*.json`: `cwd` | `herdr/pane_launch.py:launch`, `shutdown/pane_record.py:write` | `pane_restore`, `stop_resume`, `staff_sources`, `unit_watchdog`, `session_staff` |
 | Shutdown session and workers | shutdown records: `session.cwd`, `workers[].cwd`, `checkout.path` | `shutdown/inventory.py:_session_details`, `shutdown_record.py:create_session`, `update_session` | `restart`, `restart_support`, `unit_watchdog`, `rename_unit`, `unit_move` |
-| Paused Codex seats | Legacy `codex_seats[].launcher_command` | Removed from `shutdown/inventory.py` and `shutdown_record.py` | Resume builds a command with the runtime staff folder |
+| Paused Codex seats | `codex_seats[].launcher_command` | Kept in `shutdown/inventory.py` and `shutdown_record.py` as task state (task options, review lens) | Resume replaces its first 3 arguments with the run folder, the staff folder and the resume prompt |
 | Mesh roster | `mesh_roster.json`: legacy `cwd` | `agents/codex_mesh.py`, `astra/design_roles.py`, `direct/workers.py` relocation | `direct/workers.py`, `unit_move`, `rename_unit`, `staff_sources` |
 | Worker ledger | unit worker ledger: legacy worker `cwd` | `direct/workers.py` publication and relocation | `direct/workers.py`, `unit_move`, `rename_unit` |
 | Worker review context | worker review identity: `working_dir` | `direct/workers.py:_reviewer_destination` | worker naming and assignment |

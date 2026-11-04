@@ -65,7 +65,7 @@ if name == "basedpyright":
         print("1 error, 0 warnings, 0 notes")
         raise SystemExit(1)
     print("0 errors, 0 warnings, 0 notes")
-    raise SystemExit(3)
+    raise SystemExit(0)
 if name == "uv":
     if (state / "uv-fails").exists():
         print("fixture: no network", file=sys.stderr)
