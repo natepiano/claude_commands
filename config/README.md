@@ -282,7 +282,12 @@ Positive numeric settings use the readable lower bound `# range: 0.001..`.
 Zero-permitted settings retain `# range: 0..`. Whole-number settings retain their existing limits.
 
 Deployment settings require the account inputs before preparation.
-`deployment_profile` names the administrator profile. `credentials_profile` names the scaler profile.
+`deployment_profile` names the legacy administrator section for migration.
+`credentials_profile` names the unattended scaler profile.
+`admin_secret_file=~/.config/aws-build/admin.gpg` holds symmetric AES256 encrypted administrator credentials.
+Run `deploy.py secrets` in a terminal to create or update it.
+The command removes imported plain administrator credentials after encryption succeeds.
+Deployment reads the passphrase once through `/dev/tty` and disables the GPG symmetric passphrase cache.
 `stack_name`, `availability_zone`, `vpc_id`, and `subnet_id` select the deployment location.
 `ami_id`, `ami_owner_id`, `nixos_release`, and `root_device_name` identify the official x86_64 NixOS image.
 `notification_email_file` names a private file with one address for Budget notices.
@@ -619,7 +624,7 @@ Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
 
 | Key | Default | Reason |
 | --- | --- | --- |
-| `tailscale_oauth_file` | `~/.config/aws-build/tailscale-oauth` | Keep OAuth JSON outside the public repository with mode `0600`. |
+| `admin_secret_file` | `~/.config/aws-build/admin.gpg` | Encrypt AWS administrator keys and Tailscale OAuth values together with mode `0600`. |
 | `tailscale_key_expiry_s` | `300` | Expire an unused single-use join key after five minutes. |
 | `nixos_configuration_directory` | `/etc/nixos` | Read the reviewed box configuration from a clean `main` checkout. |
 | `box_shell_directory` | `~/rust/cargo-liner` | Select the repository for the configured shell parity checks. |

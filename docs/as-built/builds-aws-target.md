@@ -112,7 +112,7 @@ An interruption marker reports the instance generation.
   It writes a new key atomically to the private credential file with mode `0600`.
   It keeps other profiles. It verifies the new key before it deletes old keys.
   A failed new key is deleted. The secret appears only in the private credential file.
-- `deploy.py price` reads the current Spot price through the deployment profile.
+- `deploy.py price` reads the current Spot price with the encrypted administrator key.
   It writes the price and its read time to the state file named by `deployment_price_file`.
   The default path is `~/.config/aws-build/deployment-price`. The file stays outside the repository and has mode `0600`.
   `prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
@@ -151,8 +151,36 @@ An interruption marker reports the instance generation.
    It uses `normalize_tool_version` for both results.
    `box-shell.json` records the public archive path and shell selector.
 
-The private `tailscale_oauth_file` contains JSON fields `client_id` and `client_secret`.
-The file must have mode `0600` and stay outside the repository.
+`admin_secret_file` names `~/.config/aws-build/admin.gpg` outside the repository, with mode `0600`.
+The encrypted JSON holds `aws_access_key_id`, `aws_secret_access_key`, `tailscale_client_id`, and `tailscale_client_secret`.
+`deploy.py secrets` uses symmetric AES256 encryption and hidden terminal input.
+It can import the administrator profile and the old OAuth file.
+It removes those plain credentials only after the encrypted write succeeds.
+It preserves the scaler profile and all unrelated sections.
+Enter retains a stored value during replacement.
+
+`price`, `apply`, `setup-start`, and `up` decrypt at the first administrator request.
+`prepare` decrypts only when it must reconcile existing AWS resources.
+`bootstrap` needs no administrator credentials.
+`up` shares one decryption across all eleven stages.
+The price stage refresh and the live checks require credentials even when every stage reports `present`.
+The policy check uses the same decrypted OAuth client for its token request.
+AWS subprocesses receive the administrator key through their environment without an administrator profile argument.
+The SSM subprocess uses that same environment.
+Inherited AWS session tokens cause a refusal.
+The unattended controller continues to use the plain scaler profile without a prompt.
+
+The helper reads the passphrase from `/dev/tty` without echo.
+A process without a terminal cannot decrypt through the helper.
+GPG receives the passphrase through a private descriptor with `--no-symkey-cache` and loopback pinentry.
+The helper never uses public-key encryption.
+Decrypted values remain in process memory until the run ends.
+AWS subprocesses contain the AWS key in their environment during their lifetime.
+A process with sufficient access can inspect that memory or environment.
+Administrator subprocesses ignore the AWS configuration file to prevent CLI history from storing secret responses.
+The helper redacts administrator values from reported AWS errors.
+Administrator commands refuse a remaining plain administrator profile or legacy OAuth file and name `deploy.py secrets`.
+The planned `down` command does not exist yet.
 No deployment stage edits or pushes the NixOS checkout.
 The controller activation and routing proof remain separate plan stages.
 

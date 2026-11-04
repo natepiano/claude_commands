@@ -34,7 +34,7 @@ There is no separate charge timer.
 
 1. Create the AWS account and administrator login in the AWS console.
 2. Set the billing notification email and confirm its subscription.
-3. Prepare the administrator profile named by `deployment_profile` in the same private credential file at your terminal.
+3. Run `python3 scripts/aws_target/deploy.py secrets` in your terminal to encrypt the administrator keys.
 4. Read the free placement scores for `m7a.4xlarge` in `us-east-2`.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
 6. Select one available zone in `us-east-2` from those reads.
@@ -56,32 +56,20 @@ The account (created 2026-11-03) is a project account. The user activated advanc
 - The AWS spend limit is gone. The stack's $400 Budget with its stop action is the AWS-side backstop.
 - The four `BudgetsSpendLimit*` policies must have no target. In the Organizations console, open each policy's Targets tab, and detach the project account if it is listed.
 
-The following commands are user-run examples.
-Replace the uppercase values with public account inputs from the configuration.
-Do not send credentials or command output that contains credentials to an agent.
-Set the private credential-file environment before these reads.
-Use the configured `deployment_profile` if it differs from `build-admin`.
+Create or update the encrypted administrator file at your terminal.
+Never send a credential or passphrase to a session.
 
 ```sh
-install -d -m 0700 "$HOME/.config/aws-build"
 export AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials"
-(umask 077; aws configure --profile build-admin)
-chmod 0600 "$AWS_SHARED_CREDENTIALS_FILE"
-aws --profile build-admin ec2 get-spot-placement-scores \
-  --region us-east-2 --instance-types m7a.4xlarge --target-capacity 1 \
-  --single-availability-zone --region-names us-east-2
-aws --profile build-admin ec2 describe-spot-price-history \
-  --region us-east-2 --instance-types m7a.4xlarge \
-  --product-descriptions Linux/UNIX --max-results 20
-aws --profile build-admin service-quotas get-service-quota \
-  --region us-east-2 --service-code ec2 --quota-code L-34B43A08 \
-  --query Quota.Value
-aws --profile build-admin service-quotas request-service-quota-increase \
-  --region us-east-2 --service-code ec2 --quota-code L-34B43A08 \
-  --desired-value 32
+python3 scripts/aws_target/deploy.py secrets
 ```
 
-Run the increase request only when the quota is below 16. The value 32 also covers a later move to `m7a.8xlarge`. A quota request has no charge.
+The command asks for four hidden values and a passphrase confirmation.
+Enter retains an imported or stored value.
+The command removes the plain administrator profile after encryption succeeds.
+It keeps the unattended scaler profile.
+Use the AWS console for placement and quota inspection.
+Do not create a plain administrator profile for CLI inspection.
 
 Read gp3, root storage and public IPv4 prices for `us-east-2` from the public [EC2](https://aws.amazon.com/ec2/pricing/on-demand/) and [EBS](https://aws.amazon.com/ebs/pricing/) price pages.
 Use the price history to select the zone.
@@ -96,13 +84,7 @@ Cost Explorer reads have the configured query fee.
 1. Open the [official NixOS AMI list](https://nixos.github.io/amis/).
 2. Select the configured NixOS release, region, and x86_64 architecture.
 3. Record the AMI ID and its official owner ID in configuration.
-4. Verify the AMI at your terminal.
-
-```sh
-aws --profile build-admin ec2 describe-images --region REGION \
-  --image-ids AMI_ID --owners OFFICIAL_OWNER_ID \
-  --query 'Images[].{Id:ImageId,Owner:OwnerId,Name:Name,Arch:Architecture,State:State,Root:RootDeviceName}'
-```
+4. Verify the AMI in the AWS console.
 
 The result must show the selected release, `x86_64`, and `available`.
 Record the image's root device name.
@@ -176,7 +158,8 @@ The box receives an SSM instance profile and no scaler key.
 The `up` command checks the scaler profile through STS.
 It creates a key only when the profile does not identify the configured scaler user.
 It writes the key to the existing private credential file with mode `0600`.
-It keeps the administrator profile and every other profile.
+It keeps every unrelated profile.
+The administrator key stays in `admin.gpg`.
 It verifies the new key before it deletes the old keys.
 It deletes a new key that fails verification.
 Do not copy the credential file to the box or print its contents.
@@ -186,7 +169,7 @@ Do not copy the credential file to the box or print its contents.
 Use the default `~/.local/state/build-targets/aws` directory before and after registry activation.
 The default bundle directory is `~/.local/state/aws-build/deployment`.
 The default settings file is `~/.claude/config/aws_target.conf`.
-Keep the private administrator credential file and Budget address file in place.
+Keep the encrypted administrator file and the private Budget address file in place.
 Run this command at your terminal:
 
 ```sh
@@ -221,11 +204,7 @@ Execution remains refused until natedev binds valid permission to that boot.
 
 1. Confirm the instance appears in SSM.
 
-```sh
-aws --profile build-admin ssm describe-instance-information --region REGION \
-  --filters Key=InstanceIds,Values=INSTANCE_ID
-aws --profile build-admin ssm start-session --region REGION --target INSTANCE_ID
-```
+Use the AWS console session manager for manual SSM access.
 
 2. Use the EC2 serial console if SSM remains unavailable.
 3. Confirm the attached data volume ID before any filesystem operation.
@@ -270,8 +249,7 @@ Repeat the idle-stop check after bootstrap or lifecycle changes.
 ## Tailscale policy and box configuration
 
 `deploy.py up --approve-resources` now runs the policy, join, configuration, and checks stages.
-The helper reads the private OAuth JSON named by `tailscale_oauth_file`.
-The JSON contains `client_id` and `client_secret`.
+The helper decrypts the OAuth values from `admin_secret_file`.
 The file stays outside the repository with mode `0600`.
 The OAuth client needs `auth_keys` for `tag:build-aws` and `policy_file` access.
 Never paste its secret into a command, log, or tracked file.
@@ -462,14 +440,9 @@ Use this replacement procedure from the deployment owner:
 5. Run `deploy.py up --approve-resources`.
 
 Confirm the old instance stops before deleting its stack.
-Use your administrator profile for these user-run commands:
-
-```sh
-aws --profile build-admin ec2 stop-instances --region REGION --instance-ids OLD_INSTANCE_ID
-aws --profile build-admin ec2 wait instance-stopped --region REGION --instance-ids OLD_INSTANCE_ID
-aws --profile build-admin cloudformation delete-stack --region REGION --stack-name OLD_STACK_NAME
-aws --profile build-admin cloudformation wait stack-delete-complete --region REGION --stack-name OLD_STACK_NAME
-```
+Use the AWS console for manual stack deletion.
+The planned `deploy.py down` command does not exist yet.
+Do not restore a plain administrator profile.
 
 Keep the data volume in the same availability zone.
 Preserve its filesystem identity, encryption, and cost-allocation tags.
@@ -559,3 +532,23 @@ Run `python3 scripts/aws_target/deploy.py up --approve-resources` at your termin
 A retry skips proofs recorded for the current instance ID.
 A replacement instance requires new proofs.
 Keep `routing.json`, `deployment.json`, and `up.json` outside the repository.
+
+## Encrypted administrator credentials
+
+1. Run `deploy.py secrets` in your terminal before the first encrypted deployment.
+2. Enter the AWS administrator key and Tailscale OAuth values without echo.
+3. Enter the encryption passphrase twice.
+4. Run `deploy.py up --approve-resources` with the scaler credential file environment.
+
+The default encrypted path is `~/.config/aws-build/admin.gpg`.
+The helper uses symmetric AES256 encryption and disables the GPG symmetric passphrase cache.
+It refuses a terminal-free process and never uses cached public-key decryption.
+Each deployment asks for one passphrase at its first administrator request.
+`up` always needs this passphrase because it refreshes the price and checks live state.
+`price`, `apply`, and `setup-start` also need it.
+`prepare` needs it only when existing resources require an AWS read.
+`bootstrap` and normal builds never need it.
+A remaining plain administrator profile or `tailscale-oauth` file causes a refusal that names `deploy.py secrets`.
+The helper stores decrypted values only in memory.
+The local AWS subprocess environment contains the AWS key while the subprocess runs.
+Do not inspect or capture that environment.

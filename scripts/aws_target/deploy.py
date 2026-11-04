@@ -23,7 +23,7 @@ from typing import Literal, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.aws_target import box, ledger, remote
+from scripts.aws_target import admin_secrets, box, ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
 from scripts.aws_target.config import (
     BudgetNotificationAddress, DeploymentSettings, deployment_price, deployment_price_path, money, read_budget_notification_address,
@@ -107,6 +107,7 @@ class Deployment:
         self.execute = execute
         self.clock = clock
         self.notify = notify
+        self.admin: admin_secrets.AdminSecretSession = admin_secrets.AdminSecretSession(settings_path)
 
     def _guard(self) -> ledger.SpendingAllowed:
         decision = ledger.spending_guard(self.settings_path, self.directory, 'deployment',
@@ -118,7 +119,7 @@ class Deployment:
         return decision
 
     def _api(self, settings: DeploymentSettings) -> AwsCli:
-        return AwsCli(settings.profile, settings.region, settings.timeout_s, self.execute)
+        return AwsCli(settings.profile, settings.region, settings.timeout_s, self.admin.executor(self.execute))
 
     def price(self) -> dict[str, str | int]:
         """Save the current public Spot price without requesting resources."""
@@ -207,6 +208,7 @@ class Deployment:
         self._confirm_preparation(settings, parameters)
 
     def prepare(self) -> PreparedDeployment:
+        admin_secrets.refuse_plain_admin(self.settings_path)
         with control_lock(self.directory):
             settings = read_deployment_settings(self.settings_path, self.directory)
             now = int(self.clock())
@@ -337,6 +339,7 @@ class Deployment:
         self._check_credentials()
 
     def _check_credentials(self) -> None:
+        admin_secrets.refuse_plain_admin(self.settings_path)
         credential_file = os.environ.get('AWS_SHARED_CREDENTIALS_FILE', '')
         if not credential_file or stat.S_IMODE(Path(credential_file).expanduser().stat().st_mode) != 0o600:
             raise DeploymentRefused('AWS_SHARED_CREDENTIALS_FILE must name a private mode 0600 file')
@@ -551,7 +554,7 @@ class Deployment:
             raise DeploymentRefused('the scaler key works; IAM could not remove every old key') from None
 
     def _box_stages(self) -> tuple[UpStage, ...]:
-        setup = box.BoxSetup(self.settings_path, self.directory, self._start_box, execute=self.execute)
+        setup = box.BoxSetup(self.settings_path, self.directory, self._start_box, execute=self.execute, admin=self.admin)
         return (
             UpStage('tailscale-policy', setup.policy_present, setup.policy),
             UpStage('box-join', setup.join_present, setup.join),
@@ -583,7 +586,7 @@ class Deployment:
                         _ = stage.action()
                     result = StageResult('present' if present else 'done', started, int(self.clock()))
                 except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                    reason = 'scaler credential stage failed' if stage.name == 'scaler-key' else str(error)
+                    reason = 'scaler credential stage failed' if stage.name == 'scaler-key' else self.admin.redact(str(error))
                     result = StageResult('refused', started, int(self.clock()), reason)
                 results = remote.read_record(path) if path.exists() else results
                 previous = ledger.mapping(results.get(stage.name, {}))
@@ -673,7 +676,7 @@ class DeploymentArguments(argparse.Namespace):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('up', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
+    _ = parser.add_argument('command', choices=('secrets', 'up', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)
@@ -681,7 +684,9 @@ def main() -> int:
     args = parser.parse_args(namespace=DeploymentArguments())
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
-        if args.command == 'up':
+        if args.command == 'secrets':
+            admin_secrets.configure(args.settings)
+        elif args.command == 'up':
             return 0 if deploy.up(approve_resources=args.approve_resources) else 1
         elif args.command == 'price':
             print(json.dumps(deploy.price(), sort_keys=True))
@@ -697,7 +702,7 @@ def main() -> int:
             print(json.dumps(deploy.apply(approve_resources=args.approve_resources), sort_keys=True))
         return 0
     except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-        print(f'aws_deploy: {error}', file=sys.stderr)
+        print('aws_deploy: ' + deploy.admin.redact(str(error)), file=sys.stderr)
         return 1
 
 

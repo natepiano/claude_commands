@@ -33,12 +33,12 @@ from scripts.direct import step_record
 
 class AwsExecutor(Protocol):
     def __call__(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
-                 timeout: float, check: bool) -> subprocess.CompletedProcess[str]: ...
+                 timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]: ...
 
 
 def execute_command(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                    timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check)
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
 
 
 class AwsUnavailable(RuntimeError):

@@ -15,11 +15,21 @@ The user said on 2026-11-03: "we need to be able to set a box up to run soup to 
 
 ## One-time user inputs
 
-These inputs are private files outside the repository, mode 0600. The user makes each one once.
+The user creates these private files outside the repository.
 
-1. `~/.config/aws-build/credentials`, profile `build-admin`. It exists.
-2. `~/.config/aws-build/notification-email`. It exists.
-3. `~/.config/aws-build/tailscale-oauth`: a Tailscale OAuth client with the scopes `auth_keys` (tag `tag:build-aws`) and `policy_file`. It is new. `up` refuses with one clear line when the file is missing.
+1. Run `deploy.py secrets` in a terminal to create `~/.config/aws-build/admin.gpg`, mode `0600`.
+2. Store the AWS administrator key and the Tailscale OAuth client in that encrypted file.
+3. Give the OAuth client `auth_keys` access for `tag:build-aws` and `policy_file` access.
+4. Keep `~/.config/aws-build/credentials` for the unattended `build-scaler` profile only.
+5. Keep the existing private Budget address file outside the repository.
+
+`secrets` imports an existing administrator profile and removes it after encryption succeeds.
+It also imports and removes the old `tailscale-oauth` file.
+The user can retain stored values with Enter and replace one value.
+The helper asks for one passphrase when a deployment first needs administrator credentials.
+It keeps decrypted values only in memory for that process.
+Symmetric AES256 encryption disables the GPG symmetric passphrase cache.
+The planned `down` command must use this same terminal credential boundary.
 
 ## Stages of `up`
 

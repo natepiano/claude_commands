@@ -16,7 +16,7 @@ from typing import Protocol, cast, final
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from scripts.aws_target import ledger
+from scripts.aws_target import admin_secrets, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
 from scripts.aws_target.config import deployment_outputs, read_deployment_settings
 from scripts.build_targets import target_config
@@ -59,21 +59,16 @@ class TailnetAuthorization:
 
 @final
 class Tailnet:
-    def __init__(self, settings: Path, transport: TailnetTransport = tailnet_request) -> None:
+    def __init__(self, settings: Path, admin: admin_secrets.AdminSecretSession, transport: TailnetTransport = tailnet_request) -> None:
         self.settings = settings
         self.transport = transport
+        self.admin = admin
 
     def _authorization(self) -> TailnetAuthorization:
-        path = Path(conf.read(self.settings).text('tailscale_oauth_file')).expanduser().resolve()
-        try:
-            if path.is_relative_to(Path(__file__).resolve().parents[2]) or path.stat().st_mode & 0o777 != 0o600:
-                raise ValueError
-            credentials = json_record(path.read_text())
-            body = urlencode({'client_id': ledger.text(credentials, 'client_id'),
-                              'client_secret': ledger.text(credentials, 'client_secret'),
-                              'grant_type': 'client_credentials'}).encode()
-        except (OSError, ValueError):
-            raise BoxRefused(f'tailscale_oauth_file: {path}: require private JSON outside the repository, mode 0600') from None
+        credentials = self.admin.get()
+        body = urlencode({'client_id': credentials.tailscale_client_id,
+                          'client_secret': credentials.tailscale_client_secret,
+                          'grant_type': 'client_credentials'}).encode()
         reply = self.transport('POST', 'oauth/token', body,
                                {'Content-Type': 'application/x-www-form-urlencoded'},
                                conf.read(self.settings).number('aws_timeout_s'))
@@ -106,13 +101,13 @@ JOIN_COMMAND = '''sudo bash -c 'set +x; unset HISTFILE; stty -echo || exit 1; pr
 
 
 class JoinSession(Protocol):
-    def __call__(self, arguments: Sequence[str], key: str, timeout: float) -> None: ...
+    def __call__(self, arguments: Sequence[str], key: str, timeout: float, *, env: dict[str, str]) -> None: ...
 
 
-def join_session(arguments: Sequence[str], key: str, timeout: float) -> None:
+def join_session(arguments: Sequence[str], key: str, timeout: float, *, env: dict[str, str]) -> None:
     """Wait for echo suppression before sending the key through SSM stdin."""
     try:
-        with subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+        with subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env) as process:
             if process.stdout is None:
                 raise BoxRefused('SSM join has no output channel')
             try:
@@ -142,13 +137,14 @@ def join_session(arguments: Sequence[str], key: str, timeout: float) -> None:
 @final
 class BoxSetup:
     def __init__(self, settings: Path, directory: Path, start: Callable[[], object], *,
-                 execute: AwsExecutor = execute_command, tailnet: TailnetTransport = tailnet_request,
+                 admin: admin_secrets.AdminSecretSession, execute: AwsExecutor = execute_command, tailnet: TailnetTransport = tailnet_request,
                  session: JoinSession = join_session, pause: Callable[[float], object] = time.sleep) -> None:
         self.settings = settings
         self.directory = directory
         self.start = start
         self.execute = execute
-        self.tailnet = Tailnet(settings, tailnet)
+        self.admin = admin
+        self.tailnet = Tailnet(settings, self.admin, tailnet)
         self.session = session
         self.pause = pause
         self.joined: JoinedBox | UnjoinedBox = UnjoinedBox()
@@ -162,7 +158,7 @@ class BoxSetup:
 
     def _api(self) -> AwsCli:
         settings = read_deployment_settings(self.settings, self.directory)
-        return AwsCli(settings.profile, settings.region, settings.timeout_s, self.execute)
+        return AwsCli(settings.profile, settings.region, settings.timeout_s, self.admin.executor(self.execute))
 
     def _instance(self) -> str:
         outputs = deployment_outputs(self.directory)
@@ -306,10 +302,10 @@ class BoxSetup:
         key_id = ledger.text(key, 'id')
         try:
             settings = read_deployment_settings(self.settings, self.directory)
-            self.session(['aws', '--profile', settings.profile, '--region', settings.region, 'ssm', 'start-session',
+            self.session(['aws', '--region', settings.region, 'ssm', 'start-session',
                           '--target', self._instance(), '--document-name', 'AWS-StartInteractiveCommand',
                           '--parameters', json.dumps({'command': [JOIN_COMMAND]})], ledger.text(key, 'key'),
-                         conf.read(self.settings).whole('box_setup_timeout_s'))
+                         conf.read(self.settings).whole('box_setup_timeout_s'), env=self.admin.environment())
             self._wait(self.join_present, 'the box did not confirm its Tailscale identity')
         finally:
             _ = self.tailnet.call('DELETE', 'keys/' + key_id)

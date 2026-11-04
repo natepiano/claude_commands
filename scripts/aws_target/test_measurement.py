@@ -172,7 +172,8 @@ class MeasurementTests(MeasurementFixture):
                 book.observe(ledger.InstanceObservation(instant(first + "T00:00:00+00:00"), "stopped", "fixture"))
 
                 def date_only_api(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                                  timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
+                                  timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    self.assertIsNone(env)
                     self.assertTrue(capture_output and text)
                     self.assertGreater(timeout, 0)
                     self.assertFalse(check)
@@ -358,7 +359,8 @@ class MeasurementTests(MeasurementFixture):
         calls: list[list[str]] = []
 
         def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                    timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            self.assertIsNone(env)
             self.assertTrue(capture_output and text)
             self.assertGreater(timeout, 0)
             self.assertFalse(check)

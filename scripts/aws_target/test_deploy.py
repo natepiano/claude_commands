@@ -22,7 +22,7 @@ from urllib.request import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
 
-from scripts.aws_target import aws_target, config as aws_config, deploy, ledger, measurement, remote
+from scripts.aws_target import admin_secrets, aws_target, config as aws_config, deploy, ledger, measurement, remote
 from scripts.aws_target.config import read_control_settings
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.measurement_test_support import DAY, narrow
@@ -35,15 +35,16 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 FAKE_AWS = r'''import datetime, json, os, pathlib, sys
 root = pathlib.Path(os.environ['DEPLOY_FIXTURE'])
 args = sys.argv[1:]
-service = args[4]
-operation = args[5]
+service_index = args.index('--region') + 2
+service = args[service_index]
+operation = args[service_index + 1]
 state_path = root / 'fake-stack.json'
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
 clock = int((root / 'clock').read_text())
 book = root / 'state/cost-ledger.json'
 evidence = json.loads(book.read_text()) if book.exists() else {}
 with (root / 'commands.jsonl').open('a') as output:
-    output.write(json.dumps({'args': args, 'decision': evidence.get('decision', {}),
+    output.write(json.dumps({'args': args if '--profile' in args else ['--profile', 'environment', *args], 'decision': evidence.get('decision', {}),
                              'compute_requests': evidence.get('compute_requests', [])}) + '\n')
 def reply(value):
     print(json.dumps(value))
@@ -170,7 +171,7 @@ class DeploymentTests(CostFixture):
         self.text_setting('deployment_price_file', str(self.price_file))
         self.write_price()
         values = {
-            'offload': 'off', 'deployment_profile': 'build-admin', 'stack_name': 'fixture-build',
+            'admin_secret_file': str(self.root / 'admin.gpg'), 'offload': 'off', 'deployment_profile': 'build-admin', 'stack_name': 'fixture-build',
             'ami_id': 'ami-fixture', 'ami_owner_id': '123456789012', 'nixos_release': '26.05',
             'availability_zone': 'us-east-1a', 'vpc_id': 'vpc-fixture', 'subnet_id': 'subnet-fixture',
             'root_device_name': '/dev/xvda', 'scaler_user_name': 'build-scaler',
@@ -191,6 +192,8 @@ class DeploymentTests(CostFixture):
         })
         for key, value in values.items():
             self.replace(key, value)
+        _ = cast(object, self.enterContext(mock.patch.object(admin_secrets.AdminSecretSession, 'get', return_value=
+            admin_secrets.AdminCredentials('fixture-admin-id', 'fixture-admin-secret', 'fixture-client', 'fixture-oauth-secret'))))
         self.credentials = self.root / 'credentials'
         _ = self.credentials.write_text('')
         self.credentials.chmod(0o600)
@@ -256,13 +259,13 @@ class DeploymentTests(CostFixture):
         compute_returned = False
 
         def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                    timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
             nonlocal compute_returned
-            operation = arguments[6]
+            operation = arguments[arguments.index('--region') + 3]
             if compute_returned and ((failure in ('stack', 'timeout') and operation == 'describe-stacks')
                                      or (failure == 'instance' and operation == 'describe-instances')):
                 return subprocess.CompletedProcess(arguments, 1, '', 'the requested observation is unavailable')
-            result = aws_target.execute_command(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check)
+            result = aws_target.execute_command(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
             if operation == 'deploy' and 'EnableCompute=true' in arguments:
                 compute_returned = True
                 if failure == 'timeout':
@@ -461,7 +464,7 @@ class DeploymentTests(CostFixture):
         return success, output.getvalue()
 
     def test_up_creates_each_stage_and_the_second_run_only_checks_live_state(self) -> None:
-        _ = self.credentials.write_text('[build-admin]\naws_access_key_id=admin-key\naws_secret_access_key=admin-value\n')
+        _ = self.credentials.write_text('[unrelated]\naws_access_key_id=other-key\naws_secret_access_key=other-value\n')
         self.price_file.unlink()
         settings = self.settings.read_bytes()
         success, output = self.up_output(self.deployment())
@@ -472,7 +475,7 @@ class DeploymentTests(CostFixture):
         self.assertLess(operations.index('describe-spot-price-history'), operations.index('deploy'))
         self.assertLess(operations.index('deploy'), operations.index('create-access-key'))
         self.assertEqual(self.credentials.stat().st_mode & 0o777, 0o600)
-        self.assertIn('admin-key', self.credentials.read_text())
+        self.assertIn('other-key', self.credentials.read_text())
         self.assertIn('[build-scaler]', self.credentials.read_text())
         self.assertEqual(json.loads((self.root / 'fake-keys.json').read_text()), ['new-key'])
         before = len(self.commands())
@@ -540,7 +543,7 @@ class DeploymentTests(CostFixture):
             _ = self.deployment().up()
         self.assertEqual(self.commands(), [])
 
-    def test_price_command_writes_private_state_for_the_selected_zone_and_profile(self) -> None:
+    def test_price_command_writes_private_state_for_the_selected_zone_and_admin_environment(self) -> None:
         path = self.root / '.config/aws-build/deployment-price'
         self.replace('deployment_price_file', '~/.config/aws-build/deployment-price')
         settings = self.settings.read_bytes()
@@ -568,7 +571,7 @@ class DeploymentTests(CostFixture):
         self.assertEqual(len(calls), 2)
         for call in calls:
             args = cast(list[str], call['args'])
-            self.assertEqual(args[args.index('--profile') + 1], 'build-admin')
+            self.assertEqual(args[args.index('--profile') + 1], 'environment')
             self.assertEqual(args[args.index('--region') + 1], 'us-east-1')
             self.assertIn('describe-spot-price-history', args)
             self.assertEqual(args[args.index('--instance-types') + 1], 'm7a.4xlarge')
@@ -758,8 +761,8 @@ class DeploymentTests(CostFixture):
         execute = subject.execute
 
         def change_limit(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                         timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
-            result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check)
+                         timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
             if 'EnableCompute=false' in arguments:
                 self.replace('monthly_limit_usd', '1')
             return result
@@ -883,7 +886,8 @@ class DeploymentTests(CostFixture):
                          ['mac', 'natedev', 'aws'])
 
     def refuse_command(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
-                       timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
+                       timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        self.assertIsNone(env)
         _ = (capture_output, text, timeout, check)
         raise AssertionError(f'disabled tick called AWS: {arguments}')
 
@@ -1005,11 +1009,12 @@ class DeploymentTests(CostFixture):
         pauses: list[float] = []
 
         def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                    timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
             self.assertFalse(capture_output)
             self.assertTrue(text)
             self.assertFalse(check)
             self.assertEqual(timeout, conf.read(self.settings).number('controller_tick_timeout_s'))
+            self.assertIsNone(env)
             self.assertEqual(os.environ['AWS_SHARED_CREDENTIALS_FILE'], str(self.credentials))
             calls.append(list(arguments))
             self.replace('tick_interval_s', str(7 * len(calls)))

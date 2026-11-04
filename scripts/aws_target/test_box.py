@@ -12,7 +12,7 @@ import unittest
 from typing import cast, final, override
 from unittest import mock
 
-from scripts.aws_target import box, deploy
+from scripts.aws_target import admin_secrets, box, deploy
 from scripts.aws_target.ledger import mapping
 from scripts.build_targets import target_config
 from scripts.mac_test import mac_test, offload
@@ -37,7 +37,7 @@ def versions(command, remote=False):
     elif 'mend' in command: print('mend fixture')
     else: raise AssertionError(command)
 if name == 'aws':
-    op = args[5]
+    op = args[args.index('--region') + 3]
     if op == 'describe-instances':
         s['observations'] = s.get('observations', 0) + 1
         if s.get('self_stop') and s['observations'] >= s.get('stop_after', 2): s['ec2'] = 'stopped'
@@ -156,7 +156,7 @@ class BoxTests(unittest.TestCase):
         self.directory = Path()
         self.tailnet = FakeTailnet()
         self.starts = 0
-        self.subject = box.BoxSetup(self.settings, self.directory, self.start, tailnet=self.tailnet)
+        self.subject = box.BoxSetup(self.settings, self.directory, self.start, admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet)
 
     @override
     def setUp(self) -> None:
@@ -168,11 +168,10 @@ class BoxTests(unittest.TestCase):
         self.directory.mkdir()
         _ = (self.directory / 'deployment.json').write_text(json.dumps({'region': 'us-east-2', 'stack': 'aws-build',
                                     'outputs': {'InstanceId': 'i-box', 'DataVolumeId': 'vol-box'}}))
-        oauth = self.root / 'oauth'
-        _ = oauth.write_text(json.dumps({'client_id': 'fixture-id', 'client_secret': 'fixture-secret'}))
-        oauth.chmod(0o600)
+        _ = cast(object, self.enterContext(mock.patch.object(admin_secrets.AdminSecretSession, 'get', return_value=
+            admin_secrets.AdminCredentials('fixture-admin-id', 'fixture-admin-secret', 'fixture-id', 'fixture-secret'))))
         config = (Path(__file__).resolve().parents[2] / 'config/aws_target.conf').read_text()
-        values = {'tailscale_oauth_file': str(oauth), 'box_check_attempts': '4', 'box_check_delay_s': '0.001', 'idle_stop_minutes': '0.001', 'idle_stop_margin_s': '0',
+        values = {'admin_secret_file': str(self.root / 'admin.gpg'), 'box_check_attempts': '4', 'box_check_delay_s': '0.001', 'idle_stop_minutes': '0.001', 'idle_stop_margin_s': '0',
                   'nixos_configuration_directory': str(self.root / 'nixos'), 'box_shell_directory': str(self.root / 'cargo-liner')}
         _ = self.settings.write_text('\n'.join(key + '=' + values[key] if '=' in line and (key := line.partition('=')[0]) in values else line
                                              for line in config.splitlines()) + '\n')
@@ -192,7 +191,7 @@ class BoxTests(unittest.TestCase):
                    'desired': SYSTEM, 'source': SOURCE})
         self.tailnet = FakeTailnet()
         self.starts = 0
-        self.subject = box.BoxSetup(self.settings, self.directory, self.start, tailnet=self.tailnet)
+        self.subject = box.BoxSetup(self.settings, self.directory, self.start, admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet)
 
     def start(self) -> str:
         self.starts += 1
