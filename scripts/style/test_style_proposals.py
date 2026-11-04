@@ -36,6 +36,7 @@ import proposal_issue
 import proposals_table
 from issues import Issue, frontmatter, open_issues
 from style_proposals import FilingResult
+from scripts.production.staff_test_support import isolated_staff_file, recorded_unit
 
 # Each crate declares the new name of the fixture rename, so a merge finds it applied, and still declares
 # Size and Rate, so the renames of those variants are not applied.
@@ -827,14 +828,15 @@ class StyleProposalsTests(unittest.TestCase):
     always: str = "global:rust/always.md"
 
     def standing_units(self, *families: str) -> None:
-        """A standing style production whose Units table lists a live unit of each family, and the always approved rule."""
+        """A standing style production with a live unit of each family in staff, and the always approved rule."""
         _ = (self.catalog / "always.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\napproval: always\n---\n# Rule\n")
         doc = self.root / "sample-style/docs/sample-style-production.md"
         doc.parent.mkdir(parents=True)
-        rows = [f"| sample-style-{family}-unit | docs/style-production/units/{family}-unit.md | {self.root / family} | {family} |"
-                for family in families]
-        _ = doc.write_text("\n".join(["# Style", "", "## Units", "", "| Unit | Plan | Worktree | Branch |",
-                                       "| --- | --- | --- | --- |", *rows, ""]))
+        _ = doc.write_text("# Style\n")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        for family in families:
+            _ = recorded_unit("sample-style", f"sample-style-{family}-unit", self.root / family, doc,
+                              plan=f"docs/style-production/units/{family}-unit.md")
         standing = add_style.StandingStyleProduction(self.repo, "sample-style", doc.parent.parent, doc, "main")
         _ = self.enterContext(mock.patch.object(style_proposals, "standing_style_production", return_value=standing))
         _ = self.enterContext(mock.patch.object(style_proposals, "unit_file_holders", return_value={}))

@@ -291,65 +291,36 @@ class HerdrSessionsTests(unittest.TestCase):
         self.claude(101, 100, "solo-name", pane="w1:p1", marks={"SHOWRUNNER_UNIT": "build"})
         self.assertEqual(self.call("list"), (0, "solo\tstandalone\tsolo-name\n", ""))
 
-    def test_sort_tabs_ignores_saved_order_saves_unit_groups_and_keeps_split_workspaces(self) -> None:
+    def test_sort_tabs_ignores_saved_order_saves_unit_groups_and_orders_split_tabs(self) -> None:
+        from scripts.herdr.test_herdr import LayoutHerdr
         members = {name: unit_membership("boss", name) for name in ("mike", "zulu")}
         members.update({name: fixture_member("showrunner", name=name)
                         for name in ("boss", "apple", "split", "zebra", "alpha")})
         self.respond(["agents"])
         self.server(100, "agents")
-        pane_titles = {**{f"w1:p{index}": title for index, title in
-                         enumerate(("boss", "zulu", "apple", "mike"), 1)},
-                       "w2:p1": "split", "w2:p2": "split", "w2:p3": "zebra", "w2:p4": "alpha"}
-        for pid, (pane, title) in enumerate(pane_titles.items(), 101):
-            self.claude(pid, 100, title, pane=pane, marks={"CLAUDE_CODE_SESSION_ID": members[title].current_session})
-        tabs = [{"tab_id": f"w1:t{index}", "label": title, "pane_count": 1, "workspace_id": "w1"}
-                for index, title in enumerate(("boss", "zulu", "apple", "mike"), 1)]
-        split_tabs = [{"tab_id": "w2:t1", "label": "split", "pane_count": 2, "workspace_id": "w2"},
-                      {"tab_id": "w2:t2", "label": "zebra", "pane_count": 1, "workspace_id": "w2"},
-                      {"tab_id": "w2:t3", "label": "alpha", "pane_count": 1, "workspace_id": "w2"}]
-        spaces = [{"workspace_id": "w1", "label": "boss", "focused": False, "active_tab_id": "w1:t3"},
-                  {"workspace_id": "w2", "label": "split", "focused": True, "active_tab_id": "w2:t1"}]
-
-        def reply(result: dict[str, object]) -> CommandResponse:
-            return {"stdout": json.dumps({"result": result}), "code": 0}
-
-        replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(self.responses.read_text()))
-        replies["--session agents workspace list"] = reply({"workspaces": spaces})
-        replies["--session agents tab list --workspace w1"] = reply({"tabs": tabs})
-        replies["--session agents tab list --workspace w2"] = reply({"tabs": split_tabs})
-        panes: list[dict[str, object]] = [
-            dict[str, object](pane_id=pane, tab_id=f"w1:t{index}", workspace_id="w1",
-                              label=pane_titles[pane], agent_session={"value": members[pane_titles[pane]].current_session})
-            for index in range(1, 5) for pane in [f"w1:p{index}"]] + [
-            dict[str, object](pane_id=f"w2:p{index}", tab_id=f"w2:t{max(1, index - 1)}", workspace_id="w2",
-                              label=title, agent_session={"value": members[title].current_session})
-            for index, title in enumerate(("split", "split", "zebra", "alpha"), 1)]
-        replies["--session agents pane list"] = reply({"panes": panes})
-        sorted_tabs = [tabs[0]]
-        for index, tab_number in ((4, 5), (2, 6), (3, 7)):
-            tab_id = f"w1:t{tab_number}"
-            replies[f"--session agents pane move w1:p{index} --new-tab --workspace w1"] = reply({
-                "move_result": {"created_tab": {"tab_id": tab_id}, "pane": {"pane_id": f"w1:p{index}"}}})
-            sorted_tabs.append({**tabs[index - 1], "tab_id": tab_id})
-        replies["--session agents tab list"] = [reply({"tabs": tabs + split_tabs}), reply({"tabs": sorted_tabs + split_tabs})]
-        replies["default"] = {"stdout": "", "code": 0}
-        _ = self.responses.write_text(json.dumps(replies))
+        client = LayoutHerdr("agents")
+        client.spaces = [("w1", "boss"), ("w2", "split")]
+        for space, titles in (("w1", ("boss", "zulu", "apple", "mike")), ("w2", ("split", "zebra", "alpha"))):
+            for title in titles:
+                _ = client.add_tab(space, title)
+        client.tabs.insert(5, {**client.tabs[4], "pane_id": "split-sibling"})
+        before = {pane["pane_id"]: pane["tab_id"] for pane in client.tabs}
+        for pid, pane in enumerate(client.tabs, 101):
+            self.claude(pid, 100, pane["label"], pane=pane["pane_id"],
+                        marks={"CLAUDE_CODE_SESSION_ID": pane["session_id"]})
         path = herdr.layout_path("agents")
         path.parent.mkdir(parents=True)
         _ = path.write_text(json.dumps(herdr.SavedLayout(at=100.0, workspaces=[herdr.SavedSpace(
-            name="boss", seen=100.0, tabs=[herdr.SavedName(name=members[str(tab["label"])].id, seen=100.0) for tab in tabs])])))
-
-        self.assertEqual(self.call("sort-tabs"),
-                         (0, "herdr_sessions: split: tab with several panes; order kept\n", ""))
-        acted = [command[2:] for command in self.commands() if command[3:4] in (["move"], ["rename"], ["focus"])]
-        self.assertEqual(acted, [
-            ["pane", "move", "w1:p4", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t5", "mike"],
-            ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t6", "zulu"],
-            ["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t7", "apple"],
-            ["tab", "focus", "w1:t7"], ["workspace", "focus", "w2"]])
+            name="boss", seen=100.0, tabs=[herdr.SavedName(name=members[pane["label"]].id, seen=100.0)
+                                         for pane in client.tabs[:4]])])))
+        running = herdr.live_sessions()
+        with patch.object(herdr, "Herdr", return_value=client), patch.object(herdr, "live_sessions", return_value=running):
+            self.assertEqual(self.call("sort-tabs"), (0, "", ""))
+        self.assertEqual(client.commands, [("tab.move", before["p8"], "1"), ("tab.move", before["p14"], "1")])
+        self.assertEqual({pane["pane_id"]: pane["tab_id"] for pane in client.tabs}, before)
         saved = {space["name"]: [tab["name"] for tab in space["tabs"]] for space in herdr.saved_layout("agents")["workspaces"]}
         self.assertEqual(saved, {space: [members[title].id for title in titles] for space, titles in
-                                 {"boss": ["boss", "mike", "zulu", "apple"], "split": ["split", "zebra", "alpha"]}.items()})
+                                 {"boss": ["boss", "mike", "zulu", "apple"], "split": ["split", "alpha", "zebra"]}.items()})
 
     def test_list_follows_the_named_shared_session(self) -> None:
         shared = self.root / "config/herdr/shared-session"

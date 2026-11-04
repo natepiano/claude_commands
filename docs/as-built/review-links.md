@@ -149,7 +149,7 @@ In that case, its owner remains unrouted and receives no message.
 An unreadable staff record stops either run before anything is pushed.
 `merge_checkpoint` also undoes its unpushed local merge.
 One read supplies the rows for each run.
-Each writer matches the branch to its Units row and finds the staff unit by the Worktree path.
+Each writer matches the branch to a unit staff row through its worktree branch.
 An exact Branch name wins over a Plan, Unit, or worktree alias.
 The staff lookup prefers present worktrees, then the latest row within each worktree state.
 An unregistered unit writes an empty cell and one named note.

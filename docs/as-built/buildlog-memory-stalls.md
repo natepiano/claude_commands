@@ -258,7 +258,7 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 - **The `(of …)` duration counts PSI pairs only.** It is the time of pairs where any PSI counter counted, so a host with only tick readings shows `0.0 s` sampled beside valid idle and iowait shares.
 - **A `SCHEMA_VERSION` raise changes `test_index.py`'s schema expectation.**
 - **The cgroup path assumes cgroup v2.** The scope string reads the unified `0::` line of `/proc/self/cgroup`.
-- **basedpyright exits 3 in every checkout.** `pyrightconfig.json` names an absent `.venv`. The lint result is the error and warning counts line, not the exit code.
+- **basedpyright** exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why it is this way
 

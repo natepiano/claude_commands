@@ -36,9 +36,8 @@ import change_review
 import proposals_folder
 import proposals_table
 from footer_counts import efficiency_ledger
-from production_units import read_production
-from production_units import Refusal
 from proposals_folder import slug_of
+from scripts.production.production_doc import Refusal, read_production
 from update_registration import RegistrationFailure, open_lists, question_queue
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))

@@ -232,9 +232,8 @@ counted among the open questions. It goes on this list, and the user asks for
 
 ### Producer ids
 
-The merge writer matches each checkpoint branch to a Units row.
-It reads that row's Worktree path and stores the unit's fixed staff id in Producer.
-An unregistered unit leaves the cell empty and prints one named note.
+The merge writer matches each checkpoint branch to a unit staff row and stores that row's id in Producer.
+A unit with no staff row leaves the cell empty and prints one named note.
 For `add`, `--repo` selects the directory; the default is `.`.
 A unit worktree stores its id.
 A showrunner directory or an unowned directory leaves the cell empty.

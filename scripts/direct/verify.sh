@@ -1289,7 +1289,9 @@ cancel_tree_run() {
     fi
     [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
     [[ -z "${MAC_RESULT_FILE:-}" ]] || rm -f "$MAC_RESULT_FILE"
-    printf 'verify.sh: cancelled — the tree changed while %s ran, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$CMD" >&2
+    local changed_path=""
+    if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
+    printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
     note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
     rm -rf "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""

@@ -243,57 +243,6 @@ Dropped 2026-10-30 by its own rule: no module that natedev's condition allows to
 
 **Ruled out:** choosing one base by the fewer `base..HEAD` commits (a merge's trunk commits count against the upstream base); a HEAD-to-tree supplement beside the intersection (it counted one removal twice after a production rename merge, and each reconciliation of it opened new owner or grouping edges).
 
-### Phase 7b — The assertion guard compares against the combined history of its bases  · status: todo
-**Depends on:** Phase 7
-
-Source: Phase 7 repair round 4 (landing rule; showrunner ruling 2026-10-31). Astra review `/tmp/claude/astra/20261031T113652Z-318765/review.md` items 1-3. Phase 7's per-base intersection hides a branch-made removal of an assertion whose text differs per base. Distinguishing test (clean tree, no conflicts, one test name): fork with `self.assertEqual(value, 1)`; pushed U changes it to `2`; P changes another file; merge U and P and replace the assertion with `pass`; add an unrelated commit. With no `--base` and `--head HEAD`, the guard must give exactly one blocking removal of `self.assertEqual(value, 2)`. The same hole covers a working-tree or index removal of an assertion whose text the merge changed (Phase 7 round 4 tried a HEAD-to-tree supplement; it double-counted after a rename merge, and Astra review `/tmp/claude/astra/20261031T121403Z-1704209/review.md` lists the owner, replacement and grouping edges a fix must handle): the guard must give exactly one blocking removal with HEAD's spelling, and its count on the tree or index must never exceed the `--base HEAD` count for local changes. Design inputs: Phase 7 round 3's merge-tree fold (saved in the Phase 7 run folder as `round3_wip/assertion_guard.py`), and that its whole-path conflict fallback reports imported removals. natedev-verify's explicit multi-`--base` tests require intersection semantics: the Work Order must name each one it changes. The Work Order is written when the phase starts.
-
-**From the Phase 7 plan review (architect, 2026-10-31):** The count limit covers only duplicate representations of local changes: a committed removal plus an unrelated local removal stays 2 blocking. Acceptance adds a distant header conflict where production already removed one assertion and the branch removes another (imported excluded, branch kept), and the same in the pending-merge and index case. The printed owner is HEAD's current test name; a ruling clears exactly that occurrence, and an identical assertion in another test stays blocking. Constraints: `commit_bases` stays the one selector; the commit hook keeps its HEAD/index and pending-merge behavior; explicit and VERIFY_ASSERTION_BASE bases keep their list and order; the shared revision cache and the CPU test (`test_large_diff_guard_call_uses_less_than_one_cpu_second`) stay; the lint cache-key test proves a changed comparison input invalidates a cached green lint. **Workers:** 1 writer + 1 tester. impl: `scripts/direct/assertion_guard.py`, `scripts/direct/tree_watch.py`. test: `test_assertion_guard_revisions.py`, `assertion_guard_test_support.py`, `test_verify_lint_guard_key.py`, `verify_assertion_guard_test_support.py`.
-
-#### Work Order
-
-**Goal:** with no explicit base, the assertion guard compares HEAD, the index or the working tree against one combined base, the merge of its bases, so a branch-made removal of an assertion whose text the merge changed counts once, with HEAD's spelling, and nothing the bases already removed or changed counts at all.
-
-**Spec:**
-- Combined base. When `commit_bases` returns more than one base and none was given by `--base` or `VERIFY_ASSERTION_BASE`, `run` builds one combined tree with `git merge-tree --write-tree` over those bases (folding them in order; the Phase 7 round 3 fold in `/tmp/claude/unit/fe59e5e3-0e2d-4361-a843-3881414f5f2e/phases/7/round3_wip/assertion_guard.py` is a design input) and compares the target against that tree in one pass. One base needs no fold. `commit_bases` stays the one selector.
-- Conflicts. A path the fold reports as conflicted is compared against each base and intersected for that path only (Phase 7's `intersect_findings`), never by a whole-path fallback that reports imported removals. A distant header conflict where production removed one assertion and the branch removes another gives the branch's removal only, for commit, index and pending-merge judgments.
-- Local changes. Compare the index and working tree against the combined tree.
-  Use no HEAD-to-tree supplement.
-  Count each local removal once.
-  Apply the local count limit after aggregation and rulings.
-  Apply that limit only to matching local occurrences.
-  Keep committed removals in the automatic total.
-  A committed removal and a distinct local removal produce two blockers.
-- Owners and rulings. The printed owner is HEAD's current test name. A ruling clears exactly that occurrence; an identical assertion in another test stays blocking (identical assertions in `test_a` and `test_b`, `test_a`'s removed in a commit and `test_b`'s locally, a ruling for `test_b`: `test_a`'s removal stays blocking). Apply aggregation and rulings before checking duplicate local occurrences.
-  Do not cap the automatic total at the total from `--base HEAD`.
-- Explicit bases. `--base` and `VERIFY_ASSERTION_BASE` keep their list, their order and Phase 7's per-base intersection. Name in the summary every natedev-verify multi-`--base` test whose expectation changes; the aim is none.
-- Keep: the commit hook's HEAD/index and pending-merge behavior, the shared `RevisionSourceCache`, `test_large_diff_guard_call_uses_less_than_one_cpu_second`, and the lint cache key in `tree_watch.py` (a changed comparison input, the combined tree included, invalidates a cached green lint).
-- New regressions, each red on 4b353c42: (a) the plan's distinguishing test above (fork `assertEqual(value, 1)`; pushed U changes it to `2`; P changes another file; merge U and P, replace the assertion with `pass`; add an unrelated commit; no `--base`, `--head HEAD` gives exactly one blocking removal of `self.assertEqual(value, 2)`); (b) the same removal made in the index and in the working tree instead, one blocker with HEAD's spelling each; (c) production renames `test_old` to `test_new`, the merge weakens `assertEqual(value, 1)` to `assertTrue(value)`, then a local removal: one blocker; (d) the header-conflict case; (e) the `test_a`/`test_b` ruling case; (f) a base test with two assertions whose signature HEAD changes, deleted in the tree: one grouped `test removed` blocker. Keep `test_local_removal_after_production_test_rename_is_counted_once` and the changed-spelling regression near `test_assertion_guard_revisions.py:1185` (one removal with HEAD's spelling in both modes).
-
-Assertion-Change: scripts/direct/test_assertion_guard_revisions.py::test_local_removal_after_production_test_rename_is_counted_once — with one combined base the automatic comparison reports HEAD's name; the expected owner changes from `test_old` to `test_new` (`:1128`), and the single-blocker assertion stays.
-
-**Files:**
-- `scripts/direct/assertion_guard.py` — the combined base, the per-path conflict intersection, local judgments against the combined tree
-- `scripts/direct/tree_watch.py` — the lint cache key carries the combined comparison input
-- `scripts/direct/test_assertion_guard_revisions.py` — regressions (a)-(f)
-- `scripts/direct/assertion_guard_test_support.py` — shared fixture steps for those histories
-- `scripts/direct/test_verify_lint_guard_key.py` — the cache key test for the combined input
-- `scripts/direct/verify_assertion_guard_test_support.py` — the one fake guard, if its surface changes
-
-**Workers:** 1 writer + 1 tester
-- `impl` — `scripts/direct/assertion_guard.py`, `scripts/direct/tree_watch.py`
-- `test` — `scripts/direct/test_assertion_guard_revisions.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/direct/test_verify_lint_guard_key.py`, `scripts/direct/verify_assertion_guard_test_support.py`, from this Spec alone
-
-**State:** none
-
-**Constraints from prior phases:** Phase 7 As-built above (one selector, one comparison path, owner-free identity). Phase 7 round 4's HEAD supplement double-counted after a rename merge; Astra reviews `/tmp/claude/astra/20261031T113652Z-318765/review.md` and `/tmp/claude/astra/20261031T121403Z-1704209/review.md` list the owner, replacement and grouping edges. Inspectors HEAD 03fafc1d6c with no `--base` gives 1 blocking; `~/rust/cargo-liner` `--base e21d5b93^ --head e21d5b93` gives `assertion guard: 73 blocking`; both must hold.
-
-**Acceptance gate:** each of `test_assertion_guard.py`, `test_assertion_guard_revisions.py`, `test_assertion_guard_strings.py`, `test_verify_assertion_guard.py`, `test_verify_assertion_guard_fake.py` and `test_verify_lint_guard_key.py` green in its own run (`python3 -m unittest discover -s scripts/direct -p <file>`), with (a)-(f) red on 4b353c42; the full merged-tree gate (`merge_gate.py --tests-only`) green before the checkpoint; `basedpyright` on each slot's files `0 errors, 0 warnings, 0 notes`; the director reruns the Inspectors and cargo-liner figures above and puts them in the checkpoint notice.
-Add a regression with one committed removal and one distinct local removal.
-The automatic comparison reports two blockers.
-The `--base HEAD` comparison reports one blocker.
-A ruling for the local occurrence leaves the committed occurrence blocking.
-
 ### Phase 7d — Small fixes fast-track to main  · status: done
 **Depends on:** Phase 8 (the one config reader; 7d lands after it and reads through it)
 
@@ -691,85 +640,114 @@ Every tool takes a unit's location from its staff row. A stale or absent Units W
 
 **Ruled out:** a fallback reader for a missing staff file; a walk up from a missing Plan folder to a parent checkout.
 
-### Phase 4v — Folder moves name what blocks them  · status: todo
+### Phase 4v — Folder moves name what blocks them  · status: done
 
-**Depends on:** Phase 4o
+#### As-built
 
-Source: the sdlc showrunner, 2026-11-03. The devtools folder move refused with `unit_move: processes inside <folder>: <pids>`. The blocker was a `codex app-server` left running for 29 hours by a `scripts/agents/test_codex_mesh.py` fixture. Goal change (user via sdlc, 2026-11-03 10:4x): "i hope we are REMOVING all of these guards rather than adding MORE code to look for them and suppress them"; "moving should be very simple - it should look for very few things - only things that would be catastrophic should be prevented". The first 4v attempt added proof and anomaly code for 11 repair rounds; it is saved at `<run>/phases/4v/pre_redo_4v.patch` and is not the base. `unit_move.py`, `herdr.py`, `pane_launch.py`, `pane_record.py`, `pane_restore.py` and their tests are back at `3f03870d5`.
-
-#### Work Order
-
-**Goal:** `unit_move.py move-folder` does four things and checks almost nothing: it stops the unit's session and pauses its workers, moves the folder, writes the staff row, and resumes. `unit_move.py` ends shorter than main's 1532 lines.
-
-**Spec:**
-1. Done in the tree (keep): the `test_codex_mesh.py` fixture starts no real app-server, and a guard fails a test that leaves an app-server or idle-stop watcher under its temporary folder.
-2. Done in the tree (keep): `test_assertion_guard_revisions.py` compares the guard's CPU time with a reference workload measured in the same test, not a fixed 1.0 second.
-3. Done in the tree (keep): `staff.py` refuses a doc or worktree path under a test root at the write entry; `test_verify_lint_guard_key.py` uses its own staff file.
-4. Done in the tree (keep): `merge_gate.py` gives each test module a private `STAFF_FILE` and `HERDR_PANE_RECORD_DIR`.
-5. Two refusals stay in code: a bad command line (no unit row with a present worktree, a unit on another machine, a destination inside the unit worktree) and a held move lock (`folder_move_lock`). Each prevents a catastrophe: a move with no source, and two moves of one unit at once. Write no check for an existing target: `git worktree move` refuses it; pass its error on.
-6. The move, in order:
-   1. Stop: stop the unit session with the existing stop helper (`stop_folder_session`). Pause each run of the unit that has a mesh with `codex_mesh.command_stop(pause=True)`, which keeps queued messages.
-   2. Move: `git worktree move <old> <new>`, then `pane_record.move_cwd` and `move_run`. If `git worktree move` fails, resume what step 1 stopped, then exit 1 with git's error.
-   3. Staff: `staff.set_worktree(unit, new, expected=old)`.
-   4. Resume: when step 1 stopped a running session, resume it with `resume_folder_session`. Its prompt names the move and the worker resume lines through `resume_message(..., moved_from, moved_to, workers=ResumeWorkers(codex_seats(runs), new))`, as `stop_resume.py:337` does. The move starts no worker itself. A stopped or paused unit stays stopped.
-7. Any other failed action (no launch record, several records, a changed pane, a failed pause, a different folder in a launch record) prints one line and the move goes on. `pane_record.move_cwd` skips a record with a different folder and prints one line.
-8. Delete every other check and the code that only feeds it: the process scan inside the folder and `_folder_boundary`, process identity proofs (`OwnedFolderProcess`, `observe_folder_process`, `folder_process_live`, launcher, server and watcher roots), worker selection and validation, the worker resume launch and its waits (`restore_folder_workers`, `_resume_worker`, `_start_worker_resume`, `_recover_worker_claim`, `_prove_folder_worker_idle`), the folder-move journal (`FolderMove`, `read_folder_move`, `save_folder_move`, step states), the call to `herdr.repair_retained_launches`, and the `FOLDER_MOVE_*_SECONDS` waits that only these use. Keep the rename helpers that `rename.py`, `rename_unit.py`, `retire_unit.py`, `add_unit.py` and `unit_watchdog.py` import.
-9. Rerun: a move whose staff worktree already equals the destination prints `unchanged` and changes nothing. A rerun after a crash: when the old folder is absent and the destination is the unit's worktree root, skip the git move and finish steps 3 and 4.
-
-Assertion-Change: scripts/production/test_unit_move.py, scripts/shutdown/test_pane_restore.py, scripts/shutdown/test_pane_record.py — tests of removed folder-move refusals, process proofs, worker resume waits and journal states are deleted (user goal change 2026-11-03: only catastrophic cases are prevented, spec 8).
-
-Assertion-Change: scripts/direct/test_assertion_guard_revisions.py::test_large_diff_guard_call_uses_less_than_one_cpu_second — renamed test_large_diff_guard_cpu_cost_stays_below_a_fixed_reference_workload; the fixed 1.0 CPU-second limit becomes a fixed multiple of a reference workload measured in the same test (spec 2), so contention slows both and a slow comparison still fails.
+- `move_folder` stops the session, pauses mesh runs without losing queued messages, moves the Git worktree, publishes staff, and resumes only its stopped session.
+- `folder_move_lock` serializes moves per staff row; `staff.set_worktree(..., expected=row.worktree)` checks the published location. Git rejects an occupied target; a failed Git move resumes the stopped session.
+- Claude signals use the `session_liveness` pid in the target pane. Resume requires `SessionNotLive` and a shell; unproved targets receive only a manual command.
+- Each selected history reaches `move_run`; each paused seat retains its task prompt and one move note. Other failures print one line.
+- `request_from` reads no staff. The commit check tries the production checkout first; an unavailable folder omits `merge_gate_wait` without stopping tests.
+- `merge_gate.py` assigns private `STAFF_FILE` and `HERDR_PANE_RECORD_DIR` paths. Mesh fixtures use a stub with leak checks; the CPU regression uses a reference workload.
 
 **Files:**
-- `scripts/production/unit_move.py` — the four steps; the deletions.
-- `scripts/shutdown/pane_record.py` — `move_cwd` skips a record with a different folder and prints one line.
-- `scripts/production/test_unit_move.py` — delete tests of removed checks; keep the `unchanged` rerun; the tests in Acceptance.
-- `scripts/shutdown/test_pane_restore.py`, `scripts/shutdown/test_pane_record.py`, `scripts/production/rename_test_support.py` — delete or adjust folder-move tests of removed checks.
-- `scripts/agents/test_codex_mesh.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/direct/test_assertion_guard_revisions.py`, `scripts/direct/test_verify_lint_guard_key.py`, `scripts/production/staff.py`, `scripts/production/test_staff.py`, `scripts/production/merge_gate.py` — done in the tree (specs 1-4).
+- `scripts/production/unit_move.py`, `scripts/shutdown/pane_record.py` — folder movement and launch-folder handling.
+- `scripts/production/merge_checkpoint.py`, `scripts/production/add_unit.py` — deferred staff lookup and launch-gate deletion.
+- `scripts/production/merge_gate.py`, `scripts/production/staff.py`, and their fixture tests — private state and test-root write protection.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `unit_move.py`, `pane_record.py`.
-- `test` — `test_unit_move.py`, `test_pane_restore.py`, `test_pane_record.py`, `rename_test_support.py`.
+**Binds later work:** Checkpoints merge into the unit's staff parent preserves deferred folder reads. Production tools read the row and `.unit.toml` preserves per-row locking and expected-location writes. Run owner and showrunner timers keyed by staff id has no move journal, process scan, identity-proof subsystem, or direct worker-resume waits.
+**Gotchas:** A crash rerun checks the destination's Git common directory against the repository named by staff metadata. It starts no session automatically.
+**Ruled out:** Move journals, folder process scans, worker relaunch proofs, and `FOLDER_MOVE_*` waits.
 
-**State:** the move writes the staff row, the launch record folder and the run marker; it keeps no journal. A rerun on a moved unit writes nothing.
+### Phase 4w — Folder paths live only in the staff row  · status: done
 
-**Constraints from prior phases:** never kill by pattern. Staff rows hold canonical unit names from `unit_names.name`. Phase 4q item 11 (workers start through the unit's resume message) is met by spec 6 step 4.
+#### As-built
 
-**Acceptance gate:** `wc -l scripts/production/unit_move.py` is below 1532. Tests: (a) a running Claude unit with one working worker: stop, pause, move, staff row, one resume with the worker's resume line; (b) a stopped unit moves and stays stopped; (c) a held lock refuses; (d) an existing target: git's error, the session resumed, exit 1; (e) a move with no launch record or a failed pause prints one line and finishes; (f) a rerun prints `unchanged` and writes nothing; (g) a crash rerun after the git move finishes. Run `scripts/production/test_unit_move.py`, `scripts/shutdown/test_pane_restore.py`, `scripts/shutdown/test_pane_record.py`, `scripts/production/test_rename_units.py`. `basedpyright` on each slot's files reads `0 errors, 0 warnings, 0 notes`. One review, then one director gate.
-
-### Phase 4w — Folder paths live only in the staff row  · status: todo
-
-**Depends on:** Phase 4s
-
-Source: the sdlc showrunner, 2026-11-03, with the user's words: "all i want is the simplest possible system ... i really really really feel that i should have a command right now that can rename things successfully and all duplication is gone"; "the staff is the one place". A unit's folder path is copied into several records, and each move or rename must change every copy. The staff row holds each session's first id and its current id after a /clear; Claude and Codex data are found by those ids, never by a folder path.
-
-#### Work Order
-
-**Goal:** the staff row's worktree is the only stored copy of a unit's folder path. Every reader takes the path from the staff row, and Claude transcripts and Codex threads are found by session id.
-
-**Spec:**
-1. List every record our code writes that holds a unit folder path: launch and recovery records, the shutdown record, the worker ledger, the mesh roster, the Units Worktree cell, run markers, and any other. For each, name its writer and its readers. Write the list to `docs/plans/sdlc-devtools-path-copies.md` and post it on the board before step 2.
-2. Make each reader take the path from the staff row (`staff.snapshot().by_id(...).worktree`) and delete the stored field and its writer. Switch every caller in the same change.
-3. Find a Claude transcript and a Codex thread by the staff row's session ids, never by a folder path. Do not move a transcript. If `claude --resume <id>` cannot find a transcript by its id from a new folder, post blocked with the evidence.
-4. `scripts/production/rename_unit.py` and `scripts/production/transfer_unit.py` stop writing the deleted copies and lose the code that only fed them.
-5. Add nothing new: each change deletes code or moves a reader to the staff row. `scripts/production/unit_move.py` belongs to Phase 4v; do not edit it. After 4v lands, the director merges it and the copies the move still writes are deleted in this phase.
-
-Assertion-Change: tests that assert a stored folder-path copy is written or updated are deleted or changed to read the staff row (user goal 2026-11-03: the staff row is the one place).
+- Staff supplies unit and worker folders; absolute Plan paths do not select another checkout. Run, pane, recovery, and resume readers ignore legacy folder copies.
+- Claude transcripts and Codex threads use session ids. Codex turns read the current staff folder; transcripts stay in place.
+- `launcher_command` remains task state. Resume replaces its first three task arguments and preserves task options.
+- The move restarts the sessions in the folder. A completed rerun changes no records and starts only a down director.
 
 **Files:**
-- `docs/plans/sdlc-devtools-path-copies.md` — the list (spec 1).
-- `scripts/production/rename_unit.py`, `scripts/production/transfer_unit.py` — stop writing copies.
-- `scripts/shutdown/` — launch, recovery and shutdown records lose the folder field; readers use staff.
-- `scripts/agents/` — the mesh roster and worker ledger lose the folder field; readers use staff.
-- `scripts/production/` — other readers and their tests, except `scripts/production/unit_move.py` and `scripts/production/test_unit_move.py`.
+- `docs/plans/sdlc-devtools-path-copies.md` — record writers, readers, and retained task fields.
+- `scripts/production/{unit_lookup,unit_move,rename_unit,transfer_unit}.py`, `scripts/direct/{plan_history,progress_history}.py` — staff-folder joins without path-copy journals.
+- `scripts/shutdown/`, `scripts/agents/codex_mesh.py`, `scripts/lib/resume_message.py` — identity-based discovery and current-folder launch behavior.
 
-**Workers:** `1 writer + 1 tester`
-- `impl2` — source files.
-- `fix` — test files; regressions that a reader gets the path from the staff row.
+**Binds later work:** Units tables have no Worktree column and Checkpoints merge into the unit's staff parent use staff-only folders. Small stores keyed by staff id and Production tools read the row and `.unit.toml` use the same folder source. Run owner and showrunner timers keyed by staff id keeps no folder copy. Transfer preserves the move's restart behavior.
+**Gotchas:** `SessionNotFound` and `NotRunning` do not prove the saved pid stopped; restart checks that pid. `unchanged` and `resumed` distinguish move rerun outcomes.
+**Ruled out:** Absolute-Plan routing, worker-folder copies, transcript relocation, rename journals, and old-name sweeps.
 
-**State:** deletes stored folder-path fields; old records keep their extra field until rewritten, and readers ignore it.
+### Phase 4g — Both promotions use one rule for local edits  · status: done
 
-**Acceptance gate:** `rg` for each deleted field finds no writer. A test per record kind proves its reader follows a staff row change with no record rewrite. A rename and a transfer test pass with no copy written. `basedpyright` per slot reads `0 errors, 0 warnings, 0 notes`. One review, then one director gate.
+#### As-built
+
+`merge_gate.promotion_edit_conflict(repo: Path, target: str) -> str` reads staged edits and worktree edits through a fresh index. Local and Mac promotion and `merge_checkpoint.promote_local_checkout` reject only edited paths changed between `HEAD` and the target before `git merge --ff-only`. The fake Git helper in `test_fast_track.py` releases its commit FIFO in `finally`.
+
+**Files:**
+- `scripts/production/{merge_gate,merge_checkpoint}.py` — shared promotion rule and callers; their promotion tests cover both outcomes.
+- `scripts/production/test_fast_track.py` — unconditional FIFO cleanup.
+
+**Binds later work:** Checkpoints merge into the unit's staff parent and Production tools read the row and `.unit.toml` preserve the shared promotion rule.
+**Ruled out:** Promotion refusal for every tracked edit.
+
+### Phase 4f — The bump gate tests the pushed tip  · status: done
+
+#### As-built
+
+The bump gate tests the pushed tip in a detached clone. `tree_watch.py` records the first changed watched path beside its fired file. The cancellation line in `verify.sh` names that path.
+
+**Files:**
+- `scripts/direct/{tree_watch.py,verify.sh,test_tree_watch.py,tree_watch_test_support.py}` — changed-path reporting and its regression.
+
+### Phase 4e — The change row date is in the user zone  · status: done
+
+#### As-built
+
+The merge gate uses `change_review.today()` for the user-zone date. Its test computes the expected date in the gate's fixture environment. The UTC-boundary regression checks that 01:00 UTC on November 4 writes November 3.
+
+**Files:**
+- `scripts/production/test_merge_gate.py` — fixture-zone expectations and the UTC-boundary regression.
+
+### Phase 4b — 4w merge reds repair  · status: done
+
+#### As-built
+
+Fixture staff rows hold unit folders; add-unit assertions read staff and expect a dash in the legacy table. Watchdog, inventory, and identity-migration fixtures publish the staff facts their readers use. A missing staff file reads as empty staff; the missing-file merge-refusal test is absent.
+
+**Files:**
+- `scripts/{accounts/test_unit_watchdog,shutdown/test_inventory,production/test_add_unit,production/test_migrate_staff_ids,production/test_merge_gate}.py` — staff-based fixtures and expectations.
+
+**Binds later work:** Checkpoints merge into the unit's staff parent and Production tools read the row and `.unit.toml` retain empty-staff semantics and explicit fixture locations.
+
+### Phase 4d — Every Units table reader reads staff  · status: done
+
+#### As-built
+
+- Staff supplies membership and row order with canonical names from `unit_names.name`; `.unit.toml` supplies unit configuration, including Port and `nightly-review` responsibility; Git supplies the branch.
+- `Production`, `read_production`, `production_field`, `Refusal`, and `WRAPPED` live in `scripts/production/production_doc.py`, without `update_registration` or `tidy_wrapped` imports.
+- `UnitMetadata` retains metadata and `UnitProblem` diagnostics for partial reports. `transfer_unit.apply` changes only the staff parent under the per-row move lock.
+- `unit_table.py` and `audit_unit_ports.py` are absent. `unit_phases.py` replaces `units_table.py`; `display_cells.py` replaces `unit_table_cells.py`. The style `split-all` command is absent.
+
+**Files:**
+- `scripts/production/{production_doc,unit_lookup,unit_phases,display_cells}.py` — document fields, staff facts, phase projection, and display cells.
+- `scripts/production/`, outside readers, command text, and fixture builders — staff and `.unit.toml` consumers without table writes.
+
+**Binds later work:** Units tables have no Worktree column and Checkpoints merge into the unit's staff parent use these sources. Small stores keyed by staff id and Production tools read the row and `.unit.toml` retain these module names. Run owner and showrunner timers keyed by staff id uses staff and `.unit.toml`.
+**Gotchas:** `production_units.py` retains only `Refusal` and `production_field` re-exports for `merge_gate.py`. The table-removal helper and absolute-Plan resolver no longer exist.
+**Ruled out:** A table-removal script, a second row-order field, and special unit-name constants for nightly review.
+
+### Phase 4y — basedpyright exits 0 when the tree is clean  · status: done
+
+#### As-built
+
+`pyrightconfig.json` has no `venvPath` or `venv`; a clean checkout needs no `.venv`. `merge_gate` requires status 0 and a clean basedpyright footer; status 3 fails even with a clean footer. The gate retains its pinned `--pythonpath`. Tests cover statuses 0, 1, and 3, including a real clean file without `.venv`.
+
+**Files:**
+- `pyrightconfig.json`, `scripts/production/{merge_gate.py,merge_gate_test_support.py,test_merge_gate_suites_types.py,test_merge_gate_suites_tripwires.py}` — configuration and result checks.
+
+**Binds later work:** Checkpoints merge into the unit's staff parent preserves status-0 judging and changes the separate `merge_checkpoint.test_passed` judge.
+**Gotchas:** `merge_checkpoint.test_passed` still accepts status 3.
 
 ### Phase 4u — Units tables have no Worktree column  · status: todo
 
@@ -783,10 +761,12 @@ Source: split from Phase 4s (director, 2026-11-03). After 4s no tool reads the c
 
 **Spec:**
 1. One heading-based operation in `scripts/production/unit_table.py` removes the complete Worktree column after the caller proves item 3. Remove the header, separator cell, and every row cell together. Keep other tables, extra columns, retirement notes, and other text. A second run changes nothing.
-2. Writers stop writing the cell: `add_unit.desired_row` (`add_unit.py:439`) and `append_row` (`:759`), `rename_unit._doc_text` (`rename_unit.py:477`), `rename._unit_doc` (`rename.py:773-784`), `transfer_unit._row_line` (`transfer_unit.py:332`, both table layouts), `style/add_style._unit_row` (`add_style.py:190`), `_production_text` (`:209`) and its pilot-row replacement. Each writer that edits an existing table removes the column through the operation in item 1.
+2. Writers stop writing the cell: `add_unit.desired_row` (`add_unit.py:439`) and `append_row` (`:759`), `rename_unit._units_display` (`rename_unit.py:91`), `rename._unit_doc` (`rename.py:773-784`), `transfer_unit.apply` (`transfer_unit.py:74`, both table layouts; today it writes a dash), `style/add_style._unit_row` (`add_style.py:190`), `_production_text` (`:209`) and its pilot-row replacement. Each writer that edits an existing table removes the column through the operation in item 1.
 3. Before removal, the caller checks every Units row against one staff snapshot. Each row needs its matching member and a typed location (`PresentWorktree` or `RemovedWorktree`). If any member or location is unavailable, keep the entire Worktree column, including its header and separator. Name each unavailable row for repair; never remove only some cells. Admission can precede membership publication (`add_unit.py:1428-1446`); keep the column during that pending state. A new proposed location does not prove published membership. Test mixed valid and `WorktreeUnfilled` rows, missing membership, unreadable staff, and admission before publication. After all required facts are published, remove the column once; a rerun changes nothing.
 4. `docs/production_format.md:143` and `:158`, `commands/producer/to_production.md:105` and `commands/showrunner/rename.md:35` say the staff row owns the location.
 5. Test fixtures change to the new layout. Some legacy fixtures stay for the tests that read an old table.
+
+**Review amendment (Phase 4w plan review, 2026-11-03):** the unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`). Drop every rule that routes by an absolute Plan path or keeps a worker folder copy. Replace the Plan-routing test (`test_merge_checkpoint.py:74`) with assertions on the folder each command runs in.
 
 **Files:**
 - `scripts/production/unit_table.py` — column removal.
@@ -820,78 +800,84 @@ Source: sdlc showrunner ask, 2026-11-03 04:5x; design accepted 05:0x; second wor
 **Spec:**
 0. Make the 4s tip green with `origin/main`:
    1. Merge `origin/main` into `sdlc-devtools-lane2` with `git merge --no-ff`. Resolve the conflicts in `scripts/direct/assertion_guard.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/direct/test_verify_lint_guard_key.py` and `scripts/usage/{outcomes,test_outcomes,test_usage_report,test_waste_watch,usage_report}.py`. Keep both sides' behavior.
-   2. `merge_checkpoint.py` reads the staff record in one place for each run. Phase 4s reads it in `parse_units` (`merge_checkpoint.py:371`). Phase 17l (`6c10240c8`) reads it again through `change_review.publication_changes` before the push. Take one snapshot and pass it to both. An unreadable record keeps 17l's stop text and pushes nothing.
-   3. The `test_merge_checkpoint_rerun.py` tests write the staff rows they read, as Phase 4s tests do. The five tests that fail with "cannot read staff record" or "invalid staff JSON" pass.
+   2. `merge_checkpoint.py` reads the staff record once for each run. Today `other_units` (`merge_checkpoint.py:296`), `run` (`:702`) and `change_review.publication_changes` (`change_review.py:974`, called at `merge_checkpoint.py:1499`) each take a snapshot; `parse_units` reads no staff. Take one snapshot and pass it through parent selection, folder lookup, reporting and publication. An unreadable record keeps 17l's stop text and pushes nothing.
+   3. The `test_merge_checkpoint_rerun.py` tests write the staff rows they read, as Phase 4s tests do. The five tests that fail with "cannot read staff record" or "invalid staff JSON" pass. Change the tests that let publication run with no readable staff or no registered unit (`test_merge_checkpoint_rerun.py:154`): they cannot prove staff-parent routing.
 1. `merge_checkpoint.py` takes the production from the unit's staff parent. When the named production differs from the parent, it refuses before any merge and names the parent. A rerun after a refusal changes nothing.
 2. A Units row holds plan and branch data only. A unit row in a production doc that is not its staff parent is a doc-check refusal that names the row and the parent.
-3. `transfer_unit.py apply` accepts a unit whose staff row moved first (`transfer_unit.py:156`). It moves the herdr, shutdown and style rows. A rerun changes nothing. Before each live `apply`, the director sends the showrunner a note; tests use fixture records only.
+3. `transfer_unit.py apply` changes only the staff parent and the Units rows (Phase 4w, `transfer_unit.py:61`). Keep that, and keep the staff-first transfer tests (`test_transfer_unit.py:74`, `:89`). Add no herdr, shutdown or style row moves.
 4. No change to `pm.sh`.
+5. Delete the basedpyright status-3 acceptance in `merge_checkpoint.test_passed` (`merge_checkpoint.py:924-933`) and its docstring text: after Phase 4y, basedpyright exits 0 on a clean tree. A basedpyright Merge tests command passes on status 0 with its clean summary line. Change the tests that assert status 3 is green, and `docs/as-built/showrunner-automation.md:274`.
 
 **Files:**
 - `scripts/production/merge_checkpoint.py` — one staff snapshot; staff-parent routing.
 - `scripts/production/change_review.py` — accepts the snapshot (step 0.2), when its signature needs it.
-- `scripts/production/transfer_unit.py` — staff-moved-first apply.
 - `scripts/production/test_merge_checkpoint_rerun.py`, `scripts/production/test_merge_checkpoint.py`, `scripts/production/test_merge_checkpoint_validation.py`, `scripts/production/merge_checkpoint_test_support.py` — staff rows, parent routing and refusal tests.
-- `scripts/production/test_transfer_unit.py`, `scripts/production/transfer_unit_test_support.py` — staff-moved-first apply and rerun.
 - `scripts/direct/assertion_guard.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/direct/test_verify_lint_guard_key.py`, `scripts/usage/outcomes.py`, `scripts/usage/test_outcomes.py`, `scripts/usage/test_usage_report.py`, `scripts/usage/test_waste_watch.py`, `scripts/usage/usage_report.py` — the step 0.1 conflict files.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — the merge (step 0.1) and the source files.
 - `test` — the test and test-support files.
 
-**State:** `merge_checkpoint.py` reads the staff record once per run and writes nothing new. `transfer_unit.py apply` moves the herdr, shutdown and style rows of one unit; a rerun changes nothing.
+**State:** `merge_checkpoint.py` reads the staff record once per run and writes nothing new.
 
 **Constraints from prior phases:** Phase 4s readers take the worktree from staff and ignore the Units Worktree cell. A requested checkpoint refuses with the unit and folder; unrelated rows do not block it (`merge_checkpoint.py:277-306`). Keep the requested-checkpoint regressions in `test_merge_checkpoint.py`. Phase 4v (beside this phase, in `/home/natepiano/worktrees/devtools`) owns `staff.py`, `unit_move.py`, `herdr.py`, `pane_launch.py` and `merge_gate.py`: read only here.
 
-**Acceptance gate:** the merged tree passes the five `test_merge_checkpoint_rerun.py` tests. A checkpoint for a unit whose named production differs from its staff parent refuses before any merge and names the parent; a matching one merges. A row in a non-parent doc fails the doc check. `transfer_unit.py apply` after a staff move moves the three row kinds once; a rerun changes nothing. Each writer runs `python3 -m unittest` on at most 4 named test files per run. Require `0 errors, 0 warnings, 0 notes` from `basedpyright` for each slot. One director gate (`merge_gate.py --tests-only --full`).
+**Acceptance gate:** the merged tree passes the five `test_merge_checkpoint_rerun.py` tests. A checkpoint for a unit whose named production differs from its staff parent refuses before any merge and names the parent; a matching one merges. A row in a non-parent doc fails the doc check. Each writer runs `python3 -m unittest` on at most 4 named test files per run. Require `0 errors, 0 warnings, 0 notes` from `basedpyright` for each slot. One director gate (`merge_gate.py --tests-only --full`).
 
-### Phase 4q — The folder move uses its owners' readers  · status: todo
+### Phase 4q — The folder move uses its owners' readers  · status: done
 
-**Depends on:** Phase 4o
+#### As-built
 
-Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy that Phase 4o added; the owners' modules are outside the 4o file set.
-
-#### Work Order
-
-**Depends on:** 4v.
-
-**Goal:** the folder move keeps no private copy of a rule that another module owns, and each owner's callers all use the one copy.
-
-**Spec:**
-1. `workers._moved_path` (`workers.py:1726`) becomes public. `unit_move.moved_folder_argument`, `rename_unit._moved` (`rename_unit.py:933`) and the inline rule at `progress_history.py:478` call it.
-2. `move_folder_worker_paths` calls `workers.repoint_unit_worktree`. Its `repoint_roster` (`workers.py:1870`) also moves `instructions_file` and `authorized_prompt`. Settle the `unit_ledger` difference in the merge.
-3. One shared step pauses runs, classifies run processes and stops them, in `unit_move`. `rename_unit._stop_runs` (`rename_unit.py:899`) and `retire_unit.run_processes` (`retire_unit.py:439`) use it. Keep the stronger proof: start time plus exact argv, and detached `mesh_runs` supervisors. Classification is a read-only call; stopping is a separate call. `rename_unit.check_stoppable` (`rename_unit.py:364`) uses only the classification in preflight; keep `test_rename_unit_processes.py:188` (refusal with no signal).
-4. `codex_mesh` exposes `recorded_run_servers(run)`, `is_run_server(pid, port, run)`, `is_worker_launcher(pid, run, name)` and `run_watcher(arguments)` beside their writers. `unit_move` and `retire_unit.py:460` call them.
-5. `unit_move` drops `PriorFolderWorker` and checks a status against `codex_mesh.ENDABLE_STATUSES`, with the classes of a public `_roster_thread` (`codex_mesh.py:636`). The exit code for an unknown status stays 1.
-6. `resume_message` exposes `resume_prompt_path(seat)` and `add_resume_note(seat, note)`. `unit_move`, `rename_unit.py:973`, `resume_message.py:87` and `inventory.py:818` use them, with one atomic write form.
-7. `herdr.child_environment` (`herdr.py:871`) owns one list of session identity variables, and `unit_move` uses it. The change to `herdr.py` goes through herdr-unit. First define the required launch environment for each caller and test the inherited identities: `herdr.child_environment` (`herdr.py:903`) removes fewer identity variables than either folder-resume path, the unit path removes `HERDR_TAB_ID` and the worker path removes `STAFF_OPERATION_FD`.
-8. `progress_history` exposes one call that returns the run states for a history file; `move_run` (`progress_history.py:499`) and `unit_move.folder_runs` use it.
-9. A worker process that exits between the liveness check and its argument read in `pause_folder_workers`, or just after `Popen` in the resume path, reads as exited; the move goes on. Add a regression test for each read.
-10. Each `codex_mesh` import in `unit_move` comes after the early exits, so a move whose runs have no mesh imports no `codex_mesh`.
-11. Copy removals from the Phase 4o review (sdlc showrunner ruling, 2026-11-02; where two copies differ, keep the owner's rule): the move starts workers through the unit's resume message, as `stop_resume.py:337` and `restart.py:2246` do, and starts no worker itself; one worker resume path keeps the `codex_seats` "was working" rule; one `codex_mesh.pause_run` serves `unit_move` and `rename_unit.py:909`, in place of the `Namespace` call and the subprocess call; `codex_mesh` owns "unpause an idle worker" for a run and its idle workers, and `unit_move` writes no roster status; `has_mesh` comes from the mesh files only; the move record always holds `sessions`, and the legacy branch goes.
-12. For each of these, first find why the code is as it is: two folder scans (`unit_move.py:736, 1237`) — is the second needed?; does `codex_mesh` lock the app-server start, so all workers can start before one wait loop?; does anything read `launcher_command` of a worker that is not running (else list Codex seats only for runs with a running worker)?; why the unlocked first roster read (can all runs be checked under the locks before any write)?; can a run state folder have another name, and who writes it (else read the run's own state file first)? The director settles each item under DecisionEconomy and states the call in one line (user via builds and the sdlc showrunner, 2026-11-02). Only an item that touches money, safety, behavior the user sees, or an act that cannot be undone goes to /unit:question, and its change waits for the user's answer.
-13. Resources-unit P47 (`fd1508d72` on `builds-resources`) moves `UseConfiguredValue` to `scripts/lib/conf.py` with one definition; devtools accepted it on 2026-11-03. At 4q start, confirm that it is on the merge branch with `rg -n 'class UseConfiguredValue' scripts` (one hit, `scripts/lib/conf.py`). If it is not there, do this move as written in the binding below. Keep the settings-sharing regression in `test_rename_unit_processes.py:207` and the `test_conf.py` read-count and recovery tests.
+The affected account, checkpoint, merge-gate, status, and log fixtures publish staff rows and `.unit.toml` files instead of table rows. An unregistered producer stays empty and receives one note naming the checkpoint branch. Source APIs remain unchanged.
 
 **Files:**
-- `scripts/production/unit_move.py`, `scripts/direct/workers.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/agents/codex_mesh.py`, `scripts/lib/resume_message.py`, `scripts/shutdown/inventory.py`, `scripts/direct/progress_history.py`, `scripts/herdr/herdr.py` — source.
-- `scripts/production/test_unit_move.py`, `scripts/production/test_rename_unit.py`, `scripts/production/test_retire_unit.py` — regressions.
-- `scripts/lib/conf.py`
-- `scripts/issue_score/selection.py`
-- `scripts/issue_score/apply_labels.py`
-- `scripts/accounts/next_moves.py`, `scripts/direct/simplify_result.py` — configuration-default consumers.
-- `scripts/issue_score/{blind,client,decide,evaluate,questions,records,score_issues,vault}.py` — configuration-default consumers.
-- `scripts/production/test_rename_unit_processes.py`, `scripts/lib/test_conf.py`, `scripts/accounts/test_next_moves.py` — ownership and configuration preservation.
-- `scripts/issue_score/test_score_issues.py`, `scripts/issue_score/test_config.py` — configuration-default consumers.
+- `scripts/production/test_{add_unit_accounts,merge_checkpoint_rerun,merge_gate,producer_backfill,unit_status_dailies,unit_status_routing,update_registration_log}.py`, `scripts/production/unit_status_test_support.py` — staff fixtures and exact producer diagnostics.
 
-**Workers:** `1 writer + 1 tester`.
-- `impl` — all source files above, including `conf`, `selection`, `accounts/next_moves`, `direct/simplify_result`, and the eight issue-score consumers.
-- `test` — all test files above, including `test_conf`, `test_rename_unit_processes`, `test_next_moves`, `test_score_issues`, and `test_config`.
+**Binds later work:** Checkpoints merge into the unit's staff parent preserves the empty-producer diagnostic. Production tools read the row and `.unit.toml` preserves explicit staff and configuration fixtures.
 
-**State:** none; behavior stays the same.
+### Phase 4c — A resumed showrunner reads its next list from the state file  · status: done
 
-**Constraints from prior phases:** Phase 4o pauses and resumes workers on their same threads. Keep every `test_unit_move.py` test green. Staff rows hold canonical unit names from `unit_names.name`. A missing absolute Plan folder is unavailable (`staff.StaffUnreadable`; `unit_lookup.py:107-108`). A requested checkpoint refuses with the unit and folder; unrelated rows do not block it (`merge_checkpoint.py:277-306`). Read-only consumers report the bad row and keep the other rows. Keep `test_unit_lookup.py`, the requested-checkpoint regressions in `test_merge_checkpoint.py`, and the partial-report regressions.
+#### As-built
 
-**Acceptance gate:** Phase 4v passes first. Keep its refusal-before-stop tests and the `staff.set_worktree(..., expected=row.worktree)` guard (`unit_move.py:1494`). Keep the settings-sharing, lookup, requested-checkpoint, and partial-report regressions. `grep` shows one definition of each rule above. Each changed module's existing suite passes without assertion changes. Require `0 errors, 0 warnings, 0 notes` from `basedpyright` on changed files and their callers. Run each test file with `unittest discover`. The full gate passes.
+`load --resume` reads `showrunners.session_state_dir(slug) / "showrunner_state.json"` through `update_registration.judgment_state`. It prints the current `next` list or `no next list`; refused state produces one anomaly without stopping load. `showrunner-compaction.py` supplies only SessionStart text; no PreCompact writer or registration remains. `log --before-compaction` remains a manual command.
+
+**Files:**
+- `scripts/production/production_lifecycle.py`, `scripts/hooks/showrunner-compaction.py`, `settings.json`, and their tests — current state reading without a compaction write.
+
+**Binds later work:** Run owner and showrunner timers keyed by staff id and Production tools read the row and `.unit.toml` preserve this state-file source.
+
+### Phase 4z — Retire is a staff operation  · status: done
+
+#### As-built
+
+Retire stops the unit and worker staff rows by `current_session`. It refuses uncommitted work and commits missing from the merge branch; a sole added `Project started` line does not count. Resource releases and folder-process SIGTERM remain. `RemovedWorktree` records retirement on the retained staff row; resume by name or id restores that row from the merge branch. Rename uses the staff name without session-name or former-name selectors.
+
+**Files:**
+- `scripts/production/{retire_unit,resume_unit,rename}.py` and their tests — staff retirement, restoration, and naming.
+- `commands/showrunner/retire_unit.md`, `docs/as-built/` — retirement behavior.
+
+**Binds later work:** Production tools read the row and `.unit.toml` preserves retirement identity, lost-work refusals, the recorder-line exception, and resource releases. Small stores keyed by staff id uses staff-name selection.
+**Ruled out:** Saved branch refs, retired notes, and `--wait-minutes`.
+
+### Phase 4h — A folder move restarts a unit with no launch record  · status: done
+
+#### As-built
+
+`NoFolderLaunch` does not prevent stopping `current_session` through `stop_resume.stop`. After `staff.set_worktree`, a fresh snapshot supplies `restart.start_row(row, record, herdr.Herdr(herdr.shared_session()))`. This path restarts only a unit that was live before the move. A stop or start failure prints one `unit_move:` line without undoing the move.
+
+**Files:**
+- `scripts/production/{unit_move.py,test_unit_move.py}` — no-record stop/start behavior and its regression.
+
+**Binds later work:** Checkpoints merge into the unit's staff parent and Production tools read the row and `.unit.toml` preserve this identity-based restart path.
+
+### Phase 4l — Main sync sends a blocked state once per window  · status: done
+
+#### As-built
+
+`main_sync.py` keeps no blocked marker; `record()` only appends the log line. Each blocked run with `--notify` sends through `send.py --key main-sync-<host>-<state> --repeat-minutes <M>`, with `<M>` from `send.conf` `main_sync_repeat_minutes`. The fetch-failed text advises `github-warmup` only when `github-warm-status` fails, is missing or passes its 5-second limit; at exit 0 it names a likely GitHub incident. Checkpoint 5e796820d on `sdlc-devtools-sync`, off main 48dc96882.
+
+**Files:**
+- `scripts/lib/{main_sync.py,test_main_sync.py}`, `config/send.conf` — send-once through send.py and its regressions.
 
 ### Phase 4r — One config read serves many settings  · status: done
 
@@ -945,6 +931,8 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Sta
 5. **Proposal `unit:`** (`proposal_issue.py:261`; 4 readers): the issue field holds the staff id, and readers show the row's name. The proposals folder also holds question records, which Phase 4i already keyed by staff id. A production with no Proposals line keeps its question records in `<state>/<showrunner staff id>/questions` instead (Phase 4j, `update_registration.question_folder`); the migration does not touch that folder. The migration changes proposal records only; each question record keeps its contents, timestamps, `production_id` and `asked_by` byte for byte. A shared-folder regression holds both kinds of record and checks proposal ownership and the `/showrunner:questions` table after the migration, after a rename and after a transfer.
 6. **Stall stretch** (`stall_watch.py:412` `stretch_path`; 4 readers): stretch files, prompt files and notification keys by staff id. The migration cancels and re-sends a live alert under the new key, so elapsed time and cancellation survive (old Phase 3h). The moves in `rename_unit.py`, `rename.py` and `transfer_unit.py` go. `PROMPT_ALERT_SECONDS = 60` (`stall_watch.py:66`) moves to `config/production.conf`, read at use through `conf.read("production")`, one read for each pass, with a changed-config test. `stall_watch.py` belongs to messaging-unit: coordinate this item with it, outside the devtools store landings.
 
+**Review amendment (Phase 4w plan review, 2026-11-03):** the unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`). Drop every rule that routes by an absolute Plan path or keeps a worker folder copy. Replace the Plan-routing test (`test_merge_checkpoint.py:74`) with assertions on the folder each command runs in.
+
 **Files:**
 - `scripts/production/change_review.py`, `scripts/direct/phase_table.py`, `scripts/direct/board_json.py`, `scripts/production/proposal_issue.py`, `commands/change_review.md` — the four stores' writers and readers; every other reader that a store's inventory search finds joins its step.
 - `scripts/production/change_routing.py` — remaining change-review consumers; preserve current-parent routing.
@@ -967,6 +955,8 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Sta
 
 ### Phase 3t — Production tools read the row and `.unit.toml`  · status: todo
 
+> **Note (herdr-unit, 2026-11-04):** herdr Phase 4r (`90b975402` on `natedev-herdr`) deletes `staff_check.py` and `test_staff_check.py`. When 4r is on main, drop this phase's checker items and its checker acceptance gate.
+
 Source: herdr-unit plan Phase 3t, given to devtools-unit by sdlc 2026-11-02. Starts after herdr-unit's 3s and after models-unit's Phase 4 lands.
 
 **Depends on:** 3s. Shared gate with 3u/3v over the exact final batch; before the record and deletion stages.
@@ -982,6 +972,8 @@ Source: herdr-unit plan Phase 3t, given to devtools-unit by sdlc 2026-11-02. Sta
 4. History stays history: a reader that reports who owned a past commit or run keeps what the artifact recorded (old 3i rule).
 5. **The resume recovery type states its guarantee (moved here from the Phase 3r closure review, 2026-11-01).** `resume_unit.py:89` holds `recovery: UnitConfig | NoRetiredSession`. A `UnitConfig` can lack the retirement facts, and the sentinel means only that no recovery file is outstanding, so the callers keep the guarantee by procedure. Replace it with one named recovery type whose retirement facts are mandatory, and a separate `NoRecoveryRequired` state. A test pins that a recovery value without the retirement facts cannot be made.
 6. **An unreadable staff record is its own result (Phase 4i review, 2026-11-02).** The question readers that join staff (`scripts/hierarchies/measure.py`, the review sample in `scripts/notify/review.py`) give an explicit incomplete-read result when `staff.json` cannot be read, distinct from confirmed absence. `measure` prints it as one note and never refuses (user, 2026-11-02). The review sample never classifies a stored question as unregistered from an unreadable record. Tests inject an unreadable staff record and show the two results differ.
+
+**Review amendment (Phase 4w plan review, 2026-11-03):** the unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`). Drop every rule that routes by an absolute Plan path or keeps a worker folder copy. Replace the Plan-routing test (`test_merge_checkpoint.py:74`) with assertions on the folder each command runs in.
 
 **Files:**
 - `scripts/production/{add_showrunner,add_unit,change_review,ci_points,codex_winddown,completion_receipt,footer_counts,log_backup,merge_checkpoint,merge_gate,next_item,production_lifecycle,promote_showrunner,proposals_folder,proposals_table,prune_phase_notes,resume_unit,retire_unit,roles_audit,staff_check,stall_watch,style_units,unit_run,update_registration,waiting}.py` — the readers item 1 lists (ac680222); a reader the search finds at dispatch joins them.
@@ -1028,6 +1020,8 @@ Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Sta
 **Spec:** The same rule as Phase 3x, one store per landing with its own real proof, for:
 1. **Run owner** (`progress_history_state.json`; find all readers with `grep -rln progress_history_state scripts`): new runs record the unit's staff id; old runs keep their names as history. Use one source for each folder kind: the director folder comes from staff; the branch folder uses `unit_lookup.plan_worktree`. A relative Plan uses the director folder; an absolute Plan uses its existing folder's Git root. The worker folder comes from its run record, not staff (`progress_history.py:475,484`). Test three distinct folders through migration: the director folder, the absolute Plan's branch folder, and the worker's run folder. Keep the worker's folder and thread. A completed rerun changes no stored bytes and preserves all three folder roles.
 2. **Showrunner timers** (`~/.local/state/notifier/showrunner-<slug>/`, written by `update_registration.py`, read by `notifier.sh`, `statusline.sh`, `showrunners.registered_showrunners` and about 37 files): the folder is `showrunner-<staff id>`, and its `CHECK` line passes the staff id, so `production_check.sh` reads the doc from the row. The timer keeps its session, socket, zone and interval (decision 16), and `showrunners.timer_for` reads the folder by staff id, so its doc join (Phase 3s) goes. The search for readers covers `commands` and the Codex mirror too (`produce.md`'s `UPDATES`). The messaging unit owns `notifier.sh`; agree it first. Two question readers take meaning from the folder name and switch in the same landing (Phase 4i review, 2026-11-02): `scripts/hooks/showrunner_footer.py:112` takes the production slug from the timer folder name, and `scripts/production/tidy_wrapped.py:87` refuses cleanup while `showrunner-<slug>` exists. After the migration, tests show that cleanup still refuses while the production has a timer, the footer reminder and question counts stay the same, and a deferred question still expires on time.
+
+**Review amendment (Phase 4w plan review, 2026-11-03):** the unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`). Drop every rule that routes by an absolute Plan path or keeps a worker folder copy. Replace the Plan-routing test (`test_merge_checkpoint.py:74`) with assertions on the folder each command runs in.
 
 **Files:**
 - `scripts/hooks/showrunner_footer.py`, `scripts/production/tidy_wrapped.py`, `scripts/hooks/test_showrunner_footer.py`, `scripts/production/test_tidy_wrapped.py` — the timer-dependent question readers and their tests.

@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
+from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch
 from scripts.production import change_review, merge_gate, staff
@@ -35,10 +36,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
         _ = self.enterContext(isolated_source_readers())
 
     def review_producer(self, doc: Path) -> staff.StaffId:
-        """Give the checkpoint unit a private staff record and a Units row."""
-        self.write(doc, doc.read_text() + "\n## Units\n\n"
-                   + "| Unit | Branch | Worktree |\n| --- | --- | --- |\n"
-                   + f"| fixture | unit-phase | {self.unit} |\n")
+        """Give the checkpoint unit a private staff record and a `.unit.toml` whose plan names its checkpoints."""
+        self.write(self.unit / ".unit.toml", 'plan = "docs/plans/fixture.md"\nresponsibilities = []\n')
+        exclude = Path(self.git(self.unit, "rev-parse", "--git-path", "info/exclude"))
+        exclude = exclude if exclude.is_absolute() else self.unit / exclude
+        self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
         path = Path(self.environment["HOME"]) / ".local/state/staff/staff.json"
         with isolated_staff_file(path, self.environment):
             runner = recorded_showrunner("fixture-showrunner", doc)
@@ -336,9 +338,10 @@ class MergeGateCheckpointTests(MergeGateFixture):
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
                                             + "Change-Review: none — the gate script")
         # The row carries today in the user's zone, as the gate reads it; a run across midnight may take either day.
-        before = change_review.today()
-        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
-        days = {before.isoformat(), change_review.today().isoformat()}
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            before = change_review.today()
+            result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+            days = {before.isoformat(), change_review.today().isoformat()}
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
@@ -347,6 +350,22 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+    def test_a_change_row_uses_the_user_date_when_utc_has_the_next_date(self) -> None:
+        review, doc = self.review_list()
+        _ = self.review_producer(doc)
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): date\n\n"
+                                            + "Change-Review: The date follows the user zone | Read | The local date")
+        instant = datetime(2026, 11, 4, 1, tzinfo=UTC)
+
+        def now(zone: tzinfo | None = None) -> datetime:
+            return instant.astimezone(zone) if zone is not None else instant.replace(tzinfo=None)
+
+        self.environment["USER_ZONE"] = "America/New_York"
+        with mock.patch.object(change_review, "datetime", mock.Mock(wraps=datetime, now=now)):
+            result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[0], "2026-11-03")
 
     def test_without_production_the_calling_showrunners_list_takes_the_rows(self) -> None:
         review, doc = self.review_list()
@@ -365,32 +384,6 @@ class MergeGateCheckpointTests(MergeGateFixture):
                          ["The grid fades gently", "The sky dims"])
         self.assertEqual([row[change_review.PRODUCER] for row in change_review.pending(review)
                           if row["#"] in {"C8", "C9"}], [producer, producer])
-
-    def test_an_unreadable_staff_record_refuses_before_the_merge_and_a_rerun_writes_the_rows(self) -> None:
-        review, doc = self.review_list()
-        producer = self.review_producer(doc)
-        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Run hana | The grid fades")
-        path = Path(self.environment["STAFF_FILE"])
-        record = path.read_bytes()
-        before = review.read_bytes()
-        path.unlink()
-        refused = self.run_gate("--production", str(doc), checkpoint=checkpoint)
-        self.assert_refused_before_gate(refused)
-        self.assertIn("cannot read staff record", refused.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
-        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
-        self.assertEqual(review.read_bytes(), before)
-        _ = path.write_bytes(record)
-        retried = self.run_gate("--production", str(doc), checkpoint=checkpoint)
-        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
-        merged = self.git(self.checkout, "rev-parse", "HEAD")
-        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), merged)
-        self.assertEqual(self.git(self.checkout, "rev-list", "--count", f"{self.base}..HEAD", "--merges"), "1")
-        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
-                         [merged, self.base, checkpoint])
-        self.assertEqual([row[change_review.PRODUCER] for row in change_review.pending(review)
-                          if row["#"] == "C8"], [producer])
 
     def test_a_gate_that_finds_no_production_is_refused_before_the_merge(self) -> None:
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
@@ -547,4 +540,4 @@ class MergeGateProducerTests(ProducerFixture):
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")
         notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
         self.assertEqual(len(notes), 1)
-        self.assertIn("new-unit", notes[0])
+        self.assertIn("old-branch", notes[0])

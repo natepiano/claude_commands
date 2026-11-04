@@ -213,14 +213,7 @@ class LifecycleFixture(unittest.TestCase):
         ]
         if promote:
             lines.append(f"- **Promote:** {promote}")
-        lines.extend([
-            "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| alpha-unit | docs/plans/alpha.md | `{self.alpha}` | alpha-branch | alpha | — | `alpha.txt` |",
-            f"| beta-unit | docs/plans/beta.md | `{self.beta}` | beta-branch | beta | — | `beta.txt` |",
-            "", "## Close-out", "",
-        ])
+        lines.extend(["", "## Close-out", ""])
         if close_out:
             lines.append(close_out)
         lines.extend(["", "## Production rules", "", "- No CI, smoke launch, Mac run, or validate_and_push.sh."])
@@ -254,8 +247,7 @@ class LifecycleFixture(unittest.TestCase):
     def park_fixture_unit(self, name: str, worktree: Path, branch: str) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == name)
         with mock.patch.dict(os.environ, self.env):
-            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id,
-                unit_config.RecordedStartFolder(worktree), unit_config.Branch(branch)))
+            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id, unit_config.Branch(branch)))
 
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         # Restore import-time state just as a fresh CLI would compute it.

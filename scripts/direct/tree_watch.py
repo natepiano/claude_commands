@@ -123,6 +123,7 @@ class TreeInputs:
             ) if not folder.startswith(b"..") and folder != b"."
         )
         self.workspace_root: bytes = b""
+        self.watch_entries: dict[str, str] = {}
         try:
             meta: Metadata = cast(Metadata, json.loads(metadata)) if metadata.strip() else {"workspace_root": "", "packages": [], "workspace_members": []}
             workspace_root = meta.get("workspace_root", "")
@@ -191,7 +192,9 @@ class TreeInputs:
                     _ = entries.pop(path, None)
         watched = hashlib.sha256(self.top + b"\0")
         if watch:
+            self.watch_entries = {}
             for path in sorted(filter(self.watched, entries)):
+                self.watch_entries[os.fsdecode(path)] = entries[path].decode()
                 watched.update(path + b"\0" + entries[path] + b"\0")
         watch_key = watched.hexdigest() if watch else ""
         if not cache:
@@ -263,9 +266,11 @@ def main(args: list[str]) -> int:
         lint_versions = args[:1] != ["--without-lint-versions"]
         if not lint_versions:
             args = args[1:]
-        cache, watched = TreeInputs(args, metadata).keys(
+        inputs = TreeInputs(args, metadata)
+        cache, watched = inputs.keys(
             cache=mode == "--key", watch=bool(start) or mode == "--watch-key", lint_versions=lint_versions)
         if start:
+            _ = Path(start + ".paths").write_text(json.dumps(inputs.watch_entries))
             _ = Path(start).write_text(watched + "\n")
         print(cache if mode == "--key" else watched)
         return 0
@@ -278,6 +283,7 @@ def main(args: list[str]) -> int:
     start_key = Path(start_file).read_text().strip()
     if not start_key:
         return 3
+    start_entries = cast(dict[str, str], json.loads(Path(start_file + ".paths").read_text()))
     try:
         interval = float(os.environ.get("VERIFY_TREE_WATCH_S", "5"))
         if not math.isfinite(interval) or interval <= 0:
@@ -288,6 +294,9 @@ def main(args: list[str]) -> int:
         try:
             _, key = inputs.keys(cache=False)
             if key and key != start_key:
+                changed = next(path for path in sorted(start_entries.keys() | inputs.watch_entries.keys())
+                               if start_entries.get(path) != inputs.watch_entries.get(path))
+                _ = Path(fired_file + ".path").write_text(changed + "\n")
                 _ = Path(fired_file).write_text(key + "\n")
                 if notify:
                     os.kill(int(parent), signal.SIGUSR2)
