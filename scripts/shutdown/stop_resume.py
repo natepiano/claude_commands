@@ -96,6 +96,10 @@ def _same_process(pid: int, started: str) -> bool:
 
 def _signal_process(pid: int, number: int) -> None:
     """Refuse proof signals unless herdr places the process in the selected workspace."""
+    if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" not in os.environ and (
+            "STAFF_FILE" in os.environ or "SHUTDOWN_STATE_DIR" in os.environ):
+        raise PermissionError(
+            f"signal {number} to pid {pid} refused: isolated records require SHUTDOWN_PROOF_WORKSPACE")
     if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" in os.environ:
         workspace = os.environ["SHUTDOWN_PROOF_WORKSPACE"]
         refusal = f"proof workspace {workspace!s}: signal {number} to pid {pid} refused"
