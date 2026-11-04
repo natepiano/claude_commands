@@ -807,32 +807,14 @@ The plan has one home, `.unit.toml`; staff holds no plan. `unit_config.set_plan`
 
 **Binds later work:** messaging-unit's `send.py` sender check changes the rule's last point in its own commit.
 
-### Phase 7n — The proposals table widths live in config  · status: todo
+### Phase 7n — The proposals table widths live in config  · status: done
 
-Source: sdlc 2026-11-03 (natedev-efficiency found it; morty #16 asked again 2026-11-04). The user rule: tunables live in config, read at use.
+#### As-built
 
-**Depends on:** nothing.
-
-#### Work Order
-
-**Goal:** `proposals_table.py` reads its title and state cell widths from config, with the same values as now (110 and 140).
-
-**Spec:**
-1. Add `config/proposals_table.conf` with `title_width = 110` and `state_width = 140`, in the format the other `config/*.conf` files use.
-2. Delete the `TITLE_WIDTH` and `STATE_WIDTH` constants (`proposals_table.py:68-69`). Read each value with `conf.read("proposals_table")` at the place that uses it.
-3. Change no other behavior and add no fallback value: a missing key is the error `conf.py` already gives.
+`config/proposals_table.conf` holds `title_width = 110` and `state_width = 140`. `proposals_table.table` reads both through `conf.read("proposals_table")` at use; the `TITLE_WIDTH` and `STATE_WIDTH` constants are gone. Checkpoint fa006856e on `sdlc-devtools-width`.
 
 **Files:**
-- `scripts/production/proposals_table.py` — the two reads.
-- `config/proposals_table.conf` — new.
-- `scripts/production/test_proposals_table.py` — one test that a changed config width changes where a cell is cut.
-
-**Workers:** `1 writer`.
-- `impl` — all three files.
-
-**State:** none.
-
-**Acceptance gate:** `basedpyright scripts/production/proposals_table.py scripts/production/test_proposals_table.py` gives `0 errors, 0 warnings, 0 notes`. `python3 -m unittest scripts/production/test_proposals_table.py` passes. The full merge gate passes, except reds that main also has.
+- `scripts/production/proposals_table.py`, `config/proposals_table.conf`, `scripts/production/test_proposals_table.py` — the config reads and a test that a changed width moves the cut.
 
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
