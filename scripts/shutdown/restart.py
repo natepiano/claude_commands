@@ -17,7 +17,7 @@ for dependency in ("herdr", "message", "lib", "shutdown"):
 
 import herdr
 import sessions
-from scripts.production import staff, unit_move
+from scripts.production import staff
 from scripts.lib import nix_env
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.shutdown.codex_trust import trust_arguments
@@ -52,7 +52,7 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[str, P
             raise ValueError(f"{row.name}: the staff worktree is unavailable")
         if isinstance(member.doc, staff.LiveDoc):
             return member.doc.machine, member.doc.path.parent
-        parent = record.by_id(member.parent) if member.parent is not None else None
+        parent = record.parent_of(member)
         if parent is None:
             raise ValueError(f"{row.name}: no worktree in staff")
         member = parent
@@ -98,7 +98,7 @@ def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str,
         for directory in entry.get("plugin_directories", []):
             arguments.extend(("--plugin-dir", directory))
         return kind, named_account_environment(Path(entry["config_dir"])), arguments
-    for directory in unit_move.config_dirs():
+    for directory in sessions.config_dirs():
         if any((directory / "projects").glob(f"*/{identity}.jsonl")):
             return "claude", named_account_environment(directory), ["--resume", identity]
     homes = list(Path.home().glob(".codex*"))

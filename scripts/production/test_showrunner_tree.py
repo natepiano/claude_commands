@@ -73,7 +73,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         child = record.by_path("child")
         parent = record.by_path("new")
         assert child is not None and parent is not None
-        _ = staff.move(child.id, parent.id)
+        _ = staff.move(child.id, staff.ReportsTo(parent.id))
         write_text_atomic(self.state / "child" / "parent", "old\n")
         record = staff.snapshot()
         expected = {"child": "new", "leaf": "child"}

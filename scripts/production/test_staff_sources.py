@@ -20,11 +20,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import unit_runs
-from scripts.production import staff, staff_sources, unit_config, worker_fill, session_staff
-from scripts.production.staff_test_support import (
-    SOURCES_SCRIPT, FixtureMachine, StaffTestCase, production_membership, unit_membership,
-)
+from scripts.production import staff, staff_sources, unit_config, session_staff
+from scripts.production.staff_test_support import SOURCES_SCRIPT, FixtureMachine, StaffTestCase, unit_membership
 from scripts.production.unit_config_format_test_support import (
     check_format, count_taplo, remove_assignment_spacing, require_taplo, write_aligning_config,
 )
@@ -334,7 +331,7 @@ class StaffSourcesTests(StaffTestCase):
         doc = self.fill_production("builds")
         root = fixture_member("showrunner", name="natedev")
         owner = next(row for row in staff.find(kind="showrunner") if row.name == "builds")
-        owner = staff.move(owner.id, root.id)
+        owner = staff.move(owner.id, staff.ReportsTo(root.id))
         other_root = fixture_member("showrunner", name="other")
         other = fixture_member("showrunner", name="other-builds", parent=other_root.id)
         # Timer names can predate the current staff name. Its retained target
@@ -534,133 +531,23 @@ class StaffSourcesTests(StaffTestCase):
         assert old_row is not None
         self.assertIsInstance(old_row.doc, staff.DocUnfilled)
 
-    def test_serverless_delegate_skips_its_roster_and_counts_once_in_worker_fill(self) -> None:
-        production_membership("sdlc", "models-unit")
-        doc = self.production("sdlc", "models-unit")
-        owner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
-        unit = unit_membership("sdlc", "models-unit")
-        _ = self.session_record("session-models", "models-unit")
-        self.pane("w1:models", session_id="session-models", environment={"STAFF_ID": unit.id})
-        delegate_root = self.source_root / "delegate"
-        with (mock.patch.object(unit_runs, "FORMER_RUN_ROOT", delegate_root),
-              mock.patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(delegate_root)})):
-            run = self.worker_run("sdlc", "models-unit", "session-models")
-            (run / "mesh_server.json").unlink()
-            roster = self.roster_worker(run, "delegate", "", "thread-paused", status="paused")
-            entry = cast(dict[str, dict[str, object]], json.loads(roster.read_text()))
-            missing_role = {"delegate": {key: value for key, value in entry["delegate"].items() if key != "role"}}
-            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-            for contents in (roster.read_text(), json.dumps(missing_role), "{broken roster"):
-                with self.subTest(roster=contents):
-                    write_text_atomic(roster, contents)
-                    with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
-                        code = worker_fill.fill()
-                    self.assertEqual((code, output.getvalue(), errors.getvalue()),
-                                     (0, "skipped 1 not current\nunchanged\n", ""))
-                    self.assertEqual(staff.find(kind="worker"), [])
-                    self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-
-    def test_serverless_delegate_held_by_ledger_adds_no_worker_and_counts_once(self) -> None:
-        production_membership("sdlc", "models-unit")
-        doc = self.production("sdlc", "models-unit")
-        owner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
-        unit = unit_membership("sdlc", "models-unit")
-        _ = self.session_record("session-models", "models-unit")
-        self.pane("w1:models", session_id="session-models", environment={"STAFF_ID": unit.id})
-        delegate_root = self.source_root / "delegate"
-        with (mock.patch.object(unit_runs, "FORMER_RUN_ROOT", delegate_root),
-              mock.patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(delegate_root)})):
-            run = self.worker_run("sdlc", "models-unit", "session-models")
-            _ = self.ledger_worker(run, "sdlc", "models-unit", "test", "test", "thread-held")
-            _ = self.roster_worker(run, "test", "test", "thread-held", status="paused")
-            (run / "mesh_server.json").unlink()
-            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
-                code = worker_fill.fill()
-            self.assertEqual((code, output.getvalue(), errors.getvalue()),
-                             (0, "skipped 1 not current\nunchanged\n", ""))
-            self.assertEqual(staff.find(kind="worker"), [])
-            self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-
-    def test_serverless_unit_keeps_uncertain_worker_evidence_out_of_the_skip_count(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        production_membership("sdlc", "models-unit")
-        run = self.worker_run("sdlc", "models-unit", "gone-director")
-        (run / "mesh_server.json").unlink()
-        self.write_json(run / "mesh_roster.json", {
-            "test": {"role": "test", "status": "paused", "family": "codex", "launcher_pid": 0},
-        })
-        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
-            code = worker_fill.fill()
-        self.assertEqual(code, 1, output.getvalue() + errors.getvalue())
-        self.assertIn(str(run), errors.getvalue())
-        self.assertIn("source unavailable", errors.getvalue())
-        self.assertNotIn("skipped", output.getvalue())
-        self.assertEqual(staff.find(kind="worker"), [])
-
-    def test_paused_roster_workers_survive_a_director_restart_or_a_missing_messaging_socket(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        production_membership("sdlc", "models-unit")
-        unit = unit_membership("sdlc", "models-unit")
-        _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
-        registry = self.session_record(unit.id, "models-unit")
-        self.assertEqual(json.loads(registry.read_text())["messagingSocketPath"], "")
-        self.pane("w1:models", session_id=unit.id, environment={"STAFF_ID": unit.id})
-        run = self.worker_run("sdlc", "models-unit", "ec4e4c1d-6ca3-5651-9d48-74452fc51acc")
-        self.write_json(run / "mesh_server.json", {"pid": 0, "codex_home": str(self.root / "codex")})
-        roster = self.roster_worker(run, "test", "test", "71280e34-5ba9-5e39-b979-05acf27f3f6a", status="paused")
-        with mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")}):
-            for director in ("ec4e4c1d-6ca3-5651-9d48-74452fc51acc", unit.id):
-                with self.subTest(director=director):
-                    write_text_atomic(run / "director", director + "\n")
-                    with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
-                        _ = self.seed()
-                    self.assertEqual(reads.call_count, 1)
-                    rows = staff.find(kind="worker", parent=unit.id)
-                    self.assertEqual([row.name for row in rows], ["test"])
-                    with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
-                        value = staff_sources.live()
-                    self.assertEqual(reads.call_count, 1)
-                    members = cast(list[dict[str, object]], value["members"])
-                    worker = next(member for member in members if member["id"] == rows[0].id)
-                    self.assertEqual(worker["parent"], unit.id)
-                    self.assertEqual(worker["identity"], {"codex": "71280e34-5ba9-5e39-b979-05acf27f3f6a"})
-                    self.assertEqual(worker["role"], "test")
-                    self.assertIn(str(roster), cast(list[str], value["inputs"]))
-
-    def test_legacy_claude_workers_join_board_slots_by_registered_mesh_name(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
-        _ = self.session_record("bae0b3d7-3d25-5a1f-9630-b7991a2f9721", "models-unit")
-        self.pane("w1:models", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={
-            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
-        for index, (prefix, kind, role) in enumerate((
-            ("hana_catalyst", "impl", "test"), ("3D.Project-explicit", "fix", "fix"),
-            ("unassigned", "impl", ""),
-        )):
-            with self.subTest(prefix=prefix, kind=kind, role=role):
-                run = self.worker_run("sdlc", f"legacy-{index}", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721")
-                session_id = fixture_runtime_id(f"legacy-worker:{index}")
-                _ = self.session_record(session_id, "Claude worker")
-                name = self.legacy_claude_worker(run, session_id, prefix=prefix, kind=kind, role=role)
-                self.assertEqual(list(run.glob("impl_worker_*.json")), [])
-                _, problems = self.seed()
-                row = next((row for row in staff.find(kind="worker") if row.name == name), None)
-                with redirect_stderr(io.StringIO()):
-                    members = cast(list[dict[str, object]], staff_sources.live()["members"])
-                if role:
-                    self.assertIsNotNone(row, problems)
-                    assert row is not None
-                    member = next(member for member in members if member["id"] == row.id)
-                    self.assertEqual(member["name"], name)
-                    self.assertEqual(member["role"], role)
-                    self.assertEqual(member["identity"], {"claude": session_id})
-                else:
-                    self.assertIsNone(row)
-                    self.assertIn(str(run), problems)
-                    self.assertFalse(any(member["name"] == name for member in members))
+    def test_fill_refuses_tracked_and_negated_config_before_mutating_the_unit(self) -> None:
+        _ = self.fill_production("sdlc", "tracked-unit", "negated-unit")
+        tracked, negated = (self.source_root / "worktrees" / name for name in ("tracked-unit", "negated-unit"))
+        write_text_atomic(tracked / ".unit.toml", 'plan = "standby"\nresponsibilities = []\n')
+        _ = self.fixture_git(tracked, "add", ".unit.toml")
+        _ = self.fixture_git(tracked, "commit", "-m", "tracked configuration")
+        write_text_atomic(negated / ".gitignore", "!.unit.toml\n")
+        before = {folder: (folder / ".unit.toml").read_bytes() for folder in (tracked, negated)}
+        members = [unit_membership("sdlc", name) for name in ("tracked-unit", "negated-unit")]
+        code, _, errors = self.fill_result()
+        self.assertEqual(code, 1)
+        self.assertIn("tracked", errors)
+        self.assertIn("ignored", errors)
+        for member in members:
+            self.assertEqual(staff.by_id(member.id), member)
+        for folder, content in before.items():
+            self.assertEqual((folder / ".unit.toml").read_bytes(), content)
 
     def test_live_inputs_keep_rejected_production_documents_and_read_them_after_correction(self) -> None:
         _ = self.production("sdlc", "models-unit")
@@ -704,57 +591,6 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertIn(str(config), inputs)
                 self.assert_no_system_inputs(inputs)
 
-    def test_finished_and_adopted_rosters_cannot_override_the_live_ledger_worker(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
-        _ = self.session_record("bae0b3d7-3d25-5a1f-9630-b7991a2f9721", "models-unit")
-        self.pane("w1:models", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={
-            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
-        run = self.worker_run("sdlc", "models-unit", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721")
-        ledger = self.ledger_worker(run, "sdlc", "models-unit", "review", "review", "e63a4770-62e8-5270-91f0-a163996415b9")
-        _ = self.roster_worker(run, "review", "review", "e63a4770-62e8-5270-91f0-a163996415b9")
-        for number, status in enumerate(("done", "adopted"), start=1):
-            old_run = self.worker_run("sdlc", f"history-{status}", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721")
-            _ = self.roster_worker(old_run, "review", "review", f"thread-{status}", status=status)
-            _ = self.roster_worker(old_run, f"fix{number}", "fix", f"thread-only-{status}", status=status)
-        gone = self.worker_run("sdlc", "history-gone", "3790170d-f8c8-5dbd-ba9b-38eb5179177f")
-        self.write_json(gone / "progress_history_state.json", {
-            "production": "sdlc", "unit": "models-unit",
-            "main_agent": {"family": "claude", "session_id": "3790170d-f8c8-5dbd-ba9b-38eb5179177f"},
-        })
-        self.write_json(gone / "mesh_server.json", {"pid": 0, "codex_home": str(self.root / "codex")})
-        _ = self.roster_worker(gone, "fix3", "fix", "e4481fcb-8cb1-560b-b68f-82663434e61a")
-        dead_roster = cast(dict[str, dict[str, object]], json.loads((gone / "mesh_roster.json").read_text()))
-        dead_roster["fix3"]["launcher_pid"] = 0
-        self.write_json(gone / "mesh_roster.json", dead_roster)
-        _, errors = self.seed()
-        self.assertNotIn("conflicting worker identities", errors)
-        workers = staff.find(kind="worker")
-        self.assertEqual([row.name for row in workers], ["review"])
-        value = staff_sources.live()
-        members = cast(list[dict[str, object]], value["members"])
-        reviewer = next(member for member in members if member["id"] == workers[0].id)
-        self.assertEqual(reviewer["identity"], {"codex": "e63a4770-62e8-5270-91f0-a163996415b9"})
-        self.assertIn(str(ledger), cast(list[str], value["inputs"]))
-
-    def test_adhoc_ledger_of_a_dot_named_worktree_takes_its_holder_run_without_a_name_error(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
-        _ = self.session_record("bae0b3d7-3d25-5a1f-9630-b7991a2f9721", "models-unit")
-        self.pane("w1:models", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={
-            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
-        run = self.worker_run("sdlc", "models-unit", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721")
-        # A worktree named `.claude` gives the adhoc ledger stem `.claude-<digest>`.
-        _ = self.ledger_worker(run, "adhoc", ".claude-3314ec0bf589", "review", "review", "0783462b-323d-5d81-b61c-ddee74b529d6")
-        _, errors = self.seed()
-        self.assertNotIn("name must contain", errors)
-        with redirect_stderr(io.StringIO()) as live_errors:
-            members = cast(list[dict[str, object]], staff_sources.live()["members"])
-        self.assertNotIn("name must contain", live_errors.getvalue())
-        unit = next(member for member in members if member["kind"] == "unit")
-        reviewer = next(member for member in members if member["kind"] == "worker")
-        self.assertEqual((reviewer["name"], reviewer["parent"]), ("review", unit["id"]))
-        self.assertEqual(reviewer["identity"], {"codex": "0783462b-323d-5d81-b61c-ddee74b529d6"})
 
     def test_live_owner_ignores_a_newer_launch_whose_session_has_ended(self) -> None:
         _ = self.production("sdlc", "models-unit")
@@ -770,58 +606,6 @@ class StaffSourcesTests(StaffTestCase):
         members = cast(list[dict[str, object]], staff_sources.live()["members"])
         member = next(member for member in members if member["id"] == unit.id)
         self.assertEqual(member["identity"], {"claude": unit.id})
-
-    def test_live_workers_use_their_producers_without_invented_unit_ledger_entries(self) -> None:
-        _ = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(
-            "natedev", self.source_root / "sdlc-production.md"))
-        _ = self.production("sdlc", "models-unit")
-        _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
-        _ = self.session_record("bae0b3d7-3d25-5a1f-9630-b7991a2f9721", "models-unit")
-        self.pane("w1:models", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={
-            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
-        run = self.worker_run("sdlc", "models-unit", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721")
-        roster = self.roster_worker(run, "impl", "fix", "936663e1-4213-5af9-b170-de47f5a9e149")
-        astra = self.astra_worker(run, "sdlc-handler-astra-reviewer", "1e49a002-64a8-51fb-8291-2828649967bd", "cdc4420c-ae5d-5a9a-8135-75e8c0875088")
-        design = self.worker_design("sdlc", "sdlc-handler-astra-designer", "3d1d0e20-5129-55bd-9516-9b9e8d633777")
-        self.assertEqual(list(Path(os.environ["UNIT_WORKERS_STATE"]).rglob("*.json")), [])
-        _ = self.seed()
-        members = cast(list[dict[str, object]], staff_sources.live()["members"])
-        workers = {cast(str, member["name"]): member for member in members if member["kind"] == "worker"}
-        self.assertEqual(set(workers), {"impl", "sdlc-handler-astra-reviewer", "sdlc-handler-astra-designer"})
-        self.assertEqual(workers["impl"]["role"], "fix")
-        for name, thread in (("impl", "936663e1-4213-5af9-b170-de47f5a9e149"),
-                             ("sdlc-handler-astra-reviewer", "1e49a002-64a8-51fb-8291-2828649967bd"),
-                             ("sdlc-handler-astra-designer", "3d1d0e20-5129-55bd-9516-9b9e8d633777")):
-            self.assertEqual(workers[name]["identity"], {"codex": thread})
-        root = next(member for member in members if member["name"] == "sdlc")
-        self.assertEqual(workers["sdlc-handler-astra-reviewer"]["parent"], root["id"])
-        inputs = cast(list[str], staff_sources.live()["inputs"])
-        for path in (roster, astra, design):
-            self.assertIn(str(path), inputs)
-
-    def test_unreadable_astra_owner_does_not_seed_a_permanent_unit_owned_duplicate(self) -> None:
-        _ = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(
-            "natedev", self.source_root / "sdlc-production.md"))
-        _ = self.production("sdlc", "models-unit")
-        _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
-        run = self.worker_run("sdlc", "models-unit", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721")
-        name = "sdlc-handler-astra-reviewer"
-        _ = self.ledger_worker(run, "sdlc", "models-unit", name, "review", "1e49a002-64a8-51fb-8291-2828649967bd")
-        path = self.astra_worker(run, name, "1e49a002-64a8-51fb-8291-2828649967bd", "cdc4420c-ae5d-5a9a-8135-75e8c0875088")
-        original = path.read_text()
-        write_text_atomic(path, "{broken")
-        _, errors = self.seed()
-        self.assertIn(str(path), errors)
-        self.assertEqual(staff.find(kind="worker"), [])
-        write_text_atomic(path, original)
-        _ = self.seed()
-        root = staff.by_path("sdlc")
-        assert root is not None
-        rows = staff.find(kind="worker")
-        self.assertEqual([(row.name, row.parent) for row in rows], [(name, root.id)])
-        before = self.staff_file.read_bytes()
-        _ = self.seed()
-        self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_live_inputs_include_the_remote_owner_record_and_exclude_process_and_system_reads(self) -> None:
         owner = self.tree()[0]
@@ -855,95 +639,6 @@ class StaffSourcesTests(StaffTestCase):
             if path.startswith(root):
                 continue
             self.assertFalse(path.startswith(("/proc/", "/dev/", "/usr/share/zoneinfo/")), path)
-
-    def test_worker_seed_imports_ledger_and_roster_once_and_keeps_replacement_identity(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        run = self.worker_run("sdlc", "models-unit", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721")
-        _ = self.session_record("bae0b3d7-3d25-5a1f-9630-b7991a2f9721", "models-unit")
-        ledger = self.ledger_worker(run, "sdlc", "models-unit", "impl", "impl", "ebd83cc0-0d36-5908-86b5-d3e5a4277b05")
-        _ = self.ledger_worker(run, "sdlc", "models-unit", "test", "test", "0fc60dc3-b54e-55fd-97eb-84c6a4a4e3bf", family="claude")
-        _ = self.ledger_worker(run, "sdlc", "models-unit", "fix3", "fix", "d0db35da-1fdb-52f7-8a8d-34398d8f13b3", retired=True)
-        roster_path = run / "mesh_roster.json"
-        roster = cast(dict[str, object], json.loads(roster_path.read_text()))
-        roster["review2"] = {"role": "review", "status": "paused", "thread_id": "936663e1-4213-5af9-b170-de47f5a9e149"}
-        self.write_json(roster_path, roster)
-        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads, \
-                mock.patch.object(staff, "apply_seed", wraps=staff.apply_seed) as writes:
-            _ = self.seed()
-        self.assertEqual(reads.call_count, 1)
-        self.assertEqual(writes.call_count, 1)
-        unit = staff.by_path("sdlc/models")
-        assert unit is not None
-        workers = {row.name: row for row in staff.find(kind="worker", parent=unit.id)}
-        self.assertEqual(set(workers), {"impl", "test", "review2"})
-        before = self.staff_file.read_bytes()
-        _ = self.seed()
-        self.assertEqual(self.staff_file.read_bytes(), before)
-        document = cast(dict[str, object], json.loads(ledger.read_text()))
-        entries = cast(dict[str, dict[str, object]], document["workers"])
-        backend = cast(dict[str, object], entries["impl"]["backend"])
-        backend["thread_id"] = "4362efed-e9f3-50e0-b02e-8c33b50288b9"
-        self.write_json(ledger, document)
-        _ = self.seed()
-        self.assertEqual(staff.by_id(workers["impl"].id), workers["impl"])
-        self.assertEqual(self.staff_file.read_bytes(), before)
-
-    def test_worker_seed_names_each_unreadable_source_instead_of_silently_skipping_it(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        run = self.worker_run("sdlc", "models-unit", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721")
-        ledger = self.ledger_worker(run, "sdlc", "models-unit", "impl", "impl", "3e104a36-0fc6-5eb7-b30b-7f3aa8ecb79b")
-        astra = self.astra_worker(run, "sdlc-handler-astra-reviewer", "1e49a002-64a8-51fb-8291-2828649967bd", "cdc4420c-ae5d-5a9a-8135-75e8c0875088")
-        _ = self.seed()
-        for path in (ledger, run / "mesh_roster.json", astra):
-            original = path.read_text()
-            with self.subTest(path=path):
-                write_text_atomic(path, "{broken")
-                with redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
-                    try:
-                        staff_sources.seed()
-                    except staff.StaffUnreadable as error:
-                        print(error, file=sys.stderr)
-                self.assertIn(str(path), errors.getvalue())
-                self.assertTrue(errors.getvalue().strip())
-                write_text_atomic(path, original)
-
-    def test_empty_pending_files_have_no_publication_evidence_or_diagnostics(self) -> None:
-        from scripts.agents import worker_lifecycle
-
-        run = self.root / "pending-run"
-        run.mkdir()
-        _ = (run / "empty.pending.json").write_bytes(b"")
-        _ = (run / "object.pending.json").write_text("{}")
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in run.iterdir()}
-        with mock.patch.object(worker_lifecycle, "locked_state", side_effect=AssertionError("reader took a lock")):
-            evidence = staff_sources.pending_publication_evidence(run)
-        self.assertEqual(evidence.workers, ())
-        self.assertEqual(evidence.diagnostics, ())
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in run.iterdir()}, before)
-
-    def test_pending_evidence_reads_every_damaged_file_without_recovery_or_locks(self) -> None:
-        from scripts.agents import worker_lifecycle
-
-        run = self.root / "pending-run"
-        run.mkdir()
-        empty = run / "z.pending.json"
-        invalid = run / "a.pending.json"
-        valid = run / "zz.pending.json"
-        _ = empty.write_text("")
-        self.write_json(invalid, {"messages": []})
-        native = fixture_runtime_id("pending-native")
-        parent = fixture_runtime_id("pending-parent")
-        self.write_json(valid, {"thread_id": "", "messages": [],
-                                "unpublished_thread": {"id": native, "parent": parent}})
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in run.iterdir()}
-        with mock.patch.object(worker_lifecycle, "locked_state", side_effect=AssertionError("reader took a lock")):
-            first = staff_sources.pending_publication_evidence(run)
-            second = staff_sources.pending_publication_evidence(run)
-        self.assertEqual(first, second)
-        self.assertEqual(first.diagnostics, (f"{invalid}: worker state unreadable: invalid queue fields",))
-        self.assertEqual([(entry.inbox, entry.identity, entry.parent) for entry in first.workers],
-                         [(valid, native, parent)])
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in run.iterdir()}, before)
 
     def test_codex_scan_continues_after_unparsable_process_arguments(self) -> None:
         from scripts.message import process_table
@@ -981,14 +676,10 @@ class StaffSourcesTests(StaffTestCase):
         sources = MemberSources({}, (launch,))
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            evidence = staff_sources.observe_workers(
-                record, sources, unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
-            with self.assertRaises(staff.StaffUnreadable) as refused:
-                _ = staff_sources.observe_workers(record, sources)
+            evidence = staff_sources.observe_workers(record, sources)
         expected = "staff sources: Codex process 42401: native thread identity is unavailable"
         self.assertEqual(evidence.diagnostics, (expected,))
-        self.assertEqual(str(refused.exception), expected)
-        self.assertNotIn("Claude", str(refused.exception))
+        self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
 
     def test_codex_without_a_thread_in_an_unowned_pane_reports_a_diagnostic_without_refusal(self) -> None:
         from scripts.message import process_table
@@ -1016,8 +707,9 @@ class StaffSourcesTests(StaffTestCase):
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            with self.assertRaisesRegex(staff.StaffUnreadable, "native thread identity is unavailable"):
-                _ = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
+            evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
+        self.assertEqual(evidence.diagnostics, (
+            "staff sources: Codex process 42401: native thread identity is unavailable",))
 
     def test_unparsable_claude_settings_do_not_make_the_codex_scan_incomplete(self) -> None:
         from scripts.message import process_table
@@ -1056,19 +748,18 @@ class StaffSourcesTests(StaffTestCase):
             42401, 1, "node", 'node /modules/@openai/codex/bin/codex.js --config "unfinished')}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment") as environment):
-            with self.assertRaises(staff.StaffUnreadable) as refused:
-                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
         environment.assert_not_called()
-        self.assertEqual(str(refused.exception),
-                         "staff sources: Codex process scan: pid 42401: No closing quotation")
+        self.assertEqual(evidence.diagnostics,
+                         ("staff sources: Codex process scan: pid 42401: No closing quotation",))
 
     def test_failed_codex_process_snapshot_does_not_report_a_claude_registry_failure(self) -> None:
         from scripts.message import process_table
 
         with mock.patch.object(process_table, "snapshot", side_effect=OSError("process table unavailable")):
-            with self.assertRaisesRegex(staff.StaffUnreadable, "Codex processes: process table unavailable") as refused:
-                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
-        self.assertNotIn("Claude", str(refused.exception))
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+        self.assertEqual(evidence.diagnostics, ("staff sources: Codex processes: process table unavailable",))
+        self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
 
     def test_live_staff_includes_codex_showrunner_and_unit_by_current_thread_without_role_inference(self) -> None:
         from scripts.message import process_table
@@ -1103,90 +794,6 @@ class StaffSourcesTests(StaffTestCase):
         self.assertNotIn(environments[42403]["CODEX_THREAD_ID"], errors.getvalue())
         self.assertEqual(self.staff_file.read_bytes(), before)
 
-    def test_live_staff_command_keeps_worker_identity_and_all_input_paths(self) -> None:
-        doc = self.production("sdlc", "models-unit")
-        self.pane("w1:runner", session_id="cdc4420c-ae5d-5a9a-8135-75e8c0875088", environment={})
-        self.pane("w1:models", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={
-            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
-        })
-        registry = [self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc"),
-                    self.session_record("bae0b3d7-3d25-5a1f-9630-b7991a2f9721", "models-unit"),
-                    self.session_record("0fc60dc3-b54e-55fd-97eb-84c6a4a4e3bf", "test")]
-        run = self.worker_run("sdlc", "models-unit", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721")
-        ledger = self.ledger_worker(run, "sdlc", "models-unit", "impl", "impl", "3e104a36-0fc6-5eb7-b30b-7f3aa8ecb79b")
-        _ = self.ledger_worker(run, "sdlc", "models-unit", "test", "test", "0fc60dc3-b54e-55fd-97eb-84c6a4a4e3bf", family="claude")
-        astra = self.astra_worker(run, "sdlc-handler-astra-reviewer", "1e49a002-64a8-51fb-8291-2828649967bd", "cdc4420c-ae5d-5a9a-8135-75e8c0875088")
-        _ = self.seed()
-        owner = staff.by_path("sdlc")
-        assert owner is not None
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
-        unit = staff.by_path("sdlc/models")
-        assert unit is not None
-        folder = self.source_root / "worktrees" / "models-unit"
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", folder), expected=unit.worktree)
-        (folder / ".git").unlink()
-        _ = self.fixture_git(folder, "init", "-b", "models")
-        _ = self.fixture_git(folder, "config", "user.email", "fixture@example.invalid")
-        _ = self.fixture_git(folder, "config", "user.name", "Fixture")
-        _ = self.fixture_git(folder, "commit", "--allow-empty", "-m", "fixture")
-        write_text_atomic(folder / ".unit.toml", 'plan = "active"\nresponsibilities = []\n')
-        before = self.staff_file.read_bytes()
-        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads, \
-                redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(staff.main(["show", "--json", "--live"]), 0)
-        self.assertEqual(reads.call_count, 1)
-        document = cast(dict[str, object], json.loads(output.getvalue()))
-        self.assertEqual(set(document), {"schema", "inputs", "members", "complete", "unregistered"})
-        self.assertEqual(document["complete"], True)
-        self.assertEqual(document["unregistered"], [])
-        self.assertEqual(document["schema"], 3)
-        members = cast(list[dict[str, object]], document["members"])
-        by_name = {cast(str, member["name"]): member for member in members}
-        by_identity = {tuple(cast(dict[str, str], member["identity"]).items()): member for member in members}
-        root = by_name["sdlc"]
-        unit = by_name["models"]
-        self.assertEqual(root["identity"], {"claude": "cdc4420c-ae5d-5a9a-8135-75e8c0875088"})
-        self.assertEqual(unit["parent"], root["id"])
-        self.assertEqual(unit["identity"], {"claude": "bae0b3d7-3d25-5a1f-9630-b7991a2f9721"})
-        for name, identity in (("impl", {"codex": "3e104a36-0fc6-5eb7-b30b-7f3aa8ecb79b"}), ("test", {"claude": "0fc60dc3-b54e-55fd-97eb-84c6a4a4e3bf"})):
-            self.assertEqual(by_name[name]["parent"], unit["id"])
-            self.assertEqual(by_name[name]["identity"], identity)
-        designer = by_identity[(("codex", "1e49a002-64a8-51fb-8291-2828649967bd"),)]
-        self.assertEqual(designer["parent"], root["id"])
-        self.assertEqual(designer["role"], "astra-reviewer")
-        ids = {member["id"] for member in members}
-        self.assertEqual(len(ids), len(members))
-        for member in members:
-            self.assertEqual(set(member), {"id", "kind", "name", "parent", "current_session", "role", "identity"})
-            self.assertIn(member["role"], {"showrunner", "unit", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"})
-            self.assertTrue(member["parent"] in ids or member is root)
-            self.assertEqual(member["parent"] is None, member is root)
-            self.assertEqual(len(cast(dict[str, str], member["identity"])), 1)
-        inputs = cast(list[str], document["inputs"])
-        self.assertTrue(all(Path(path).is_absolute() for path in inputs))
-        self.assertEqual(len(inputs), len(set(inputs)))
-        for path in (self.staff_file, doc, ledger, astra, run / "mesh_roster.json", *registry,
-                     Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-sdlc" / "conf",
-                     pane_record.record_path(herdr.shared_session())):
-            self.assertIn(str(path), inputs)
-        self.assertEqual(self.staff_file.read_bytes(), before)
-        ledger_value = cast(dict[str, object], json.loads(ledger.read_text()))
-        workers = cast(dict[str, dict[str, object]], ledger_value["workers"])
-        cast(dict[str, object], workers["impl"]["backend"])["thread_id"] = "4362efed-e9f3-50e0-b02e-8c33b50288b9"
-        self.write_json(ledger, ledger_value)
-        replacement_id = staff.native_id("4362efed-e9f3-50e0-b02e-8c33b50288b9")
-        _ = staff.update_current_session(staff.StaffId(cast(str, by_name["impl"]["id"])), replacement_id)
-        published = self.staff_file.read_bytes()
-        replacement = cast(dict[str, object], json.loads(self.cli("show", "--json", "--live").stdout))
-        replacement_members = cast(list[dict[str, object]], replacement["members"])
-        replaced = next(member for member in replacement_members if member["id"] == by_name["impl"]["id"])
-        self.assertEqual(replaced["identity"], {"codex": replacement_id})
-        self.assertEqual(replaced["current_session"], replacement_id)
-        self.assertNotIn(replacement_id, {member["id"] for member in replacement_members})
-        self.assertEqual({member["id"]: member["parent"] for member in replacement_members},
-                         {member["id"]: member["parent"] for member in members})
-        self.assertEqual(self.staff_file.read_bytes(), published)
-
     def test_seed_preserves_recorded_moves_despite_stale_sources(self) -> None:
         old = fixture_member("showrunner", name="old")
         new = fixture_member("showrunner", name="new")
@@ -1199,8 +806,8 @@ class StaffSourcesTests(StaffTestCase):
         _ = staff.set_doc(new.id, staff.LiveDoc("natedev", new_doc))
         child_doc = self.production("child", workspace="tools", parent="old")
         _ = staff.set_doc(child.id, staff.LiveDoc("natedev", child_doc))
-        moved_unit = staff.move(unit.id, new.id)
-        moved_child = staff.move(child.id, new.id)
+        moved_unit = staff.move(unit.id, staff.ReportsTo(new.id))
+        moved_child = staff.move(child.id, staff.ReportsTo(new.id))
         before = self.staff_file.read_bytes()
         output, errors = self.seed()
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -1234,8 +841,8 @@ class StaffSourcesTests(StaffTestCase):
         child = staff.by_path("tools")
         unit = staff.by_path("tools/models")
         assert root is not None and child is not None and unit is not None
-        self.assertIsNone(child.parent)
-        self.assertEqual(unit.parent, child.id)
+        self.assertEqual(child.parent, staff.StaffRoot())
+        self.assertEqual(unit.parent, staff.ReportsTo(child.id))
         self.assertEqual(len(staff.find()), 3)
         self.assertEqual(staff.find(kind="worker"), [])
 
@@ -1291,7 +898,7 @@ class StaffSourcesTests(StaffTestCase):
         parent, moved, _ = self.tree()
         _ = self.production("sdlc", "models-unit")
         other = fixture_member("showrunner", name="elsewhere")
-        moved = staff.move(moved.id, other.id)
+        moved = staff.move(moved.id, staff.ReportsTo(other.id))
         moved = staff.update_current_session(moved.current_session, staff.StaffId(fixture_runtime_id("moved-B")))
         target = fixture_member("unit", name="actual", parent=parent.id)
         self.pane("newest-local", session_id=moved.id, written_at="2026-11-01T12:00:00Z",
@@ -1311,7 +918,7 @@ class StaffSourcesTests(StaffTestCase):
         parent, unit, worker = self.tree()
         _ = self.production("sdlc", "models-unit")
         other = fixture_member("showrunner", name="elsewhere")
-        moved = staff.move(unit.id, other.id)
+        moved = staff.move(unit.id, staff.ReportsTo(other.id))
         _ = staff.update_current_session(moved.current_session, staff.StaffId(fixture_runtime_id("wrong-parent-B")))
         _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("same-name"))
         selector = staff_sources.UnitMember("sdlc", "models-unit")
@@ -1427,7 +1034,7 @@ class StaffSourcesTests(StaffTestCase):
         _ = self.production("receiving")
         receiving = fixture_member("showrunner", name="receiving",
                                    doc=staff.LiveDoc("natedev", self.source_root / "receiving-production.md"))
-        moved = staff.move(unit.id, receiving.id)
+        moved = staff.move(unit.id, staff.ReportsTo(receiving.id))
         self.pane("w1:unit", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={
             "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
         })
@@ -1447,7 +1054,7 @@ class StaffSourcesTests(StaffTestCase):
         _ = self.production("receiving", workspace="control")
         receiving = fixture_member("showrunner", name="control",
                                    doc=staff.LiveDoc("natedev", self.source_root / "receiving-production.md"))
-        moved = staff.move(unit.id, receiving.id)
+        moved = staff.move(unit.id, staff.ReportsTo(receiving.id))
         self.pane("w1:unit", session_id=unit.id, environment={
             "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
         })
@@ -1463,7 +1070,7 @@ class StaffSourcesTests(StaffTestCase):
         new_doc = self.production("receiving")
         receiving = fixture_member("showrunner", name="receiving",
                                    doc=staff.LiveDoc("natedev", self.source_root / "receiving-production.md"))
-        moved = staff.move(unit.id, receiving.id)
+        moved = staff.move(unit.id, staff.ReportsTo(receiving.id))
         self.pane("w1:unit", session_id=unit.id, environment={
             "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
         })
@@ -1493,7 +1100,7 @@ class StaffSourcesTests(StaffTestCase):
             _ = self.production("receiving")
             receiving = fixture_member("showrunner", name="receiving",
                                        doc=staff.LiveDoc(remote.local_machine(), self.source_root / "receiving-production.md"))
-            _ = staff.move(unit.id, receiving.id)
+            _ = staff.move(unit.id, staff.ReportsTo(receiving.id))
             self.pane("w1:unit", session_id=unit.id, environment={
                 "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
             })
@@ -1516,7 +1123,7 @@ class StaffSourcesTests(StaffTestCase):
         })
         for slug, expected_parent, doc in (("sdlc", original, old_doc), ("receiving", destination, new_doc)):
             with self.subTest(slug=slug):
-                _ = staff.move(unit.id, expected_parent.id)
+                _ = staff.move(unit.id, staff.ReportsTo(expected_parent.id))
                 record = staff.snapshot()
                 members = staff_sources.showrunner_members(record)
                 with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot, \
@@ -1527,7 +1134,7 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertEqual(members[parent.slug], expected_parent)
                 recorded_unit = record.by_id(unit.id)
                 assert recorded_unit is not None
-                self.assertEqual(members[parent.slug].id, recorded_unit.parent)
+                self.assertEqual(staff.ReportsTo(members[parent.slug].id), recorded_unit.parent)
                 self.assertEqual(snapshot.call_count, 1)
                 self.assertEqual(launches.call_count, 1)
                 self.assertEqual(productions.call_count, 1)
@@ -1630,7 +1237,7 @@ class StaffSourcesTests(StaffTestCase):
         self.assertIsNotNone(staff.by_path("two/beta"))
 
     def test_seed_cli_reports_an_unreadable_record_without_replacing_it(self) -> None:
-        before = self.write_document({"schema": 3, "rows": []})
+        before = self.write_document({"schema": 999, "rows": []})
         _ = self.production("sdlc")
         failed = self.script(SOURCES_SCRIPT, "seed", code=2)
         self.assertTrue(failed.stderr.strip())
@@ -1648,7 +1255,7 @@ class StaffSourcesTests(StaffTestCase):
         lock = self.staff_file.parent / "operation.lock"
         with self.lock_notice(lock) as listener:
             with staff.operation():
-                moved = staff.move(unit.id, destination.id)
+                moved = staff.move(unit.id, staff.ReportsTo(destination.id))
                 pending = self.start_script(SOURCES_SCRIPT, "seed")
                 self.assert_operation_blocks(pending, listener)
             _output, errors = pending.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -1666,7 +1273,7 @@ class StaffSourcesTests(StaffTestCase):
         ))
         renamed = staff.rename(second.id, "renamed")
         record = staff.apply_seed(seed)
-        self.assertEqual(record.by_id(second.id), replace(renamed, parent=first.id))
+        self.assertEqual(record.by_id(second.id), replace(renamed, parent=staff.ReportsTo(first.id)))
         invalid = staff.SeedInput((
             staff.SeedMember("first", "showrunner", "first", first.id, staff.SeedParent("second")),
             staff.SeedMember("second", "showrunner", "second", second.id, staff.SeedParent("first")),
@@ -1771,7 +1378,7 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(staff.by_id(parent.id), parent)
         self.assertEqual(self.staff_file.read_bytes(), before)
-        _ = staff.move(child.id, parent.id)
+        _ = staff.move(child.id, staff.ReportsTo(parent.id))
         parent_file = showrunners.SHOWRUNNER_STATE_DIR / "child" / showrunners.PARENT_FILE
         parent_file.unlink()
         _ = self.seed()
@@ -1850,7 +1457,7 @@ class StaffSourcesTests(StaffTestCase):
         new = fixture_member("showrunner", name="new")
         unit = fixture_member("unit", name="models", parent=old.id)
         evidence = staff.SeedInput((), (staff.SeedRetirement(unit.id, old.id),))
-        moved = staff.move(unit.id, new.id)
+        moved = staff.move(unit.id, staff.ReportsTo(new.id))
         before = self.staff_file.read_bytes()
         with self.machine("mac"), redirect_stderr(io.StringIO()) as errors:
             record = staff.apply_seed(evidence)
@@ -1892,11 +1499,11 @@ class NonLocalMemberReferenceTests(unittest.TestCase):
         new_id = staff.StaffId(fixture_runtime_id("seed-new-owner"))
         unit_id = staff.StaffId(fixture_runtime_id("seed-moved-unit"))
         current = staff.native_id(fixture_runtime_id("seed-moved-current"))
-        old = staff.StaffRow(old_id, "showrunner", "old", None, current_session=old_id,
+        old = staff.StaffRow(old_id, "showrunner", "old", staff.StaffRoot(), current_session=old_id,
                              doc=staff.LiveDoc("natedev", Path("/fixture/old.md")))
-        new = staff.StaffRow(new_id, "showrunner", "new", None, current_session=new_id,
+        new = staff.StaffRow(new_id, "showrunner", "new", staff.StaffRoot(), current_session=new_id,
                              doc=staff.LiveDoc("natedev", Path("/fixture/new.md")))
-        moved = staff.StaffRow(unit_id, "unit", "alpha", new.id, current_session=current)
+        moved = staff.StaffRow(unit_id, "unit", "alpha", staff.ReportsTo(new.id), current_session=current)
         record = staff.StaffSnapshot((old, new, moved))
         document = "# Fixture\n"
         productions = {
@@ -1930,11 +1537,11 @@ class NonLocalMemberReferenceTests(unittest.TestCase):
         worker_id = staff.StaffId(fixture_runtime_id("nonlocal-worker"))
         other_id = staff.StaffId(fixture_runtime_id("nonlocal-other-parent"))
         moved_id = staff.StaffId(fixture_runtime_id("nonlocal-moved-unit"))
-        parent = staff.StaffRow(parent_id, "showrunner", "demo", None, current_session=parent_id)
-        unit = staff.StaffRow(unit_id, "unit", "alpha", parent_id, current_session=unit_id)
-        worker = staff.StaffRow(worker_id, "worker", "impl", unit_id, current_session=worker_id)
-        other = staff.StaffRow(other_id, "showrunner", "other", None, current_session=other_id)
-        moved = staff.StaffRow(moved_id, "unit", "alpha", other_id, current_session=moved_id)
+        parent = staff.StaffRow(parent_id, "showrunner", "demo", staff.StaffRoot(), current_session=parent_id)
+        unit = staff.StaffRow(unit_id, "unit", "alpha", staff.ReportsTo(parent_id), current_session=unit_id)
+        worker = staff.StaffRow(worker_id, "worker", "impl", staff.ReportsTo(unit_id), current_session=worker_id)
+        other = staff.StaffRow(other_id, "showrunner", "other", staff.StaffRoot(), current_session=other_id)
+        moved = staff.StaffRow(moved_id, "unit", "alpha", staff.ReportsTo(other_id), current_session=moved_id)
         record = staff.StaffSnapshot((parent, unit, worker, other, moved))
         selector = session_staff.UnitMember("demo", "alpha-unit")
         missing = fixture_runtime_id("nonlocal-unregistered-session")
@@ -1954,140 +1561,6 @@ class NonLocalMemberReferenceTests(unittest.TestCase):
                 expected = (session_staff.MemberFound(unit) if reference == missing
                             else session_staff.NoSuchMember(selector))
                 self.assertEqual(found, expected)
-
-
-class LegacyWorkerSourceTests(StaffTestCase):
-    run_dir: Path = Path()
-
-    @property
-    def parent(self) -> staff.StaffRow:
-        row = staff.by_path("sdlc/models")
-        assert row is not None
-        return row
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        doc = self.production("sdlc", "models-unit")
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            staff_sources.seed()
-        parent = staff.by_path("sdlc/models")
-        owner = staff.by_path("sdlc")
-        assert parent is not None and owner is not None
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
-        folder = self.source_root / "worktrees" / "models-unit"
-        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", folder), expected=parent.worktree)
-        (folder / ".git").unlink()
-        _ = self.fixture_git(folder, "init", "-b", "models")
-        _ = self.fixture_git(folder, "config", "user.email", "fixture@example.invalid")
-        _ = self.fixture_git(folder, "config", "user.name", "Fixture")
-        _ = self.fixture_git(folder, "commit", "--allow-empty", "-m", "fixture")
-        write_text_atomic(folder / ".unit.toml", 'plan = "active"\nresponsibilities = []\n')
-        _ = self.session_record(owner.current_session, owner.name)
-        _ = self.session_record(parent.current_session, "models-unit")
-        self.run_dir = self.worker_run("sdlc", "models-unit", parent.current_session)
-
-    def read_live(self) -> tuple[list[dict[str, object]], str]:
-        with redirect_stderr(io.StringIO()) as errors:
-            value = staff_sources.live()
-        return cast(list[dict[str, object]], value["members"]), errors.getvalue()
-
-    def test_roleless_roster_uses_exact_worker_membership_without_inventing_a_role(self) -> None:
-        worker = fixture_member("worker", name="review", parent=self.parent.id)
-        worker = staff.update_current_session(worker.id, staff.native_id(fixture_runtime_id("legacy-review-current")))
-        path = self.roster_worker(self.run_dir, worker.name, "", worker.current_session)
-        for omitted in (True, False):
-            with self.subTest(omitted=omitted):
-                data = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
-                if omitted:
-                    _ = data[worker.name].pop("role", None)
-                else:
-                    data[worker.name]["role"] = ""
-                self.write_json(path, data)
-                before = self.staff_file.read_bytes(), path.read_bytes()
-                members, errors = self.read_live()
-                self.assertEqual(errors, "")
-                found = next(member for member in members if member["id"] == worker.id)
-                self.assertEqual(found["kind"], "worker")
-                self.assertEqual(found["role"], "worker")
-                self.assertEqual(found["name"], worker.name)
-                self.assertEqual(found["parent"], self.parent.id)
-                self.assertEqual(found["identity"], {"codex": worker.current_session})
-                self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
-
-    def test_roleless_roster_rejects_missing_or_conflicting_membership_and_invalid_roles(self) -> None:
-        worker = fixture_member("worker", name="review", parent=self.parent.id)
-        other = fixture_member("unit", name="other", parent=self.parent.parent)
-        elsewhere = fixture_member("worker", name="elsewhere", parent=other.id)
-        cases = (
-            ("missing", "", fixture_runtime_id("missing-worker")),
-            (worker.name, "invalid-role", worker.current_session),
-            (worker.name, "", fixture_runtime_id("conflicting-worker")),
-            ("wrong-name", "", worker.current_session),
-            ("elsewhere", "", elsewhere.current_session),
-        )
-        for name, role, identity in cases:
-            with self.subTest(name=name, role=role, identity=identity):
-                self.write_json(self.run_dir / "mesh_roster.json", {})
-                path = self.roster_worker(self.run_dir, name, role, identity)
-                before = self.staff_file.read_bytes(), path.read_bytes()
-                members, errors = self.read_live()
-                self.assertFalse(any(member["kind"] == "worker" for member in members), members)
-                self.assertEqual(len(errors.splitlines()), 1, errors)
-                self.assertIn(f"{path} worker {name}:", errors)
-                self.assertIn("missing or invalid recorded worker role", errors)
-                self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
-
-    def test_malformed_roster_entry_preserves_its_valid_sibling(self) -> None:
-        worker = fixture_member("worker", name="review", parent=self.parent.id)
-        path = self.roster_worker(self.run_dir, worker.name, "review", worker.current_session)
-        data = cast(dict[str, object], json.loads(path.read_text()))
-        write_text_atomic(path, json.dumps({"broken": [], **data}) + "\n")
-        before = self.staff_file.read_bytes(), path.read_bytes()
-        members, errors = self.read_live()
-        self.assertEqual(len(errors.splitlines()), 1, errors)
-        self.assertIn(f"{path} worker broken: expected a JSON object", errors)
-        found = next(member for member in members if member["id"] == worker.id)
-        self.assertEqual(found["role"], "review")
-        self.assertEqual(found["identity"], {"codex": worker.current_session})
-        self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
-
-    def paused_legacy_ledger(self, identity: str) -> Path:
-        path = self.ledger_worker(self.run_dir, "sdlc", "former-models-unit", "review", "review",
-                                  identity, family="claude")
-        data = cast(dict[str, object], json.loads(path.read_text()))
-        entries = cast(dict[str, dict[str, object]], data["workers"])
-        entries["review"]["ownership"] = {"kind": "Paused"}
-        self.write_json(path, data)
-        self.write_json(self.run_dir / "mesh_roster.json", {})
-        return path
-
-    def test_paused_legacy_ledger_finds_renamed_parent_through_backend_current_session(self) -> None:
-        worker = fixture_member("worker", name="review", parent=self.parent.id)
-        worker = staff.update_current_session(worker.id, staff.native_id(fixture_runtime_id("legacy-ledger-current")))
-        path = self.paused_legacy_ledger(worker.current_session)
-        parent = staff.rename(self.parent.id, "renamed-models")
-        _ = self.session_record(worker.current_session, "review")
-        before = self.staff_file.read_bytes(), path.read_bytes()
-        members, errors = self.read_live()
-        self.assertEqual(errors, "")
-        found = next(member for member in members if member["id"] == worker.id)
-        self.assertEqual(found["parent"], parent.id)
-        self.assertEqual(found["identity"], {"claude": worker.current_session})
-        self.assertEqual(found["role"], "review")
-        self.assertEqual(next(member["name"] for member in members if member["id"] == parent.id), parent.name)
-        self.assertNotIn("staff_id", path.read_text())
-        self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
-
-    def test_paused_legacy_ledger_without_native_membership_has_no_current_staff_parent(self) -> None:
-        identity = fixture_runtime_id("unregistered-legacy-ledger")
-        path = self.paused_legacy_ledger(identity)
-        _ = self.session_record(identity, "review")
-        before = self.staff_file.read_bytes(), path.read_bytes()
-        members, errors = self.read_live()
-        self.assertFalse(any(member["kind"] == "worker" for member in members), members)
-        self.assertIn(f"{path} worker review: worker ledger has no current staff parent", errors)
-        self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
 
 
 if __name__ == "__main__":

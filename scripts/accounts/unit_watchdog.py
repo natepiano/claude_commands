@@ -157,7 +157,7 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
     for member in staff.active(record, "unit"):
         if not isinstance(member.worktree, staff.PresentWorktree) or member.worktree.machine != local_machine():
             continue
-        parent = record.by_id(member.parent) if member.parent is not None else None
+        parent = record.parent_of(member)
         production = parent.name if parent is not None else ""
         try:
             entry = pane_record.launch_for_session(member.current_session)

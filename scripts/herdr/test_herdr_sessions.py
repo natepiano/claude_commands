@@ -556,7 +556,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         configuration = self.enterContext(scratch_accounts_config())
         _ = (configuration / "script_prompts.conf").write_text(
             (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {"CLAUDE_CONFIG_DIR": ""}))
         self.responses = {"default": {"stdout": json.dumps({"result": {
             "workspaces": [], "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": [], "panes": [],
         }}), "code": 0}}

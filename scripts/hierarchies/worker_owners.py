@@ -30,6 +30,7 @@ for directory in ("lib", "message", "production", "whoami"):
 
 from scripts.lib import unit_runs
 from scripts.message import roster
+from scripts.production import staff, session_staff
 from scripts.accounts.role_map import stored_role_map
 
 
@@ -132,31 +133,13 @@ class Worker:
         return self.ownership.unit if isinstance(self.ownership, MissingDirectorRecord) else ""
 
 
-@dataclass(frozen=True)
-class OwnershipEvidence:
-    name: str
-    thread_id: str
-    run: str
-    owner: Director | MissingDirectorRecord
-    evidence: tuple[str, ...]
-
-    @classmethod
-    def from_worker(cls, worker: Worker) -> OwnershipEvidence:
-        if isinstance(worker.ownership, ConflictingOwners):
-            raise ValueError("conflicting owners cannot become a single ownership record")
-        owner = worker.ownership.director if isinstance(worker.ownership, (LiveDirectorOwner, RecordedDirectorOwner)) else MissingDirectorRecord(worker.unit)
-        return cls(worker.name, worker.thread_id, worker.run, owner, worker.evidence)
-
-    def worker(self) -> Worker:
-        ownership = ownership_record(self.owner)
-        return Worker(self.name, self.thread_id, self.run, ownership, self.evidence)
 
 
 @dataclass(frozen=True)
 class OwnershipSources:
     workers: list[Worker]
     directors: list[Director]
-    provenance: list[OwnershipEvidence]
+    membership: staff.StaffSnapshot
     problems: list[str]
 
 
@@ -271,12 +254,7 @@ def ownership_record(owner: Director | MissingDirectorRecord) -> RecordedDirecto
 def classify_worker(worker: Worker, directors: Sequence[Director]) -> Worker:
     if isinstance(worker.ownership, ConflictingOwners):
         return worker
-    matches = [director for director in directors if (
-        (worker.director and director.session_id == worker.director)
-        or (worker.unit and director.unit == worker.unit)
-        or (isinstance(worker.ownership, MissingDirectorRecord) and director.unit and director.worker_prefix
-            and worker.name.startswith(director.worker_prefix + "-"))
-    )]
+    matches = [director for director in directors if worker.director and director.session_id == worker.director]
     if matches:
         current = next((item for item in matches if item.session_id == worker.director), matches[0])
         return replace(worker, ownership=LiveDirectorOwner(current), evidence=evidence_lines(
@@ -319,62 +297,20 @@ def merge_observations(records: Sequence[Worker], directors: Sequence[Director])
     return replace(base, ownership=ownership, evidence=supporting, status=status)
 
 
-def recover_worker(worker: Worker, provenance: Sequence[OwnershipEvidence], directors: Sequence[Director]) -> Worker:
-    current = classify_worker(worker, directors)
-    if not isinstance(current.ownership, MissingDirectorRecord):
-        return current
-    matches = [item for item in provenance if worker.thread_id and item.thread_id == worker.thread_id]
-    if not matches:
-        return replace(current, recovery_attempted=True, evidence=evidence_lines(current.evidence,
-            ("no owner found in shutdown history, message log or launcher records",)))
-    recovered = merge_observations([current, *(item.worker() for item in matches)], directors)
-    recovered = replace(recovered, recovery_attempted=True, status=current.status)
-    if isinstance(recovered.ownership, MissingDirectorRecord):
-        return replace(recovered, evidence=evidence_lines(recovered.evidence,
-            ("no owner found in shutdown history, message log or launcher records",)))
-    if isinstance(recovered.ownership, ConflictingOwners):
-        return recovered
-    missing = (f"recorded run folder missing: {recovered.run}; known case: 2026-10-28 run-folder loss; deletion date unrecorded",) if recovered.run and not Path(recovered.run).is_dir() else ()
-    return replace(recovered, evidence=evidence_lines(recovered.evidence, missing, ("ownership recovered by thread id",)))
+def _staff_director(record: staff.StaffSnapshot, member: staff.StaffRow | None) -> Director | MissingDirectorRecord:
+    parent = record.parent_of(member) if member is not None and member.kind == "worker" else None
+    return (Director(parent.current_session, parent.name, parent.name if parent.kind == "unit" else "")
+            if parent is not None else MISSING_DIRECTOR_RECORD)
 
 
-def provenance_records(value: object, source: str, inherited: Director | MissingDirectorRecord = MISSING_DIRECTOR_RECORD,
-                       run: str = "", worker_context: bool = False) -> list[OwnershipEvidence]:
-    """Read shutdown seats, worker snapshots and launcher records by thread id."""
-    if isinstance(value, list):
-        return [worker for item in list_items(cast(object, value)) for worker in provenance_records(item, source, inherited, run, worker_context)]
-    record = object_fields(value)
-    if not record:
-        return []
-    session = object_fields(record.get("session"))
-    if session.get("kind") == "worker":
-        return provenance_records(session, source, inherited, run, True)
-    host = object_fields(session.get("host"))
-    session_id = text_field(session, "session_id")
-    identity = Director(session_id, text_field(session, "name"), text_field(host, "unit")) if session_id else inherited
-    owner = object_fields(record.get("owner"))
-    director = text_field(owner, "session_id") or text_field(record, "director_session_id") or text_field(record, "director") or (identity.session_id if isinstance(identity, Director) else "")
-    unit = text_field(record, "unit") or identity.unit
-    run_path = text_field(record, "run_dir") or text_field(record, "session_dir") or run
-    thread = text_field(record, "thread_id")
-    if not thread and record.get("family") == "codex":
-        thread = text_field(record, "worker_id")
-    if not thread and record.get("kind") == "worker":
-        thread = text_field(record, "session_id")
-    found: list[OwnershipEvidence] = []
-    worker_named = (worker_context or bool(text_field(record, "seat")) or record.get("kind") == "worker"
-                    or (record.get("family") == "codex" and bool(text_field(record, "worker_id")))
-                    or bool(text_field(record, "director_session_id")) or bool(text_field(owner, "session_id")))
-    if thread and worker_named:
-        director_record = (replace(identity, unit=unit) if isinstance(identity, Director) and identity.session_id == director
-                           else Director(director, "", unit)) if director else MissingDirectorRecord(unit)
-        found.append(OwnershipEvidence(text_field(record, "seat") or text_field(record, "name"), thread,
-                                       run_path, director_record, (source,)))
-    for key, item in record.items():
-        if key not in ("session", "owner") and isinstance(item, (dict, list)):
-            found.extend(provenance_records(cast(object, item), source, identity, run_path,
-                                             worker_context or key in ("codex_seats", "workers", "seats")))
-    return found
+def recover_worker(worker: Worker, record: staff.StaffSnapshot, directors: Sequence[Director]) -> Worker:
+    member = record.by_current_session(worker.thread_id)
+    owner = ownership_record(_staff_director(record, member))
+    current = classify_worker(replace(worker, ownership=owner), directors)
+    return replace(current, recovery_attempted=True, evidence=evidence_lines(current.evidence,
+        ("ownership read from staff" if not isinstance(owner, MissingDirectorRecord) else "worker owner is unavailable in staff",)))
+
+
 
 
 def source_files(root: Path, pattern: str, problems: list[str]) -> list[Path]:
@@ -388,82 +324,27 @@ def source_files(root: Path, pattern: str, problems: list[str]) -> list[Path]:
         return []
 
 
-def message_ownership_records(record: JsonObject, source: str, directors: Sequence[Director],
-                              routes: Sequence[OwnershipEvidence]) -> list[OwnershipEvidence]:
-    """Join a director's worker address to recorded worker thread identities."""
-    address = text_field(record, "to")
-    if not address.startswith("worker:"):
-        return []
-    run_key, separator, name = address.removeprefix("worker:").rpartition("/")
-    if not separator or not run_key or not name:
-        return []
-    sender = text_field(record, "from")
-    owners = {item.session_id: item for item in directors if item.unit and sender in (item.name, f"session:{item.session_id}")}
-    if len(owners) != 1:
-        return []
-    matching = [item for item in routes if item.name == name and item.run and
-                (item.run == run_key if Path(run_key).is_absolute() else Path(item.run).name == run_key)]
-    if len({item.run for item in matching}) != 1:
-        return []
-    owner = next(iter(owners.values()))
-    return [OwnershipEvidence(item.name, item.thread_id, item.run, owner, (source,)) for item in matching]
 
 
-def load_provenance(roots: Sequence[Path], directors: Sequence[Director], problems: list[str],
-                    routes: Sequence[OwnershipEvidence]) -> list[OwnershipEvidence]:
-    found: list[OwnershipEvidence] = []
-    for root in roots:
-        for path in source_files(root, "**/impl_worker_*.json", problems):
-            owner = unit_runs.director(path.parent)
-            identity = next((item for item in directors if item.session_id == owner),
-                            Director(owner, "", "") if owner else MISSING_DIRECTOR_RECORD)
-            found.extend(provenance_records(read_object(path, problems), f"launcher record {path}", identity, str(path.parent), True))
-    known_directors = [*directors, *(item.owner for item in found if isinstance(item.owner, Director))]
-    message_routes = [*routes, *found]
-    log = Path(os.environ.get("WORKER_MESSAGE_LOG", str(Path.home() / ".local/state/message/log.jsonl")))
-    try:
-        with log.open(encoding="utf-8") as handle:
-            for number, line in enumerate(handle, 1):
-                try:
-                    record = object_fields(cast(object, json.loads(line)))
-                except ValueError:
-                    problems.append(f"{log}:{number}: invalid JSON")
-                    continue
-                found.extend(message_ownership_records(record, f"message log {log}:{number}", known_directors, message_routes))
-    except (OSError, UnicodeError) as error:
-        problems.append(f"{log}: {error}")
-    return found
 
 
 def state_directory() -> Path:
     return Path(os.environ.get("WORKER_OWNERS_STATE", str(Path.home() / ".local/state/worker-owners")))
 
 
-def saved_ownership(record: JsonObject) -> OwnershipEvidence:
-    evidence = tuple(item for item in list_items(record.get("evidence")) if isinstance(item, str))
-    director = text_field(record, "director")
-    owner = Director(director, "", text_field(record, "unit")) if director else MISSING_DIRECTOR_RECORD
-    return OwnershipEvidence(text_field(record, "name"), text_field(record, "thread_id"), text_field(record, "run"),
-                             owner, evidence)
 
 
-def enrich_director_record(worker: Worker, provenance: Sequence[OwnershipEvidence]) -> Worker:
-    """Complete an already recorded session's unit before checking its liveness."""
-    if not isinstance(worker.ownership, RecordedDirectorOwner) or worker.unit:
-        return worker
-    matching = [item for item in provenance if isinstance(item.owner, Director) and item.owner.session_id == worker.director and item.owner.unit]
-    units = {item.owner.unit for item in matching}
-    if len(units) == 1:
-        owner = replace(worker.ownership.director, unit=next(iter(units)))
-        return replace(worker, ownership=RecordedDirectorOwner(owner),
-                       evidence=evidence_lines(worker.evidence, *(item.evidence for item in matching)))
-    return worker
 
 
 def collect_sources() -> OwnershipSources:
     with stored_role_map():
         observed = roster.roster(os.environ, roster.ThisMachine())
     problems = list(observed.problems)
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffUnreadable as error:
+        problems.append(f"staff: {error}")
+        membership = staff.StaffSnapshot(())
     directors: list[Director] = []
     for entry in observed.entries:
         if isinstance(entry.session, roster.ClaudeSession):
@@ -476,62 +357,46 @@ def collect_sources() -> OwnershipSources:
     observations: dict[str, list[Worker]] = {}
     mesh_paths = [path for root in roots for path in source_files(root, "*/mesh_roster.json", problems)]
     for path in mesh_paths:
-        owner = unit_runs.director(path.parent)
-        unit = next((item.unit for item in directors if item.session_id == owner), "")
         for name, raw in read_object(path, problems).items():
             record = object_fields(raw)
-            thread = text_field(record, "thread_id")
-            if record.get("held_design_id") or text_field(record, "role").startswith("astra-"):
+            member = session_staff.worker_row(record, membership)
+            thread = session_staff.worker_session(record, membership)
+            if record.get("held_design_id"):
                 if thread:
                     excluded.add(thread)
                 continue
-            if record.get("status") == "ended" or record.get("role_redirect") or record.get("transferring_role") or thread in excluded:
+            if record.get("status") == "ended" or thread in excluded:
                 continue
             if not thread:
                 problems.append(f"{path}: {name}: thread id missing")
                 continue
-            identity = Director(owner, "", unit) if owner else MISSING_DIRECTOR_RECORD
+            identity = _staff_director(membership, member)
             ownership = ownership_record(identity)
             observations.setdefault(thread, []).append(Worker(name, thread, str(path.parent), ownership,
                 (f"mesh roster {path}", f"recorded status {text_field(record, 'status')}"),
                 status=WorkerTurnState.from_status(text_field(record, "status"))))
-    routes = [OwnershipEvidence.from_worker(item) for records in observations.values() for item in records]
-    provenance = load_provenance(roots, directors, problems, routes)
-    saved = state_directory() / "recovered.json"
-    saved_provenance: list[OwnershipEvidence] = []
-    if saved.exists():
-        saved_provenance = [saved_ownership(object_fields(item)) for item in list_items(read_object(saved, problems).get("workers"))]
-        provenance.extend(saved_provenance)
-    worker_threads = {item.thread_id for item in [*routes, *provenance]}
+    worker_threads = set(observations)
     for entry in observed.entries:
         if entry.kind != "codex" or not isinstance(entry.thread, roster.CodexThread) or entry.thread.thread_id in excluded:
             continue
         if entry.role != "worker" and entry.thread.thread_id not in worker_threads:
             continue
-        relation = entry.director
-        director = relation.address.removeprefix("session:") if isinstance(relation, roster.UnderDirector) else ""
-        unit = relation.unit if isinstance(relation, roster.UnderDirector) else ""
+        member = membership.by_current_session(entry.thread.thread_id)
         run = entry.assignment.session_dir if isinstance(entry.assignment, roster.WorkerAssignment) else ""
-        identity = Director(director, "", unit) if director else MissingDirectorRecord(unit)
+        identity = _staff_director(membership, member)
         observations.setdefault(entry.thread.thread_id, []).append(Worker(entry.name, entry.thread.thread_id, run,
             ownership_record(identity), ("live session roster",), status=WorkerTurnState.from_status(entry.status)))
     classified: list[Worker] = []
     for thread, records in observations.items():
         if thread in excluded:
             continue
-        provenance.extend(OwnershipEvidence.from_worker(item) for item in records)
-        enriched = [enrich_director_record(item, provenance) for item in records]
-        worker = merge_observations(enriched, directors)
-        if isinstance(worker.ownership, MissingDirectorRecord):
-            prior = [item.worker() for item in saved_provenance if item.thread_id == thread]
-            if prior:
-                worker = merge_observations([worker, *prior], directors)
+        worker = merge_observations(records, directors)
         classified.append(worker)
-    return OwnershipSources(sorted(classified, key=lambda item: (item.run, item.name)), directors, provenance, problems)
+    return OwnershipSources(sorted(classified, key=lambda item: (item.run, item.name)), directors, membership, problems)
 
 
 def recover_sources(sources: OwnershipSources) -> OwnershipSources:
-    return replace(sources, workers=[recover_worker(worker, sources.provenance, sources.directors) for worker in sources.workers])
+    return replace(sources, workers=[recover_worker(worker, sources.membership, sources.directors) for worker in sources.workers])
 
 
 def write_json(path: Path, value: object) -> None:
@@ -542,17 +407,6 @@ def write_json(path: Path, value: object) -> None:
     os.replace(staged, path)
 
 
-def save_recoveries(sources: OwnershipSources, folder: Path) -> None:
-    """Retain saved ownership even when a worker or its original source disappears."""
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / "recovered.json"
-    prior = read_object(path, sources.problems) if path.exists() else {}
-    records = [object_fields(item) for item in list_items(prior.get("workers"))]
-    saved = {text_field(item, "thread_id"): item for item in records if text_field(item, "thread_id")}
-    for worker in sources.workers:
-        if worker.recovery_attempted and worker.classification != WorkerClass.OwnerUnknown:
-            saved[worker.thread_id] = worker_record(worker)
-    write_json(path, {"workers": list(saved.values())})
 
 
 @dataclass(frozen=True)
@@ -565,7 +419,9 @@ class EndEligible:
     pass
 
 
-def end_decision(worker: Worker, selected_class: WorkerClass, problems: Sequence[str], first_run: bool) -> WorkerKept | EndEligible:
+
+
+def end_decision(worker: Worker, selected_class: WorkerClass, problems: Sequence[str], first_run: bool, membership: staff.StaffSnapshot) -> WorkerKept | EndEligible:
     if isinstance(worker.ownership, LiveDirectorOwner):
         return WorkerKept("unit director is live")
     if isinstance(worker.ownership, ConflictingOwners):
@@ -584,7 +440,7 @@ def end_decision(worker: Worker, selected_class: WorkerClass, problems: Sequence
         return WorkerKept("source problems")
     route_problems: list[str] = []
     record = object_fields(read_object(Path(worker.run) / "mesh_roster.json", route_problems).get(worker.name)) if worker.run else {}
-    if route_problems or record.get("thread_id") != worker.thread_id:
+    if route_problems or session_staff.worker_session(record, membership) != worker.thread_id:
         return WorkerKept("mesh route missing or thread changed")
     status = WorkerTurnState.from_status(text_field(record, "status"))
     if status == WorkerTurnState.Ended:
@@ -603,13 +459,16 @@ def mesh_end(worker: Worker) -> int | WorkerKept:
     matching = [item for item in fresh.workers if item.thread_id == worker.thread_id]
     if len(matching) != 1 or matching[0].classification != worker.classification:
         return WorkerKept("worker ownership or thread changed")
-    decision = end_decision(matching[0], worker.classification, fresh.problems, False)
+    decision = end_decision(matching[0], worker.classification, fresh.problems, False, fresh.membership)
     if isinstance(decision, WorkerKept):
         return decision
     # Check the requested route too; source collection may have found a different run.
-    decision = end_decision(worker, worker.classification, fresh.problems, False)
+    decision = end_decision(worker, worker.classification, fresh.problems, False, fresh.membership)
     if isinstance(decision, WorkerKept):
         return decision
+    member = fresh.membership.by_current_session(worker.thread_id)
+    if member is None or member.kind != "worker":
+        return WorkerKept("worker staff row changed")
     # models-unit must make the handler compare under its mutation lock before any side effect.
     # Older handlers reject these flags; never retry an end by name alone.
     completed = subprocess.run([sys.executable, str(SCRIPTS / "agents/codex_mesh.py"), "end",
@@ -620,7 +479,9 @@ def mesh_end(worker: Worker) -> int | WorkerKept:
         return completed.returncode
     problems: list[str] = []
     current = object_fields(read_object(Path(worker.run) / "mesh_roster.json", problems).get(worker.name))
-    return 0 if not problems and current.get("thread_id") == worker.thread_id and current.get("status") == "ended" else 3
+    if current.get("staff_id") == member.id and current.get("status") == "ended":
+        return 0 if not problems else 3
+    return 0 if not problems and session_staff.worker_session(current) == worker.thread_id and current.get("status") == "ended" else 3
 
 
 def worker_record(worker: Worker) -> JsonObject:
@@ -687,7 +548,13 @@ def pending_route_problem(record: PendingEndCleanup) -> RouteEnded | RouteGone |
         return RouteUnreadable("; ".join(problems))
     if not route:
         return RouteGone("mesh route missing")
-    if route.get("thread_id") != record.thread_id:
+    reference = text_field(route, "staff_id")
+    if (reference and route.get("status") == "ended"
+            and staff.local_snapshot().by_id(staff.StaffId(reference)) is None):
+        return RouteGone("worker retirement confirms completed end cleanup")
+    if problems:
+        return RouteUnreadable("; ".join(problems))
+    if session_staff.worker_session(route) != record.thread_id:
         return RouteGone("mesh thread changed")
     if route.get("status") != "ended":
         return RouteGone("mesh route is not ended")
@@ -766,7 +633,7 @@ def end_workers(sources: OwnershipSources, selected_class: WorkerClass, state_di
         for record in read_pending_ends(state_dir, recovered.problems):
             notes.append(f"{record.name}: would finish end cleanup")
         for worker in recovered.workers:
-            decision = end_decision(worker, selected_class, recovered.problems, not marker.exists())
+            decision = end_decision(worker, selected_class, recovered.problems, not marker.exists(), recovered.membership)
             notes.append(f"{worker.name}: would keep: {decision.reason}" if isinstance(decision, WorkerKept)
                          else f"{worker.name}: would end")
         return EndResult(recovered.workers, (), tuple(notes), not marker.exists())
@@ -788,7 +655,7 @@ def end_workers(sources: OwnershipSources, selected_class: WorkerClass, state_di
         for worker in recovered.workers:
             if worker.classification != selected_class:
                 continue
-            decision = end_decision(worker, selected_class, recovered.problems, first_run)
+            decision = end_decision(worker, selected_class, recovered.problems, first_run, recovered.membership)
             if isinstance(decision, WorkerKept):
                 outcome = f"kept: {decision.reason}"
             else:
@@ -863,7 +730,6 @@ def main(arguments: Sequence[str] = ()) -> int:
     end_failed = False
     if command == "recover":
         sources = recover_sources(sources)
-        save_recoveries(sources, state_directory())
     elif command == "end":
         result = end_workers(sources, WorkerClass(selected_class), state_directory(), apply=apply)
         sources = replace(sources, workers=result.workers)

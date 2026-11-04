@@ -209,7 +209,7 @@ def shell_atoms(command: str) -> tuple[Atom, ...]:
 
 # Codex rollout records.
 
-STRING_LITERAL = r"""(["'`])((?:\\.|(?!\1).)*)\1"""
+STRING_LITERAL = r"""(["'`])((?:\\.|(?!\1)[^\\])*)\1"""
 TOOL_CALL = re.compile(r"tools\.(\w+)\(")
 COMMAND_FIELD = re.compile(r"""["']?cmd["']?\s*:\s*""" + STRING_LITERAL, re.S)
 CHARS_FIELD = re.compile(r"""["']?chars["']?\s*:\s*""" + STRING_LITERAL, re.S)

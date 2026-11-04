@@ -45,6 +45,21 @@ linked worktree's `.git` pointer or changes the source's branches. The clone's
 Git metadata is staged inside the already locked directory and then installed,
 so first creation has the same busy protection as reuse.
 
+The copy's `origin` URL equals the source repository's `origin` URL.
+Each use refreshes `refs/remotes/origin/*` from the source's matching remote refs.
+It does not map the source's local branches into those refs.
+The refresh uses a local fetch and keeps shared objects.
+Existing copies receive the URL and ref repair on their next use.
+The copy keeps `origin/HEAD` only when the source records that ref.
+
+Each copy also has a `source` remote with the local source path as its URL.
+Its `refs/remotes/source/*` track the source's local branches.
+The copy sweep uses these refs to detect commits saved in the source.
+Creation, reuse, and the end of use refresh both remotes with local fetches.
+A source without an `origin` remote keeps the local source URL and local branch mapping.
+These copies also keep `source`, so all copies use the same refresh rule.
+Legacy adoption resolves each local origin URL from its own repository before comparison.
+
 Each use fetches the selected commit from the source, checks it out with
 `checkout --force --detach`, and runs `clean -ffdq`. It keeps ignored files,
 including `target/`. Git updates changed files while preserving unchanged file
@@ -70,6 +85,8 @@ pids, then blocks on the primary tree's flock while rechecking the second at
 release wakes acquisition immediately. A third simultaneous caller waits; it
 never creates a third tree. Failed
 preparation and failed commands release the lock.
+Git runs automatic maintenance synchronously because its children inherit the busy lock.
+This also releases the lock after a failed metadata refresh.
 
 Each tree has one `.gate.json` record:
 

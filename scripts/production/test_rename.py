@@ -151,7 +151,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         _ = self.git("commit", "-m", "Record workspace name")
         self.assert_success(self.run_command("apply", "tools", NEW))
         self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(
-            row.id, "showrunner", "new", None, current_session=row.id,
+            row.id, "showrunner", "new", staff.StaffRoot(), current_session=row.id,
             doc=staff.LiveDoc("natedev", self.new_doc)))
         self.assertIn("- **Showrunner session:** `new`", self.new_doc.read_text())
 

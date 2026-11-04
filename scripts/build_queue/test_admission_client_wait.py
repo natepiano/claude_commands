@@ -163,7 +163,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
             assert "priority_since" in row
             places.append((path, row["pid"], row["since"], row["priority_since"]))
         self.assertEqual(places[0], places[1])
-        self.assertEqual(places[1], places[2])
+        self.assertEqual((places[1][:3], places[1][3] < places[2][3]), (places[2][:3], True))
         self.assertEqual(calls[-1]["rows"], {})
         # A reconnect can replay a grant while the client refreshes its estimate.
         self.assertEqual(len({grant.reservation for grant in self.grants}), 1)

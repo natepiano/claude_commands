@@ -389,7 +389,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery(("sent child", "sent parent"))),
               mock.patch.object(add_showrunner, "main") as restart):
             code, out, err = self.run_main()
-        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual((code, err), (0, "unchanged\n"), out)
         appeared.assert_called_once_with("child")
         restart.assert_not_called()
         prompt.assert_not_called()
@@ -423,7 +423,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                   mock.patch.object(showrunners, "tell_others", side_effect=send_notices) as notices,
                   mock.patch.object(add_showrunner, "main") as restart):
                 code, out, err = self.run_main()
-        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual((code, err), (0, "unchanged\n"), out)
         restart.assert_not_called()
         notices.assert_called_once()
         self.assertIn("sent child", out)

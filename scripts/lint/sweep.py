@@ -408,10 +408,25 @@ def discover_cargo_outputs(roots: Sequence[str], dry_run: bool, *,
     unresolved: set[str] = set()
     history = set(cached.history)
     refreshed: set[Path] = set()
+    levels: dict[int, list[Path]] = {}
     for checkout in sorted(candidates):
-        if any(checkout.is_relative_to(root) for root in refreshed):
+        levels.setdefault(len(checkout.parts), []).append(checkout)
+    readings: dict[Path, CargoOutputRoots | CargoOutputUnavailable] = {}
+    with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 1, 16)) as executor:
+        # Resolve parents before children. Each skip checks only the checkout's ancestors.
+        for depth in sorted(levels):
+            pending = [checkout for checkout in levels[depth]
+                       if not any(parent in refreshed for parent in (checkout, *checkout.parents))]
+            for checkout, result in zip(pending, executor.map(read_cargo_output_roots, pending)):
+                readings[checkout] = result
+                if isinstance(result, CargoOutputRoots):
+                    refreshed.add(result.workspace_root)
+    # Keep the saved order and history independent of worker completion order.
+    refreshed.clear()
+    for checkout in sorted(candidates):
+        if any(parent in refreshed for parent in (checkout, *checkout.parents)):
             continue
-        result = read_cargo_output_roots(checkout)
+        result = readings[checkout] if checkout in readings else read_cargo_output_roots(checkout)
         if isinstance(result, CargoOutputUnavailable):
             unresolved.add(str(checkout))
             continue
@@ -1014,6 +1029,18 @@ def record_floor_lock(path: str, guard: int, started_at: float) -> None:
         os.fsync(handle.fileno())
 
 
+def _runs_sweep(command: bytes) -> bool:
+    argv = command.rstrip(b"\0").split(b"\0")
+    program = os.path.basename(argv[0])
+    if program == b"sweep.py":
+        return True
+    if re.fullmatch(rb"python(?:\d+(?:\.\d+)*)?", program):
+        for arg in argv[1:]:
+            if not arg.startswith(b"-"):
+                return os.path.basename(arg) == b"sweep.py"
+    return False
+
+
 def alert_floor_lock(path: str, free: int, floor: int, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
@@ -1025,6 +1052,12 @@ def alert_floor_lock(path: str, free: int, floor: int, *,
         holder = floor_lock_holder(path, lint_settings=lint_settings)
         if not isinstance(holder, KnownFloorLockHolder):
             return
+        try:
+            command = (Path(PROC_DIR) / str(holder.pid) / "cmdline").read_bytes()
+            if _runs_sweep(command):
+                return
+        except OSError:
+            pass
         seconds = int(lint_settings.number(FLOOR_LOCK_ALERT_KEY) * 60)
         now = time.time()
         if now - holder.started_at < seconds:
@@ -3271,14 +3304,18 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                 continue
             idle.append(root)
             tree_targets.update({tree: root for tree in root_trees if owners.owner(tree) == TargetOwner(root)})
+        output_index = OUTPUT_ROOTS.get()
+        unresolved_checkouts = {Path(checkout) for checkout in output_index.unresolved}
+        unresolved_ancestors = {parent for checkout in unresolved_checkouts for parent in (checkout, *checkout.parents)}
+        unresolved_outputs = {str(path) for mapping in output_index.workspaces
+                              if mapping.workspace_root in unresolved_ancestors
+                              for path in (mapping.target_directory, mapping.build_directory)}
         for root in tuple(idle):
             pair = OUTPUT_ROOTS.get().roots_for(root)
             blocked_pair = next((paired for paired in pair if paired in busy), "")
-            unresolved = any(Path(root).is_relative_to(checkout) for checkout in OUTPUT_ROOTS.get().unresolved)
-            unresolved = unresolved or any(
-                any(Path(checkout).is_relative_to(mapping.workspace_root) for checkout in OUTPUT_ROOTS.get().unresolved)
-                and root in (str(mapping.target_directory), str(mapping.build_directory))
-                for mapping in OUTPUT_ROOTS.get().workspaces)
+            root_path = Path(root)
+            unresolved = root in unresolved_outputs or any(
+                parent in unresolved_checkouts for parent in (root_path, *root_path.parents))
             if blocked_pair or unresolved:
                 busy[root] = busy[blocked_pair] if blocked_pair else LockHeld("Cargo output mapping is unavailable")
                 idle.remove(root)
