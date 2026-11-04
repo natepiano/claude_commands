@@ -639,6 +639,8 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
     """Make a task-owned test clone. Publish its task before Git can leave a partial copy."""
+    from scripts.copies import copies
+
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     path = new(task, word, now=now, scratch_settings=scratch_settings)
@@ -647,9 +649,16 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
         "test_hana_clone": True, "source_path": str(source.resolve()),
     }, scratch_settings=scratch_settings)
     checkout = path / "checkout"
-    result = subprocess.run(["git", "clone", "--quiet", "--", str(source), str(checkout)], check=False)
-    if result.returncode:
-        raise ScratchError(f"clone failed; its task still owns the partial folder {path}")
+    try:
+        # The task folder keeps one lock path while its checkout gains Git metadata.
+        with copies.claim_tree(path, create=False) as state:
+            if state is not copies.ClaimState.ACQUIRED:
+                raise copies.CopyError(f"{path}: task folder is busy")
+            checkout.mkdir()
+            copies.initialize_git(checkout, source.resolve())
+            _ = copies.git(checkout, "reset", "--hard", "--quiet")
+    except (OSError, copies.CopyError) as error:
+        raise ScratchError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
     return checkout
 
 

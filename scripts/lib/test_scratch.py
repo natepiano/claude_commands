@@ -145,11 +145,14 @@ class ScratchTests(unittest.TestCase):
         self.git(source, "add", "asset")
         self.git(source, "commit", "-qm", "source")
 
-        checkout = scratch.clone(source, "gate:hana-view", "camera")
+        with mock.patch.object(copies, "initialize_git", wraps=copies.initialize_git) as initialize:
+            checkout = scratch.clone(source, "gate:hana-view", "camera")
+        initialize.assert_called_once_with(checkout, source.resolve())
 
         self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
         self.assertEqual((checkout / "asset").read_text(), "saved source")
         self.assertTrue((checkout / ".git").is_dir())
+        self.assertFalse((checkout / scratch.BUSY).exists())
         record = scratch.task_of(checkout.parent)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:hana-view")
@@ -164,17 +167,17 @@ class ScratchTests(unittest.TestCase):
         self.assertEqual(scratch.end("gate:hana-view"), [])
 
     def test_a_failed_clone_still_has_a_task_that_removes_its_partial_files(self) -> None:
-        def interrupted_clone(command: list[str], *, check: bool) -> subprocess.CompletedProcess[bytes]:
-            self.assertFalse(check)
-            checkout = Path(command[-1])
-            checkout.mkdir()
+        def interrupted_clone(checkout: Path, source: Path) -> None:
+            self.assertEqual(source, self.base / "source")
+            with scratch.judgment_lock(checkout) as available:
+                self.assertFalse(available)
             _ = (checkout / "partial").write_text("partial clone")
             record = scratch.task_of(checkout.parent)
             assert isinstance(record, copy_record.Registered)
             self.assertEqual(record.task, "gate:clone-failure")
-            return subprocess.CompletedProcess(command, 1)
+            raise copies.CopyError("interrupted clone")
 
-        with mock.patch.object(subprocess, "run", side_effect=interrupted_clone):
+        with mock.patch.object(copies, "initialize_git", side_effect=interrupted_clone):
             with self.assertRaisesRegex(scratch.ScratchError, "clone failed"):
                 _ = scratch.clone(self.base / "source", "gate:clone-failure")
         paths = [item.path for item in scratch.folders() if item.task == "gate:clone-failure"]
