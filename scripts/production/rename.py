@@ -28,7 +28,6 @@ from rename_state import RenameRefused, write_text  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.herdr import herdr  # noqa: E402
 from scripts.production import staff, staff_sources, unit_config, unit_names
-from scripts.shutdown import remote
 
 
 @dataclass(frozen=True)
@@ -141,7 +140,15 @@ def plan(old: str, new: str) -> RenamePlan:
     After the timer moves, `old` resolves to the new name, and the latest former name is the old name.
     """
     _validate_slug(new)
-    slug = showrunners.canonical_slug(old)
+    record = staff.snapshot()
+    rows = record.find(kind="showrunner")
+    found = [row for row in rows if row.name == old] or [row for row in rows if row.name == new]
+    if not found:
+        raise staff.StaffRefused(f"{old}: no showrunner staff row")
+    member = found[0]
+    if isinstance(member.doc, staff.DocUnfilled):
+        raise ValueError(f"{member.name}: the staff document is unfilled")
+    slug = showrunners.canonical_slug(member.doc.path.name.removesuffix("-production.md"))
     _validate_slug(slug)
     known = showrunners.timer_slugs()
     if slug != new and new in known:
@@ -162,8 +169,8 @@ def plan(old: str, new: str) -> RenamePlan:
     _ = unit_move.git(production.checkout, "check-ref-format", "--branch", new)
     new_doc = production.doc.with_name(f"{new}-production.md")
     old_doc = production.doc.with_name(f"{old}-production.md") if production.doc == new_doc else production.doc
-    staff_id = _staff_id(old_doc, new_doc)
-    rows = staff.snapshot().find(kind="unit", parent=staff_id)
+    staff_id = member.id
+    rows = record.find(kind="unit", parent=staff_id)
     units = tuple(unit_names.unit_id(row.name) for row in rows)
     return RenamePlan(
         old, new, old_doc, new_doc, production.checkout, production.merge_branch,
@@ -184,17 +191,6 @@ def _plans(rows: list[staff.StaffRow], checkout: Path) -> tuple[Path, ...]:
         if isinstance(config, unit_config.UnitConfig) and isinstance(config.plan, unit_config.PlanFile):
             plans.extend(path for path in unit_move.plan_paths(str(config.plan.path), checkout) if path not in plans)
     return tuple(plans)
-
-
-def _staff_id(old_doc: Path, new_doc: Path) -> staff.StaffId:
-    """The showrunner row whose doc is this production's doc, before or after the doc moves."""
-    docs = {old_doc.resolve(), new_doc.resolve()}
-    found = [row.id for row in staff.snapshot().find(kind="showrunner")
-             if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
-             and row.doc.machine == remote.local_machine() and row.doc.path.resolve() in docs]
-    if len(found) != 1:
-        raise staff.StaffRefused(f"{old_doc}: expected one showrunner staff row, found {len(found)}")
-    return found[0]
 
 
 def _describe(plan: RenamePlan) -> list[str]:

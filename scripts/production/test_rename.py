@@ -12,7 +12,7 @@ from unittest import mock
 
 from scripts.production import rename_test_support as support
 from scripts.production import staff
-from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT_MOVE_INDEX, FAIL_PLAN_REWRITE, NEW, OLD, UNITS
+from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT_MOVE_INDEX, NEW, OLD, UNITS
 
 
 @final
@@ -65,7 +65,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.write(self.doc, self.doc.read_text().replace("## Production Context\n", "## Production Context\n\n- **Showrunner session:** `tools`\n"))
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "Record workspace name")
-        self.assert_success(self.run_rename("apply"))
+        self.assert_success(self.run_command("apply", "tools", NEW))
         self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(
             row.id, "showrunner", "new", None, current_session=row.id,
             doc=staff.LiveDoc("natedev", self.new_doc)))
@@ -235,18 +235,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(len(formerly), 1, context)
         for slug in ("ancient", "earlier", OLD):
             self.assertIn(f"`{slug}`", formerly[0])
-
-    def test_a_former_source_name_reruns_after_a_failed_step(self) -> None:
-        self.write(self.doc, self.doc.read_text().replace(
-            "## Production Context\n", "## Production Context\n\n- **Formerly:** `ancient`\n"))
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Record the source production's earlier name")
-        base = self.git("rev-parse", OLD)
-        failed = self.run_command("apply", "ancient", NEW, wrapper=FAIL_PLAN_REWRITE)
-        self.assertIn("simulated unit header rewrite failure", failed.stderr)
-        self.assert_success(self.run_rename("apply", source="ancient"))
-        self.assertEqual(self.git("rev-parse", "new~2"), base)
-        self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_a_move_interrupted_before_index_update_commits_only_the_new_doc(self) -> None:
         failed = self.run_command("apply", OLD, NEW, wrapper=FAIL_GIT_MOVE_INDEX)

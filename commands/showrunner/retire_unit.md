@@ -17,42 +17,18 @@ Print the script's output without changes.
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/retire_unit.py" <slug> <unit> [--dry-run]
 ```
 
-It refuses uncommitted work. Before removal, commits the merge branch lacks are pushed to
-`origin` as `refs/retired/<staff id>` and confirmed at the full branch tip. A failed or unconfirmed
-push refuses removal. The
-`Project started` line that the `/unit:direct` recorder adds to a plan, and never commits, is not
-uncommitted work when it is the file's only change.
+Retire finds the unit by its staff name or id under the production.
+It stops the unit and its staff workers through `current_session`.
+Uncommitted work and commits outside the merge branch prevent removal.
+The recorder's only added `Project started` line does not count as uncommitted work.
 
-Then it stops everything the unit owns. It finds each thing by its own record, never by a name
-pattern, and prints one line for each thing it stops and for each thing it leaves running, with
-the reason:
+Retire releases build holds, berth reservations, and Mac claims.
+It reports other cleanup failures as anomalies.
+It removes the worktree, its branch, and any remaining Units row.
+The staff row stays with a `RemovedWorktree` location.
+Unit settings remain parked under the staff id.
+Retire writes no retired note or saved branch ref.
 
-1. Each Claude session that works in the worktree, the unit director and its Claude workers, and the director of each of the worktree's runs wherever it works, stops
-   through `stop_resume.stop`. After successful cleanup, its pane launch entry is removed,
-   so pane restore does not bring it back.
-2. Each run of the worktree with an app-server stops it and ends its Codex workers. `workers.end_unit` then prints one line for each pending message, owed continuation, detached run and reservation it cancels, and for each quarantined entry it removes, and deletes the unit's worker ledger. A worker that cannot end refuses the retire; run it again.
-3. The build holds of the unit's sessions release, its berth reservations release, and the process
-   of each Mac claim on the worktree stops.
-4. The unit's exact pane shell does not block. Another process blocks unless its environment
-   names the recorded session, no live process holds that session, and its group is still owned
-   by that session inside this worktree with matching start times. Cwd alone gives no stop authority.
-   A berth release that reports an already final reservation counts as released.
-
-When nothing is left running, retire parks `.unit.toml` with the date, the session and the branch,
-and sets `RemovedWorktree` on the unit's staff row. The session is the unit director's last one:
-the live session that carries the unit's session label, else the newest interactive transcript
-under the worktree. `/showrunner:resume_unit` resumes it and restores that same row and parent.
-The retired ref stays on origin until resume restores and checks the tip. Then the worktree, the local
-branch and the origin branch are removed. When something still runs, nothing is marked or removed:
-the output says what, and a rerun resumes.
-
-To free a retired unit's name, delete its `origin` ref
-`refs/retired/<id>` if it has one. Keep the retired identity and rename it to an unused archival name:
-`staff.py rename <id> --name <archival-name>`. The old name is then available for a new unit;
-the archived row keeps its removed worktree and historical parent.
-
-`--dry-run` prints each refusal and everything it would stop and remove, and changes nothing.
-
-Exit 0 means the unit is retired. Exit 1 is a refusal, or something still runs.
-
-Never stop a unit's session by hand: no `/exit` into its pane, no direct kill. Use the shared stop API.
+Resume uses the staff name or id and restores the folder from the merge branch.
+It resumes the row's `current_session`.
+A completed retire rerun prints `unchanged`.
