@@ -85,8 +85,7 @@ class StylePlanTests(StylePlanFixture):
         plan = worktree / f"docs/style-production/units/{family}-unit.md"
         plan.parent.mkdir(parents=True)
         _ = plan.write_text(self.plan_header().replace("names-unit", family + "-unit"))
-        _ = self.doc.write_text(self.doc.read_text() +
-                                f"| {family}-unit | docs/style-production/units/{family}-unit.md | {worktree} | demo-style-{family} |\n")
+        self.unit_plan_config(worktree, f"{family}-unit.md")
         _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), family + "-unit", worktree)
         return self.rule(family + "-borrow", f"tier: C\nfamily: {family}\ninput_scope: file\n")
 

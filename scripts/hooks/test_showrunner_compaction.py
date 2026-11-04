@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -11,7 +12,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import cast, final, override
+from typing import Protocol, cast, final, override
+from unittest.mock import patch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).resolve().parent / "showrunner-compaction.py"
@@ -100,6 +102,86 @@ class ContextNoticeTests(unittest.TestCase):
         self.assertIn(f"`next` list of your showrunner state file ({state})", notice)
         ordinary = cast(str, module.build_context(249_000, 283_800, False))  # pyright: ignore[reportAny]
         self.assertIn("write a handoff doc first", ordinary)
+
+
+class ContextMessageHook(Protocol):
+    DEBUG_LOG: Path
+
+    def main(self) -> None: ...
+
+
+class ContextMessageSwitchTests(unittest.TestCase):
+    root: Path = Path()
+    transcript: Path = Path()
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        spec = importlib.util.spec_from_file_location("context_message_switch", HOOK.with_name("post-tool-use-context-usage.py"))
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.hook: ContextMessageHook = cast(ContextMessageHook, cast(object, module))
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.transcript = self.root / "transcript.jsonl"
+        _ = self.transcript.write_text(json.dumps({
+            "type": "assistant", "message": {"model": "claude-sonnet-4", "usage": {"input_tokens": 160_000}},
+        }) + "\n", encoding="utf-8")
+        own = self.transcript.with_suffix("") / "subagents" / "agent-fixture-worker.jsonl"
+        own.parent.mkdir(parents=True)
+        _ = own.write_bytes(self.transcript.read_bytes())
+        self.hook.DEBUG_LOG = self.root / "debug.jsonl"
+        self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(self.root), "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k",
+            "CLAUDE_CONTEXT_HOOK_MODE": "dynamic", "CLAUDE_CONTEXT_HOOK_DEBUG": "1",
+        }))
+
+    def call(self, *, subagent: bool = False) -> str:
+        payload = {"transcript_path": str(self.transcript), "session_id": "fixture-session"}
+        if subagent:
+            payload["agent_id"] = "fixture-worker"
+        output = io.StringIO()
+        with patch("sys.stdin", io.StringIO(json.dumps(payload))), patch("sys.stdout", output):
+            self.hook.main()
+        return output.getvalue()
+
+    def test_off_keeps_the_reading_and_log_without_building_either_context_message(self) -> None:
+        _ = (self.root / "context_usage.conf").write_text("message = off\n", encoding="utf-8")
+        with patch.object(self.hook, "showrunner_state") as state, patch.object(self.hook, "build_context") as build:
+            for subagent in (False, True):
+                with self.subTest(subagent=subagent):
+                    self.assertEqual(self.call(subagent=subagent), "")
+            state.assert_not_called()
+            build.assert_not_called()
+        records = [cast(dict[str, object], json.loads(line))
+                   for line in self.hook.DEBUG_LOG.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([record["tokens"] for record in records], [160_000, 160_000])
+        own = self.transcript.with_suffix("") / "subagents" / "agent-fixture-worker.jsonl"
+        self.assertEqual([record["transcript_read"] for record in records], [str(self.transcript), str(own)])
+
+    def test_on_retains_the_main_thread_and_subagent_messages(self) -> None:
+        _ = (self.root / "context_usage.conf").write_text("message = on\n", encoding="utf-8")
+        with patch.object(self.hook, "showrunner_state", return_value=None):
+            self.assertIn("write a handoff doc first", self.call())
+            self.assertIn("return your results now", self.call(subagent=True))
+
+    def test_missing_key_file_or_bad_value_keeps_the_old_message(self) -> None:
+        path = self.root / "context_usage.conf"
+        for content in (None, "other = off\n", "message = invalid\n"):
+            with self.subTest(content=content), patch.object(self.hook, "showrunner_state", return_value=None):
+                if content is not None:
+                    _ = path.write_text(content, encoding="utf-8")
+                self.assertIn("write a handoff doc first", self.call())
+
+    def test_the_switch_is_read_again_in_the_same_process(self) -> None:
+        path = self.root / "context_usage.conf"
+        _ = path.write_text("message = off\n", encoding="utf-8")
+        self.assertEqual(self.call(), "")
+        _ = path.write_text("message = on\n", encoding="utf-8")
+        with patch.object(self.hook, "showrunner_state", return_value=None):
+            self.assertIn("write a handoff doc first", self.call())
 
 
 if __name__ == "__main__":
