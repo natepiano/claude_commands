@@ -143,61 +143,32 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 4 — `/test_times` shows suite, module and test history  · status: done
 **Depends on:** Phase 2, Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** the build log has one locked row reader in `store.py`, and `/test_times` prints in under one second the descending sort of test modules, the history of gate runs and folder suites, and the history of one module or one test.
-
-**Spec:**
-
-1. One locked build log reader (builds showrunner, 2026-11-03: the first item of this phase). `scripts/buildlog/store.py` gains `locked_rows(path: Path, start: int = 0) -> Iterator[dict[str, object]]`: it opens the file, takes a shared flock and yields `whole_rows(handle, start)`; an absent file yields no rows. `record.read_attempt_results` (`record.py:1079`) calls it in place of its own open, flock and `whole_rows` loop. Behavior does not change. Order (builds showrunner, 2026-11-03): `record.py` switches first; the copies in `memory_admit.py` and `sweep.py` switch in Phase 9, after resources P51/P53 and queue 10c reach origin/builds. `index.read_file` keeps its own read: it reads without a lock from a stored offset, checks its marks and must not hold appenders back while it reads a month file. `gate_record` only writes.
-2. `scripts/test_times/show.py`, with `argparse` subcommands. Its name must not match `test_*.py`: the gate runs each such file as a test module. It reaches the build log as `scripts/buildlog/cli.py` does: `index.py` imports `store` and `parse` by bare name, so `scripts/buildlog` must be on `sys.path`. Only rows of the current host (`store.host_name()`) count. Each subcommand first runs `index.update()` and then queries `index.read_only()`:
-   - `top [--limit N] [--repo PATH]` (the default with no subcommand; `N` defaults to 20; `PATH` to `~/.claude`): the descending sort. Rank each live module by the median `wall_s` of its ranking rows from its last `TOP_RUNS` gate runs in `gate_modules` (`conf.read("test_times").whole("TOP_RUNS")`). A run's ranking row for a module is its first completed execution: the lowest `attempt` whose `restart` is empty. A hold restart is not a measurement, and a rerun alone runs on a quiet machine. A module is live when `discover_test_modules(PATH)` lists it, named by `test_module_name` as the gate names its rows (both imported from `scripts/production/merge_gate.py`; Phase 8 moves them to a light module); the `types/basedpyright` row is always live. Columns: rank, `suite/module`, median s, last s, median CPU s, tests run, slowest kept test of the last run with its seconds, runs counted. When the last ranking row has `times_missing`, the tests-run and slowest-test cells show `times missing`, never zero. The `types/basedpyright` row runs no tests: its tests-run and slowest-test cells are empty, never `times missing` or zero. Last line: `<count> modules; sum of medians <s> s`.
-   - `suites [--days N]` (default 7): gate runs, newest first: local start time, host, selection, modules run, `wall_s`, `PASS` or `RED`, the slowest module of the run.
-   - `suite <folder> [--days N]`: that folder suite's `wall_s` in each run, newest first.
-   - `module <folder>/<file> [--runs N]` (default 20): each execution of the module: local time, attempt (with `hold` for a hold restart), `wall_s`, `cpu_s`, `peak_mib`, status, `tests_s`, `wall_s - tests_s` (import and fixture time), the 3 slowest kept tests. A row with `times_missing` shows `times missing: <reason>` in place of `tests_s`, `wall_s - tests_s` and the slowest tests, never zeros.
-   - `test <text> [--runs N]` (default 20): kept rows whose test name contains `<text>`: local time, `suite/module`, test, `duration_s`, status. A later run of the same module with no kept row for the test shows `not kept`: the test passed under that run's `SLOW_TEST_S`, or did not run (removed, skipped or filtered). A run whose module row has `times_missing` shows `times missing`. The index keeps no full test list, so an absent row never shows a duration.
-   - Times show in the user zone (`astimezone(user_zone())`), in the form `11-03 09:30`. Column widths and padding come from `scripts/lib/terminal_cells.py` (`terminal_width`, `pad_left`, `pad_right`). An empty result prints `no gate runs recorded yet` (or the subcommand's subject) and exits 0.
-   - A row from a gate run with `aborted: true` carries the mark `aborted` in `suites`, `suite`, `module` and `test`. The completed module rows of an aborted run stay valid measurements for `top`.
-   - `module types/basedpyright` shows empty tests-run, test-time and slowest-test cells, never `times missing`, zero, or the whole duration as import time: the type job runs no tests (`TimingNotApplicable`; `module_runs` writes zero test totals and an empty `times_missing`).
-3. `commands/test_times.md`, in the form of `commands/build/status.md`: run `python3 ~/.claude/scripts/test_times/show.py $ARGUMENTS` and show its lines unchanged; list the subcommands in one line each.
-4. Shared padding and fixtures. `pad_left` and `pad_right` join `terminal_width` in `scripts/lib/terminal_cells.py`; `show.py` pads with them. Queue 10b deletes `build_why.py` and edits the `queue_lines.py` imports, so the `queue_lines.py` copies switch in Phase 9, after queue lands. `gate_run` and `module_times` move from `test_gate_record.py` into `scripts/test_times/gate_record_test_support.py`; `test_gate_record.py`, `scripts/buildlog/test_gate_index.py` and `test_show.py` import them from there.
+- `scripts/test_times/show.py` has the subcommands `top` (the default), `suites`, `suite <folder>`, `module <folder>/<file>` and `test <text>`. Each subcommand runs `index.update()`, then queries `index.read_only()` for rows of the current host only.
+- `top` ranks each live module by the median `wall_s` of its ranking rows from its last `TOP_RUNS` gate runs (`config/test_times.conf`). A ranking row is the lowest `attempt` with an empty `restart`. A module is live when `merge_gate.discover_test_modules(repo)` lists it; `types/basedpyright` is always live and shows empty test cells.
+- A row with `times_missing` shows `times missing`, never zero. A test with no kept row in a later run shows `not kept`. A row of an aborted run carries the mark `aborted`; its completed module rows still count in `top`.
+- Times show in the user zone as `11-03 09:30`. An empty result prints `no modules recorded yet` (`top`) or `no gate runs recorded yet` and exits 0. `top` answers in 0.73 s with a warm index.
+- `store.locked_rows(path, start=0) -> Iterator[dict[str, object]]` opens a build log file, takes a shared flock and yields `whole_rows(handle, start)`; an absent file yields no rows. `record.read_attempt_results` reads through it.
+- `terminal_cells.pad_left(text, cells)` and `pad_right(text, cells)` pad by terminal cell width.
 
 **Files:**
-- `scripts/buildlog/store.py` — `locked_rows` (owner report-unit)
-- `scripts/buildlog/record.py` — `read_attempt_results` calls `locked_rows` (owner report-unit)
-- `scripts/buildlog/test_store.py` — `locked_rows` tests
-- `scripts/test_times/show.py` — new: the query tool
-- `commands/test_times.md` — new: the `/test_times` command
-- `scripts/test_times/test_show.py` — new: query tool tests
-- `scripts/lib/terminal_cells.py` — `pad_left`, `pad_right`
-- `scripts/lib/test_terminal_cells.py` — padding tests
-- `scripts/test_times/gate_record_test_support.py` — new: shared gate run fixtures
-- `scripts/test_times/test_gate_record.py` — imports the shared fixtures
-- `scripts/buildlog/test_gate_index.py` — imports the shared fixtures
+- `scripts/test_times/show.py` — the history tool
+- `scripts/test_times/test_show.py` — its tests, with one test that loads each gate-discovered module in `scripts/test_times`
+- `scripts/test_times/gate_record_test_support.py` — the `gate_run()` and `module_times()` fixtures, shared by `test_gate_record.py`, `scripts/buildlog/test_gate_index.py` and `test_show.py`
+- `commands/test_times.md` — `/test_times`: runs `show.py $ARGUMENTS` and shows its lines unchanged
+- `scripts/buildlog/store.py` (owner report-unit) — `locked_rows`
+- `scripts/buildlog/record.py` (owner report-unit) — `read_attempt_results` calls `locked_rows`
+- `scripts/lib/terminal_cells.py` (owner queue-unit) — `pad_left`, `pad_right`
 
-**Workers:** 1 writer + 1 tester — the tool and its tests split by file
-- `impl` — `scripts/buildlog/store.py`, `scripts/buildlog/record.py`, `scripts/test_times/show.py`, `commands/test_times.md`, `scripts/lib/terminal_cells.py`
-- `test` — `scripts/buildlog/test_store.py`: `locked_rows` reads whole rows from a start offset, skips the unfinished tail and invalid rows, yields nothing for an absent file, and waits for an exclusive append lock; `scripts/test_times/test_show.py`: write `gate_run` lines with `write_gate_run` into a `BUILDLOG_DIR` fixture (a `CONF_DIR` fixture sets `TOP_RUNS`), run each subcommand in-process, and check the sort order by median, the host filter, the live-module filter against a fixture repository, the ranking-row rule (a hold restart then a completed run; a failed first run then a rerun alone), the `not kept` and `times missing` cells (a module with missing times, a removed test, a `SLOW_TEST_S` change between runs), the empty test cells of the `types/basedpyright` row, the user-zone time form, and the empty outputs; one test runs the CLI in a fresh subprocess; one test loads each module the gate discovers in `scripts/test_times` and finds at least one test; `scripts/lib/test_terminal_cells.py`: padding by terminal cells; `scripts/test_times/gate_record_test_support.py`, `test_gate_record.py`, `scripts/buildlog/test_gate_index.py`: the shared fixtures
+**Binds later work:** a speed phase reads before and after medians with `show.py module <folder>/<file>`. Gate records exist only after the record writer in `merge_gate.py` reaches the main checkout that runs the gates; until then, a speed phase measures its baseline with `module_run.py`. `show.py` imports `discover_test_modules` and `test_module_name` from `merge_gate.py`; "The test history tool starts without the merge gate module" moves them to a light module. `memory_admit.py` and `sweep.py` still keep their own copy of the locked row loop.
 
-**State:** none (reads only; `index.update()` appends to the index as every build log reader does).
+**Gotchas:**
+- A file named `test_*.py` in a gate suite folder is a test module to the gate; a tool in that folder must not use that name.
+- `test_show.py` imports `scripts.lib.test_hang_guard` absolutely, above its `TYPE_CHECKING` block: `scripts/lib/test_one_hang_guard.py` reads that import.
+- A tree that changes `scripts/lib/terminal_cells.py` makes the gate run the full suite (36 min at load 50).
 
-**Constraints from prior phases:**
-- Owners: `store.py` and `record.py` belong to report-unit. The berth board is unconfigured for `~/.claude`, so the director holds the Spec 1 order. The checkpoint notice names each owner.
-- Phase 1: `config/test_times.conf` holds `TOP_RUNS`; `gate_record.write_gate_run` writes fixture lines.
-- Phase 2: a hold restart is its own module row with `restart: hold`; a failed module's rerun alone is the next attempt. A row with `times_missing` has no measured tests, and its `tests_s` is not a measurement. The `types/basedpyright` row has no tests and an empty `times_missing`: timing does not apply to it.
-- Phase 2: `gate_record.module_runs` (`gate_record.py:185`) builds the module rows from `Execution` (`:106`): `attempt` counts from 1 per module, `restart` is `hold` or empty, `times_missing` is the `NoModuleTimes` reason and is empty for `ModuleTimes` and the type job. An aborted run's record holds only the jobs that finished. A failed record build prints `gate run not written: <error>` (`report_not_written`, `:213`) and never changes the gate. Any edit to `merge_gate.py` runs every `test_merge_gate*.py` file, `test_merge_gate_holds.py` included.
-- Phase 3: tables `gate_runs`, `gate_suites`, `gate_modules` (`attempt` counts from 1; the type job is `types`/`basedpyright`) and `gate_tests`, with indexes on `(suite, module, started_at)` and `(suite, module, test, started_at)`; a test-name substring match scans `gate_tests` (19 ms over 250,000 rows).
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/buildlog -p 'test_store.py'` and `-p 'test_record.py'` green
-- `basedpyright scripts/buildlog/store.py scripts/buildlog/record.py` prints `0 errors, 0 warnings, 0 notes`
-- `python3 -m unittest discover -s scripts/test_times -p 'test_*.py'` green
-- `python3 -m unittest discover -s scripts/lib` green
-- `python3 -m unittest discover -s scripts/buildlog -p 'test_gate_index.py'` green
-- `basedpyright scripts/test_times scripts/lib/terminal_cells.py` prints `0 errors, 0 warnings, 0 notes`
-- On natedev, with a warm index, `time python3 scripts/test_times/show.py top` finishes in under 1 s; the first query after the schema change rebuilds the index and is not timed
-- Fixture tests cover an aborted run (an abort before any module finishes and an abort after one module finishes) and the `module types/basedpyright` row.
-- Live check, apart from the fixture tests: after Phase 2's `merge_gate.py` reaches the `~/.claude` main checkout that runs the gates, `show.py suites` and `show.py module <folder>/<file>` show a real gate run and its module attempts from the live build log.
+**Ruled out:** a `scripts/production/test_modules.py` light module — the name matches the gate's test pattern.
 
 ### Phase 5 — The two slowest direct modules run in half their time  · status: todo
 **Depends on:** Phase 2, Phase 4
@@ -325,7 +296,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Builds showrunner, 2026-11-03: test the move against devtools' tip and name that tip in the checkpoint notice's also-touches line.
 
 **Acceptance gate:**
-- Every `scripts/production/test_merge_gate*.py` file green
+- Every `scripts/production/test_merge_gate*.py` file green. `test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list` fails on every tree between 19:00 and 24:00 EST (the gate writes the UTC date); devtools-unit owns that repair. Until it reaches origin/builds, run that one test outside those hours; keep its assertion.
 - `python3 -m unittest discover -s scripts/test_times -p 'test_*.py'` green
 - `basedpyright scripts/production/gate_modules.py scripts/production/merge_gate.py scripts/test_times` prints `0 errors, 0 warnings, 0 notes`
 - `python3 -X importtime scripts/test_times/show.py top` lists no `scripts.production.merge_gate` import
@@ -340,7 +311,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Spec:**
 
-1. After the director merges origin/builds with resources P51/P53 and queue 10c in it, the `Path` branch of `memory_admit.anonymous_history_rows` (`memory_admit.py:1387` before that merge) and `sweep.build_log_rows` (`sweep.py:1573`) call `store.locked_rows(path, start)` in place of their own open, shared flock and `whole_rows` loop. Behavior does not change.
+1. After the director merges origin/builds with resources P51/P53 and queue 10c in it, the `Path` branch of `memory_admit.anonymous_history_rows` (`memory_admit.py:1387` before that merge) and `sweep.build_log_rows` (`sweep.py:1573`) call `store.locked_rows(path, start)` in place of their own open, shared flock and `whole_rows` loop. Behavior does not change. The `BuildLogStore` protocol in `memory_admit.py` (line 72 before that merge) gets a `locked_rows` method so the call type-checks; the locked `BinaryIO` branch stays as it is.
 2. `scripts/build_queue/queue_lines.py` imports `pad_left` and `pad_right` from `scripts/lib/terminal_cells.py` and drops its own copies; every importer of them switches to `terminal_cells.py`.
 
 **Files:**
