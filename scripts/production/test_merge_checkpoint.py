@@ -55,6 +55,25 @@ class ReviewNumbersTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_as_built_merges_after_code_checkpoint_reaches_branch_through_second_parent(self) -> None:
+        first = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        code_merge = self.git("rev-parse", "HEAD")
+        _ = self.git("checkout", "-b", "integration", "HEAD^1")
+        _ = self.git("commit", "--allow-empty", "-m", "Independent integration")
+        _ = self.git("merge", "--no-ff", "-m", "Integrate production", "production")
+        _ = self.git("branch", "-f", "production", "HEAD")
+        _ = self.git("checkout", "production")
+        self.assertNotIn(code_merge, self.git("rev-list", "--first-parent", "HEAD").splitlines())
+        self.assertTrue(merge_checkpoint.merge_branch_history(self.checkout, "production").has_code_merge("alpha-unit", "2"))
+        result = self.run_checkpoint(self.as_built_commit(), "--as-built", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("test: ok — as-built has no package tests", result.process.stdout)
+        tree = self.git("ls-tree", "-r", "--name-only", "HEAD")
+        self.assertIn("docs/as-built/alpha.md", tree)
+        self.assertNotIn("docs/plans/alpha.md", tree)
+        self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha-unit phase \S+ as-built \(")
+
     def test_checkpoint_ignores_unavailable_worktrees_of_other_units(self) -> None:
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
