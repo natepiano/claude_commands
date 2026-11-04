@@ -50,6 +50,30 @@ class QueueViewTests(QueueFixtureTests):
         write_memory_config(config)
         _ = cast(object, self.enterContext(mock.patch.dict("os.environ", {"CONF_DIR": str(config.parent)})))
 
+    def test_token_wait_keeps_place_one_and_head_status_moves_to_the_eligible_row(self) -> None:
+        inputs = self.fixture.inputs(policy=admission_policy_fixture())
+        (token_path, token), (head_path, head) = inputs.ordered[:2]
+        inputs = replace(inputs, ordered=[
+            (token_path, {**token, "token_left_at": NOW - 10}),
+            (head_path, {**head, "priority_since": NOW - 42}),
+        ])
+        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB), policy=admission_policy_fixture())
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        self.assertEqual([step.pid for step in reading.view.waiting], [token["pid"], head["pid"]])
+        self.assertIsInstance(queue_view.step_checks(model, 1), gate.LineWaiter)
+        eligible = queue_view.step_checks(model, 2)
+        self.assertIsInstance(eligible, gate.HeadExplanation)
+        if isinstance(eligible, gate.HeadExplanation):
+            self.assertEqual(eligible.waiter.pid, head["pid"])
+        self.assertEqual(queue_view.reason_phrase(reading.view.waiting[0].reason, reading.view.waiting),
+                         "waiting for the cargo token")
+        self.assertIn("waiting for the cargo token", plain(queue_card.render_card(model, [1], 140)))
+        rows = waiting_rows(queue_view.render_view(model, 140))
+        self.assertEqual([int(row.split()[0]) for row in rows], [1, 2])
+        self.assertNotIn("↑", rows[0])
+        self.assertNotIn("⊘", rows[0])
+        self.assertIn("↑", rows[1])
+
     def service_model(self, fixture: AdmissionFixture) -> queue_view.QueueModel:
         reply, = fixture.server.handle_request(wire.ViewRequest())
         assert isinstance(reply, wire.ViewReply)
@@ -462,8 +486,8 @@ class QueueViewTests(QueueFixtureTests):
             view = plain(queue_view.render_view(model, 100))
             card = plain(queue_card.render_card(model, [1], 100))
             frozen = gate.head_after_steps_end(model.reading.explanation, ())
-        self.assertIn("queue priority: cables (the user's bump)", view)
-        self.assertEqual((view + "\n" + card).count("queue priority: cables (the user's bump)"), 1)
+        self.assertIn("queue priority: cables (captured priority)", view)
+        self.assertIn("queue priority: cables (captured priority)", card)
         self.assertIn("waiting 36 min", card)
         for text in (view, card):
             self.assertNotIn("head_since", text)
@@ -478,7 +502,8 @@ class QueueViewTests(QueueFixtureTests):
     def test_live_bump_marks_every_unit_row_without_moving_columns(self) -> None:
         model = self.fixture.model()
         for unit in ("cables", "widget"):
-            priority: gate.QueuePriority = {"unit": unit, "why": "test", "set_at": NOW, "set_by": "actor"}
+            priority: gate.QueuePriority = {"unit": unit, "why": "test", "set_at": NOW, "set_by": "actor",
+                                            "transition": gate.SettledPriority()}
             bumped = replace(model, reading=replace(model.reading,
                 explanation=replace(model.reading.explanation, priority=priority)))
             unbumped = replace(model, reading=replace(model.reading,
@@ -652,7 +677,7 @@ class BudgetViewTests(QueueFixtureTests):
         lines = queue_view.render_view(model, 60)
         text = plain(lines).splitlines()
         self.assertEqual(text[:2], ["Build queue · 10:46", ""])
-        self.assertEqual(text[2], "queue priority: cables (the user's bump)")
+        self.assertEqual(text[2], "queue priority: cables (captured priority)")
         self.assertEqual(text[3], " " * 36 + "free 4.4 │ taken 16.6")
         self.assertEqual(text[4], "budget 21.0" + " " * 25 + "░" * 4 + "█" * 17)
         self.assertEqual(text[5], "")

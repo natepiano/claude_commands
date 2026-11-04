@@ -23,7 +23,7 @@ from scripts.shutdown.remote import local_machine
 from scripts.shutdown import stop_resume
 from scripts.message import sessions
 from scripts.lib import process_group, conf
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.agents import worker_lifecycle
 import berth_board
 import progress_history

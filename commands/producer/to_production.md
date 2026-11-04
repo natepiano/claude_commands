@@ -101,8 +101,6 @@ and merged units.
 Write `<source-stem>-production.md` beside the first source plan, in the
 production format, with status `planned`:
 
-Keep unit facts in staff rows and `.unit.toml`, as `docs/production_format.md` defines.
-
 - **Hub files** and **Gates** are copied from the greenlight result.
 - **Merge tests:** the command that runs the app package's tests, which catch
   cross-crate breaks, e.g. `./verify.sh test -p app`, if one exists; a command,

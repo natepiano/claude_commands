@@ -525,43 +525,6 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 
 **Ruled out:** forwarded names, values or the fetched folder in the build log; an order among Mac-only waiters; a natedev fallback for any Mac answer.
 
-### Phase 15 — Keep the branch side a base after a merge from trunk  · status: todo
-
-**Origin:** builds showrunner, 2026-10-31 06:xx EDT, wrong result ahead of Phase 14. Branch `natedev-verify-base`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-base` (49e6cc86: Phases 11 and 12, origin/builds 4082a52b).
-
-**Depends on:** Phases 11 and 12 (same guard, same branch). Held, sdlc ruling 2026-10-31 07:33: sdlc devtools-unit Phase 7's `comparison_bases` in `assertion_guard.py` is the one base selector and covers all three parts of this Spec. When its hash is on main, merge it into this branch, run this phase's tests against it and keep only what still fails. Add no second selector.
-
-#### Work Order
-
-**Constraints from the phase 20, 23 and 24 review:** The base selector is now `commit_bases` in `scripts/direct/assertion_guard.py` (near line 1387), with merge regression tests; `default_base` and `comparison_bases` no longer exist. Reproduce each Spec part against `commit_bases` first and implement only what still fails.
-
-**Source:** builds, 2026-10-31. tool-based-ui-inspectors merged trunk init/catalyst 489bcff1a5 into HEAD 6236e6f419. `default_base` picks one of the upstream merge-base and the production merge-base, the side with fewer commits; after the merge that is 489bcff1a5, also the merge's second parent. `commit_bases` then adds only merged-in parents, so the branch side (upstream merge-base b45c99b672) is never a base. Lint blocked on 26 removals (db889600), 6 on 48859c93; all but one are old branch-versus-trunk differences, present on trunk and absent on the branch since before the phase. Reproduction: `/tmp/claude/unit/bf5b8d4c-77ff-4f7b-9318-afb6114ad8f2/guard26_repro.md`.
-
-**Goal:** after a merge from trunk, the guard still judges against the branch side, so an old branch-versus-trunk difference never blocks and a real removal in the phase still does.
-
-**Spec:**
-
-1. Reproduce first: a fixture repository where trunk is merged into HEAD so the production merge-base is the merge's second parent, with one assertion present on trunk and absent on the branch since before the phase, and one assertion removed in the working diff. On 49e6cc86 the old difference blocks.
-2. With no explicit `--base`, the starting bases are every distinct one of the production merge-base and the upstream merge-base that resolves, not the fewer-commits pick. Merged-in parents are then added and ancestors dropped as today. One place decides the starting bases; if `default_base` has no other caller, its fewer-commits rule goes.
-3. An explicit `--base` (or `VERIFY_ASSERTION_BASE`) still replaces the starting bases. A branch with no upstream keeps the production merge-base alone; a repository with neither keeps today's behavior.
-4. A finding blocks only when it holds against every base, as today. No new setting, no skip.
-
-**Files:**
-- `scripts/direct/assertion_guard.py` — `default_base`, `commit_bases`
-- `scripts/direct/test_assertion_guard_revisions.py` — the merge fixture tests
-- `docs/as-built/phase-checks.md` — guard row, if it states the base rule
-
-**Workers:** 1 writer.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 11's merge-commit rule (judge a merge against both parents) and Phase 12's binding-rename pairing stay as they are.
-
-**Acceptance gate:**
-- The fixture test fails on 49e6cc86 and passes after the change; the real case (repro file, last command without `--base`) blocks exactly 1 finding (`modulation_affordance_pixels.rs` jack-to-label gap, a real phase change), where 48859c93 blocks 6.
-- `scripts.direct.test_assertion_guard*` modules pass; basedpyright `0 errors, 0 warnings, 0 notes` on changed Python; the merge gate passes.
-- When on main: tell inspectors and lfo the rule: a unit passes nothing; after a merge from trunk the guard judges against both the trunk and the branch merge-base.
-
 ### Phase 16 — Raise a red alert when the Mac takes no work while steps wait  · status: todo
 
 **Origin:** builds showrunner, 2026-10-31 07:47 EDT, with the user's words: "you should have some kind of red alert that occurs when you have nothing running on the mac as is the case right now - it is a major failure when the mac is available and not taking work". Built on branch `natedev-verify-cancel`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-cancel` (HEAD e6f8540f, Phase 14 shrink).
@@ -811,32 +774,24 @@ Checkpoint 41a3ce6d4 on `natedev-verify-cancel`.
 
 **Ruled out:** A lint-finding classifier; an idle-marker prerequisite for Mac routing; splitting whole-workspace hana lint between Mac and Linux. A workspace containing configured Linux-only members remains ineligible for Mac lint.
 
-### Phase 21 — Pair a skipUnless decorator with the test it decorates  · status: todo
+### Phase 22 — Refuse an unknown verify verb, and key the lint cache by tool versions  · status: done
 
-**Origin:** builds showrunner, 2026-11-03 08:5x EST, held item 1: the assertion guard reported a change at `scripts/lib/test_build_folders.py:122` against the test above it.
+#### As-built
 
-**Depends on:** none. Its tree takes the Phase 20 test stub repair 41a3ce6d4 only to pass the merge gate.
+Checkpoints `776c74281` and `eabe13cac` on `verify-verb-cache`; branch tip `47a58912c` is origin/builds `e7ca3f68b` plus this change only; builds-verify tip `42e58332f`.
 
-#### Work Order
+- `verify.sh` refuses an unknown verb right after `CMD=` is set: it prints the usage text and exits 2, before a mesh worker's call detaches, before any run identity, target query or step record.
+- The lint cache key in `tree_watch.py` holds the versions of mend, nightly rustfmt, clippy and taplo. A cached result made by another tool version never replays. Each lint call keeps its version answers in its wait directory.
+- The doc test fixture sets `LINT_SKIP_SWEEP=1`, so no background lint sweep outlives the fixture's cargo stub.
 
-1. `scripts/direct/assertion_guard.py` attributes a `@unittest.skipUnless(...)` decorator, and any decorator line, to the test function it decorates, not to the test that ends above it.
+**Files:**
+- `scripts/direct/verify.sh` — the verb check; the version answers per lint call.
+- `scripts/direct/tree_watch.py` — tool versions in the lint cache key.
+- `scripts/lint/invoke.sh` — the version answers.
+- `scripts/direct/test_verify_verbs.py`, `scripts/direct/test_verify_lint_cache_versions.py`, `scripts/direct/test_tree_watch.py`, `scripts/direct/test_verify_lint_scope.py` — the verb refusal and the version key.
+- Fixtures: `verify_lint_scope_test_support.py`, `verify_examples_test_support.py`, `verify_mac_offload_test_support.py`, `verify_step_routes_test_support.py`, `verify_tree_cancel_test_support.py`, `verify_doc_test_support.py` — fake tools answer `--version`.
 
-**Acceptance gate:** a regression test in the assertion guard tests fails on the old code and passes on the new; the assertion guard suites pass; basedpyright 0/0/0 on changed Python; merge gate `--tests-only` green on a tree merged with origin/builds.
-
-### Phase 22 — Refuse an unknown verify verb, and key the lint cache by tool versions  · status: todo
-
-**Origin:** builds showrunner, 2026-11-03 08:5x EST, held items 2 and 3.
-
-**Depends on:** none. Its tree takes the Phase 20 test stub repair 41a3ce6d4 only to pass the merge gate.
-
-#### Work Order
-
-**Constraints from the phase 20, 23 and 24 review:** Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green. This tree still has the outer mend pipeline (`verify.sh` near line 3554) that Phase 23 removes; its merge with Phase 23 keeps the removal.
-
-1. `verify.sh` refuses an unknown verb (for example `fmt`) right after `CMD=` is set: it prints the usage text and exits 2, before any step record or target query. Log: `/tmp/claude/delegate/fc206247-76c0-4607-b268-025299592a62/mesh_runs/20261103T002337-2080568-f123.log`.
-2. The lint result cache key includes the version of each lint tool (mend, rustfmt, clippy, taplo). A cached result made by another tool version never replays. Log: `/tmp/claude/delegate/fc206247-76c0-4607-b268-025299592a62/mesh_runs/20261103T021458-742941-b3cb.log` (mend 0.22.3 replayed a 0.23.0-dev failure).
-
-**Acceptance gate:** a test for each item fails on the old code; the verify and lint cache suites pass; `bash -n` and shellcheck on verify.sh; basedpyright 0/0/0 on changed Python; merge gate `--tests-only` green on a tree merged with origin/builds.
+**Gotchas:** a fake clippy or cargo in a test fixture must answer `--version` before its judgment logic, or the version probe counts as a lint call.
 
 ### Phase 23 — A cancelled lint run leaves no verify process and no queue place  · status: done
 
@@ -905,20 +860,27 @@ Checkpoint 23aa6712f on `verify-idle-disk`.
 
 **Acceptance gate:** a test with a fake Mac that is under the minimum before the sweep and over it after, which admits the step; one with a sweep that frees too little, which keeps the step on natedev; a scan that finds the mirror root only in `config/mac_test.conf`; merge gate `--tests-only` green on a tree merged with origin/builds.
 
-### Phase 27 — A step sent to natedev after a Mac disk decline goes back to a free Mac  · status: todo
+### Phase 27 — A step sent to natedev after a Mac disk decline goes back to a free Mac  · status: done
 
-**Origin:** builds showrunner, 2026-11-03 14:4x EST, RED Mac idle again: queue-unit found that verify.sh gives the leave hook only to `busy` and `blocked` declines, so a step sent to natedev after a `disk` decline never checks the Mac again. Two hana nextest steps waited for natedev memory while the Mac had 213 GiB free. Hotfix checkpoint, branched from origin/builds, merged ahead of Phase 20 and Phase 24.
+#### As-built
 
-**Depends on:** none (hotfix from origin/builds).
+Checkpoint `a153ef36a` on `verify-disk-leave`; builds-verify tip `540aa02db` (merged with builds `e7ca3f68b`).
 
-#### Work Order
+- A `disk` decline gets the leave hook, like `busy` and `blocked`: a step that waits on natedev leaves for the Mac when free-now says the Mac is free.
+- Every temporary decline reason (backoff, disk, unreachable, spending) keeps the leave route. Permanent reasons (`off`) do not.
+- `step_can_retry()` reads the whole target table, so target order does not change the answer. `STEP_DECLINE_REASON` is removed.
+- The step record keeps `NatedevOnly("disk")` whenever a target is excluded for disk, so the Mac idle disk alert keeps its evidence.
+- AWS spending refusals still block each claim and each command; only the retry answer changes.
 
-**Constraints from the phase 20, 23 and 24 review:** Phase 24's disk alert needs `NatedevOnly("disk")` evidence (`scripts/buildlog/mac_idle.py` near line 230). A disk decline must keep that evidence while it gains the leave hook; the acceptance gate adds that check (shared with Phase 17). Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green.
+**Files:**
+- `scripts/build_targets/build_targets.py` — temporary and permanent decline answers.
+- `scripts/direct/verify.sh` — `step_can_retry()` on the full target table; the disk leave hook.
+- `scripts/build_targets/test_build_targets.py`, `scripts/build_targets/test_ssh_eligibility.py`, `scripts/direct/test_verify_ssh_targets.py` — the changed decline answers.
+- `scripts/direct/test_verify_mac_disk_leave.py` — a disk decline, then a free Mac, and the step leaves for the Mac.
 
-1. A `disk` decline gets the same leave hook as `busy`: the waiting step leaves for the Mac when free-now says the Mac is free.
-2. Every other decline reason is checked for the same gap. Each reason that can clear while a step waits gets the hook; each that cannot is named with its reason in the summary.
+**Binds later work:** a tree-writing step (Phase 29) never retries to a remote target. Keep `NatedevOnly("disk")` in the step record for the Mac idle disk alert.
 
-**Acceptance gate:** a test that declines a step for disk, then frees the Mac, and sees the step leave for the Mac; it fails on the old code; the verify suites that cover routing pass; merge gate `--tests-only` green on the hotfix tree.
+**Gotchas:** the routing clock fixture in `verify_mac_offload_test_support.py` copies `build_folders.py`, `conf.py`, `process_group.py` and `unit_runs.py` into its fake library; a new import from verify's Python helpers goes on that list.
 
 ### Phase 28 — Keep the cargo token from a Mac step to the next local step  · status: done
 

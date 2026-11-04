@@ -22,7 +22,7 @@ from uuid import uuid4
 import zlib
 
 from scripts.lib import conf
-from .selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
 from . import questions as policy
 from .questions import Question

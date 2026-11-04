@@ -43,7 +43,9 @@
 # UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
 # <session>/verify_cache/, keyed by the working tree its verdict was judged on,
 # the arguments, rustc -vV, lint.conf, verify.sh, invoke.sh and the
-# RUST*/CARGO_*/NEXTEST_* environment. A plain `lint <package>` leaves the package out of the key:
+# RUST*/CARGO_*/NEXTEST_* environment. Lint keys also include the versions
+# of mend, nightly rustfmt, clippy and Taplo.
+# A plain `lint <package>` leaves the package out of the key:
 # every lint stage but fmt covers the workspace, and fmt covers every member
 # that differs from HEAD, so one lint record answers for each package. A
 # `test` key holds only the part of the tree its package is built from
@@ -963,6 +965,12 @@ if [[ "${1:-}" == "--session-dir" ]]; then
     fi
 fi
 
+CMD="${1:-}"
+case "$CMD" in
+    check|test|lint|doc|build|example|final|example-test) ;;
+    *) usage; exit 2 ;;
+esac
+
 # A Codex mesh worker's command dies with its turn, and a worker that waits on
 # one spends a model call per wait. So a worker's call detaches: mesh_runs.py
 # runs this same call under a supervisor outside the worker's process group,
@@ -992,11 +1000,6 @@ if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
     fi
 fi
 
-CMD="${1:-}"
-if [[ -z "$CMD" ]]; then
-    usage
-    exit 2
-fi
 shift
 if [[ "$CMD" == final ]]; then
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
@@ -1236,6 +1239,9 @@ tree_key() {
     if [[ "$CMD" == test ]]; then
         # Keyed on the package's own build, read from the call's metadata.
         scope=(--package "${ARGS[0]}")
+    fi
+    if [[ "$CMD" == lint && -z "${CACHE_DIR:-}" ]]; then
+        key_options+=(--without-lint-versions)
     fi
     VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
     "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
@@ -1876,6 +1882,7 @@ route_compiling_step() {
 }
 
 step_stopped_by_hold() {
+    (( status > 128 )) || return 1
     local admission=0
     env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" stopped --call-id "$BUILDLOG_CALL_ID" \
         --consumed "$HOLD_WAIT_DIR/stops" || admission=$?
@@ -2466,6 +2473,11 @@ if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
 fi
 
 HOLD_WAIT_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-hold --owner "$$")"
+if [[ "$CMD" == lint ]]; then
+    # The call owns these files. Cleanup removes them with the wait directory.
+    export VERIFY_LINT_VERSIONS_FILE="$HOLD_WAIT_DIR/lint-versions"
+    export VERIFY_LINT_RUSTFMT_VERSION_FILE="$HOLD_WAIT_DIR/rustfmt-version"
+fi
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
@@ -3005,9 +3017,10 @@ refresh_test_build_inputs() {
     # buildlog_begin takes its source key after that wait.
     rm -f "$HOLD_WAIT_DIR/test-build-inputs"
     VERDICT_KEY="$(VERIFY_COMPUTE_TEST_BUILD=1 tree_key)"
-    export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR=""
+    export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR="" BUILDLOG_TEST_BUILD_DIR=""
     if [[ -f "$HOLD_WAIT_DIR/test-build-inputs" ]]; then
-        { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR; } \
+        { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR;
+          IFS= read -r BUILDLOG_TEST_BUILD_DIR; } \
             < "$HOLD_WAIT_DIR/test-build-inputs"
     fi
     # A hold can also arrive during memory admission, after buildlog_begin.

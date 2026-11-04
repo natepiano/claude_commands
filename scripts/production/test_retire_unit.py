@@ -41,7 +41,7 @@ from scripts.shutdown import stop_resume
 import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.copies import copies
 from scripts.agents import worker_lifecycle
