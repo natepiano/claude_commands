@@ -3611,6 +3611,7 @@ class QueueApiTests(MemoryQueueFixture):
             "BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_PROC": str(self.root / "proc"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
+        _ = os.environ.pop(gate.BUILDLOG_UNIT, None)
         self.processes[500] = "third"
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.meminfo.write_text(f"MemAvailable: {int(23.1 * GIB) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")

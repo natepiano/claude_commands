@@ -961,7 +961,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         library.unlink()
         library.mkdir()
         self.write_executable(library / "py", ROUTING_CLOCK_SHIM)
-        _ = shutil.copy2(VERIFY.parent.parent / "lib/build_folders.py", library / "build_folders.py")
+        for name in ("build_folders.py", "conf.py", "process_group.py", "unit_runs.py"):
+            _ = shutil.copy2(VERIFY.parent.parent / "lib" / name, library / name)
         self.environment["TEST_ROUTING_CLOCK"] = str(clock)
         return clock
 
