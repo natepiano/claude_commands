@@ -90,6 +90,8 @@ class FooterCountsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
         _ = self.enterContext(isolated_source_readers())
@@ -123,6 +125,7 @@ class FooterCountsTests(unittest.TestCase):
     def doc(self, *fields: str) -> Path:
         path = self.root / "production.md"
         _ = path.write_text("# Production\n\n" + "".join(f"{field}\n" for field in fields), encoding="utf-8")
+        _ = recorded_showrunner("production", path)
         return path
 
     def test_a_footer_count_uses_one_staff_snapshot_for_scope_and_routing(self) -> None:
@@ -288,7 +291,11 @@ class FooterCountsTests(unittest.TestCase):
         doc = self.doc(f"- **Change review:** `{listing}`", f"- **Proposals:** {folder}",
                        f"- **Improvement queue:** {ledger}")
         self.assertEqual(footer_counts.sources(doc), [doc, listing, folder, ledger, folder / "wanted.md"])
-        self.assertEqual(footer_counts.sources(self.doc()), [self.root / "production.md"])
+        empty_doc = self.doc()
+        owner = staff.snapshot().by_doc("natedev", empty_doc)
+        assert owner is not None
+        question_folder = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / owner.id / "questions"
+        self.assertEqual(footer_counts.sources(empty_doc), [empty_doc, question_folder])
 
     def test_a_shared_folder_counts_only_the_productions_own_proposals(self) -> None:
         folder = self.root / "issues"

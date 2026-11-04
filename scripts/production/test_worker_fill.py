@@ -314,21 +314,26 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(self.result(), (0, "unchanged\n", ""))
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
-    def test_renamed_showrunner_holder_uses_its_journal_for_fill_and_admission(self) -> None:
+    def test_renamed_showrunner_keeps_the_design_worker_parent_and_legacy_admission(self) -> None:
         _ = self.recorded_production("natedev")
         parent = showrunner_relationship("natedev")
         self.write_json(Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "natedev/rename.json",
                         {"old": "build-followups", "new": "natedev"})
-        _ = self.worker_design("build-followups", "held-designer", fixture_runtime_id("thread-held"))
+        design = self.worker_design("natedev", "held-designer", fixture_runtime_id("thread-held"))
+        before = design.read_bytes(), design.stat().st_mtime_ns
+        worker = staff.find(kind="worker", parent=parent.id)[0]
+        _ = staff.rename(parent.id, "renamed-owner")
         code, output, errors = self.result()
         self.assertEqual((code, errors), (0, ""), output + errors)
         self.assertEqual([row.name for row in staff.find(kind="worker", parent=parent.id)], ["held-designer"])
+        self.assertEqual(staff.find(kind="worker", parent=parent.id)[0].id, worker.id)
+        self.assertEqual((design.read_bytes(), design.stat().st_mtime_ns), before)
         with mock.patch.dict(os.environ, {"STAFF_ID": "sunrelated"}):
             admitted = worker_fill.admit("review", self.root, production="build-followups", role='review')
         self.assertEqual(admitted.parent, parent.id)
         self.assertEqual(self.result(), (0, "unchanged\n", ""))
 
-    def test_renamed_holder_with_ambiguous_or_unreadable_journals_stays_listed(self) -> None:
+    def test_design_parent_ignores_ambiguous_or_unreadable_rename_journals(self) -> None:
         _ = self.recorded_production("first")
         _ = self.recorded_production("second")
         production_membership("first")
@@ -337,17 +342,21 @@ class WorkerFillTests(StaffTestCase):
         first, second = root / "first/rename.json", root / "second/rename.json"
         self.write_json(first, {"old": "former", "new": "first"})
         self.write_json(second, {"old": "former", "new": "second"})
-        _ = self.worker_design("former", "held-designer", fixture_runtime_id("thread-held"))
-        code, _, errors = self.result()
-        self.assertEqual(code, 1)
-        self.assertIn("no unique renamed showrunner", errors)
-        self.assertEqual(staff.find(kind="worker"), [])
+        parent = showrunner_relationship("first")
+        design = self.worker_design("first", "held-designer", fixture_runtime_id("thread-held"))
+        before = design.read_bytes(), design.stat().st_mtime_ns
+        self.assertEqual(self.result(), (0, "unchanged\n", ""))
+        with self.assertRaisesRegex(worker_fill.AdmissionRefused, "no unique renamed showrunner"):
+            _ = worker_fill.admit("review", self.root, production="former", role="review")
+        self.assertEqual([row.name for row in staff.find(kind="worker", parent=parent.id)], ["held-designer"])
         _ = second.write_text("{unreadable journal")
         code, output, errors = self.result()
-        self.assertEqual(code, 1)
-        self.assertIn(str(second), errors)
+        self.assertEqual((code, errors), (0, ""), output + errors)
+        with self.assertRaisesRegex(worker_fill.AdmissionRefused, str(second)):
+            _ = worker_fill.admit("review", self.root, production="former", role="review")
         self.assertNotIn("skipped", output)
-        self.assertEqual(staff.find(kind="worker"), [])
+        self.assertEqual([row.name for row in staff.find(kind="worker", parent=parent.id)], ["held-designer"])
+        self.assertEqual((design.read_bytes(), design.stat().st_mtime_ns), before)
 
     def test_confirmed_inactive_sources_are_counted_once_and_rerun_unchanged(self) -> None:
         production_membership("demo")

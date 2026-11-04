@@ -19,13 +19,13 @@ def write_mesh_server_record(mesh: Path, codex_home: Path) -> None:
     }))
 
 
-def write_empty_binding_record(repository: Path, holder: design_roles.Holder, *,
+def write_empty_binding_record(repository: Path, *,
                                lifecycle: design_roles.Lifecycle = _NOT_OPENED,
                                run_directory: str = '') -> Path:
     design_id = str(uuid4())
     design = design_roles.HeldDesign(
         design_roles.DesignPlacement(design_id, 'fixture-host', 1), 'fixture-repo', str(repository),
-        str(repository / 'broken-design.md'), 'design', '2026-10-31T00:00:00+00:00', holder,
+        str(repository / 'broken-design.md'), 'design', '2026-10-31T00:00:00+00:00',
         design_roles.DesignBoundToPhase(run_directory or str(repository / 'broken-run'), '1',
                                        str(repository), ('broken-design.md',)),
         (design_roles.RoleInstance('designer', 'broken-designer', lifecycle),
