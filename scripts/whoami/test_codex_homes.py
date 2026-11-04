@@ -24,6 +24,7 @@ from scripts.production import showrunners
 
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
+from scripts.whoami import usage_store
 import whoami
 from scripts.whoami.agent_accounts import (
     CheckedNamedClaudeAccount,
@@ -85,6 +86,45 @@ class CodexHomesTests(unittest.TestCase):
         self.assertFalse(agent_accounts.codex_home_matches_label(other, "default"))
         self.assertFalse(agent_accounts.codex_home_matches_label(other, "codex2"))
         self.assertFalse(agent_accounts.codex_home_matches_label(current, "codex1"))
+
+    def test_default_login_omits_its_empty_numbered_home_and_signed_out_problem(self) -> None:
+        numbered = self.select_workers("codex2")
+        default = self.home / ".codex"
+        _ = numbered.rename(default)
+        numbered.mkdir()
+        self.assertEqual(agent_accounts.codex_homes(numbered), [default])
+        self.assertEqual(agent_accounts.codex_account_home("codex2").home, default)
+        statuses = accounts.codex_statuses(default)
+        self.assertEqual([(row.home, row.label, row.role, row.problems) for row in statuses],
+                         [(default, "codex2", "workers", ())])
+        _ = (numbered / "auth.json").write_text("{}")
+        self.assertIn(numbered, agent_accounts.codex_homes(default))
+
+    def test_empty_numbered_home_cannot_replace_the_default_logins_good_usage_with_an_error(self) -> None:
+        numbered = self.select_workers("codex2")
+        default = self.home / ".codex"
+        _ = numbered.rename(default)
+        numbered.mkdir()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        good = Report("Codex", email="selected@example.invalid", source=CodexHomeSource(default),
+            quotas=[agent_accounts.Quota("Weekly", 13, now + timedelta(days=7))],
+            credit_balance="2272", usage_read_outcome=agent_accounts.UsageReadOutcome.OK)
+        usage_store.save([Report("Codex", email=good.email, source=CodexHomeSource(numbered),
+            quotas=good.quotas)], now - timedelta(minutes=5))
+
+        async def read_home(home: Path) -> Report:
+            return good if home == default else Report("Codex", source=CodexHomeSource(home), problem="Not logged in")
+
+        with (patch.object(agent_accounts, "claude_on_disk", return_value=Report("Claude")),
+              patch.object(agent_accounts, "codex_live", side_effect=read_home) as reads):
+            reports = asyncio.run(agent_accounts.live_reports(self.legacy_selection(), default))
+        usage_store.save(reports, now)
+        _ = reads.assert_awaited_once_with(default)
+        held = usage_store.load()[usage_store.key("Codex", good.email or "")]
+        self.assertEqual(usage_store.latest_read_outcome(held), agent_accounts.UsageReadOutcome.OK)
+        assert "weekly" in held
+        self.assertEqual(held["weekly"]["left"], 87)
+        self.assertEqual(held["weekly"]["at"], now.isoformat())
 
     def test_credit_setting_reads_on_off_and_defaults_to_on(self) -> None:
         path = self.home / "codex1.md"

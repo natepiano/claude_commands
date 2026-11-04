@@ -172,7 +172,7 @@ def exclude_copy_metadata(path: Path) -> None:
 
 def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, source_commit: str,
                   copy_commit: str, target_mode: str, seed_source: str, borrows_from: str,
-                  land_target: str = "", run_dir: str = "", phase_id: str = "") -> None:
+                  land_target: str = "", run_dir: str = "", phase_id: str = "", crate_run: str = "") -> None:
     if copy_record.copy_folder(path) != path.resolve() or path.is_symlink() or not path.is_dir():
         raise ScratchError(f"{path}: a copy must be a folder at {copy_record.copies_root()}/<pair>/<copy>")
     def registered(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
@@ -182,6 +182,11 @@ def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, s
             maker=maker(), created=time.time(), renewed=time.time())
         if isinstance(record, copy_record.Registered):
             fields["created"] = record.fields.get("created", fields["created"])
+        linked_run = record.fields.get("crate_run", "") if isinstance(record, copy_record.Registered) else ""
+        if crate_run and linked_run and linked_run != crate_run:
+            raise ScratchError(f"{path}: crate run link changed")
+        if crate_run or linked_run:
+            fields["crate_run"] = crate_run or linked_run
         return fields_for_task(fields, task, run_dir=run_dir, phase_id=phase_id, land_target=land_target)
 
     _ = update_record(path, registered)
@@ -191,8 +196,11 @@ def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, s
 def copy_lock(path: Path) -> Generator[None]:
     folder = copy_record.copy_folder(path)
     if folder is None:
-        yield
-        return
+        record = task_of(path)
+        if not isinstance(record, copy_record.Registered) or "owner_unit" not in record.fields:
+            yield
+            return
+        folder = path
     lock = os.open(folder / BUSY, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_SH)
@@ -228,8 +236,10 @@ def copy_record_lock(path: Path) -> Generator[None]:
 def directory_record_lock(path: Path, *, wait: bool) -> Generator[bool]:
     """Lock the directory still at path; readers can decline to wait on another copy."""
     if copy_record.copy_folder(path) != path.resolve():
-        yield True
-        return
+        records = (copy_record.read_record(path / copy_record.RECORD), copy_record.read_record(removal_mark(path)))
+        if not any(isinstance(record, copy_record.Registered) and "owner_unit" in record.fields for record in records):
+            yield True
+            return
     for attempt in range(3):
         try:
             descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -286,7 +296,13 @@ def judgment_lock(path: Path) -> Generator[bool]:
 
 
 @contextmanager
-def busy_locks(path: Path, *, create: bool) -> Generator[bool]:
+def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = None,
+               wait: bool = False) -> Generator[bool]:
+    """Hold busy marks; optionally export live descriptors or wait for their release.
+
+    Exported descriptors belong to this context. A child can retain the same
+    flock with subprocess pass_fds; callers must not close them themselves.
+    """
     held: list[int] = []
     acquired = True
     try:
@@ -305,9 +321,11 @@ def busy_locks(path: Path, *, create: bool) -> Generator[bool]:
                         break
                     continue
                 held.append(fd)
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except OSError:
             acquired = False
+        if acquired and inherited_fds is not None:
+            inherited_fds.extend(held)
         yield acquired
     finally:
         for fd in held:
@@ -361,7 +379,7 @@ def update_record(path: Path, change: Callable[[copy_record.Registered | copy_re
         if not isinstance(task, str):
             raise ScratchError(f"{path}: record needs a task")
         _ = checked_task(task, False)
-        if copy_record.copy_folder(path) == path.resolve():
+        if copy_record.copy_folder(path) == path.resolve() or "owner_unit" in fields:
             directory = path.stat()
             identity = record.fields.get("copy_id") if isinstance(record, copy_record.Registered) else ""
             fields.update(copy_id=identity if isinstance(identity, str) and identity else secrets.token_hex(16),
@@ -645,11 +663,21 @@ def copy_paths() -> Iterator[Path]:
                     yield path
 
 
+def registered_copy_paths() -> Iterator[Path]:
+    """List native copies and adopted copies from the existing holds."""
+    paths = set(copy_paths())
+    for held in holds():
+        path = Path(held)
+        record = task_of(path)
+        if (isinstance(record, copy_record.UnreadableRecord)
+                or isinstance(record, copy_record.Registered) and "borrows_from" in record.fields):
+            paths.add(path)
+    yield from sorted(paths)
+
+
 def record_lifetime(path: Path, now: float, ending_task: str = "") -> Live | Ended | Unknown:
     """Read end evidence while the caller holds any required removal lock."""
     removal = pending_removal(path)
-    if isinstance(removal, copy_record.Registered):
-        return Ended(f"removal started for task {removal.task}")
     if isinstance(removal, copy_record.UnreadableRecord):
         return Unknown(removal.reason)
     record = task_of(path)
@@ -659,10 +687,10 @@ def record_lifetime(path: Path, now: float, ending_task: str = "") -> Live | End
         return Unknown(f"repair record {path / copy_record.RECORD}: copy is not registered")
     protection: Live | Ended | Unknown = Ended("no copy borrows from it")
     try:
-        for child in copy_paths():
+        for child in registered_copy_paths():
             if child.resolve() == path.resolve():
                 continue
-            if isinstance(pending_removal(child), copy_record.Registered):
+            if not child.exists():
                 continue
             other = task_of(child)
             if isinstance(other, copy_record.NotRegistered):
@@ -680,6 +708,8 @@ def record_lifetime(path: Path, now: float, ending_task: str = "") -> Live | End
                 break
     except OSError as error:
         protection = Unknown(f"repair copies registry {copy_record.copies_root()}: {error}")
+    if isinstance(removal, copy_record.Registered):
+        return Ended(f"removal started for task {removal.task}") if isinstance(protection, Ended) else protection
     if record.task.startswith("phase:"):
         run, phase = record.fields.get("run_dir"), record.fields.get("phase_id")
         if not isinstance(run, str) or not run or not isinstance(phase, str) or not phase:
@@ -998,28 +1028,66 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
     return removed
 
 
-def end_copy(path: Path, task: str, now: float, *, require_task: bool = True) -> bool:
-    with removal_lock(path) as idle, copy_record_lock(path):
-        record = task_of(path)
-        if not isinstance(record, copy_record.Registered) or require_task and record.task != task:
-            return False
-        pending = pending_removal(path)
-        if record.task == task and isinstance(pending, copy_record.NotRegistered) and not task_has_end_evidence(record):
-            def task_ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
-                if not isinstance(current, copy_record.Registered) or current.task != task:
-                    raise ScratchError(f"{path}: task changed while recording its end")
-                return {**current.fields, "ended": now, "ended_task": task}
-
-            _ = update_record(path, task_ended)
+def end_selected_copy(path: Path, expected: copy_record.Registered, now: float,
+                      *, validate: Callable[[], None]) -> bool:
+    """Validate selected ownership while holding the removal and record locks."""
+    with removal_lock(path) as idle:
         if not idle:
             return False
-        state = record_lifetime(path, now)
-        if not isinstance(state, Ended):
-            return False
-        if not isinstance(pending, copy_record.Registered) and unsaved_work(path) is not None:
-            return False
-        remove_marked(path, remove)
-        return True
+        if not os.path.lexists(path):
+            pending = pending_removal(path)
+            if not isinstance(pending, copy_record.Registered) or pending.fields != expected.fields:
+                raise ScratchError(f"{path}: removal record changed; retry")
+            validate()
+            removal_mark(path).unlink(missing_ok=True)
+            return True
+        with copy_record_lock(path):
+            current = task_of(path)
+            if not isinstance(current, copy_record.Registered) or current.fields != expected.fields:
+                raise ScratchError(f"{path}: owner, task or copy identity changed; retry")
+            if "copy_device" in current.fields or "copy_inode" in current.fields:
+                directory = path.stat()
+                if (current.fields.get("copy_device"), current.fields.get("copy_inode")) != (directory.st_dev, directory.st_ino):
+                    raise ScratchError(f"{path}: copy identity changed; retry")
+            validate()
+            return end_copy_locked(path, current.task, now, require_task=True, idle=True)
+
+
+def end_copy(path: Path, task: str, now: float, *, require_task: bool = True) -> bool:
+    with removal_lock(path) as idle:
+        if not os.path.lexists(path):
+            pending = pending_removal(path)
+            if (not idle or not isinstance(pending, copy_record.Registered)
+                    or require_task and pending.task != task):
+                return False
+            removal_mark(path).unlink(missing_ok=True)
+            return True
+        with copy_record_lock(path):
+            return end_copy_locked(path, task, now, require_task=require_task, idle=idle)
+
+
+def end_copy_locked(path: Path, task: str, now: float, *, require_task: bool, idle: bool) -> bool:
+    """End and remove a copy while the caller holds its removal and record locks."""
+    record = task_of(path)
+    if not isinstance(record, copy_record.Registered) or require_task and record.task != task:
+        return False
+    pending = pending_removal(path)
+    if record.task == task and isinstance(pending, copy_record.NotRegistered) and not task_has_end_evidence(record):
+        def task_ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+            if not isinstance(current, copy_record.Registered) or current.task != task:
+                raise ScratchError(f"{path}: task changed while recording its end")
+            return {**current.fields, "ended": now, "ended_task": task}
+
+        _ = update_record(path, task_ended)
+    if not idle:
+        return False
+    state = record_lifetime(path, now)
+    if not isinstance(state, Ended):
+        return False
+    if not isinstance(pending, copy_record.Registered) and unsaved_work(path) is not None:
+        return False
+    remove_marked(path, remove)
+    return True
 
 
 def remove_empty_copy_pairs(base: Path) -> None:

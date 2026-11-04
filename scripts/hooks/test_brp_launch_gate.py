@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -128,7 +128,7 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.admission.free(4 * gate.GIB)
         self.admission.compiler(8 * gate.GIB)
         self.environment.update(BUILDLOG_MEM_WAIT_LIMIT_S="0",
-            BUILDLOG_MEM_WAIT_SINCE=str(self.admission.clock.now() - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds - 1))
+            BUILDLOG_MEM_WAIT_SINCE=str(self.admission.clock.now() - admission_policy_fixture().timing.head_seconds - 1))
         result = self.run_hook()
         self.assert_denied(result,
             "BRP launch memory check failed (exit 2): memory admission check failed "
@@ -161,7 +161,7 @@ class BrpLaunchGateTests(unittest.TestCase):
         with patch.dict(os.environ, {"BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(record),
                                      "BUILDLOG_MEMORY_PRESSURE": "/proc/pressure/memory"}):
             with self.assertRaises(gate.LiveMemoryReading):
-                _ = gate.read_pressure(policy=gate.DEFAULT_ADMISSION_POLICY)
+                _ = gate.read_pressure(policy=admission_policy_fixture())
         self.admission.server.reply_filter = lambda reply: wire.Refused(reason)
         self.assert_denied(
             self.run_hook(),

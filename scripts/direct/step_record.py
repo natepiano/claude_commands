@@ -284,6 +284,8 @@ def consume_stopped_build(call_id: str, consumed: Path) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start")
+    _ = start.add_argument("pid", type=int)
     create = commands.add_parser("write")
     for flag in ("call-id", "pid", "kind", "runs-on", "state"):
         _ = create.add_argument("--" + flag, required=True)
@@ -303,8 +305,11 @@ def main() -> int:
     _ = stopped.add_argument("--consumed", required=True)
     args = parser.parse_args()
     try:
-        call_id = cast(str, args.call_id)
         command = cast(str, args.command)
+        if command == "start":
+            print(process_start(cast(int, args.pid)))
+            return 0
+        call_id = cast(str, args.call_id)
         if command == "remove":
             remove(call_id)
         elif command == "stopped":

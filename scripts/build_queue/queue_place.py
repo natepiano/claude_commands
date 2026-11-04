@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Hold one build-queue place for a program and record its scoped peak."""
+"""Choose admission from command arguments and manage the program scope."""
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import Enum, auto
 import os
 from pathlib import Path
 import signal
@@ -33,6 +34,36 @@ class ConfiguredFirstPeak:
 
 
 CONFIGURED_FIRST_PEAK = ConfiguredFirstPeak()
+
+
+class ProgramPurpose(Enum):
+    BATCH = auto()
+    PROBE = auto()
+    EDITOR_SERVER = auto()
+
+
+def program_purpose(argv: Sequence[str], *, batch: bool = False) -> ProgramPurpose:
+    """Classify the complete command before admission or scope startup."""
+    if not argv:
+        raise QueuePlaceRefused("the program command is empty")
+    if Path(argv[0]).name != "rust-analyzer":
+        return ProgramPurpose.BATCH
+    probes = conf.read("build_admission").words("program_probe_arguments.rust-analyzer")
+    if len(argv) == 2 and argv[1] in probes:
+        return ProgramPurpose.PROBE
+    if not batch and len(argv) == 1:
+        return ProgramPurpose.EDITOR_SERVER
+    return ProgramPurpose.BATCH
+
+
+@dataclass(frozen=True)
+class UnreservedProgram:
+    pass
+
+
+@dataclass(frozen=True)
+class UnmeasuredProbe:
+    pass
 
 
 class QueuePlaceRefused(Exception):
@@ -167,7 +198,7 @@ class ScopedProgram:
 class StartedProgram:
     process: subprocess.Popen[bytes]
     stopped: threading.Event
-    sampler: threading.Thread
+    sampler: threading.Thread | UnmeasuredProbe
     tracking: ScopedProgram | ProgramTree
 
 
@@ -238,6 +269,9 @@ class QueuePlace:
     status: int = 1
     program: ProgramNotStarted | StartedProgram = field(default_factory=ProgramNotStarted, init=False)
     on_started: Callable[[], None] = no_hold_wait
+    configuration: memory_admit.MemoryConfig = field(kw_only=True, repr=False)
+    purpose: ProgramPurpose = field(default=ProgramPurpose.BATCH, kw_only=True)
+    arguments: tuple[str, ...] = field(default=(), kw_only=True)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def observe(self, peak_bytes: int, current_bytes: int) -> None:
@@ -249,18 +283,20 @@ class QueuePlace:
                 self.peak_bytes = peak_bytes
                 atomic_sample(self.path.with_suffix(".wave"), f"{peak_bytes} {int(now)}\n")
                 self.wave_at = now
-            elif self.peak_bytes and current_bytes >= self.peak_bytes / 2 and now - self.wave_at >= memory_admit.read_memory_config().peak_wave_seconds:
+            elif self.peak_bytes and current_bytes >= self.peak_bytes / 2 and now - self.wave_at >= self.configuration.peak_wave_seconds:
                 atomic_sample(self.path.with_suffix(".wave"), f"{self.peak_bytes} {int(now)}\n")
                 self.wave_at = now
 
     def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]:
         if isinstance(self.program, StartedProgram):
             raise QueuePlaceRefused("a queue place can start only one program")
+        if self.arguments and tuple(argv) != self.arguments:
+            raise QueuePlaceRefused("the program arguments changed after the purpose decision")
         if not popen_arguments.get("start_new_session", True):
             raise QueuePlaceRefused("a queued program must start in its own process group")
         popen_arguments["start_new_session"] = True
         prefix: list[str] = []
-        if os.environ.get("BUILDLOG_SCOPE") != "0":
+        if self.purpose != ProgramPurpose.PROBE and os.environ.get("BUILDLOG_SCOPE") != "0":
             with redirect_stdout(sys.stderr):
                 prefix = probe_scope_prefix()
             if not prefix:
@@ -282,14 +318,16 @@ class QueuePlace:
                 start = memory_admit.process_start_time(process.pid)
                 if start is not None:
                     tracking.observed[process.pid] = start
-            sampler = threading.Thread(target=self._sample, args=(tracking, stopped), daemon=True)
+            sampler = (UnmeasuredProbe() if self.purpose == ProgramPurpose.PROBE else
+                       threading.Thread(target=self._sample, args=(tracking, stopped), daemon=True))
             self.program = StartedProgram(process, stopped, sampler, tracking)
-            sampler.start()
+            if isinstance(sampler, threading.Thread):
+                sampler.start()
             if prefix:
                 while not self.sidecar.read_text().strip():
                     if process.poll() is not None and not self.sidecar.read_text().strip():
                         raise QueuePlaceRefused("the program exited before it published its memory scope")
-                    time.sleep(memory_admit.read_memory_config().program_sample_seconds)
+                    time.sleep(self.configuration.program_sample_seconds)
             self.on_started()
         return process
 
@@ -315,7 +353,7 @@ class QueuePlace:
                     self.observe(reading.bytes, reading.bytes)
             except (OSError, ValueError, StopIteration):
                 pass  # A process or scope can disappear between sampling reads.
-            if stopped.wait(memory_admit.read_memory_config().program_sample_seconds):
+            if stopped.wait(self.configuration.program_sample_seconds):
                 return
 
     def finish(self, *, failed: bool = False) -> None:
@@ -325,7 +363,7 @@ class QueuePlace:
         process = program.process
         try:
             completed = process.poll()
-            config = memory_admit.read_memory_config()
+            config = self.configuration
             deadline = time.monotonic() + config.program_stop_seconds
             if isinstance(program.tracking, ScopedProgram):
                 stop_scope(Path(self.sidecar.read_text().strip()), deadline, config.program_sample_seconds)
@@ -349,7 +387,8 @@ class QueuePlace:
                 self.status = completed
         finally:
             program.stopped.set()
-            program.sampler.join()
+            if isinstance(program.sampler, threading.Thread):
+                program.sampler.join()
 
 
 def _stop_holder(number: int, _frame: object) -> None:
@@ -357,20 +396,27 @@ def _stop_holder(number: int, _frame: object) -> None:
 
 
 @contextmanager
-def queue_place(program: str, repo: Path, *,
+def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
                 sizing: memory_admit.FixedCapSizing | memory_admit.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
                 before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
+    """Use full commands for purpose selection; retain named batch reservations."""
+    # A name requests a batch place. A complete command permits purpose selection.
     try:
+        if isinstance(program, str):
+            arguments: tuple[str, ...] = ()
+            name, purpose = program, ProgramPurpose.BATCH
+        else:
+            arguments = tuple(program)
+            purpose = program_purpose(arguments, batch=batch)
+            name = Path(program[0]).name
         config = memory_admit.memory_config()
     except conf.Unusable as error:
         raise QueuePlaceRefused(str(error)) from error
-    if isinstance(sizing, ConfiguredFirstPeak):
-        first = config.program_first_peaks.get(program)
+    if purpose == ProgramPurpose.BATCH and isinstance(sizing, ConfiguredFirstPeak):
+        first = config.program_first_peaks.get(name)
         if first is None:
-            raise QueuePlaceRefused(f"no first peak for {program} in lint.conf [memory]; {conf.path('lint')}: program_first_peak_gib.{program} is missing or invalid")
+            raise QueuePlaceRefused(f"no first peak for {name} in build_admission.conf [memory]; {conf.path('build_admission')}: program_first_peak_gib.{name} is missing or invalid")
         sizing = memory_admit.HistoryPeakSizing(first, memory_admit.FirstProgramPeak(first), 0.0)
-    profile: memory_admit.ProgramProfile | memory_admit.StepProfile = memory_admit.ProgramProfile(
-        program, str(Path.home() / ".claude"), str(repo.resolve()), sizing)
     pid = os.getpid()
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["queue-place"])) as temporary:
         sidecar = temporary / "program.cgroup"
@@ -380,20 +426,26 @@ def queue_place(program: str, repo: Path, *,
             if handler in (signal.SIG_DFL, signal.default_int_handler):
                 _ = signal.signal(number, _stop_holder)
         try:
-            start = memory_admit.process_start_time(pid)
-            if start is None:
-                raise QueuePlaceRefused("owner no longer exists")
-            owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
-            def refresh() -> wire.AdmitRequest:
-                return admission_client.step_request([program], str(repo), owner, since, str(sidecar), episode, profile)
-            output = admission_client.WaitOutput()
-            grant = admission_client.admit(refresh(), output, refresh, _attempt=before_check)
-            if isinstance(grant, wire.Refused):
-                raise QueuePlaceRefused(grant.reason)
-            if isinstance(grant, admission_client.LeftQueue):
-                raise QueuePlaceRefused("left the admission queue")
-            output.finished()
-            place = QueuePlace(Path(grant.max_path).with_suffix(""), sidecar)
+            grant: wire.Admitted | UnreservedProgram = UnreservedProgram()
+            if purpose == ProgramPurpose.BATCH:
+                assert not isinstance(sizing, ConfiguredFirstPeak)
+                profile = memory_admit.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), sizing)
+                start = memory_admit.process_start_time(pid)
+                if start is None:
+                    raise QueuePlaceRefused("owner no longer exists")
+                owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
+                def refresh() -> wire.AdmitRequest:
+                    return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
+                output = admission_client.WaitOutput()
+                reply = admission_client.admit(refresh(), output, refresh, _attempt=before_check)
+                if isinstance(reply, wire.Refused):
+                    raise QueuePlaceRefused(reply.reason)
+                if isinstance(reply, admission_client.LeftQueue):
+                    raise QueuePlaceRefused("left the admission queue")
+                grant = reply
+                output.finished()
+            sample_path = Path(grant.max_path).with_suffix("") if isinstance(grant, wire.Admitted) else temporary / "program"
+            place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments)
             failed = False
             try:
                 yield place
@@ -404,7 +456,8 @@ def queue_place(program: str, repo: Path, *,
             finally:
                 with defer_cleanup_signals():
                     place.finish(failed=failed)
-                    _ = admission_client.release(grant.reservation, place.status)
+                    if isinstance(grant, wire.Admitted):
+                        _ = admission_client.release(grant.reservation, place.status, place.configuration)
         finally:
             with defer_cleanup_signals():
                 for number, handler in handlers.items():
@@ -415,4 +468,13 @@ if __name__ == "__main__":
     if len(sys.argv) >= 6 and sys.argv[1] == "--scope-start":
         scope_start(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5:])
     else:
-        raise SystemExit("queue_place supports only internal scoped program startup")
+        argv = sys.argv[1:]
+        if argv[:1] == ["--"]:
+            argv = argv[1:]
+        try:
+            with queue_place(argv, Path.cwd()) as place:
+                status = place.popen(argv).wait()
+            raise SystemExit(status)
+        except QueuePlaceRefused as error:
+            print(f"queue place: {error}", file=sys.stderr)
+            raise SystemExit(1) from error
