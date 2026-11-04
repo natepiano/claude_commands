@@ -12,7 +12,7 @@ file replaced by its last chat reply.
 
 from __future__ import annotations
 
-from scripts.production import worker_admission
+from scripts.production import staff_sources, worker_admission
 from scripts.production.staff_test_support import fixture_runtime_id
 
 
@@ -1856,17 +1856,19 @@ class StaffAdmissionTests(MeshCommandFixture):
         assert row is not None
         self.assertEqual((row.name, row.parent), ("worker", os.environ["CODEX_THREAD_ID"]))
         self.assertEqual(self.methods("turn/start"), [])
-        self.assertEqual([item.identity for item in worker_admission.pending_publications(self.session_dir)], [THREAD_ID])
+        self.assertEqual(staff_sources.pending_publication_evidence(self.session_dir).diagnostics, ())
+        self.assertEqual([item.identity for item in staff_sources.pending_publication_evidence(self.session_dir).workers], [THREAD_ID])
         self.next_thread_id = fixture_runtime_id("must-not-create-a-second-backend")
         self.assertEqual(self.run_start(), (0, ""))
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
         self.assertEqual([_as_test_dict(request["params"])["threadId"] for request in self.methods("turn/start")], [THREAD_ID])
-        self.assertEqual(worker_admission.pending_publications(self.session_dir), ())
+        self.assertEqual(staff_sources.pending_publication_evidence(self.session_dir),
+                         staff_sources.PendingPublicationEvidence((), ()))
         self.assertEqual(staff.by_id(row.id), row)
 
     def test_interruption_after_roster_write_before_acknowledgement_recovers_the_same_backend(self) -> None:
-        from scripts.production import staff, worker_admission
+        from scripts.production import staff
 
         class LauncherInterrupted(BaseException):
             pass
@@ -1878,14 +1880,16 @@ class StaffAdmissionTests(MeshCommandFixture):
         assert row is not None
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
         self.assertEqual(self.methods("turn/start"), [])
-        self.assertEqual([item.identity for item in worker_admission.pending_publications(self.session_dir)], [THREAD_ID])
+        self.assertEqual(staff_sources.pending_publication_evidence(self.session_dir).diagnostics, ())
+        self.assertEqual([item.identity for item in staff_sources.pending_publication_evidence(self.session_dir).workers], [THREAD_ID])
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
         self.next_thread_id = fixture_runtime_id("must-not-start-after-published-roster")
         self.assertEqual(self.run_start(), (0, ""))
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
         self.assertEqual([_as_test_dict(request["params"])["threadId"] for request in self.methods("turn/start")], [THREAD_ID])
-        self.assertEqual(worker_admission.pending_publications(self.session_dir), ())
+        self.assertEqual(staff_sources.pending_publication_evidence(self.session_dir),
+                         staff_sources.PendingPublicationEvidence((), ()))
         self.assertEqual(staff.by_id(row.id), row)
         self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
 
@@ -1984,7 +1988,9 @@ class StaffAdmissionTests(MeshCommandFixture):
         self.assertIn(THREAD_ID, errors)
         self.assertEqual(self.methods("turn/start"), [])
         self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
-        pending = worker_admission.pending_publications(self.session_dir)
+        evidence = staff_sources.pending_publication_evidence(self.session_dir)
+        self.assertEqual(evidence.diagnostics, ())
+        pending = evidence.workers
         self.assertEqual([(item.identity, item.parent) for item in pending],
                          [(THREAD_ID, os.environ["CODEX_THREAD_ID"])])
         self.failing_method = ""
