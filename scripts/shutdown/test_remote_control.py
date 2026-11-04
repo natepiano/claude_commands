@@ -70,7 +70,6 @@ class RemoteControlTests(ShutdownTestCase):
         self.clock = FakeClock()
         self.place = HerdrPlace("owner", "w1:p7")
         self.typed: list[tuple[float, str]] = []
-        self.screen = ""
         self.fields: RegistryFixture = {
             "pid": 321, "procStart": "original", "sessionId": "owner", "name": "Owner",
             "messagingSocketPath": "", "updatedAt": 1, "tmux": "owner:@1.%7",
@@ -96,7 +95,7 @@ class RemoteControlTests(ShutdownTestCase):
         self.write()
         _ = self.enterContext(patch.object(session_pane, "record_place", side_effect=self.find_place))
         _ = self.enterContext(patch.object(session_pane, "type_place", side_effect=self.type_command))
-        _ = self.enterContext(patch.object(session_pane, "read_place", side_effect=self.read_screen))
+        _ = self.enterContext(patch.object(session_pane, "read_place", return_value=""))
 
     def write(self) -> None:
         _ = (self.registry / "321.json").write_text(json.dumps(self.fields), encoding="utf-8")
@@ -106,9 +105,6 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertEqual(saved["pid"], 321, "fixer must resolve the confirmed process's own pane")
         self.assertEqual(saved.get("procStart"), "original")
         return self.place
-
-    def read_screen(self, _place: HerdrPlace) -> str:
-        return self.screen
 
     def type_command(self, place: HerdrPlace, text: str, *, target: str) -> None:
         self.assertEqual(target, "owner")
@@ -171,27 +167,28 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertEqual(self.typed, [])
         self.assertEqual(pushes, [])
 
-    def test_idle_pane_command_enables_control_once_by_registry_or_screen(self) -> None:
-        for evidence in ("registry", "screen"):
-            with self.subTest(evidence=evidence):
+    def test_typed_attempt_requires_registry_bridge_despite_active_pane_text(self) -> None:
+        for bridge_appears in (True, False):
+            with self.subTest(bridge_appears=bridge_appears):
                 self.clock = FakeClock()
                 self.fields["bridgeSessionId"] = ""
-                self.screen = ""
                 self.typed.clear()
                 self.write()
                 def activate(at: float) -> None:
-                    if self.typed and at >= self.typed[0][0] + 1:
-                        if evidence == "registry":
-                            self.fields["bridgeSessionId"] = "bridge"
-                            self.write()
-                        else:
-                            self.screen = "/remote-control is active\n"
+                    if bridge_appears and self.typed and at >= self.typed[0][0] + 1:
+                        self.fields["bridgeSessionId"] = "bridge"
+                        self.write()
                 self.clock.tick = activate
-                outcome, text, pushes = self.run_fix()
-                self.assertIsInstance(outcome, remote_control.TurnedOn)
+                with (patch.object(session_pane, "read_place", return_value="/remote-control is active\n"),
+                      redirect_stderr(io.StringIO()) as error):
+                    outcome, _text, pushes = self.run_fix()
+                self.assertIsInstance(outcome, remote_control.TurnedOn if bridge_appears else remote_control.Failed)
                 self.assertEqual(self.typed, [(60.0, "/remote-control")])
-                self.assertEqual(self.clock.at, 61.0)
-                self.assertIn("Remote Control on", text)
+                self.assertEqual(self.clock.at, 61.0 if bridge_appears else remote_control.DEADLINE)
+                if isinstance(outcome, remote_control.Failed):
+                    self.assertEqual(outcome.reason, "pane reported Remote Control active but registry had no bridgeSessionId")
+                self.assertEqual(error.getvalue().splitlines(), [
+                    "anomaly: owner: pane reports Remote Control active without registry bridgeSessionId"])
                 self.assertEqual(pushes, [])
 
     def test_busy_then_idle_registry_delays_input_until_idle(self) -> None:
