@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
+from datetime import datetime, timedelta, timezone
 from functools import partial
 import io
 import os
@@ -141,6 +142,27 @@ class SshEligibilityTests(unittest.TestCase):
         args.reservation_file = str(self.root / "reservation.tsv")
         args.recover_only = recover_only
         return build_targets.command_reserve(args)
+
+    def test_a_mac_block_stops_a_memory_wait_from_reusing_its_reservation(self) -> None:
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
+        self.assertEqual(self.reserve("mac"), 0)
+        paths = mac_test.state_paths("mac")
+        claim, = mac_test.read_claims(paths)
+        block = mac_test.ActiveMacBlock(
+            "assembly", "assembly checks", datetime.now(timezone.utc),
+            datetime.now(timezone.utc) + timedelta(hours=1),
+            mac_test.RecordedSession("assembly-session", "assembly"), mac_test.NO_SHOWRUNNER,
+            "off_by_this_block", mac_test.FREE_MESSAGE_NOT_NEEDED)
+        mac_test.write_block(paths.block, block)
+        for published in (True, False):
+            with self.subTest(reservation_published=published):
+                destination = self.root / "reservation.tsv"
+                if not published:
+                    destination.unlink(missing_ok=True)
+                self.assertEqual(self.reserve("mac"), 1)
+                self.assertFalse(destination.exists())
+                retained, = mac_test.read_claims(paths)
+                self.assertEqual(retained.record, claim.record)
 
     def test_disabled_aws_neither_contacts_a_host_nor_reserves_capacity(self) -> None:
         _ = write_config_fixture(self.root / "aws_target.conf", "offload=off\n")
