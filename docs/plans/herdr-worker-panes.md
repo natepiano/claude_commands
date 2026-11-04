@@ -1259,7 +1259,7 @@ Make no unproved write and create no second row.
 
 **Ruled out:** a pane found by herdr's `agent_session` value; it can be stale.
 
-### Phase 4b — `production_tree.py` deleted  · status: todo
+### Phase 4b — `production_tree.py` deleted  · status: done
 
 **Scope (sdlc, 2026-11-03):** only the `production_tree.py` deletion stays here. The Owns and Hub deletions moved to Phase 4c, which devtools-unit owns.
 
@@ -1635,7 +1635,7 @@ Require two equal reads one second apart; save both snapshots and named byte/tim
 Compare operation-owned staff fields and check for probe ids or scratch paths in live staff.
 Record live hashes; an unrelated hash change alone does not prove a probe write.
 
-### Phase 4s — natedev copies the staff record to the Mac after each write  · status: todo
+### Phase 4s — natedev copies the staff record to the Mac after each write  · status: done
 
 **Depends on:** none; sdlc asked for it on 2026-11-04 (the user said yes).
 

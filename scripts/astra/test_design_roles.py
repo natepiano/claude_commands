@@ -38,7 +38,6 @@ from scripts.direct import workers  # noqa: E402
 from scripts.astra.design_role_test_support import write_empty_binding_record, write_mesh_server_record
 from scripts.astra.design_roles import launch_thread as launch_native_role
 from scripts.astra.design_roles import release_servers as release_design_servers  # noqa: E402
-from scripts.production import production_tree  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -958,9 +957,15 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual([(record["thread_id"], record["state"]) for record in records],
                          [("9309c903-5894-501a-8aa7-f33ea912e074", "idle")])
         self.assertIsInstance(records[0]["lifetime"], astra_roles.HeldDesignRole)
-        edges = production_tree.astra_edges()
-        self.assertEqual([(edge["manager"], edge["member"], edge["role"], edge["codex_home"], edge["state"]) for edge in edges],
-                         [('17759e5d-1377-577b-b283-19888bbfc1f5', "9309c903-5894-501a-8aa7-f33ea912e074", "astra-designer", str(self.root / "codex-home"), "idle")])
+        record = staff.snapshot()
+        parent = design_roles.worker_parent(design, "designer", record)
+        workers = record.find(kind="worker", parent=parent.id)
+        self.assertEqual([(worker.current_session, worker.parent) for worker in workers],
+                         [("9309c903-5894-501a-8aa7-f33ea912e074", parent.id)])
+        self.assertEqual([(role["manager"], role["thread_id"], role["role"], role["codex_home"], role["state"])
+                          for role in records],
+                         [('17759e5d-1377-577b-b283-19888bbfc1f5', "9309c903-5894-501a-8aa7-f33ea912e074",
+                           "designer", str(self.root / "codex-home"), "idle")])
         self.assertEqual(design_roles.read_design(design.placement.design_id).placement.design_id, design.placement.design_id)
 
     def test_server_refresh_uses_current_run_holder_and_generation_on_the_same_account(self) -> None:
