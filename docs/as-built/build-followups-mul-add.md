@@ -2,7 +2,12 @@
 
 ## What it is
 
-`verify.sh lint` runs `cargo clippy --fix` before its clippy judgment. The fix pass applies every automatic fix that clippy and rustc offer at the crate's own lint levels. Multiply-adds are one of these fixes: `a * b + c` becomes `a.mul_add(b, c)`. This fix pass is the only multiply-add correction mechanism. No Claude or Codex edit runs a multiply-add hook.
+`verify.sh lint` judges with clippy before it runs automatic repairs.
+A passing judgment skips the fix passes.
+After a failed judgment, `cargo clippy --fix` applies the automatic fixes that clippy and rustc offer at the crate's lint levels.
+Multiply-adds are one of these fixes: `a * b + c` becomes `a.mul_add(b, c)`.
+This fix pass is the only multiply-add correction mechanism.
+No Claude or Codex edit runs a multiply-add hook.
 
 The nightly Rust release check enables FMA for its Linux clippy build. Buildlog records a Codex worker's own thread as its session. The last hana measurement passed both limits.
 
@@ -12,12 +17,12 @@ The nightly Rust release check enables FMA for its Linux clippy build. Buildlog 
 
 | File | Role |
 | --- | --- |
-| `scripts/direct/verify.sh` | Runs the clippy fix passes, formatting, cache rekey and the clippy judgment. |
+| `scripts/direct/verify.sh` | Runs the first clippy judgment, repairs after failure, and the final judgment. |
 | `scripts/lint/invoke.sh` | `invoke_clippy_fix` runs the fix pass with the judgment's arguments. |
 | `scripts/buildlog/rust_release.py` | Sets the release trial's Linux clippy FMA flags. |
 | `scripts/buildlog/record.py` | Supplies worker, worker session and agent session for step and call records. |
 | `scripts/direct/test_verify_lint_scope.py`, `test_verify_lint_fixes.py`, `test_verify_lint_fix_limit.py`, `test_verify_lint_cache.py`, `test_verify_lint_edits.py`, `test_verify_lint_taplo.py`, `test_verify_lint_tool_failures.py` | Use the shared `verify_lint_scope_test_support.py` fixture and fake Cargo to check scope, fix order, the pass limit, cache keys and formatter failures. |
-| `scripts/style/test_style_sync.py` | Checks the Cargo calls of a workspace lint, the fix pass and both formats included. |
+| `scripts/style/test_style_sync.py` | Checks the Cargo calls of a workspace lint and the skipped repairs after a passing first judgment. |
 | `scripts/buildlog/test_rust_release.py`, `test_record.py` | Check release flags and agent-session precedence with isolated inputs. |
 
 ### Edit checks
@@ -32,15 +37,23 @@ The release check sets `CARGO_INCREMENTAL=0` for clippy. It sets `CARGO_TARGET_X
 
 ### Lint-step fix
 
-The normal `verify.sh lint` path runs mend, fmt and Taplo first. Then the clippy stage runs this loop, at most three times:
+The normal `verify.sh lint` path runs mend, fmt, and Taplo first.
+Clippy then judges with `--workspace --all-targets --all-features --keep-going -- -D warnings`.
+A passing judgment ends the clippy stage without repairs.
+A failed judgment starts this loop, with at most three passes:
 
-1. `invoke_clippy_fix --workspace --all-targets --all-features --keep-going`. This is `cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs <scope> -- -D warnings <extra clippy args>`, through `run`. It has the same scope, lint levels, gating and sandbox detection as the judgment.
-2. `fmt_cargo "${FMT_SCOPE[@]}"`, which formats what the fix wrote.
-3. A compare of `tree_key` before and after the pass. A pass that changes nothing ends the loop. So a clean tree costs one fix pass.
+1. Run `invoke_clippy_fix --workspace --all-targets --all-features --keep-going`.
+2. Run `fmt_cargo "${FMT_SCOPE[@]}"`.
+3. Compare `tree_key` before and after the pass.
 
-After the loop, lint recomputes `VERDICT_KEY` when it records a run. Then it runs the judgment, `cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings`. The judgment's status is lint's status. Rustdoc runs separately through `verify.sh doc` at the checkpoint. The `style-lint: clippy start` and `passed` lines stay.
+`invoke_clippy_fix` adds `--fix --allow-dirty --allow-staged --allow-no-vcs` to the judgment's scope and lint levels.
+A pass that changes nothing ends the loop.
+After the loop, clippy judges the resulting tree once more.
+The last judgment sets lint's status.
+Rustdoc runs separately through `verify.sh doc` at the checkpoint.
 
-The fix pass never sets lint's status. lint ignores its exit code. A tree with compile errors makes the fix pass fail, and the judgment reports those errors.
+Lint ignores the fix pass's exit code.
+A tree with compile errors makes the fix pass fail, and the judgment reports those errors.
 
 The loop repeats because one fix can expose a new fix. For example, a `mul_add` rewrite can make a function eligible for `const`. A failed judgment is cached under the fixed tree. With one pass only, every later call would hit that cache and never apply the second fix. If the third pass still changes the tree, lint sets `CLIPPY_FIX_LIMIT_REACHED`. Then `lint_failure_is_the_tree` does not cache a failed judgment, so the next call can fix more. A passing judgment at the limit is cached as usual. An empty `tree_key` never ends the loop early, because it cannot prove that the tree stopped changing.
 
