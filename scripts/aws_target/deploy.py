@@ -6,6 +6,7 @@ import argparse
 import base64
 from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
+from datetime import UTC, datetime
 import gzip
 from hashlib import sha256
 import json
@@ -23,12 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.aws_target import ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
 from scripts.aws_target.config import (
-    BudgetNotificationAddress, DeploymentSettings, deployment_price, money, read_budget_notification_address,
+    BudgetNotificationAddress, DeploymentSettings, deployment_price, deployment_price_path, money, read_budget_notification_address,
     read_control_settings, read_deployment_settings, read_settings,
 )
 from scripts.lib import conf
 from scripts.mac_test import offload
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
 
@@ -100,6 +101,30 @@ class Deployment:
 
     def _api(self, settings: DeploymentSettings) -> AwsCli:
         return AwsCli(settings.profile, settings.region, settings.timeout_s, self.execute)
+
+    def price(self) -> dict[str, str | int]:
+        """Save the current public Spot price without requesting resources."""
+        self._check_credentials()
+        path = deployment_price_path(self.settings_path)
+        settings = conf.read(self.settings_path)
+        now = int(self.clock())
+        api = AwsCli(settings.text('deployment_profile'), settings.text('region'),
+                     settings.whole('deployment_timeout_s'), self.execute)
+        reply = api.call('describe-spot-price-history', '--instance-types', settings.text('instance_type'),
+                         '--availability-zone', settings.text('availability_zone'),
+                         '--product-descriptions', 'Linux/UNIX',
+                         '--start-time', datetime.fromtimestamp(now, UTC).isoformat(), '--max-items', '1')
+        prices = ledger.rows(reply, 'SpotPriceHistory')
+        if len(prices) != 1:
+            raise DeploymentRefused('describe-spot-price-history must return one current price')
+        price = money(ledger.text(prices[0], 'SpotPrice'))
+        if price <= 0:
+            raise DeploymentRefused('describe-spot-price-history must return a positive price')
+        now = int(self.clock())
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_bytes_atomic(path, (f'deployment_price_usd_per_hour={price}\n'
+                                 + f'deployment_price_at={now}\n').encode(), mode=0o600)
+        return {'deployment_price_usd_per_hour': str(price), 'deployment_price_at': now, 'file': str(path)}
 
     def _observe(self, settings: DeploymentSettings, instance_id: str) -> ledger.InstanceObservation:
         evidence = self._api(settings).observe(instance_id, int(self.clock()))
@@ -279,6 +304,9 @@ class Deployment:
     def _authorize(self, approve_resources: bool) -> None:
         if not approve_resources:
             raise DeploymentRefused('the user must pass --approve-resources at their terminal')
+        self._check_credentials()
+
+    def _check_credentials(self) -> None:
         credential_file = os.environ.get('AWS_SHARED_CREDENTIALS_FILE', '')
         if not credential_file or stat.S_IMODE(Path(credential_file).expanduser().stat().st_mode) != 0o600:
             raise DeploymentRefused('AWS_SHARED_CREDENTIALS_FILE must name a private mode 0600 file')
@@ -422,7 +450,7 @@ class DeploymentArguments(argparse.Namespace):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('prepare', 'apply', 'setup-start', 'bootstrap'))
+    _ = parser.add_argument('command', choices=('price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)
@@ -430,7 +458,9 @@ def main() -> int:
     args = parser.parse_args(namespace=DeploymentArguments())
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
-        if args.command == 'bootstrap':
+        if args.command == 'price':
+            print(json.dumps(deploy.price(), sort_keys=True))
+        elif args.command == 'bootstrap':
             remote_settings = remote_configuration(args.settings)
             text = bootstrap_configuration(args.settings, remote_settings)
             args.output.mkdir(parents=True, exist_ok=True)

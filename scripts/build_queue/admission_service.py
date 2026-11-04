@@ -846,7 +846,8 @@ class AdmissionServer:
                                              self.readings.compilers(), policy=policy)
         ordered, priority = self._queue_order()
         unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path,
-                                           activity_reader=activity, ci_memory_slice=config.ci_memory_slice)
+                                           activity_reader=activity, ci_memory_slice=config.ci_memory_slice,
+                                           ci_memory_margin_bytes=config.ci_memory_margin_bytes)
         inputs = gate.build_queue_inputs(ordered, memories, readings, self.override, now, priority, unowned)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}

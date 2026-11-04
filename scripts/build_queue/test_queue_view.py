@@ -140,6 +140,7 @@ class QueueViewTests(QueueFixtureTests):
             scope = fixture.root / "builds.slice/cache-only.scope"
             scope.mkdir(parents=True)
             _ = (scope / "memory.current").write_text(str(5 * gate.GIB))
+            _ = (scope / "memory.stat").write_text("inactive_file 0\n")
             _ = (scope / "cgroup.procs").write_text("")
             _ = fixture.server.run_pass()
             model = self.service_model(fixture)
@@ -168,6 +169,7 @@ class QueueViewTests(QueueFixtureTests):
             unowned.mkdir()
             amount = int(17.4 * gate.GIB)
             _ = (unowned / "memory.current").write_text(str(amount))
+            _ = (unowned / "memory.stat").write_text("inactive_file 0\n")
             _ = (unowned / "cgroup.procs").write_text("")
             server.free(12 * gate.GIB)
             _ = server.server.handle_request(server.request(need=8 * gate.GIB))

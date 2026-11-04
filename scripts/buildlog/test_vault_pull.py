@@ -174,7 +174,7 @@ class VaultPullTests(unittest.TestCase):
     def test_busy_lock_on_every_try_has_its_own_stop_and_detail(self) -> None:
         self.scenario = "locked"
         status, line = self.hour()
-        self.assertEqual(status, 1)
+        self.assertEqual(status, 0)
         self.assertIn("index.lock", line)
         self.assertEqual(sum(command[2] == "merge" for command in self.remote_commands()), 3)
         outage = vault_pull.read_state().outage
@@ -312,13 +312,74 @@ class VaultPullTests(unittest.TestCase):
     def test_tracked_changes_stop_before_merge_and_name_the_safe_fix(self) -> None:
         self.scenario = "tracked"
         status, line = self.hour()
-        self.assertEqual(status, 1)
+        self.assertEqual(status, 0)
         self.assertIn("Some files in ~/rust/hanadocs on the Mac have changes that are not committed.", line)
         self.assertFalse(any(command[2] == "merge" for command in self.remote_commands()))
         self.assertEqual(len(self.pushes), 1)
         self.assertIn("commit", self.pushes[0].message)
         self.assertIn("Mac", self.pushes[0].message)
         self.assertIsInstance(vault_pull.pull(), vault_pull.TrackedFilesChanged)
+
+    def test_tracked_changes_exit_zero_and_print_the_stop_line(self) -> None:
+        self.scenario = "tracked"
+        self.assertEqual(self.hour(), (
+            0,
+            "buildlog vault: stopped: Some files in ~/rust/hanadocs on the Mac have changes that are not committed.",
+        ))
+        self.assertEqual(len(self.pushes), 1)
+        outage = vault_pull.read_state().outage
+        assert isinstance(outage, vault_pull.OpenOutage)
+        self.assertEqual(outage.cause, "tracked_files_changed")
+        self.assertTrue(outage.alerted)
+
+    def test_command_failure_exits_one_after_a_recorded_user_action_stop(self) -> None:
+        self.scenario = "tracked"
+        self.assertEqual(self.hour()[0], 0)
+        self.scenario = "command_failed"
+        self.assertEqual(self.hour(), (
+            1, "buildlog vault: stopped: fatal: fixture transport configuration is invalid",
+        ))
+        self.assertEqual(len(self.pushes), 1)
+        outage = vault_pull.read_state().outage
+        assert isinstance(outage, vault_pull.OpenOutage)
+        self.assertEqual(outage.cause, "command_failed")
+        self.assertTrue(outage.alerted)
+
+    def test_user_action_stops_exit_zero_after_sent_or_recorded_alerts(self) -> None:
+        for scenario, cause in (
+            ("tracked", "tracked_files_changed"), ("branch", "not_on_main"),
+            ("diverged", "history_diverged"), ("push_refused", "history_diverged"),
+            ("untracked", "untracked_would_be_overwritten"), ("locked", "vault_locked"),
+        ):
+            with self.subTest(scenario=scenario):
+                vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), vault_pull.NoOutage()))
+                self.pushes.clear()
+                self.scenario = scenario
+                status, line = self.hour()
+                self.assertEqual(status, 0)
+                self.assertTrue(line.startswith("buildlog vault: stopped: "))
+                outage = vault_pull.read_state().outage
+                assert isinstance(outage, vault_pull.OpenOutage)
+                self.assertEqual(outage.cause, cause)
+                self.assertTrue(outage.alerted)
+                self.assertEqual(len(self.pushes), 1)
+                self.assertEqual(self.hour(), (0, line))
+                self.assertEqual(len(self.pushes), 1)
+
+    def test_user_action_stops_exit_one_when_the_alert_fails(self) -> None:
+        self.send_ok = False
+        for scenario in ("tracked", "branch", "diverged", "untracked", "locked"):
+            with self.subTest(scenario=scenario):
+                vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), vault_pull.NoOutage()))
+                self.pushes.clear()
+                self.scenario = scenario
+                status, line = self.hour()
+                self.assertEqual(status, 1)
+                self.assertTrue(line.startswith("buildlog vault: stopped: "))
+                outage = vault_pull.read_state().outage
+                assert isinstance(outage, vault_pull.OpenOutage)
+                self.assertFalse(outage.alerted)
+                self.assertEqual(len(self.pushes), 1)
 
     def test_non_main_branch_stops_before_status_or_merge(self) -> None:
         self.scenario = "branch"
@@ -337,7 +398,7 @@ class VaultPullTests(unittest.TestCase):
         self.scenario = "untracked"
         self.assertIsInstance(vault_pull.pull(), vault_pull.UntrackedWouldBeOverwritten)
         status, line = self.hour()
-        self.assertEqual(status, 1)
+        self.assertEqual(status, 0)
         self.assertIn("An update would replace a file on the Mac that git does not track.", line)
         self.assertIn("move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs", self.pushes[0].message)
 
@@ -380,20 +441,20 @@ class VaultPullTests(unittest.TestCase):
 
     def test_one_alert_per_outage_survives_hours_until_a_good_pull_closes_it(self) -> None:
         self.scenario = "tracked"
-        self.assertEqual(self.hour()[0], 1)
+        self.assertEqual(self.hour()[0], 0)
         first = vault_pull.read_state().outage
         self.assertIsInstance(first, vault_pull.OpenOutage)
         for scenario in ("tracked", "branch", "untracked"):
             self.scenario = scenario
             self.now += 3600
-            self.assertEqual(self.hour()[0], 1)
+            self.assertEqual(self.hour()[0], 0)
         self.assertEqual(len(self.pushes), 1)
         self.scenario = "clean"
         self.assertEqual(self.hour()[0], 0)
         self.assertEqual(vault_pull.read_state().outage, vault_pull.NoOutage())
         self.scenario = "tracked"
         self.now += 3600
-        self.assertEqual(self.hour()[0], 1)
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(len(self.pushes), 2)
         self.assertNotEqual(vault_pull.read_state().outage, first)
 
@@ -406,12 +467,12 @@ class VaultPullTests(unittest.TestCase):
         since = self.now
         self.send_ok = True
         self.now += 3600
-        self.assertEqual(self.hour()[0], 1)
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(len(self.pushes), 2)
         self.assertEqual(vault_pull.read_state().outage, vault_pull.OpenOutage("tracked_files_changed", since, True,
                                                             vault_pull.stop_details(vault_pull.TrackedFilesChanged())[1]))
         self.now += 3600
-        self.assertEqual(self.hour()[0], 1)
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(len(self.pushes), 2)
 
     def test_no_state_save_after_a_sent_alert_can_make_the_next_hour_repeat_it(self) -> None:
@@ -424,12 +485,12 @@ class VaultPullTests(unittest.TestCase):
             save(state)
 
         with mock.patch.object(vault_pull, "write_state", side_effect=fail_after_send):
-            self.assertEqual(self.hour()[0], 1)
+            self.assertEqual(self.hour()[0], 0)
         self.assertEqual(vault_pull.read_state().outage,
                          vault_pull.OpenOutage("tracked_files_changed", self.now, True,
                                               vault_pull.stop_details(vault_pull.TrackedFilesChanged())[1]))
         self.now += 3600
-        self.assertEqual(self.hour()[0], 1)
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(len(self.pushes), 1)
 
     def test_a_failed_pre_send_state_save_does_not_send_an_alert(self) -> None:

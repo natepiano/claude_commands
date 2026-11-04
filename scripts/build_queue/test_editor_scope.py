@@ -17,7 +17,9 @@ class EditorScopeTests(unittest.TestCase):
             _ = (scope / "cgroup.procs").write_text("")
             _ = (nested / "cgroup.procs").write_text("")
             _ = (scope / "memory.current").write_text(str(4 * gate.GIB))
+            _ = (scope / "memory.stat").write_text("inactive_file 0\n")
             _ = (nested / "memory.current").write_text(str(4 * gate.GIB))
+            _ = (nested / "memory.stat").write_text("inactive_file 0\n")
             _ = fixture.server.run_pass()
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
