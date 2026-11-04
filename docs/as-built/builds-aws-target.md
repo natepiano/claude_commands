@@ -99,7 +99,7 @@ An interruption marker reports the instance generation.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
-- `deploy.py up --approve-resources` runs the price, bootstrap, stacks, and scaler-key stages.
+- `deploy.py up --approve-resources` runs price, bootstrap, stacks, scaler-key, Tailscale policy, box join, box configuration, and checks.
   Each stage checks live state and records its last result and times in `up.json`.
   A retry continues from incomplete stages. The price stage always refreshes the public price.
   The stacks stage preserves the guard, ledger, and retained-volume checks.
@@ -124,6 +124,37 @@ An interruption marker reports the instance generation.
 - `deploy.py prepare` writes the CloudFormation parameters, priced inventory and preflight evidence locally, with no AWS command. `apply` and `setup_start` run only at the user's terminal. They create the monthly Budget (emails at 50, 80 and 100 percent, a stop action at 100 percent) before any chargeable resource.
 - `cloudformation.json` defines the Spot instance, the root volume and the retained data volume. Shutdown behavior is `stop`, IMDSv2 is required and inbound is UDP 41641 only. The scaler IAM policy allows start and stop on the one instance, the needed describe calls and `ce:GetCostAndUsage`.
 - `nixos.patch` adds host `aws-build` and the natedev `aws-target` user unit, stopped by default. It is on `/etc/nixos` main as commit 78746da. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03): `aws-target.service` is installed and disabled. `/etc/nixos` main 25966d8 adds sccache (one shared module with natedev), mold, natedev's cargo config and cargo-tile to `hosts/aws-build.nix`. The box is not built.
+
+### Box setup stages
+
+1. `tailscale-policy` reads `config/aws-build-tailscale.json` and the live policy.
+   It resolves the natedev and Mac addresses from local Tailscale status.
+   It changes only `tag:build-aws` owners and destination rules.
+   It prints each proposed change and uses the policy ETag to prevent concurrent overwrites.
+   It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
+2. `box-join` checks SSM and the instance's Tailscale identity.
+   It starts a stopped instance through the existing guarded setup path.
+   It creates a single-use, pre-approved key and revokes it after the join attempt.
+   SSM disables terminal echo before the helper sends the key through stdin.
+   The command reads the key from stdin and writes no key file.
+3. `box-configuration` reads the clean `main` checkout named by `nixos_configuration_directory`.
+   It compares `/run/current-system` with the `aws-build` output.
+   It builds the output locally and copies the closure with destination substitutes.
+   It holds the controller lock and stops the remote idle service during the copy.
+   A bounded poweroff timer protects a failed reconnect.
+   A transient systemd unit runs the switch independently of SSH.
+   The helper resets the old idle timestamp before it restarts the remote service.
+   It waits for the expected system and an active `aws-build-remote` service.
+4. `checks` confirms SSM, the EBS serial under `/home`, ext4, and the remote service.
+   It archives the repository named by `box_shell_directory` and copies its shell inputs.
+   It compares Rust, nextest, and mend inside the configured shell on both machines.
+   It uses `normalize_tool_version` for both results.
+   `box-shell.json` records the public archive path and shell selector.
+
+The private `tailscale_oauth_file` contains JSON fields `client_id` and `client_secret`.
+The file must have mode `0600` and stay outside the repository.
+No deployment stage edits or pushes the NixOS checkout.
+The controller activation and routing proof remain separate plan stages.
 
 ## Invariants
 

@@ -612,3 +612,21 @@ Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
 | `smoke_call_seconds` | `5` | Maximum time for a BRP request. |
 | `smoke_signal_grace_seconds` | `2` | Delay after the termination signal. |
 | `smoke_poll_seconds` | `1` | Delay between readiness and exit checks. |
+
+### AWS box setup inputs
+
+`deploy.py up` reads these inputs at use.
+
+| Key | Default | Reason |
+| --- | --- | --- |
+| `tailscale_oauth_file` | `~/.config/aws-build/tailscale-oauth` | Keep OAuth JSON outside the public repository with mode `0600`. |
+| `tailscale_key_expiry_s` | `300` | Expire an unused single-use join key after five minutes. |
+| `nixos_configuration_directory` | `/etc/nixos` | Read the reviewed box configuration from a clean `main` checkout. |
+| `box_shell_directory` | `~/rust/cargo-liner` | Select the repository for the configured shell parity checks. |
+| `box_setup_timeout_s` | `3600` | Bound each setup command and the idle shutdown hold. |
+| `box_check_attempts` | `60` | Bound SSM and SSH recovery checks. |
+| `box_check_delay_s` | `5` | Allow registration and Tailscale restarts between checks. |
+
+The OAuth JSON contains `client_id` and `client_secret`.
+`config/aws-build-tailscale.json` holds only the public box access rules and source device names.
+The helper prints policy changes and preserves unrelated rules.

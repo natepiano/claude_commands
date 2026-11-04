@@ -203,6 +203,8 @@ class DeploymentTests(CostFixture):
         })))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         self.set_clock(self.now)
+        # These tests cover the resource stages. test_box covers the box stages.
+        _ = cast(object, self.enterContext(mock.patch.object(deploy.Deployment, '_box_stages', return_value=())))
 
     @override
     def replace(self, key: str, value: str) -> None:

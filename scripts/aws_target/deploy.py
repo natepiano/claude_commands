@@ -23,7 +23,7 @@ from typing import Literal, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.aws_target import ledger, remote
+from scripts.aws_target import box, ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
 from scripts.aws_target.config import (
     BudgetNotificationAddress, DeploymentSettings, deployment_price, deployment_price_path, money, read_budget_notification_address,
@@ -550,6 +550,15 @@ class Deployment:
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
             raise DeploymentRefused('the scaler key works; IAM could not remove every old key') from None
 
+    def _box_stages(self) -> tuple[UpStage, ...]:
+        setup = box.BoxSetup(self.settings_path, self.directory, self._start_box, execute=self.execute)
+        return (
+            UpStage('tailscale-policy', setup.policy_present, setup.policy),
+            UpStage('box-join', setup.join_present, setup.join),
+            UpStage('box-configuration', setup.configuration_present, setup.configure),
+            UpStage('checks', setup.checks_present, setup.checks),
+        )
+
     def up(self, *, approve_resources: bool = False) -> bool:
         """Check each deployment stage and stop at the first refusal."""
         self._authorize(approve_resources)
@@ -558,6 +567,7 @@ class Deployment:
             UpStage('bootstrap', self._bootstrap_present, self.bootstrap),
             UpStage('stacks', self._stacks_present, self._apply_stacks),
             UpStage('scaler-key', self._scaler_stage_present, self._scaler_key),
+            *self._box_stages(),
         )
         with control_lock(self.directory / 'up'):
             path = self.directory / 'up.json'
@@ -578,6 +588,19 @@ class Deployment:
                 if result.status == 'refused':
                     return False
         return True
+
+    def _start_box(self) -> object:
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        outputs = deployment_outputs(self.directory)
+        if not outputs.get('InstanceId'):
+            raise DeploymentRefused('deployment.json has no InstanceId')
+        instance = outputs['InstanceId']
+        state = self._api(settings).observe(instance, int(self.clock())).state
+        if state in ('running', 'pending'):
+            return state
+        _ = self.price()
+        _ = self.prepare()
+        return self.setup_start(approve_resources=True)
 
 
 def remote_configuration(path: Path) -> str:

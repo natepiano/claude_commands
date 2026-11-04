@@ -268,42 +268,36 @@ A missing mount must not create mirrors on the root filesystem.
 SSM remains available for mount recovery.
 Repeat the idle-stop check after bootstrap or lifecycle changes.
 
-## Tailscale policy and branch handoff
+## Tailscale policy and box configuration
 
-Run this command yourself through SSM:
+`deploy.py up --approve-resources` now runs the policy, join, configuration, and checks stages.
+The helper reads the private OAuth JSON named by `tailscale_oauth_file`.
+The JSON contains `client_id` and `client_secret`.
+The file stays outside the repository with mode `0600`.
+The OAuth client needs `auth_keys` for `tag:build-aws` and `policy_file` access.
+Never paste its secret into a command, log, or tracked file.
 
-```sh
-sudo tailscale up --ssh --advertise-tags=tag:build-aws
-```
+1. Confirm the natedev and Mac device names in `config/aws-build-tailscale.json`.
+2. Confirm the clean `main` checkout at `nixos_configuration_directory` contains the reviewed box configuration.
+3. Confirm `box_shell_directory` names the repository for the configured shell checks.
+4. Run `python3 scripts/aws_target/deploy.py up --approve-resources` yourself.
 
-Use the [Tailscale SSH policy documentation](https://tailscale.com/docs/features/tailscale-ssh) when editing the tailnet policy.
-Give `tag:build-aws` no initiated connections to natedev or the Mac.
-Remove broader grants that would permit those connections.
-Permit natedev's user and the Mac's user to reach `tag:build-aws`.
-Permit each user to enter the box's `natepiano` account through Tailscale SSH.
-The user asked for this access on 2026-11-03, to run `cargo tile` on the box by hand.
-Test the permitted and denied directions in the policy console.
-Do not store a Tailscale auth key on either branch.
-
-natedev is already rebuilt. On 2026-11-03 it switched to `/etc/nixos` 10353a9, which holds the patch commit 78746da.
-`aws-target.service` is installed on natedev and stays disabled until go-live.
-
-1. Give the natedev showrunner the prepared `aws-build` branch and the director's commit.
-2. Have the showrunner inspect the patch and the box's Nix evaluation result.
-3. Rebuild the box yourself from the reviewed branch.
-4. Keep the controller service inactive during the box activation.
-5. Confirm SSM, Tailscale SSH, `/home`, and the remote lifecycle service after activation.
-
-Install the reviewed public NixOS branch on the box before its user-run activation.
-Use the `aws-build` output for that activation.
-Do not copy credentials, private host keys, or a live machine's configuration directory.
-The showrunner must supply the committed branch identity before the activation.
+The policy stage prints each change to `tag:build-aws` rules.
+It preserves unrelated rules and refuses a broad outbound rule that needs policy review.
+The join stage waits for SSM and sends one short-lived auth key through SSM stdin.
+The key never enters a command argument or a disk file.
+The configuration stage uses substitutes during closure transfer.
+It holds idle shutdown during the copy and detached switch.
+A bounded poweroff timer protects a failed SSH reconnect.
+The stage confirms the running system and restarts `aws-build-remote` before it removes the timer.
+The checks stage confirms SSM, the expected `/home` volume, the remote service, and shell tool parity.
+A refusal stops `up` and records the stage in `up.json`.
+Correct the reported cause and run `up` again.
+Completed stages report `present`.
 
 Agents must not activate a system or modify the live NixOS checkout.
-The prepared AWS host installs Python 3.13, Nix, Git, rsync, Rust, nextest, and mend.
-Its pinned Rust overlay and cargo-liner source supply the Rust tools.
-A successful Nix evaluation proves neither package builds nor runtime tool parity.
-If tool versions differ, prepare matching packages and repeat the user checks before enabling work.
+The helper reads the NixOS checkout only when the user runs `up`.
+Controller activation and the routing proof remain separate plan stages.
 
 ## Update public scripts before the registry
 
