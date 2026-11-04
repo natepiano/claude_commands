@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from scripts.agents import test_codex_mesh as mesh_fixture
 from scripts.direct import assign
-from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, read_object
+from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, LauncherScript, read_object
 from scripts.lint import style_review
 from scripts.production.cli_fixture import invoke_cli
 
@@ -47,7 +47,7 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_unreadable_staff_starts_no_worker(self) -> None:
         record = Path(os.environ["STAFF_FILE"])
         _ = record.write_text("{broken")
-        result = self.launch(script=ASSIGN)
+        result = self.launch(execution=LauncherScript(ASSIGN))
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertIn("invalid staff JSON:", result.stderr)
         self.assertEqual(self.methods("thread/start"), [])
@@ -115,7 +115,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_writer_dispatch_records_paths_rules_identity_and_a_finished_pass(self) -> None:
-        _ = self.successful(script=ASSIGN)
+        _ = self.successful(execution=LauncherScript(ASSIGN))
         name, record = next(iter(self.assignment_records().items()))
         self.assertEqual(record["role"], "impl")
         self.assertEqual(self.turn_starts, 1)
@@ -232,7 +232,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR"):
             _ = environment.pop(key, None)
         with patch.dict(os.environ, environment, clear=True):
-            result = self.launch(session=False, script=script)
+            result = self.launch(session=False, execution=LauncherScript(script))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(prepared.exists())
         self.assertIn(str(self.session_dir), result.stdout)
@@ -256,7 +256,7 @@ class AssignLauncherTests(AssignLauncherFixture):
             _ = environment.pop(key, None)
         environment["CODEX_THREAD_ID"] = director
         with patch.dict(os.environ, environment, clear=True):
-            result = self.launch(session=False, script=script)
+            result = self.launch(session=False, execution=LauncherScript(script))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(prepared.exists())
         phase = cast(dict[str, object], read_object(self.session_dir / "progress_history_state.json")["phase"])

@@ -56,16 +56,16 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 - **Speed method** (every speed phase):
   0. Targets: at dispatch, the director takes the top live rows of `test_times top` that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal.
-  1. Baseline: before the edit, run the module alone three times with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` and keep the median `wall_s` and `cpu_s`. Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
+  1. Baseline: before the edit, run the module three times with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` and keep the median `wall_s` and `cpu_s`. These runs find the cost (step 2); they are not the before number of the gain (step 5). Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
   2. Find the cost from the JSON: the slowest tests, and `wall_s - tests_s` (import and module or class fixtures). Name the expensive operations before any edit; do not apply a cut the module already has.
   3. Cut it, in this order:
+     - Find each fixed wait first: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. A fixed wait often also causes flakes, so a flaky module is a speed target too (fastest-unit, Phases 5i and 6: 64 to 35 s, 58 to 24 s).
      - Remove trivial tests (Invariants above).
      - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does.
      - Call code in-process in place of a subprocess when the test does not check the process boundary; keep one process test for each boundary.
-     - Remove fixed waits and polling loops in the tests; wait on an event, a file or a pipe instead.
      - Split a module whose tests are independent into two or more files, so the gate runs them at the same time. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time. Every file of the group is in acceptance.
   4. A change to a shared support file (for example `scripts/lint/memory_test_support.py`) is allowed only when every module that imports it stays green; name those importers in the final gate run.
-  5. After the edit, measure three runs again, the same way, into `<module>-after-<n>-<sha>.json`. Half the wall time is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. Report the before and after medians, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
+  5. After the edit, measure the gain in same-load pairs: run the module at the phase base (a `copies.py run --commit <base>` copy) and in the worktree at the same time, three rounds, into `<module>-pair-<before|after>-<n>-<sha>.json`, with `/proc/loadavg` beside each round. The host load changes all day, so a before batch and a later after batch do not compare. The director runs the pairs after the last repair lands (example: `phases/7/pairs.sh` in the run directory). Half the wall time is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. Report the before and after medians, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
 
 ## Phases
 
@@ -174,7 +174,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 #### As-built
 
-- The SSH target tests are five `test_verify_ssh_targets*.py` files that share `verify_ssh_targets_test_support.py`. The module runner runs them in parallel. Group wall time is 62-71 s (median), from 327.1 s; CPU is 181-188 s, from 205.5 s.
+- The SSH target tests are five `test_verify_ssh_targets*.py` files that share `verify_ssh_targets_test_support.py`. Each file runs in its own `module_run.py` process, all at the same time (the runner itself is serial). Group wall time is 62-71 s (median), from 327.1 s; CPU is 181-188 s, from 205.5 s.
 - The assign launcher tests are four `test_assign_launcher*.py` files (`test_assign_launcher.py`, `_identity`, `_reuse`, `_review`) that share `assign_launcher_test_support.py`. Most tests call the launcher in-process; `test_unreadable_staff_starts_no_worker` runs it as a separate process, because the progress recorder writes its refusal to the process stderr.
 - The merge gate test-times fixture writes `build_admission.conf` and `build_folders.conf` into its private config folder.
 - The build log index is at `SCHEMA_VERSION = 31`. A database at an older schema rebuilds, and the rebuild reads gate history from the start of each log, also before the saved offset.
@@ -190,7 +190,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - A split of a file that other units edit makes later upstream merges need hand ports: merge origin/builds before each split and keep the split window short.
 - The index schema number must stay above the builds branch's number; a clash makes one side skip its rebuild.
 
-### Phase 6 — The simplify-lens and assign-launcher modules run faster  · status: todo
+### Phase 6 — The simplify-lens and assign-launcher modules run faster  · status: done
 **Depends on:** Phase 5
 
 #### Work Order
@@ -349,3 +349,67 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - every importer of the two helpers green in the checkpoint gate run
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 - each changed importer's after median `cpu_s` is not higher than its before median
+
+### Phase 12 — A tool lists the tests that only repeat other tests  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file> [<file> ...]` lists each test whose lines other tests in the same run also run, as removal candidates, in a few seconds over the module's own run time.
+
+**Spec:**
+
+1. Collector: standard library only. Use Python 3.13 `sys.monitoring` `LINE` events under its own tool id. Run the named modules through `unittest` in one process, and record one set of `(path, line)` for each test id. Call `sys.monitoring.restart_events()` between tests, so a line that one test ran counts again for the next one. Record only lines of repository files under `scripts/` that are not test modules or `*_test_support.py` files.
+2. Unknown coverage: a test that starts a child process (`subprocess.Popen`, `os.fork`, `os.exec*`) runs lines the collector does not see. Mark it `child: unknown`. It is never a candidate, and its lines do not cover another test.
+3. Candidates: a test is a candidate when a kept test, or the union of kept tests, runs every line it runs. Decide the tests slowest first. After each candidate, take it out of the kept set and check again, so two tests that cover each other cannot both be candidates.
+4. Output: one JSON file (`COVERAGE_OUT=<path>`) with the tree sha, the interpreter, and for each test: id, status, seconds, line count, `child`, and for a candidate the covering test ids. Also print a table: candidate, covering tests, seconds. Use `terminal_cells.py` for alignment.
+5. The list is candidates only. Two tests can run the same lines and check different results. Before a removal, a worker compares the assertions and names the covering test that checks the same result. Speed is never measured with the collector on.
+6. Add one line to the Speed method step 3, under "Remove trivial tests": run `coverage_overlap.py` on the module, and treat each confirmed candidate as a trivial test.
+
+**Files:**
+- `scripts/test_times/coverage_overlap.py` — new collector and report
+- `scripts/test_times/test_coverage_overlap.py` — new tests, with small fixture modules written in a temporary folder
+- `docs/plans/builds-natest.md` — the Speed method line (director)
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `coverage_overlap.py`
+- `test` — `test_coverage_overlap.py`, from the Spec: a repeat test is a candidate; a test with one line of its own is not; two tests that cover each other give one candidate; a child-process test is `child: unknown` and covers nothing; lines in test files are not counted
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 1: `module_run.py` and its `TimedRunner` give each test's id and time; reuse its runner and output form, do not copy it.
+- Invariants: standard library only; typed; tunables in `config/test_times.conf`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/test_times -p 'test_coverage_overlap.py'` green
+- the tool runs on `scripts/production/test_fast_track.py` and prints its table; the run takes less than twice the module's own `module_run.py` time
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 13 — The slowest modules lose the tests that only repeat other tests  · status: todo
+**Depends on:** Phase 12, Phase 7
+
+#### Work Order
+
+**Goal:** the top 10 live modules of `test_times top` (no claimed or retired module) keep every checked behavior and lose each test that only repeats another.
+
+**Spec:**
+
+1. At dispatch, the director takes the 10 modules and splits them between writers by folder.
+2. For each module, run `coverage_overlap.py`. For each candidate, compare its assertions with the covering tests. Remove it only when a covering test checks the same result; otherwise keep it and give the reason in the summary.
+3. Measure the gain with same-load pairs (Speed method step 5).
+4. Report each removed test, its covering test, and the time saved; and each kept candidate with its reason.
+
+**Files:** the 10 test modules, named at dispatch.
+
+**Workers:** 2 writers — modules split by folder; no hub file.
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 12: `coverage_overlap.py` and its `child: unknown` rule.
+
+**Acceptance gate:**
+- every changed module green in the checkpoint gate run
+- each removal names a covering test that checks the same result
+- the pair medians show each changed module's wall and CPU time not higher than before
