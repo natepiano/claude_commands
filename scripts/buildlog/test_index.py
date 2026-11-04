@@ -19,6 +19,7 @@ from unittest import mock
 import index
 from cgroup_test_support import CPU, GIB, slice_reading
 import parse
+import report
 import record as recorder
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
@@ -451,12 +452,12 @@ class IndexTests(unittest.TestCase):
         decoded = [(identifier, json.loads(cast(str, names)) if names is not None else None, target_dir, repository, folder)
                    for identifier, names, target_dir, repository, folder in rows]
         self.assertEqual(decoded, [
-            ("cwd", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/subdirectory"),
-            ("null", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"),
+            ("cwd", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
+            ("null", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
             ("target", ["hana", "dependency", "hana"], "/shared/target", "https://example.com/hana", "/shared/target"),
-            ("unknown", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/unknown"),
-            ("unset", None, TARGET_DIR_UNSET, "git-root:fixture-root", "/r/feature"),
-            ("worktree", [], UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"),
+            ("unknown", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
+            ("unset", None, TARGET_DIR_UNSET, "git-root:fixture-root", None),
+            ("worktree", [], UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
         ])
         columns = [(column[1], column[2], column[3]) for column in self.rows("PRAGMA table_info(steps)")
                    if column[1] in ("target_dir", "repo_identity")]
@@ -474,10 +475,75 @@ class IndexTests(unittest.TestCase):
         self.assertGreater(index.SCHEMA_VERSION, 23)
         self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         row = self.rows("SELECT worker, compiled_crate_names, target_dir, repo_identity, target_folder, build_base, build_items FROM steps")[0]
-        self.assertEqual(row[:5], ("impl", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"))
+        self.assertEqual(row[:5], ("impl", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None))
         self.assertIsInstance(row[5], str)
         self.assertNotEqual(json.loads(cast(str, row[6])), [])
         self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_unknown_and_none_folders_never_use_the_worktree_after_schema_rebuild(self) -> None:
+        self.write(self.host_file, step("none", target_dir="none"), step("empty", target_dir=""),
+                   step("unknown", target_dir="unknown"), step("unset", target_dir="unset"),
+                   step("absolute", target_dir="/shared/actual-target"))
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            connection.execute("CREATE TABLE steps (id TEXT)").close()
+            connection.execute(f"PRAGMA user_version = {index.SCHEMA_VERSION - 1}").close()
+            connection.commit()
+        self.assertEqual(index.update(), 5)
+        self.assertEqual(self.rows("SELECT id, target_dir, target_folder FROM steps ORDER BY id"), [
+            ("absolute", "/shared/actual-target", "/shared/actual-target"),
+            ("empty", "unknown", None), ("none", "none", None),
+            ("unknown", "unknown", None), ("unset", "unset", None),
+        ])
+
+    def test_report_history_keeps_legacy_groups_separate_from_real_folders(self) -> None:
+        cases: tuple[tuple[str, Record, Record, bool], ...] = (
+            ("legacy worktree", {"target_dir": "unset"}, {}, True),
+            ("legacy cwd", {"worktree": None}, {"worktree": None}, True),
+            ("other legacy checkout", {"worktree": "/old"}, {"worktree": "/new"}, False),
+            ("known shared folder", {"target_dir": "/shared/output", "worktree": "/old"},
+             {"target_dir": "/shared/output", "worktree": "/new"}, True),
+            ("different real folders", {"target_dir": "/old/output"}, {"target_dir": "/new/output"}, False),
+            ("legacy to known", {}, {"target_dir": "/shared/output"}, False),
+            ("known to legacy", {"target_dir": "/shared/output"}, {}, False),
+            ("explicit none", {"target_dir": "none"}, {"target_dir": "none"}, False),
+            ("unresolved to unresolved", {"target_dir": "unresolved"}, {"target_dir": "unresolved"}, False),
+            ("unresolved to legacy", {"target_dir": "unresolved"}, {}, False),
+            ("legacy to unresolved", {}, {"target_dir": "unresolved"}, False),
+        )
+        for name, previous, current, expected in cases:
+            with self.subTest(history=name):
+                self.write(self.host_file,
+                           step("previous", started_at="2026-09-01T00:00:00Z", finished_s=1.0, **previous),
+                           step("current", finished_s=1.0, **current))
+                _ = index.reindex()
+                self.assertEqual(self.rows("SELECT " + report.warm_step_clause() + " FROM steps WHERE id = 'current'"),
+                                 [(int(expected),)])
+
+    def test_history_query_limits_reads_to_its_folder_or_checkout_group(self) -> None:
+        size = 800
+        self.write(self.host_file, *[
+            step(str(number), worktree=f"/checkout/{number}",
+                 target_dir=f"/output/{number}" if number % 2 else "unknown",
+                 started_at=f"2026-09-01T00:{number // 60:02d}:{number % 60:02d}Z", finished_s=1.0)
+            for number in range(size)
+        ])
+        _ = index.reindex()
+        with closing(index.read_only()) as connection:
+            sql = "SELECT " + report.warm_step_clause() + " FROM steps"
+            plan = str(connection.execute("EXPLAIN QUERY PLAN " + sql).fetchall())
+            self.assertIn("steps_build_group_history", plan)
+            self.assertIn("build_history_group=? AND build_base=? AND started_at_us<?", plan)
+            batches = 0
+
+            def count_instructions() -> int:
+                nonlocal batches
+                batches += 1
+                return 0
+
+            connection.set_progress_handler(count_instructions, 1000)
+            rows = connection.execute(sql).fetchall()
+            self.assertEqual(rows, [(0,)] * size)
+            self.assertLessEqual(batches * 1000, size * 150)
 
     def test_warm_history_lookup_has_the_folder_base_time_index(self) -> None:
         self.write(self.host_file, step("history"))
@@ -486,14 +552,14 @@ class IndexTests(unittest.TestCase):
             [column[2] for column in self.rows(f'PRAGMA index_info("{name}")')]
             for name, in self.rows("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'steps'")
         ]
-        self.assertIn(["host", "target_folder", "build_base", "started_at_us"], indexed_columns)
+        self.assertIn(["host", "build_history_group", "build_base", "started_at_us"], indexed_columns)
         base, started_at_us = self.rows("SELECT build_base, started_at_us FROM steps")[0]
         plan = str(self.rows(
-            "EXPLAIN QUERY PLAN SELECT id FROM steps WHERE host = ? AND target_folder = ?"
-            + " AND build_base = ? AND started_at_us < ?",
-            "natedev", "/r/feature", base, started_at_us,
+            "EXPLAIN QUERY PLAN SELECT id FROM steps WHERE host = ? AND build_history_group = ?"
+            + " AND build_base = ? AND started_at_us < ? AND finished_s IS NOT NULL",
+            "natedev", "legacy:/r/feature", base, started_at_us,
         ))
-        self.assertIn("steps_build_history", plan)
+        self.assertIn("steps_build_group_history", plan)
         self.assertIn("started_at_us<?", plan)
 
     def test_indexed_start_instants_preserve_microseconds_and_normalize_offsets(self) -> None:
