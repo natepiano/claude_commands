@@ -7140,11 +7140,9 @@ with patch.object(fcntl, "flock", admission):
         note = vault_root / "example-showrunner" / "unit-a.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
         note_text = note.read_text(encoding="utf-8")
-        self.assertIn("| ETA | 10-08 13:00 |", note_text)
-        self.assertIn(
-            "| ETA from | stated 12:00: the measured final checks |",
-            note_text,
-        )
+        self.assertIn("phase_table: true", note_text)
+        self.assertIn("| Phase | What it delivers | Status |", note_text)
+        self.assertNotIn("| ETA", note_text)
 
 
     def start_numbered_phase(

@@ -16,7 +16,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Generator, Iterable, Iterator, Mapping
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -28,9 +28,7 @@ from types import UnionType, MappingProxyType
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue.scope_activity import (
-    EmptyBuildScope, LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses,
-)
+from scripts.build_queue.scope_activity import EmptyBuildScope, LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
@@ -563,7 +561,7 @@ class MemoryPressure:
     some_avg10: float = 0.0
     swap_used_percent: float = 0.0
     next_start_at: float = 0.0
-    condition: Literal["full", "swap"] | PressureConditionNotRecorded = "full"
+    condition: Literal["full", "swap"] | PressureConditionNotRecorded = PressureConditionNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -592,6 +590,7 @@ class Waiter(TypedDict):
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]
+    unit: NotRequired[str]
     step: NotRequired[str]
     folder: NotRequired[str]
     priority_rank: NotRequired[int]
@@ -693,6 +692,12 @@ class UnitMembership(Protocol):
     def unit(self) -> str: ...
 
 
+def queue_unit(unit: str, session_id: str, labels: Mapping[str, UnitMembership]) -> str:
+    """Use the caller's unit before the session's unit."""
+    label = labels.get(session_id)
+    return unit or (label.unit if label is not None else "")
+
+
 class PriorityRoster(Protocol):
     def unit_labels_for(self, session_ids: list[str], environment: Mapping[str, str]) -> Mapping[str, UnitMembership]: ...
 
@@ -733,9 +738,9 @@ def resolve_queue_order(directory: Path, rows: list[tuple[Path, Waiter]], *, fin
 def apply_queue_priority(rows: list[tuple[Path, Waiter]], context: QueueOrderContext
                          ) -> tuple[list[tuple[Path, Waiter]], QueuePriority | NoQueuePriority]:
     for _, row in rows:
-        label = context.labels.get(row.get("session_id", ""))
         row["priority_rank"] = (0 if not isinstance(context.priority, NoQueuePriority)
-                                and label is not None and label.unit == context.priority["unit"] else 1)
+                                and queue_unit(row.get("unit", ""), row.get("session_id", ""), context.labels)
+                                == context.priority["unit"] else 1)
     return sorted(rows, key=lambda item: waiter_order(item[1])), context.priority
 
 
@@ -1007,6 +1012,7 @@ class WaitingStep:
     since: float
     need: int
     reason: WaitReason
+    unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -1019,6 +1025,7 @@ class RunningStep:
     measured: StepMemory
     run: LiveBuildRun | NoLiveBuildRun = NoLiveBuildRun()
     started_at: float = 0.0
+    unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -1463,6 +1470,8 @@ def warn_configuration_diagnostics(diagnostics: tuple[ConfigurationDiagnostic, .
 @dataclass(frozen=True)
 class MemoryConfig:
     policy: AdmissionPolicy
+    ci_memory_slice: str
+    ci_memory_margin_bytes: int
     test_phase_margin: float
     build_budget_bytes: int
     running_pass_seconds: float
@@ -1486,6 +1495,12 @@ class MemoryConfig:
 
 def _gib_bytes(value: float) -> int:
     return max(1, int(value * GIB))
+
+
+def _ci_slice_name(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*\.slice", value) is None:
+        raise ValueError("expected a systemd slice name")
+    return value
 
 
 def build_budget_bytes() -> int:
@@ -1535,6 +1550,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds)),
+                ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
+                ci_memory_margin_bytes=int(number("ci_memory_margin_gib") * GIB),
                 test_phase_margin=number("test_phase_margin"), build_budget_bytes=gib("build_budget_gib"),
                 running_pass_seconds=running_interval, waiting_pass_seconds=number("waiting_pass_seconds"),
                 wait_reply_seconds=number("wait_reply_seconds"), query_timeout_seconds=number("query_timeout_seconds"),
@@ -2633,7 +2650,7 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -
     swap = 100 * max(0, host.swap_total - host.swap_free) / host.swap_total if host.swap_total else 0.0
     if swap > policy.pressure.swap_used_limit and some > policy.pressure.some_avg10_limit:
         return MemoryPressure(full, some, swap, condition="swap")
-    return MemoryPressure(full, some, swap) if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
+    return MemoryPressure(full, some, swap, condition="full") if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
 
 
 def read_recovery(directory: Path) -> RecoverySpacing:
@@ -2674,7 +2691,7 @@ def pressure_with_recovery(recovery: RecoverySpacing, pressure: Pressure, now: f
     if isinstance(pressure, MemoryPressure):
         return pressure
     if isinstance(recovery, RecoveryStarts) and now < min(recovery.ends_at, recovery.next_start_at):
-        return MemoryPressure(0, next_start_at=min(recovery.ends_at, recovery.next_start_at))
+        return MemoryPressure(0, next_start_at=min(recovery.ends_at, recovery.next_start_at), condition="full")
     return pressure
 
 
@@ -3144,13 +3161,20 @@ def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: in
     return directory / f"{pid}-{start_time}-{admitted_ns}"
 
 
+BUILDLOG_UNIT = "BUILDLOG_UNIT"
+
+
 def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
     session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    return {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
-            "step": step, "folder": os.getcwd() if worktree else ""}
+    identity: WaiterIdentity = {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
+                                "step": step, "folder": os.getcwd() if worktree else ""}
+    if unit := os.environ.get(BUILDLOG_UNIT):
+        identity["unit"] = unit
+    return identity
 
 
 class WaiterIdentity(TypedDict):
+    unit: NotRequired[str]
     session_id: str
     session_name: str
     step: str
@@ -3158,7 +3182,7 @@ class WaiterIdentity(TypedDict):
 
 
 def waiter_unit_name(identity: WaiterIdentity, pid: int) -> str:
-    return identity["session_name"] or Path(identity["folder"]).name or str(pid)
+    return identity.get("unit") or identity["session_name"] or Path(identity["folder"]).name or str(pid)
 
 
 class QueueIdentityReader:
@@ -3377,8 +3401,12 @@ class RecordedQueueIdentities:
     """Identity evidence already resolved by gather_queue_inputs."""
 
     def identity(self, _pid: int, row: dict[str, object]) -> WaiterIdentity:
-        return {"session_id": str(row.get("session_id", "")), "session_name": str(row.get("session_name", "")),
-                "step": str(row.get("step", "")), "folder": str(row.get("folder", ""))}
+        identity: WaiterIdentity = {"session_id": str(row.get("session_id", "")),
+            "session_name": str(row.get("session_name", "")),
+            "step": str(row.get("step", "")), "folder": str(row.get("folder", ""))}
+        if row.get("unit"):
+            identity["unit"] = str(row["unit"])
+        return identity
 
 
 class QueueIdentities(Protocol):
@@ -3428,7 +3456,7 @@ def queue_read_from_pass(inputs: QueueInputs, limits: AdmissionLimits, policy: A
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
         reason = admission.reason
         step = WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
-                           identity["folder"], row["since"], row["need"], reason)
+                           identity["folder"], row["since"], row["need"], reason, row.get("unit", ""))
         waiting.append(step)
         if row is ordered[0][1]:
             width = row.get("test_threads")
@@ -3559,24 +3587,13 @@ def parse_snapshot_value(value: object, schema: object) -> object:
             diagnostics.append({**main_diagnostic, "kind": "ConfigurationDiagnostic"})
         record = {name: item for name, item in record.items() if name != "fallbacks"}
         record["diagnostics"] = diagnostics
-    if schema is StepProfile and record.keys() == annotations.keys() - {"build_history_generation"} | {"kind"}:
-        record = {**record, "build_history_generation": snapshot_value(NoBuildHistoryGeneration())}
-    if schema is MemoryPressure:
-        # Remove this main-service compatibility after the admission cut-over.
-        main_pressure_fields = annotations.keys() - {"condition"} | {"kind"}
-        if record.keys() == main_pressure_fields:
-            record = {**record, "condition": snapshot_value(PressureConditionNotRecorded())}
-    if schema in (RunningStep, UnownedSliceMemory):
-        # Older services omit display evidence that these fields add.
-        for member in fields(schema):
-            if member.name not in record and member.name in ("activity", "run", "started_at"):
-                record = {**record, member.name: snapshot_value(member.default)}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
         raise ValueError("invalid snapshot record tag")
-    if record.keys() != annotations.keys() | {"kind"}:
+    if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING
+           for member in fields(schema)):
         raise ValueError("invalid snapshot record fields")
     return cast(Callable[..., object], schema)(**{name: parse_snapshot_value(record[name], kind)
-                                                for name, kind in annotations.items()})
+                                                for name, kind in annotations.items() if name in record})
 
 
 @dataclass(frozen=True)
@@ -3867,7 +3884,8 @@ def build_queue_inputs(ordered: list[tuple[Path, Waiter]],
         identity = reservation_identity(row)
         running.append(RunningStep(identity["session_id"], identity["session_name"],
                                    identity["step"], identity["folder"], row["need"], memory,
-                                   row.get("build_run", NoLiveBuildRun()), _epoch(row["admitted_at"])))
+                                   run=row.get("build_run", NoLiveBuildRun()), started_at=_epoch(row["admitted_at"]),
+                                   unit=identity.get("unit", "")))
         rows.append(row)
     running.extend(RunningStep("", "sccache.service", "compile", "builds.slice", 0, value)
                    for value in readings.compilers)
@@ -3878,8 +3896,8 @@ def build_queue_inputs(ordered: list[tuple[Path, Waiter]],
             activity.session_name if isinstance(activity, ScopeProcesses) else "",
             "between steps" if isinstance(activity, ScopeProcesses) and isinstance(activity.run, LiveBuildRun) else "unowned",
             activity.folder if isinstance(activity, ScopeProcesses) else value.cgroup, 0, value,
-            activity.run if isinstance(activity, ScopeProcesses) else NoLiveBuildRun(),
-            activity.started_at if isinstance(activity, ScopeProcesses) else 0.0))
+            run=activity.run if isinstance(activity, ScopeProcesses) else NoLiveBuildRun(),
+            started_at=activity.started_at if isinstance(activity, ScopeProcesses) else 0.0))
     return QueueInputs(sorted(ordered, key=lambda item: waiter_order(item[1])), tuple(running), tuple(rows),
                        readings.host, readings.pressure, readings.recovery, override, now, priority)
 
@@ -3894,8 +3912,48 @@ def inputs_after_reservations_end(inputs: QueueInputs, live_reservations: set[st
         running=tuple(step for step in inputs.running if not running_has_reservation(step) or id(step) in kept_steps))
 
 
+class SliceMemoryUnavailable(RuntimeError):
+    """A required slice reading cannot authorize another grant."""
+
+
+def ci_slice_cgroup(name: str) -> Path:
+    """Resolve the configured system slice through systemd."""
+    private = os.environ.get("BUILDLOG_CI_CGROUP", "")
+    if private:
+        return Path(private)
+    try:
+        reply = subprocess.run(["systemctl", "show", "--property=ControlGroup", "--value", name],
+                               capture_output=True, text=True, check=True, timeout=5)
+        group = reply.stdout.strip()
+        if not group.startswith("/") or group == "/" or ".." in Path(group).parts:
+            raise ValueError("systemd returns no slice cgroup")
+        return Path("/sys/fs/cgroup") / group.lstrip("/")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise SliceMemoryUnavailable(f"{name}: cannot read ControlGroup: {error}") from error
+
+
+def slice_working_set(directory: Path) -> MeasuredMemory:
+    """Measure resident memory without inactive file cache, plus swap."""
+    current = directory / "memory.current"
+    check_memory_reading(current)
+    amount = int(current.read_text())
+    stat = directory / "memory.stat"
+    check_memory_reading(stat)
+    contents = stat.read_text()
+    try:
+        fields = dict(line.split() for line in contents.splitlines())
+        inactive_file = int(fields["inactive_file"])
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"{stat}: expected inactive_file bytes") from error
+    swap = directory / "memory.swap.current"
+    check_memory_reading(swap)
+    swapped = int(swap.read_text()) if swap.exists() else 0
+    return MeasuredMemory(max(0, amount - inactive_file) + swapped, swap_bytes=swapped)
+
+
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
-                         *, activity_reader: ScopeActivityReader | None = None) -> tuple[UnownedSliceMemory, ...]:
+                         *, activity_reader: ScopeActivityReader | None = None,
+                         ci_memory_slice: str = "", ci_memory_margin_bytes: int = 0) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
     directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
         f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
@@ -3915,24 +3973,46 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
     try:
         children = list(directory.iterdir())
     except OSError:
-        return ()
+        children = []
+    ci_groups = (ci_slice_cgroup(ci_memory_slice),) if ci_memory_slice else ()
+    children.extend(group for group in ci_groups if group not in children)
     for child in children:
-        if child in owned or child.name == "sccache.service" or not child.is_dir():
+        required = child in ci_groups
+        if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
             continue
         try:
-            current = child / "memory.current"
-            check_memory_reading(current)
-            amount = int(current.read_text())
-            swap = child / "memory.swap.current"
-            check_memory_reading(swap)
-            swapped = int(swap.read_text()) if swap.exists() else 0
+            working_set = slice_working_set(child)
+            amount = working_set.bytes
+            swapped = working_set.swap_bytes
             members = {int(pid) for membership in child.rglob("cgroup.procs") for pid in membership.read_text().split()}
             duplicate = process_memory(members & tree_pids, proc).bytes
-            amount = max(0, amount + swapped - duplicate)
+            amount = max(0, amount - duplicate)
+            promise: MemoryPromise = NoPromise()
+            if required:
+                limit_path = child / "memory.max"
+                check_memory_reading(limit_path)
+                try:
+                    limit = int(limit_path.read_text().strip())
+                except ValueError as error:
+                    raise ValueError(f"{limit_path}: expected a finite memory limit") from error
+                if limit <= 0:
+                    raise ValueError(f"{limit_path}: no finite positive memory limit")
+                for pid in members:
+                    try:
+                        program = (proc / str(pid) / "comm").read_text().strip()
+                    except FileNotFoundError:
+                        continue
+                    if program == "Runner.Worker":
+                        promise = LifetimePromise(min(amount + ci_memory_margin_bytes, limit))
+                        break
             if amount or members:
-                result.append(UnownedSliceMemory(amount, cgroup=str(child), owner=child.name,
+                result.append(UnownedSliceMemory(amount, promise=promise,
+                                                 swap_bytes=swapped if required else 0,
+                                                 cgroup=str(child), owner=child.name,
                                                  activity=activity_reader.scope(members, child.name)))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as error:
+            if required:
+                raise SliceMemoryUnavailable(f"{ci_memory_slice}: cannot read slice memory at {child}: {error}") from error
             continue
     return tuple(result)
 

@@ -555,7 +555,7 @@ class AdmissionFixture(ExitStack):
         directory = self.root / f"scope-{owner.pid}"
         directory.mkdir(exist_ok=True)
         for name, text in {"cgroup.procs": str(owner.pid), "cgroup.events": "populated 1\n",
-                           "memory.current": str(GIB), "memory.swap.current": "0"}.items():
+                           "memory.current": str(GIB), "memory.stat": "inactive_file 0\n", "memory.swap.current": "0"}.items():
             _ = (directory / name).write_text(text)
         sidecar = self.root / f"sample-{owner.pid}.cgroup"
         _ = sidecar.write_text(str(directory))

@@ -767,7 +767,7 @@ class AdmissionServer:
             "pid": request.owner.pid, "start_time": request.owner.start_time,
             "need": profile.peak.bytes, "since": place.since, "priority_rank": place.priority_rank,
             "session_id": identity.session_id, "session_name": identity.name,
-            "step": identity.step, "folder": identity.folder,
+            "step": identity.step, "folder": identity.folder, "unit": identity.unit,
             "estimated_at": profile.estimated_at or self.clock.now(),
             "fresh_test": isinstance(request, wire.AdmitRequest) and request.fresh_test,
             "need_source": profile.peak.source, "need_runs": profile.peak.count,
@@ -846,7 +846,8 @@ class AdmissionServer:
                                              self.readings.compilers(), policy=policy)
         ordered, priority = self._queue_order()
         unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path,
-                                           activity_reader=activity)
+                                           activity_reader=activity, ci_memory_slice=config.ci_memory_slice,
+                                           ci_memory_margin_bytes=config.ci_memory_margin_bytes)
         inputs = gate.build_queue_inputs(ordered, memories, readings, self.override, now, priority, unowned)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
@@ -924,7 +925,12 @@ class AdmissionServer:
                                      self.clock.monotonic() + config.source_check_seconds)
         policy = config.policy
         self.last_diagnostics = config.diagnostics
-        inputs, limits = self._inputs(config)
+        try:
+            inputs, limits = self._inputs(config)
+        except gate.SliceMemoryUnavailable as error:
+            refusal = self._run_pass(gate.UnusableAdmissionConfiguration(str(error)))
+            self.next_pass = self.clock.monotonic() + config.waiting_pass_seconds
+            return refusal
         if self.launches and (self.waiters or self.reservations or isinstance(inputs.pressure, gate.MemoryPressure)):
             for episode, waiting in list(self.launches.items()):
                 self.waiters[episode] = waiting
@@ -989,7 +995,7 @@ class AdmissionServer:
                 del self.launches[episode]
         self.persist()
         waiting_steps = tuple(gate.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
-            row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason)
+            row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
             for (_, row), decision in zip(inputs.ordered, result.rows, strict=True))
         for position, decision in enumerate(result.rows, 1):
             episode = by_owner[decision.owner]
@@ -1225,11 +1231,12 @@ class AdmissionServer:
             if isinstance(request, wire.PrioritySetRequest):
                 if not request.unit.strip():
                     return self._mutation_reply(key, wire.Refused("unit is required"))
-                sessions = [waiting.row.get("session_id", "") for waiting in self.waiters.values()]
-                sessions.extend(record.queue_waiter.get("session_id", "") for record in self.reservations.values())
-                labels = gate.priority_labels(sessions)
+                rows = [waiting.row for waiting in self.waiters.values()]
+                rows.extend(record.queue_waiter for record in self.reservations.values())
+                labels = gate.priority_labels([row.get("session_id", "") for row in rows])
                 if request.unit == "—" or not any(
-                        session in labels and labels[session].unit == request.unit for session in sessions):
+                        gate.queue_unit(row.get("unit", ""), row.get("session_id", ""), labels) == request.unit
+                        for row in rows):
                     return self._mutation_reply(key, wire.Refused(
                         f"no waiting step or current reservation belongs to unit {request.unit}"))
                 priority: gate.QueuePriority = {"unit": request.unit, "why": request.why,

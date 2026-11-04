@@ -37,6 +37,84 @@ from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, only_admitted
 
 
+class CiSliceAdmissionTests(unittest.TestCase):
+    def test_idle_ci_use_reduces_the_admission_budget(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = (fixture.root / "ci.slice/memory.current").write_text(str(4 * GIB))
+            request = fixture.request(need=18 * GIB)
+            replies = fixture.server.handle_request(request)
+            self.assertTrue(any(isinstance(reply, wire.Wait) for reply in replies))
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 4 * GIB)
+
+    def test_running_ci_job_uses_the_current_limit_on_every_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(ci_memory_margin_gib=20)
+            ci = fixture.root / "ci.slice"
+            _ = (ci / "memory.current").write_text(str(2 * GIB))
+            _ = (ci / "memory.stat").write_text("inactive_file 0\n")
+            _ = (ci / "memory.max").write_text(str(18 * GIB))
+            (fixture.proc.path / "123").mkdir()
+            _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
+            _ = (ci / "cgroup.procs").write_text("123\n")
+            request = fixture.request(need=8 * GIB)
+            _ = fixture.server.handle_request(request)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 18 * GIB)
+            _ = (ci / "memory.max").write_text(str(12 * GIB))
+            _ = fixture.server.run_pass()
+            self.assertIn(request.episode, fixture.server.reservations)
+
+    def test_running_ci_job_uses_live_use_plus_the_current_margin(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(ci_memory_margin_gib=6)
+            ci = fixture.root / "ci.slice"
+            _ = (ci / "memory.current").write_text(str(2 * GIB))
+            _ = (ci / "memory.stat").write_text("inactive_file 0\n")
+            (fixture.proc.path / "123").mkdir()
+            _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
+            _ = (ci / "cgroup.procs").write_text("123\n")
+            request = fixture.request(need=14 * GIB)
+            _ = fixture.server.handle_request(request)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 8 * GIB)
+            fixture.configure(ci_memory_margin_gib=3)
+            _ = fixture.server.run_pass()
+            self.assertIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 5 * GIB)
+
+    def test_missing_ci_limit_refuses_grants_but_keeps_cleanup_and_recovers(self) -> None:
+        with AdmissionFixture() as fixture:
+            grant = only_admitted(fixture.server.handle_request(fixture.request(need=GIB)))
+            limit = fixture.root / "ci.slice/memory.max"
+            limit.unlink()
+            result = fixture.server.run_pass()
+            assert isinstance(result, gate.UnusableAdmissionConfiguration)
+            self.assertIn("hana-ci.slice", result.reason)
+            self.assertIn("memory.max", result.reason)
+            self.assertNotIn("\n", result.reason)
+            self.assertGreater(fixture.server.next_pass, fixture.clock.monotonic())
+            self.assertTrue(math.isfinite(fixture.server.next_pass))
+            self.assertEqual(fixture.server.handle_request(wire.ViewRequest()), [wire.Refused(result.reason)])
+            replies = fixture.server.handle_request(wire.ReleaseRequest("ci-cleanup", grant.reservation, 0))
+            self.assertEqual(replies, [wire.Ok()])
+            request = fixture.request(need=GIB)
+            replies = fixture.server.handle_request(request)
+            self.assertTrue(any(isinstance(reply, wire.Refused) for reply in replies))
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            _ = limit.write_text(str(18 * GIB))
+            _ = fixture.server.run_pass()
+            self.assertIn(request.episode, fixture.server.reservations)
+
+
 class ServiceTests(unittest.TestCase):
     def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
         with AdmissionFixture() as fixture:
@@ -93,6 +171,7 @@ class ServiceTests(unittest.TestCase):
             unowned = fixture.root / "builds.slice/unowned.scope"
             unowned.mkdir(parents=True)
             _ = (unowned / "memory.current").write_text(str(GIB))
+            _ = (unowned / "memory.stat").write_text("inactive_file 0\n")
             _ = (unowned / "cgroup.procs").write_text("")
             _ = fixture.server.run_pass()
             snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
@@ -127,7 +206,7 @@ class ServiceTests(unittest.TestCase):
             with self.subTest(inherited=inherited), AdmissionFixture() as fixture:
                 fixture.configure(override_reconnect_seconds=4, reconnect_seconds=2)
                 fixture.free(0)
-                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                     _ = fixture.server.handle_request(fixture.request())
                     _ = fixture.server.handle_request(wire.AdmitHeadRequest("delayed-head", "urgent", "director"))
                     override = fixture.server.override
@@ -184,7 +263,7 @@ class ServiceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.configure(override_reconnect_seconds=4)
             request = fixture.launch()
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
                 _ = fixture.server.handle_request(wire.AdmitHeadRequest("launch-head", "urgent", "director"))
                 override = fixture.server.override
@@ -215,7 +294,7 @@ class ServiceTests(unittest.TestCase):
                 fixture.configure(override_reconnect_seconds=4)
                 fixture.free(0)
                 request = fixture.request()
-                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                     _ = fixture.server.handle_request(request)
                     _ = fixture.server.handle_request(wire.AdmitHeadRequest("queued-head", "urgent", "director"))
                     override = fixture.server.override
@@ -240,7 +319,7 @@ class ServiceTests(unittest.TestCase):
                 fixture.free(0)
                 request = fixture.request()
                 request = replace(request, argv=(*request.argv, "x" * 70000))
-                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                     _ = fixture.server.handle_request(request)
                     _ = fixture.server.handle_request(wire.AdmitHeadRequest("large-head", "urgent", "director"))
                     override = fixture.server.override
@@ -410,7 +489,7 @@ class ServiceTests(unittest.TestCase):
             fixture.free(16 * GIB)
             request = fixture.request(need=12 * GIB)
             mutation = wire.AdmitHeadRequest("persisted-head", "urgent", "director")
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
                 self.assertEqual(fixture.server.handle_request(mutation), [wire.Ok()])
                 override = fixture.server.override
@@ -432,7 +511,7 @@ class ServiceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.configure(override_reconnect_seconds=4)
             fixture.free(0)
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(10, condition="full")):
                 _ = fixture.server.handle_request(fixture.request())
                 _ = fixture.server.handle_request(wire.AdmitHeadRequest("head-grace", "urgent", "director"))
                 fixture.restart()
@@ -1142,7 +1221,7 @@ class CutoverServiceTests(unittest.TestCase):
                 follower = fixture.request(need=12 * GIB, since=head.since + 1)
                 _ = fixture.server.handle_request(head)
                 _ = fixture.server.handle_request(follower)
-                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(pressure) if pressure else gate.NoPressureHold()), \
+                with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(pressure, condition="full") if pressure else gate.NoPressureHold()), \
                      mock.patch.object(gate, "head_override_event", wraps=gate.head_override_event) as events:
                     self.assertEqual(fixture.server.handle_request(
                         wire.AdmitHeadRequest("override", "user asked", "showrunner-id")), [wire.Ok()])
@@ -1195,7 +1274,7 @@ class CutoverServiceTests(unittest.TestCase):
             fixture.free(23 * GIB)
             head = fixture.request(need=12 * GIB)
             _ = fixture.server.handle_request(head)
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(6)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(6, condition="full")):
                 _ = fixture.server.handle_request(wire.AdmitHeadRequest("override", "urgent", "director"))
             before = fixture.state_text()
             viewed = fixture.server.handle_request(wire.ViewRequest())[0]
@@ -1473,6 +1552,7 @@ class CutoverServiceTests(unittest.TestCase):
                     gate.RepositoryIdentity("https://example.org/hana", "hana"), "full", fixture.clock.now()))
             scope = Path(Path(request.sidecar).read_text())
             _ = (scope / "memory.current").write_text(str(8 * GIB))
+            _ = (scope / "memory.stat").write_text("inactive_file 0\n")
             grant = only_admitted(fixture.server.handle_request(request))
             _ = fixture.server.run_pass()
             reading = fixture.server.handle_request(wire.ViewRequest())[0]
@@ -1624,6 +1704,7 @@ class CutoverServiceTests(unittest.TestCase):
             scope.mkdir(parents=True)
             _ = (scope / "cgroup.procs").write_text("")
             _ = (scope / "memory.current").write_text(str(GIB))
+            _ = (scope / "memory.stat").write_text("inactive_file 0\n")
             _ = fixture.server.run_pass()
             first = fixture.server.handle_request(wire.ViewRequest())[0]
             assert isinstance(first, wire.ViewReply)
@@ -1631,6 +1712,7 @@ class CutoverServiceTests(unittest.TestCase):
             assert isinstance(measured, gate.UnownedSliceMemory)
             self.assertEqual(measured.bytes, GIB)
             _ = (scope / "memory.current").write_text(str(17 * GIB))
+            _ = (scope / "memory.stat").write_text("inactive_file 0\n")
             fixture.clock.advance(gate.read_memory_config().running_pass_seconds)
             fixture.server.run_once(0)
             updated = fixture.server.handle_request(wire.ViewRequest())[0]
@@ -2287,7 +2369,7 @@ class CutoverServiceTests(unittest.TestCase):
                 wire.LaunchAdmitted(12884901888, "shape"), 1793601567.702956))
             self.assertEqual(path.read_text(), legacy)
 
-    def test_service_drain_rejects_unknown_state_fields(self) -> None:
+    def test_service_drain_ignores_unknown_state_fields(self) -> None:
         from scripts.build_queue.admission_test_support import TestProcesses
         state = service.ServiceState({}, {}, {}, gate.NoRecoverySpacing(), gate.NoHeadAdmissionOverride())
         with tempfile.TemporaryDirectory() as temporary:
@@ -2301,8 +2383,9 @@ class CutoverServiceTests(unittest.TestCase):
                         del record["legacy_cleanup"]
                     record["unknown"] = True
                     _ = (directory / "state.json").write_text(wire.encode_record(record))
-                    with self.assertRaisesRegex(ValueError, "invalid snapshot record fields"):
-                        _ = service.drain_check(directory, service=True, include_gate_callers=False, proc=proc)
+                    self.assertEqual(service.drain_check(
+                        directory, service=True, include_gate_callers=False, proc=proc), 0)
+                    self.assertEqual(service.read_state(directory), state)
 
     def service_drain_with_process(self, script: str, *, default_folder: bool) -> tuple[int, str]:
         from scripts.build_queue.admission_test_support import TestProcesses
@@ -2661,7 +2744,7 @@ class CutoverServiceTests(unittest.TestCase):
             requests = [fixture.request(need=GIB, since=fixture.clock.now() - age) for age in (300, 200, 100)]
             for request in requests:
                 _ = fixture.server.handle_request(request)
-            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(6)):
+            with mock.patch.object(fixture.readings, "pressure", return_value=gate.MemoryPressure(6, condition="full")):
                 _ = fixture.server.run_pass()
             self.assertFalse(fixture.server.reservations)
             policy = fixture.server.last_policy
@@ -3332,6 +3415,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
             scope = fixture.root / "builds.slice/cache.scope"
             scope.mkdir(parents=True)
             _ = (scope / "memory.current").write_text(str(GIB))
+            _ = (scope / "memory.stat").write_text("inactive_file 0\n")
             _ = (scope / "cgroup.procs").write_text("")
             first = fixture.request(need=4 * GIB)
             grant = only_admitted(fixture.server.handle_request(first))

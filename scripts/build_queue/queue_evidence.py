@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
+
 from datetime import datetime
 from typing import assert_never
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts
-from scripts.build_queue.queue_lines import age, field
+from scripts.build_queue.queue_lines import age
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 
@@ -15,10 +17,11 @@ from scripts.message import unit_labels
 def step_labels(step: gate.WaitingStep | gate.RunningStep,
                 labels: Mapping[str, unit_labels.UnitLabels]) -> unit_labels.UnitLabels:
     identity = labels.get(step.session_id)
+    unit = gate.queue_unit(step.unit, step.session_id, labels)
     if identity is not None:
-        return identity
-    fallback = field(step.session_name) or step.folder.rstrip("/").rpartition("/")[2] or "unknown"
-    return unit_labels.UnitLabels(fallback)
+        return replace(identity, unit=unit) if step.unit else identity
+    fallback = " ".join(step.session_name.split()) or step.folder.rstrip("/").rpartition("/")[2] or "unknown"
+    return unit_labels.UnitLabels(fallback, unit=unit or "—")
 
 
 def gib(value: int) -> str:

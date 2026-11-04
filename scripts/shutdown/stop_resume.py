@@ -1,4 +1,4 @@
-"""Stop a session's Claude, or resume it on its account in its herdr tab."""
+"""Stop a session, or resume it on its account in its herdr tab."""
 
 from __future__ import annotations
 
@@ -79,8 +79,8 @@ def _tab_of(session: str) -> herdr.TabSession | SessionNotFound:
     return matches[0] if matches and matches[0].session_id else SessionNotFound(session)
 
 
-def _same_claude(pid: int, started: str) -> bool:
-    """Registry removal is not exit: only the saved pid and start time say the Claude is gone."""
+def _same_process(pid: int, started: str) -> bool:
+    """Check the saved process and start time after registry removal."""
     identity = sessions.process_liveness(pid, started)
     if isinstance(identity, sessions.SessionLivenessUnknown):
         raise OSError(identity.reason)
@@ -139,7 +139,7 @@ def _retire_prompt(session_id: str) -> None:
 
 
 def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
-    """Signal only the Claude identified by the session registry; leave workers alone."""
+    """Signal only the process that proves the current conversation."""
     identity = session
     tab: herdr.TabSession | SessionNotFound = SessionNotFound(session)
     try:
@@ -158,34 +158,43 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
                 identity = tab.session_id
             else:
                 return SessionNotFound(session)
+        kind = "claude"
         live = sessions.session_liveness(identity)
         if isinstance(live, sessions.SessionNotLive):
-            return tab if member is None and isinstance(tab, SessionNotFound) else NotRunning(identity)
+            client = herdr.Herdr(herdr.shared_session())
+            for pane in client.panes():
+                if pane["session_id"] == identity and not isinstance(
+                        client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
+                    if pid := client.codex_launch(pane["pane_id"]).get("pid"):
+                        live, kind = sessions.LiveSessionProcess(pid), "codex"
+                        break
+        if isinstance(live, sessions.SessionNotLive):
+            return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        proved = herdr.native_process(live.pid, "claude")
+        proved = herdr.native_process(live.pid, kind)
         if proved.identity != identity:
             return StopFailed(identity, "process runs another conversation; no signal sent")
         started = proved.started
-        if not _same_claude(live.pid, started):
+        if not _same_process(live.pid, started):
             return NotRunning(identity)
-        if herdr.native_process(live.pid, "claude") != proved:
+        if herdr.native_process(live.pid, kind) != proved:
             return StopFailed(identity, "process identity changed; no signal sent")
         os.kill(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
-        while _same_claude(live.pid, started):
+        while _same_process(live.pid, started):
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
             _ = Event().wait(min(0.1, remaining))
         else:
             return Stopped(identity, live.pid)
-        if _same_claude(live.pid, started):
-            if herdr.native_process(live.pid, "claude") != proved:
+        if _same_process(live.pid, started):
+            if herdr.native_process(live.pid, kind) != proved:
                 return StopFailed(identity, "process identity changed; no signal sent")
             os.kill(live.pid, signal.SIGKILL)
             deadline = monotonic() + KILL_GRACE_SECONDS
-            while _same_claude(live.pid, started):
+            while _same_process(live.pid, started):
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     return StopFailed(identity, f"pid {live.pid} is still running after SIGKILL")
@@ -491,7 +500,7 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
                 requester: str = "", why: str = "") -> str:
     """Observe the started generation after the command returns; recovery belongs to the watchdog."""
     began = monotonic()
-    while _same_claude(pid, generation):
+    while _same_process(pid, generation):
         remaining = STAY_SECONDS - (monotonic() - began)
         if remaining <= 0:
             return ""

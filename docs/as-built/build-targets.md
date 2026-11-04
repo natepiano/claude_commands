@@ -2,13 +2,13 @@
 
 ## What it is
 
-Each machine that can run a build job is a build target with its own rules. natedev is a `local` target: it takes as many jobs as its existing limits admit (the memory gate, the cargo token, build-folder turns). The Mac is an `ssh` target: it takes one job per repository, under the `mac_test.py` claim for that repository, so a hana run and a cargo-liner run share it. A hold names one target. natedev's hold is the build hold (`build_hold.py`); the Mac's hold is the Mac block (`mac_test.py block`). The tools enforce holds themselves: `verify.sh` waits out a natedev hold before any local step, and the BRP launch gate refuses a launch while natedev is held, except for the session whose own hold is the only one in force. `verify.sh test` goes to the first free target it may use, Mac first, and waits when every eligible target is held or full; it never falls back to a held target. A Mac claim whose Mac has run nothing for 15 minutes is released and its holder told, so an idle claim cannot turn tests away for long. `/build:report` counts natedev's steps in its tables and shows the Mac's in a section of its own.
+Each machine that can run a build job is a build target with its own rules. natedev is a `local` target: it takes as many jobs as its existing limits admit (the memory gate, the cargo token, build-folder turns). The Mac is an `ssh` target: it takes one job per repository, under the `mac_test.py` claim for that repository, so a hana run and a cargo-liner run share it. A hold names one target. natedev's hold is the build hold (`build_hold.py`); the Mac's hold is the Mac block (`mac_test.py block`). The tools enforce holds themselves: `verify.sh` waits out a natedev hold before any local step, and the BRP launch gate refuses a launch while natedev is held, except for the session whose own hold is the only one in force. `verify.sh test` goes to the first free target it may use, Mac first, and waits when every eligible target is held or full; it never falls back to a held target. A Mac claim whose Mac has run nothing for 15 minutes is released and its holder told, so an idle claim cannot turn tests away for long. `buildlog costs` ranks costs by machine. Use `buildlog report` for detailed step tables.
 
 ## How it works
 
 ### Targets: `config/build_targets.conf` and `scripts/build_targets/target_config.py`
 
-- The config is in the `key=value` form `scripts/lib/conf.py` reads. `targets=mac,natedev` lists the targets in the order a job tries them. natedev is `kind.natedev=local`, `platform.natedev=linux`. The Mac is `kind.mac=ssh`, `platform.mac=macos`, `settings.mac=mac_test.conf`; its own settings (host, mirror, size budgets, CI switch, disk floor, `linux_only.<repo>`) stay in `config/mac_test.conf`.
+- The config is in the `key=value` form `scripts/lib/conf.py` reads. `targets=mac,natedev,aws` lists the targets in the order a job tries them. natedev is `kind.natedev=local`, `platform.natedev=linux`. AWS is `kind.aws=ssh`, `platform.aws=linux`, `settings.aws=aws_target.conf`. The Mac is `kind.mac=ssh`, `platform.mac=macos`, `settings.mac=mac_test.conf`; its own settings (host, mirror, size budgets, CI switch, disk floor, `linux_only.<repo>`) stay in `config/mac_test.conf`.
 - `target_config.py` imports only `sweep`. It holds `Platform = Literal["linux", "macos"]`, the frozen dataclasses `LocalTarget(name, platform)` and `SshTarget(name, platform, settings: Path)`, `Target = LocalTarget | SshTarget`, `ConfigError(ValueError)` and `read_targets(path=None) -> tuple[Target, ...]`. Target names must be distinct and non-empty; a missing or unsupported `kind`, `platform` or `settings` key, or a settings file that does not exist, is a `ConfigError` naming the key. `BUILD_TARGETS_CONFIG` replaces the path, for tests.
 - `targets.py` re-exports those names, so callers import them from one place. `build_hold.py` imports `read_targets` from `target_config` directly; going through `targets` would form the import cycle `build_hold` → `targets` → `build_hold`.
 - A new `ssh` target is a new entry plus its own settings file, and it reuses the same runner (probe, copy, run, release). `mac_test.state_paths(target)` gives each target its own claim, block and backoff state: the Mac keeps `~/.local/state/mac-test`, and every other target uses `~/.local/state/build-targets/<target>/`. The AWS target is one such entry; see [builds-aws-target.md](builds-aws-target.md).
@@ -111,7 +111,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
 | `/build:queue [<position\|session\|folder>]` | `build_queue.py` | A free/taken budget bar and one waiting row per step, with showrunner, unit, minutes waited and a size bar on the budget scale. `▸` marks the asking session. Row 1 shows `↑` for backfill, `↑ ≤N.N` for strict-window room or `⊘` when no room remains, its recorded window countdown and host holds. A selector opens step cards with each step’s admission checks. `queue_read()` uses the lock-free snapshot or a 0.5 s bounded lock; stale readings keep their time and an amber header, and unavailable readings show `queue busy; try again`. Bump is off and nothing can move a waiting step. |
-| `/build:report` | `buildlog report` | The build report: natedev's steps in its tables, the Mac's in its `### Mac` section, natedev's power-profile changes in `### Power profile`; see [build-report-session.md](build-report-session.md) and [build-followups.md](build-followups.md). |
+| Build costs | `buildlog costs [--days N]` | Phase time and ranked costs by machine. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
 Each command shows its script's output unchanged; each script answers in about a second. There are no stubs at the old names `/builds`, `/build_hold` or `/mac_test`.
@@ -120,7 +120,7 @@ Each command shows its script's output unchanged; each script answers in about a
 
 - A call row has `target`, `hold_wait_s` and `mac_holder` (index schema 14 and later); older rows read `not recorded` / `holder not recorded`. `record.py hold-event <began|ended> <target> <key> <holder> <reason> <at> [<until>]` writes one row per hold beginning or end, for natedev's holder files and the Mac's block alike, through a detached recorder started after the coordination lock closes. The index's `holds` view pairs them into intervals.
 - `scripts/buildlog/holds.py` is the one read of recorded intervals and of what is in force now (`read_current_holds`, from the coordination records, never from `hold_events`). Both reports open with its `Now:` lines.
-- `/build:report` splits by host. `mac_outcome.natedev_step_predicate(step="steps")` returns `{step}.host = 'natedev'`, and every step reader in `report.py` takes it: the kind tables, Rebuilds, the lead block's counts, waits, test routing, the caller-host count, the Summary tables, Power profile and Memory pressure (through `memory.instrument_lines` in its unqualified form). With one host left, callers carry no `(host)` suffix. `mac_section` then shows every step with `host <> 'natedev'`, by caller and kind; its layout is in [mac-test-offload.md](mac-test-offload.md) ("Build log and report"). `mac_report.py` reads Mac steps through `is_mac_step`, never through the predicate.
+- `buildlog report` splits by host. `mac_outcome.natedev_step_predicate(step="steps")` returns `{step}.host = 'natedev'`, and every step reader in `report.py` takes it: the kind tables, Rebuilds, the lead block's counts, waits, test routing, the caller-host count, the Summary tables, Power profile and Memory pressure (through `memory.instrument_lines` in its unqualified form). With one host left, callers carry no `(host)` suffix. `mac_section` then shows every step with `host <> 'natedev'`, by caller and kind; its layout is in [mac-test-offload.md](mac-test-offload.md) ("Build log and report"). `mac_report.py` reads Mac steps through `is_mac_step`, never through the predicate.
 - `mac_outcome.usable_share` is the shared reading of the Mac's usable share: a candidate is a `verify.sh test` call that reached the Mac decision for a package the Mac may run; `blocked`, `backoff`, `unreachable`, `battery`, `disk` and `off` are set aside as "not usable".
 - `power_profile_section(connection, day)` emits `### Power profile` directly after the Test builds section. It reads natedev's power profile from the 60 s samples (`samples.power_profile` and `power_profile_since`, [buildlog-memory-stalls.md](buildlog-memory-stalls.md)):
   - `profile_changes(connection) -> list[ProfileChange]` walks natedev's samples with a non-NULL profile in time order and keeps the first sample of each run of one profile as `ProfileChange(at, profile)`, `at` being its `power_profile_since`, else the sample's own `at`. A later sample of the same profile with a newer `power_profile_since` is the daemon rewriting its file, not a change.
@@ -281,13 +281,16 @@ the log does not record that connection. Journal retention also limits the evide
 
 ### Copy records and lifetime
 
-Copies seed their own build folders. The unused per-repository Cargo folder
-helper was removed: the verify-copies measurement (2026-10-30, case D) spent
-68.7 of 69.0 s waiting on that folder's build lock. New copy records do not
-write its path; old records still load and the old field has no effect.
-The `style-sync-target` still outlives its production task and keeps
-`sync.lock` across checkout creation, lint and cleanup. The sweep still reads
-Cargo's general `build.build-dir` templates.
+Standing gate checkouts build cold once and retain their own build folders;
+no target seed is copied. The unused per-repository Cargo folder helper was
+removed: the verify-copies measurement (2026-10-30, case D) spent 68.7 of 69.0 s
+waiting on that folder's build lock. Legacy copy records still load and their
+old shared-folder field has no effect.
+Style lint uses a standing gate checkout with its own real `target/` and holds
+`.claude-busy` through verification and cleanup. The checkout and cache survive
+the run; the floor sweep discovers the configured gates root and may reclaim
+idle marked caches. See `gate-checkouts.md` for configuration and removal.
+The sweep still reads Cargo's general `build.build-dir` templates.
 
 `/tmp/claude/copies` is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 

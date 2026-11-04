@@ -138,6 +138,7 @@ Recovery skips records that a live request owns.
 It ignores legacy failed records and preserves validation ownership and open questions.
 The router alerts `unrouted_alert_recipient` once for each unrouted row and reason.
 It alerts only for a list in the real change-review folder; a list elsewhere never alerts.
+It alerts only from the production staff record; a `STAFF_FILE` override never alerts.
 This config key starts at `natedev`.
 `unrouted_alert_retry_seconds` starts at 60 seconds and accepts 5 through 3600 seconds.
 Both keys are in `config/review_links.conf` and are read when used.
