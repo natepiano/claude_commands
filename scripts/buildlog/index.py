@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 else:
     from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 
 # These indexes extend the current schema without rebuilding the recorded rows.

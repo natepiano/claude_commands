@@ -48,7 +48,7 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_unreadable_staff_starts_no_worker(self) -> None:
         record = Path(os.environ["STAFF_FILE"])
         _ = record.write_text("{broken")
-        result = self.launch()
+        result = self.launch(script=ASSIGN)
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertIn("staff: impl: not opened:", result.stderr)
         self.assertEqual(self.methods("thread/start"), [])
