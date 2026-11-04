@@ -148,8 +148,8 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 ### Input
 
 The judgment file has `units` and optional `topics` and `merge`. Each unit
-has its Units table id in `unit`, never the session's current name; the builder
-joins run records and status blocks on that id. It has only the fields requiring judgment: `project`,
+has its staff row name in `unit` (`web-unit`); the builder
+joins run records and status blocks on that name. It has only the fields requiring judgment: `project`,
 `goal` when measured, `phase`, `started`, `held`, `held_examples` when useful,
 `update`, `waiting_on_it`, `needed`, `needs_user` when you know the answer, `idle`,
 `then`, `label` (up to eight characters; needed when the session name without
@@ -203,7 +203,7 @@ The builder's output, which the renderer consumes:
 | `children` | The builder's, when productions report to this one: each one's `name`, its saved `report`, `open` (due items for the user in its list and the lists below it), `unreadable` (lists that could not be read) and `expand`. Leave it to the builder. |
 | `reports_to` | The builder's, when this showrunner is under a root: the root's production. Leave it to the builder. |
 | `doc` | The builder's: the production doc, whose changes to review, efficiency and proposals the footer's counts line reads when the report renders. Leave it to the builder. |
-| `unit` | The Units table's unit id, never the session's current name. The builder joins on this id. |
+| `unit` | The unit's staff row name (`web-unit`). The builder joins on this name. |
 | `name` | The plan the unit runs, when its session name does not say it (a lane that took on another plan): `hana_organon`. Defaults to `unit`. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
 | `project` | The goal of the unit's whole plan, in a few words, from its plan doc's opening: what you get when every phase is done. Not this phase, and not a list. Example: `tools you build and edit in the 3D scene`. It is the section heading. |

@@ -27,9 +27,6 @@ import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
 from sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
 from scripts.production import staff, showrunners, session_staff, unit_config  # noqa: E402
-import unit_names  # noqa: E402
-from production_units import cell_value, order_unit_names  # noqa: E402
-from scripts.production.unit_table import unit_spellings  # noqa: E402
 from scripts.shutdown import remote
 from scripts.lib import unit_runs  # noqa: E402
 
@@ -65,11 +62,22 @@ from scripts.production.session_staff import (
 )
 
 
-def production_slug_for_document(doc: Path, record: staff.StaffSnapshot, sources: MemberSources) -> str:
-    """Resolve a production through its registered document and fixed owner."""
+def doc_owner(doc: Path, record: staff.StaffSnapshot) -> staff.StaffRow:
+    """The showrunner row whose staff `doc` is this local production document."""
     owner = record.by_doc(remote.local_machine(), doc.resolve())
     if owner is None or owner.kind != "showrunner":
         raise staff.StaffUnreadable(f"{doc}: no showrunner staff row")
+    return owner
+
+
+def doc_units(doc: Path, record: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """The production's unit rows in staff.json row order; a retired row has a RemovedWorktree."""
+    return tuple(record.find(kind="unit", parent=doc_owner(doc, record).id))
+
+
+def production_slug_for_document(doc: Path, record: staff.StaffSnapshot, sources: MemberSources) -> str:
+    """Resolve a production through its registered document and fixed owner."""
+    owner = doc_owner(doc, record)
     slugs = [slug for slug, row in sources.showrunner_members(record).items() if row.id == owner.id]
     if len(slugs) == 1:
         return slugs[0]
@@ -88,66 +96,6 @@ def local_worktree(selected: MemberFound | NoSuchMember) -> staff.PresentWorktre
     if location.machine != remote.local_machine():
         raise staff.StaffUnreadable(f"{selected.row.name}: staff worktree is on {location.machine}: {location.path}")
     return location
-
-
-def plan_worktree(cells: dict[str, str], selected: MemberFound | NoSuchMember) -> Path:
-    """Read the branch worktree from the Plan folder, after checking staff ownership."""
-    location = local_worktree(selected)
-    if isinstance(location, staff.RemovedWorktree):
-        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: staff worktree is removed")
-    plan = cell_value(cells.get("Plan", ""))
-    if not plan or plan in ("—", "-", "standby", "permanent"):
-        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is unavailable")
-    path = Path(plan).expanduser()
-    if not path.is_absolute():
-        return location.path
-    from scripts.direct.phase_reservation import repository_root
-    try:
-        directory = path if path.is_dir() else path.parent
-        if not directory.is_dir():
-            raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is missing: {directory}")
-        root = repository_root(directory)
-    except (OSError, UnicodeError) as error:
-        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: cannot read Plan folder: {error}") from error
-    if root is None:
-        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is outside Git: {path.parent}")
-    return root
-
-
-class ProductionMembers:
-    """Recorded membership of a production, read once without probing live panes."""
-
-    def __init__(self, slug: str, *, record: staff.StaffSnapshot | None = None) -> None:
-        self._slug: str = slug
-        self._record: staff.StaffSnapshot | None = record
-        self._units: set[str] | None = None
-        self._retired: set[str] = set()
-
-    def has(self, unit: str) -> bool:
-        """Whether the unit is a current staff child, including an offline child."""
-        if self._units is None:
-            record = self._record if self._record is not None else staff.snapshot()
-            sources = member_sources()
-            members = production_members(record, sources)
-            self._units = {row.name for row in members.get(sources.canonical_slug(self._slug), ())}
-            parent = sources.member(ShowrunnerMember(self._slug), record)
-            if isinstance(parent, MemberFound):
-                resolver = session_staff.RowResolver(record)
-                self._retired = {row.name for row in record.find(kind="unit", parent=parent.row.id)
-                                 if isinstance(resolver.unit_state(row), session_staff.RetiredUnit)}
-        return unit_names.name(unit) in self._units
-
-
-    def is_retired(self, unit: str) -> bool:
-        """Only a retained row's removed worktree marks retirement."""
-        _ = self.has(unit)
-        return unit_names.name(unit) in self._retired
-
-
-def unit_is_retired(cells: dict[str, str], marks: ProductionMembers) -> bool:
-    """Read retirement from the retained row, never from a missing membership."""
-    unit = cell_value(cells.get("Unit", ""))
-    return bool(unit) and marks.is_retired(unit)
 
 
 @dataclass(frozen=True)
@@ -215,40 +163,6 @@ def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
             issues.append(UnitProblem(row.id, row.name, "; ".join(causes)))
         metadata[row.id] = cells
     return UnitMetadata(metadata, tuple(issues))
-
-
-def live_unit_table(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None,
-                    sources: MemberSources | None = None) -> list[dict[str, str]]:
-    """Staff members with metadata bound by identity; a table cannot change a parent."""
-    record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources()
-    slug = sources.canonical_slug(slug)
-    members = production_members(record, sources).get(slug, ())
-    metadata = unit_metadata(record, sources, slug=slug)
-    for problem in metadata.problems:
-        print(f"production_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
-    rows: dict[str, dict[str, str]] = {}
-    spellings = unit_spellings(lines)
-    for row in members:
-        rendered = {key: "—" if value.startswith("unavailable: ") else value
-                    for key, value in metadata.cells[row.id].items()}
-        rendered["Unit"] = spellings.get(row.name, unit_names.unit_id(row.name))
-        rows[rendered["Unit"]] = rendered
-    return [rows[name] for name in order_unit_names(lines, rows)]
-
-
-def retired_units(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None,
-                  sources: MemberSources | None = None) -> set[str]:
-    """List retained removed children, including members absent from the table."""
-    record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources()
-    parent = sources.member(ShowrunnerMember(slug), record)
-    if isinstance(parent, NoSuchMember):
-        return set()
-    resolver = session_staff.RowResolver(record)
-    names = {unit_names.unit_id(row.name) for row in record.find(kind="unit", parent=parent.row.id)
-             if isinstance(resolver.unit_state(row), session_staff.RetiredUnit)}
-    return set(order_unit_names(lines, names, offline=names))
 
 
 @dataclass(frozen=True)
@@ -353,7 +267,8 @@ class HeldRunUnknown:
 class HeldRunLookup:
     """Read only held histories and retain each result for one watch pass."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> None:
+        self._record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = record
         self._folders: dict[str, list[str]] | None = None
         self._histories: dict[Path, HeldRun | HeldRunUnknown] = {}
 
@@ -370,13 +285,15 @@ class HeldRunLookup:
                         first = _event(handle.readline().decode("utf-8"))
                     if first is None or first.get("event_type") != "run_started":
                         raise ValueError("history does not start with run_started")
-                    worktree = first.get("working_dir")
-                    if not isinstance(worktree, str) or not worktree:
-                        raise ValueError("run_started has no worktree")
+                    if isinstance(self._record, session_staff.ReadCurrentStaff):
+                        self._record = staff.snapshot()
+                    row = self._record.by_member_reference(session_id)
+                    if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+                        raise ValueError(f"{session_id}: the staff worktree is unavailable")
                     last = _last_event(path)
                     state = (UnitState.RUN_FINISHED if last is not None
                              and last.get("event_type") == "run_finished" else UnitState.RUNNING)
-                    self._histories[path] = HeldRun(path, Path(worktree).expanduser().resolve(), state)
+                    self._histories[path] = HeldRun(path, row.worktree.path, state)
                 except (OSError, UnicodeError, ValueError) as error:
                     self._histories[path] = HeldRunUnknown(path, str(error))
             run = self._histories[path]
@@ -386,7 +303,6 @@ class HeldRunLookup:
 
 
 class RunStates(NamedTuple):
-    # Keep the recorded spelling: unit_move matches working_dir exactly.
     records: dict[str, RunRecord]
 
     def state(self, worktree: Path) -> UnitState:
@@ -430,14 +346,11 @@ def _last_event(path: Path) -> dict[str, object] | None:
 
 
 def read_run_states() -> RunStates:
-    """Snapshot newest runs once: each file's first line, then each newest file's last event.
-
-    Keys keep working_dir as recorded; state() looks up a resolved worktree path. Unreadable
-    records raise OSError, and invalid UTF-8 in the lines read raises UnicodeError.
-    """
+    """Join each run's director to its staff folder and read the newest run state."""
     directory = runs_dir()
     if not directory.exists():
         return RunStates({})
+    record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT
     newest: dict[str, _StartedRun] = {}
     for path in directory.iterdir():
         if path.suffix != ".jsonl":
@@ -446,9 +359,16 @@ def read_run_states() -> RunStates:
             first = _event(handle.readline().decode("utf-8"))
         if first is None or first.get("event_type") != "run_started":
             continue
-        worktree = first.get("working_dir")
-        if not isinstance(worktree, str) or not worktree:
+        agent = first.get("main_agent")
+        identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
+        if not isinstance(identity, str):
             continue
+        if isinstance(record, session_staff.ReadCurrentStaff):
+            record = staff.snapshot()
+        row = record.by_member_reference(identity)
+        if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+            continue
+        worktree = str(row.worktree.path)
         started = first.get("run_started_at")
         at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
         if worktree not in newest or at > newest[worktree].at:

@@ -22,6 +22,8 @@ from scripts.accounts import accounts
 
 
 from add_unit_test_support import AddUnitTestCase, configure_test_zone
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
 
 
 def setUpModule() -> None:
@@ -75,6 +77,9 @@ class AddUnitAccountsTests(AddUnitTestCase):
         directory = self.prepare_unit_account("claude3")
         prior = self.root / "prior-session"
         prior.mkdir()
+        # The pane mark joins its unit only through the unit's staff row.
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         self.persist_herdr_unit("alpha", prior)
         transcript = Path(self.env["HOME"]) / ".claude/projects/project/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -421,7 +426,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
                 with self.subTest(production=document.name, name=name):
                     request = add_unit.launch_request(argparse.Namespace(
                         production=str(document), name=name, plan="docs/plans/given.md", brief=None,
-                        standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
+                        standby=False, permanent=False, port=None, timeout=90.0, check=False,
                         resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
                         probe=False,
                     ))

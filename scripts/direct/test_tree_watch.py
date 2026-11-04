@@ -47,6 +47,13 @@ class TreeWatchTests(TreeWatchFixture):
         self.assertRegex(key, r"^[0-9a-f]{64}$")
         self.assertRegex(watched, r"^[0-9a-f]{64}$")
 
+    def test_fired_path_names_the_changed_watched_file(self) -> None:
+        process, fired, before = self.start_watcher(os.getpid())
+        relative = "sample/src/lib.rs"
+        _ = (self.root / relative).write_text("// changed input\n")
+        self.assert_fires(process, fired, before)
+        self.assertEqual(fired.with_name(fired.name + ".path").read_text(), relative + "\n")
+
     def test_in_scope_edit_table_fires(self) -> None:
         for relative in ("sample/src/lib.rs", "dep/src/lib.rs", "sample/fixtures/input.bin",
                          "Cargo.toml", "Cargo.lock", ".cargo/config.toml",

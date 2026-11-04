@@ -6,7 +6,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import completion_receipt, staff
 from scripts.production.staff_test_support import StaffTestCase
-from production_units import Refusal
+from scripts.production.production_doc import Refusal
 
 
 class CompletionReceiptTests(StaffTestCase):

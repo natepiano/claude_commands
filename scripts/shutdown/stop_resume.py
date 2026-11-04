@@ -30,6 +30,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 import herdr
 import pane_record
 from scripts.shutdown.launch_names import LaunchNames
+from scripts.shutdown.codex_trust import trust_arguments
 import pane_launch
 from scripts.lib.resume_message import (
     ResumeWorkers as ResumeWorkers,
@@ -171,20 +172,20 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             for pane in client.panes():
                 if pane["session_id"] == identity and not isinstance(
                         client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
-                    if pid := client.codex_launch(pane["pane_id"]).get("pid"):
+                    if pid := client.codex_launch(pane["pane_id"], ["resume", identity]).get("pid"):
                         live, kind = sessions.LiveSessionProcess(pid), "codex"
                         break
         if isinstance(live, sessions.SessionNotLive):
             return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        proved = herdr.native_process(live.pid, kind)
+        proved = herdr.native_process(live.pid, kind, resume_id=identity)
         if proved.identity != identity:
             return StopFailed(identity, "process runs another conversation; no signal sent")
         started = proved.started
         if not _same_process(live.pid, started):
             return NotRunning(identity)
-        if herdr.native_process(live.pid, kind) != proved:
+        if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
             return StopFailed(identity, "process identity changed; no signal sent")
         os.kill(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
@@ -196,7 +197,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         else:
             return Stopped(identity, live.pid)
         if _same_process(live.pid, started):
-            if herdr.native_process(live.pid, kind) != proved:
+            if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
                 return StopFailed(identity, "process identity changed; no signal sent")
             os.kill(live.pid, signal.SIGKILL)
             deadline = monotonic() + KILL_GRACE_SECONDS
@@ -228,7 +229,7 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     return ["env", "-u", "HERDR_TAB_ID", "-u", "STAFF_ID", *(f"{key}={value}" for key, value in environment.items()),
             "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
             sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-            *pane_record.resume_arguments(entry)]
+            *trust_arguments(pane_launch.agent_kind(entry), entry["cwd"], pane_record.resume_arguments(entry))]
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,

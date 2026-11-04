@@ -17,7 +17,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.fail("verify never used the offload runner: " + output + errors)
         self.edit_source()
-        self.assert_cancelled(process, "test")
+        _ = self.assert_cancelled(process, "test")
         self.assertEqual((self.control / "mac-cancelled").read_text(), "15")
         self.assertEqual([args for args in self.cargo_calls() if args[:2] == ["nextest", "run"]], [],
                          "Mac cancellation fell back to a local test run")
@@ -34,7 +34,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.wait_for_running(self.control / "running", process)
         self.assertTrue((self.control / "mac-attempt").exists(), "memory wait never transferred to the Mac")
         self.edit_source()
-        self.assert_cancelled(process, "test")
+        _ = self.assert_cancelled(process, "test")
         self.assertEqual((self.control / "mac-cancelled").read_text(), "15")
         self.assertEqual([args for args in self.cargo_calls() if args[:2] == ["nextest", "run"]], [],
                          "memory-blocked local step reached Cargo")

@@ -134,7 +134,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - Deleting `rust_release.json` forgets the trial and the sent text. The next run fetches, and the next quiet-hours run trials and texts again.
 - The check runs on natedev only, and sync does not copy the log root, so the Mac's report never shows the Rust line.
 - The hourly job runs `~/.claude` main's copy. Test a change with the worktree's `./scripts/...`.
-- basedpyright exits 3 on every checkout because `pyrightconfig` names a missing `.venv`. The bar is 0 errors and 0 warnings, not the exit code.
+- basedpyright exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 
