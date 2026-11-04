@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, role_map
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.whoami import run_out
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))

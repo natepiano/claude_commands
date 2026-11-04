@@ -2,6 +2,8 @@
 """Show the build queue, or one step's place and why it waits."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import json
 import math
 import os
@@ -41,6 +43,16 @@ def default_columns() -> int:
     return 100
 
 
+@dataclass(frozen=True)
+class WaitingPosition:
+    place: int
+
+
+@dataclass(frozen=True)
+class NoWaitingStep:
+    pass
+
+
 def bump(selector: str, actor: str) -> int:
     reading = memory_admit.queue_read()
     labels = unit_labels.unit_labels_for([step.session_id for step in reading.view.waiting], os.environ)
@@ -52,17 +64,17 @@ def bump(selector: str, actor: str) -> int:
         return 3
     selected_place = matches[0]
     unit = step_labels(reading.view.waiting[selected_place - 1], labels).unit
-    if unit == "—" or not unit:
+    if unit == unit_labels.UnitLabels("").unit or not unit:
         print(f"build queue: waiting step #{selected_place} has no unit")
         return 3
     result = admission_client.priority_set(unit, "the user's bump", actor)
     if isinstance(result, admission_protocol.Refused):
-        print(f"build queue: {result.reason}", file=sys.stderr)
-        return 2
+        print(f"build queue: {result.reason}")
+        return 3
     reading = memory_admit.queue_read()
-    place = next((place for place, step in enumerate(reading.view.waiting, 1)
-                  if step_labels(step, labels).unit == unit), 0)
-    detail = f"first step now #{place}" if place else "no waiting step now"
+    first = next((WaitingPosition(place) for place, step in enumerate(reading.view.waiting, 1)
+                  if step_labels(step, labels).unit == unit), NoWaitingStep())
+    detail = f"first step now #{first.place}" if isinstance(first, WaitingPosition) else "no waiting step now"
     print(f"queue priority set for {unit} (step #{selected_place}): {detail}")
     return 0
 

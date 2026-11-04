@@ -35,10 +35,10 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         print("lint helper starts:", dict(sorted(counts.items())), "total:", len(rows), flush=True)
         self.assertNotIn("INLINE_PY", counts, rows)
         self.assertNotIn("STDIN_PY", counts, rows)
-        # The current fixture starts 64 helpers before Phase 9, including 14 tree helpers.
+        # The builds signal-status guard removes one stopped-step query.
         self.assertEqual(counts["tree_watch.py"], 11, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)
-        self.assertEqual(len(rows), 60, counts)
+        self.assertEqual(len(rows), 59, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"

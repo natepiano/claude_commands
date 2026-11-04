@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, override
@@ -22,6 +23,7 @@ import restart
 import shutdown
 from unit_staff_test_support import unit_host
 from scripts.production import staff
+from scripts.accounts import accounts
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from test_support import ShutdownTestCase, registry_confirmation
 
@@ -134,6 +136,11 @@ class RestartTests(ShutdownTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = self.root / ".claude2"
+        config.mkdir()
+        _ = (config / ".claude.json").write_text(json.dumps({
+            "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
+        }))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root),
                                                      "XDG_STATE_HOME": str(self.root)})))
         self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", None,
@@ -148,6 +155,10 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop))
         _ = self.enterContext(patch.object(restart, "session_launch", side_effect=self.session_launch))
+        _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
+        _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
+            "claude2", self.root / ".claude2")))
+        _ = self.enterContext(patch.object(accounts, "trust_sources", return_value=[]))
         _ = self.enterContext(patch.object(herdr, "prepare_session_environment",
             return_value=herdr.PreparedAgentEnvironment(self.root, {})))
         _ = self.enterContext(patch.object(herdr, "launch_prepared_agent", side_effect=self.launch))
@@ -216,28 +227,72 @@ class RestartTests(ShutdownTestCase):
         self.running.add(str(row.current_session))
         return herdr.AgentLaunched(f"w1:p{self.rows.index(row)}", herdr.PromptSubmissionNotRequired())
 
-    def test_start_row_uses_the_target_account_environment(self) -> None:
+    def test_start_row_ignores_a_managed_daemon_at_both_live_checks(self) -> None:
         self.running.clear()
+        row = self.rows[0]
+        daemon = ["/package/bin/codex", "app-server", "--listen", "unix://", "--managed-daemon"]
+        def threads(*, thread_host: Callable[[list[str]], bool]) -> set[str]:
+            self.assertIs(thread_host, herdr.codex_managed_daemon)
+            return set() if thread_host(daemon) else {str(row.current_session)}
+        with (patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", row.current_session])),
+              patch.object(herdr, "running_codex_threads", side_effect=threads) as scan,
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p0", herdr.PromptSubmissionNotRequired())) as launch,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p0")
+        self.assertEqual(scan.call_count, 2)
+        launch.assert_called_once()
+        self.assertEqual(output.getvalue(), f"{row.name}: restarted\n")
+
+    def test_codex_clients_stay_live_and_only_daemon_rows_are_omitted(self) -> None:
+        self.running.clear()
+        row = self.rows[0]
+        for arguments, live in ((["codex", "app-server", "--managed-daemon"], False),
+                                (["codex", "resume", str(row.current_session)], True),
+                                (["codex", "app-server", "--listen", "ws://127.0.0.1:1234"], True)):
+            def threads(*, thread_host: Callable[[list[str]], bool]) -> set[str]:
+                self.assertIs(thread_host, herdr.codex_managed_daemon)
+                return set() if thread_host(arguments) else {str(row.current_session)}
+            with (self.subTest(arguments=arguments),
+                  patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", row.current_session])),
+                  patch.object(herdr, "running_codex_threads", side_effect=threads),
+                  patch.object(herdr, "launch_prepared_agent") as launch,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(restart.live_rows(staff.StaffSnapshot((row,)), herdr.Herdr("agents")), [row] if live else [])
+                if live:
+                    self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "")
+                    self.assertEqual(output.getvalue(), f"{row.name}: unchanged\n")
+                launch.assert_not_called()
+
+    def test_start_row_uses_the_target_account_environment(self) -> None:
         source, target = self.root / ".claude3", self.root / ".claude4"
         environment = {"CLAUDE_CONFIG_DIR": str(self.root / ".claude4"), "ACCOUNT_SETTING": "target"}
-        with (patch.object(restart, "named_account_environment", return_value=environment) as account,
-              patch.object(restart, "session_launch", return_value=("claude", {"CLAUDE_CONFIG_DIR": str(source)},
-                  ["--resume", str(self.rows[0].current_session)])),
-              patch("scripts.accounts.accounts.trust_sources", return_value=[("claude3", source / ".claude.json")]) as sources,
-              patch.object(herdr, "heal_claude_trust", return_value=herdr.TrustCopied(self.root,
-                  target / ".claude.json", "claude3")) as trust,
-              patch.object(herdr, "prepare_session_environment",
-                  return_value=herdr.PreparedAgentEnvironment(self.root, environment)) as prepare,
-              patch("scripts.accounts.accounts.account_dir", return_value=target)):
-            pane = restart.start_row(self.rows[0], staff.StaffSnapshot(self.rows),
-                                     herdr.Herdr("agents"), target_account="claude4")
-        account.assert_called_once_with(target)
-        sources.assert_called_once_with(target, source)
-        trust.assert_called_once_with(self.root, target / ".claude.json",
-                                      [("claude3", source / ".claude.json")], dry_run=False)
-        prepare.assert_called_once_with(str(self.rows[0].current_session), str(self.root),
-                                        environment, herdr.NO_ENVIRONMENT_REMOVALS)
-        self.assertEqual(pane, "w1:p0")
+        for requested in ("claude4", ""):
+            with (self.subTest(target_account=requested),
+                  patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude4", target)) as selection,
+                  patch.object(restart, "named_account_environment", return_value=environment) as account,
+                  patch.object(restart, "session_launch", return_value=("claude", {"CLAUDE_CONFIG_DIR": str(source)},
+                      ["--resume", str(self.rows[0].current_session)])),
+                  patch("scripts.accounts.accounts.trust_sources", return_value=[("claude3", source / ".claude.json")]) as sources,
+                  patch.object(herdr, "heal_claude_trust", return_value=herdr.TrustCopied(self.root,
+                      target / ".claude.json", "claude3")) as trust,
+                  patch.object(herdr, "prepare_session_environment",
+                      return_value=herdr.PreparedAgentEnvironment(self.root, environment)) as prepare,
+                  patch("scripts.accounts.accounts.account_dir", return_value=target)):
+                self.running.clear()
+                pane = restart.start_row(self.rows[0], staff.StaffSnapshot(self.rows),
+                                         herdr.Herdr("agents"), target_account=requested)
+            if requested:
+                selection.assert_not_called()
+            else:
+                selection.assert_called_once_with("unit")
+            account.assert_called_once_with(target)
+            sources.assert_called_once_with(target, source)
+            trust.assert_called_once_with(self.root, target / ".claude.json",
+                                          [("claude3", source / ".claude.json")], dry_run=False)
+            prepare.assert_called_once_with(str(self.rows[0].current_session), str(self.root),
+                                            environment, herdr.NO_ENVIRONMENT_REMOVALS)
+            self.assertEqual(pane, "w1:p0")
 
     def test_start_row_trusts_the_codex_folder(self) -> None:
         self.running.clear()

@@ -23,8 +23,10 @@ import report
 import record as recorder
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..test_times.gate_record_test_support import gate_run
 else:
     from scripts.lib import test_hang_guard
+    from scripts.test_times.gate_record_test_support import gate_run
 from record import TARGET_DIR_UNSET
 from store import UNKNOWN_IDENTITY
 
@@ -190,6 +192,19 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
     test.addCleanup(restore)
 
 
+def rows(sql: str, *parameters: object) -> list[tuple[object, ...]]:
+    with closing(index.read_only()) as connection:
+        return cast(list[tuple[object, ...]], connection.execute(sql, parameters).fetchall())
+
+
+def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]:
+    with closing(index.read_only()) as connection:
+        connection.row_factory = sqlite3.Row
+        records = cast(list[sqlite3.Row],
+                       connection.execute(f"SELECT * FROM {table} {where} ORDER BY 1", parameters).fetchall())
+        return [{name: cast(object, row[name]) for name in row.keys()} for row in records]
+
+
 class LogIsolationTests(unittest.TestCase):
     def test_import_preserves_the_callers_coordination_environment(self) -> None:
         environment = dict(os.environ)
@@ -264,8 +279,7 @@ class IndexTests(unittest.TestCase):
         _ = path.write_bytes(b"".join(encode(record) for record in records))
 
     def rows(self, sql: str, *parameters: object) -> list[tuple[object, ...]]:
-        with closing(index.read_only()) as connection:
-            return cast(list[tuple[object, ...]], connection.execute(sql, parameters).fetchall())
+        return rows(sql, *parameters)
 
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
@@ -471,6 +485,22 @@ class IndexTests(unittest.TestCase):
         self.assertCountEqual(columns, [("target_dir", "TEXT", 1), ("repo_identity", "TEXT", 1)])
         self.assertEqual(self.host_file.read_bytes(), original)
 
+    def test_output_roots_survive_indexing_and_legacy_steps_stay_readable(self) -> None:
+        self.write(self.host_file,
+                   step("split", target_dir="/artifacts", target_directory="/artifacts",
+                        build_directory="/intermediates"),
+                   step("same", target_directory="/output", build_directory="/output"),
+                   step("legacy", target_dir="/legacy-output"),
+                   step("unknown"))
+        self.assertEqual(index.update(), 4)
+        self.assertEqual(self.rows(
+            "SELECT id, target_directory, build_directory FROM steps ORDER BY id"), [
+                ("legacy", "/legacy-output", "/legacy-output"),
+                ("same", "/output", "/output"),
+                ("split", "/artifacts", "/intermediates"),
+                ("unknown", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+            ])
+
     def test_schema_twenty_three_rebuilds_history_build_keys_without_rewriting_logs(self) -> None:
         self.write(self.host_file, step("legacy", seat="impl", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana"]))
         original = self.host_file.read_bytes()
@@ -673,6 +703,51 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT name FROM sqlite_master WHERE name = 'leftover'"), [])
         self.assertEqual(self.ids(), ["s0", "s1"])
 
+    def test_legacy_schema_recovers_gate_history_before_the_saved_offset(self) -> None:
+        run: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "recovered-gate", "host": "natedev"}
+        before = step("before-gate", duration_s=12.5)
+        after = call("after-gate", wall_s=6.0)
+        source = self.host_file.relative_to(self.root).as_posix()
+        for legacy_version in (29, 30):
+            with self.subTest(legacy_version=legacy_version):
+                index.index_path().unlink(missing_ok=True)
+                self.write(self.host_file, before, run, after)
+                original = self.host_file.read_bytes()
+                with closing(sqlite3.connect(index.index_path())) as connection:
+                    index.create_schema(connection)
+                    for table in ("gate_tests", "gate_modules", "gate_suites", "gate_runs"):
+                        _ = connection.execute(f"DROP TABLE {table}")
+                    index.add_step(connection, before, source)
+                    index.add_call(connection, after, source)
+                    with self.host_file.open("rb") as handle:
+                        stored_marks = index.marks(handle, len(original))
+                    _ = connection.execute(
+                        "INSERT INTO files (path, offset, marks) VALUES (?, ?, ?)",
+                        (source, len(original), stored_marks),
+                    )
+                    _ = connection.execute(f"PRAGMA user_version = {legacy_version}")
+                    connection.commit()
+
+                self.assertEqual(index.update(), 3)
+                self.assertEqual(self.rows(
+                    "SELECT id, selection, status, modules_run, tests_run FROM gate_runs"),
+                    [("recovered-gate", "affected", 1, 1, 2)])
+                self.assertEqual(self.rows(
+                    "SELECT run_id, suite, wall_s, status FROM gate_suites"),
+                    [("recovered-gate", "scripts", 4.0, 1)])
+                self.assertEqual(self.rows(
+                    "SELECT run_id, suite, module, attempt, tests_run, tests_s FROM gate_modules"),
+                    [("recovered-gate", "scripts", "test_example.py", 1, 2, 1.5)])
+                self.assertEqual(self.rows(
+                    "SELECT run_id, suite, module, attempt, test, duration_s, status FROM gate_tests ORDER BY test"),
+                    [("recovered-gate", "scripts", "test_example.py", 1, "Example.test_fail", 0.5, "fail"),
+                     ("recovered-gate", "scripts", "test_example.py", 1, "Example.test_pass", 1.0, "pass")])
+                self.assertEqual(self.rows("SELECT id, duration_s FROM steps"), [("before-gate", 12.5)])
+                self.assertEqual(self.rows("SELECT id, wall_s FROM calls"), [("after-gate", 6.0)])
+                self.assertEqual(self.host_file.read_bytes(), original)
+                self.assertEqual(index.update(), 0)
+                self.assertEqual(self.host_file.read_bytes(), original)
+
     def test_schema_five_rebuilds_with_memory_admission_columns(self) -> None:
         self.write(self.host_file, step("s0", mem_wait_s=12))
         _ = index.update()
@@ -731,7 +806,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("PRAGMA user_version = 25")
             connection.commit()
         self.assertEqual(index.update(), 3)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(29,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(json.loads(cast(str, self.rows("SELECT slices FROM samples ORDER BY at")[1][0])), slices)
 
