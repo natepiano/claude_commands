@@ -15,14 +15,16 @@ class TerminalCellsTests(unittest.TestCase):
     def test_left_padding_uses_terminal_cells_and_preserves_long_text(self) -> None:
         for text, width, expected in (("abc", 5, "  abc"), ("界語", 6, "  界語"),
                                       ("e\u0301", 3, "  e\u0301"), ("界語", 3, "界語"),
-                                      ("", 2, "  ")):
+                                      ("", 2, "  "), ("界", 2, "界"), ("", 0, ""),
+                                      ("界7", 6, "   界7"), ("nextest", 3, "nextest")):
             with self.subTest(text=text, width=width):
                 self.assertEqual(pad_left(text, width), expected)
 
     def test_right_padding_uses_terminal_cells_and_preserves_long_text(self) -> None:
         for text, width, expected in (("abc", 5, "abc  "), ("界語", 6, "界語  "),
                                       ("e\u0301", 3, "e\u0301  "), ("界語", 3, "界語"),
-                                      ("", 2, "  ")):
+                                      ("", 2, "  "), ("界", 2, "界"), ("", 0, ""),
+                                      ("界7", 6, "界7   "), ("nextest", 3, "nextest")):
             with self.subTest(text=text, width=width):
                 self.assertEqual(pad_right(text, width), expected)
 

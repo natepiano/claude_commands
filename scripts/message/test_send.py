@@ -38,7 +38,10 @@ from relay_identity import relay_session_name
 from relay_test_support import write_relay_record
 from scripts.lib import names
 from scripts.production import staff
+from scripts.whoami import account
+import process_table
 from scripts.message import send_result
+from scripts.message.unit_labels import LiveRun, NoRunningDirector, StaffRowAnomaly
 from scripts.message.recipient_test_support import staff_child_command
 from scripts.lib.test_names import fixture_names
 import rca
@@ -3313,7 +3316,152 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             errors.getvalue(),
         )
 
-    def test_roster_problem_is_printed_while_a_usable_worker_still_succeeds(self) -> None:
+    def test_orphan_worker_folder_does_not_print_problems_for_a_live_recipient(self) -> None:
+        run = self.root / "delegate" / "orphan-run"
+        run.mkdir(parents=True)
+        orphan = staff.StaffRow(
+            staff.StaffId("orphan"), "worker", "orphan-worker",
+            staff.ReportsTo(staff.StaffId("missing-parent")), current_session=staff.StaffId("orphan-thread"))
+        self.staff_rows["orphan"] = orphan
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            orphan.name: {"staff_id": orphan.id, "thread_id": orphan.current_session, "status": "running"}}))
+        self.session("live-recipient", "Live recipient")
+        problems: list[str] = []
+        with mock.patch.object(process_table, "snapshot", return_value={}):
+            workers, threads = roster._unit_workers(  # pyright: ignore[reportPrivateUsage]
+                "machine", [LiveRun(run, NoRunningDirector())], {}, {}, problems,
+                home_state=account.ConfigOnlyHome(), membership=staff.snapshot())
+        self.assertEqual(workers, [])
+        self.assertEqual(threads, set())
+        self.assertEqual(problems, [f"{run}: orphan-worker: worker parent is unavailable"])
+        record = sessions.live_sessions()[0]
+        entry = roster.RosterEntry(
+            "machine", "claude", "freestanding", record["name"], "running",
+            roster.Messageable("session:live-recipient"), "/fixture", roster.NoShowrunner(),
+            roster.NoDirector(), roster.NotAWorker(), session=roster.ClaudeSession("live-recipient"))
+        observed = self.recipient_roster([entry], problems)
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            route = send.resolve_recipient("Live recipient", send.LocalOnly(), observed,
+                                           membership=staff.snapshot(), records=[record])
+        self.assertEqual(route, send.ClaudeRecipient("session:live-recipient"))
+        self.assertEqual(errors.getvalue(), "")
+        output = io.StringIO()
+        with (mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch.object(send, "relay", return_value=self.outcome) as deliver,
+              redirect_stdout(output), redirect_stderr(errors)):
+            status = send.main(["--here", "--to", "Live recipient", "--from", "fixture-reviewer",
+                                "--text", "Fixture message"])
+        self.assertEqual(status, 0)
+        self.assertEqual(output.getvalue(), "SENT: ok\n")
+        self.assertEqual(errors.getvalue(), "")
+        deliver.assert_called_once()
+        self.assertEqual(cast(send.Message, deliver.call_args.args[0]).to,
+                         f"uds:{self.root / 'live-recipient.sock'}")
+        self.assertEqual(self.relayed, [])
+
+    def test_failed_socket_lookup_prints_recipient_problem_and_omitted_count_once(self) -> None:
+        target = f"uds:{self.root / 'missing.sock'}"
+        own = f"{target}: session record is unreadable"
+        for count in (1, 2):
+            unrelated = [f"other-worker-{index}: parent is unavailable" for index in range(count)]
+            errors = io.StringIO()
+            with self.subTest(count=count), redirect_stderr(errors):
+                route = send.resolve_recipient(target, send.LocalOnly(), roster.Roster([], [own, *unrelated]),
+                                               membership=staff.snapshot(), records=[])
+            self.assertIsInstance(route, send.RecipientLookupFailed)
+            self.assertEqual(errors.getvalue().splitlines(), [
+                f"send.py: roster: {own}",
+                f"send.py: roster problems omitted: {count}; run ~/.claude/scripts/lib/py "
+                + "~/.claude/scripts/message/roster.py",
+            ])
+        self.assertEqual(self.relayed, [])
+
+    def test_failed_lookup_prints_only_recipient_problems_and_omitted_count(self) -> None:
+        own = "missing-person: session record is unreadable"
+        unrelated = "other-person: worker parent is unavailable"
+        for scope in (send.LocalOnly(), send.LocalThenPeer()):
+            errors = io.StringIO()
+            with (self.subTest(scope=scope), redirect_stderr(errors), self.assertRaises(SystemExit) as stopped):
+                _ = send.resolve_recipient("missing-person", scope, roster.Roster([], [own, unrelated]),
+                                           membership=staff.snapshot())
+            self.assertEqual(stopped.exception.code, 2)
+            lines = errors.getvalue().splitlines()
+            self.assertIn(f"send.py: roster: {own}", lines)
+            self.assertIn("send.py: roster problems omitted: 1; run ~/.claude/scripts/lib/py "
+                          + "~/.claude/scripts/message/roster.py", lines)
+            self.assertNotIn(unrelated, errors.getvalue())
+        self.assertEqual(self.relayed, [])
+
+    def test_typed_anomaly_owner_overrides_a_name_in_its_reason(self) -> None:
+        other = staff.StaffRow(staff.StaffId("other-id"), "unit", "other", staff.StaffRoot(),
+                               current_session=staff.StaffId("other-session"))
+        anomaly = StaffRowAnomaly(other, "missing-person has no recorded document")
+        observed = roster.Roster([], [], [anomaly.diagnostic], (anomaly,))
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit):
+            _ = send.resolve_recipient("missing-person", send.LocalOnly(), observed, membership=staff.snapshot())
+        self.assertNotIn(anomaly.diagnostic, errors.getvalue())
+        self.assertIn("roster problems omitted: 1", errors.getvalue())
+        self.assertEqual(self.relayed, [])
+
+    def test_recipient_staff_anomaly_keeps_its_existing_refusal(self) -> None:
+        member = self.staff_rows["recipient"]
+        anomaly = StaffRowAnomaly(member, "the production document is not recorded")
+        observed = roster.Roster([], ["other-worker: parent is unavailable"],
+                                 [anomaly.diagnostic], (anomaly,))
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
+            _ = send.resolve_recipient("recipient", send.LocalOnly(), observed, membership=staff.snapshot())
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"send.py: {anomaly.diagnostic}",
+            f"send.py: roster: warning: {anomaly.diagnostic}",
+            "send.py: roster problems omitted: 1; run ~/.claude/scripts/lib/py "
+            + "~/.claude/scripts/message/roster.py",
+        ])
+        self.assertEqual(self.relayed, [])
+
+    def test_recipient_anomaly_refusal_prints_omitted_count_once_without_warning(self) -> None:
+        member = self.staff_rows["recipient"]
+        anomaly = StaffRowAnomaly(member, "the production document is not recorded")
+        observed = roster.Roster([], ["other-worker: parent is unavailable"], [], (anomaly,))
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
+            _ = send.resolve_recipient("recipient", send.LocalOnly(), observed, membership=staff.snapshot())
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"send.py: {anomaly.diagnostic}",
+            "send.py: roster problems omitted: 1; run ~/.claude/scripts/lib/py "
+            + "~/.claude/scripts/message/roster.py",
+        ])
+        self.assertEqual(self.relayed, [])
+
+    def test_peer_lookup_failure_does_not_copy_unrelated_problems_into_its_reason(self) -> None:
+        own = "codex:missing-thread: daemon is unavailable"
+        unrelated = "other-worker: worker parent is unavailable"
+        errors = io.StringIO()
+        with (mock.patch.object(roster, "peer_roster", return_value=roster.Roster([], [own, unrelated])),
+              redirect_stderr(errors)):
+            route = send.resolve_recipient("codex:missing-thread", send.LocalThenPeer(), roster.Roster([], []),
+                                           membership=staff.snapshot())
+        self.assertEqual(route, send.RecipientLookupFailed("recipient lookup failed for 'codex:missing-thread'"))
+        self.assertIn(f"send.py: roster: {own}", errors.getvalue())
+        self.assertNotIn(unrelated, errors.getvalue())
+        self.assertIn("roster problems omitted: 1", errors.getvalue())
+        self.assertEqual(self.relayed, [])
+
+    def test_failed_lookup_with_only_recipient_problems_has_no_omitted_count(self) -> None:
+        own = "missing-person: session record is unreadable"
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit):
+            _ = send.resolve_recipient("missing-person", send.LocalOnly(), roster.Roster([], [own]),
+                                       membership=staff.snapshot())
+        self.assertIn(f"send.py: roster: {own}", errors.getvalue())
+        self.assertNotIn("omitted", errors.getvalue())
+        self.assertEqual(self.relayed, [])
+
+    def test_roster_problem_is_silent_while_a_usable_worker_still_succeeds(self) -> None:
         address = "worker:33333333-3333-3333-3333-333333333333/worker"
         run = self.root / "33333333-3333-3333-3333-333333333333"
         worker = roster.RosterEntry(
@@ -3344,7 +3492,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ]))
 
         self.assertEqual(result, send.Result("sent", "queued on worker"))
-        self.assertEqual(errors.getvalue(), "send.py: roster: one run was unreadable\n")
+        self.assertEqual(errors.getvalue(), "")
         self.assertEqual(
             [(message.to, session_dir) for message, session_dir in delivered],
             [("worker", str(run))],
@@ -3391,7 +3539,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                   redirect_stderr(errors), self.assertRaises(SystemExit) as stopped):
                 _ = send.send(local_options(["--to", target, "--text", "hello"]))
             self.assertEqual(stopped.exception.code, 2)
-            self.assertIn("send.py: roster: cannot read the worker root", errors.getvalue())
+            self.assertNotIn("cannot read the worker root", errors.getvalue())
+            self.assertIn("roster problems omitted: 1; run ~/.claude/scripts/lib/py "
+                          + "~/.claude/scripts/message/roster.py", errors.getvalue())
             if target.startswith("worker:"):
                 self.assertIn("no roster session has address worker:missing/worker", errors.getvalue())
             else:
@@ -4840,7 +4990,9 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         self.peer([self.row("absent here", "codex:peer")])
         status, output, errors = self.run_main("absent here")
         self.assertEqual(status, 2, output + errors)
-        self.assertIn("worker source unreadable", errors)
+        self.assertNotIn("worker source unreadable", errors)
+        self.assertIn("roster problems omitted: 1; run ~/.claude/scripts/lib/py "
+                      + "~/.claude/scripts/message/roster.py", errors)
         self.assertIn("--machine", errors)
         self.assertIn("address", errors)
         self.assertEqual(self.ssh_calls(), [])
@@ -4853,8 +5005,9 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(status, 2, output + errors)
         self.assertEqual(self.relayed, [])
         self.assertEqual(errors.splitlines(), [
-            f'send.py: roster: warning: {roster.remote.other_machine()}: {warning}',
             "send.py: no staff row or live session for 'bare missing'",
+            'send.py: roster problems omitted: 1; run ~/.claude/scripts/lib/py '
+            + '~/.claude/scripts/message/roster.py',
         ])
         self.assertEqual(len(self.ssh_calls()), 1)
 
@@ -4863,7 +5016,7 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         self.peer([self.row("peer", "codex:peer")])
         status, output, errors = self.run_main("codex:peer")
         self.assertEqual(status, 0, output + errors)
-        self.assertIn("worker source unreadable", errors)
+        self.assertEqual(errors, "")
         self.assertEqual(len(self.forwarded()), 1)
 
     def test_remote_between_turns_worker_address_keeps_no_roster_address_error(self) -> None:
@@ -4892,8 +5045,10 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         status, output, errors = self.run_main("only peer")
         self.assertEqual(status, 3, output + errors)
         self.assertEqual(len(errors.splitlines()), 1)
-        self.assertIn("not reached", errors)
-        self.assertIn("FAILED:", output)
+        self.assertEqual(errors, "send.py: roster problems omitted: 1; "
+                         + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py\n")
+        self.assertNotIn("not reached", errors)
+        self.assertIn("FAILED: recipient lookup failed for 'only peer'", output)
         self.assertEqual(self.forwarded(), [])
 
     def test_refusal_advice_matches_worker_ownership_and_socketless_claude_state(self) -> None:
