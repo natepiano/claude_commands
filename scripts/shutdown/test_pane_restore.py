@@ -766,6 +766,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         self.assertNotIn("w1:p1", pane_record.read("agents"))
 
     def test_missing_pane_recovery_retires_its_source_before_the_next_folder_move(self) -> None:
+        from scripts.accounts import accounts
         from scripts.shutdown import stop_resume
 
         backend = self.folder_backend("claude", live=False)
@@ -786,7 +787,9 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             pane_record.write("agents", replacement)
             return runtime_sessions.LiveSessionProcess(backend.pid)
 
-        with (mock.patch.object(herdr, "Herdr", return_value=client),
+        with (mock.patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts(units="claude4")),
+              mock.patch.object(accounts, "claude_account_dir", return_value=backend.config),
+              mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(client, "open_tab", side_effect=open_tab),
               mock.patch.object(stop_resume, "_tab_of", return_value=stop_resume.SessionNotFound(self.owner.current_session)),
               mock.patch.object(stop_resume, "_start_session", side_effect=start),

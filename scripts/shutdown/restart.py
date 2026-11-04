@@ -123,6 +123,10 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
     if machine != remote.local_machine():
         raise ValueError(f"{row.name}: session is on {machine}")
     kind, environment, arguments = session_launch(str(row.current_session))
+    if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
+        from scripts.accounts import accounts
+
+        target_account = accounts.role_account(row.kind).label
     if target_account and kind == "claude":
         from scripts.accounts import accounts
 
@@ -138,14 +142,12 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
     target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
     try:
         panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
-        if len(panes) == 1:
-            pane = panes[0]
-            place = herdr.HerdrPlace(client.session, pane["pane_id"])
-            if herdr.check_target("", action="keys", place=place,
-                                  terminal=pane.get("terminal_id", ""), client=client):
-                target = herdr.ExistingPane(pane["pane_id"], pane.get("terminal_id", ""))
-        elif panes:
+        if len(panes) > 1:
             _anomaly(row, "duplicate panes retained")
+        elif panes and not panes[0].get("terminal_id"):
+            _anomaly(row, "pane has no terminal id; pane retained")
+        elif panes:
+            target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         _anomaly(row, error)
     # Read liveness again immediately before the launch.
