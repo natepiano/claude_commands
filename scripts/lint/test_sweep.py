@@ -695,7 +695,9 @@ class TargetDirTests(SweepCase):
         config = target.root.parent / "lint.conf"
         _ = write_config_fixture(config)
         environ = {sweep.BUDGET_ENV: "1024", "CONF_DIR": str(config.parent)}
-        with mock.patch.dict(os.environ, environ), redirect_stdout(output):
+        # The machine's real disk floor is not this test's subject; its scan reads every real root.
+        with (mock.patch.dict(os.environ, environ), redirect_stdout(output),
+              mock.patch.object(sweep, "hold_floor", return_value=0)):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root), "--dry-run"])
         self.assertEqual(status, 0)
         self.assertIn(f"lint sweep: {target.root} is ", output.getvalue())
