@@ -28,7 +28,6 @@ The script lives at
 1. Run `plan`. It writes nothing, and it either refuses or prints every step with its old and new values.
    It refuses when:
    - the new name is taken, or a session already runs under it;
-   - the unit is a reserved one;
    - the unit is on the Mac.
 
    A running unit is not a refusal: apply stops it itself, at step 1. The stop is at once: it does
@@ -46,8 +45,8 @@ The script lives at
       takes the merge branch and the rename commit at its own next merge;
    3. move the branch and the worktree where their names change;
    4. move the Claude transcripts and trust;
-   5. update the Units row and plan Production header, then commit
-      `chore(<slug>): rename unit <old> to <new>`; style plans keep their Plan cell filenames,
+   5. update the plan Production header, then commit
+      `chore(<slug>): rename unit <old> to <new>`; style plans keep their filenames,
       and git-excluded style docs use `--allow-empty`;
    6. merge that commit into the unit;
    7. move the unit's state; style productions also move current ledger tickets, sync waits and

@@ -528,11 +528,7 @@ class StylePlanTests(StylePlanFixture):
     def test_structure_phase_contains_its_pinned_uncovered_instructions_and_sites(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\ncandidates:\n  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: Read the crate layout.\n")
         self.sync()
-        worktree = self.root / "modules"
-        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
-        plan = worktree / "docs/style-production/units/modules-unit.md"
-        plan.parent.mkdir(parents=True)
-        _ = plan.write_text(self.plan_header())
+        plan = self.modules_unit()
         result = style_plan.next_phase("modules-unit", plan, self.repo)
         self.assertIsInstance(result, style_plan.PhaseWritten)
         ticket = self.ledger().ticket_open("modules-unit")[0]
@@ -559,11 +555,7 @@ class StylePlanTests(StylePlanFixture):
         catalog = frozenset(rule for entry in mechanical_classes.classes() for rule in entry.rules) | {"third-rule"}
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
-        worktree = self.root / "modules"
-        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
-        plan = worktree / "docs/style-production/units/modules-unit.md"
-        plan.parent.mkdir(parents=True)
-        _ = plan.write_text(self.plan_header())
+        plan = self.modules_unit()
         with mock.patch.object(mechanical_classes, "classes", return_value=mechanical_classes.load(listed, catalog)):
             self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
         text = plan.read_text()
@@ -575,11 +567,7 @@ class StylePlanTests(StylePlanFixture):
         read = self.rule("read")
         listed = self.rule("listed", "tier: B\nfamily: names\npre_filter: value\n")
         self.sync()
-        worktree = self.root / "modules"
-        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
-        plan = worktree / "docs/style-production/units/modules-unit.md"
-        plan.parent.mkdir(parents=True)
-        _ = plan.write_text(self.plan_header())
+        plan = self.modules_unit()
         self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
         text = plan.read_text()
         instructions = (

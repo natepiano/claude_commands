@@ -309,6 +309,14 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
         self.assertEqual(self.entry["name"], "alpha")
 
+    def test_pane_command_trusts_the_codex_folder(self) -> None:
+        folder = str(self.root / 'a.b "folder"')
+        entry = pane_record.launch("w1:p2", "thread", folder, {"CODEX_HOME": "/account"}, ["codex"], kind="codex")
+        command = stop_resume._pane_command(  # pyright: ignore[reportPrivateUsage]
+            herdr.TabSession("w1:p2", "test", "w1", "thread"), entry, "workers")
+        self.assertEqual(command[-4:], ["-c", 'projects={' + json.dumps(folder)
+            + '={trust_level="trusted"}}', "resume", "thread"])
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -440,6 +448,18 @@ class StopResumeTests(unittest.TestCase):
     def alive_until_kill(self, _pid: int, _generation: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
         return (sessions.LiveSessionProcess(123) if call(123, signal.SIGKILL) not in self.kill.call_args_list
                 else sessions.SessionNotLive())
+
+    def test_review_resume_keeps_the_lens_and_task_with_the_current_folder(self) -> None:
+        run = str(self.root / "worker run")
+        old, current = str(self.root / "old folder"), str(self.root / "staff folder")
+        command = ["bash", str(stop_resume.SCRIPTS / "direct/review.sh"), "--lens", "contract",
+                   "--phase", "4w", run, old, "old prompt.md", "review", "check the contract", "reviewing", "3"]
+        seat = PausedSeat(run_dir=run, seat="review2", role="review", thread_id="same-thread",
+                          turn_live=True, launcher_command=command)
+        rebuilt = shlex.split(stop_resume.resume_worker_command(seat, current))
+        self.assertEqual(rebuilt, [*command[:6], "--to", "review2", run, current,
+                                  str(Path(run) / "review2.resume-prompt.md"), *command[9:]])
+        self.assertEqual(seat["launcher_command"], command)
 
     def test_saved_review_resumes_without_retired_allocation_options(self) -> None:
         run, cwd = str(self.root / "worker run"), str(self.root / "working tree")
@@ -585,6 +605,8 @@ class StopResumeTests(unittest.TestCase):
             owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id=self.entry["session_id"])
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
+            folder = self.root / "staff-folder"
+            _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", folder), expected=owner.worktree)
             self.client.rows[0]["agent_session"] = {"kind": "id", "value": current}
             pane_record.write("agents", self.entry)
             record = pane_record.record_path("agents")
@@ -597,6 +619,7 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(arguments[arguments.index("--resume") + 1], current)
             self.assertNotIn(owner.id, arguments)
             self.assertEqual(self.launched, {current})
+            self.assertIn(str(folder), arguments)
             self.assertEqual((path.read_bytes(), record.read_bytes(), record.stat().st_mtime_ns), before)
 
     def test_stop_returns_as_soon_as_term_takes_effect(self) -> None:
@@ -902,19 +925,25 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(stop_resume.stop("019b3a40-4250-7000-8000-000000000102"), stop_resume.Stopped("019b3a40-4250-7000-8000-000000000102", 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
 
-    def test_stop_proves_the_staff_current_codex_process_without_a_claude_registry(self) -> None:
+    def test_stop_proves_an_idle_restarted_codex_process_with_the_staff_current_session(self) -> None:
         identity = self.entry["session_id"]
         row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", None,
                              current_session=staff.StaffId(identity))
-        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        self.process.side_effect = self.alive_until_kill
+        self.client.process_info = {"foreground_processes": [
+            {"pid": 123, "argv": ["codex", "resume", identity], "cwd": str(self.root)}]}
+        def native_process(pid: int, kind: str, *, resume_id: str = "") -> herdr.NativeAgentProcess:
+            self.assertEqual((pid, kind), (123, "codex"))
+            if resume_id != identity:
+                raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+            return herdr.NativeAgentProcess(identity, "generation-1", {})
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))),
-              patch.object(self.client, "codex_launch", return_value={**self.entry, "pid": 123}),
-              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-                  identity, "generation-1", {})) as native):
+              patch.object(self.client, "result", side_effect=self.client_result),
+              patch.object(herdr, "native_process", side_effect=native_process) as native):
             self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
-        self.kill.assert_called_once_with(123, signal.SIGTERM)
-        self.assertTrue(all(item == call(123, "codex") for item in native.call_args_list))
+        self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
+        self.assertEqual(native.call_args_list, [call(123, "codex", resume_id=identity)] * 4)
 
     def test_registry_removal_does_not_resume_until_the_saved_process_exits(self) -> None:
         self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),

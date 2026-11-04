@@ -1,8 +1,34 @@
-"""Read names, optional fields and promotion destinations from production documents."""
+"""Read names, fields and promotion destinations from production documents."""
 from __future__ import annotations
 
+import re
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
+from zoneinfo import ZoneInfo
+
+from scripts.lib.user_zone import user_zone
+
+
+WRAPPED = "> **Status: PRODUCTION — wrapped.**"
+
+
+class Refusal(Exception):
+    """An invalid request that must leave the production unchanged."""
+
+
+class Production(NamedTuple):
+    doc: Path
+    slug: str
+    merge_branch: str
+    checkout: Path
+    log: Path
+    zone: ZoneInfo
+
+
+def cell_value(value: str) -> str:
+    """Read the value before its commentary."""
+    quoted = re.search(r"`([^`]+)`", value)
+    return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
 
 
 class ProductionName(NamedTuple):
@@ -52,6 +78,33 @@ def optional_field(lines: list[str], field: str) -> FieldPresent | FieldAbsent:
         if line.startswith(prefix):
             return FieldPresent(line[len(prefix):].removeprefix(" "))
     return FieldAbsent()
+
+
+def production_field(lines: list[str], field: str) -> str:
+    """Read a Production Context field without its commentary."""
+    present = optional_field(lines, field)
+    value = cell_value(present.text) if isinstance(present, FieldPresent) else ""
+    if not value:
+        raise Refusal(f"production doc lacks {field}")
+    return value
+
+
+def read_production(path: Path) -> Production:
+    """Read the production fields shared with merge_checkpoint.py."""
+    try:
+        doc = path.resolve(strict=True)
+        lines = doc.read_text(encoding="utf-8").splitlines()
+        merge_branch = production_field(lines, "Merge branch")
+        checkout = Path(production_field(lines, "Showrunner checkout")).expanduser().resolve()
+        log = Path(production_field(lines, "Log"))
+        slug = doc.name.removesuffix("-production.md")
+        if slug == doc.name:
+            raise Refusal("production doc name must end in -production.md")
+        if log.is_absolute():
+            raise Refusal("production Log must be relative to Showrunner checkout")
+        return Production(doc, slug, merge_branch, checkout, checkout / log, user_zone())
+    except (OSError, UnicodeError, KeyError, ValueError) as error:
+        raise Refusal(f"cannot read production doc: {error}") from error
 
 
 def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:

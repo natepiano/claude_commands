@@ -542,7 +542,7 @@ class RoleTests(unittest.TestCase):
         sources = {source.timer.slug: source}
         instance = self.home / ".local/state/notifier/showrunner-different-slug"
         instance.mkdir(parents=True)
-        _ = doc.write_text("# No Units table\n")
+        _ = doc.write_text("# Production\n")
         _ = (instance / "conf").write_text(
             f"TARGET=session:runner-id\nCHECK=zsh /scripts/production_check.sh {shlex.quote(str(doc))}\n")
         cases: list[tuple[str, tuple[staff.StaffRow, ...], dict[str, str], str, str, str, str]] = [

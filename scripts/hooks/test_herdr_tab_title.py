@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 from scripts.lib import names
@@ -57,7 +58,8 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.retitled, self.fault = [], False
         _ = self.enterContext(patch.object(herdr.Herdr, "retitle", autospec=True, side_effect=self.fake_retitle))
 
-    def fake_retitle(self, _client: herdr.Herdr, pane: str, title: str) -> bool:
+    def fake_retitle(self, _client: herdr.Herdr, pane: str, title: str, *, tab: bool = True) -> bool:
+        self.assertTrue(tab)
         self.retitled.append((pane, title))
         if self.fault:
             raise herdr.HerdrFailure("server gone")
@@ -142,7 +144,14 @@ class HerdrTabTitleTests(unittest.TestCase):
             pane["label"] = arguments[-1]
             return ""
 
-        with (patch.object(herdr.Herdr, "panes", return_value=[pane]),
+        def result(_client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            del deadline
+            self.assertEqual(arguments, ("pane", "list"))
+            return {"panes": [pane]}
+
+        with (patch.object(herdr.Herdr, "retitle", new=REAL_RETITLE),
+              patch.object(herdr.Herdr, "result", autospec=True, side_effect=result),
+              patch.object(herdr.Herdr, "save_layout"),
               patch.object(herdr.Herdr, "run", autospec=True, side_effect=rename) as writes,
               redirect_stderr(io.StringIO()) as errors):
             self.assertTrue(herdr_tab_title.sync({"session_id": worker.current_session}, environment))

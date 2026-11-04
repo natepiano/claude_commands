@@ -23,6 +23,7 @@ import herdr  # noqa: E402
 import pane_launch  # noqa: E402
 import pane_record  # noqa: E402
 from scripts.shutdown.launch_names import LaunchNames
+from scripts.shutdown.codex_trust import trust_arguments
 import sessions  # noqa: E402
 from scripts.production import staff, staff_sources  # noqa: E402
 from scripts.whoami.account import named_account_environment  # noqa: E402
@@ -64,7 +65,8 @@ def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession,
     environment = {**entry["environment"], **account}
     title = entry["name"] or pane.label
     launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], environment, kind,
-        pane_record.resume_arguments(entry), herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
+        trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)),
+        herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(launched.reason)
     path = pane_record.record_path(session)

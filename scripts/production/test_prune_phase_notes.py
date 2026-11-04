@@ -55,9 +55,6 @@ class PrunePhaseNotesTests(unittest.TestCase):
             f"# Production — {slug}", "", "## Production Context", "",
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{checkout}`",
             "- **Log:** `production.log`", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |",
-            f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |", "",
         )), encoding="utf-8")
         self.timer(slug, doc)
         unit = unit_membership(slug, "alpha-unit")
