@@ -171,87 +171,80 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:** a `scripts/production/test_modules.py` light module — the name matches the gate's test pattern.
 
 ### Phase 5 — The two slowest direct modules run in half their time  · status: done
-**Depends on:** Phase 2, Phase 4
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_assign_launcher.py` (median 180 s of its last 5 gate runs on 2026-11-03, 127 s CPU in the last) and `direct/test_verify_ssh_targets.py` (median 157 s, 117 s CPU) each run in at most half their baseline wall time, with no CPU increase and no lost coverage.
-
-**Spec:** apply the speed method (Delegation Context) to each module. Each writer owns one module.
+- The SSH target tests are five `test_verify_ssh_targets*.py` files that share `verify_ssh_targets_test_support.py`. The module runner runs them in parallel. Group wall time is 62-71 s (median), from 327.1 s; CPU is 181-188 s, from 205.5 s.
+- The assign launcher tests are four `test_assign_launcher*.py` files (`test_assign_launcher.py`, `_identity`, `_reuse`, `_review`) that share `assign_launcher_test_support.py`. Most tests call the launcher in-process; `test_unreadable_staff_starts_no_worker` runs it as a separate process, because the progress recorder writes its refusal to the process stderr.
+- The merge gate test-times fixture writes `build_admission.conf` and `build_folders.conf` into its private config folder.
+- The build log index is at `SCHEMA_VERSION = 31`. A database at an older schema rebuilds, and the rebuild reads gate history from the start of each log, also before the saved offset.
 
 **Files:**
-- `scripts/direct/test_assign_launcher.py` — speed edits
-- `scripts/direct/test_verify_ssh_targets.py` — speed edits; a split adds `scripts/direct/test_verify_ssh_targets_<part>.py` files
-- `scripts/direct/recorder_fixture.py` — read; edit only under speed method step 4
-- `scripts/direct/verify_mac_offload_test_support.py` — read; edit only under speed method step 4
+- `scripts/direct/test_verify_ssh_targets*.py`, `scripts/direct/verify_ssh_targets_test_support.py` — the SSH target group
+- `scripts/direct/test_assign_launcher*.py`, `scripts/direct/assign_launcher_test_support.py` — the assign launcher group
+- `scripts/buildlog/index.py`, `scripts/buildlog/test_index.py` — schema 31 and the legacy-schema recovery test
 
-**Workers:** 2 writers — one module each; there is no new test to write before the code
-- `impl` — `scripts/direct/test_assign_launcher.py`; hub: `scripts/direct/recorder_fixture.py`
-- `test` opens as impl — `scripts/direct/test_verify_ssh_targets.py` and its split files; hub: `scripts/direct/verify_mac_offload_test_support.py`
+**Gotchas:**
+- A test fixture that sets its own `CONF_DIR` breaks each time a unit moves a setting into a new config file.
+- CPU comparisons are valid only when the before and after runs go one after the other on an idle host.
+- A split of a file that other units edit makes later upstream merges need hand ports: merge origin/builds before each split and keep the split window short.
+- The index schema number must stay above the builds branch's number; a clash makes one side skip its rebuild.
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 1: `scripts/test_times/module_run.py` writes `wall_s`, `cpu_s`, `tests_s` and each test's `s` to `TEST_TIMES_OUT`.
-- Phase 4: `show.py module <folder>/<file>` shows the module's gate history.
-- `test_assign_launcher.py` imports `scripts.agents.test_codex_mesh` as a fixture; Phase 6 changes that module, so keep this import's use unchanged.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_assign_launcher.py'` and `-p 'test_verify_ssh_targets*.py'` green
-- `python3 -m unittest discover -s scripts/lib` green
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
-- Each module's (or group's) after median `wall_s` is at most half its before median, or the phase report names the measured floor and the proposal sent; its `cpu_s` median is not higher
-- The checkpoint gate is green, with the importers of each changed support file in it
-
-### Phase 6 — The mesh and simplify-lens modules run in half their time  · status: todo
+### Phase 6 — The simplify-lens and assign-launcher modules run faster  · status: todo
 **Depends on:** Phase 5
 
 #### Work Order
 
-**Goal:** `agents/test_codex_mesh.py` (median 137 s of its last 5 gate runs, one run at 947 s, 78 s CPU in the last) and `direct/test_simplify_lens.py` (median 132 s, 61 s CPU) each run in at most half their baseline wall time, with no CPU increase and no lost coverage.
+**Goal:** `direct/test_simplify_lens.py` (median 132 s, 61 s CPU) runs in at most half its baseline wall time, and the assign launcher group records its session once per class (F025), with no CPU increase and no lost coverage.
 
-**Spec:** apply the speed method (Delegation Context) to each module. Each writer owns one module.
-- `agents/test_codex_mesh.py` is 18,835 lines and 720 tests, and herdr-unit's plan (`docs/plans/herdr-worker-panes.md`) deletes `scripts/agents/codex_mesh.py` in its cleanup phase. Its wall time is near twice its CPU time, so cut waits only: fixed sleeps, polling loops and timeouts that the 947 s run shows grow with load. Do not restructure the file. When herdr-unit's deletion of `codex_mesh.py` lands before this phase starts, this module leaves the phase and the next live module of `test_times top` takes its place.
+**Spec:** apply the speed method (Delegation Context). Each writer owns one module group.
+- `agents/test_codex_mesh.py` left this phase: codex-mesh retires, so the builds showrunner stopped new mesh test work (2026-11-04). Do not edit it.
 - `direct/test_simplify_lens.py`: `scripts/direct/wait_for_test_state.py` already waits on folder events and process descriptors (37). Find the cost from the timings.
+- F025: each assign launcher test runs the recorder setup from the start (about 150 git starts a run). Record the session once per class and copy it per test. Do it in `assign_launcher_test_support.py`; do not edit `test_codex_mesh.py`.
+- F025 isolation: the parent fixture makes a new root and server for each test, and the recorder state holds absolute history and project paths (`progress_history.py:1358`). Restore the session, history and project together for each test, with private paths and a fresh server identity. Add a test that proves a recorder write in one test cannot reach the class seed or another test.
+- Type: `AssignLauncherFixture.launch()` and `successful()` take `script: Path | None` (`assign_launcher_test_support.py:119`, `:139`); absence means in-process and presence means a separate process. Replace it with named execution choices (for example `InProcessAssignment | LauncherScript`). Keep the existing process tests.
+- Measure CPU with the sequential method from phase 5: run the before and after trees one after the other on an idle host, never side by side.
 
 **Files:**
-- `scripts/agents/test_codex_mesh.py` — wait cuts
 - `scripts/direct/test_simplify_lens.py` — speed edits
 - `scripts/direct/wait_for_test_state.py` — read; edit only under speed method step 4
+- `scripts/direct/assign_launcher_test_support.py` — F025 per-class recording
+- `scripts/direct/test_assign_launcher*.py` — fixture use only
 
-**Workers:** 2 writers — one module each; there is no new test to write before the code
-- `impl` — `scripts/agents/test_codex_mesh.py`
+**Workers:** 2 writers — one module group each; there is no new test to write before the code
+- `impl` — `scripts/direct/assign_launcher_test_support.py`, `scripts/direct/test_assign_launcher*.py`
 - `test` opens as impl — `scripts/direct/test_simplify_lens.py`; hub: `scripts/direct/wait_for_test_state.py`
 
 **State:** none
 
 **Constraints from prior phases:**
-- Phase 5: `scripts/direct/test_assign_launcher.py` imports `scripts.agents.test_codex_mesh` as a fixture, so the final gate run includes it.
+- Phase 5: the assign launcher tests are four files (`test_assign_launcher.py`, `_identity`, `_reuse`, `_review`) with one support module, `assign_launcher_test_support.py`. Each still imports `scripts.agents.test_codex_mesh` as a fixture, so the gate run includes it.
+- Phase 5: the SSH target tests are five files with `verify_ssh_targets_test_support.py`; they are not in this phase.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/agents -p 'test_codex_mesh.py'`, `python3 -m unittest discover -s scripts/direct -p 'test_simplify_lens.py'` and `-p 'test_assign_launcher.py'` green
+- `python3 -m unittest discover -s scripts/direct -p 'test_simplify_lens.py'` and `-p 'test_assign_launcher*.py'` green
 - `python3 -m unittest discover -s scripts/lib` green
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 - Each module's (or group's) after median `wall_s` is at most half its before median, or the phase report names the measured floor and the proposal sent; its `cpu_s` median is not higher
 - The checkpoint gate is green
 
-### Phase 7 — The fast-track and lint-guard-key modules run in half their time  · status: todo
+### Phase 7 — The fast-track module and the next live slow module run in half their time  · status: todo
 **Depends on:** Phase 6
 
 #### Work Order
 
-**Goal:** `production/test_fast_track.py` (median 127 s of its last 5 gate runs, 85 s CPU in the last) and `direct/test_verify_lint_guard_key.py` (median 107 s, 63 s CPU) each run in at most half their baseline wall time, with no CPU increase and no lost coverage.
+**Goal:** `production/test_fast_track.py` (median 127 s of its last 5 gate runs, 85 s CPU in the last) and the next live module of `test_times top` each run in at most half their baseline wall time, with no CPU increase and no lost coverage.
 
 **Spec:** apply the speed method (Delegation Context) to each module. Each writer owns one module. `MergeCheckpointFixture.setUpClass` (`scripts/production/merge_checkpoint_test_support.py:262`) already builds one seed for each class and copies it for each test. Find the cost from the timings.
 
 **Files:**
 - `scripts/production/test_fast_track.py` — speed edits
-- `scripts/direct/test_verify_lint_guard_key.py` — speed edits
+- The second module — speed edits. Upstream commit `322530677` deleted `scripts/direct/test_verify_lint_guard_key.py` and kept four build-key tests in `scripts/direct/test_verify_build_key.py`. At dispatch, the director takes the slowest live module of `test_times top` that no phase owns and writes its path, median and CPU here and in the Goal.
 - `scripts/production/merge_checkpoint_test_support.py` — read; edit only under speed method step 4
 
 **Workers:** 2 writers — one module each; there is no new test to write before the code
 - `impl` — `scripts/production/test_fast_track.py`; hub: `scripts/production/merge_checkpoint_test_support.py`
-- `test` opens as impl — `scripts/direct/test_verify_lint_guard_key.py`
+- `test` opens as impl — the second module
 
 **State:** none
 
@@ -259,7 +252,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Phase 5: the speed phases run one after another, so each baseline is measured on the tree the last one left.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_fast_track.py'` and `python3 -m unittest discover -s scripts/direct -p 'test_verify_lint_guard_key.py'` green
+- `python3 -m unittest discover -s scripts/production -p 'test_fast_track.py'` and the second module green
 - `python3 -m unittest discover -s scripts/lib` green
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 - Each module's (or group's) after median `wall_s` is at most half its before median, or the phase report names the measured floor and the proposal sent; its `cpu_s` median is not higher
@@ -271,12 +264,13 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 #### Work Order
 
-**Goal:** `show.py` imports test discovery from a light module, so each `/test_times` subcommand starts about 0.4 s faster.
+**Goal:** `show.py` imports test discovery from a light module, so each `/test_times` subcommand starts about 0.4 s faster, and it names a missing gate table in one line instead of a traceback.
 
 **Spec:**
 
 1. After the director merges origin/builds with devtools 4y in it, move `GateRefused`, `discover_test_modules` and `test_module_name` from `scripts/production/merge_gate.py` into a new `scripts/production/gate_modules.py`. The name must not match `test_*.py`. `merge_gate.py` imports the three names from it; behavior does not change.
 2. `scripts/test_times/show.py` and `scripts/test_times/test_show.py` import `discover_test_modules` and `test_module_name` from `gate_modules.py`. `show.py` no longer imports `merge_gate.py` (measured: 373 ms of import time, cumulative, on natedev).
+3. `show.py top` (and each subcommand that reads gate tables) prints one clear line when the index has no `gate_modules` or `gate_runs` table, and exits 1. Today it ends in a traceback (`sqlite3.OperationalError: no such table: gate_modules`) on natedev, because the live index was built by an older indexer. Add a test for that case to `test_show.py`.
 
 **Files:**
 - `scripts/production/gate_modules.py` — new: gate test discovery and module names
@@ -318,6 +312,8 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/lint/memory_admit.py` — `anonymous_history_rows` calls `locked_rows` (owner resources-unit, moving to queue-unit)
 - `scripts/lint/sweep.py` — `build_log_rows` calls `locked_rows` (owner resources-unit)
 - `scripts/build_queue/queue_lines.py` — imports the padding helpers (owner queue-unit)
+- `scripts/build_queue/queue_view.py` — imports the padding helpers (line 12)
+- `scripts/build_queue/test_queue_lines.py` — imports the padding helpers (line 10)
 
 **Workers:** 1 writer — two short call-site edits; the existing tests prove them
 - `impl` — all three files and the importers of the padding helpers
@@ -332,4 +328,4 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - `scripts/lint/test_memory_admit.py` and `scripts/lint/test_sweep.py` green in the checkpoint gate run
 - `python3 -m unittest discover -s scripts/build_queue` green
-- `basedpyright scripts/lint/memory_admit.py scripts/lint/sweep.py scripts/build_queue/queue_lines.py` prints `0 errors, 0 warnings, 0 notes`
+- `basedpyright scripts/lint/memory_admit.py scripts/lint/sweep.py scripts/build_queue/queue_lines.py scripts/build_queue/queue_view.py scripts/build_queue/test_queue_lines.py` prints `0 errors, 0 warnings, 0 notes`

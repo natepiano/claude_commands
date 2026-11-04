@@ -10,10 +10,9 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 | --- | --- | --- | --- | --- | --- |
 | 1 | `direct/test_assign_launcher.py` | 180 | 132 | 127 | 5 |
 | 2 | `direct/test_verify_ssh_targets.py` | 157 | 116 | 117 | 5 |
-| 3 | `agents/test_codex_mesh.py` | 137 | 947 | 79 | 6 |
+| 3 | `agents/test_codex_mesh.py` | 137 | 947 | 79 | excluded: codex-mesh retires |
 | 4 | `direct/test_simplify_lens.py` | 132 | 122 | 61 | 6 |
 | 5 | `production/test_fast_track.py` | 127 | 97 | 85 | 7 |
-| 6 | `direct/test_verify_lint_guard_key.py` | 107 | 63 | 63 | 7 |
 | 7 | `shutdown/test_restart.py` | 71 | 59 | 58 | — |
 | 8 | `hana_shot/test_hana_shot.py` | 61 | 56 | 14 | — |
 | 9 | `direct/test_workers.py` | 51 | 57 | 26 | — |
