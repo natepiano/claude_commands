@@ -165,6 +165,7 @@ class ServiceTests(unittest.TestCase):
             unowned = fixture.root / "builds.slice/unowned.scope"
             unowned.mkdir(parents=True)
             _ = (unowned / "memory.current").write_text(str(GIB))
+            _ = (unowned / "memory.stat").write_text("inactive_file 0\n")
             _ = (unowned / "cgroup.procs").write_text("")
             _ = fixture.server.run_pass()
             snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
@@ -1646,6 +1647,7 @@ class CutoverServiceTests(unittest.TestCase):
             scope.mkdir(parents=True)
             _ = (scope / "cgroup.procs").write_text("")
             _ = (scope / "memory.current").write_text(str(GIB))
+            _ = (scope / "memory.stat").write_text("inactive_file 0\n")
             _ = fixture.server.run_pass()
             first = fixture.server.handle_request(wire.ViewRequest())[0]
             assert isinstance(first, wire.ViewReply)
