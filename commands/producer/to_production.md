@@ -101,15 +101,6 @@ and merged units.
 Write `<source-stem>-production.md` beside the first source plan, in the
 production format, with status `planned`:
 
-- **Units:**
-  - **Worktree:** `<parent of ${REPO}>/<name>-<area>`, with a branch of the
-    same name.
-  - **Session:** the unit name. If a herdr session with that name already
-    exists, add the production name as a prefix.
-  - **Port:** a distinct app port per unit, only when the project launches an
-    app for smoke tests. Never the user's default port. The repository's
-    memory names the default.
-  - **Owns:** the files greenlight gave the unit.
 - **Hub files** and **Gates** are copied from the greenlight result.
 - **Merge tests:** the command that runs the app package's tests, which catch
   cross-crate breaks, e.g. `./verify.sh test -p app`, if one exists; a command,

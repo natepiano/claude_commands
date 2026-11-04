@@ -26,8 +26,7 @@ Retire releases build holds, berth reservations, and Mac claims.
 It reports other cleanup failures as anomalies.
 It removes the worktree, its branch, and any remaining Units row.
 The staff row stays with a `RemovedWorktree` location.
-Unit settings remain parked under the staff id.
-Retire writes no retired note or saved branch ref.
+Retire parks `.unit.toml` and its retirement facts under the staff id.
 
 Resume uses the staff name or id and restores the folder from the merge branch.
 It resumes the row's `current_session`.

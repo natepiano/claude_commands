@@ -323,6 +323,8 @@ class UnitWatchdogTests(unittest.TestCase):
               patch.object(stop_resume, "_tab_of", side_effect=tab),
               patch.object(sessions, "process_start", return_value="fixture-start"),
               patch.object(sessions, "process_liveness", side_effect=process),
+              # This fixture supplies signals; shutdown tests check the workspace guard.
+              patch.object(stop_resume, "_signal_process", side_effect=signal_claude),
               patch.object(os, "kill", side_effect=signal_claude)):
             yield
 

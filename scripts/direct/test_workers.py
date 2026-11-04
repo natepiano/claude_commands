@@ -368,6 +368,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         assert owner is not None
         _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", nested), expected=owner.worktree)
+        del state["working_dir"]
         _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
         expected = subprocess.run(["bash", str(SCRIPT.with_name("worker_name.sh")), str(nested), "review", "review"],
                                   check=True, capture_output=True, text=True).stdout.strip()
@@ -402,7 +403,21 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertFalse((self.session_dir / workers.STATE).exists())
         self.assertFalse((self.session_dir / "working_dir").exists())
 
-    def test_reviewer_state_worktree_is_authoritative_over_the_launcher(self) -> None:
+    def test_reviewer_without_staff_or_launcher_worktree_is_unavailable(self) -> None:
+        (self.session_dir / workers.STATE).unlink()
+        (self.session_dir / "working_dir").unlink()
+        owner = staff.by_current_session(os.environ["CODEX_THREAD_ID"])
+        assert owner is not None
+        _ = staff.set_worktree(owner.id, staff.RemovedWorktree("natedev", self.session_dir.parent / "repository"),
+                              expected=owner.worktree)
+        with self.assertRaisesRegex(workers.WorkerUnavailable, "^invalid worker state: missing working_dir$"):
+            _ = workers.resolve(self.session_dir, "review")
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_reviewer_staff_worktree_is_authoritative_over_the_launcher(self) -> None:
+        state = json_object(self.session_dir / workers.STATE)
+        state["working_dir"] = str(self.session_dir.parent / "stale-launcher")
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
         self.configure_new_worker()
         with (self.session_dir.parent / "registry.conf").open("a") as output:
             _ = output.write("review=gpt-kept-sol:xhigh\n")

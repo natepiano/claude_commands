@@ -28,13 +28,17 @@ from test_index import Record, encode, point_root_at, step
 from test_launches import CLI, result_line
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lint.memory_test_support import config_environment
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lint.memory_test_support import config_environment
 
 if TYPE_CHECKING:
     from ..hana_shot import hana_shot
+    from ..hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
 else:
     from scripts.hana_shot import hana_shot
+    from scripts.hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
 
 
 class RecordingStopped(BaseException):
@@ -70,6 +74,7 @@ class LaunchRecordingTests(unittest.TestCase):
         )
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(base / "config"),
             "XDG_CACHE_HOME": str(self.cache),
             "BUILDLOG_LAUNCH_STATES": str(self.cache / "hana-shot" / "launches"),
             "BUILDLOG_TRANSCRIPTS": str(base / "transcripts"),
@@ -143,7 +148,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
     def launch_without_process(self, port: int) -> hana_shot.LaunchState:
         with self.fake_launch_process(port):
-            launched = hana_shot.launch(port, str(self.worktree), str(self.binary))
+            launched = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
         return launched[0]
 
     def test_hana_launch_records_one_start_with_no_admission(self) -> None:
@@ -303,7 +308,7 @@ class LaunchRecordingTests(unittest.TestCase):
             try:
                 sys.setprofile(interrupt_recording)
                 with self.assertRaises(hana_shot.ExitSignal) as caught:
-                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary))
+                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
             finally:
                 sys.setprofile(previous_profile)
 
@@ -405,7 +410,7 @@ class LaunchRecordingTests(unittest.TestCase):
         with mock.patch.object(record, "write_launch_line", side_effect=fail_first_publication):
             for port in (15816, 15817):
                 with self.fake_launch_process(port) as process:
-                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary))
+                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
                     self.assertTrue(hana_shot.launch_state_path(port).exists())
                     hana_shot.shutdown(port, process)
                     self.assertEqual(process.poll(), 0)

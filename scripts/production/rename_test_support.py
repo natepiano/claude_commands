@@ -64,7 +64,8 @@ class FolderMoveBackend:
         """Expose the private process and an empty rollout descriptor directory."""
         process = self.fixture.root / "folder-processes" / str(self.pid)
         (process / "fd").mkdir(parents=True, exist_ok=True)
-        _ = (process / "cmdline").write_bytes(self.kind.encode() + b"\0" if self.live else b"")
+        arguments = [self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]
+        _ = (process / "cmdline").write_bytes("\0".join(arguments).encode() + b"\0" if self.live else b"")
 
     def panes(self) -> list[herdr.PaneIdentity]:
         return [

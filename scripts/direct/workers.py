@@ -563,6 +563,8 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
 def _reviewer_destination(run: Path) -> str:
     membership = staff.local_snapshot()
     owner = worker_admission.parent(membership, staff_id=staff.runtime_id(), run=run)
+    if owner.kind == "unit" and not isinstance(owner.worktree, staff.PresentWorktree):
+        raise WorkerUnavailable("invalid worker state: missing working_dir")
     directory = str(session_staff.worker_directory(membership, owner.id))
     result = subprocess.run(
         ["bash", str(Path(__file__).with_name("worker_name.sh")),

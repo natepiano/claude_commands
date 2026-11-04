@@ -554,6 +554,7 @@ class MemoryMomentTests(unittest.TestCase):
         return records
 
     def test_configured_kill_level_changes_the_python_split_and_definition(self) -> None:
+        self.journal.index_output_roots(Path("/work/target"))
         at = START + timedelta(days=1)
         self.journal.stub_journal(early=[
             memory_fixtures.journal_entry(at + timedelta(minutes=1),
@@ -617,6 +618,7 @@ with index.read_only() as connection:
         self.assertEqual(sum("A window shorter than 2 day is thin" in line for line in section), 1)
 
     def test_memory_table_counts_kills_stalls_zero_waits_and_stopped_retries(self) -> None:
+        self.journal.index_output_roots(Path("/work/target"))
         at = START + timedelta(days=1)
         moment = moments.MemoryMoment(at, "fixture budget raise")
         before_messages = [memory_fixtures.earlyoom_message(number) for number in range(6)]

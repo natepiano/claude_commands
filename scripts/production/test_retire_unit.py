@@ -42,7 +42,7 @@ from scripts.shutdown import pane_record as staff_pane_record
 import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.copies import copies
 from scripts.lib import conf
 from scripts.agents import worker_lifecycle
