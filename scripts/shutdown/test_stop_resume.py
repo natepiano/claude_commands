@@ -1170,6 +1170,44 @@ class StopResumeTests(unittest.TestCase):
         self.assertGreater(self.process.call_count, 4)
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
 
+    def test_move_waits_for_exit_when_term_removes_the_registry_before_cleanup_finishes(self) -> None:
+        identity = self.entry["session_id"]
+        for exits in (True, False):
+            with self.subTest(exits=exits):
+                self.clock.elapsed = 0
+                self.launched.clear()
+                self.kill.reset_mock()
+                self.start.reset_mock()
+                def registry(_session: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+                    return sessions.SessionNotLive() if self.kill.called else sessions.LiveSessionProcess(123)
+
+                self.live.side_effect = registry
+
+                def process(_pid: int, _started: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+                    return sessions.SessionNotLive() if exits and self.clock.elapsed >= 3 else sessions.LiveSessionProcess(123)
+
+                def native(_pid: int, _kind: str) -> herdr.NativeAgentProcess:
+                    if self.kill.called:
+                        raise ValueError("pid 123: native registry identity is unavailable")
+                    return herdr.NativeAgentProcess(identity, "generation-1", {})
+
+                def start(*_command: str) -> str:
+                    self.assertGreaterEqual(self.clock.elapsed, 3)
+                    return ""
+
+                self.process.side_effect = process
+                self.start.side_effect = start
+                with patch.object(herdr, "native_process", side_effect=native), redirect_stderr(io.StringIO()) as output:
+                    result = stop_resume.move("alpha", "claude4", why="limit")
+                self.kill.assert_called_once_with(123, signal.SIGTERM)
+                self.assertIn("stop identity anomaly after SIGTERM:", output.getvalue())
+                if exits:
+                    self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", "claude4"))
+                    self.start.assert_called_once()
+                else:
+                    self.assertEqual(result, stop_resume.StopFailed(identity, "pid 123 is still running after SIGTERM"))
+                    self.start.assert_not_called()
+
     def test_a_process_still_alive_after_kill_fails_and_never_resumes(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
         result = stop_resume.move("alpha", "claude4", why="limit")
