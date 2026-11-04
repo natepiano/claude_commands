@@ -64,12 +64,12 @@ function expectHostClipping(tree: unknown, columns: number, lineCount: number) {
   for (const props of drawing.textProps) expect(props).toMatchObject({ wrap: 'truncate' });
 }
 
-function queueHost(on: On) {
+function queueHost(on: On, environment: Record<string, string> = {}) {
   const panes = new Map<string, UiPane>();
   const opened: string[] = [];
   const closed: string[] = [];
   const clock = mock.clock(on, { now: NOW });
-  mock.env(on, { HOME, USER_ZONE: 'UTC' });
+  mock.env(on, { HOME, USER_ZONE: 'UTC', ...environment });
   const processes: string[][] = [];
   const writes: QueuePaneState[] = [];
   const escaped: string[] = [];
@@ -606,6 +606,13 @@ describe('build queue pane', () => {
     });
   }
 
+  test('a bump passes the pane session instead of the inherited session to the process', async ($, on) => {
+    const fake = queueHost(on, { CLAUDE_CODE_SESSION_ID: 'a-different-inherited-session' });
+    expect(await $.command.run(command('bump berth'))).toEqual({ text: BUMP });
+    expect(fake.processes).toEqual([PRIORITY_ARGV]);
+    expect(fake.escaped).toEqual([]);
+  });
+
   for (const open of [false, true]) {
     test(`bump sets unit priority and ${open ? 'refreshes the open' : 'does not open a closed'} pane`, async ($, on) => {
       const fake = queueHost(on);
@@ -674,6 +681,18 @@ describe('build queue pane', () => {
       expect(fake.escaped).toEqual([]);
     });
   }
+
+  test('an unknown-unit exit-3 refusal is shown in the open queue pane', async ($, on) => {
+    const fake = queueHost(on);
+    await $.command.run(command());
+    const refusal = 'build queue: unknown unit not-a-roster-unit';
+    fake.refuseBump(refusal);
+    expect(await $.command.run(command('bump not-a-roster-unit'))).toEqual({ text: refusal });
+    expect(fake.processes).toEqual([READ,
+      PRIORITY_ARGV.map(argument => argument === 'berth' ? 'not-a-roster-unit' : argument), READ]);
+    expect(fake.opened).toEqual(['build-queue']);
+    expect(fake.escaped).toEqual([]);
+  });
 
   test('an exit-2 bump hides permission errors even when they have the build queue prefix', async ($, on) => {
     mock.env(on, { HOME });

@@ -33,7 +33,7 @@ from scripts.direct import progress_history, workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, isolated_source_readers, showrunner_relationship, recorded_unit
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner, fixture_runtime_id, StaffTestCase, isolated_source_readers, showrunner_relationship, recorded_unit
 
 
 SCRIPT = Path(__file__).with_name("workers.py")
@@ -554,7 +554,10 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         nested = working / "nested"
         nested.mkdir()
         state = json_object(self.session_dir / workers.STATE)
-        state["working_dir"] = str(nested)
+        owner = recorded_showrunner("fixture", working / "production.md")
+        unit = fixture_unit_location(owner, "fixture-unit", nested)
+        del state["working_dir"]
+        state["main_agent"] = {"session_id": str(unit.id)}
         _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
         expected = subprocess.run(["bash", str(SCRIPT.with_name("worker_name.sh")), str(nested), "review", "review"],
                                   check=True, capture_output=True, text=True).stdout.strip()
@@ -597,7 +600,13 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             _ = workers.resolve(self.session_dir, "review")
         self.assertEqual(self.methods("thread/start"), [])
 
-    def test_reviewer_state_worktree_is_authoritative_over_the_launcher(self) -> None:
+    def test_reviewer_staff_worktree_is_authoritative_over_the_launcher(self) -> None:
+        state = json_object(self.session_dir / workers.STATE)
+        owner = recorded_showrunner("fixture", self.session_dir.parent / "production.md")
+        unit = fixture_unit_location(owner, "fixture-unit", self.session_dir.parent / "repository")
+        del state["working_dir"]
+        state["main_agent"] = {"session_id": str(unit.id)}
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
         self.configure_new_worker()
         with (self.session_dir.parent / "registry.conf").open("a") as output:
             _ = output.write("review=gpt-kept-sol:xhigh\n")

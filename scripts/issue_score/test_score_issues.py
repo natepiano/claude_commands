@@ -22,7 +22,7 @@ from urllib.request import Request
 from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.issue_score import client, questions, score_issues
 from scripts.issue_score import records as run_records
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.issue_score.test_decide import choice_answer
 
 # proposals_table.py imports its production neighbors by bare name.

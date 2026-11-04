@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from scripts.accounts import role_map
 from scripts.lib import conf
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
 
 class NextMoveError(ValueError):

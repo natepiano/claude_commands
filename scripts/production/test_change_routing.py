@@ -12,6 +12,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import conf
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import change_review, change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.production.test_change_review import ProducerFixture, producer_rows
@@ -374,11 +375,14 @@ class StaffRoutingTests(unittest.TestCase):
             root = Path(directory)
             config = root / "config"
             config.mkdir()
+            config_env = config_environment(config)
+            _ = write_config_fixture(config / "scratch.conf",
+                                     f"visible_root={root / 'repro'}\nholds_file={root / 'holds.json'}")
             settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
             _ = (config / "change_review.conf").write_text(settings.read_text())
             source = Path(__file__).resolve().parents[2] / "config/review_links.conf"
             _ = (config / "review_links.conf").write_text(source.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
-            environment = {"CONF_DIR": str(config), "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
+            environment = {**config_env, "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
                            "REVIEW_LINKS_ROOT": str(root / "links"),
                            "NEXT_STATE_DIR": str(root / "next"), "FEATURE_LOG_VAULT": str(root / "vault")}
             with mock.patch.dict(os.environ, environment):
