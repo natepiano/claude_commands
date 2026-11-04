@@ -19,7 +19,9 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n")
         environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                       "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
+                       "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1",
+                       "USER_ZONE": "UTC"}
+        _ = environment.pop("USER_ZONE_SCRIPT", None)
         phase_16_errors = self.root / "phase-16.err"
         phase_16 = self.start_memory_waiter(environment, phase_16_errors)
         resume_waiter = self.defer_memory_waiter_for_peer()
@@ -46,10 +48,14 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
             self.assertEqual((lock / "holder_pid").read_text(), str(phase_15.pid))
 
+            self.wait_for_output(phase_16_errors, "waiting for the cargo token since", phase_16)
+            self.assertRegex(phase_16_errors.read_text(),
+                             r"waiting for the cargo token since [0-2][0-9]:[0-5][0-9] UTC:")
             _ = (self.root / "release").touch()
             self.assertEqual(phase_15.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             self.assertEqual(phase_16.wait(timeout=TEST_HANG_GUARD_SECS), 0, phase_16_errors.read_text())
             self.assertNotIn("Traceback", phase_16_errors.read_text())
+            self.assertNotIn("unbound variable", phase_16_errors.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
             self.assertFalse(lock.exists())
         finally:
