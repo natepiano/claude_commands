@@ -535,21 +535,12 @@ The showrunner routed five rows of the rerun sweep (`docs/plans/sdlc-rerun-sweep
 
 **Acceptance gate:** for each of the five rows, one test stops the command at the named line (a fault injected at that step), reruns the same command, and asserts the rerun's result: a reused pid takes the worker; `landed` restores `finding_batch_landed` exactly once; a failed forced lint after a saved pass reports the failure on the next ordinary call; a failed wait close is closed by the next run; a failed unbind still cleans the other runs and the rerun retries only the failed one. Each test fails on the tree before its fix. The `scripts.direct.test_assign_launcher`, `scripts.direct.test_findings`, `scripts.direct.test_end_session`, `scripts.direct.test_verify_hold_lint` and `scripts.direct.test_verify_hold_wait` suites stay green.
 
-### Phase 18 — The Stop hook lets a full-context stop through only when something live will wake the session  · status: done
+### Phase 18 — The direct Stop hook records turn waits  · status: done
 **Depends on:** none (showrunner fix, 2026-10-29: ahead of other work)
 
 #### As-built
 
-- `scripts/hooks/stop-direct-continue.py` measures context before any wake-source check. Below the handoff threshold, or when context cannot be measured, the stop passes.
-- At or above the threshold, the only wake source is a live entry in the payload's `background_tasks` (`pending_background_tasks`). With none, the hook blocks once, so the next request runs compaction. The `heartbeat.log` age is not a wake source: a finished worker writes the heartbeat too. `workers_working` no longer exists in `direct_run.py`.
-- The other early returns keep their meaning: a subagent, no session id, no active run, a declared user or supplier wait (`record_turn_wait`), and `stop_hook_active` (block once only).
-
-**Files:**
-- `scripts/hooks/stop-direct-continue.py` — context first, then background tasks
-- `scripts/hooks/direct_run.py` — `workers_working` removed
-- `scripts/hooks/test_stop_direct_continue.py` — runs the real hook once per return in `main()`, the finished-heartbeat block case included
-
-**Ruled out:** a fresh `heartbeat.log` as proof of a later wake-up.
+`scripts/hooks/stop-direct-continue.py` records turn waits with `record_turn_wait` and permits the stop without output.
 
 ### Phase 19 — An uncertain wait reason prints once, with its count  · status: done
 **Depends on:** none (showrunner add-on from hierarchies-unit, 2026-10-29)

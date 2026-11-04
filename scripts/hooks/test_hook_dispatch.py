@@ -283,33 +283,6 @@ class RealHookEquivalenceTests(IsolatedHookTests):
                 else:
                     self.assertEqual(outcome.output, {})
 
-    def test_stop_direct_continue_blocks_active_run_near_compaction(self) -> None:
-        session_id = "dispatcher-active-director"
-        run = self.root / "unit-run"
-        run.mkdir()
-        _ = (run / "director").write_text(session_id + "\n", encoding="utf-8")
-        markers = Path(self.environment["UNIT_ACTIVE_DIR"])
-        markers.mkdir()
-        _ = (markers / session_id).write_text(str(run) + "\n", encoding="utf-8")
-        settings = self.home / ".claude/settings.json"
-        settings.parent.mkdir(parents=True)
-        _ = settings.write_text(json.dumps({"autoCompactWindow": 200_000}), encoding="utf-8")
-        transcript = self.root / "active-transcript.jsonl"
-        _ = transcript.write_text(json.dumps({
-            "type": "assistant", "message": {
-                "role": "assistant", "model": "claude-sonnet-4-5",
-                "content": [{"type": "text", "text": "The checks passed."}],
-                "usage": {"input_tokens": 170_000},
-            },
-        }) + "\n", encoding="utf-8")
-
-        outcome = self.compare("stop", {
-            "session_id": session_id, "transcript_path": str(transcript),
-            "last_assistant_message": "The checks passed.",
-        })
-        self.assertEqual(outcome.output["decision"], "block")
-        self.assertIn("/unit:direct run active, 170,000", str(outcome.output["reason"]))
-
     def test_stop_matches_separate_hooks_and_logs_last_assistant_prose(self) -> None:
         transcript = self.root / "transcript.jsonl"
         for message in ("The checks passed.", "A zorblax claim."):

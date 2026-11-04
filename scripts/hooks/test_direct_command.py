@@ -27,7 +27,6 @@ class CommandStubTests(unittest.TestCase):
     def test_hooks_reread_the_direct_command(self) -> None:
         for name in (
             "session-start-direct-resume.py",
-            "stop-direct-continue.py",
         ):
             with self.subTest(name=name):
                 text = (REPO / "scripts/hooks" / name).read_text()

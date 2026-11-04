@@ -226,31 +226,31 @@ The second live simplify run (2026-11-02, pass 1 through `review.sh`) raised 25 
 
 **Acceptance gate:** `python3 -m unittest scripts.direct.test_verify_doc` passes 5 runs in a row in one mesh run, and no `lint-sweep` folder is left under the case root; `basedpyright scripts/direct/verify_doc_test_support.py` reports 0 errors, 0 warnings, 0 notes.
 
-### Phase 5 — assertion_guard.py accepts one ruling for a deleted mechanism  · status: done
+### Phase 6 — The direct Stop hook never blocks  · status: in progress
 
 **Depends on:** Phase 4
 
 #### Work Order
 
-**Goal:** one `Assertion-Change` line rules every removed test of a deleted mechanism.
+**Goal:** no Stop hook text near the context limit reaches the user's screen.
 
-**User ruling (to devtools, 2026-11-03 12:1x):** "yes the guard should accept one line for a whole deleted mechanism".
+**User words (via natedev and sdlc, 2026-11-03):** "every time i type something when messaging is near its limit i just see this" and "the hook should not be set to make its text visible to me - it should only go to the agent".
 
 **Spec:**
-1. The new form: `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted`. The trailing `*` marks a prefix ruling.
-2. A prefix ruling rules each `test removed` finding in `<path>` whose test name starts with the prefix. It does not rule a `removed` or `weaker` assertion in a test that stays.
-3. A prefix ruling that matches no removed test is blocking. The guard prints the ruling and says it matched no removed test.
-4. The output for each ruled finding stays as now: `— ruled: <why>`.
-5. Delete the per-test code that the prefix form replaces where you can. The tool must not grow by much. Net lines in `assertion_guard.py` must be 20 or fewer.
-6. Docs: name the prefix form beside the per-test form in `commands/unit/direct.md` and `docs/as-built/phase-checks.md`. Add text; do not reword pinned phrases (`scripts/hooks/test_direct_command.py` pins them).
-7. Tests, one per behavior, in `scripts/direct/test_assertion_guard.py`: a prefix rules two removed tests; a prefix does not rule a weaker assertion in a kept test; a prefix that matches no removed test blocks.
+1. `scripts/hooks/stop-direct-continue.py` returns `decision: block` near the handoff threshold. Claude Code shows the block reason to the user. A Stop hook has no model-only channel.
+2. Delete the block path: `REASON`, `build_reason`, the measurement, the threshold and the background-task checks, and their docstring text. The hook keeps only `record_turn_wait`. It prints nothing.
+3. The PostToolUse context hook already gives the agent the model-only warning. Do not change it.
+4. Delete each helper in `scripts/hooks/context_usage.py` that has no caller after the cut. Keep each one that another file uses.
+5. Update the text that describes the block: `commands/unit/direct.md` lines near 434 and 445, and any other doc that says the Stop hook blocks.
+6. Tests: delete the block tests in `scripts/hooks/test_stop_direct_continue.py`. Keep one test that a stop past the threshold prints nothing, and keep the turn-wait test. `scripts/hooks/test_direct_command.py` pins some `direct.md` phrases; update a pin only where its phrase describes the deleted block.
+7. The phase is net negative.
 
 **Files:**
-- `scripts/direct/assertion_guard.py` — `read_rulings`, `run`
-- `scripts/direct/test_assertion_guard.py` — the tests in Spec item 7
-- `commands/unit/direct.md`, `docs/as-built/phase-checks.md` — the prefix form
+- `scripts/hooks/stop-direct-continue.py`, `scripts/hooks/test_stop_direct_continue.py`
+- `scripts/hooks/context_usage.py` — unused helpers only
+- `commands/unit/direct.md` and the docs that describe the block
 
 **Workers:** 1 writer.
 - `impl` — all files
 
-**Acceptance gate:** `test_assertion_guard.py`, `test_verify_assertion_guard.py` and `scripts/hooks/test_direct_command.py` pass; `basedpyright scripts/direct/assertion_guard.py scripts/direct/test_assertion_guard.py` reports 0 errors, 0 warnings, 0 notes.
+**Acceptance gate:** `test_stop_direct_continue.py`, `test_direct_command.py`, `test_hook_dispatch.py` and the context-usage hook tests pass in one run; `basedpyright` on each changed Python file reports 0 errors, 0 warnings, 0 notes.

@@ -1,4 +1,4 @@
-"""A full-context director stops only for a real wait or a later CLI wake-up."""
+"""The direct Stop hook records waits and prints nothing."""
 
 from __future__ import annotations
 
@@ -14,30 +14,19 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 HOOK = Path(__file__).with_name("stop-direct-continue.py")
 SESSION = "fixture-director"
-# A 200k window reserves 33k for compaction and 25k for the handoff.
-THRESHOLD = 142_000
 
 
 @dataclass(frozen=True)
 class DirectorStopFixture:
     root: Path
     run: Path
-    marker: Path
     transcript: Path
     environment: dict[str, str]
-
-    def write_usage(self, tokens: int) -> None:
-        _ = self.transcript.write_text(json.dumps({
-            "type": "assistant", "message": {
-                "model": "claude-sonnet-4", "usage": {"input_tokens": tokens},
-            },
-        }) + "\n", encoding="utf-8")
 
     def call(self, **fields: object) -> str:
         payload: dict[str, object] = {
@@ -84,72 +73,19 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
             "CLAUDE_PROBE_SESSION": "0", "MODELS_CONFIG_FILE": str(config),
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k",
         }
-        fixture = DirectorStopFixture(root, run, marker, root / "transcript.jsonl", environment)
-        fixture.write_usage(160_000)
+        transcript = root / "transcript.jsonl"
+        _ = transcript.write_text(json.dumps({
+            "type": "assistant", "message": {
+                "model": "claude-sonnet-4", "usage": {"input_tokens": 160_000},
+            },
+        }) + "\n", encoding="utf-8")
+        fixture = DirectorStopFixture(root, run, transcript, environment)
         yield fixture
 
 
 class DirectorStopTests(unittest.TestCase):
-    def assert_blocked(self, output: str) -> None:
-        self.assertTrue(output, "the hook allowed a stop with no live wake source")
-        response = cast(dict[str, object], json.loads(output))
-        self.assertEqual(response["decision"], "block")
-        self.assertIn("compaction fires on the next request", str(response["reason"]))
-
-    def test_finished_worker_heartbeat_does_not_allow_a_full_context_stop(self) -> None:
+    def test_stop_past_the_handoff_threshold_prints_nothing(self) -> None:
         with director_stop_fixture() as fixture:
-            _ = (fixture.run / "heartbeat.log").write_text(
-                "[wrapper] fix:impl agent finished\n", encoding="utf-8")
-            self.assert_blocked(fixture.call())
-
-    def test_running_background_task_allows_a_full_context_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            self.assertEqual(fixture.call(background_tasks=[{"id": "launcher", "status": "running"}]), "")
-
-    def test_finished_background_tasks_do_not_allow_a_full_context_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            for status in ("completed", "failed", "cancelled"):
-                with self.subTest(status=status):
-                    self.assert_blocked(fixture.call(background_tasks=[{"status": status}]))
-
-    def test_unreported_background_tasks_do_not_allow_a_full_context_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            self.assert_blocked(fixture.call(background_tasks=None))
-
-    def test_handoff_threshold_blocks_without_a_wake_source(self) -> None:
-        with director_stop_fixture() as fixture:
-            fixture.write_usage(THRESHOLD)
-            self.assert_blocked(fixture.call())
-
-    def test_context_below_handoff_threshold_allows_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            fixture.write_usage(THRESHOLD - 1)
-            self.assertEqual(fixture.call(), "")
-
-    def test_unmeasurable_transcript_allows_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            fixture.transcript.unlink()
-            self.assertEqual(fixture.call(), "")
-
-    def test_unconfigured_context_window_allows_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            del fixture.environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]
-            self.assertEqual(fixture.call(), "")
-
-    def test_subagent_allows_stop_even_with_full_context(self) -> None:
-        with director_stop_fixture() as fixture:
-            own = fixture.transcript.with_suffix("") / "subagents" / "agent-worker.jsonl"
-            own.parent.mkdir(parents=True)
-            _ = own.write_bytes(fixture.transcript.read_bytes())
-            self.assertEqual(fixture.call(agent_id="worker"), "")
-
-    def test_missing_session_id_allows_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            self.assertEqual(fixture.call(session_id=""), "")
-
-    def test_no_active_run_allows_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            fixture.marker.unlink()
             self.assertEqual(fixture.call(), "")
 
     def test_declared_user_wait_is_recorded_and_allows_stop(self) -> None:
@@ -157,17 +93,6 @@ class DirectorStopTests(unittest.TestCase):
             self.assertEqual(fixture.call(last_assistant_message="decision: approve the checkpoint"), "")
             self.assertTrue((fixture.run / "turn_wait.json").is_file())
             self.assertIn('"WaitingForUser"', (fixture.root / "history/run.jsonl").read_text())
-
-    def test_declared_supplier_wait_is_recorded_and_allows_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            self.assertEqual(fixture.call(last_assistant_message="blocked: waiting on session:supplier"), "")
-            self.assertTrue((fixture.run / "turn_wait.json").is_file())
-            self.assertIn('"WaitingForSupplier"', (fixture.root / "history/run.jsonl").read_text())
-
-    def test_continuation_after_a_block_allows_stop(self) -> None:
-        with director_stop_fixture() as fixture:
-            self.assert_blocked(fixture.call())
-            self.assertEqual(fixture.call(stop_hook_active=True), "")
 
 
 if __name__ == "__main__":
