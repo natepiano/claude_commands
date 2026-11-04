@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import change_review, change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
@@ -194,10 +195,67 @@ class StaffRoutingTests(unittest.TestCase):
             self.assertEqual(router.list_paths, expected)
             self.assertEqual(reads.call_count, len(documents))
 
-    def test_a_showrunner_without_either_document_has_an_unavailable_production(self) -> None:
+    def test_a_showrunner_without_either_document_routes_to_the_root_when_available(self) -> None:
         listing = self.root / "change-review - top.md"
-        assignment = self.router().owner_and_production(listing, {"#": "C1", "Producer": self.unit.id})
+        doc = self.root / "top-production.md"
+        _ = doc.write_text("# Top")
+        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        row = {"#": "C1", "Producer": self.unit.id}
+        assignment = self.router().owner_and_production(listing, row)
+        self.assertEqual(assignment.production, doc)
+        self.assertEqual(assignment.owner, change_routing.ShowrunnerOwnChange(self.top.id, "top"))
+        doc.unlink()
+        assignment = self.router().owner_and_production(listing, row)
         self.assertEqual(assignment.production, change_routing.UnavailableProduction(listing))
+        self.assertEqual(assignment.owner, change_routing.StaffRoutedChange(self.unit.id, self.child.id, "child"))
+
+    def test_an_orphan_list_routes_to_the_configured_root_with_an_available_document(self) -> None:
+        listing = self.root / "change-review - orphan.md"
+        doc = self.root / "top-production.md"
+        _ = doc.write_text("# Top")
+        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        config = self.root / "config"
+        config.mkdir()
+        setting = config / "review_links.conf"
+        _ = setting.write_text("unrouted_alert_recipient=top\n")
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        router = self.router()
+        row = {"#": "C1"}
+        original = change_routing.ShowrunnerOwnChange(change_routing.MissingShowrunner("orphan"), "orphan")
+        expected = change_routing.ShowrunnerOwnChange(self.top.id, "top")
+        with mock.patch.object(conf, "read", wraps=conf.read) as reads:
+            for number in range(3):
+                orphan = {"#": f"C{number + 1}"}
+                assignment = router.owner_and_production(listing, orphan)
+                self.assertEqual(assignment.owner, expected)
+                self.assertEqual(assignment.production, doc)
+                self.assertEqual(router.owner(orphan, listing), assignment.owner)
+            reads.assert_called_once_with("review_links")
+        normal = self.router()
+        with mock.patch.object(conf, "read", wraps=conf.read) as reads:
+            assignment = normal.owner_and_production(self.root / "change-review - top.md", row)
+            self.assertEqual(assignment.production, doc)
+            self.assertEqual(assignment.owner, change_routing.ShowrunnerOwnChange(self.top.id, "top"))
+            self.assertEqual(normal.owner(row, self.root / "change-review - top.md"), assignment.owner)
+            reads.assert_not_called()
+        _ = listing.write_text(f'---\nproductions:\n  - "{doc}"\n---\n')
+        documents = change_routing.production_documents({}, [("orphan", listing.read_text())])
+        stamped = change_routing.StaffRouting(staff.snapshot(), documents)
+        assignment = stamped.owner_and_production(listing, row)
+        self.assertEqual(assignment, change_routing.ChangeAssignment(expected, doc))
+        self.assertEqual(stamped.owner(row, listing), assignment.owner)
+        _ = setting.write_text("unrouted_alert_recipient=missing\n")
+        self.assertEqual(router.owner_and_production(listing, row).owner, expected)
+        assignment = self.router().owner_and_production(listing, row)
+        self.assertEqual(assignment, change_routing.ChangeAssignment(original, change_routing.UnavailableProduction(listing)))
+        _ = setting.write_text("unrouted_alert_recipient=top\n")
+        doc.unlink()
+        assignment = self.router().owner_and_production(listing, row)
+        self.assertEqual(assignment, change_routing.ChangeAssignment(original, change_routing.UnavailableProduction(listing)))
 
     def test_an_existing_staff_document_wins_over_the_supplied_document(self) -> None:
         supplied, authoritative = self.root / "supplied.md", self.root / "staff.md"

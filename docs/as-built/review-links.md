@@ -117,6 +117,13 @@ The `lists_directory` setting names this folder.
 This override never makes a list real.
 Lists outside this folder print the routing note without sending an alert or writing an alert record.
 `unrouted_alert_recipient` starts at `natedev` in `config/review_links.conf`.
+A change goes to this root showrunner when its list has no staff showrunner or its production document is gone.
+The page, the verdict and the footer counts use the same owner.
+The router keeps an available document, including a document that an earlier verdict added to the list.
+Otherwise, the router uses the root showrunner's current document.
+If neither document is available, the page shows the unavailable message.
+If the root showrunner is unavailable, the router keeps the original owner.
+The router reads the root setting once when it first needs this rule.
 `unrouted_alert_retry_seconds` starts at 60 and accepts 5 through 3600 seconds.
 The router reads both keys when it uses them.
 A private record stores the last attempt time and accepted alert for each row and reason.
@@ -128,12 +135,12 @@ A new reason permits one new alert.
 A crash between acceptance and the durable mark can repeat an alert.
 Routed rows and rows that need no user answer send no routing alert.
 
-The status count watches the staff record, review lists, and delivery records.
+The status count watches the routing configuration, staff record, review lists, and delivery records.
 The owner's staff document supplies the production document when the file exists.
 The supplied production document for that showrunner is the fallback.
 A missing document reference in the source list does not block a row with an available owner document.
 An unrouted row retains verdict controls when its list's staff showrunner has an available document.
-Its owner remains unrouted and receives no message.
+In that case, its owner remains unrouted and receives no message.
 
 `merge_checkpoint`, `merge_gate`, and `change_review.py append` store each checkpoint unit's Producer id.
 `merge_gate` reads the staff record before the merge.
@@ -527,7 +534,9 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_allocation_tries` limits folder allocation attempts.
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
-`unrouted_alert_recipient` selects the alert recipient.
+`unrouted_alert_recipient` selects the alert recipient and the root showrunner for changes that nobody can take.
+This rule applies when the list has no staff showrunner or its production document is gone.
+If no document is available for the change or the root showrunner, the page shows the unavailable message.
 `unrouted_alert_retry_seconds` controls repeated alerts.
 
 The routing scripts read `config/change_review.conf` when they need a folder.
@@ -536,7 +545,7 @@ The routing scripts read `config/change_review.conf` when they need a folder.
 `CHANGE_REVIEW_DIR` overrides the reader folder for tests.
 Each publication uses one delivery root for the HTML and its manifest.
 Each router resolves the configured alert folder once, when an unsaved unrouted row needs it.
-The status line watches `change_review.conf` so folder changes invalidate its counts.
+The status line watches `change_review.conf` and `review_links.conf` so folder and root showrunner changes invalidate its counts.
 The alert guard uses only the configured folder.
 `REVIEW_LINKS_ROOT` overrides the delivery folder.
 The page, the footer and `/next` use these same folder readers.

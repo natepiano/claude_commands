@@ -448,6 +448,8 @@ class NewAccountTests(unittest.TestCase):
                 steps = new_account.codex_steps(account)
                 alias.assert_called_once_with(account)
                 self.assertIn("set up and signed in", steps[0].text)
+                self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap workers codex3",
+                              steps[0].text)
                 self.assertIn('codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";', steps[-1].text)
                 self.assertTrue(steps[-1].done)
 
