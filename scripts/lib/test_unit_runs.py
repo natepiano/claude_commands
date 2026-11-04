@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -9,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import IO, TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -24,6 +25,19 @@ else:
 
 
 class RunOwnerMigrationTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        lock = fcntl.flock
+
+        def fail_on_lock_wait(descriptor: int | IO[str], operation: int) -> None:
+            try:
+                lock(descriptor, operation | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise AssertionError(f"run-owner migration test would block on a file lock: {descriptor}") from error
+
+        _ = self.enterContext(patch.object(fcntl, "flock", side_effect=fail_on_lock_wait))
+        super().setUp()
+
     def test_interrupted_owner_migration_repeats_after_clear_without_changing_history_or_finished_runs(self) -> None:
         owner = fixture_member("showrunner", name="production")
         row = fixture_member("unit", name="tools", parent=owner.id)
@@ -40,9 +54,14 @@ class RunOwnerMigrationTests(StaffTestCase):
         before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)]
         publish = atomic_file.write_text_atomic
         changed_session = fixture_runtime_id("run-owner-clear")
+        interrupted_once = False
 
         def interrupted(path: Path, text: str) -> None:
+            nonlocal interrupted_once
             publish(path, text)
+            if path != runs / "a" / unit_runs.STATE_FILE or interrupted_once:
+                return
+            interrupted_once = True
             _ = staff.update_current_session(row.id, staff.StaffId(changed_session))
             raise RuntimeError("migration interrupted")
 
@@ -66,6 +85,7 @@ class RunOwnerMigrationTests(StaffTestCase):
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)], before)
 
     def test_unproved_owner_keeps_the_active_run_and_reports_unavailable(self) -> None:
+        _ = fixture_member("showrunner", name="production")
         run = self.root / "runs/unknown"
         run.mkdir(parents=True)
         path = run / unit_runs.STATE_FILE
