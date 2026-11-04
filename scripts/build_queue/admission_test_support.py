@@ -21,7 +21,7 @@ from unittest import mock
 from typing import cast, override
 
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_service as service
 from scripts.build_queue.queue_fixture import write_process
@@ -311,12 +311,13 @@ class AdmissionFixture(ExitStack):
             "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
             "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.state_dir.parent),
             "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+            "BUILDLOG_RUN": "",
             "BUILDLOG_BUILD_BUDGET_GIB": "21", "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
             "HOME": str(self.root)}
         self.enter_context(mock.patch.dict(os.environ, environment))
-        if not (self.root / "lint.conf").exists():
-            write_memory_config(self.root / "lint.conf")
+        if not (self.root / "build_admission.conf").exists():
+            write_memory_config(self.root / "build_admission.conf")
         self.readings: PrivateReadings = PrivateReadings(self.root)
         self.loop_access: threading.RLock = threading.RLock()
         try:
@@ -373,7 +374,10 @@ class AdmissionFixture(ExitStack):
     def run_pass(self) -> gate.PassResult:
         """Keep a test pass separate from the private loop's current event."""
         with self.loop_turn():
-            return self.server.run_pass()
+            result = self.server.run_pass()
+            if isinstance(result, gate.UnusableAdmissionConfiguration):
+                raise AssertionError(result.reason)
+            return result
 
     @contextmanager
     def loop_turn(self) -> Generator[None]:
@@ -385,7 +389,7 @@ class AdmissionFixture(ExitStack):
             self.loop_access.release()
 
     def configure(self, **seconds: float) -> None:
-        write_memory_config(self.root / "lint.conf", **{name: str(value) for name, value in seconds.items()})
+        write_memory_config(self.root / "build_admission.conf", **{name: str(value) for name, value in seconds.items()})
 
     def scope_events(self) -> ScopeEvents:
         events = ScopeEvents(self.server.epoll)
@@ -421,6 +425,36 @@ class AdmissionFixture(ExitStack):
         self.proc.register(owner)
         return owner
 
+    def run_owner(self) -> wire.RunIdentity:
+        """Give a verify run its own process and real pidfd lifetime."""
+        owner = self.proc.spawn(used=0)
+        return wire.RunIdentity(owner.pid, owner.start_time)
+
+    def end_run(self, run: wire.RunIdentity) -> None:
+        """Deliver the run's real exit event while its child steps remain alive."""
+        self.end_owner(wire.Owner(run.pid, run.start_time))
+
+    def end_owner(self, owner: wire.Owner) -> None:
+        """End a real fixture process and deliver its exit event."""
+        self.proc.kill(owner)
+        self.server.run_once(0)
+
+    def finish_step(self, request: wire.AdmitRequest, *, end_owner: bool = False) -> wire.Admitted:
+        """Admit and release a step without retaining its memory charge."""
+        granted = only_admitted(self.server.handle_request(request))
+        replies = self.server.handle_request(wire.ReleaseRequest(f"finish-{request.episode}", granted.reservation, 0))
+        if replies != [wire.Ok()]:
+            raise AssertionError(f"step release failed: {replies!r}")
+        if end_owner:
+            self.end_owner(request.owner)
+        return granted
+
+    def queue_pids(self) -> list[int]:
+        """Read the queue order through the public view request."""
+        reply, = self.server.handle_request(wire.ViewRequest())
+        assert isinstance(reply, wire.ViewReply)
+        return [row["pid"] for _, row in reply.reading.ordered]
+
     def end_fixture_owner(self, pid: int) -> None:
         with self.loop_turn():
             del self.proc.fixture_owners[pid]
@@ -439,7 +473,10 @@ class AdmissionFixture(ExitStack):
     def request(self, *, need: int = 8 * GIB, owner: wire.Owner | None = None,
                 episode: str = "", since: float | None = None, age: float = 0,
                 width: gate.TestWidth = DEFAULT_WIDTH,
-                call: gate.Call = DEFAULT_CALL, step: str = "nextest") -> wire.AdmitRequest:
+                call: gate.Call = DEFAULT_CALL, step: str = "nextest",
+                run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> wire.AdmitRequest:
+        from scripts.build_queue.admission_client import LOADED_ADMISSION_CODE_VERSION
+
         owner = owner or self.proc.spawn()
         generation: gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration = gate.NoBuildHistoryGeneration()
         if step == "build":
@@ -449,12 +486,12 @@ class AdmissionFixture(ExitStack):
         return wire.AdmitRequest(episode or f"episode-{owner.pid}", owner, ("cargo", step),
             str(self.root), self.clock.now() if since is None else since, "",
             wire.Identity(f"session-{owner.pid}", "fixture", step, str(self.root)), call, width,
-            profile, False)
+            profile, False, run=run, code_version=LOADED_ADMISSION_CODE_VERSION)
 
     def launch(self, *, need: int = 8 * GIB, since: float | None = None) -> wire.LaunchRequest:
         request = self.request(need=need, since=since)
         return wire.LaunchRequest(request.episode, request.owner, request.since,
-                                  request.identity, request.profile)
+                                  request.identity, request.profile, code_version=request.code_version)
 
     def connect(self, request: wire.Request | str) -> SocketPeer:
         peer = SocketPeer(self, request)
@@ -616,7 +653,7 @@ def wait_reply(reason: gate.WaitReason, position: int = 1, head: str = "head",
     peak = gate.ExpectedPeak(8 * GIB, "fallback", 0)
     decision = gate.decide(0, 60 * GIB, peak.bytes, [], limits=gate.AdmissionLimits(21 * GIB, 3 * GIB))
     snapshot = gate.AdmissionWaitSnapshot(decision, peak, (), 0, "repo", "nextest",
-                                         gate.DEFAULT_ADMISSION_POLICY, ())
+                                         admission_policy_fixture(), ())
     return wire.Wait(reason, position, head, text, snapshot)
 
 

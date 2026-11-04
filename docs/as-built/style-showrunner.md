@@ -603,7 +603,7 @@ Each start uses `QueuePlace.popen`; the shared queue controls admission, scope a
 `verify.sh` retains its existing place.
 A dry run that starts no program requests no place.
 
-The queue reads `[memory]` at each program start.
+The queue reads `[memory]` from `config/build_admission.conf` at each program start.
 `program_first_peak_gib.rust-analyzer` and `program_first_peak_gib.cargo` supply the first peaks before this host has program history.
 The existing queue uses measured program peaks when history exists.
 Missing or invalid first peaks refuse the start, even when history exists.

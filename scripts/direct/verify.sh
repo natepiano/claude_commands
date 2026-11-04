@@ -998,6 +998,14 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
     esac
 fi
 
+# Set the run identity after detachment so the run owns its queue place.
+if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
+    BUILDLOG_RUN_START="$("$PY" "$STEP_RECORD_SCRIPT" start "$$")"
+    if [[ -n "$BUILDLOG_RUN_START" ]]; then
+        export BUILDLOG_RUN="$$:$BUILDLOG_RUN_START"
+    fi
+fi
+
 CMD="${1:-}"
 if [[ -z "$CMD" ]]; then
     usage
