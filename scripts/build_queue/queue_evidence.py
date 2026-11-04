@@ -9,7 +9,8 @@ from typing import assert_never
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts
-from scripts.build_queue.queue_lines import age
+from scripts.build_queue.queue_lines import age, field
+from scripts.build_queue.scope_activity import IdleService, NotServiceSlice, RunningServiceJob
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 
@@ -196,16 +197,36 @@ def release_text(release: gate.HeadAfterEnd, explanation: gate.QueueExplanation,
     return text
 
 
+def service_text(memory: gate.CompilerServiceMemory | gate.UnownedSliceMemory, now: float) -> str:
+    """Show service RAM and swap with the job state from the same pass."""
+    state = memory.job_state
+    if isinstance(state, NotServiceSlice):
+        raise ValueError("a build scope has no service state")
+    if isinstance(state, RunningServiceJob):
+        elapsed = f"{age(state.started_at, now)} min" if state.started_at else "age unknown"
+        activity = f"running job, {elapsed}"
+    else:
+        activity = "idle"
+    name = memory.owner if isinstance(memory, gate.UnownedSliceMemory) else "sccache.service"
+    return f"{field(name)}: {activity}; {gib(memory.bytes)} RAM; {gib(memory.swap_bytes)} swapped"
+
+
 def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExplanation,
                  labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo) -> str:
+    memory = running.step.measured
+    if isinstance(memory, gate.CompilerServiceMemory) or (
+            isinstance(memory, gate.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
+        return (service_text(memory, explanation.now)
+                + f"; promise {gib(running.promise)}, charge {gib(running.charged)}")
     identity = step_labels(running.step, labels)
     admitted = running.admitted_at
     started = ("admission time unknown" if isinstance(admitted, gate.AdmissionTimeNotRecorded) else
                f"admitted {head_facts.clock(admitted, zone, seconds=False)} ({age(admitted, explanation.now)} min ago)")
     using = gib(running.measured) if isinstance(running.step.measured, gate.MeasuredMemory) else "—"
+    swap = f"; {gib(memory.swap_bytes)} swapped" if isinstance(memory, gate.MeasuredMemory) and memory.swap_bytes else ""
     return (f"{identity.showrunner} / {identity.unit} / {identity.session}, {running.step.step}: {started}; "
             + f"promise {gib(running.promise)}, charge {gib(running.charged)}, using now {using}; "
-            + charge_text(running.basis, zone, explanation.policy, running.step.step))
+            + charge_text(running.basis, zone, explanation.policy, running.step.step) + swap)
 
 
 def need_details(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:

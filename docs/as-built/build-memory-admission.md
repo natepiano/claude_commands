@@ -308,13 +308,22 @@ The first selected charge evidence is persisted outside the pure pass. A failed 
 Each pass counts `sccache.service` and unowned child scopes under `builds.slice`.
 `ci_memory_slice` in `[memory]` of `config/build_admission.conf` names the system CI slice.
 `systemctl show` supplies its cgroup path. Each pass reads its `memory.current`, `memory.stat`, swap, and `memory.max` through `unowned_slice_memory`.
-Unowned scopes and the CI slice use one working-set rule: `max(0, memory.current - memory.stat inactive_file) + swap`.
-An idle CI slice charges this working set. Inactive file cache holds no build budget.
+Step scopes, unowned scopes, the compiler cache, and CI use one resident working-set rule: `max(0, memory.current - memory.stat inactive_file)`.
+An idle CI slice charges this resident working set. Inactive file cache and swap hold no build budget.
+Process-tree readings charge RSS and record swap separately. Every reading retains `swap_bytes` for display.
 A `Runner.Worker` adds `ci_memory_margin_gib` for growth between passes, capped at the live slice limit.
 The charge never falls below the working set. Each pass reads the margin and the limit again.
 The promise reserves free RAM for the added margin. An unavailable reading refuses new grants and retries on the next pass.
 Releases remain available during a reading refusal.
 `UnownedSliceMemory` names each unowned scope and its size. Process-tree charges are subtracted to prevent duplicate charges.
+The CI slice and compiler cache always have service rows, including zero RAM readings.
+`IdleService` shows `idle` without an age.
+`RunningServiceJob` records the oldest live `Runner.Worker` start time and shows `running job` with its age.
+Listener uptime never supplies the CI job age. The compiler cache always shows `idle`.
+The board and card show RAM and a separate `GiB swapped` label.
+`NotServiceSlice` retains the build-scope activity rules.
+Existing saved peaks and reservation promises keep their recorded values, including swap in peaks recorded before resident accounting.
+New CI promises use resident working set plus the configured margin, capped at the slice limit.
 The held head shows free memory, reserve, and need from `HeadExplanation`.
 
 ### Clients and program places
