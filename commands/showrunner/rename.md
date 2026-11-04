@@ -29,7 +29,8 @@ Show the output. On a nonzero exit, show the error and stop. Use this order:
    `anomaly: <step>: <reason>`, and the next step runs. Run `apply` again
    until it prints `unchanged`.
 3. For each unit that is not retired, run `unit <new> <unit>` with its exact
-   staff row name. `unit` uses the folder move: it stops the unit and its
+   staff row name. Staff and `.unit.toml` hold unit facts; production docs have no Units table.
+   `unit` uses the folder move: it stops the unit and its
    workers, moves the worktree, writes the staff worktree and starts them
    again. Then it renames the unit branch with `git branch -m`. A rerun with
    nothing to change prints `<unit>: unchanged`.
