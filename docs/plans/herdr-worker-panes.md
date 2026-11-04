@@ -613,7 +613,9 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 - The live fill starts at each existing staff row. A timer selects a showrunner's live merge checkout and doc. A unit takes its location from that doc's Units row or its proved live session folder when the row is stale. The fill refuses unequal existing fields, lists unfilled rows with reasons, continues complete rows, and resumes a stopped row-to-file publication. A finished rerun changes nothing. Failed timer evidence keeps its durable owner id, including nested showrunners.
 - The stored showrunner doc is the one retired source. Scratch copies, other worktrees and branch-tip copies cannot override it. Missing owners and historical facts stay listed. New retired rows belong to Phase 3h; this phase has no pending writer assignment.
 
-### Phase 3k — `.unit.toml` writers emit taplo-formatted text  · status: todo
+### Phase 3k — `.unit.toml` writers emit taplo-formatted text  · status: done (models-unit 3ed6b4e3c on sdlc; live proof by style-unit)
+
+**Evidence (style-unit, 2026-11-04):** `taplo fmt --check` passes on 49 of 49 `.unit.toml` files; a `staff_sources` dry-run prints unchanged on natedev and on the Mac.
 
 **Owner:** models-unit (sdlc split, 2026-11-02 08:23).
 
@@ -1313,7 +1315,9 @@ Make no unproved write and create no second row.
 
 **Acceptance gate:** `grep -rnE '\*\*Production:\*\*|gate_names|## Gates' scripts commands docs/direct docs/production_format.md` finds nothing; a unit director in a real production finds its showrunner from the row; a real merge checkpoint runs with the staged-file, shrink and as-built checks; the suites pass; full gate green. No rerun test: a delete.
 
-### Phase 4m — Port audit: every unit's port is in its `.unit.toml`  · status: todo
+### Phase 4m — Port audit: every unit's port is in its `.unit.toml`  · status: done (models-unit 42a7ef32d on sdlc; live proof by style-unit)
+
+**Evidence (style-unit, 2026-11-04):** the audit reads 13 AppPort, 54 NoAppPort and 1 ConfigMissing rows and writes nothing. 4d deleted the audit after this run. Tables: /tmp/claude/scratch/style-unit-ports-evidence/.
 
 **Owner:** models-unit (sdlc split, 2026-11-02 08:23).
 
