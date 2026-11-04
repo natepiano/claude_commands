@@ -404,7 +404,8 @@ When the production doc's **Production rules** say CI does not apply, pass
 For a planned production, run
 `python3 ~/.claude/scripts/production/production_lifecycle.py open
 --production PRODUCTION_DOC`. The command creates and pushes the merge
-branch, records the running doc and plans, and initializes `LOG`. Rerun it
+branch, records the running doc, finds the plans from staff rows and
+`.unit.toml`, and initializes `LOG`. Rerun it
 after a failed step; it resumes at the first unfinished step.
 </OpenMergeBranch>
 
