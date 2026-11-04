@@ -155,6 +155,11 @@ def stream(arguments):
     if mode in ("run-refusal", "after-probe"):
         wire, status = "linux_startup=unresolved\n", 75
         (root / (request.target + ".marker")).touch()
+    elif mode == "runtime-version-mismatch":
+        wire = (request.target + " version mismatch: rustc box=rustc other natedev=rustc fixture; "
+                + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/aws-build.nix\n"
+                + "mac_cleanup=kept\n")
+        status = 75
     elif mode in ("interrupted", "other-generation"):
         generation = "fixture-generation" if mode == "interrupted" else "old-generation"
         wire, status = "aws_interrupted=" + generation + "\n", 255
@@ -320,9 +325,15 @@ class VerifySshTargetsTests(VerifyMacOffloadFixture):
 
     def test_pinned_target_refusal_keeps_the_reason_and_never_runs_locally(self) -> None:
         self.configure("natedev,aws")
+        settings = self.root / "aws_target.conf"
+        _ = settings.write_text(settings.read_text() + "version_pin_file=nixos hosts/aws-build.nix\n")
         for mode, reason, detail in (
             ("disk", "disk", "not running on the aws (disk)"),
-            ("version-mismatch", "unreachable", "public tools or tracked scripts differ"),
+            ("version-mismatch", "aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
+             + "move the box pins in nixos hosts/aws-build.nix", "rustc box=rustc other"),
+            ("runtime-version-mismatch", "aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
+             + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/aws-build.nix",
+             "nextest box=nextest other"),
             ("probe-leftovers", "busy", "2 leftover processes"),
         ):
             with self.subTest(mode=mode):
@@ -334,6 +345,7 @@ class VerifySshTargetsTests(VerifyMacOffloadFixture):
                 self.assertIn(detail, result.stdout + result.stderr)
                 self.assertEqual(self.local_runs(), [])
                 self.assertEqual(self.admission.history(), [])
+                self.assertEqual(self.attempts()[-1]["reason"], reason)
 
     def test_pinned_wait_keeps_its_live_record_until_aws_becomes_available(self) -> None:
         self.configure("natedev,aws")

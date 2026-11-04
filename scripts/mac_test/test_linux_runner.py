@@ -248,8 +248,11 @@ class LinuxShellTests(unittest.TestCase):
                     else:
                         status = 0
                 return subprocess.CompletedProcess(argv, status, "", "")
-            completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=capture_output,
+            completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
                                  text=True, timeout=timeout, env=env)
+            if not capture_output:
+                print(completed.stdout, end="")
+                print(completed.stderr, end="", file=sys.stderr)
             if interrupt and argv[:2] == ["bash", "-c"]:
                 interrupt_runner(self.permission_directory, self.permission_at)
             return completed
@@ -620,7 +623,8 @@ class LinuxShellTests(unittest.TestCase):
         for tool in ("rustc", "cargo"):
             self.write_tool(self.root / "bin" / tool)
         _ = self.settings.write_text(self.settings.read_text()
-                                    + "parity.rustc=rustc fixture\nparity.nextest=nextest fixture\nparity.mend=mend fixture\n")
+                                    + "parity.rustc=rustc fixture\nparity.nextest=nextest fixture\nparity.mend=mend fixture\n"
+                                    + "version_pin_file=nixos hosts/aws-build.nix\n")
         self.environment["FAKE_NIX_EXPORTS"] = "export TEST_SHELL_TOOL_VERSION=different"
 
         result = self.execute(self.request())
@@ -628,6 +632,38 @@ class LinuxShellTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("mac_exit=", result.stdout)
         self.assertIn("mac_cleanup=", result.stdout)
+        self.assertFalse(self.events("lint"))
+        self.assertEqual(result.stderr.splitlines(), [
+            "aws version mismatch: rustc box=rustc different natedev=rustc fixture; "
+            + "nextest box=nextest different natedev=nextest fixture; "
+            + "mend box=mend different natedev=mend fixture; move the box pins in nixos hosts/aws-build.nix",
+        ])
+
+    def test_version_decline_uses_the_selected_target_and_configured_pin_file(self) -> None:
+        for tool in ("rustc", "cargo"):
+            self.write_tool(self.root / "bin" / tool)
+        values = {**offload.read_config(self.settings).values, "selected_target": "builder",
+                  "parity.rustc": "rustc required", "version_pin_file": "nixos hosts/builder.nix"}
+        output, errors = io.StringIO(), io.StringIO()
+        real_run = subprocess.run
+
+        def capture(argv: list[str], *, cwd: Path | str = "", check: bool = False,
+                    capture_output: bool = False, text: bool = False, timeout: float = 5) -> subprocess.CompletedProcess[str]:
+            _ = text
+            reply = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True, timeout=timeout)
+            if not capture_output:
+                print(reply.stdout, end="")
+                print(reply.stderr, end="", file=sys.stderr)
+            return reply
+
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                mock.patch.object(subprocess, "run", side_effect=capture), \
+                mock.patch.object(linux_runner, "trim_build_folder", return_value=0), \
+                redirect_stdout(output), redirect_stderr(errors):
+            status = linux_runner.execute_slot(self.mirror, values, "hana", "check", (), "call", "tree")
+        self.assertEqual(status, 75)
+        self.assertEqual(errors.getvalue(), "builder version mismatch: rustc box=rustc fixture "
+                         + "natedev=rustc required; move the box pins in nixos hosts/builder.nix\n")
         self.assertFalse(self.events("lint"))
 
     def test_check_and_staged_doc_keep_their_arguments_and_document_policy(self) -> None:
@@ -1244,6 +1280,7 @@ class LinuxCopyTests(unittest.TestCase):
     def test_script_stamp_never_labels_dirty_worktree_bytes_as_the_head_commit(self) -> None:
         runner = self.write_source("scripts/mac_test/linux_runner.py", "committed runner\n")
         _ = self.write_source("config/aws_target.conf", "host=fake-linux\n")
+        _ = self.write_source("config/build_folders.conf", "prefixes.verify-hold=verify-hold-\n")
         _ = self.git("add", "scripts", "config")
         _ = self.git("commit", "-qm", "Fixture scripts")
         commit = self.git("rev-parse", "HEAD")
@@ -1255,6 +1292,8 @@ class LinuxCopyTests(unittest.TestCase):
                 mock.patch.object(controller, "capture", side_effect=self.capture):
             self.assertTrue(offload.copy_tracked_scripts(controller, self.config()))
             self.assertEqual((self.destination / "scripts/mac_test/linux_runner.py").read_text(), "committed runner\n")
+            self.assertEqual((self.destination / "config/build_folders.conf").read_text(),
+                             "prefixes.verify-hold=verify-hold-\n")
             self.assertTrue(self.stamps)
             self.assertIn(commit, self.stamps[-1])
             shutil.rmtree(self.destination)
