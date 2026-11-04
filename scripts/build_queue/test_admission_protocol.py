@@ -32,6 +32,26 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(gate.parse_snapshot_value(old, gate.UnownedSliceMemory),
                          gate.UnownedSliceMemory(GIB, owner="scope"))
 
+    def test_service_job_state_and_separate_swap_survive_the_view_reply(self) -> None:
+        from scripts.build_queue.scope_activity import IdleService, RunningServiceJob
+        from scripts.build_queue.queue_fixture import queue_read_fixture
+
+        for state in (IdleService(), RunningServiceJob(NOW - 120)):
+            with self.subTest(state=state):
+                memory = gate.UnownedSliceMemory(GIB // 10, swap_bytes=2 * GIB,
+                    owner="hana-ci.slice", job_state=state)
+                step = gate.RunningStep("", "", "unowned", "ci.slice", 0, memory)
+                view = gate.QueueView((), (step,), 20 * GIB, 0, 3 * GIB, NOW)
+                reading = queue_read_fixture(view, policy=admission_policy_fixture())
+                reply = wire.ViewReply(reading)
+                parsed = wire.parse_reply(wire.encode_reply(reply))
+                self.assertEqual(parsed, reply)
+                assert isinstance(parsed, wire.ViewReply)
+                shown = queue_evidence.running_text(parsed.reading.explanation.running[0],
+                    parsed.reading.explanation, {}, ZoneInfo("UTC"))
+                self.assertIn("0.1 GiB RAM; 2.0 GiB swapped", shown)
+                self.assertIn("running job, 2 min" if isinstance(state, RunningServiceJob) else "idle", shown)
+
     def test_main_display_fields_and_diagnostics_remain_readable(self) -> None:
         from scripts.build_queue.scope_activity import LiveBuildRun
         from scripts.build_queue.queue_fixture import queue_read_fixture

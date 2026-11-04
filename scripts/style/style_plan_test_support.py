@@ -128,7 +128,7 @@ class StylePlanFixture(unittest.TestCase):
         })))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
-        owner = recorded_showrunner("sample-style", self.doc)
+        owner = recorded_showrunner("sample-style", self.doc, "sample")
         _ = fixture_unit_location(owner, "names-unit", self.unit)
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
         _ = self.enterContext(mock.patch.object(berth_board, "read_board", return_value=self.board()))
@@ -281,7 +281,7 @@ class StylePlanFixture(unittest.TestCase):
         plan.parent.mkdir(parents=True)
         _ = plan.write_text(self.plan_header())
         self.unit_plan_config(worktree, "modules-unit.md")
-        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "modules-unit", worktree)
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc, "sample"), "modules-unit", worktree)
         return plan
 
     def unit_takes_tip(self) -> None:
@@ -328,7 +328,7 @@ class StylePlanFixture(unittest.TestCase):
         plan.parent.mkdir(parents=True)
         _ = plan.write_text(self.plan_header().replace("names-unit", "types-unit"))
         self.unit_plan_config(types, "types-unit.md")
-        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "types-unit", types)
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc, "sample"), "types-unit", types)
         return plan
 
     def names_files(self) -> set[str]:

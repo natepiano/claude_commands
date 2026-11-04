@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import NamedTuple, cast, override
 from unittest.mock import MagicMock, patch
 
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
@@ -52,6 +53,7 @@ class MeshRunsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.stack = contextlib.ExitStack()
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        _ = self.stack.enter_context(isolated_staff_file(self.root / "staff.json", {}))
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
         _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
@@ -133,7 +135,7 @@ class MeshRunsTests(unittest.TestCase):
         design_id = "00000000-0000-4000-8000-000000000076"
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
             str(self.root), str(self.root / "design.md"), "design", "2026-10-21T12:00:00+00:00",
-            design_roles.UnitHolder("demo", "design-unit"), design_roles.DesignUnbound(),
+            design_roles.DesignUnbound(),
             (design_roles.RoleInstance("designer", "unused", design_roles.RoleNotOpened()),
              design_roles.RoleInstance("reviewer", WORKER, design_roles.RoleOpen("thread-1"))))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]

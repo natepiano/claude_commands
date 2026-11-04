@@ -29,7 +29,8 @@ from types import UnionType, MappingProxyType
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue.scope_activity import EmptyBuildScope, LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses
+from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
+    NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
@@ -692,7 +693,7 @@ PeakHistory = NoPeakRecorded | PeakSoFar | PeakDecayed | PeakFileUnreadable | Te
 class MeasuredMemory:
     bytes: int
     promise: MemoryPromise = NoPromise()
-    # Swap counts toward the build charge, but its release does not free RAM.
+    # Swap is shown separately and does not consume the resident memory budget.
     swap_bytes: int = 0
     observed_peak: int = 0
     # An existing peak file could not be read; its promise remains a floor.
@@ -704,12 +705,15 @@ class MeasuredMemory:
 class CompilerServiceMemory(MeasuredMemory):
     """Compiler charge, without a build reservation or run-alone veto."""
 
+    job_state: IdleService = IdleService()
+
 
 @dataclass(frozen=True)
 class UnownedSliceMemory(MeasuredMemory):
     cgroup: str = ""
     owner: str = ""
     activity: ScopeProcesses | EmptyBuildScope = EmptyBuildScope()
+    job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
 
 
 @dataclass(frozen=True)
@@ -1787,6 +1791,7 @@ class MemoryConfig:
     reconnect_seconds: float
     silence_seconds: float
     outage_notice_seconds: float
+    unreachable_limit_seconds: float
     source_check_seconds: float
     source_settle_seconds: float
     override_reconnect_seconds: float
@@ -1865,7 +1870,9 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 wait_reply_seconds=number("wait_reply_seconds"), query_timeout_seconds=number("query_timeout_seconds"),
                 replay_retention_seconds=number("replay_retention_seconds"),
                 reconnect_seconds=number("reconnect_seconds"), silence_seconds=number("silence_seconds"),
-                outage_notice_seconds=number("outage_notice_seconds"), source_check_seconds=number("source_check_seconds"),
+                outage_notice_seconds=number("outage_notice_seconds"),
+                unreachable_limit_seconds=number("unreachable_limit_seconds"),
+                source_check_seconds=number("source_check_seconds"),
                 source_settle_seconds=number("source_settle_seconds"), override_reconnect_seconds=number("override_reconnect_seconds"),
                 request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
@@ -1927,7 +1934,12 @@ def decide(available: int, total: int | UnknownHostTotal, need: int, running: li
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
-    return any(not isinstance(row, (CompilerServiceMemory, GoneMemory)) for row in running)
+    return any(not isinstance(row, (CompilerServiceMemory, GoneMemory))
+               and not (isinstance(row, UnownedSliceMemory)
+                        and not isinstance(row.job_state, NotServiceSlice)
+                        and isinstance(row.activity, EmptyBuildScope)
+                        and row.bytes == 0)
+               for row in running)
 
 
 def build_charge(memory: StepMemory) -> int:
@@ -2779,7 +2791,7 @@ def process_tree(roots: Mapping[int, str], processes: dict[int, ProcessIdentity]
 
 
 def process_memory(pids: set[int], proc: Path = PROC) -> MeasuredMemory:
-    """Sum resident and swapped bytes for a set of processes."""
+    """Sum resident bytes and record swap separately for a set of processes."""
     used, swapped = 0, 0
     for child in pids:
         try:
@@ -2787,9 +2799,10 @@ def process_memory(pids: set[int], proc: Path = PROC) -> MeasuredMemory:
                 parts = line.split()
                 if parts and parts[0] in ("VmRSS:", "VmSwap:"):
                     size = int(parts[1]) * 1024
-                    used += size
                     if parts[0] == "VmSwap:":
                         swapped += size
+                    else:
+                        used += size
         except (OSError, ValueError, IndexError):
             continue
     return MeasuredMemory(used, swap_bytes=swapped)
@@ -2797,7 +2810,7 @@ def process_memory(pids: set[int], proc: Path = PROC) -> MeasuredMemory:
 
 def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
                 proc: Path = PROC) -> MeasuredMemory | GoneMemory:
-    """Sum resident and swapped bytes from one process table reading."""
+    """Read resident bytes and swap separately from one process table reading."""
     members = process_tree({pid: start}, processes)
     return process_memory(members, proc) if members else GoneMemory()
 
@@ -2848,13 +2861,8 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
     if isinstance(lifetime, EndedStep):
         return GoneMemory()
     if isinstance(lifetime, PopulatedStepScope):
-        current = lifetime.directory / "memory.current"
-        swap = lifetime.directory / "memory.swap.current"
-        check_memory_reading(current)
-        check_memory_reading(swap)
         try:
-            used, swapped = int(current.read_text()), int(swap.read_text())
-            reading = MeasuredMemory(used + swapped, swap_bytes=swapped)
+            reading = slice_working_set(lifetime.directory)
         except FileNotFoundError:
             if not owner_live:
                 return GoneMemory()
@@ -2946,17 +2954,11 @@ def sccache_memory() -> list[StepMemory]:
     """Charge the compiler service once, outside all step process trees."""
     directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
         f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
-    path = directory / "sccache.service/memory.stat"
-    check_memory_reading(path)
     try:
-        for line in path.read_text().splitlines():
-            key, _, value = line.partition(" ")
-            if key == "anon":
-                used = int(value)
-                return [CompilerServiceMemory(used)] if used > 0 else []
+        reading = slice_working_set(directory / "sccache.service")
+        return [CompilerServiceMemory(reading.bytes, swap_bytes=reading.swap_bytes)]
     except (OSError, ValueError):
-        pass
-    return []
+        return []
 
 
 class LiveMemoryReading(RuntimeError):
@@ -3839,7 +3841,7 @@ def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits, pol
 
 def released_resident_bytes(running: tuple[RunningStep, ...], ended: frozenset[int]) -> int:
     """Only measured resident memory of ended rows becomes available RAM."""
-    return sum(max(0, step.measured.bytes - step.measured.swap_bytes)
+    return sum(step.measured.bytes
                for index, step in enumerate(running) if index in ended
                and isinstance(step.measured, MeasuredMemory))
 
@@ -4475,6 +4477,10 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                    for value in readings.compilers)
     for value in unowned:
         activity = value.activity
+        if not isinstance(value.job_state, NotServiceSlice):
+            running.append(RunningStep("", value.owner, "service", value.cgroup, 0, value,
+                started_at=value.job_state.started_at if isinstance(value.job_state, RunningServiceJob) else 0.0))
+            continue
         running.append(RunningStep(
             activity.session_id if isinstance(activity, ScopeProcesses) else "",
             activity.session_name if isinstance(activity, ScopeProcesses) else "",
@@ -4517,7 +4523,7 @@ def ci_slice_cgroup(name: str) -> Path:
 
 
 def slice_working_set(directory: Path) -> MeasuredMemory:
-    """Measure resident memory without inactive file cache, plus swap."""
+    """Measure resident memory without inactive file cache and record swap separately."""
     current = directory / "memory.current"
     check_memory_reading(current)
     amount = int(current.read_text())
@@ -4532,7 +4538,7 @@ def slice_working_set(directory: Path) -> MeasuredMemory:
     swap = directory / "memory.swap.current"
     check_memory_reading(swap)
     swapped = int(swap.read_text()) if swap.exists() else 0
-    return MeasuredMemory(max(0, amount - inactive_file) + swapped, swap_bytes=swapped)
+    return MeasuredMemory(max(0, amount - inactive_file), swap_bytes=swapped)
 
 
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
@@ -4569,10 +4575,13 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             amount = working_set.bytes
             swapped = working_set.swap_bytes
             members = {int(pid) for membership in child.rglob("cgroup.procs") for pid in membership.read_text().split()}
-            duplicate = process_memory(members & tree_pids, proc).bytes
-            amount = max(0, amount - duplicate)
+            duplicate = process_memory(members & tree_pids, proc)
+            amount = max(0, amount - duplicate.bytes)
+            swapped = max(0, swapped - duplicate.swap_bytes)
             promise: MemoryPromise = NoPromise()
+            job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
             if required:
+                job_state = IdleService()
                 limit_path = child / "memory.max"
                 check_memory_reading(limit_path)
                 try:
@@ -4581,19 +4590,24 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                     raise ValueError(f"{limit_path}: expected a finite memory limit") from error
                 if limit <= 0:
                     raise ValueError(f"{limit_path}: no finite positive memory limit")
-                for pid in members:
+                workers: list[int] = []
+                for pid in members.intersection(processes):
                     try:
                         program = (proc / str(pid) / "comm").read_text().strip()
                     except FileNotFoundError:
                         continue
                     if program == "Runner.Worker":
-                        promise = LifetimePromise(min(amount + ci_memory_margin_bytes, limit))
-                        break
-            if amount or members:
+                        workers.append(pid)
+                if workers:
+                    oldest = min(workers, key=lambda pid: (int(processes[pid].start), pid))
+                    job_state = RunningServiceJob(activity_reader.started_at(oldest))
+                    promise = LifetimePromise(min(amount + ci_memory_margin_bytes, limit))
+            if required or amount or members:
                 result.append(UnownedSliceMemory(amount, promise=promise,
-                                                 swap_bytes=swapped if required else 0,
+                                                 swap_bytes=swapped,
                                                  cgroup=str(child), owner=child.name,
-                                                 activity=activity_reader.scope(members, child.name)))
+                                                 activity=activity_reader.scope(members, child.name),
+                                                 job_state=job_state))
         except (OSError, ValueError) as error:
             if required:
                 raise SliceMemoryUnavailable(f"{ci_memory_slice}: cannot read slice memory at {child}: {error}") from error

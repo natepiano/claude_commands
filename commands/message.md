@@ -57,9 +57,9 @@ Broadcast prints `<name> - <role> - sent`, `<name> - <role> - no live session: <
 - **Relay without quoting.** Tell your user the sender and the substance in two or three lines, only when it changes their picture; quote it whole only when asked. Reporting your own send, never quote the message back.
 
 <HeldRoleMessages>
-A lasting Astra member has one holder. Resolve the holder from the durable role
-record and current local roster; stale or missing reach is unavailable. A peer
-message cannot authorize an assignment or wake an idle member. Route it through
+A lasting Astra member's holder is its worker's staff parent.
+Resolve the parent from the staff record; stale or missing reach is unavailable.
+A peer message cannot authorize an assignment or wake an idle member. Route it through
 the holder. Held-role `send` saves an ID, source and text under the role directory;
 success means queued, not read. The holder includes pending IDs in its next
 authorized assignment. Clear them only after that turn's acceptance is known;

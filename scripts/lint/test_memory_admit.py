@@ -35,7 +35,7 @@ from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view
 from scripts.build_queue.admission_test_support import AdmissionFixture, InjectedCrash, only_admitted
-from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, write_recovery_fixture, fixture_queue_inputs
+from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, write_recovery_fixture, fixture_queue_inputs, write_process
 import nextest_budget as budget
 from build_shape import BuildShape, build_shape
 from memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
@@ -3693,11 +3693,35 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
 
 
 
+    def test_scoped_step_and_queue_totals_exclude_swap_and_inactive_file_cache(self) -> None:
+        sidecar = self.root / "step.cgroup"
+        path = self.running(100, 1, sidecar=str(sidecar))
+        scope = Path(sidecar.read_text())
+        scope.mkdir(parents=True)
+        _ = (scope / "cgroup.procs").write_text("100\n")
+        _ = (scope / "memory.current").write_text(str(3 * GIB))
+        _ = (scope / "memory.stat").write_text(f"inactive_file {GIB}\n")
+        _ = (scope / "memory.swap.current").write_text(str(7 * GIB))
+        row = gate.read_reservation(path)
+        reading = gate.step_memory(row, NOW, gate.process_table(self.root / "proc"),
+                                   self.root / "proc", policy=admission_policy_fixture())
+        self.assertIsInstance(reading, gate.MeasuredMemory)
+        assert isinstance(reading, gate.MeasuredMemory)
+        self.assertEqual((reading.bytes, reading.swap_bytes), (2 * GIB, 7 * GIB))
+        step = gate.RunningStep("owner", "owner", "nextest", "/tree", GIB, reading)
+        inputs = gate.QueueInputs([], (step,), (row,), gate.HostMemory(40 * GIB, 60 * GIB),
+            gate.NoPressureHold(), gate.NoRecoverySpacing(), gate.NoHeadAdmissionOverride(), NOW.timestamp())
+        result = gate.queue_read_from(inputs, gate.AdmissionLimits(21 * GIB, 3 * GIB),
+                                      policy=admission_policy_fixture())
+        self.assertEqual(result.explanation.totals.measured, 2 * GIB)
+        self.assertEqual(result.explanation.totals.charged, 2 * GIB)
+
     def test_scope_counter_disappearing_uses_owner_lifetime(self) -> None:
         reservation = self.running(100, 12)
         scope = self.builds / "ending.scope"
         scope.mkdir(parents=True)
         _ = (scope / "cgroup.procs").write_text("101\n")
+        _ = (scope / "memory.stat").write_text("inactive_file 0\n")
         sidecar = self.root / "scope-path"
         _ = sidecar.write_text(str(scope))
         row = cast(gate.Reservation, json.loads(reservation.read_text()))
@@ -3707,11 +3731,15 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                 with self.subTest(missing=missing, owner=owner):
                     for counter in ("memory.current", "memory.swap.current"):
                         _ = (scope / counter).write_text("0")
+                    _ = (scope / "memory.current").write_text(str(3 * GIB))
                     (scope / missing).unlink()
                     processes = {} if owner == "gone" else {100: gate.ProcessIdentity(1, "first" if owner == "live" else "other")}
                     with patch.object(gate, "tree_memory", return_value=gate.MeasuredMemory(2 * GIB)) as tree:
                         reading = gate.step_memory(row, NOW, processes, self.root / "proc", policy=admission_policy_fixture())
-                    if owner == "live":
+                    if missing == "memory.swap.current":
+                        self.assertEqual(reading, gate.MeasuredMemory(3 * GIB, swap_bytes=0))
+                        tree.assert_not_called()
+                    elif owner == "live":
                         self.assertEqual(reading, gate.MeasuredMemory(2 * GIB))
                         tree.assert_called_once_with(100, "first", processes, self.root / "proc")
                     else:
@@ -3759,7 +3787,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
 
     def test_caught_live_cgroup_refusal_still_records_the_read(self) -> None:
         record = self.root / "caught-reads.jsonl"
-        live = Path("/sys/fs/cgroup/test-builds/sccache.service/memory.stat")
+        live = Path("/sys/fs/cgroup/test-builds/sccache.service/memory.current")
         with patch.dict(os.environ, {"BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(record),
                                     "BUILDLOG_BUILDS_CGROUP": str(live.parent.parent)}):
             with self.assertRaises(gate.LiveMemoryReading), patch.object(Path, "read_text", side_effect=AssertionError("live read")):
@@ -3900,7 +3928,8 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
             self.readings[pid] = gate.MeasuredMemory(0)
         service = self.builds / 'sccache.service'
         service.mkdir(parents=True)
-        _ = (service / 'memory.stat').write_text(f'anon {int(5.95 * GIB)}\n')
+        _ = (service / 'memory.stat').write_text(f'anon {int(5.95 * GIB)}\ninactive_file 0\n')
+        _ = (service / 'memory.current').write_text(str(int(5.95 * GIB)))
         self.readings_for(swap_free=20, some=29, full=0)
         charged_peaks = sum((peak for _, _, _, peak in recorded))
         with patch.dict(os.environ, {'BUILDLOG_BUILD_BUDGET_GIB': '21'}):
@@ -3927,7 +3956,8 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         service = self.builds / "sccache.service"
         service.mkdir(parents=True)
         stat = service / "memory.stat"
-        _ = stat.write_text(f"anon {6 * GIB}\nfile {90 * GIB}\n")
+        _ = stat.write_text(f"anon {6 * GIB}\nfile {90 * GIB}\ninactive_file {90 * GIB}\n")
+        _ = (service / "memory.current").write_text(str(96 * GIB))
         result = self.admit_at()
         self.assertEqual((result.decision.state, result.decision.charged), ("hold", 14 * GIB))
         view = gate.queue_read().view
@@ -3943,7 +3973,8 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
     def test_sccache_is_charged_but_does_not_prevent_running_alone(self) -> None:
         service = self.builds / "sccache.service"
         service.mkdir(parents=True)
-        _ = (service / "memory.stat").write_text("anon 1048576\n")
+        _ = (service / "memory.stat").write_text("anon 1048576\ninactive_file 0\n")
+        _ = (service / "memory.current").write_text("1048576")
         result = self.pass_for(400, need=22, free=60)
         self.assertEqual((result.decision.state, result.decision.charged), ("admit", 1048576))
         head = self.head(22)
@@ -4720,7 +4751,7 @@ class QueueApiTests(MemoryQueueFixture):
 
 class ProcessMemoryTests(unittest.TestCase):
 
-    def test_tree_counts_resident_and_swap_and_excludes_other_processes(self) -> None:
+    def test_tree_counts_resident_bytes_and_records_swap_separately(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             proc = Path(folder)
             for pid, parent, state, start, resident, swap in (
@@ -4735,7 +4766,7 @@ class ProcessMemoryTests(unittest.TestCase):
                 _ = (path / "status").write_text(f"VmRSS: {resident} kB\nVmSwap: {swap} kB\n")
             processes = gate.process_table(proc)
             self.assertEqual(gate.tree_memory(100, "start", processes, proc),
-                             gate.MeasuredMemory(69 * 1024, swap_bytes=9 * 1024))
+                             gate.MeasuredMemory(60 * 1024, swap_bytes=9 * 1024))
             self.assertEqual(gate.tree_memory(100, "reused", processes, proc), gate.GoneMemory())
             self.assertEqual(gate.tree_memory(999, "gone", processes, proc), gate.GoneMemory())
 
@@ -4782,7 +4813,7 @@ class ShellTests(unittest.TestCase):
             request = self.admission.request()
             sidecar = self.admission.scope(request.owner)
             scope = Path(sidecar.read_text())
-            _ = (scope / "memory.stat").write_text(f"anon {GIB}\n")
+            _ = (scope / "memory.stat").write_text(f"anon {GIB}\ninactive_file 0\n")
             request = replace(request, sidecar=str(sidecar))
             grant = only_admitted(self.admission.server.handle_request(request))
         result = sample_anon_once(sidecar, Path(grant.max_path))
@@ -5728,7 +5759,7 @@ class QueueExplanationTests(MemoryQueueFixture):
                                     gate.CompilerServiceMemory(3 * GIB, swap_bytes=GIB))
         inputs = replace(inputs, running=(*inputs.running, compiler))
         explanation = gate.queue_read_from(inputs, limits, policy=admission_policy_fixture()).explanation
-        for ended, expected in (((), 0), ((0,), 4 * GIB), ((1,), 0), ((2,), 2 * GIB), ((0, 1, 2), 6 * GIB)):
+        for ended, expected in (((), 0), ((0,), 6 * GIB), ((1,), GIB), ((2,), 3 * GIB), ((0, 1, 2), 10 * GIB)):
             with self.subTest(ended=ended):
                 self.assertEqual(gate.released_resident_bytes(inputs.running, frozenset(ended)), expected)
                 changed = gate.inputs_after_steps_end(inputs, frozenset(ended))
@@ -6187,6 +6218,7 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.ci = self.root / "ci.slice"
         self.proc = self.root / "proc"
         (self.proc / "123").mkdir(parents=True)
+        write_process(self.proc, 123)
         _ = (self.proc / "123/comm").write_text("Runner.Listener\n")
         _ = (self.ci / "cgroup.procs").write_text("123\n")
         _ = (self.ci / "memory.current").write_text(str(3 * GIB))
@@ -6194,28 +6226,50 @@ class CiSliceMemoryTests(unittest.TestCase):
 
     def reading(self) -> gate.UnownedSliceMemory:
         config = gate.read_memory_config()
-        reading, = gate.unowned_slice_memory([], {}, self.proc, ci_memory_slice=config.ci_memory_slice,
+        reading, = gate.unowned_slice_memory([], gate.process_table(self.proc), self.proc, ci_memory_slice=config.ci_memory_slice,
                                               ci_memory_margin_bytes=config.ci_memory_margin_bytes)
         return reading
 
-    def test_idle_ci_charges_live_memory_and_swap(self) -> None:
-        _ = (self.ci / "memory.swap.current").write_text(str(GIB))
+    def test_idle_ci_charges_resident_memory_and_records_swap_separately(self) -> None:
+        resident = int(0.09 * GIB)
+        swapped = int(1.98 * GIB)
+        _ = (self.ci / "memory.current").write_text(str(resident))
+        _ = (self.ci / "memory.swap.current").write_text(str(swapped))
         reading = self.reading()
-        self.assertEqual(reading.bytes, 4 * GIB)
-        self.assertEqual(gate.build_charge(reading), 4 * GIB)
-        self.assertEqual(reading.swap_bytes, GIB)
+        self.assertEqual(reading.bytes, resident)
+        self.assertEqual(gate.build_charge(reading), resident)
+        self.assertEqual(reading.swap_bytes, swapped)
         self.assertEqual(gate.growth_headroom(reading), 0)
 
-    def test_idle_ci_excludes_inactive_file_cache_and_keeps_swap(self) -> None:
+    def test_empty_ci_slice_allows_the_sole_oversized_step(self) -> None:
+        _ = (self.ci / "cgroup.procs").write_text("")
+        _ = (self.ci / "memory.current").write_text("0")
+        reading = self.reading()
+        decision = gate.decide(60 * GIB, 64 * GIB, 22 * GIB, [reading],
+                               limits=gate.AdmissionLimits(21 * GIB, 0))
+        self.assertEqual(decision.state, "admit")
+
+    def test_idle_ci_with_ram_or_live_processes_keeps_the_budget_limit(self) -> None:
+        for members, amount in (("", GIB), ("123\n", 0), ("123\n", GIB)):
+            with self.subTest(members=members, amount=amount):
+                _ = (self.ci / "cgroup.procs").write_text(members)
+                _ = (self.ci / "memory.current").write_text(str(amount))
+                reading = self.reading()
+                decision = gate.decide(60 * GIB, 64 * GIB, 22 * GIB, [reading],
+                                       limits=gate.AdmissionLimits(21 * GIB, 0))
+                self.assertEqual(decision.state, "hold")
+                self.assertEqual(decision.charged, amount)
+
+    def test_idle_ci_excludes_inactive_file_cache_and_records_swap_separately(self) -> None:
         _ = (self.ci / "memory.current").write_text(str(10 * GIB))
         _ = (self.ci / "memory.stat").write_text(f"anon 1024\nfile {9 * GIB}\ninactive_file {8 * GIB}\n")
         _ = (self.ci / "memory.swap.current").write_text(str(GIB))
         reading = self.reading()
-        self.assertEqual(reading.bytes, 3 * GIB)
-        self.assertEqual(gate.build_charge(reading), 3 * GIB)
+        self.assertEqual(reading.bytes, 2 * GIB)
+        self.assertEqual(gate.build_charge(reading), 2 * GIB)
         self.assertEqual(reading.swap_bytes, GIB)
         _ = (self.ci / "memory.stat").write_text(f"inactive_file {11 * GIB}\n")
-        self.assertEqual(self.reading().bytes, GIB)
+        self.assertEqual(self.reading().bytes, 0)
 
     def test_unowned_build_scope_uses_the_same_working_set(self) -> None:
         scope = self.root / "builds.slice/unowned.scope"
@@ -6225,8 +6279,9 @@ class CiSliceMemoryTests(unittest.TestCase):
         _ = (scope / "memory.swap.current").write_text(str(GIB))
         _ = (scope / "cgroup.procs").write_text("")
         reading, = gate.unowned_slice_memory([], {}, self.proc)
-        self.assertEqual(reading.bytes, 3 * GIB)
-        self.assertEqual(gate.build_charge(reading), 3 * GIB)
+        self.assertEqual(reading.bytes, 2 * GIB)
+        self.assertEqual(gate.build_charge(reading), 2 * GIB)
+        self.assertEqual(reading.swap_bytes, GIB)
         (scope / "memory.stat").unlink()
         self.assertEqual(gate.unowned_slice_memory([], {}, self.proc), ())
 
@@ -6236,9 +6291,9 @@ class CiSliceMemoryTests(unittest.TestCase):
         _ = (self.ci / "memory.stat").write_text(f"inactive_file {8 * GIB}\n")
         _ = (self.ci / "memory.swap.current").write_text(str(GIB))
         reading = self.reading()
-        self.assertEqual(reading.bytes, 3 * GIB)
-        self.assertEqual(reading.promise, gate.LifetimePromise(9 * GIB))
-        self.assertEqual(gate.build_charge(reading), 9 * GIB)
+        self.assertEqual(reading.bytes, 2 * GIB)
+        self.assertEqual(reading.promise, gate.LifetimePromise(8 * GIB))
+        self.assertEqual(gate.build_charge(reading), 8 * GIB)
         _ = (self.ci / "memory.max").write_text(str(5 * GIB))
         self.assertEqual(gate.build_charge(self.reading()), 5 * GIB)
 
@@ -6278,12 +6333,12 @@ class CiSliceMemoryTests(unittest.TestCase):
         write_memory_config(self.root / "build_admission.conf", ci_memory_margin_gib="0")
         self.assertEqual(gate.build_charge(self.reading()), 3 * GIB)
 
-    def test_active_ci_margin_includes_swap_and_preserves_live_use(self) -> None:
+    def test_active_ci_margin_excludes_swap_and_preserves_resident_use(self) -> None:
         _ = (self.proc / "123/comm").write_text("Runner.Worker\n")
         _ = (self.ci / "memory.swap.current").write_text(str(GIB))
-        self.assertEqual(gate.build_charge(self.reading()), 10 * GIB)
+        self.assertEqual(gate.build_charge(self.reading()), 9 * GIB)
         _ = (self.ci / "memory.max").write_text(str(3 * GIB))
-        self.assertEqual(gate.build_charge(self.reading()), 4 * GIB)
+        self.assertEqual(gate.build_charge(self.reading()), 3 * GIB)
         self.assertEqual(gate.growth_headroom(self.reading()), 0)
 
     def test_missing_or_unbounded_limit_refuses_the_reading(self) -> None:
