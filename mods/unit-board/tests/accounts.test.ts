@@ -15,7 +15,7 @@ const CONFIG = `${HOME}/.claude/config/accounts.json`;
 const INPUTS = [USAGE, GROUPS, CACHE, CONFIG];
 const ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/accounts/accounts.py`,
   'status', '--json', '--stored'];
-const command = (name = 'accounts-board', args = ''): CommandRunInput => ({ command: name, args,
+const command = (name = 'showrunner:accounts', args = ''): CommandRunInput => ({ command: name, args,
   origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 170 } });
 const start = { cwd: CWD, surface: null, isInteractive: false } as const;
 const turn: TurnCompleteInput = { answer: 'finished', reason: 'answer', durationMs: 100,
@@ -234,7 +234,7 @@ function accountsHost(on: On, missing: readonly string[] = [], environment: Reco
   const stateWrites: string[] = [];
   let accountStateKind = 'closed';
   on('state.set', { plugin: 'unit-board', key: 'accountsPanes' }, (_$, e, next) => {
-    const state = e.value['accounts-board'];
+    const state = e.value['accounts'];
     accountStateKind = state?.kind ?? 'closed';
     stateWrites.push(accountStateKind);
     return next(e);
@@ -304,7 +304,7 @@ function accountsHost(on: On, missing: readonly string[] = [], environment: Reco
   };
 }
 async function mount($: Engine, surface: 'terminal' | 'desktop' = 'terminal') {
-  return $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface, props });
+  return $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane', surface, props });
 }
 function hasSensitivePath(paths: readonly string[]) {
   return paths.some(path => /(?:\.claude\.json|auth\.json|id_token)/.test(path));
@@ -319,7 +319,7 @@ describe('accounts table', () => {
       const before = JSON.stringify(data);
       fake.replace(data);
       await $.command.run(command());
-      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane',
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane',
         surface: 'terminal', props: { ...props, bodyColumns: columns } });
       const tree = await ui.drawn();
       const rows = accountLines(tree, 'Low');
@@ -351,7 +351,7 @@ describe('accounts table', () => {
       const before = JSON.stringify(data);
       fake.replace(data);
       await $.command.run(command());
-      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane',
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane',
         surface: 'terminal', props: { ...props, bodyColumns: columns } });
       const tree = await ui.drawn();
       const row = normalized(accountLines(tree, 'Low'));
@@ -398,7 +398,7 @@ describe('accounts table', () => {
         const before = JSON.stringify(data);
         fake.replace(data);
         await $.command.run(command());
-        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
+        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane', surface,
           props: { ...props, bodyColumns: columns } });
         const tree = await ui.drawn();
         const lines = rowLines(tree);
@@ -441,7 +441,7 @@ describe('accounts table', () => {
     fake.replace(readableFixture());
     await $.command.run(command());
     for (const columns of [140, 80]) {
-      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface: 'terminal',
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane', surface: 'terminal',
         props: { ...props, bodyColumns: columns } });
       const lines = rowLines(await ui.drawn());
       const header = lines[0]!;
@@ -485,7 +485,7 @@ describe('accounts table', () => {
       data.problems = [];
       fake.replace(data);
       await $.command.run(command());
-      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface: 'terminal',
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane', surface: 'terminal',
         props: { ...props, bodyColumns: columns } });
       const lines = rowLines(await ui.drawn());
       // Empty balances retain every column and the credit setting.
@@ -511,7 +511,7 @@ describe('accounts table', () => {
     data.problems = [];
     fake.replace(data);
     await $.command.run(command());
-    const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface: 'terminal',
+    const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane', surface: 'terminal',
       props: { ...props, bodyColumns: 40 } });
     const lines = rowLines(await ui.drawn());
     for (const line of lines) expect(cellWidth(line)).toBeLessThanOrEqual(40);
@@ -598,7 +598,7 @@ describe('accounts table', () => {
         fake.replace({ accounts: [{ ...statusFixture().accounts[1]!, read_at: '2026-10-01T10:58:00Z' }],
           problems: [problem] });
         await $.command.run(command());
-        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
+        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane', surface,
           props: { ...props, bodyColumns: columns } });
         const tree = await ui.drawn();
         const lines = rowLines(tree);
@@ -650,7 +650,7 @@ describe('accounts table', () => {
         role_counts: [{ busy: 2, shell: null, idle: 3, total: 5 },
           { busy: 1, shell: null, idle: 4, total: 5 }] }], problems: [] });
       await $.command.run(command());
-      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane',
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane',
         surface: 'terminal', props: { ...props, bodyColumns: columns } });
       const lines = rowLines(await ui.drawn());
       const row = normalized(accountLines(await ui.drawn(), 'Watch'));
@@ -776,7 +776,7 @@ describe('accounts pane', () => {
       expect(result.text === 'Accounts opened.').toBe(true);
       expect(result.text?.includes('@') ?? false).toBe(false);
       expect(fake.accountRuns()).toEqual([ARGV]);
-      expect(fake.opened).toEqual(['accounts-board']);
+      expect(fake.opened).toEqual(['accounts']);
       const ui = await mount($, surface);
       const text = drawnText(await ui.drawn());
       for (const word of ['●', 'Left', 'Resets', 'Credits', 'Read', 'Problems', 'Low', 'Watch', 'Unknown', 'showrunners', 'workers',
@@ -880,10 +880,10 @@ describe('accounts pane', () => {
     const fake = accountsHost(on);
     await $.session.start(start);
     await $.command.run(command());
-    const result = await $.command.run(command('accounts-board', 'close'));
+    const result = await $.command.run(command('showrunner:accounts', 'close'));
     expect(result.text === 'Accounts closed.').toBe(true);
     expect(result.text?.includes('@') ?? false).toBe(false);
-    expect(fake.closed).toEqual(['accounts-board']);
+    expect(fake.closed).toEqual(['accounts']);
   });
 
   test('closing during startup zone lookup cannot restart accounts while the board keeps refreshing', async ($, on) => {
@@ -894,7 +894,7 @@ describe('accounts pane', () => {
     const pending = fake.pauseZone();
     const restarting = $.session.start(start);
     await pending.started;
-    await $.command.run(command('accounts-board', 'close'));
+    await $.command.run(command('showrunner:accounts', 'close'));
     fake.clear();
     pending.finish();
     await restarting;
@@ -926,7 +926,7 @@ describe('accounts pane', () => {
     const calls: string[] = [];
     const services = {
       command: { register: async () => ({}) },
-      ui: { panes: async () => [{ id: 'accounts-board' }] },
+      ui: { panes: async () => [{ id: 'accounts' }] },
       env: { get: async () => { signal(); return lookup; } },
       state: { get: async () => ({ value: {} }), set: async () => { calls.push('state'); } },
       clock: { every: () => { calls.push('timer'); return { cancel: () => {} }; } },
@@ -940,7 +940,7 @@ describe('accounts pane', () => {
     };
     const restarting = dispatch('session.start', start);
     await started;
-    await dispatch('ui.close', { id: 'accounts-board', origin: { kind: 'person' } });
+    await dispatch('ui.close', { id: 'accounts', origin: { kind: 'person' } });
     calls.length = 0;
     finish('UTC');
     await restarting;
@@ -1018,7 +1018,7 @@ describe('accounts pane', () => {
     await $.turn.complete(turn);
     expect(fake.fs).toEqual([]);
     expect(fake.processes).toEqual([]);
-    await $.command.run(command('accounts-board', 'close'));
+    await $.command.run(command('showrunner:accounts', 'close'));
     fake.clear();
     await fake.clock.advance(60_000);
     await $.turn.complete(turn);
@@ -1026,7 +1026,7 @@ describe('accounts pane', () => {
     expect(fake.processes).toEqual([]);
   });
 
-  for (const close of ['accounts-board', 'showrunner:unit_board']) {
+  for (const close of ['showrunner:accounts', 'showrunner:unit_board']) {
     test(`closing ${close} preserves the other pane refresh loop`, async ($, on) => {
       const fake = accountsHost(on);
       await $.session.start(start);
@@ -1037,11 +1037,11 @@ describe('accounts pane', () => {
       fake.change(USAGE);
       fake.change(RUN);
       await fake.clock.advance(10_000);
-      expect(fake.accountRuns().length).toBe(close === 'accounts-board' ? 0 : 1);
+      expect(fake.accountRuns().length).toBe(close === 'showrunner:accounts' ? 0 : 1);
       expect(fake.boardRuns().length).toBe(close === 'showrunner:unit_board' ? 0 : 1);
-      expect(fake.fs.includes(USAGE)).toBe(close !== 'accounts-board');
+      expect(fake.fs.includes(USAGE)).toBe(close !== 'showrunner:accounts');
       expect(fake.fs.includes(RUN)).toBe(close !== 'showrunner:unit_board');
-      await $.command.run(command(close === 'accounts-board' ? 'showrunner:unit_board' : 'accounts-board', 'close'));
+      await $.command.run(command(close === 'showrunner:accounts' ? 'showrunner:unit_board' : 'showrunner:accounts', 'close'));
       fake.clear();
       await fake.clock.advance(60_000);
       expect(fake.fs).toEqual([]);
@@ -1082,7 +1082,7 @@ describe('accounts pane', () => {
     fake.change(USAGE);
     await fake.clock.advance(10_000);
     expect(fake.accountRuns()).toEqual([ARGV]);
-    expect(fake.opened).toEqual(['accounts-board']);
+    expect(fake.opened).toEqual(['accounts']);
   });
 
   for (const refresh of [false, true]) {
@@ -1096,7 +1096,7 @@ describe('accounts pane', () => {
       if (refresh) { fake.change(USAGE); opening = fake.clock.advance(10_000); }
       else opening = $.command.run(command());
       await pending.started;
-      await $.command.run(command('accounts-board', 'close'));
+      await $.command.run(command('showrunner:accounts', 'close'));
       fake.clear();
       pending.finish();
       await opening;

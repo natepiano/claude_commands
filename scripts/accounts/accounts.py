@@ -12,14 +12,12 @@ import io
 import json
 import math
 import os
-import random
 import re
 import shlex
 import socket
 import stat
 import subprocess
 import sys
-import time
 import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
@@ -500,8 +498,6 @@ class CommandLine(argparse.Namespace):
     counts_lock: int = -1
 
 
-
-
 class SwapDirectorOwner(TypedDict):
     kind: Literal["director"]
     session_id: str
@@ -677,11 +673,9 @@ def _move_shared_entry(source: Path, destination: Path) -> None:
         if sys.platform.startswith("linux"):
             rename = cast(Callable[[int, bytes, int, bytes, int], int], library.renameat2)
             result = rename(AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), RENAME_NOREPLACE)
-        elif sys.platform == "darwin":
+        else:
             rename_exclusive = cast(Callable[[bytes, bytes, int], int], library.renamex_np)
             result = rename_exclusive(os.fsencode(source), os.fsencode(destination), RENAME_EXCL)
-        else:
-            raise OSError(errno.ENOTSUP, "atomic no-replace moves are unavailable")
     except AttributeError as error:
         raise OSError(errno.ENOSYS, "atomic no-replace moves are unavailable") from error
     if result != 0:
@@ -852,27 +846,24 @@ def trust_settings_file() -> Path:
 def _accounts_settings_section(document: dict[str, object], name: str) -> dict[str, object]:
     section = document.get(name)
     if not isinstance(section, dict):
-        raise AccountsError(f"accounts: {trust_settings_file()}: expected [{name}] section")
+        print(f"accounts: anomaly: {trust_settings_file()}: expected [{name}] section", file=sys.stderr)
+        return {}
     return cast(dict[str, object], section)
 
 
 def _trusted_folders(document: dict[str, object]) -> tuple[str, ...]:
-    """Configured absolute project paths, resolved for this machine at use."""
-    path = trust_settings_file()
-    try:
-        folders = _accounts_settings_section(document, "trust").get("folders")
-        if not isinstance(folders, list):
-            raise ValueError("trust.folders must be a list of paths")
-        result: list[str] = []
-        for folder in cast(list[object], folders):
-            if not isinstance(folder, str) or not folder or not Path(folder).expanduser().is_absolute():
-                raise ValueError("trust.folders must contain absolute or ~/ paths")
+    """Resolve the configured project paths for this machine."""
+    folders = _accounts_settings_section(document, "trust").get("folders", [])
+    if not isinstance(folders, list):
+        print("accounts: anomaly: trust.folders must be a list", file=sys.stderr)
+        return ()
+    result: list[str] = []
+    for folder in cast(list[object], folders):
+        if isinstance(folder, str) and Path(folder).expanduser().is_absolute():
             result.append(str(Path(folder).expanduser().absolute()))
-        return tuple(dict.fromkeys(result))
-    except AccountsError:
-        raise
-    except ValueError as error:
-        raise AccountsError(f"accounts: {path}: {error}") from error
+        else:
+            print("accounts: anomaly: trust folder is not an absolute path", file=sys.stderr)
+    return tuple(dict.fromkeys(result))
 
 
 def with_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
@@ -903,44 +894,10 @@ def _account_home_lock(home: Path) -> Generator[None]:
 
 
 @dataclass(frozen=True)
-class ClaudeConfigLockPolicy:
-    """Configured timing for interoperating with Claude's directory lock."""
-
-    retries: tuple[float, ...]
-    stale_seconds: float
-
-
-def _positive_lock_seconds(value: object, key: str) -> float:
-    try:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError
-        seconds = float(value)
-        if not math.isfinite(seconds) or seconds <= 0:
-            raise ValueError
-        return seconds
-    except (ValueError, OverflowError) as error:
-        raise AccountsError(
-            f"accounts: {trust_settings_file()}: claude_config_lock.{key} must contain finite positive seconds"
-        ) from error
-
-
-def _claude_config_lock_policy(document: dict[str, object]) -> ClaudeConfigLockPolicy:
-    section = _accounts_settings_section(document, "claude_config_lock")
-    retries = section.get("retries")
-    if not isinstance(retries, list) or not retries:
-        raise AccountsError(f"accounts: {trust_settings_file()}: claude_config_lock.retries must be a non-empty list")
-    return ClaudeConfigLockPolicy(
-        tuple(_positive_lock_seconds(value, "retries") for value in cast(list[object], retries)),
-        _positive_lock_seconds(section.get("stale_seconds"), "stale_seconds"),
-    )
-
-
-@dataclass(frozen=True)
 class TrustConfiguration:
-    """Validated folders and lock timing for one trust or seed operation."""
+    """Configured folders for one trust or seed operation."""
 
     folders: tuple[str, ...]
-    lock_policy: ClaudeConfigLockPolicy
 
 
 def trust_configuration() -> TrustConfiguration:
@@ -950,76 +907,19 @@ def trust_configuration() -> TrustConfiguration:
         document = cast(dict[str, object], tomllib.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError) as error:
         raise AccountsError(f"accounts: {path}: {error}") from error
-    return TrustConfiguration(_trusted_folders(document), _claude_config_lock_policy(document))
-
-
-@dataclass(frozen=True)
-class ClaudeConfigLock:
-    """Ownership of Claude's directory lock for one short publication."""
-
-    path: Path
-    inode: int
-    publish_before: float
-
-    def require_current(self) -> None:
-        if self.path.stat().st_ino != self.inode:
-            raise OSError("Claude config lock ownership changed")
-        if time.monotonic() >= self.publish_before:
-            raise TimeoutError("Claude config lock publication budget exceeded; rerun trust")
+    return TrustConfiguration(_trusted_folders(document))
 
 
 @contextmanager
-def claude_config_lock(path: Path, policy: ClaudeConfigLockPolicy) -> Generator[ClaudeConfigLock]:
-    """Wait like Claude, recovering locks older than the configured stale age.
-
-    Our critical section has no waits: its publication budget is half Claude's
-    shortest retry, also below its 1.5s boot retry-abort window. No heartbeat is
-    needed for such a short hold (Claude normally updates its lock every 5s).
-    """
-    lock = path.with_name(path.name + ".lock")
-    for attempt in range(len(policy.retries) + 1):
-        if _try_claude_config_lock(lock, policy.stale_seconds):
-            break
-        if attempt == len(policy.retries):
-            raise TimeoutError("Claude config lock still held after retries; rerun trust")
-        time.sleep(policy.retries[attempt] * (1 + random.random()))
-    ownership = ClaudeConfigLock(lock, lock.stat().st_ino,
-                                time.monotonic() + min(policy.retries) / 2)
-    try:
-        yield ownership
-    finally:
-        # A stolen/replaced lock belongs to its new writer, even on failure.
-        try:
-            if lock.stat().st_ino == ownership.inode:
-                lock.rmdir()
-        except FileNotFoundError:
-            pass
-
-
-def _try_claude_config_lock(lock: Path, stale_seconds: float) -> bool:
-    try:
-        lock.mkdir(mode=0o700)
-        return True
-    except FileExistsError:
-        pass
-    try:
-        if lock.stat().st_mtime >= time.time() - stale_seconds:
-            return False
-        lock.rmdir()
-    except FileNotFoundError:
-        pass
-    # Like proper-lockfile, make only one fresh acquisition after stale removal.
-    try:
-        lock.mkdir(mode=0o700)
-        return True
-    except FileExistsError:
-        return False
+def claude_config_lock(path: Path) -> Generator[None]:
+    """Wait for the kernel lock until the current holder releases it."""
+    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
 
 
 def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bool:
-    if home.is_symlink() or path.is_symlink():
-        raise ValueError("linked account configuration refused")
-    with _account_home_lock(home):
+    with _account_home_lock(home), claude_config_lock(path):
         while True:
             before_mode = stat.S_IMODE(path.stat().st_mode)
             before = path.read_bytes()
@@ -1029,15 +929,13 @@ def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bo
                 return False
             published = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
             with atomic_file.prepared_replacement(path, published, mode=before_mode) as temporary:
-                with claude_config_lock(path, configuration.lock_policy) as ownership:
-                    if path.read_bytes() != before or stat.S_IMODE(path.stat().st_mode) != before_mode:
-                        continue
-                    ownership.require_current()
-                    os.replace(temporary, path)
+                if path.read_bytes() != before or stat.S_IMODE(path.stat().st_mode) != before_mode:
+                    continue
+                os.replace(temporary, path)
                 atomic_file.sync_folder(path.parent)
                 if path.read_bytes() == published.encode("utf-8"):
                     return True
-                # Release before retrying a detected unlocked writer's change.
+                # Preserve changes from writers that do not use the lock.
 
 
 def trust_accounts() -> int:
@@ -1054,7 +952,6 @@ def trust_accounts() -> int:
         except (OSError, ValueError) as error:
             print(f"{home.label}: trust failed: {error}", file=sys.stderr)
             failures = True
-    print("A later unlocked Claude save can overwrite trust; rerun accounts.py trust if prompted.", file=sys.stderr)
     return int(failures)
 
 
@@ -1080,10 +977,6 @@ def _filtered_seed(source: dict[str, object], folders: tuple[str, ...]) -> Claud
 
 
 def _seed_config(destination: Path, configuration: TrustConfiguration) -> list[str]:
-    if destination.is_symlink():
-        return [
-            f"accounts: {destination} is a link; identity stays in each account dir"
-        ]
     source = accounts_home() / ".claude.json"
     try:
         with _account_home_lock(destination.parent):
@@ -1108,12 +1001,6 @@ def setup(label: str) -> list[str]:
     configuration = trust_configuration()
     destination = account_dir(label)
     problems: list[str] = []
-    if destination.is_symlink():
-        return [
-            f"accounts: {destination} is a link; an account dir must be a real directory"
-        ]
-    if destination.exists() and not destination.is_dir():
-        return [f"accounts: {destination} is not a directory"]
     try:
         destination.mkdir(mode=0o700, parents=True, exist_ok=True)
         destination.chmod(0o700)
@@ -1314,7 +1201,6 @@ def _inspect_account_directory(
     return AccountDirectoryReady(identity.login)
 
 
-
 def check(label: str) -> list[str]:
     """Return every reason a numbered account is not fit to launch."""
     label = note_file.canonical_label(label)
@@ -1360,19 +1246,14 @@ def _prepare_codex_home(label: str) -> agent_accounts.CodexHomePreparation:
 def _link_codex_home(label: str) -> list[str]:
     """Prepare private storage and shared links without starting a Codex process."""
     destination = codex_setup_home(label)
-    if destination.is_symlink():
-        return [f"accounts: {destination} is a link; an account home must be a real directory"]
-    if destination.exists() and not destination.is_dir():
-        return [f"accounts: {destination} is not a directory"]
     try:
         destination.mkdir(mode=0o700, parents=True, exist_ok=True)
         destination.chmod(0o700)
     except OSError as error:
         return [f"accounts: could not create {destination}: {error}"]
-    problems = _codex_private_link_problems(destination)
-    problems.extend(_repair_shared_links(
+    problems = _repair_shared_links(
         destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
-    ))
+    )
     return problems
 
 
@@ -2230,7 +2111,6 @@ def codex_destination_uses_credits(chosen: PickedAccount, now: datetime) -> bool
     return chosen.weekly_left <= 0
 
 
-
 ClaudeGroup = Literal["units", "showrunners"]
 CLAUDE_GROUPS: tuple[ClaudeGroup, ...] = ("units", "showrunners")
 
@@ -2310,8 +2190,6 @@ class GroupTransition:
 @dataclass(frozen=True)
 class NoGroupTransition:
     """A legacy selection has no recorded transition."""
-
-
 
 
 @dataclass(frozen=True)
@@ -2444,7 +2322,6 @@ def group_configuration_line(group: ClaudeGroup) -> str:
 
 def group_status_line(groups: GroupAccounts) -> str:
     return f"units: {group_label(groups, 'units')}, showrunners: {group_label(groups, 'showrunners')}"
-
 
 
 def group_note_labels() -> dict[ClaudeGroup, str]:
@@ -2759,7 +2636,6 @@ def burn(since: datetime, until: datetime) -> list[AccountRoleBurn]:
 def _claude_login_command(directory: Path) -> str:
     """Reach this home directly without a shell alias or an inherited token."""
     return f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude"
-
 
 
 def _write_role(role: str, label: str, *, why: str = "by hand",
@@ -3406,8 +3282,8 @@ def _mcp_differences(baseline: ReadMcpConfiguration | UnreadableMcpConfiguration
 def _inspect_mcp_configuration(directory: Path) -> McpConfigurationInspection:
     baseline = _mcp_server_names(agent_accounts.claude_config_file(main_config_dir()), main_config_dir())
     config_file = directory / ".claude.json"
-    account_is_safe_to_inspect = not directory.is_symlink() and not config_file.is_symlink()
-    current = _mcp_server_names(config_file, main_config_dir()) if account_is_safe_to_inspect else baseline
+    account_is_safe_to_inspect = True
+    current = _mcp_server_names(config_file, main_config_dir())
     return McpConfigurationInspection(
         _mcp_differences(baseline, current, directory), account_is_safe_to_inspect,
         (baseline,) if isinstance(baseline, UnreadableMcpConfiguration) else (),
@@ -3420,10 +3296,6 @@ def mcp_projects(label: str, server: str, direction: McpDirection) -> tuple[str,
     """Read the differing scopes without changing either configuration."""
     directory = account_dir(label)
     inspection = _inspect_mcp_configuration(directory)
-    if not inspection.account_is_safe_to_inspect:
-        raise AccountsError(f"accounts: cannot inspect linked MCP configuration for {label}")
-    if not directory.is_dir():
-        raise AccountsError(f"accounts: {label} is not set up; run accounts.py setup {label}")
     for configuration in (*inspection.baseline_problems, *inspection.account_problems):
         raise AccountsError(f"accounts: cannot read MCP configuration {configuration.path}: {configuration.reason}")
     return next((entry.projects for entry in inspection.differences.entries
@@ -3434,18 +3306,14 @@ def mcp_repair(label: str, server: str) -> None:
     """Match one server's effective project settings to the shared baseline."""
     directory = account_dir(label)
     config_file = directory / ".claude.json"
-    if directory.is_symlink() or config_file.is_symlink() or not directory.is_dir():
-        raise AccountsError(f"accounts: cannot repair linked or missing MCP configuration for {label}")
     with (directory / ".mcp-repair.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         inspection = _inspect_mcp_configuration(directory)
-        if not inspection.account_is_safe_to_inspect:
-            raise AccountsError(f"accounts: cannot repair linked MCP configuration for {label}")
         for fault in (*inspection.baseline_problems, *inspection.account_problems):
             raise AccountsError(f"accounts: cannot read MCP configuration {fault.path}: {fault.reason}")
         baseline, current = inspection.baseline, inspection.account
         if not isinstance(baseline, ReadMcpConfiguration) or not isinstance(current, ReadMcpConfiguration):
-            raise AccountsError("accounts: MCP comparison is unavailable")
+            return
         source = current.file
         differences = [entry for entry in inspection.differences.entries if entry.server == server]
         if not differences:
@@ -3496,7 +3364,7 @@ def mcp_repair(label: str, server: str) -> None:
             if not atomic_file.create_text_atomic(config_file, repaired):
                 raise AccountsError("accounts: MCP configuration changed during repair; rerun the command")
             return
-        if config_file.is_symlink() or config_file.read_text(encoding="utf-8") != source.text:
+        if config_file.read_text(encoding="utf-8") != source.text:
             raise AccountsError("accounts: MCP configuration changed during repair; rerun the command")
         backup = config_file.with_name(config_file.name + ".mcp-backup-"
             + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
@@ -4558,6 +4426,18 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
     role_problems: list[AccountsError | str] = []
     try:
         selected_workers = role_account("workers")
+        label = read_role_map().workers
+        if not label:
+            raise AccountsError("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
+        selected = agent_accounts.codex_account_home(label)
+        if not isinstance(selected, agent_accounts.CodexHomeHoldingLogin):
+            kind: ProblemKind = "signed out" if selected.home.is_dir() else "access"
+            state = "not logged in" if selected.home.is_dir() else "not set up"
+            step = (f"CODEX_HOME={shlex.quote(str(selected.home))} codex login" if selected.home.is_dir()
+                    else f"run accounts.py setup {label}")
+            diagnostic = f"accounts: workers is on {label}, which is {state} on this machine; {step}"
+            raise AccountsError(diagnostic, source=ObservedStateCause(diagnostic,
+                ProblemCauseKey(kind, CauseAccount(label), CauseFile(str(selected.home)))))
     except AccountsError as error:
         role_problems.append(error)
         _observe_status_problem(_role_problem(error, tuple(str(note_file.note_path(status.label)) for status in statuses)))

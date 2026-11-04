@@ -756,6 +756,19 @@ def read_claim_block(paths: StatePaths) -> MacBlockState:
     return read_block(paths.block)
 
 
+def blocking_claim_block(paths: StatePaths) -> MacBlockState:
+    """Return the block that prevents this session from starting new work."""
+    block = read_claim_block(paths)
+    if isinstance(block, NoMacBlock) or block_belongs_to(block, build_hold.owning_session()):
+        return NO_MAC_BLOCK
+    return block
+
+
+def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimFinished:
+    print(f"blocked by {block.holder}: {block.reason}")
+    return ClaimFinished(10)
+
+
 def timestamp(value: datetime) -> str:
     return value.isoformat()
 
@@ -2034,7 +2047,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return ClaimFinished(12)
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
     try:
-        block = read_claim_block(paths)
+        block = blocking_claim_block(paths)
     except (OSError, StateReadError):
         print(f"state unreadable: {paths.block}")
         return ClaimFinished(12)
@@ -2056,7 +2069,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         for claim in overlapping:
             if (claim.record["pid"] == args.pid and claim.record["worktree"] == args.worktree
                     and not run_is_kept(claim.record) and "slot" in claim.record
-                    and (isinstance(block, NoMacBlock) or block_belongs_to(block, build_hold.owning_session()))):
+                    and isinstance(block, NoMacBlock)):
                 print(f"claimed\nslot: {claim.record['slot']}")
                 return ClaimFinished(0)
         for slot in slots:
@@ -2070,10 +2083,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             record = claim.record
             if scopes_overlap(claim.scope, scope) and run_is_kept(record):
                 return take_over_kept_claim(args, claim, record)
+    if not isinstance(block, NoMacBlock):
+        return blocked_claim(block)
     owner = build_hold.owning_session()
-    if not isinstance(block, NoMacBlock) and not block_belongs_to(block, owner):
-        print(f"blocked by {block.holder}: {block.reason}")
-        return ClaimFinished(10)
     if overlapping:
         # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
@@ -2146,6 +2158,16 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     if len(owners) != 1 or not isinstance(args.remote, str):
         return ClaimFinished(12)
     claim = owners[0]
+    # A reservation grants capacity. A later block still prevents new work.
+    # Retained remote work keeps its cleanup path.
+    if "remote_host" not in claim.record:
+        try:
+            block = blocking_claim_block(paths)
+        except (OSError, StateReadError):
+            print(f"state unreadable: {paths.block}")
+            return ClaimFinished(12)
+        if not isinstance(block, NoMacBlock):
+            return blocked_claim(block)
     record: RemoteJobClaim
     if "remote_host" in claim.record:
         record = {**claim.record}
@@ -2257,8 +2279,8 @@ def free_now(
         return "backoff"
     scope = target_claim_scope(paths, str(repo_root))
     try:
-        block = read_claim_block(paths)
-        if not isinstance(block, NoMacBlock) and not block_belongs_to(block, build_hold.owning_session()):
+        block = blocking_claim_block(paths)
+        if not isinstance(block, NoMacBlock):
             return "blocked"
         claims = read_claims(paths)
     except (OSError, StateReadError):

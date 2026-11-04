@@ -223,7 +223,14 @@ assert 'send' not in sys.modules
 
     def test_routed_rows_and_saved_unrouted_rows_read_no_alert_record_and_send_nothing(self) -> None:
         router, runner, unit = self.orphan_router()
-        with (patch.object(Path, "read_text", side_effect=AssertionError("no record read")),
+        read_text = Path.read_text
+
+        def read_config(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path.suffix != ".conf":
+                raise AssertionError("no record read")
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with (patch.object(Path, "read_text", new=read_config),
               patch.object(unrouted_alert, "send_message") as send):
             self.assertEqual(router.owner(self.row, self.root / "change-review - top.md").tab, runner.name)
             owner = router.owner(self.row | {"Verdict": "works", "Producer": str(unit.id)}, self.root / "change-review - top.md")

@@ -17,6 +17,8 @@ from scripts.lib.atomic_file import write_text_atomic
 class ScheduleBusy:
     """Another process owns this schedule's current pass."""
 
+    owner_id: str
+
 
 @dataclass
 class IntervalHistory:
@@ -40,12 +42,17 @@ def schedule_directory(name: str) -> Path:
 @contextmanager
 def locked_history(directory: Path) -> Generator[IntervalHistory | ScheduleBusy]:
     directory.mkdir(parents=True, exist_ok=True)
-    with (directory / "lock").open("a") as lock:
+    with (directory / "lock").open("a+") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            yield ScheduleBusy()
+            _ = lock.seek(0)
+            yield ScheduleBusy(lock.read().strip() or directory.name)
             return
+        _ = lock.seek(0)
+        _ = lock.truncate()
+        _ = lock.write(str(os.getpid()))
+        lock.flush()
         path = directory / "completed.json"
         try:
             saved = cast(object, json.loads(path.read_text(encoding="utf-8")))
