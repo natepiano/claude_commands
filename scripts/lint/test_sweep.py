@@ -711,7 +711,9 @@ class TargetDirTests(SweepCase):
         config = target.root.parent / "lint.conf"
         _ = write_config_fixture(config)
         environ = {sweep.BUDGET_ENV: "0", "CONF_DIR": str(config.parent)}
-        with mock.patch.dict(os.environ, environ), redirect_stdout(output):
+        # The machine's real disk floor is not this test's subject; below it, main would page.
+        with (mock.patch.dict(os.environ, environ), redirect_stdout(output),
+              mock.patch.object(sweep, "hold_floor", return_value=0)):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
         self.assertEqual(status, 0)
         self.assertIn(f"lint sweep: pid {worker.pid} works in {target.root}; {target.root} skipped", output.getvalue())
@@ -2636,17 +2638,23 @@ class FloorTests(SweepCase):
 
     def base(self) -> Path:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        config = base / "copies.conf"
+        configured = (Path(__file__).resolve().parents[2] / "config/copies.conf").read_text()
+        _ = config.write_text("\n".join(f"root={base / 'gates'}" if line.startswith("root=") else line
+                                           for line in configured.splitlines()) + "\n")
         self.enterContext(mock.patch.dict(os.environ, {
             sweep.tmp_sweep.STATE_ENV: str(base),
             "BUILDLOG_DIR": str(base / "buildlog"),
             "BUILD_HOLD_DIR": str(base / "build-hold"),
+            "COPIES_CONFIG": str(config),
         }))
         _ = self.enterContext(mock.patch.object(sweep, "output_device", return_value=base.stat().st_dev))
         _ = self.enterContext(mock.patch.object(build_hold, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", return_value={}))
         _ = write_config_fixture(conf.path("lint"),
-                                 f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n")
+                                 f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n"
+                                 + f"sweep_floor_roots={base}\n")
         _ = self.enterContext(mock.patch.object(
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         _ = self.enterContext(mock.patch.object(

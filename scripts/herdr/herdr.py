@@ -1178,9 +1178,21 @@ class Herdr:
 
     def run_in_pane(self, pane: str, command: list[str], *, terminal: str = "") -> None:
         """Run a command only when the selected pane contains its empty shell."""
-        if not check_target("", action="keys", place=HerdrPlace(self.session, pane), terminal=terminal,
-                            pane_info=_pane_row(self, pane), client=self):
-            raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of the selected shell")
+        deadline = time.monotonic() + PROGRAM_TIMEOUT_SECONDS
+        while True:
+            try:
+                if check_target("", action="keys", place=HerdrPlace(self.session, pane), terminal=terminal,
+                                pane_info=_pane_row(self, pane), client=self):
+                    break
+                failure = HerdrFailure(f"{pane}: would send keys to an unproved target instead of the selected shell")
+            except HerdrFailure as error:
+                if error.code != "wrong_target":
+                    raise
+                failure = error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise failure
+            time.sleep(min(0.1, remaining))
         _ = self.run("pane", "run", pane, shlex.join(command))
 
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:

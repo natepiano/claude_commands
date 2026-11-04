@@ -69,3 +69,7 @@ Anything else unexpected prints one anomaly line and the operation continues.
 | shutdown | refusals in `restart.py` and `shutdown_record.py`; the restore record keeps only the list of row ids that were live. Done: the `launch_permission.py` and `folder_trust.py` gates (deleted in b9fd6ada4) |
 | accounts | `cutover-home` (after the Mac cutover); the Mac session counts fetch; the resume retry loop |
 | phases | wait recovery; unknown-owner states; queue_place cleanup redesign; verify staging recovery; `process_start.py` unless it deletes the `/proc` copies (net negative) |
+
+## 6. Every accessor
+
+`docs/as-built/staff-accessors.md` lists every file that reads or writes the staff file, and each copy the user approved. Use it for a staff migration.

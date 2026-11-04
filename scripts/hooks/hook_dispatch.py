@@ -110,6 +110,7 @@ POST_TOOL_USE = (
 STOP = (
     HookSpec("stop-conversation-pause.py", None),
     HookSpec("stop-assistant-prose-banned-words.py", None),
+    HookSpec("stop-context-deferral.py", None, 10),
     HookSpec("herdr_tab_title.py", None),
 )
 EVENTS = {"pre_tool_use": PRE_TOOL_USE, "post_tool_use": POST_TOOL_USE, "stop": STOP}
