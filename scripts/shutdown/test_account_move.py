@@ -187,7 +187,7 @@ class AccountMoveTests(ShutdownTestCase):
                   [stop_resume.ClaudeUp("move-id", "w1:p1", "claude3")]]) as moved):
             status, output, error = self.cli()
             self.assertEqual((status, output), (1, ""))
-            self.assertEqual(error, "move-id: stopped, resume pending: registry unreadable\n")
+            self.assertEqual(error, "move-id: stopped, resume pending on claude3: registry unreadable\n")
             self.assertNotIn("not moved", error)
             status, output, error = self.cli()
         self.assertEqual((status, error), (0, ""))

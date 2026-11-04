@@ -187,7 +187,7 @@ def row_production(row: staff.StaffRow, record: staff.StaffSnapshot,
     """Resolve a unit's current parent from the caller's owner snapshot."""
     doc = session_staff.RowResolver(record).production_doc(row)
     if isinstance(doc, session_staff.ProductionDoc):
-        slugs = [slug for slug, parent in sources.showrunner_members(record).items() if parent.id == row.parent]
+        slugs = [slug for slug, parent in sources.showrunner_members(record).items() if staff.ReportsTo(parent.id) == row.parent]
         slug = slugs[0] if len(slugs) == 1 else showrunners.production_slug(str(doc.path))
         return UnitProduction(slug, str(doc.path))
     raise staff.StaffUnreadable(f"{row.name}: {doc.reason}")
@@ -209,7 +209,7 @@ def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
     while row is not None:
         if row.kind == "showrunner":
             return MemberFound(row)
-        row = record.by_id(row.parent) if row.parent is not None else None
+        row = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
     return NoSessionShowrunner()
 
 
@@ -267,8 +267,8 @@ class HeldRunUnknown:
 class HeldRunLookup:
     """Read only held histories and retain each result for one watch pass."""
 
-    def __init__(self, *, record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> None:
-        self._record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = record
+    def __init__(self, *, record: staff.StaffSnapshot | None = None) -> None:
+        self._record: staff.StaffSnapshot | None = record
         self._folders: dict[str, list[str]] | None = None
         self._histories: dict[Path, HeldRun | HeldRunUnknown] = {}
 
@@ -285,7 +285,7 @@ class HeldRunLookup:
                         first = _event(handle.readline().decode("utf-8"))
                     if first is None or first.get("event_type") != "run_started":
                         raise ValueError("history does not start with run_started")
-                    if isinstance(self._record, session_staff.ReadCurrentStaff):
+                    if self._record is None:
                         self._record = staff.snapshot()
                     row = self._record.by_member_reference(session_id)
                     if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
@@ -350,7 +350,7 @@ def read_run_states() -> RunStates:
     directory = runs_dir()
     if not directory.exists():
         return RunStates({})
-    record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT
+    record: staff.StaffSnapshot | None = None
     newest: dict[str, _StartedRun] = {}
     for path in directory.iterdir():
         if path.suffix != ".jsonl":
@@ -363,7 +363,7 @@ def read_run_states() -> RunStates:
         identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
         if not isinstance(identity, str):
             continue
-        if isinstance(record, session_staff.ReadCurrentStaff):
+        if record is None:
             record = staff.snapshot()
         row = record.by_member_reference(identity)
         if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):

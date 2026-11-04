@@ -11,10 +11,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import cast, override
+from typing import override
 from unittest.mock import patch
 
 from scripts.direct import remove_workers, workers
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_worker, fixture_runtime_id, unit_membership
+from scripts.agents import worker_lifecycle
 
 SCRIPT = Path(__file__).parent / "remove_workers.py"
 
@@ -33,11 +36,10 @@ esac
 ORCHESTRATOR = "aaaaaaaa-0000-0000-0000-000000000000"
 GONE_ORCHESTRATOR = "bbbbbbbb-0000-0000-0000-000000000000"
 LEGACY_DEAD = "c1596298-9325-4c8b-961a-ba976e73a3f5"
-LEGACY_LIVE = "d2222222-2222-2222-2222-222222222222"
 
 
-def row(worker_id: str, name: str, kind: str = "background") -> dict[str, str]:
-    return {"id": worker_id, "sessionId": f"{worker_id}-full", "kind": kind, "name": name}
+def row(worker_id: str, name: str, kind: str = "background") -> remove_workers.AgentRow:
+    return {"id": worker_id, "sessionId": fixture_runtime_id(f"{worker_id}-full"), "kind": kind, "name": name}
 
 
 class RemoveWorkersTest(unittest.TestCase):
@@ -51,6 +53,10 @@ class RemoveWorkersTest(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        fixture = StaffTestCase()
+        fixture.setUp()
+        fixture.write_json(fixture.staff_file, {"schema": 2, "rows": []})
+        self.addCleanup(fixture.doCleanups)
         self.temporary = tempfile.TemporaryDirectory()
         base = Path(self.temporary.name)
         self.root = base / "runs"
@@ -60,11 +66,7 @@ class RemoveWorkersTest(unittest.TestCase):
         self.claude = base / "claude"
         self.state_root = base / "shutdown"
         self.account_log = base / "accounts.jsonl"
-        environment_context: object = cast(
-            object,
-            self.enterContext(patch.dict(os.environ, {"HOME": str(base)})),
-        )
-        del environment_context
+        self.enterContext(patch.dict(os.environ, {"HOME": str(base)}))
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         _ = self.claude.write_text(STUB_CLAUDE, encoding="utf-8")
         self.claude.chmod(0o755)
@@ -73,17 +75,20 @@ class RemoveWorkersTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def run_dir(self, name: str, workers: list[str], orchestrator: str | None = None) -> Path:
-        run = self.root / name
+    def run_dir(self, name: str, workers: list[str], orchestrator: str | None = None, *, root: Path | None = None) -> Path:
+        selected = root or self.root
+        run = selected / name
         run.mkdir()
-        _ = (run / "workers").write_text(
-            "".join(f"{worker}\tproject-{worker}\n" for worker in workers), encoding="utf-8"
-        )
+        parent = unit_membership("cleanup", name)
         if orchestrator is not None:
-            _ = (self.root / "active" / orchestrator).write_text(f"{run}\n", encoding="utf-8")
+            parent = staff.update_current_session(parent.current_session, staff.native_id(orchestrator))
+            _ = (selected / "active" / orchestrator).write_text(f"{run}\n", encoding="utf-8")
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "cleanup", "unit": name}))
+        for worker in workers:
+            _ = fixture_worker("worker-" + worker, parent.id, runtime_id=fixture_runtime_id(worker + "-full"))
         return run
 
-    def list_rows(self, rows: list[dict[str, str]]) -> None:
+    def list_rows(self, rows: list[remove_workers.AgentRow]) -> None:
         listed = [*rows, {"id": "aaaaaaaa", "sessionId": ORCHESTRATOR, "kind": "interactive", "name": "me"}]
         _ = self.rows.write_text(json.dumps(listed), encoding="utf-8")
 
@@ -137,7 +142,7 @@ class RemoveWorkersTest(unittest.TestCase):
             STUB_ROWS=str(self.rows),
             STUB_REMOVED=str(self.removed),
             STUB_ACCOUNTS=str(self.account_log),
-            CLAUDE_CODE_SESSION_ID=caller,
+            CLAUDE_CODE_SESSION_ID=fixture_runtime_id(caller) if caller else "",
             SHUTDOWN_STATE_DIR=str(self.state_root),
         )
         command = [sys.executable, str(SCRIPT), "--run-root", str(self.root)]
@@ -157,14 +162,42 @@ class RemoveWorkersTest(unittest.TestCase):
         result, removed = self.run_remove_workers(session_dir, caller)
         return result.returncode, sorted(removed)
 
+    def test_retirement_retries_after_the_staff_publication_is_interrupted(self) -> None:
+        fixture = StaffTestCase()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        _, parent, _ = fixture.tree()
+        worker = fixture_worker("removed", parent.id, runtime_id=fixture_runtime_id("removed-Claude"))
+        run = self.run_dir("removed-run", [worker.current_session])
+        retire = staff.retire
+
+        def publish_then_interrupt(identity: staff.StaffId) -> staff.StaffRow | None:
+            _ = retire(identity)
+            raise InterruptedError("lost staff acknowledgement")
+
+        with worker_lifecycle.membership_operation(run):
+            with patch.object(staff, "retire", side_effect=publish_then_interrupt):
+                with self.assertRaisesRegex(InterruptedError, "lost staff acknowledgement"):
+                    remove_workers.retire_removed_worker(worker.current_session)
+            self.assertIsNone(staff.by_id(worker.id))
+            before = fixture.staff_file.read_bytes(), fixture.staff_file.stat().st_mtime_ns
+            remove_workers.retire_removed_worker(worker.current_session)
+            self.assertEqual((fixture.staff_file.read_bytes(), fixture.staff_file.stat().st_mtime_ns), before)
+
     def test_phase_cleanup_keeps_a_claude_session_owned_by_the_unit_ledger(self) -> None:
         own = self.run_dir("own", ["held", "ephemeral"], orchestrator=ORCHESTRATOR)
-        self.list_rows([row("held", "persistent writer"), row("ephemeral", "temporary writer")])
+        runner = staff.ensure("showrunner", name="cleanup", parent=staff.StaffRoot(),
+                              runtime_id=fixture_runtime_id("cleanup-owner"))
+        worker = staff.by_current_session(fixture_runtime_id("held-full"))
+        assert worker is not None
+        worker = staff.move(worker.id, staff.ReportsTo(runner.id))
+        self.list_rows([{**row("held", "persistent writer"), "sessionId": worker.current_session},
+                        row("ephemeral", "temporary writer")])
         with patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.root / "unit-workers")}):
-            store = workers.UnitWorkerLedger(workers.ledger_path("production", "builders"))
+            store = workers.UnitWorkerLedger(workers.ledger_path("cleanup", "own"))
             with store.locked() as ledger:
-                ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "claude", "opus", "high", {},
-                    workers.ClaudeSession("held-full"), workers.Paused(), [])
+                ledger.workers[worker.name] = workers.UnitWorker(worker.name, "impl", "claude", "opus", "high", {},
+                    workers.ClaudeSession(worker.current_session), workers.Paused(), [], staff_id=worker.id)
             self.assertEqual(self.remove_workers(own), (0, ["ephemeral"]))
             self.assertTrue(store.path.exists())
 
@@ -190,13 +223,6 @@ class RemoveWorkersTest(unittest.TestCase):
             ["agents\t<unset>", "rm\t<unset>"],
         )
 
-    def test_cleanup_reads_an_old_run_ledger_and_keeps_its_shared_link(self) -> None:
-        own = self.run_dir("old-run", ["old-worker"], orchestrator=ORCHESTRATOR)
-        _ = (own / "workers").rename(own / "seats")
-        self.list_rows([row("old-worker", "p-impl")])
-        self.assertEqual(self.remove_workers(own), (0, ["old-worker"]))
-        self.assertTrue((own / "seats").samefile(own / "workers"))
-        self.assertEqual((own / "workers").read_text(), "old-worker\tproject-old-worker\n")
 
     def test_own_run_goes_even_while_live(self) -> None:
         own = self.run_dir("own", ["own1", "own2"], orchestrator=ORCHESTRATOR)
@@ -233,27 +259,39 @@ class RemoveWorkersTest(unittest.TestCase):
     def test_runs_under_either_folder_name_are_kept_live_or_swept(self) -> None:
         former = self.root.parent / "former"
         (former / "active").mkdir(parents=True)
-        new_live = self.run_dir("new-live", ["new1"], orchestrator=ORCHESTRATOR)
+        _ = self.run_dir("new-live", ["new1"], orchestrator=ORCHESTRATOR)
         _ = self.run_dir("new-ended", ["new2"])
-        old_live = former / "old-live"
-        old_live.mkdir()
-        _ = (old_live / "workers").write_text("old1\tproject-old1\n", encoding="utf-8")
-        _ = (former / "active" / GONE_ORCHESTRATOR).write_text(f"{old_live}\n", encoding="utf-8")
-        (former / "old-ended").mkdir()
-        _ = (former / "old-ended" / "workers").write_text("old2\tproject-old2\n", encoding="utf-8")
-        roots = (self.root, former)
-        live = remove_workers.live_runs(roots, {ORCHESTRATOR, GONE_ORCHESTRATOR})
-        self.assertEqual(live, {new_live.resolve(), old_live.resolve()})
-        self.assertEqual(set(remove_workers.removal_targets(roots, set(), [], live)), {"new2", "old2"})
+        _ = self.run_dir("old-live", ["old1"], orchestrator=GONE_ORCHESTRATOR, root=former)
+        _ = self.run_dir("old-ended", ["old2"], root=former)
+        listed = [row(name, name) for name in ("new1", "new2", "old1", "old2")]
+        listed.extend([{"sessionId": ORCHESTRATOR}, {"sessionId": GONE_ORCHESTRATOR}])
+        self.assertEqual(set(remove_workers.removal_targets(set(), listed, roots=(self.root, former))), {"new2", "old2"})
 
-    def test_legacy_names_follow_their_run(self) -> None:
-        _ = self.run_dir(LEGACY_LIVE, [], orchestrator=ORCHESTRATOR)
-        self.list_rows([
-            row("old1", f"{LEGACY_DEAD}-test"),
-            row("old2", f"{LEGACY_DEAD}-impl"),
-            row("kept", f"{LEGACY_LIVE}-impl"),
-        ])
-        self.assertEqual(self.remove_workers(), (0, ["old1", "old2"]))
+
+    def test_cleanup_uses_staff_membership_instead_of_handles_or_display_names(self) -> None:
+        _ = self.run_dir("ended", ["member"])
+        run = self.root / "unowned"
+        run.mkdir()
+        _ = (run / "workers").write_text("stranger\tproject-stranger\n")
+        self.list_rows([row("member", "unrelated display"), row("stranger", f"project-{LEGACY_DEAD}-test")])
+        self.assertEqual(self.remove_workers(), (0, ["member"]))
+
+    def test_claude_cleanup_preserves_a_paused_codex_worker(self) -> None:
+        run = self.run_dir("ended", ["member"])
+        parent = unit_membership("cleanup", "ended")
+        codex = fixture_worker("paused-codex", parent.id,
+                               backend=staff.CodexBackend(self.root.parent / "codex-home"))
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            codex.name: {"staff_id": codex.id, "status": "paused"},
+        }))
+        listed = [row("member", "Claude worker")]
+        self.assertEqual(set(remove_workers.removal_targets(set(), listed, roots=(self.root,))), {"member"})
+        self.list_rows(listed)
+        self.assertEqual(self.remove_workers(), (0, ["member"]))
+        self.assertEqual(staff.by_id(codex.id), codex)
+        self.assertEqual(worker_lifecycle.read_json_object(run / "mesh_roster.json"), {
+            codex.name: {"staff_id": codex.id, "status": "paused"},
+        })
 
     def test_only_listed_background_workers_go(self) -> None:
         _ = self.run_dir("ended", ["gone1", "inter1"])
@@ -275,11 +313,8 @@ class RemoveWorkersTest(unittest.TestCase):
             os.fspath(SCRIPT),
             "--session-dir",
             os.fspath(own),
-            "--run-root",
-            os.fspath(self.root),
         ]
         with patch.object(sys, "argv", arguments), \
-                patch.object(remove_workers, "DEFAULT_ROOTS", (self.root,)), \
                 patch.object(remove_workers, "claude_bin", return_value=os.fspath(self.claude)), \
                 patch.object(remove_workers, "list_sessions", return_value=None), \
                 patch.object(subprocess, "run") as commands:
@@ -292,7 +327,6 @@ class RemoveWorkersTest(unittest.TestCase):
         own = self.run_dir("own", [], orchestrator=ORCHESTRATOR)
         arguments = [str(SCRIPT), "--session-dir", str(own)]
         with (patch.object(sys, "argv", arguments),
-              patch.object(remove_workers, "DEFAULT_ROOTS", (self.root,)),
               patch.object(remove_workers, "list_sessions", return_value=[]),
               patch.object(subprocess, "run", side_effect=AssertionError("run cleanup launched a server sweep")) as commands):
             self.assertEqual(remove_workers.main(), 0)

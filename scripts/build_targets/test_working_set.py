@@ -44,7 +44,7 @@ class WorkingSetTests(unittest.TestCase):
     def process(self, pid: int, argv: list[str], pss_kib: int, swap_kib: int = 0,
                 *, cwd: str = "/home/test/.claude", owner: str = "") -> Path:
         if owner and not any(row.name == owner for row in self.rows):
-            self.rows.append(staff.StaffRow(staff.StaffId(owner), "unit", owner, None,
+            self.rows.append(staff.StaffRow(staff.StaffId(owner), "unit", owner, staff.STAFF_ROOT,
                 current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", Path(cwd))))
         process = self.proc / str(pid)
         process.mkdir()
@@ -186,7 +186,7 @@ class WorkingSetTests(unittest.TestCase):
         ):
             with self.subTest(script=script):
                 folder = Path("/work") / owner
-                row = staff.StaffRow(staff.StaffId(owner), "unit", owner, None,
+                row = staff.StaffRow(staff.StaffId(owner), "unit", owner, staff.STAFF_ROOT,
                     current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", folder))
                 resolver = session_staff.RowResolver(staff.StaffSnapshot((row,)))
                 self.assertEqual(working_set.owner_for(str(folder / script), resolver), owner)
@@ -196,7 +196,7 @@ class WorkingSetTests(unittest.TestCase):
         for pid, owner in ((801, "first"), (802, "second")):
             _ = self.process(pid, ["python3", script], 1024, cwd=f"/work/{owner}", owner=owner)
         _ = self.process(803, ["python3", script], 512, cwd="/work/first-other")
-        self.rows.append(staff.StaffRow(staff.StaffId("retired"), "unit", "retired", None,
+        self.rows.append(staff.StaffRow(staff.StaffId("retired"), "unit", "retired", staff.STAFF_ROOT,
             current_session=staff.StaffId("retired-current"), worktree=staff.RemovedWorktree("natedev", Path("/work/first-other"))))
         groups = {(group.script, group.owner): group.pss_kib for group in self.report().groups if group.script}
         self.assertEqual(groups, {(script, "first"): 1024, (script, "second"): 1024, (script, "unassigned"): 512})
@@ -204,7 +204,7 @@ class WorkingSetTests(unittest.TestCase):
     def test_folder_ownership_selects_the_nested_unit_and_ignores_other_row_kinds(self) -> None:
         for pid, owner, folder in ((811, "outer", "/work"), (812, "inner", "/work/inner")):
             _ = self.process(pid, ["python3", "/shared/helper.py"], 1024, cwd=folder, owner=owner)
-        self.rows.append(staff.StaffRow(staff.StaffId("director"), "showrunner", "director", None,
+        self.rows.append(staff.StaffRow(staff.StaffId("director"), "showrunner", "director", staff.STAFF_ROOT,
             current_session=staff.StaffId("director-session"), worktree=staff.PresentWorktree("natedev", Path("/separate"))))
         resolver = session_staff.RowResolver(staff.StaffSnapshot(tuple(self.rows)))
         for folder, owner in (("/work/file", "outer"), ("/work/inner/src", "inner"),
@@ -214,10 +214,10 @@ class WorkingSetTests(unittest.TestCase):
 
     def test_nested_agent_worktree_keeps_the_outer_unit_owner(self) -> None:
         self.rows.extend((
-            staff.StaffRow(staff.StaffId("outer-id"), "unit", "outer", None,
+            staff.StaffRow(staff.StaffId("outer-id"), "unit", "outer", staff.STAFF_ROOT,
                 current_session=staff.StaffId("outer-session"),
                 worktree=staff.PresentWorktree("natedev", Path("/work/unit"))),
-            staff.StaffRow(staff.StaffId("nested-id"), "agent", "nested", None,
+            staff.StaffRow(staff.StaffId("nested-id"), "agent", "nested", staff.STAFF_ROOT,
                 current_session=staff.StaffId("nested-session"),
                 worktree=staff.PresentWorktree("natedev", Path("/work/unit/nested"))),
         ))
@@ -226,7 +226,7 @@ class WorkingSetTests(unittest.TestCase):
         self.assertEqual([(group.owner, group.pss_kib) for group in groups], [("outer", 1024)])
 
     def test_unfilled_worktree_reports_one_problem_and_keeps_the_report(self) -> None:
-        self.rows.append(staff.StaffRow(staff.StaffId("pending"), "unit", "pending", None,
+        self.rows.append(staff.StaffRow(staff.StaffId("pending"), "unit", "pending", staff.STAFF_ROOT,
                                        current_session=staff.StaffId("pending-session")))
         _ = self.process(813, ["python3", "/shared/helper.py"], 1024)
         with redirect_stderr(io.StringIO()) as errors:

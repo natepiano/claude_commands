@@ -113,7 +113,7 @@ def resume_launch(entry: PaneLaunch) -> PaneLaunch:
     current = entry.copy()
     if owner is not None:
         current["session_id"] = owner.current_session
-        unit = record.by_id(owner.parent) if owner.kind == "worker" and owner.parent else owner
+        unit = record.parent_of(owner) if owner.kind == "worker" else owner
         if unit is not None and unit.kind == "unit" and not isinstance(unit.worktree, staff.WorktreeUnfilled):
             current["cwd"] = str(unit.worktree.path)
     return current

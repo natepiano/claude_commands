@@ -262,7 +262,7 @@ class TopLevelTests(unittest.TestCase):
 
     def test_docless_staff_warning_keeps_other_top_level_recipients(self) -> None:
         address = self.add("reachable", session_id="reachable-id")
-        bad = staff.StaffRow(staff.StaffId("bad"), "showrunner", "bad", None,
+        bad = staff.StaffRow(staff.StaffId("bad"), "showrunner", "bad", staff.STAFF_ROOT,
                              current_session=staff.StaffId("bad-session"))
         diagnostics = unit_labels.StaffDiagnostics()
         self.assertEqual(unit_labels.registered_showrunners(

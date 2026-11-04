@@ -11,7 +11,6 @@ Exit 0 on success, 1 on a refusal or failure, and 2 on invalid arguments.
 """
 from __future__ import annotations
 
-
 import argparse
 import subprocess
 import sys
@@ -23,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import completion_receipt, staff, staff_sources, unit_config
 from scripts.shutdown import remote
 from scripts.lib import conf
+from scripts.message import sessions
 
 import add_unit
 import retire_unit
@@ -115,7 +115,7 @@ def has_worktree(unit: RetiredUnit) -> bool:
 
 
 def has_transcript(unit: RetiredUnit) -> bool:
-    return bool(retire_unit.transcript_locations(unit.session_id))
+    return bool(sessions.transcript_locations(unit.session_id))
 
 
 def is_running(unit: RetiredUnit) -> bool:

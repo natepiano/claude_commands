@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, recorded_unit
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file, recorded_unit
 
 
 HOOKS = Path(__file__).resolve().parent
@@ -330,13 +330,16 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             runs = fixture.root / "unit-runs"
             worker_run = runs / "supplier-run"
             worker_run.mkdir(parents=True)
-            _ = (worker_run / "mesh_roster.json").write_text(json.dumps({"supplier-fix": {"thread_id": "supplier-thread"}}))
+            parent, = staff.local_snapshot().find(kind="unit")
+            worker = fixture_worker("supplier-fix", parent.id,
+                                    backend=staff.CodexBackend(fixture.root / "codex"))
+            _ = (worker_run / "mesh_roster.json").write_text(json.dumps({"supplier-fix": {"staff_id": worker.id}}))
             fixture.environment["UNIT_RUN_ROOT"] = str(runs)
             supplier = "worker:supplier-run/supplier-fix"
             fixture.call(STOP, {"last_assistant_message": "blocked: waiting on " + supplier}, 1010)
             fixture.call(PROMPT, {"prompt": fixture.message("Ready", address="codex:another-thread", name=supplier)}, 1020)
             self.assertEqual(len(fixture.wait_events()), 1)
-            fixture.call(PROMPT, {"prompt": fixture.message("Ready", address="codex:supplier-thread")}, 1040)
+            fixture.call(PROMPT, {"prompt": fixture.message("Ready", address=f"codex:{worker.current_session}")}, 1040)
             self.assertEqual(fixture.wait_events()[-1]["event_type"], "wait_finished")
 
     def test_unnamed_supplier_remains_unresolved_and_different_supplier_replaces_wait(self) -> None:

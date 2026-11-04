@@ -278,7 +278,7 @@ def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduct
         found: list[NightlyProduction] = []
         unknown: list[str] = []
         for row in staff.active(record, "unit"):
-            parent = record.by_id(row.parent) if row.parent is not None else None
+            parent = record.parent_of(row)
             if parent is not None and isinstance(parent.doc, staff.WrappedDoc):
                 continue
             try:
