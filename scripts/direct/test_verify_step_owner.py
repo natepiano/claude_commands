@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import re
 import signal
 import subprocess
 import sys
@@ -15,6 +14,7 @@ import unittest
 from scripts.direct.test_verify_mac_offload import stub_build_tool_path
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_function
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -31,13 +31,6 @@ class StepOwnership(TypedDict):
 class StepProcess(TypedDict):
     pid: int
     group: int
-
-
-def shell_function(source: str, name: str) -> str:
-    match = re.search(rf"(?ms)^{name}\(\) \{{\n.*?^\}}", source)
-    if match is None:
-        raise AssertionError(f"missing shell function: {name}")
-    return match.group(0)
 
 
 class VerifyStepOwnerTests(unittest.TestCase):

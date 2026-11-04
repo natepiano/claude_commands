@@ -251,7 +251,7 @@ Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second la
 
 **Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/test_charts.py`.
 
-### Phase 11 — Every build step records its real target folder  · status: todo
+### Phase 11 — Every build step records its real target folder  · status: done
 **Depends on:** none (runs beside Phase 10)
 
 The builds showrunner, 2026-11-03: add-on 1 is current and belongs to report-unit (its Units row owns `scripts/buildlog/`, the build log and its writer). Phase 9 found that 1,399 of 1,517 cold natedev steps in 7 days have no absolute target folder (678 `unknown`, 721 unset). Cold-cause rounds cannot tell which folder went cold.

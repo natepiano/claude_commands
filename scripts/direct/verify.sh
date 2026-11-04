@@ -2915,7 +2915,7 @@ refresh_test_build_inputs() {
     fi
     # A hold can also arrive during memory admission, after buildlog_begin.
     if [[ -n "${BUILDLOG_START:-}" ]]; then
-        BUILDLOG_TREE="$("$PY" "$BUILDLOG_RECORD" key 2>/dev/null)" || BUILDLOG_TREE=""
+        buildlog_read_context ${BUILDLOG_STEP_ARGV[@]+"${BUILDLOG_STEP_ARGV[@]}"}
     fi
     TEST_BUILD_INPUTS_READY=1
 }
