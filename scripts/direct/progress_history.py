@@ -33,7 +33,7 @@ from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import models_registry, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production import production_doc, session_staff, showrunners, staff  # noqa: E402
+from scripts.production import production_doc, session_staff, showrunners, staff, unit_config  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 
 
@@ -1368,7 +1368,8 @@ def _start_run(args: argparse.Namespace) -> None:
         raise SystemExit(
             "Unable to detect the unit director's model and effort; pass explicit --main-* values"
         )
-    current = plan_history.staff_directory({"main_agent": main_agent}, staff.initial_snapshot())
+    record = staff.initial_snapshot()
+    current = plan_history.staff_directory({"main_agent": main_agent}, record)
     working_dir_value = _string(current.get("working_dir")) or working_dir_value
     working_dir = Path(working_dir_value).expanduser().resolve()
     now = plan_history.now_epoch()
@@ -1378,6 +1379,10 @@ def _start_run(args: argparse.Namespace) -> None:
         short_hash = _git_value(working_dir, "rev-parse", "--short", "HEAD")
         branch = f"detached@{short_hash or 'unknown'}"
     plan_doc = _arg_string(args, "plan_doc")
+    member = record.by_member_reference(main_agent["session_id"])
+    if plan_doc and member is not None and member.kind == "unit":
+        plan = plan_history.resolve_plan_path(working_dir, plan_doc).relative_to(working_dir)
+        unit_config.set_plan(working_dir, plan)
     project_timing = _resolve_project_timing(working_dir, branch, plan_doc, now)
     history_file = plan_history.history_root() / "runs" / f"{run_id}.jsonl"
     state: dict[str, object] = {

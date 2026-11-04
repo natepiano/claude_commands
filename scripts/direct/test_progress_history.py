@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.production import staff
+from scripts.production import session_staff, staff, unit_config
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_member, isolated_staff_file, recorded_showrunner, recorded_unit,
 )
@@ -1571,6 +1571,38 @@ print('two homes isolated; recorder lock retained; caller restored')
             "implementing",
             at=at,
         )
+
+    def test_start_run_assigns_its_plan_to_the_registered_unit(self) -> None:
+        unit = recorded_unit("Example", "unit-a", self.working_dir,
+                             self.root / "example-production.md", plan="docs/old.md")
+        original = unit_config.read(self.working_dir)
+        assert isinstance(original, unit_config.UnitConfig)
+        session_dir = self.root / "new-plan"
+        plan = self.working_dir / "docs/new.md"
+        plan.parent.mkdir()
+        _ = plan.write_text(
+            "# New plan\n\n## Delegation Context\n\n- **Project:** Example\n",
+            encoding="utf-8",
+        )
+        before = (self.root / "staff.json").read_bytes()
+        _ = self.run_command(
+            "start-run", "--session-dir", str(session_dir),
+            "--working-dir", str(self.working_dir), "--plan-doc", str(plan),
+            "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "xhigh",
+            "--main-session-id", str(unit.current_session), at=1_700_000_000)
+        configuration = session_staff.RowResolver(staff.snapshot()).unit_config(unit)
+        assert isinstance(configuration, unit_config.UnitConfig)
+        self.assertEqual(configuration.plan, unit_config.PlanFile(Path("docs/new.md")))
+        self.assertEqual((configuration.port, configuration.responsibilities),
+                         (original.port, original.responsibilities))
+        self.assertEqual((self.root / "staff.json").read_bytes(), before)
+        published = (self.working_dir / ".unit.toml").stat().st_mtime_ns
+        _ = self.run_command(
+            "start-run", "--session-dir", str(session_dir),
+            "--working-dir", str(self.working_dir), "--plan-doc", str(plan),
+            "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "xhigh",
+            "--main-session-id", str(unit.current_session), at=1_700_000_001)
+        self.assertEqual((self.working_dir / ".unit.toml").stat().st_mtime_ns, published)
 
     def test_start_run_persists_the_plan_git_time_without_an_agent_timestamp(
         self,
