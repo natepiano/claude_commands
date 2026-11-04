@@ -191,9 +191,10 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(why, "unit watchdog recovery")
         if not to:
             entry = pane_record.launch_for_session(identity)
-            if entry is None:
-                return stop_resume.ResumeFailed(identity, "no pane launch")
-            to = accounts.claude_config_label(Path(entry["config_dir"]))
+            owner = self.units[identity]
+            assert "config_dir" in owner
+            directory = entry["config_dir"] if entry is not None else owner["config_dir"]
+            to = accounts.claude_config_label(Path(directory))
         self.commands.append(["resume", identity, "--to", to, "--only", identity])
         if not Path(self.units[identity]["cwd"]).is_dir():
             return stop_resume.ResumeFailed(identity, "folder no longer exists")
@@ -416,6 +417,33 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
         self.assertEqual(self.notices, [])
         self.assertEqual({item["sessionId"] for item in self.fixture.live}, {"alpha"})
+
+    def test_crashed_unit_without_a_pane_launch_record_restarts_on_its_launch_account(self) -> None:
+        _ = self.add_unit("alpha")
+        _ = pane_record.forget_unit("alpha")
+        self.die("alpha")
+        lines = self.pass_at(0)
+        self.assertEqual(self.pass_at(2, dry_run=True),
+                         ["watchdog: would restart alpha; no pane launch is saved for this unit"])
+        self.assertEqual(self.pending, [])
+        for minute in (2, 4):
+            lines.extend(self.pass_at(minute))
+        self.assertIn("watchdog: alpha: restarted on claude4", lines)
+        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
+        self.assertEqual({item["sessionId"] for item in self.fixture.live}, {"alpha"})
+
+    def test_missing_folder_without_a_pane_launch_record_reports_no_saved_launch(self) -> None:
+        owner = self.add_unit("alpha")
+        _ = pane_record.forget_unit("alpha")
+        self.die("alpha")
+        Path(owner["cwd"]).rmdir()
+        lines: list[str] = []
+        for minute in (0, 2, 4):
+            lines.extend(self.pass_at(minute))
+        self.assertTrue(any(line.endswith("folder no longer exists; no pane launch is saved for this unit")
+                            for line in lines), lines)
+        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
+        self.assertEqual(self.fixture.live, [])
 
     def test_older_launch_without_an_end_mark_still_recovers_its_conversation(self) -> None:
         _ = self.add_unit("alpha")
