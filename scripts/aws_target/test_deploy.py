@@ -28,6 +28,7 @@ from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.buildlog import sync
 from scripts.lib import conf
+from scripts.build_targets import target_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -50,13 +51,41 @@ override = root / (operation + '.json')
 if override.exists():
     reply(json.loads(override.read_text()))
     sys.exit(0)
-if service == 'cloudformation' and operation == 'describe-stacks':
+keys_path = root / 'fake-keys.json'
+keys = json.loads(keys_path.read_text()) if keys_path.exists() else ['old-key']
+if service == 'sts' and operation == 'get-caller-identity':
+    import configparser
+    credentials = configparser.ConfigParser()
+    credentials.read(os.environ['AWS_SHARED_CREDENTIALS_FILE'])
+    profile = args[args.index('--profile') + 1]
+    valid = credentials.get(profile, 'aws_access_key_id', fallback='') == 'new-key'
+    if not valid or (root / 'fail-scaler').exists():
+        print('The profile is not ready', file=sys.stderr)
+        sys.exit(1)
+    reply({'Arn': 'arn:aws:iam::123456789012:user/build-scaler'})
+elif service == 'iam' and operation == 'create-access-key':
+    keys.append('new-key')
+    keys_path.write_text(json.dumps(keys))
+    reply({'AccessKey': {'AccessKeyId': 'new-key', 'SecretAccessKey': 'fixture-secret-only-in-credentials'}})
+elif service == 'iam' and operation == 'list-access-keys':
+    reply({'AccessKeyMetadata': [{'AccessKeyId': key} for key in keys]})
+elif service == 'iam' and operation == 'delete-access-key':
+    keys.remove(args[args.index('--access-key-id') + 1])
+    keys_path.write_text(json.dumps(keys))
+    reply({})
+elif service == 'cloudformation' and operation == 'describe-stacks':
+    if not state and (root / 'review-stack').exists():
+        reply({'Stacks': [{'StackStatus': 'REVIEW_IN_PROGRESS'}]})
+        sys.exit(0)
     if not state or state.get('stack_name') != args[args.index('--stack-name') + 1]:
         print('ValidationError: Stack does not exist', file=sys.stderr)
         sys.exit(1)
     reply({'Stacks': [{'StackStatus': 'UPDATE_COMPLETE', 'Outputs': [
         {'OutputKey': key, 'OutputValue': value} for key, value in state['outputs'].items()]}]})
 elif service == 'cloudformation' and operation == 'deploy':
+    if 'EnableCompute=true' in args and (root / 'fail-compute').exists():
+        print('Compute deploy failed', file=sys.stderr)
+        sys.exit(1)
     start = args.index('--parameter-overrides') + 1
     params = dict(word.split('=', 1) for word in args[start:] if '=' in word)
     outputs = {'ComputeEnabled': params['EnableCompute'], 'BudgetName': 'fixture-monthly',
@@ -65,6 +94,8 @@ elif service == 'cloudformation' and operation == 'deploy':
         outputs.update(InstanceId='i-fixture', DataVolumeId=params['ExistingDataVolumeId'] or 'vol-created')
     state = {'outputs': outputs, 'stack_name': args[args.index('--stack-name') + 1]}
     state_path.write_text(json.dumps(state))
+    if params['EnableCompute'] == 'false' and (root / 'slow-foundation').exists():
+        (root / 'clock').write_text(str(clock + 301))
     reply({})
 elif operation == 'describe-images':
     reply({'Images': [{'ImageId': 'ami-fixture', 'OwnerId': '123456789012', 'Architecture': 'x86_64',
@@ -142,7 +173,6 @@ class DeploymentTests(CostFixture):
             'offload': 'off', 'deployment_profile': 'build-admin', 'stack_name': 'fixture-build',
             'ami_id': 'ami-fixture', 'ami_owner_id': '123456789012', 'nixos_release': '26.05',
             'availability_zone': 'us-east-1a', 'vpc_id': 'vpc-fixture', 'subnet_id': 'subnet-fixture',
-            'existing_data_volume_id': '',
             'root_device_name': '/dev/xvda', 'scaler_user_name': 'build-scaler',
             'bootstrap_template_path': str(bootstrap_template),
             'scripts_source_url': 'https://example.invalid/public/commit.tar.gz',
@@ -156,7 +186,7 @@ class DeploymentTests(CostFixture):
             'deployment_timeout_s': '30', 'preflight_max_age_s': '300', 'fixed_usd_per_month': '0.001',
             'retained_storage_usd_per_month': '0', 'root_storage_usd_per_month': '0',
             'ipv4_usd_per_month': '0', 'gp3_iops_usd_per_month': '0', 'gp3_throughput_usd_per_month': '0',
-            'region': 'us-east-1', 'instance_id': 'i-fixture',
+            'region': 'us-east-1',
             'cost_explorer_tag_key': 'Project', 'cost_explorer_tag_value': 'fixture-build', 'accounting_zone': 'UTC',
         })
         for key, value in values.items():
@@ -171,7 +201,26 @@ class DeploymentTests(CostFixture):
             'PATH': f'{bin_path}{os.pathsep}{os.environ["PATH"]}', 'DEPLOY_FIXTURE': str(self.root),
             'AWS_SHARED_CREDENTIALS_FILE': str(self.credentials),
         })))
+        _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         self.set_clock(self.now)
+
+    @override
+    def replace(self, key: str, value: str) -> None:
+        if key in ('instance_id', 'existing_data_volume_id'):
+            saved: dict[str, object] = aws_config.deployment_record(self.state)
+            if not saved:
+                saved = {'stack': 'previous-build', 'region': 'us-east-1',
+                         'outputs': {'InstanceId': 'i-fixture'}}
+            outputs = ledger.mapping(saved.get('outputs'))
+            if key == 'instance_id':
+                outputs['InstanceId'] = value
+            else:
+                outputs['ExistingDataInput'] = value
+                outputs['DataVolumeId'] = value
+            saved['outputs'] = outputs
+            _ = (self.state / 'deployment.json').write_text(json.dumps(saved))
+            return
+        super().replace(key, value)
 
     def set_clock(self, at: int) -> None:
         self.now = at
@@ -327,7 +376,7 @@ class DeploymentTests(CostFixture):
         self.set_clock(start + 3600)
         self.write_price()
         _ = self.deployment().prepare()
-        self.assertEqual(ledger.CostLedger(self.state).pending_compute_requests(), ())
+        self.assertFalse(ledger.CostLedger(self.state).pending_compute_requests())
         self.assertEqual(self.instance_intervals(self.now + 3600), [(start, self.now, Decimal('1'), 0)])
 
     def test_compute_request_preserves_conflict_checks_for_confirmed_observations(self) -> None:
@@ -402,6 +451,92 @@ class DeploymentTests(CostFixture):
                 requests = [r for r in costs.intervals if r.source == 'unconfirmed compute request']
                 self.assertEqual([(r.start, r.end, r.usd, r.confirmed_uptime_s) for r in requests],
                                  [(start, midnight, Decimal('6'), 0), (midnight, self.now, Decimal('6.5'), 0)])
+
+    def up_output(self, subject: deploy.Deployment) -> tuple[bool, str]:
+        output = StringIO()
+        with redirect_stdout(output):
+            success = subject.up(approve_resources=True)
+        return success, output.getvalue()
+
+    def test_up_creates_each_stage_and_the_second_run_only_checks_live_state(self) -> None:
+        _ = self.credentials.write_text('[build-admin]\naws_access_key_id=admin-key\naws_secret_access_key=admin-value\n')
+        self.price_file.unlink()
+        settings = self.settings.read_bytes()
+        success, output = self.up_output(self.deployment())
+        self.assertTrue(success, output)
+        self.assertEqual(output.splitlines(), ['price: done', 'bootstrap: done', 'stacks: done', 'scaler-key: done'])
+        commands = self.commands()
+        operations = [cast(list[str], row['args'])[5] for row in commands]
+        self.assertLess(operations.index('describe-spot-price-history'), operations.index('deploy'))
+        self.assertLess(operations.index('deploy'), operations.index('create-access-key'))
+        self.assertEqual(self.credentials.stat().st_mode & 0o777, 0o600)
+        self.assertIn('admin-key', self.credentials.read_text())
+        self.assertIn('[build-scaler]', self.credentials.read_text())
+        self.assertEqual(json.loads((self.root / 'fake-keys.json').read_text()), ['new-key'])
+        before = len(self.commands())
+        success, output = self.up_output(self.deployment())
+        self.assertTrue(success, output)
+        self.assertEqual(output.splitlines(), ['price: present', 'bootstrap: present', 'stacks: present', 'scaler-key: present'])
+        later = self.commands()[before:]
+        self.assertEqual(sum('describe-spot-price-history' in cast(list[str], row['args']) for row in later), 1)
+        for row in later:
+            self.assertFalse({'deploy', 'create-access-key', 'delete-access-key', 'list-access-keys'} & set(cast(list[str], row['args'])))
+        self.assertEqual(self.settings.read_bytes(), settings)
+        self.assertNotIn('fixture-secret-only-in-credentials', output)
+        for file in self.state.rglob('*.json'):
+            self.assertNotIn('fixture-secret-only-in-credentials', file.read_text())
+        results = remote.read_record(self.state / 'up.json')
+        self.assertEqual(set(results), {'price', 'bootstrap', 'stacks', 'scaler-key'})
+        self.assertTrue(all(ledger.mapping(result)['status'] == 'present' for result in results.values()))
+
+    def test_up_retries_failed_compute_without_a_second_foundation(self) -> None:
+        failure = self.root / 'fail-compute'
+        _ = failure.write_text('fail')
+        success, output = self.up_output(self.deployment())
+        self.assertFalse(success)
+        self.assertIn('stacks: refused:', output)
+        self.assertNotIn('scaler-key:', output)
+        failure.unlink()
+        success, output = self.up_output(self.deployment())
+        self.assertTrue(success, output)
+        foundations = [row for row in self.commands('deploy') if 'EnableCompute=false' in cast(list[str], row['args'])]
+        self.assertEqual(len(foundations), 1)
+        self.assertEqual(len(self.commands('create-access-key')), 1)
+        self.assertFalse(ledger.CostLedger(self.state).pending_compute_requests())
+
+    def test_review_in_progress_stack_has_no_resources_to_reconcile(self) -> None:
+        _ = (self.root / 'review-stack').write_text('empty change set')
+        success, output = self.up_output(self.deployment())
+        self.assertTrue(success, output)
+        self.assertEqual(len(self.commands('deploy')), 2)
+
+    def test_foundation_wait_does_not_expire_unchanged_compute_preparation(self) -> None:
+        _ = (self.root / 'slow-foundation').write_text('slow')
+        subject = deploy.Deployment(self.settings, self.state, self.bundle,
+            clock=lambda: float((self.root / 'clock').read_text()), notify=lambda _event: True)
+        success, output = self.up_output(subject)
+        self.assertTrue(success, output)
+        self.assertEqual(len(self.commands('deploy')), 2)
+        self.assertEqual(int((self.root / 'clock').read_text()), self.now + 301)
+
+    def test_unconfirmed_scaler_key_is_deleted_and_never_printed(self) -> None:
+        self.replace('scaler_key_check_attempts', '2')
+        self.replace('scaler_key_check_delay_s', '0.001')
+        before = self.credentials.read_bytes()
+        _ = (self.root / 'fail-scaler').write_text('fail')
+        success, output = self.up_output(self.deployment())
+        self.assertFalse(success)
+        self.assertIn('scaler-key: refused:', output)
+        self.assertNotIn('fixture-secret-only-in-credentials', output)
+        self.assertEqual(self.credentials.read_bytes(), before)
+        self.assertEqual(json.loads((self.root / 'fake-keys.json').read_text()), ['old-key'])
+        self.assertEqual(len(self.commands('get-caller-identity')), 3)
+        self.assertEqual(len(self.commands('delete-access-key')), 1)
+
+    def test_up_refuses_without_approval_before_any_price_or_resource_read(self) -> None:
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'approve-resources'):
+            _ = self.deployment().up()
+        self.assertEqual(self.commands(), [])
 
     def test_price_command_writes_private_state_for_the_selected_zone_and_profile(self) -> None:
         path = self.root / '.config/aws-build/deployment-price'
@@ -1034,7 +1169,7 @@ class DeploymentTests(CostFixture):
             first = destination.read_bytes()
             remote.write_bootstrap_settings(source, destination)
         self.assertEqual(destination.read_bytes(), first)
-        settings = read_control_settings(destination)
+        settings = read_control_settings(destination, remote_identity=True)
         self.assertEqual(settings.instance_id, 'i-abcdef')
         self.assertEqual(settings.region, 'us-east-2')
         self.assertTrue(settings.enabled)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+from configparser import ConfigParser
+from io import StringIO
 from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
@@ -17,7 +19,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import cast, final
+from typing import Literal, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -25,10 +27,10 @@ from scripts.aws_target import ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
 from scripts.aws_target.config import (
     BudgetNotificationAddress, DeploymentSettings, deployment_price, deployment_price_path, money, read_budget_notification_address,
-    read_control_settings, read_deployment_settings, read_settings,
+    deployment_record, deployment_outputs, read_control_settings, read_deployment_settings, read_settings,
 )
 from scripts.lib import conf
-from scripts.mac_test import offload
+from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
@@ -44,6 +46,22 @@ class PreparedDeployment:
     fingerprint: str
     parameters: dict[str, str]
 
+
+
+@dataclass(frozen=True)
+class UpStage:
+    name: str
+    check: Callable[[], bool]
+    action: Callable[[], object]
+    refresh: bool = False
+
+
+@dataclass(frozen=True)
+class StageResult:
+    status: Literal['present', 'done', 'refused']
+    started_at: int
+    finished_at: int
+    reason: str = ''
 
 def deployment_parameters(path: Path, settings: DeploymentSettings, bootstrap_path: Path,
                           notification: BudgetNotificationAddress) -> dict[str, str]:
@@ -106,12 +124,10 @@ class Deployment:
         """Save the current public Spot price without requesting resources."""
         self._check_credentials()
         path = deployment_price_path(self.settings_path)
-        settings = conf.read(self.settings_path)
+        settings = read_deployment_settings(self.settings_path, self.directory)
         now = int(self.clock())
-        api = AwsCli(settings.text('deployment_profile'), settings.text('region'),
-                     settings.whole('deployment_timeout_s'), self.execute)
-        reply = api.call('describe-spot-price-history', '--instance-types', settings.text('instance_type'),
-                         '--availability-zone', settings.text('availability_zone'),
+        reply = self._api(settings).call('describe-spot-price-history', '--instance-types', settings.instance_type,
+                         '--availability-zone', settings.availability_zone,
                          '--product-descriptions', 'Linux/UNIX',
                          '--start-time', datetime.fromtimestamp(now, UTC).isoformat(), '--max-items', '1')
         prices = ledger.rows(reply, 'SpotPriceHistory')
@@ -126,10 +142,11 @@ class Deployment:
                                  + f'deployment_price_at={now}\n').encode(), mode=0o600)
         return {'deployment_price_usd_per_hour': str(price), 'deployment_price_at': now, 'file': str(path)}
 
-    def _observe(self, settings: DeploymentSettings, instance_id: str) -> ledger.InstanceObservation:
+    def _observe(self, settings: DeploymentSettings, instance_id: str, *,
+                 confirms_transition: bool = False) -> ledger.InstanceObservation:
         evidence = self._api(settings).observe(instance_id, int(self.clock()))
         observation = ledger.InstanceObservation(evidence.observed_at, evidence.state, 'confirmed deployment instance state')
-        ledger.CostLedger(self.directory).observe(observation)
+        ledger.CostLedger(self.directory).observe(observation, confirms_transition=confirms_transition)
         return observation
 
     def _refresh_observation(self, settings: DeploymentSettings) -> None:
@@ -159,7 +176,8 @@ class Deployment:
         book = ledger.CostLedger(self.directory)
         if not stack or stack.get('ComputeEnabled') == 'false' and not stack.get('InstanceId'):
             now = int(self.clock())
-            book.observe(ledger.InstanceObservation(now, 'terminated', 'confirmed absence of requested compute resources'))
+            book.observe(ledger.InstanceObservation(now, 'terminated', 'confirmed absence of requested compute resources'),
+                         confirms_transition=True)
             book.resolve_compute_request(request, ledger.ComputeResourcesAbsent(now))
             return {}
         if stack.get('ComputeEnabled') != 'true' or not stack.get('InstanceId') or not stack.get('DataVolumeId'):
@@ -167,7 +185,7 @@ class Deployment:
         write_text_atomic(self.directory / 'deployment.json', json.dumps({
             'stack': request.stack, 'region': request.region, 'at': int(self.clock()), 'outputs': stack,
         }, sort_keys=True) + '\n')
-        observation = self._observe(requested, stack['InstanceId'])
+        observation = self._observe(requested, stack['InstanceId'], confirms_transition=True)
         previous_instances = {r.resolution.instance_id for r in book.read_snapshot().compute_requests
                               if isinstance(r.resolution, ledger.ComputeInstanceConfirmed)}
         if observation.state == 'terminated' and stack['InstanceId'] in previous_instances:
@@ -177,7 +195,7 @@ class Deployment:
 
     def _load(self, notification: BudgetNotificationAddress, *, refresh: bool = False
               ) -> tuple[DeploymentSettings, dict[str, str]]:
-        settings = read_deployment_settings(self.settings_path)
+        settings = read_deployment_settings(self.settings_path, self.directory)
         if refresh:
             self._refresh_observation(settings)
         parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification)
@@ -190,7 +208,7 @@ class Deployment:
 
     def prepare(self) -> PreparedDeployment:
         with control_lock(self.directory):
-            settings = read_deployment_settings(self.settings_path)
+            settings = read_deployment_settings(self.settings_path, self.directory)
             now = int(self.clock())
             price_at, price = deployment_price(self.settings_path, now)
             notification = read_budget_notification_address(self.settings_path)
@@ -230,6 +248,8 @@ class Deployment:
             raise DeploymentRefused('expected one stack')
         stack = stacks[0]
         status = ledger.text(stack, 'StackStatus')
+        if status == 'REVIEW_IN_PROGRESS':
+            return {}
         if status not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE'):
             raise DeploymentRefused(f'reconcile the stack before deployment: {status}')
         outputs: dict[str, str] = {}
@@ -286,20 +306,30 @@ class Deployment:
             '--parameter-overrides', *[f'{key}={value}' for key, value in parameters.items()],
             f'EnableCompute={str(compute).lower()}', service='cloudformation')
 
-    def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
-        current = read_deployment_settings(self.settings_path)
+    def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], *, renew: bool = False) -> None:
+        current = read_deployment_settings(self.settings_path, self.directory)
         notification = BudgetNotificationAddress(parameters['NotificationEmail'])
         current_parameters = deployment_parameters(self.settings_path, current, self.output / 'bootstrap.sh', notification)
         preflight = remote.read_record(self.output / 'preflight.json')
         at = ledger.instant(preflight, 'at')
         template = TEMPLATE.read_bytes()
         expected = fingerprint(current, current_parameters, template)
-        if (not 0 <= int(self.clock()) - at <= current.preflight_max_age_s
+        if ((not renew and not 0 <= int(self.clock()) - at <= current.preflight_max_age_s)
                 or preflight.get('fingerprint') != expected
                 or fingerprint(settings, parameters, template) != expected
                 or (self.output / 'template.json').read_bytes() != template):
             raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
-        _ = deployment_price(self.settings_path, int(self.clock()))
+        try:
+            _ = deployment_price(self.settings_path, int(self.clock()))
+        except ValueError:
+            if not renew:
+                raise
+            _ = self.price()
+            price_at, price = deployment_price(self.settings_path, int(self.clock()))
+            ledger.CostLedger(self.directory).record_price(ledger.PriceSample(price_at, price, 'public deployment price after foundation'))
+        if renew:
+            preflight['at'] = int(self.clock())
+            write_text_atomic(self.output / 'preflight.json', json.dumps(preflight, sort_keys=True) + '\n')
 
     def _authorize(self, approve_resources: bool) -> None:
         if not approve_resources:
@@ -367,7 +397,7 @@ class Deployment:
                         if self._stack(old_settings):
                             raise DeploymentRefused('stop and delete the old stack before replacement')
                     elif not stack:
-                        raise DeploymentRefused('use a new stack_name for replacement to preserve the retained Budget')
+                        raise DeploymentRefused('use a new stack_name and its saved DataVolumeId to preserve the retained Budget')
                 elif stack.get('InstanceId') != saved.get('InstanceId') or stack.get('DataVolumeId') != saved.get('DataVolumeId'):
                     raise DeploymentRefused('the stack differs from the saved resource identities')
             if stack and stack.get('ExistingDataInput', '') != settings.existing_data_volume_id:
@@ -378,11 +408,176 @@ class Deployment:
                 stack = self._stack(settings)
                 if not stack.get('BudgetName') or stack.get('ComputeEnabled') != 'false':
                     raise DeploymentRefused('the Budget foundation has no confirmed evidence')
+                self._confirm_preparation(settings, parameters, renew=True)
             self._deploy(settings, parameters, compute=True)
             pending = ledger.CostLedger(self.directory).pending_compute_requests()
             if len(pending) != 1:
                 raise DeploymentRefused('the compute request has no durable accounting evidence')
-            return self._reconcile_compute_request(settings, pending[0])
+            outputs = self._reconcile_compute_request(settings, pending[0])
+            saved = deployment_record(self.directory)
+            saved['fingerprint'] = fingerprint(settings, parameters, TEMPLATE.read_bytes())
+            write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+            return outputs
+
+
+    def bootstrap(self) -> None:
+        remote_settings = remote_configuration(self.settings_path)
+        text = bootstrap_configuration(self.settings_path, remote_settings, self.directory)
+        self.output.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(self.output / 'bootstrap.sh', text)
+        write_text_atomic(self.output / 'remote.conf', remote_settings)
+
+    def _bootstrap_present(self) -> bool:
+        remote_settings = remote_configuration(self.settings_path)
+        text = bootstrap_configuration(self.settings_path, remote_settings, self.directory)
+        try:
+            return ((self.output / 'bootstrap.sh').read_text() == text
+                    and (self.output / 'remote.conf').read_text() == remote_settings)
+        except FileNotFoundError:
+            return False
+
+    def _price_present(self) -> bool:
+        try:
+            _ = deployment_price(self.settings_path, int(self.clock()))
+            return True
+        except ValueError:
+            return False
+
+    def _stacks_present(self) -> bool:
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        stack = self._stack(settings)
+        saved = deployment_record(self.directory)
+        outputs = deployment_outputs(self.directory)
+        if not stack or stack.get('ComputeEnabled') != 'true' or not outputs:
+            return False
+        if (saved.get('stack') != settings.stack_name or saved.get('region') != settings.region
+                or any(not stack.get(key) or stack.get(key) != outputs.get(key)
+                       for key in ('InstanceId', 'DataVolumeId', 'BudgetName'))):
+            return False
+        if ledger.CostLedger(self.directory).pending_compute_requests():
+            return False
+        parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh',
+                                           read_budget_notification_address(self.settings_path))
+        return saved.get('fingerprint') == fingerprint(settings, parameters, TEMPLATE.read_bytes())
+
+    def _apply_stacks(self) -> None:
+        _ = self.prepare()
+        _ = self.apply(approve_resources=True)
+
+    def _scaler_api(self) -> AwsCli:
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        profile = conf.read(self.settings_path).text('credentials_profile')
+        return AwsCli(profile, settings.region, settings.timeout_s, self.execute)
+
+    def _scaler_present(self) -> bool:
+        try:
+            reply = self._scaler_api().call('get-caller-identity', service='sts')
+            user = read_deployment_settings(self.settings_path, self.directory).scaler_user_name
+            return ledger.text(reply, 'Arn').endswith('user/' + user)
+        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
+            return False
+
+    def _scaler_stage_present(self) -> bool:
+        if not self._scaler_present():
+            return False
+        path = self.directory / 'up.json'
+        previous = remote.read_record(path) if path.exists() else {}
+        result = previous.get('scaler-key', {})
+        return not (self.directory / 'scaler-key.json').exists() and ledger.mapping(result).get('status') != 'refused'
+
+    def _scaler_key(self) -> None:
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        api = self._api(settings)
+        credential_file = Path(os.environ['AWS_SHARED_CREDENTIALS_FILE']).expanduser()
+        previous = credential_file.read_bytes()
+        key_id = ''
+        checkpoint = self.directory / 'scaler-key.json'
+        credentials = ConfigParser(interpolation=None)
+        _ = credentials.read_string(previous.decode())
+        profile = conf.read(self.settings_path).text('credentials_profile')
+        if checkpoint.exists():
+            saved_key = ledger.text(remote.read_record(checkpoint), 'access_key_id')
+            if credentials.get(profile, 'aws_access_key_id', fallback='') == saved_key and self._scaler_present():
+                self._remove_old_scaler_keys(api, settings.scaler_user_name, saved_key)
+                checkpoint.unlink()
+                return
+            _ = api.call('delete-access-key', '--user-name', settings.scaler_user_name,
+                         '--access-key-id', saved_key, service='iam')
+            checkpoint.unlink()
+        try:
+            reply = api.call('create-access-key', '--user-name', settings.scaler_user_name, service='iam')
+            key = ledger.mapping(reply.get('AccessKey'))
+            key_id = ledger.text(key, 'AccessKeyId')
+            secret = ledger.text(key, 'SecretAccessKey')
+            write_text_atomic(checkpoint, json.dumps({'access_key_id': key_id}) + '\n', new_file_mode=0o600)
+            if not credentials.has_section(profile):
+                credentials.add_section(profile)
+            credentials.set(profile, 'aws_access_key_id', key_id)
+            credentials.set(profile, 'aws_secret_access_key', secret)
+            content = StringIO()
+            credentials.write(content)
+            write_bytes_atomic(credential_file, content.getvalue().encode(), mode=0o600)
+            attempts = conf.read(self.settings_path).whole('scaler_key_check_attempts')
+            for attempt in range(attempts):
+                if self._scaler_present():
+                    break
+                if attempt + 1 < attempts:
+                    time.sleep(conf.read(self.settings_path).number('scaler_key_check_delay_s'))
+            else:
+                raise DeploymentRefused('the new scaler key did not confirm its IAM user')
+        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
+            try:
+                if key_id:
+                    _ = api.call('delete-access-key', '--user-name', settings.scaler_user_name,
+                                 '--access-key-id', key_id, service='iam')
+            except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
+                raise DeploymentRefused('scaler key setup failed; remove the unconfirmed key through IAM') from None
+            finally:
+                write_bytes_atomic(credential_file, previous, mode=0o600)
+            checkpoint.unlink(missing_ok=True)
+            raise DeploymentRefused('scaler key setup failed; the new key was removed') from None
+        self._remove_old_scaler_keys(api, settings.scaler_user_name, key_id)
+        checkpoint.unlink()
+
+    def _remove_old_scaler_keys(self, api: AwsCli, user: str, key_id: str) -> None:
+        try:
+            reply = api.call('list-access-keys', '--user-name', user, service='iam')
+            for old in ledger.rows(reply, 'AccessKeyMetadata'):
+                old_id = ledger.text(old, 'AccessKeyId')
+                if old_id != key_id:
+                    _ = api.call('delete-access-key', '--user-name', user,
+                                 '--access-key-id', old_id, service='iam')
+        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
+            raise DeploymentRefused('the scaler key works; IAM could not remove every old key') from None
+
+    def up(self, *, approve_resources: bool = False) -> bool:
+        """Check each deployment stage and stop at the first refusal."""
+        self._authorize(approve_resources)
+        stages = (
+            UpStage('price', self._price_present, self.price, refresh=True),
+            UpStage('bootstrap', self._bootstrap_present, self.bootstrap),
+            UpStage('stacks', self._stacks_present, self._apply_stacks),
+            UpStage('scaler-key', self._scaler_stage_present, self._scaler_key),
+        )
+        with control_lock(self.directory / 'up'):
+            path = self.directory / 'up.json'
+            results = remote.read_record(path) if path.exists() else {}
+            for stage in stages:
+                started = int(self.clock())
+                try:
+                    present = stage.check()
+                    if not present or stage.refresh:
+                        _ = stage.action()
+                    result = StageResult('present' if present else 'done', started, int(self.clock()))
+                except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                    reason = 'scaler credential stage failed' if stage.name == 'scaler-key' else str(error)
+                    result = StageResult('refused', started, int(self.clock()), reason)
+                results[stage.name] = {field.name: cast(object, getattr(result, field.name)) for field in fields(result)}
+                write_text_atomic(path, json.dumps(results, sort_keys=True) + '\n')
+                print(f'{stage.name}: {result.status}' + (f': {result.reason}' if result.reason else ''))
+                if result.status == 'refused':
+                    return False
+        return True
 
 
 def remote_configuration(path: Path) -> str:
@@ -399,7 +594,7 @@ def remote_configuration(path: Path) -> str:
         if field.name == 'enabled':
             continue
         value = cast(object, getattr(settings, field.name))
-        if field.name == 'instance_id' and not value:
+        if field.name == 'instance_id':
             continue
         if field.name in limits:
             lines.append(limits[field.name])
@@ -407,9 +602,9 @@ def remote_configuration(path: Path) -> str:
     return '\n'.join(lines) + '\n'
 
 
-def bootstrap_configuration(path: Path, remote_settings: str) -> str:
+def bootstrap_configuration(path: Path, remote_settings: str, directory: Path | None = None) -> str:
     """Render the reviewed public bootstrap without creating resources."""
-    settings = read_deployment_settings(path)
+    settings = read_deployment_settings(path, directory)
     def nix_string(value: str) -> str:
         return json.dumps(value).replace('${', '\\${')
     def module_text(path: Path) -> str:
@@ -443,14 +638,14 @@ class DeploymentArguments(argparse.Namespace):
         super().__init__()
         self.command: str = ''
         self.settings: Path = conf.path('aws_target')
-        self.directory: Path = offload.ssh_target_state_directory('aws')
+        self.directory: Path = target_config.ssh_target_state_directory('aws')
         self.output: Path = Path.home() / '.local/state/aws-build/deployment'
         self.approve_resources: bool = False
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
+    _ = parser.add_argument('command', choices=('up', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)
@@ -458,14 +653,12 @@ def main() -> int:
     args = parser.parse_args(namespace=DeploymentArguments())
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
-        if args.command == 'price':
+        if args.command == 'up':
+            return 0 if deploy.up(approve_resources=args.approve_resources) else 1
+        elif args.command == 'price':
             print(json.dumps(deploy.price(), sort_keys=True))
         elif args.command == 'bootstrap':
-            remote_settings = remote_configuration(args.settings)
-            text = bootstrap_configuration(args.settings, remote_settings)
-            args.output.mkdir(parents=True, exist_ok=True)
-            write_text_atomic(args.output / 'bootstrap.sh', text)
-            write_text_atomic(args.output / 'remote.conf', remote_settings)
+            deploy.bootstrap()
             print(str(args.output / 'bootstrap.sh'))
         elif args.command == 'prepare':
             prepared = deploy.prepare()

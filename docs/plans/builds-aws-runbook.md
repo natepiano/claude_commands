@@ -39,9 +39,9 @@ There is no separate charge timer.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
 6. Select one available zone in `us-east-2` from those reads.
 7. Read the standard Spot vCPU quota. Request an increase if it is below 16.
-8. Run `python3 scripts/aws_target/deploy.py price` just before `deploy.py prepare`.
+8. Run `python3 scripts/aws_target/deploy.py up --approve-resources` for deployment.
    Deployment refuses a price older than `price_max_age_seconds`.
-   Confirm that `notification_email_file` names an existing private file before `deploy.py prepare`.
+   Confirm that `notification_email_file` names an existing private file before deployment.
 9. Confirm that the fixed components sum to `fixed_usd_per_month`.
 10. Confirm that `limit_reserve_usd` covers the configured drain and idle intervals.
 
@@ -85,7 +85,7 @@ Run the increase request only when the quota is below 16. The value 32 also cove
 
 Read gp3, root storage and public IPv4 prices for `us-east-2` from the public [EC2](https://aws.amazon.com/ec2/pricing/on-demand/) and [EBS](https://aws.amazon.com/ebs/pricing/) price pages.
 Use the price history to select the zone.
-Run `python3 scripts/aws_target/deploy.py price` before each `deploy.py prepare` command.
+The `up` command reads the current price before stack preparation.
 The command saves the price and its read time outside the repository.
 Do not edit tracked files to record the price.
 Price-list and placement reads do not launch capacity.
@@ -122,8 +122,8 @@ Do not substitute an unverified third-party image.
 5. Permit no inbound TCP ports.
 6. Activate the configured cost-allocation tag in the billing console.
 7. Keep its key and value unchanged on retained resources.
-8. Leave `existing_data_volume_id` empty for the first deployment.
-9. Prepare the public bootstrap source and rendered file as described below.
+8. Keep the saved deployment record for retained-volume replacement.
+9. Set the public bootstrap source as described below.
 10. Keep `offload=off` and omit AWS from `targets`.
 
 Use the reviewed scripts commit for the public bootstrap archive.
@@ -147,12 +147,7 @@ The helper compresses the script for the CloudFormation `Bootstrap` parameter.
 The compressed parameter must fit the 4096-byte limit.
 CloudFormation sets the volume ID before it decompresses and executes the script.
 
-Generate the bootstrap locally before the priced preflight:
-
-```sh
-cd "$HOME/.claude"
-python3 scripts/aws_target/deploy.py bootstrap
-```
+The `up` command renders the bootstrap and remote settings before it prepares the stacks.
 
 Inspect the generated bootstrap file and remote settings.
 They must contain no credential or published admission permission.
@@ -178,59 +173,44 @@ Those reads include `ec2:DescribeSpotInstanceRequests` for the rollback check.
 It has no general deployment permission.
 The box receives an SSM instance profile and no scaler key.
 
-Run these commands yourself after the scoped IAM user exists.
-Do not copy this file to the box or print its contents.
+The `up` command checks the scaler profile through STS.
+It creates a key only when the profile does not identify the configured scaler user.
+It writes the key to the existing private credential file with mode `0600`.
+It keeps the administrator profile and every other profile.
+It verifies the new key before it deletes the old keys.
+It deletes a new key that fails verification.
+Do not copy the credential file to the box or print its contents.
 
-```sh
-(umask 077; aws configure --profile build-scaler)
-```
-
-The earlier credential block sets the private file and mode.
-Use your administrator profile only for guarded deployment and administrative recovery.
-Keep passwords, AWS keys, Tailscale auth keys, and GitHub credentials outside all tracked files.
-
-## First-resource preflight and deployment
+## Deployment
 
 Use the default `~/.local/state/build-targets/aws` directory before and after registry activation.
 The default bundle directory is `~/.local/state/aws-build/deployment`.
 The default settings file is `~/.claude/config/aws_target.conf`.
-Never delete its ledger, inventory, charges, claims, or deployment evidence to permit a retry.
+Keep the private administrator credential file and Budget address file in place.
+Run this command at your terminal:
 
 ```sh
-cd "$HOME/.claude"
-export AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials"
-python3 scripts/aws_target/deploy.py price
-python3 scripts/aws_target/deploy.py prepare
+AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" python3 scripts/aws_target/deploy.py up --approve-resources
 ```
 
-The price command reads AWS through the deployment profile.
-It requires the private credential file.
-Preparation reads the saved price locally.
-It records priced inventory, current price evidence, generated parameters, and a deployment-purpose guard decision.
-Inspect the generated public template, parameters, and preflight evidence.
-Confirm the monthly Budget amount equals `monthly_limit_usd`.
-Confirm email thresholds are 50, 80, and 100 percent.
-Confirm the stop action threshold equals `budget_stop_percent`.
-Confirm the Budget and IAM enforcement foundation precede compute and storage creation.
-The native Budget stop action follows the instance ID because it requires that ID.
-The synchronous deployment guard protects the earlier resource-creating stages.
-Confirm the configured cost tag appears on the instance, root volume, Spot request, and retained data volume.
-Confirm the instance policy names only the selected instance ARN for start and stop.
-
-Run the guarded deployment yourself:
-
-```sh
-python3 scripts/aws_target/deploy.py apply --approve-resources
-```
-
-The helper rechecks live limits before each resource-creating stage.
-It runs `aws cloudformation deploy` for the foundation before the compute stage.
-It reconciles stack outputs on a retry.
-If preparation expires or inputs change, run preparation again.
-A prior allowed decision does not permit deployment after a live limit becomes invalid.
-Record the stack, instance, persistent request, and data volume IDs.
-Set `instance_id` from the confirmed stack output.
-Keep the original priced inventory across reruns.
+The command runs four ordered stages: price, bootstrap, stacks, and scaler-key.
+It prints `present`, `done`, or `refused` for each stage.
+It stops at the first refusal.
+Correct the reported problem and run the same command again.
+A retry uses the completed stages and preserves the ledger.
+The command refreshes the price on every run.
+A complete target requires no stack deployment or key creation on a later run.
+The command stores each stage result and its times in `up.json`.
+The command stores stack, instance, and volume identities in `deployment.json`.
+Do not copy resource IDs into tracked configuration.
+Never delete the ledger, inventory, claims, or deployment record to permit a retry.
+The spending guard runs before each resource request.
+A foundation wait renews preparation only when its inputs remain unchanged.
+A stack in `REVIEW_IN_PROGRESS` has no resources and counts as absent.
+Other incomplete stack states require recovery before deployment.
+Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
+This phase prepares the stacks and scaler credentials.
+The following checks cover the remaining join and activation procedure.
 
 ## First boot, SSM, and retained data
 
@@ -484,12 +464,9 @@ Use this replacement procedure from the deployment owner:
 
 1. Stop and delete the old stack.
 2. Keep its retained Budget and DataVolumeId.
-3. Set a new stack_name and existing_data_volume_id to the saved DataVolumeId.
+3. Set a new `stack_name`. The helper reads the retained volume ID from the saved deployment record.
 4. Preserve the ledger directory.
-5. Render bootstrap.
-6. Run `deploy.py price`.
-7. Run `deploy.py prepare`.
-8. Run `deploy.py apply --approve-resources`.
+5. Run `deploy.py up --approve-resources`.
 
 Confirm the old instance stops before deleting its stack.
 Use your administrator profile for these user-run commands:
@@ -506,22 +483,19 @@ Preserve its filesystem identity, encryption, and cost-allocation tags.
 Keep the existing ledger, priced inventory, and saved deployment record.
 Do not change the volume selection inside an existing stack.
 
-After recording the new stack name and saved volume ID, run these commands:
+After setting the new stack name, run this command:
 
 ```sh
-python3 scripts/aws_target/deploy.py bootstrap
-python3 scripts/aws_target/deploy.py price
-python3 scripts/aws_target/deploy.py prepare
-python3 scripts/aws_target/deploy.py apply --approve-resources
+python3 scripts/aws_target/deploy.py up --approve-resources
 ```
 
 apply confirms that the old stack is absent.
-It refuses an unselected retained volume or a second active stack.
+It verifies the saved retained volume and refuses a second active stack.
 The new deployment record replaces the stack identity after confirmed deployment.
 The ledger and accounting evidence remain in the same directory.
 
 1. Confirm the new instance mounts the same data at `/home`.
-2. Configure the replacement scaler credential at your terminal after its scoped IAM user exists.
+2. Confirm the scaler-key stage reports `done` or `present`.
 3. Repeat boot permission, tool parity, exchange, and retained-ownership checks before admitting work.
 
 Stack deletion and replacement retain the data volume and Budget.

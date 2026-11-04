@@ -231,7 +231,8 @@ This file defines the disabled AWS SSH target. `offload=off` prevents work.
 The active target list remains `targets=mac,natedev` in `build_targets.conf`.
 The user completes deployment before target activation.
 
-`host=aws-build` names the Tailscale SSH host. `instance_id` and `region` remain empty before deployment.
+`host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
+The controller reads the instance ID from `deployment.json`.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
 `kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
 
@@ -292,15 +293,24 @@ The `budget_notice_*_percent` keys set the notice thresholds.
 `budget_stop_percent` sets the stop threshold. The live spending guard remains the primary limit.
 `root_volume_gib` sizes the root volume.
 `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.
-`existing_data_volume_id` selects a retained volume. An empty value requests a new volume.
+The saved `deployment.json` record identifies the instance and retained data volume.
+Replacement uses its saved `DataVolumeId`. Configuration contains no instance or volume ID.
 `spot_max_usd_per_hour` limits the Spot request price.
 `deployment_price_file` names the price state file outside the repository. Its default path is `~/.config/aws-build/deployment-price`.
-Run `python3 scripts/aws_target/deploy.py price` before `prepare`.
+Run `python3 scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
+The command records stage results and times in `up.json` beside `deployment.json`.
+It checks live state before each stage. It always refreshes the price.
+Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
 The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
 It writes the price and its read time atomically with mode `0600`.
 `prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
-`preflight_max_age_s` limits preparation age. `deployment_timeout_s` bounds each deployment command.
+`preflight_max_age_s` limits preparation age. A completed foundation wait renews preparation for unchanged inputs.
+The guard runs before each resource request. `deployment_timeout_s` bounds each deployment command.
 `scaler_user_name` names the IAM user.
+`scaler_key_check_attempts=12` bounds the identity checks after key creation.
+`scaler_key_check_delay_s=5` allows IAM time to publish the key between checks.
+The scaler stage keeps other credential profiles and writes the private file with mode `0600`.
+It verifies the new key before deleting old keys. It deletes a new key that fails verification.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
 `scripts_source_url`, `scripts_source_sha256`, and `scripts_source_commit` identify the public archive.
 The bootstrap command writes `bootstrap.sh` and `remote.conf` in the output directory.

@@ -41,6 +41,16 @@ Target = LocalTarget | SshTarget
 ConfigError = conf.Unusable
 
 
+def ssh_target_state_directory(target: str) -> Path:
+    """Return the state path without requiring target registration."""
+    if target in (".", "..") or Path(target).name != target:
+        raise ConfigError(f"invalid target name: {target}")
+    if target != "mac":
+        return Path.home() / ".local/state/build-targets" / target
+    configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
+    return Path(configured).expanduser()
+
+
 def uses_legacy_mac_layout(platform: Platform) -> bool:
     """Mac targets retain one mirror and claim per source repository name."""
     return platform == "macos"

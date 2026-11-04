@@ -151,6 +151,8 @@ class AwsStatusTests(MeasurementFixture):
         self.assertEqual(block.read_text(), '{"holder": 42}')
 
     def test_repeated_pending_ticks_preserve_the_original_start_time_in_status(self) -> None:
+        _ = (self.state / "deployment.json").write_text(json.dumps({
+            "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
         replies = AwsReplies()
         now = NOW + 1
         controller = aws_target.Controller(self.settings, self.state, self.root / "admission",

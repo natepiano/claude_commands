@@ -43,6 +43,8 @@ class MeasurementTests(MeasurementFixture):
             _ = measurement.read_charges(self.settings, self.state, NOW, fetch)
         older = self.state / "charges" / "2026-01-13.json"
         _ = older.write_text("{broken")
+        _ = (self.state / "deployment.json").write_text(json.dumps({
+            "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
         replies = AwsReplies()
         controller = aws_target.Controller(self.settings, self.state, self.root / "admission", execute=replies,
             clock=lambda: float(NOW + 1), notify=lambda _event: True, publish=lambda _envelope: True)
@@ -115,6 +117,8 @@ class MeasurementTests(MeasurementFixture):
 
     def test_tick_does_not_persist_an_unused_charge_error(self) -> None:
         self.seed_cost()
+        _ = (self.state / "deployment.json").write_text(json.dumps({
+            "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
         replies = AwsReplies()
         controller = aws_target.Controller(self.settings, self.state, self.root / "admission", execute=replies,
             clock=lambda: float(NOW + 1), notify=lambda _event: True, publish=lambda _envelope: True)

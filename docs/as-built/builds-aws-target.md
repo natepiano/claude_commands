@@ -99,6 +99,19 @@ An interruption marker reports the instance generation.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
+- `deploy.py up --approve-resources` runs the price, bootstrap, stacks, and scaler-key stages.
+  Each stage checks live state and records its last result and times in `up.json`.
+  A retry continues from incomplete stages. The price stage always refreshes the public price.
+  The stacks stage preserves the guard, ledger, and retained-volume checks.
+  A completed foundation wait renews preparation for unchanged inputs.
+  `REVIEW_IN_PROGRESS` counts as absent because that stack has no resources.
+- `deployment.json` holds the stack, instance, and data volume IDs outside the repository.
+  The controller reads its instance ID from that record.
+  Replacement reads the saved retained volume from the same record.
+- The scaler-key stage verifies the configured profile through STS.
+  It writes a new key atomically to the private credential file with mode `0600`.
+  It keeps other profiles. It verifies the new key before it deletes old keys.
+  A failed new key is deleted. The secret appears only in the private credential file.
 - `deploy.py price` reads the current Spot price through the deployment profile.
   It writes the price and its read time to the state file named by `deployment_price_file`.
   The default path is `~/.config/aws-build/deployment-price`. The file stays outside the repository and has mode `0600`.
@@ -117,7 +130,7 @@ An interruption marker reports the instance generation.
 1. No AWS resource and no AWS call exist before the user's go-live gate.
 2. Read every tunable at use from `config/aws_target.conf` or `config/build_targets.conf`, through `scripts/lib/conf.py`.
 3. The guard runs before every AWS start, admission, deployment and first boot. Derive the Budget amount from `monthly_limit_usd`.
-4. No password, AWS key or Tailscale auth key passes through a session. The scaler key is not on the box. `build-scaler` credentials are never read or printed.
+4. No password, AWS key or Tailscale auth key passes through a session. The scaler key is not on the box. `build-scaler` credentials remain in the private credential file. The helper never prints them.
 5. Use Tailscale SSH. Store no GitHub credential on the box; `ci_repo=` stays empty.
 6. An empty `OffloadRequest.target` selects the legacy Mac default. Mac paths and output do not change.
 7. Unresolved process ownership never adds an unattributed PID to the kill list. Missing completion stays `LostMacRun`.

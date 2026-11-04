@@ -274,7 +274,9 @@ class Controller:
         state: dict[str, object] = {}
         with control_lock(self.directory):
             try:
-                settings = read_control_settings(configuration)
+                settings = read_control_settings(configuration, self.directory)
+                if not settings.instance_id:
+                    raise ValueError("deployment.json: no saved instance identity")
                 configured = SshTarget(self.target, 'linux', self.settings_path)
                 if not is_aws_target(configured):
                     raise ValueError('target is not an AWS target')
