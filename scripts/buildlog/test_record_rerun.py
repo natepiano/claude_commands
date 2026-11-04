@@ -26,6 +26,7 @@ import launches
 import record
 import report
 import store
+from mac_natedev_test_support import mac_natedev_environment
 from cgroup_test_support import CPU, save_scope_counters, write_cgroup
 import test_launch_recording as launch_tests
 import test_record as record_tests
@@ -88,6 +89,7 @@ class RecordRerunTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         environment = self.fixture.environment(
+            **mac_natedev_environment(self.fixture.base / "config"),
             BUILDLOG_TRANSCRIPTS=str(self.fixture.base / "transcripts"),
             BUILDLOG_CALLER="verify",
             BUILDLOG_CALL_ID=record_tests.CALL_ID,

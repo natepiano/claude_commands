@@ -110,7 +110,8 @@ class RemoteControlTests(ShutdownTestCase):
     def read_screen(self, _place: HerdrPlace) -> str:
         return self.screen
 
-    def type_command(self, place: HerdrPlace, text: str) -> None:
+    def type_command(self, place: HerdrPlace, text: str, *, target: str) -> None:
+        self.assertEqual(target, "owner")
         self.assertEqual(place, self.place)
         current = cast(dict[str, object], json.loads((self.registry / "321.json").read_text()))
         self.assertEqual(current["status"], "idle", "busy registry must never authorize input")
@@ -309,11 +310,11 @@ class RemoteControlTests(ShutdownTestCase):
                 self.fields["bridgeSessionId"] = ""
                 self.write()
                 attempted: list[float] = []
-                def input_with_failure(place: HerdrPlace, text: str) -> None:
+                def input_with_failure(place: HerdrPlace, text: str, *, target: str) -> None:
                     attempted.append(self.clock.at)
                     if not recover or len(attempted) == 1:
                         raise OSError("temporary pane transport failure")
-                    self.type_command(place, text)
+                    self.type_command(place, text, target=target)
                     self.fields["bridgeSessionId"] = "bridge"
                     self.write()
                 with patch.object(session_pane, "type_place", side_effect=input_with_failure):
@@ -324,7 +325,8 @@ class RemoteControlTests(ShutdownTestCase):
                 self.assertEqual(pushes, [])
 
     def test_blocked_herdr_input_is_not_counted_as_a_successful_attempt(self) -> None:
-        def blocked(_place: object, _text: str) -> None:
+        def blocked(_place: object, _text: str, *, target: str) -> None:
+            self.assertEqual(target, "owner")
             raise AgentBlocked("busy")
         with patch.object(session_pane, "type_place", side_effect=blocked):
             outcome, _text, pushes = self.run_fix()

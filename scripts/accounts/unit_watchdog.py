@@ -387,7 +387,8 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                         if datetime.fromisoformat(outage["first_seen"]) >= now:
                             continue
                         if dry_run:
-                            lines.append(f"watchdog: would restart {unit} from {source.label}'s pane launch")
+                            lines.append(f"watchdog: would restart {unit} from {source.label}'s pane launch" if source.label else
+                                f"watchdog: would restart {unit}; no pane launch is saved for this unit")
                             continue
                         job = outage.get("job")
                         if job is not None:
@@ -402,7 +403,8 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                             since = datetime.fromisoformat(outage["first_seen"]).astimezone(user_zone()).strftime("%H:%M %Z")
                             text = (f"watchdog: {unit} was down since {since}; restarted on {restored}" if restored else
                                 f"watchdog: {unit} was down since {since}; {failure or 'restart did not make the session live'}; "
-                                + f"retry from {source.label}'s pane launch")
+                                + (f"retry from {source.label}'s pane launch" if source.label else
+                                   "no pane launch is saved for this unit"))
                             lines.append(text)
                             if restored:
                                 del retained[key]

@@ -186,6 +186,56 @@ class ScratchGuardTests(unittest.TestCase):
         ]:
             self.assert_allowed(command)
 
+    def test_repository_creation_under_unit_and_session_roots_is_refused(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        for destination in ("/tmp/claude/unit/private-run/dylib_ab/hana",
+                            str(self.session_root / "scratch-session" / "dylib_ab" / "hana")):
+            for command in (f"git clone ~/rust/hana {destination}",
+                            f"git -C ~/rust/hana worktree add {destination}",
+                            f"cp -r ~/rust/hana {destination}", f"rsync -a ~/rust/hana/ {destination}"):
+                with self.subTest(command=command):
+                    output = self.run_hook(command)
+                    self.assertNotEqual(output, "")
+                    decision = cast(HookResponse, json.loads(output))["hookSpecificOutput"]
+                    self.assertEqual(decision["permissionDecision"], "deny")
+                    self.assertIn("build_folders.py run --owner O --name N -- CMD", decision["permissionDecisionReason"])
+        self.assert_allowed("mkdir -p /tmp/claude/unit/private-run/data")
+        self.assert_allowed("cp ~/rust/hana/file /tmp/claude/unit/private-run/file")
+
+    def test_repository_copy_with_an_equals_target_directory_is_refused(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy-parent"
+        destination.mkdir(parents=True)
+        self.assert_refused(f"cp -a --target-directory={destination} ~/rust/hana", f"{destination}/hana")
+
+    def test_rsync_previews_do_not_create_repository_copies(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy"
+        for option in ("--dry-run", "-n", "-an"):
+            with self.subTest(option=option):
+                self.assert_allowed(f"rsync {option} -a ~/rust/hana/ {destination}")
+        self.assert_refused(f"rsync -a ~/rust/hana/ {destination}", str(destination))
+
+    def test_rsync_times_flag_does_not_consume_the_repository_source(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy"
+        self.assert_refused(f"rsync -a -t ~/rust/hana/ {destination}", str(destination))
+
+    def test_rsync_option_values_do_not_enable_a_preview(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy"
+        for option in ("--exclude -n", "--exclude=-n", "--exclude --dry-run", "--include -n",
+                       "--filter -n", "--exclude-from -n", "-f -n", "-afn", "-e -n", "-aen"):
+            with self.subTest(option=option):
+                self.assert_refused(f"rsync -a {option} ~/rust/hana/ {destination}", str(destination))
+
+    def test_rsync_preview_flags_remain_flags_after_option_values(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy"
+        for option in ("--exclude -n --dry-run", "--exclude=-n -an", "-f -n -n", "-afn --dry-run"):
+            with self.subTest(option=option):
+                self.assert_allowed(f"rsync -a {option} ~/rust/hana/ {destination}")
+
     def test_words_that_are_data_are_never_judged(self) -> None:
         self.assert_allowed(f"cat <<'EOF' > notes.md\nmkdir /tmp/{self.name}\nEOF\necho done")
         self.assert_allowed(f"git commit -m 'mkdir /tmp/{self.name}'")

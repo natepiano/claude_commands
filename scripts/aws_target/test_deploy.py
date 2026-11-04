@@ -739,10 +739,11 @@ class DeploymentTests(CostFixture):
         self.assertNotIn('AccessKey', json.dumps(template))
         self.assertNotIn('mkfs', json.dumps(template))
 
-    def test_repository_defaults_leave_control_and_exchange_inactive(self) -> None:
+    def test_repository_configuration_enables_approved_aws_control_and_exchange(self) -> None:
         root = Path(__file__).resolve().parents[2]
-        self.assertEqual(conf.read(root / 'config/aws_target.conf').text('offload'), 'off')
-        self.assertNotIn('aws', conf.read(root / 'config/build_targets.conf').text('targets').split(','))
+        self.assertEqual(conf.read(root / 'config/aws_target.conf').text('offload'), 'on')
+        self.assertEqual(conf.read(root / 'config/build_targets.conf').text('targets').split(','),
+                         ['mac', 'natedev', 'aws'])
 
     def refuse_command(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                        timeout: float, check: bool) -> subprocess.CompletedProcess[str]:

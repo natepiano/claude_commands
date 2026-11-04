@@ -19,6 +19,7 @@ from typing import cast
 
 import health
 import record
+import step_context
 import store
 
 STATE_NAME = "launches_state.json"
@@ -172,6 +173,7 @@ def launch_record(
         "step": "build",
         "argv": argv,
         "cwd": cwd,
+        "target_dir": step_context.target_folder_text(record.transcript_target_folder(metadata, parameters)),
         **facts,
         "caller": "brp-launch",
         "session": session,

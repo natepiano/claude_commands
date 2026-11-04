@@ -16,9 +16,10 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, redirect_stdout
 from io import StringIO
+from importlib import import_module
 from threading import Event
 from time import monotonic
-from typing import TYPE_CHECKING, Never, cast
+from typing import TYPE_CHECKING, Never, Protocol, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -46,7 +47,12 @@ import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
-    from scripts.production.staff import StaffRow
+    from scripts.production.staff import StaffRow, StaffSnapshot
+
+
+class RowStarter(Protocol):
+    def start_row(self, row: StaffRow, record: StaffSnapshot, client: herdr.Herdr, *,
+                  target_account: str) -> str: ...
 
 STOP_GRACE_SECONDS = 2.0
 KILL_GRACE_SECONDS = 5.0
@@ -337,6 +343,19 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
     return result
 
 
+def heal_account_trust(
+    folder: Path, target: Path, source: Path, name: str,
+) -> herdr.Trusted | herdr.TrustCopied | herdr.Untrusted | herdr.UnreadableTrustFile:
+    from scripts.accounts import accounts
+
+    trust = herdr.heal_claude_trust(folder, target / ".claude.json",
+        accounts.trust_sources(target, source), dry_run=False)
+    if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
+        reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {folder}"
+        print(f"{name}: trust anomaly: {reason}", file=sys.stderr)
+    return trust
+
+
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
                  names: LaunchNames) -> ResumeResult:
     began = monotonic()
@@ -346,13 +365,14 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
     try:
         tab = _tab_of(session)
         client = herdr.Herdr(herdr.shared_session())
+        row = names.tab_record.by_current_session(identity)
         if isinstance(tab, SessionNotFound):
             original = pane_record.publication_for_session(session, record=names.tab_record)
-            if original is None:
+            if original is None and row is None:
                 return tab
-            if any(pane["pane_id"] == original.entry["pane_id"] for pane in client.panes()):
+            if original is not None and any(pane["pane_id"] == original.entry["pane_id"] for pane in client.panes()):
                 return tab
-            entry = original.entry
+            entry = original.entry if original is not None else None
         else:
             identity = tab.session_id or identity
             entry = pane_record.read_strict(client.session).get(tab.pane_id)
@@ -366,7 +386,14 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if not isinstance(running, sessions.SessionNotLive):
             return running
         if entry is None:
-            return SessionNotFound(session)
+            if row is None:
+                return SessionNotFound(session)
+            restart = cast(RowStarter, cast(object, import_module("scripts.shutdown.restart")))
+            pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
+            result = _running_on_account(identity, pane)
+            if isinstance(result, ClaudeUp):
+                return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
+            return ResumeFailed(identity, "session did not start") if isinstance(result, sessions.SessionNotLive) else result
         entry = entry.copy()
         entry["session_id"] = identity
         entry["environment"] = names.environment(entry)
@@ -382,11 +409,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                       Path(entry["environment"].get("CLAUDE_CONFIG_DIR", str(source))))
         label = to if to is not None else accounts.claude_config_label(target_dir)
         account_environment = named_account_environment(target_dir)
-        trust = herdr.heal_claude_trust(Path(entry["cwd"]), target_dir / ".claude.json",
-            accounts.trust_sources(target_dir, source), dry_run=False)
-        if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-            reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {entry['cwd']}"
-            print(f"{entry['name']}: trust anomaly: {reason}", file=sys.stderr)
+        trust = heal_account_trust(Path(entry["cwd"]), target_dir, source, entry["name"])
         entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
         if to is not None and original is not None and Path(original.entry["config_dir"]) != target_dir:

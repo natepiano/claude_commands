@@ -3611,6 +3611,7 @@ class QueueApiTests(MemoryQueueFixture):
             "BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_PROC": str(self.root / "proc"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
+        _ = os.environ.pop(gate.BUILDLOG_UNIT, None)
         self.processes[500] = "third"
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.meminfo.write_text(f"MemAvailable: {int(23.1 * GIB) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
@@ -3621,6 +3622,13 @@ class QueueApiTests(MemoryQueueFixture):
                 self.waiter(500, NOW.timestamp() - 60, "/tmp/third", "third"))
 
 
+
+    def test_waiter_identity_reads_the_unit_override_without_changing_the_session(self) -> None:
+        with patch.dict(os.environ, {gate.BUILDLOG_UNIT: "queue-unit", "CODEX_THREAD_ID": "showrunner"}):
+            identity = gate.waiter_identity("merge-gate", "tree")
+            self.assertEqual(identity.get("unit"), "queue-unit")
+            self.assertEqual(identity["session_id"], "showrunner")
+            self.assertEqual(gate.waiter_unit_name(identity, 123), "queue-unit")
 
     def test_waiter_identity_keeps_the_bare_step_and_caller_identity(self) -> None:
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_CODE_SESSION_ID": "parent-id",
@@ -4234,6 +4242,7 @@ class QueueLeaveTests(unittest.TestCase):
         py.chmod(0o755)
         _ = (scripts / "buildlog/record.py").write_text(
             f"import sys\nwith open({str(self.recorded)!r}, 'a') as log:\n    log.write(sys.argv[1] + '\\n')\n")
+        _ = (scripts / "buildlog/step_context.py").write_text((scripts / "buildlog/record.py").read_text())
         config = self.root / "config.sh"
         _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
         self.environment = {**os.environ, **gate_isolation_environment(self.root),
@@ -4300,7 +4309,7 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertFalse(self.ran.exists())
         self.assertEqual(self.hook_calls(), 1)
         self.assertEqual(self.reservations(), [])
-        self.assertEqual(self.recorder_actions(), ["key"])
+        self.assertEqual(self.recorder_actions(), ["step-context"])
         # The wait is measured in whole seconds of SECONDS, so a loaded machine
         # can cross a second between the first check and the leave.
         self.assertRegex(result.stderr, r"another machine is free after \d+ min \d+ s: leaving the memory wait\n")
@@ -4312,7 +4321,7 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
         self.assertTrue(self.ran.exists())
         self.assertEqual(self.hook_calls(), 0)
-        self.assertEqual(self.recorder_actions(), ["key", "step"])
+        self.assertEqual(self.recorder_actions(), ["step-context", "step"])
 
     def test_declining_hook_and_no_hook_wait_alike(self) -> None:
         free_on_second = 'if (( sleeps == 2 )); then printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; fi;'

@@ -13,7 +13,6 @@
     change_review.py list-path [--production DOC]
     change_review.py showrunner [--production DOC]
     change_review.py backfill-production [--list L] [--write]
-    change_review.py backfill-producer [--list L] [--write]
 
 A checkpoint(...) commit tells a person with no context what changed, how to try it and what they
 see, one line each: `Change-Review: <what changed for you> | <how to try it: where and what to type> |
@@ -1616,14 +1615,6 @@ def _run(options: CommandLine) -> int:
             print(production_list(options.production))
         case "showrunner":
             print(showrunner_of(production_doc(options.production)))
-        case "backfill-producer":
-            from importlib import import_module
-
-            documents, lists = _backfill_targets(options)
-            # Load the one-time backfill only for this action.
-            run_lists = cast(Callable[[list[Path], list[Path], staff.StaffSnapshot, bool], int],
-                             import_module("scripts.production.producer_backfill").run_lists)
-            return run_lists(lists, documents, staff.snapshot(), options.write)
         case "backfill-production":
             docs, lists = _backfill_targets(options)
             for path in lists:
@@ -1661,7 +1652,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
-                                                   "backfill-production", "backfill-producer"))
+                                                   "backfill-production"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
                  "row", "verdict", "production", "urgency", "due", "after", "kind"):

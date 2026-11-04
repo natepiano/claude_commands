@@ -572,8 +572,11 @@ class WorkerFillTests(StaffTestCase):
         parent = unit_membership("demo", "models-unit")
         _ = staff.set_worktree(parent.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=parent.worktree)
         run = self.worker_run("demo", "models-unit", "director")
-        with self.assertRaises(worker_fill.AdmissionRefused):
-            _ = worker_fill.admit("impl", run, role='impl')
+        with redirect_stderr(io.StringIO()) as errors:
+            allowed = worker_fill.admit("impl", run, role='impl')
+        self.assertEqual(allowed.parent, parent.id)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("retired", errors.getvalue())
         self.assertEqual(staff.find(kind="worker"), [])
 
     def test_new_codex_threads_are_created_only_inside_admitted_starters(self) -> None:
