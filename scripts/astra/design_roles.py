@@ -795,7 +795,7 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
         current = read_design(design_id)
         if _instance(current, role).lifecycle != RoleNotOpened(claim):
             raise RoleRefused('RoleNeedsRecovery: thread creation claim changed')
-        design = _set_lifecycle(current, role, RoleOpen(admitted.member.id if admitted.member is not None else staff.native_id(thread)))
+        design = _set_lifecycle(current, role, RoleOpen(admitted.slot.row.id if isinstance(admitted.slot, worker_admission.ExistingWorkerSlot) else staff.native_id(thread)))
         _save(design)
     _project_hold(design, role)
     return design

@@ -36,18 +36,6 @@ AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
 
 
-# The wrapper calls this as: <task> write <working_dir> <prompt> <reply> <log>.
-# Writing both outputs and exiting immediately drives the wrapper's completion
-# branch without a model call; the wrapper copies the reply into the summary
-# file because the stub, like a worker that skipped its last act, left it
-# empty.
-STUB_AGENT_EXEC = """#!/usr/bin/env bash
-set -euo pipefail
-printf 'Wrote the retry path.\\n' > "$5"
-printf 'stub agent log\\n' > "$6"
-if [[ -n "${TEST_WORKER_STARTED:-}" ]]; then : > "$TEST_WORKER_STARTED"; fi
-"""
-
 STUB_MESH = "#!/usr/bin/env python3\n" + STUB_ATOMIC_JSON_WRITER + """
 import json
 import os
@@ -71,15 +59,20 @@ if verb == 'follow':
     member = worker_admission.member(session, option('--to'))
     (session / 'follow_cwd.txt').write_text(str(session_staff.worker_directory(staff.local_snapshot(), member.id)))
 if verb == 'start':
+    baseline = session / 'phases/3/phase_baseline'
+    if baseline.exists():
+        (session / 'baseline-at-worker-open').write_bytes(baseline.read_bytes())
     name = option('--name')
     roster[name] = {'thread_id': 'thread-for-' + name, 'turn_id': 'turn-1',
                     'status': 'done', 'role': option('--role'), 'task': option('--task')}
     from scripts.production.staff_test_support import fixture_worker, isolated_staff_file
     from scripts.production import staff
     with isolated_staff_file(pathlib.Path(os.environ['STAFF_FILE']), {}):
-        worker = fixture_worker(name, staff.native_id(os.environ['CODEX_THREAD_ID']))
+        worker = fixture_worker(name, staff.native_id(os.environ['CODEX_THREAD_ID']), backend=staff.CodexBackend(pathlib.Path.home() / '.codex'))
     roster[name]['staff_id'] = worker.id
     pathlib.Path(option('--reply-file')).write_text('initial reply\\n')
+    if os.environ.get('TEST_WORKER_STARTED'):
+        pathlib.Path(os.environ['TEST_WORKER_STARTED']).touch()
 elif verb == 'compact':
     name = option('--to')
     if os.environ.get('STUB_COMPACT_FAIL') == '1':
@@ -322,9 +315,6 @@ class ImplementLauncherFixture(LauncherFixture):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/py", home_lib / "py")
         configure_launcher_fixture(direct_dir / "implement.sh")
         _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
-        stub = agents / "agent_exec.sh"
-        _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
-        stub.chmod(0o755)
         mesh = agents / "codex_mesh.py"
         _ = mesh.write_text(STUB_MESH, encoding="utf-8")
         mesh.chmod(0o755)
@@ -340,7 +330,7 @@ class ImplementLauncherFixture(LauncherFixture):
         _ = shutil.copy2(AGENTS_DIR / "agent_bg.sh", agent_bg)
         _ = agent_bg.write_text(
             agent_bg.read_text(encoding="utf-8").replace(
-                'POLL_SECS="${8:-15}"', 'POLL_SECS="${8:-0.05}"'
+                'POLL_SECS="${7:-15}"', 'POLL_SECS="${7:-0.05}"'
             ), encoding="utf-8",
         )
         return direct_dir / "implement.sh"
@@ -365,9 +355,6 @@ class ImplementLauncherFixture(LauncherFixture):
             _ = environment.pop(name, None)
         environment["TEST_WAIT_HELPER"] = str(DIRECT_DIR.resolve() / "wait_for_test_state.py")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
-        # The plain launcher, so the stub above stands in for the agent. The mesh
-        # path would need a live app-server, which is a different test's subject.
-        environment["UNIT_CODEX_MESH"] = "0"
         return environment
 
     def launch(
@@ -430,7 +417,6 @@ printf '%s\\n' '{answer}'
 
     def mesh_environment(self, fail: bool = False) -> dict[str, str]:
         environment = self.environment()
-        environment["UNIT_CODEX_MESH"] = "1"
         if fail:
             environment["STUB_FOLLOW_FAIL"] = "1"
         return environment
@@ -557,9 +543,6 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         _ = transcript.write_text(
             json.dumps({"type": "assistant", "message": {"stop_reason": "end_turn"}})
             + "\n", encoding="utf-8"
-        )
-        _ = (session_dir / "impl_bg_id_impl").write_text(
-            "abc12345\n", encoding="utf-8"
         )
         from scripts.production import staff
         from scripts.production.staff_test_support import fixture_worker, isolated_staff_file

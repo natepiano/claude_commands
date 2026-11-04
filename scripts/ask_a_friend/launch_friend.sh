@@ -1,30 +1,6 @@
 #!/usr/bin/env bash
-# launch_friend.sh — Start the consultation friend as an addressable session of
-# the caller's own family, with question.md as its opening turn.
-#
-# Usage: launch_friend.sh <session_dir> <working_dir>
-#
-# The friend is always the caller's family — claude asks claude, codex asks
-# codex — because that is the only pairing where messages flow both ways. The
-# registry enforces it: [assignments] ask_a_friend=caller makes agents_resolve
-# pick the [ask_a_friend.<family>] row for the family running this script.
-#
-# claude: launches a named background session through agent_bg.sh in detach
-#   mode and RETURNS at once. The friend answers by SendMessage into the
-#   caller's conversation; follow-ups go back the same way. friend_id holds the
-#   session id for `claude logs` and end_friend.sh.
-# codex: runs codex_mesh.py start --resident and BLOCKS for the friend's
-#   lifetime, printing each reply between `=== reply from <friend> (N) ===` and
-#   `=== end reply ===`. Follow-ups go through codex_mesh.py send; end_friend.sh
-#   releases this process.
-#
-# Produces:
-#   <session_dir>/status         running | ended | error
-#   <session_dir>/consult_agent  task/family/agent/effort provenance
-#   <session_dir>/friend_id      claude: the background session id
-#   <session_dir>/answer.txt     codex: the latest reply
-#   <session_dir>/agent.log      codex: the friend's activity log; resolver errors
-
+# Start the configured consultation worker in the existing run.
+# Keep its address in staff and its answer in the consultation artifacts.
 set -euo pipefail
 
 SESSION_DIR="${1:?Usage: launch_friend.sh <session_dir> <working_dir>}"
@@ -63,15 +39,14 @@ printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
 case "${AGENT_FAMILY}" in
   claude)
     if ! AGENT_BG_ROLE=review AGENT_BG_DETACH=1 AGENT_BG_EFFORT="${AGENT_EFFORT}" \
-         bash "${AGENTS_DIR}/agent_bg.sh" "${FRIEND}" "${WORKING_DIR}" \
+         bash "${AGENTS_DIR}/agent_bg.sh" --run "${SESSION_DIR}" "${FRIEND}" "${WORKING_DIR}" \
            "${QUESTION_FILE}" "${ANSWER_FILE}" "${LOG_FILE}" \
-           "${SESSION_DIR}/friend_id" "${AGENT_MODEL}" >/dev/null; then
+           "${AGENT_MODEL}" >/dev/null; then
       echo "error" > "${STATUS_FILE}"
       exit 1
     fi
-    FRIEND_ID="$(cat "${SESSION_DIR}/friend_id")"
     echo "running" > "${STATUS_FILE}"
-    echo "friend=${FRIEND} family=claude agent=${AGENT_MODEL} effort=${AGENT_EFFORT:-default} id=${FRIEND_ID}"
+    echo "friend=${FRIEND} family=claude agent=${AGENT_MODEL} effort=${AGENT_EFFORT:-default}"
     echo "The friend answers by SendMessage; follow-ups go to ${FRIEND} the same way."
     ;;
   codex)

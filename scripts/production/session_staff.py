@@ -70,6 +70,17 @@ def worker_backend(record: staff.StaffSnapshot, identity: staff.StaffId
     return RecordedWorker(row, backend)
 
 
+def worker_family(record: staff.StaffSnapshot, reference: staff.StaffId) -> str:
+    backend = record.backends.get(reference)
+    return "codex" if isinstance(backend, staff.CodexBackend) else "claude" if isinstance(backend, staff.ClaudeBackend) else ""
+
+
+def codex_thread(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
+    record = record if record is not None else staff.local_snapshot()
+    row = worker_row(entry, record)
+    return row.current_session if row is not None and worker_family(record, row.id) == "codex" else ""
+
+
 def worker_row(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> staff.StaffRow | None:
     record = record if record is not None else staff.local_snapshot()
     return record.by_id(staff.StaffId(str(entry.get("staff_id", ""))))
@@ -78,6 +89,34 @@ def worker_row(entry: Mapping[str, object], record: staff.StaffSnapshot | None =
 def worker_session(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
     member = worker_row(entry, record)
     return member.current_session if member is not None else ""
+
+
+def worker_run_index(record: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[Path, ...]]:
+    """Read fixed staff references from each run once."""
+    from scripts.lib import unit_runs
+    marked: dict[Path, list[staff.StaffId]] = {}
+    for row in record.find(kind="worker"):
+        owner = record.parent_of(row)
+        marker = unit_runs.marker(owner.current_session) if owner is not None else None
+        if marker is not None and marker.is_file():
+            marked.setdefault(Path(marker.read_text().strip()), []).append(row.id)
+    paths = [*marked]
+    if current := unit_runs.environ("RUN_DIR"):
+        paths.append(Path(current))
+    paths.extend(path for root in unit_runs.run_roots() if root.is_dir()
+                 for path in root.iterdir() if path.is_dir())
+    found: dict[staff.StaffId, list[Path]] = {}
+    for run in sorted(dict.fromkeys(paths), key=lambda run: run.stat().st_mtime if run.exists() else 0):
+        try:
+            entries = [*read_worker_roster(run / "mesh_roster.json").values()]
+            entries.extend(cast(object, json.loads(path.read_text())) for path in run.glob("impl_worker_*.json"))
+            identities = {staff.StaffId(value) for entry in entries if isinstance(entry, dict)
+                          and isinstance(value := cast(dict[str, object], entry).get("staff_id"), str)}
+            for identity in identities | set(marked.get(run, ())):
+                found.setdefault(identity, []).append(run)
+        except (OSError, ValueError) as error:
+            print(f"anomaly: {run}: {error}".replace("\n", " "), file=sys.stderr)
+    return {identity: tuple(runs) for identity, runs in found.items()}
 
 
 def worker_name(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:

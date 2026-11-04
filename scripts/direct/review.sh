@@ -677,8 +677,7 @@ TREE_BASELINE_READY=0
 TURN_IMAGE_ARGS=()
 
 if [[ -n "${REVIEW_WORKER}" ]]; then
-  CODEX_MESH="${UNIT_CODEX_MESH:-$(_models_registry_get direct.options codex_mesh)}"
-  if [[ "${AGENT_FAMILY}" != "codex" || "${CODEX_MESH}" != "1" ]]; then
+  if [[ "${AGENT_FAMILY}" != "codex" ]]; then
     echo "ERROR: review worker ${REVIEW_WORKER} requires the Codex mesh." >&2
     exit 2
   fi

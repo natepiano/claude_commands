@@ -55,14 +55,106 @@ def fixture_runtime_id(label: str) -> str:
     return str(uuid5(NAMESPACE_URL, "staff-test-backend:" + label))
 
 
+def _fixture_session_path(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> Path:
+    home = backend.codex_home if isinstance(backend, staff.CodexBackend) else Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    return home / "sessions" / f"{identity}.jsonl" if isinstance(backend, staff.CodexBackend) else home / "projects/fixture" / f"{identity}.jsonl"
+
+
 def fixture_session(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> None:
     """Create the private session file that supplies the worker family."""
-    home = backend.codex_home if isinstance(backend, staff.CodexBackend) else Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-    path = home / "sessions" / f"{identity}.jsonl" if isinstance(backend, staff.CodexBackend) else home / "projects/fixture" / f"{identity}.jsonl"
+    path = _fixture_session_path(identity, backend)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch(exist_ok=True)
     if isinstance(backend, staff.CodexBackend):
-        os.environ["CODEX_HOME"] = str(home)
+        os.environ["CODEX_HOME"] = str(backend.codex_home)
+
+
+def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend, *,
+                       turns: int = 1, malformed: bool = False) -> tuple[Path, tuple[list[str], list[str], list[str]]]:
+    """Write source evidence with private tool data between assignments and final replies."""
+    path = _fixture_session_path(row.current_session, backend)
+    family = "codex" if isinstance(backend, staff.CodexBackend) else "claude"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    assignments = [f"Assignment {index}: preserve this complete requirement. " + "detail " * 90
+                   for index in range(turns)]
+    replies = [f"Final {index}: completed the required change. " + "proof " * 90
+               for index in range(turns)]
+    files = [f"src/changed-{index}.py" for index in range(turns)]
+    records: list[object] = []
+    moved: list[str] = []
+    for index, (assignment, reply, file) in enumerate(zip(assignments, replies, files, strict=True)):
+        if family == "claude":
+            records.extend([
+                {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": assignment}]}},
+                {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "write", "name": "Edit",
+                     "input": {"file_path": file, "content": "PRIVATE_TOOL_REQUEST"}}]}},
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "write", "content": "PRIVATE_TOOL_OUTPUT"}]}},
+                {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": reply}], "stop_reason": "end_turn"}},
+            ])
+        else:
+            moved.append(file + ".moved")
+            patch = f"*** Begin Patch\n*** Update File: {file}\n*** Move to: {moved[-1]}\n+PRIVATE_TOOL_REQUEST\n*** End Patch"
+            tool, arguments = ("apply_patch", patch) if index % 2 == 0 else (
+                "exec", f"const example = 'tools.apply_patch(\"PRIVATE_TOOL_REQUEST\")'; await tools.apply_patch({json.dumps(patch)});")
+            records.extend([
+                {"type": "response_item", "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": assignment}]}},
+                {"type": "response_item", "payload": {"type": "custom_tool_call", "name": tool, "input": arguments}},
+                {"type": "response_item", "payload": {"type": "custom_tool_call_output",
+                    "output": "PRIVATE_TOOL_OUTPUT"}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": reply}},
+            ])
+    lines = [json.dumps(record) for record in records]
+    if malformed:
+        lines.insert(1, '{"broken":')
+        lines.insert(3, json.dumps({"type": "assistant", "message": None}))
+        lines.insert(5, json.dumps(["unexpected record"]))
+        lines.append('{"torn":')
+    _ = path.write_text("\n".join(lines) + "\n")
+    return path, (assignments, replies, files + moved)
+
+
+def stopped_worker_module(directory: Path) -> Path:
+    """Install a child-process lifecycle stub that records the source row."""
+    directory.mkdir()
+    _ = (directory / "sitecustomize.py").write_text('''import json, os
+from pathlib import Path
+from scripts.production import staff
+from scripts.shutdown import stop_resume
+def stop(reference):
+    row = staff.by_id(staff.StaffId(reference))
+    if os.environ.get("FIXTURE_STOPPED"):
+        Path(os.environ["FIXTURE_STOPPED"]).write_text(json.dumps(row.to_json()))
+    return stop_resume.Stopped(row.current_session, 987654)
+stop_resume.stop = stop
+''')
+    return directory
+
+
+def switch_backend_stub() -> str:
+    """Create a native destination and check the staff row at dispatch."""
+    return r'''import os, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.production import staff, worker_admission as admission
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_session
+from scripts.shutdown import stop_resume
+args = sys.argv[1:]
+run = Path(args[args.index("--session-dir") + 1])
+allowed = admission.admit(args[args.index("--name") + 1], run, role="impl")
+row = allowed.slot.row
+def start(handoff):
+    identity = fixture_runtime_id("destination:" + row.id + "codex")
+    fixture_session(identity, staff.CodexBackend(Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))))
+    return identity
+def dispatch(published):
+    assert staff.by_id(row.id) == published.row
+with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.current_session, 987654)):
+    admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: None)
+'''
 
 
 def fixture_member(kind: staff.Kind, *, name: str,
@@ -435,6 +527,11 @@ class StaffTestCase(unittest.TestCase):
     staff_file: Path = Path()
     mac_file: Path = Path()
     ssh_log: Path = Path()
+
+    def assert_only_current_session_changed(self, before: bytes, old: staff.StaffRow, identity: str) -> None:
+        self.assertEqual(self.staff_file.read_bytes(), before.replace(
+            f'"current_session": "{old.current_session}"'.encode(),
+            f'"current_session": "{identity}"'.encode(), 1))
 
     @override
     def setUp(self) -> None:

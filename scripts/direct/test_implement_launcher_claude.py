@@ -4,13 +4,42 @@ from __future__ import annotations
 
 import unittest
 import json
+import os
+from dataclasses import replace
 from typing import cast
+from unittest.mock import patch
 from scripts.direct.implement_launcher_claude_test_support import ClaudeLauncherFixture
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production.staff_test_support import CHECKOUT, fixture_worker, isolated_staff_file, transcript_fixture, stopped_worker_module
 
 
 class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
+    def test_codex_slot_uses_claude_start_and_receives_the_extract_after_publication(self) -> None:
+        run = self.start_phase("codex-to-claude")
+        with isolated_staff_file(self.root / "staff.json", {}):
+            old = fixture_worker(self.working_dir.name + "-impl", staff.native_id(self.staff_parent),
+                                 backend=staff.CodexBackend(self.root / ".codex"))
+        source, evidence = transcript_fixture(old, staff.CodexBackend(self.root / ".codex"))
+        reference = run / "impl_worker_impl.json"
+        _ = reference.write_text(json.dumps({"staff_id": old.id, "slot": "impl", "model": "gpt-6"}))
+        modules = stopped_worker_module(self.root / "switch-modules")
+        environment = self.environment()
+        environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
+        with patch.object(self, "environment", return_value=environment):
+            result = self.claude_launch(run, "sonnet:low")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = self.recorded_worker(run)
+        self.assertNotEqual(current.current_session, old.current_session)
+        self.assertEqual(current, replace(old, current_session=current.current_session))
+        rows = cast(list[dict[str, object]], json.loads((self.root / "staff-at-work.json").read_text()))
+        self.assertIn(current.to_json(), rows)
+        prompt = (self.root / "opening-message.txt").read_text()
+        extract = run / f"{old.id}.handoff.md"
+        self.assertLess(prompt.index(str(extract)), prompt.index(str(source)))
+        self.assertIn(evidence[0][0], extract.read_text())
+        stored = cast(dict[str, object], json.loads(reference.read_text()))
+        self.assertEqual((stored["staff_id"], stored["slot"]), (old.id, "impl"))
+
     def test_claude_repair_in_the_impl_slot_keeps_a_distinct_worker_identity(self) -> None:
         run = self.start_phase("claude-repair-identity")
         first = self.claude_launch(run, "sonnet:low")

@@ -600,6 +600,12 @@ def is_owner() -> bool:
     return bool(_file_override()) or remote.other_machine() != OWNER_MACHINE
 
 
+def child_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    """Remove row lock proofs and retired staff hints from child environments."""
+    return {key: value for key, value in environment.items()
+            if not key.startswith("STAFF_ROW_FD_") and key != "STAFF_ID"}
+
+
 def operation_fds() -> tuple[int, ...]:
     """Descriptors a nested tool must preserve with subprocess pass_fds."""
     result: list[int] = []
@@ -856,8 +862,7 @@ def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | C
         except OSError as error:
             print(f"anomaly: {home}: {error}", file=sys.stderr)
     for current, identity in wanted.items():
-        if identity not in found and any(sessions.latest_transcript(current, home / "projects")
-                                         for home in sessions.config_dirs()):
+        if identity not in found and bool(sessions.transcript_locations(current)):
             found[identity] = ClaudeBackend()
     return found
 

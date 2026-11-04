@@ -386,6 +386,12 @@ def config_dirs() -> list[Path]:
     return sorted(directories)
 
 
+def transcript_locations(session_id: str) -> list[Path]:
+    """Return distinct transcript paths across the Claude accounts."""
+    return sorted({path.resolve() for directory in config_dirs()
+                   for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
+
+
 def latest_transcript(session_id: str, projects: Path) -> Path | None:
     """The session's transcript under the Claude projects folder: the newest one, when a resume left several."""
     transcripts = sorted(projects.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)

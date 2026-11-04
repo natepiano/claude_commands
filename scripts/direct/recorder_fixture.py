@@ -169,13 +169,12 @@ class LauncherFixture(unittest.TestCase):
         return session_dir
 
 
-def launcher_registry(implementation_roles: tuple[str, ...], *, mesh: bool = False) -> str:
+def launcher_registry(implementation_roles: tuple[str, ...]) -> str:
     """Build both launcher registries from the same catalog and role settings."""
     return registry_text({
         "assignments": ExactRows({"direct": "codex"}),
         "direct.codex": {**dict.fromkeys(implementation_roles, "gpt-called:xhigh"), "review": "gpt-blind:max"},
         "codex.agents": {"gpt-called": "low,medium,high,xhigh,max", "gpt-blind": "low,medium,high,xhigh,max"},
-        "direct.options": {"codex_mesh": "1" if mesh else "0"},
     })
 
 

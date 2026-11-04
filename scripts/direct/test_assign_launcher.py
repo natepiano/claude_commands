@@ -95,7 +95,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
             "NOTIFIER_SESSIONS_DIR": str(self.session_dir.parent / "sessions"),
             "SHUTDOWN_STATE_DIR": str(self.session_dir.parent / "shutdown"),
-            "UNIT_CODEX_MESH": "1", "UNIT_SYNC_WRITES": "0",
+            "UNIT_SYNC_WRITES": "0",
             "PYTHONPATH": str(ROOT), "TMPDIR": "/tmp",
         }))
         (self.session_dir / "progress_history_state.json").unlink(missing_ok=True)

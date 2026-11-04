@@ -170,12 +170,6 @@ def mac_claims(worktree: Path) -> tuple[MacClaim, ...]:
     return tuple(found)
 
 
-def transcript_locations(session_id: str) -> list[Path]:
-    """Distinct project folders holding this transcript, including shared account symlinks once."""
-    return sorted({path.resolve() for directory in sessions.config_dirs()
-                   for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
-
-
 def terminate(pids: list[int], what: dict[int, str], wait: float | None = None, *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
     """SIGTERM each pid, observing the configured wait and poll limits."""
     if not pids:

@@ -128,7 +128,7 @@ The staff row is the one record of a worker, per the staff-lifecycle spec (`docs
 
 **Ruled out:** `WorkerRole` and a row `role` field; a `"backends"` section in `staff.json`; `staff.adopt_worker` and the adoption journal; `repair_roster` and the ledger-to-roster check; per-thread inbox and held-role files; readers of legacy identity records.
 
-### Phase 3o — Transcript handoff when a slot changes family  · status: todo
+### Phase 3o — Transcript handoff when a slot changes family  · status: done
 
 **Owner:** models-unit, the next phase after 3n (sdlc for the user, 2026-11-03). It goes before herdr Phases 7, 8, 9 and 12.
 
@@ -214,6 +214,11 @@ The staff row is the one record of a worker, per the staff-lifecycle spec (`docs
 10. Keep the phase net negative in code lines.
 11. Coordinate shared lifecycle interfaces with shutdown and herdr owners.
 12. Do not wait for herdr's later worker-pane implementation.
+13. herdr-unit (2026-11-04): stop the source through `stop_resume.stop` by staff id; it reaches herdr through `check_target` and `close_pane`. Start through the family launcher until herdr's `WorkerStart` lands; then start a worker pane with `Herdr.start_agent`.
+14. herdr-unit (2026-11-04): write `current_session` only after the new process proves its native id (Claude session id or Codex thread id), never the id the launcher asked for. A failed start leaves the row on the old `current_session`.
+15. shutdown-unit (2026-11-04): take the row lock with `staff.row_operation(<row id>)` in the same process; `stop_resume.stop` joins it through `STAFF_ROW_FD_<id>` and does not block.
+16. shutdown-unit (2026-11-04): start the destination with every `STAFF_ROW_FD_*` removed from its environment and the fd not passed on, so the long-lived launcher child does not keep the row locked (herdr `child_environment` does the same, d8e76084a).
+17. shutdown-unit (2026-11-04): `stop` by staff id covers a Claude source and a Codex TUI pane. A Codex source that is a no-pane mesh thread returns `NotRunning`; end it with codex_mesh's idle end. `Stopped` and `NotRunning` are done; on `StopFailed`, keep `current_session` and print one anomaly line.
 
 **Acceptance gate:**
 
@@ -235,14 +240,38 @@ The staff row is the one record of a worker, per the staff-lifecycle spec (`docs
 16. Run affected suites with `unittest discover`.
 17. Pass basedpyright with zero errors and warnings on changed Python files and caller modules.
 18. Pass the Delegation Context merge gate.
-19. Prove one real Codex-to-Claude switch through `implement.sh`, with the worker using the extract.
-20. Prove the reverse direction and record the outcomes for sdlc.
+19. Prove one real Codex-to-Claude switch through `implement.sh`, with the worker using the extract. Moved to Phase 3p (sdlc, 2026-11-04): assign.sh starts only Codex workers.
+20. Prove the reverse direction and record the outcomes for sdlc. Moved to Phase 3p (sdlc, 2026-11-04): assign.sh starts only Codex workers.
+
+### Phase 3p — 3o follow-ups: live switch proofs, regression tests, test cut  · status: todo
+
+**Owner:** models-unit. 3o routed these items here under the hard landing rule (repair round 11, 2026-11-04).
+
+**Depends on:** 3o. Spec items 1-2 also depend on assign.sh starting a Claude worker; today `assign.py:207` refuses any non-Codex worker. sdlc sent that change to devtools-unit (one-launch-path) on 2026-11-04 and tells models-unit when it lands.
+
+#### Work Order
+
+**Goal:** Finish the 3o proofs and cuts that 3o did not land.
+
+**Spec:**
+
+1. Prove one real Codex-to-Claude switch through assign.sh, with the worker using the extract (3o spec 19).
+2. Prove the reverse direction and record both outcomes for sdlc (3o spec 20).
+3. F010: define "already stopped" evidence for a rerun after a partial switch. Distinguish a confirmed release from missing evidence. Keep the refusal for an unresolved identity or unknown server state. Test a source release followed by a failed destination creation (Astra review 20261104T173320Z, item 1).
+4. F008: test healthy allocation at `scripts/direct/workers.py:484` after a failed switch.
+5. F035: test that a caller acquires the worker row during a live Codex turn (`codex_mesh.py:4639` releases the lock before streaming).
+6. F012: test the done-record ownership guard in `codex_mesh.py`.
+7. F017: in the running regression in `test_codex_mesh.py`, exclude duplicate developer instructions.
+8. Simplify: F013 (one family comparison), F015 (`end_friend.sh` inline staff lookup), F016 (dummy callback; named admission states, not `bool | None`), F019 (duplicate filter and STAFF_ID removal in `test_worker_admission.py`), F026 (one admission path), F028, F034 (session equality in `test_implement_launcher_claude_effort.py`).
+9. Cut the 3o tests to one test per behavior, with table rows. 3o left tests net +309 lines against 5e72ab674.
+
+**Acceptance gate:** basedpyright zero errors and warnings on changed files and callers; affected suites green; source net negative.
 
 ### Phase 5a — Bash reads the resolved model registry in one call  · status: todo
 
 **Owner:** models-unit (user via natedev and sdlc, 2026-11-03: "going forward herdr should not own changes to /default_models - it should be owned by the models unit under sdlc"). models-unit owns `commands/default_models.md`, `scripts/agents/default_models.sh`, `models_config.sh`, `sync_codex_catalog.sh`, `scripts/lib/models_registry.py` and `config/models.conf`.
 
-**Depends on:** 3o.
+**Depends on:** 3o. It does not wait for 3p.
 
 **Order:** after 3o. It runs beside herdr Phase 7 when no file overlaps; it never delays 3n or 3o.
 

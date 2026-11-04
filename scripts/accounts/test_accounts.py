@@ -39,10 +39,11 @@ from scripts.accounts.home_test_support import clear_notes_directory_cache, scra
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import fixture_member, fixture_worker
+from scripts.shutdown import stop_resume
 from scripts.shutdown import remote
-from scripts.agents import codex_mesh
-from scripts.message import roster, sessions
+from scripts.message import sessions
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
@@ -288,6 +289,7 @@ class AccountsTests(unittest.TestCase):
         _ = notes.mkdir()
         environment = {
             "AGENT_NOTES_DIR": str(notes),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "PATH": os.defpath,
             # The wall times these tests pass are Pacific; the user's zone setting must not change them.
             "USER_ZONE": "America/Los_Angeles",
@@ -301,6 +303,7 @@ class AccountsTests(unittest.TestCase):
         counts_cache.parent.mkdir(parents=True, exist_ok=True)
         _ = counts_cache.write_text(json.dumps({"machine": remote.other_machine(),
             "at": datetime.now(timezone.utc).isoformat(), "accounts": {}}))
+        _ = (self.root / "staff.json").write_text('{"schema": 2, "rows": []}\n')
         self.trust_config = accounts.trust_settings_file()
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "quota_alert.json"))
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.root / "pace.jsonl"))
@@ -312,7 +315,6 @@ class AccountsTests(unittest.TestCase):
         _ = self.enterContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (self.root / "worker-runs",)))
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
-        _ = self.enterContext(patch.object(codex_mesh, "retire_workers_servers", return_value=[]))
         _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=[
             showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="America/Los_Angeles", doc=""),
         ]))
@@ -6099,10 +6101,15 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         _ = config.write_text('{"workers": "codex2"}\n')
         return default, target
 
+    def workers_member(self, name: str = "project-review") -> staff.StaffRow:
+        owner = fixture_member("showrunner", name="worker-owner")
+        unit = fixture_member("unit", name="worker-unit", parent=owner.id,
+                              worktree=staff.PresentWorktree("natedev", self.root))
+        return fixture_worker(name, unit.id, backend=staff.CodexBackend(self.home / ".codex"))
+
     def test_workers_swap_records_the_callers_auto_reason_and_cause(self) -> None:
         _ = self.workers_fixture()
-        with patch.object(accounts, "_retire_workers_servers", return_value=[]):
-            _ = accounts.swap("workers", "codex1", why="auto: workers-entry", cause="auto")
+        _ = accounts.swap("workers", "codex1", why="auto: workers-entry", cause="auto")
         rows = [cast(dict[str, object], json.loads(line))
                 for line in accounts.roles_history_file().read_text().splitlines()]
         self.assertEqual((rows[-1]["role"], rows[-1]["cause"], rows[-1]["why"]),
@@ -6284,254 +6291,55 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
     def test_workers_swap_dry_run_names_target_and_preserves_roles_and_history(self) -> None:
-        _, target = self.workers_fixture()
-        before = self.role_files()
-        with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
+        _ = self.workers_fixture()
+        worker = self.workers_member()
+        before = self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()
+        with patch.object(stop_resume, "stop") as stop:
             result, stdout, stderr = self.run_cli("swap", "workers", "codex1", "--dry-run")
         self.assertEqual((result, stderr), (0, ""))
         self.assertIn("codex1", stdout)
-        self.assertEqual(stdout, "Workers would move codex2 → codex1:\n")
-        self.assertEqual(self.role_files(), before)
-        retire.assert_called_once_with(target, "codex1", dry_run=True)
+        self.assertEqual(stdout, f"{worker.name} ({worker.id}): would stop; restart on codex1 stays pending\n")
+        self.assertEqual((self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()), before)
+        stop.assert_not_called()
 
-    def test_workers_swap_names_each_switching_worker_and_its_production_for_both_modes(self) -> None:
-        def holder(session: str, machine: str, unit: str, name: str) -> roster.RosterEntry:
-            return roster.RosterEntry(
-                machine=machine, kind="claude", role="unit director", name=name, status="running",
-                reach=roster.Messageable(f"session:{session}"), cwd="",
-                showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
-                director=roster.DirectsUnit(unit) if unit else roster.NoDirector(),
-                assignment=roster.NotAWorker(), session=roster.ClaudeSession(session))
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                switches = (
-                    codex_mesh.WorkersRunSwitch(self.root / "private-run-a", ("director-a",), (
-                        codex_mesh.SwitchingWorker("claude-build-two-accounts-impl", False),)),
-                    codex_mesh.WorkersRunSwitch(self.root / "private-run-b", ("director-b",), (
-                        codex_mesh.SwitchingWorker("claude-build-herdr-trial-review", True),)),
-                    codex_mesh.WorkersRunSwitch(self.root / "private-run-c", ("freestanding",), (
-                        codex_mesh.SwitchingWorker("project-test-worker", False),)),
-                    codex_mesh.WorkersRunSwitch(self.root / "orphan-run", ("missing",), (
-                        codex_mesh.SwitchingWorker("project-fix", False),)),
-                )
-                snapshot = roster.Roster([
-                    holder("director-a", "here", "two-accounts", "director-a"),
-                    holder("director-b", "macbook", "herdr-trial", "director-b"),
-                    holder("freestanding", "here", "", "scratch session"),
-                ], [])
-                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-                      patch.object(roster, "roster", return_value=snapshot),
-                      patch.object(roster, "machine_name", return_value="here")):
-                    code, stdout, stderr = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, stderr), (0, ""))
-                header = "Workers would move" if dry_run else "Workers moving"
-                self.assertEqual(stdout, f"{header} codex2 → codex1:\n" +
-                    "  natedev · two-accounts · impl-worker → codex1\n" +
-                    "  macbook · natedev · herdr-trial · review-worker → codex1, interrupted and resumed\n" +
-                    "  natedev · scratch session · test-worker → codex1\n" +
-                    "  unknown session (orphan-run) · fix-worker → codex1\n")
-                self.assertNotIn("private-run", stdout)
 
-    def test_workers_swap_reports_each_failed_worker_with_manual_resume_and_keeps_new_role(self) -> None:
+    def test_workers_swap_reports_each_failed_stop_and_keeps_new_role_for_pending_workers(self) -> None:
         _, target = self.workers_fixture()
-        run = self.root / "run with spaces"
-        interrupt_command = f"python3 mesh.py resume-account-move --session-dir '{run}' --to project-impl"
-        resume_command = f"python3 mesh.py resume-account-move --session-dir '{run}' --to project-review"
-        switches = (codex_mesh.WorkersRunSwitch(run, (), (
-            codex_mesh.SwitchingWorker("project-impl", True,
-                codex_mesh.WorkerMoveFailed("interrupt failed: access denied", interrupt_command)),
-            codex_mesh.SwitchingWorker("project-review", True,
-                codex_mesh.WorkerMoveFailed("resume failed: server unavailable", resume_command)),
-            codex_mesh.SwitchingWorker("project-test", False),
-        )),)
-        with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-              patch.object(roster, "roster", return_value=roster.Roster([], []))):
+        failed = self.workers_member("project-review")
+        pending = self.workers_member("project-test")
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+
+        def stop(reference: str) -> stop_resume.StopFailed | stop_resume.Stopped:
+            return (stop_resume.StopFailed(reference, "source process could not stop") if reference == failed.id
+                    else stop_resume.Stopped(pending.current_session, 987654))
+
+        with patch.object(stop_resume, "stop", side_effect=stop) as stopped:
             code, output, errors = self.run_cli("swap", "workers", "codex1")
-        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual((code, errors), (1, ""))
         self.assertEqual(agent_accounts.workers_home(), target)
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertEqual({entry.args[0] for entry in stopped.call_args_list}, {failed.id, pending.id})
+        self.assertEqual(stopped.call_count, 2)
         lines = output.splitlines()
-        self.assertEqual(len(lines), 4)
-        for worker, reason, command in (("impl-worker", "interrupt failed: access denied", interrupt_command),
-                                         ("review-worker", "resume failed: server unavailable", resume_command)):
-            line = next(line for line in lines if f" · {worker} → codex1" in line)
-            self.assertIn(reason, line)
-            self.assertIn(command, line)
-            self.assertNotIn("interrupted and resumed", line)
-        idle = next(line for line in lines if " · test-worker → codex1" in line)
-        self.assertNotIn("failed", idle)
-        self.assertNotIn("interrupted", idle)
+        self.assertEqual(len(lines), 2)
+        failed_line = next(line for line in lines if failed.id in line)
+        self.assertIn("source process could not stop", failed_line)
+        self.assertNotIn("resumed", failed_line)
+        pending_line = next(line for line in lines if pending.id in line)
+        self.assertIn("pending", pending_line)
+        self.assertIn("codex1", pending_line)
+        self.assertNotIn("failed", pending_line)
 
     def test_workers_swap_role_write_failure_exits_one_before_interrupting_workers(self) -> None:
         _ = self.workers_fixture()
         before = self.role_files()
         with (patch.object(accounts, "_write_role", side_effect=accounts.AccountsError("role write refused")),
-              patch.object(codex_mesh, "retire_workers_servers") as retire):
+              patch.object(stop_resume, "stop") as stop):
             code, output, errors = self.run_cli("swap", "workers", "codex1")
         self.assertEqual((code, output), (1, ""))
         self.assertIn("role write refused", errors)
         self.assertEqual(self.role_files(), before)
-        retire.assert_not_called()
-
-    def test_workers_swap_folds_same_holder_slot_across_runs_without_hiding_failures_or_other_holders(self) -> None:
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                commands = ("mesh resume-account-move --to plan-c-review", "mesh resume-account-move --to plan-d-review")
-                switches = (
-                    codex_mesh.WorkersRunSwitch(self.root / "plan-a", ("holder-a",), (
-                        codex_mesh.SwitchingWorker("plan-a-review", False),
-                        codex_mesh.SwitchingWorker("plan-a-impl", False))),
-                    codex_mesh.WorkersRunSwitch(self.root / "plan-b", ("holder-a",), (
-                        codex_mesh.SwitchingWorker("plan-b-review-worker", True, codex_mesh.WorkerMoveResumed()),
-                        codex_mesh.SwitchingWorker("plan-b-impl", False))),
-                    codex_mesh.WorkersRunSwitch(self.root / "failures", ("holder-a",), (
-                        codex_mesh.SwitchingWorker("plan-c-review", True,
-                            codex_mesh.WorkerMoveFailed("interrupt failed: denied", commands[0])),
-                        codex_mesh.SwitchingWorker("plan-d-review", True,
-                            codex_mesh.WorkerMoveFailed("resume failed: refused", commands[1])))),
-                    codex_mesh.WorkersRunSwitch(self.root / "different-holder", ("holder-b",), (
-                        codex_mesh.SwitchingWorker("plan-e-review", False),)),
-                )
-                # Identical display names still describe two distinct holder identities.
-                listing = roster.Roster([roster.RosterEntry(
-                    machine="here", kind="claude", role="unit director", name="director", status="running",
-                    reach=roster.Messageable(f"session:{holder}"), cwd="",
-                    showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
-                    director=roster.DirectsUnit("two-accounts"), assignment=roster.NotAWorker(),
-                    session=roster.ClaudeSession(holder)) for holder in ("holder-a", "holder-b")], [])
-                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-                      patch.object(roster, "roster", return_value=listing),
-                      patch.object(roster, "machine_name", return_value="here")):
-                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, errors), (0, ""))
-                rows = output.splitlines()[1:]
-                self.assertEqual(len(rows), 5)
-                self.assertIn("  natedev · two-accounts · review-worker → codex1 ×2, 1 interrupted and resumed", rows)
-                self.assertIn("  natedev · two-accounts · impl-worker → codex1 ×2", rows)
-                self.assertIn("  natedev · two-accounts · review-worker → codex1", rows)
-                for reason, command in zip(("interrupt failed: denied", "resume failed: refused"), commands, strict=True):
-                    failed = next(row for row in rows if reason in row)
-                    self.assertIn(command, failed)
-                    self.assertNotIn("×", failed)
-
-    def test_workers_swap_fold_counts_mid_turn_entries_and_preserves_single_rows_in_both_modes(self) -> None:
-        previous, _ = self.workers_fixture()
-        holder = roster.RosterEntry(
-            machine="here", kind="claude", role="unit director", name="director", status="running",
-            reach=roster.Messageable("session:holder"), cwd="",
-            showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
-            director=roster.DirectsUnit("two-accounts"), assignment=roster.NotAWorker(),
-            session=roster.ClaudeSession("holder"))
-        cases = (
-            ((False,) * 11 + (True,), " ×12, 1 interrupted and resumed"),
-            ((False, True, True, False), " ×4, 2 interrupted and resumed"),
-            ((True, True, True), " ×3, 3 interrupted and resumed"),
-            ((False, False, False), " ×3"),
-            ((True,), ", interrupted and resumed"),
-            ((False,), ""),
-        )
-        for dry_run in (True, False):
-            for mid_turns, suffix in cases:
-                with self.subTest(dry_run=dry_run, mid_turns=mid_turns):
-                    switches = tuple(codex_mesh.WorkersRunSwitch(
-                        self.root / f"plan-{index}", ("holder",), (
-                            codex_mesh.SwitchingWorker(f"plan-{index}-test", mid_turn),))
-                        for index, mid_turn in enumerate(mid_turns))
-                    with (patch.object(roster, "roster", return_value=roster.Roster([holder], [])),
-                          patch.object(roster, "machine_name", return_value="here")):
-                        lines = accounts._workers_swap_lines(  # pyright: ignore[reportPrivateUsage]
-                            switches, previous, "codex2", dry_run=dry_run)
-                    self.assertEqual(lines[1:], (
-                        f"  natedev · two-accounts · test-worker → codex2{suffix}",))
-
-    def test_workers_swap_names_launcher_session_and_folds_with_that_sessions_holder_rows(self) -> None:
-        holder = roster.RosterEntry(
-            machine="here", kind="claude", role="unit director", name="director", status="running",
-            reach=roster.Messageable("session:launching-director"), cwd="",
-            showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
-            director=roster.DirectsUnit("two-accounts"), assignment=roster.NotAWorker(),
-            session=roster.ClaudeSession("launching-director"))
-        switches = (
-            codex_mesh.WorkersRunSwitch(self.root / "holderless-run", (), (
-                codex_mesh.SwitchingWorker("plan-a-test", False),),
-                launcher_sessions=("launching-director",)),
-            codex_mesh.WorkersRunSwitch(self.root / "marked-run", ("launching-director",), (
-                codex_mesh.SwitchingWorker("plan-b-test", True, codex_mesh.WorkerMoveResumed()),)),
-            codex_mesh.WorkersRunSwitch(self.root / "unresolved-run", (), (
-                codex_mesh.SwitchingWorker("plan-c-impl", False),)),
-        )
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-                      patch.object(roster, "roster", return_value=roster.Roster([holder], [])),
-                      patch.object(roster, "machine_name", return_value="here")):
-                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, errors), (0, ""))
-                self.assertEqual(output.splitlines()[1:], [
-                    "  natedev · two-accounts · test-worker → codex1 ×2, 1 interrupted and resumed",
-                    "  unknown session (unresolved-run) · impl-worker → codex1",
-                ])
-
-    def test_workers_swap_uses_saved_launcher_session_name_when_roster_cannot_name_it(self) -> None:
-        records = sessions.sessions_dir()
-        records.mkdir(parents=True, exist_ok=True)
-        _ = (records / "321.json").write_text(json.dumps({
-            "pid": 321, "sessionId": "launching-director", "name": "saved launching director",
-            "messagingSocketPath": "", "updatedAt": 10}))
-        switches = (codex_mesh.WorkersRunSwitch(self.root / "holderless-run", (), (
-            codex_mesh.SwitchingWorker("project-impl", False),), launcher_sessions=("launching-director",)),)
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                previous, _ = self.workers_fixture()
-                with patch.object(roster, "roster", return_value=roster.Roster([], [])):
-                    lines = accounts._workers_swap_lines(  # pyright: ignore[reportPrivateUsage]
-                        switches, previous, "codex1", dry_run=dry_run)
-                self.assertEqual(lines[1:], ("  saved launching director · impl-worker → codex1",))
-
-    def test_workers_swap_prints_ended_server_totals_and_each_busy_reason_in_both_modes(self) -> None:
-        run = self.root / "ended-run"
-        reason = "a conversation is not idle: unread-worker: ThreadLive"
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                before = self.role_files()
-                switches = (codex_mesh.WorkersRunSwitch(run, (), (), leftover_servers=3,
-                    stopped_servers=0 if dry_run else 1, kept_servers=(
-                        codex_mesh.KeptWorkersServer(101, 4001, reason),
-                        codex_mesh.KeptWorkersServer(102, 4002, "1 client connection(s) on its port"))),)
-                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-                      patch.object(roster, "roster", side_effect=AssertionError("ended runs need no worker roster"))):
-                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, errors), (0, ""))
-                summary = ("3 leftover servers from ended sessions: 1 can be stopped, 2 would stay" if dry_run
-                           else "3 leftover servers from ended sessions, 1 stopped")
-                prefix = "would stay" if dry_run else "left running"
-                self.assertEqual(output.splitlines()[1:], [summary,
-                    f"{prefix}: 101 on port 4001 ({run}): {reason}",
-                    f"{prefix}: 102 on port 4002 ({run}): 1 client connection(s) on its port"])
-                self.assertNotIn("unknown session", output)
-                if dry_run:
-                    self.assertEqual(self.role_files(), before)
-
-    def test_workers_swap_uses_saved_holder_name_when_roster_cannot_list_it(self) -> None:
-        records = sessions.sessions_dir()
-        records.mkdir(parents=True, exist_ok=True)
-        _ = (records / "321.json").write_text(json.dumps({
-            "pid": 321, "sessionId": "missing-holder", "name": "saved director",
-            "messagingSocketPath": "", "updatedAt": 10}))
-        switches = (codex_mesh.WorkersRunSwitch(self.root / "private-run", ("missing-holder",), (
-            codex_mesh.SwitchingWorker("project-impl", False),)),)
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                with (patch.object(roster, "roster", return_value=roster.Roster([], [])),
-                      patch.object(codex_mesh, "retire_workers_servers", return_value=switches)):
-                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, errors), (0, ""))
-                self.assertEqual(output.splitlines()[1:], ["  saved director · impl-worker → codex1"])
-                self.assertNotIn("private-run", output)
+        stop.assert_not_called()
 
     def test_numbered_workers_target_selects_the_login_in_the_home_directory(self) -> None:
         default, _ = self.workers_fixture()
@@ -6540,12 +6348,13 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         report.email = "default@example.invalid"
         report.source = agent_accounts.CodexHomeSource(default)
         before = self.role_files()
-        with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
+        worker = self.workers_member()
+        with patch.object(stop_resume, "stop") as stop:
             code, stdout, stderr = self.run_cli("swap", "workers", "codex2", "--dry-run")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertEqual(stdout, "Workers would move codex1 → codex2:\n")
+        self.assertEqual(stdout, f"{worker.name} ({worker.id}): would stop; restart on codex2 stays pending\n")
         self.assertEqual(self.role_files(), before)
-        retire.assert_called_once_with(default, "codex2", dry_run=True)
+        stop.assert_not_called()
         self.assertEqual(self.run_cli("set-role", "workers", "codex2"), (0, "", ""))
         self.assertEqual(agent_accounts.workers_home(), default)
         self.assertEqual(self.run_cli("role", "workers"), (0, "codex2\n", ""))
@@ -6560,28 +6369,33 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         report.quotas = [agent_accounts.Quota("Weekly", 100, datetime.now(timezone.utc) + timedelta(days=1))]
         report.credit_balance = "6370"
         before = self.role_files()
-        with patch.object(codex_mesh, "retire_workers_servers") as retire:
+        with patch.object(stop_resume, "stop") as stop:
             code, stdout, stderr = self.run_cli("swap", "workers", "codex1")
         self.assertNotEqual(code, 0)
         self.assertIn("is used up and set not to use credits; choose another account or wait for reset", stdout + stderr)
         self.assertIn("codex1 (~/.codex1)", stdout + stderr)
         self.assertEqual(self.role_files(), before)
         self.assertEqual(target, self.home / ".codex1")
-        retire.assert_not_called()
+        stop.assert_not_called()
 
-    def test_workers_swap_writes_role_before_retiring_servers(self) -> None:
+    def test_workers_swap_writes_role_before_stopping_fixed_workers(self) -> None:
         _, target = self.workers_fixture()
+        worker = self.workers_member()
         observed: list[Path] = []
-        def retire(home: Path, label: str, dry_run: bool = False) -> tuple[codex_mesh.WorkersRunSwitch, ...]:
-            self.assertFalse(dry_run)
-            self.assertEqual((home, label), (target, "codex1"))
+
+        def stop(reference: str) -> stop_resume.Stopped:
+            self.assertEqual(reference, worker.id)
             observed.append(agent_accounts.workers_home())
-            return ()
-        with patch.object(codex_mesh, "retire_workers_servers", side_effect=retire):
+            return stop_resume.Stopped(worker.current_session, 987654)
+
+        with patch.object(stop_resume, "stop", side_effect=stop):
             result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-        self.assertEqual((result, stderr), (0, ""))
+        self.assertEqual((result, stderr), (1, ""))
         self.assertEqual(observed, [target])
-        self.assertEqual(stdout, "Workers moving codex2 → codex1:\n")
+        self.assertEqual(len(stdout.splitlines()), 1)
+        self.assertIn(worker.id, stdout)
+        self.assertIn("pending", stdout)
+        self.assertIn("codex1", stdout)
         self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
 
     def test_workers_swap_accepts_default_real_shared_entries(self) -> None:
@@ -6594,10 +6408,12 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         report = cast(agent_accounts.Report, self.codex_reads.return_value)
         report.email = "default@example.invalid"
         report.source = agent_accounts.CodexHomeSource(default)
-        with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
-            result, _, stderr = self.run_cli("swap", "workers", "codex2")
-        self.assertEqual((result, stderr), (0, ""))
-        retire.assert_called_once_with(default, "codex2", dry_run=False)
+        worker = self.workers_member()
+        with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(worker.current_session, 987654)) as stop:
+            result, output, stderr = self.run_cli("swap", "workers", "codex2")
+        self.assertEqual((result, stderr), (1, ""))
+        self.assertIn("pending", output)
+        stop.assert_called_once_with(worker.id)
         self.assertEqual(self.run_cli("role", "workers"), (0, "codex2\n", ""))
 
     def test_workers_swap_refuses_exhausted_usage(self) -> None:
@@ -6608,7 +6424,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             agent_accounts.Report("Codex", email="target@example.invalid", five_hour=agent_accounts.Quota("5-hour", 100, now + timedelta(hours=1)),
                 quotas=[agent_accounts.Quota("Weekly", 20, now + timedelta(days=1))], credit_balance="0"),
         ):
-            with self.subTest(report=report), patch.object(codex_mesh, "retire_workers_servers") as retire:
+            with self.subTest(report=report), patch.object(stop_resume, "stop") as stop:
                 report.source = agent_accounts.CodexHomeSource(target)
                 self.codex_reads.return_value = report
                 result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
@@ -6616,7 +6432,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertIn("codex1", stdout + stderr)
                 self.assertIn("~/.codex1", stdout + stderr)
                 self.assertEqual(self.role_files(), before)
-                retire.assert_not_called()
+                stop.assert_not_called()
 
     def test_workers_swap_accepts_credits_when_a_window_is_used_up(self) -> None:
         _ = self.workers_fixture()
@@ -6636,14 +6452,13 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         for report in reports:
             report.source = agent_accounts.CodexHomeSource(target)
             self.codex_reads.return_value = report
-            with self.subTest(report=report), patch.object(codex_mesh, "retire_workers_servers", return_value=()) as retire:
+            with self.subTest(report=report):
                 result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
             self.assertEqual(result, 0)
             self.assertEqual(len(stderr.splitlines()), 1)
             self.assertIn("accounts: anomaly: codex1 (~/.codex1):", stderr)
-            self.assertIn("Workers moving", stdout)
+            self.assertEqual(stdout, "\n")
             self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
-            retire.assert_called_once_with(target, "codex1", dry_run=False)
 
     def test_codex_log_directory_is_own_state(self) -> None:
         _, target = self.workers_fixture()

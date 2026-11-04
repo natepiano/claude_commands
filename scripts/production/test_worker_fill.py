@@ -2,16 +2,61 @@
 from __future__ import annotations
 
 import io
+import json
 import os
+import sys
 from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from scripts.production import staff, worker_fill
-from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, production_membership, unit_membership, showrunner_relationship
+from scripts.production import staff, worker_admission, worker_fill
+from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, production_membership, unit_membership, showrunner_relationship, transcript_fixture
 
 
 class WorkerFillTests(StaffTestCase):
+    def test_uncertain_claude_dispatch_requires_readable_evidence_before_resending(self) -> None:
+        _, unit, row = self.tree()
+        launcher = self.root / "fixture_launcher.py"
+        _ = launcher.write_text('''import os, socket, sys
+from pathlib import Path
+with socket.socket(fileno=int(os.environ["WORKER_SWITCH_FD"])) as channel:
+    channel.sendall((sys.argv[-2] + "\\n").encode())
+    with channel.makefile("rb") as control:
+        assert control.readline() == b"published\\n"
+    with Path(sys.argv[-1]).open("a") as sent:
+        sent.write("assignment dispatched\\n")
+    channel.sendall(b"dispatched\\n")
+''')
+        for case, torn, matching, resend in (("matched", True, True, False),
+                                             ("unknown", True, False, False),
+                                             ("absent", False, False, True)):
+            with self.subTest(case=case):
+                run = self.root / case
+                run.mkdir()
+                prompt = run / "prompt.md"
+                _ = prompt.write_text("Complete the private assignment.")
+                source = transcript_fixture(row, staff.ClaudeBackend())[0]
+                text = prompt.read_text() if matching else "An unrelated assignment."
+                _ = source.write_text(('{"torn":\n' if torn else "") + json.dumps({
+                    "type": "user", "message": {"role": "user", "content": text}}) + "\n")
+                _ = (run / f"{row.id}.handoff.md").write_text(f"Full source transcript: {source}\n")
+                allowed = worker_admission.WorkerStartAllowed(row.name, unit.id, run,
+                    worker_admission.ExistingWorkerSlot(row))
+                worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), "sending")
+                sent = run / "dispatched.txt"
+                _ = sent.write_text("")
+                before = self.staff_file.read_bytes(), source.read_bytes()
+                command = [sys.executable, str(launcher), row.current_session, str(sent)]
+                if torn and not matching:
+                    with self.assertRaisesRegex(worker_admission.AdmissionRefused, "delivery is unknown"):
+                        _ = worker_fill.launch_claude(row.name, run, "impl", command, prompt, row.id)
+                else:
+                    self.assertEqual(worker_fill.launch_claude(row.name, run, "impl", command, prompt, row.id), 0)
+                self.assertEqual(sent.read_text().splitlines(), ["assignment dispatched"] if resend else [])
+                self.assertEqual((self.staff_file.read_bytes(), source.read_bytes()), before)
+                self.assertEqual(worker_admission.dispatch_record(allowed)["dispatch_state"],
+                                 "sending" if torn and not matching else "accepted")
+
     def recorded_production(self, slug: str, *units: str) -> Path:
         doc = self.production(slug, *units)
         owner = showrunner_relationship(slug)

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+if [[ "${1:-}" != --fixture-environment ]]; then
+    exec env -i PATH="$PATH" bash "$0" --fixture-environment
+fi
+shift
 export MODELS_CONFIG_PUBLISH=0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -313,17 +317,17 @@ chmod +x "$TEST_DIR/bin/claude-bg"
 export TEST_CLAUDE_WORKERS_FLAG_FILE="$TEST_DIR/claude-workers-flag"
 export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000001
 CLAUDE_BIN="$TEST_DIR/bin/claude-bg" AGENT_BG_WORKERS=1 AGENT_BG_DETACH=1 bash "$SCRIPT_DIR/agent_bg.sh" \
-    fixture-worker "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/summary" "$LOG_FILE" "$TEST_DIR/bg-id"
+    --run "$WORKING_DIR" fixture-worker "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/summary" "$LOG_FILE"
 assert_equal "background worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
-assert_equal "background worker did not launch" "abcdef12" "$(cat "$TEST_DIR/bg-id")"
+assert_equal "background worker did not launch" "$FAKE_CLAUDE_SESSION_ID" "$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../production/worker_fill.py" member --run "$WORKING_DIR" --name fixture-worker | cut -d " " -f2)"
 assert_equal "background worker passed its route opt-in to its children" "" "$(cat "$TEST_CLAUDE_WORKERS_FLAG_FILE")"
 
 # A caller's helper does not opt in to the workers route.
 export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000002
 CLAUDE_BIN="$TEST_DIR/bin/claude-bg" AGENT_BG_DETACH=1 env -u AGENT_BG_WORKERS bash "$SCRIPT_DIR/agent_bg.sh" \
-    fixture-friend "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/friend-summary" "$LOG_FILE" "$TEST_DIR/friend-id"
+    --run "$WORKING_DIR" fixture-friend "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/friend-summary" "$LOG_FILE"
 assert_equal "friend took the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
-assert_equal "friend did not launch" "abcdef12" "$(cat "$TEST_DIR/friend-id")"
+assert_equal "friend did not launch" "$FAKE_CLAUDE_SESSION_ID" "$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../production/worker_fill.py" member --run "$WORKING_DIR" --name fixture-friend | cut -d " " -f2)"
 
 # CLI assignments also come from the registry.
 write_test_registry "$MODELS_CONFIG_FILE" --update cli.claude/commit_prep=opus:max

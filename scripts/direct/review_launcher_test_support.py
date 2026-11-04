@@ -202,7 +202,7 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-MODELS_REGISTRY = launcher_registry(("impl",), mesh=True)
+MODELS_REGISTRY = launcher_registry(("impl",))
 
 
 class ReviewLauncherFixture(LauncherFixture):

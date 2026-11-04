@@ -925,9 +925,8 @@ def json_items(value: object, context: str) -> list[object]:
 
 def child_environment(environment: dict[str, str]) -> dict[str, str]:
     """Keep launch proofs and retired identity hints out of child processes."""
-    return {key: value for key, value in environment.items()
-            if not key.startswith("STAFF_ROW_FD_")
-            and key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV, "STAFF_ID")}
+    return {key: value for key, value in staff.child_environment(environment).items()
+            if key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV)}
 
 
 def unmarked_environment() -> dict[str, str]:
