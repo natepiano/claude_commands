@@ -4,6 +4,8 @@
   buildlog query [--json] "<SQL>"   bring the index up to date, run SQL read-only
   buildlog schema                   tables, columns, views and example queries
   buildlog report [YYYY-MM-DD]      one day (default today) as markdown: each kind by caller, then a summary
+  buildlog costs [--days N]          phase time and ranked build costs, read-only
+  buildlog charts [--days 7|30]      open standalone build history charts, read-only
   buildlog moments [YYYY-MM-DD]     before/after build moments, read-only
   buildlog mac-report [--hours N]    Mac test outcomes over the last N hours and three local days
   buildlog reindex                  rebuild the index from the JSON lines
@@ -36,25 +38,6 @@ import time
 from datetime import date
 from pathlib import Path
 from typing import cast
-
-import ci
-import disk
-import index
-import launches
-import mac_report
-import mac_idle
-import memory
-import record
-import report
-import rust_release
-import sample
-import store
-import sync
-import treekey
-import vault_pull
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone_name  # noqa: E402
 
 # Covers shot_report.py's 330 s Mac SSH timeout plus a measured 120-175 s cold local scan and report under load, with room inside the 3,600 s job interval.
 SCREENSHOT_HOURLY_TIMEOUT_SECONDS = 900
@@ -131,6 +114,8 @@ def print_table(names: list[str], rows: list[tuple[object, ...]]) -> None:
 
 
 def query(args: list[str]) -> int:
+    import index
+
     as_json = "--json" in args
     words = [word for word in args if word != "--json"]
     if len(words) != 1:
@@ -164,6 +149,9 @@ def query(args: list[str]) -> int:
 
 
 def schema() -> int:
+    import index
+    import store
+
     print(f"buildlog: records in {store.root()}, index {index.index_path()}")
     print("Times are UTC ISO strings; use date(x, 'localtime') or datetime(x, 'localtime') for local.")
     print(f"Step names: {STEP_NAMES}.")
@@ -186,6 +174,10 @@ def schema() -> int:
 
 
 def day_report(args: list[str]) -> int:
+    import index
+    import launches
+    import report
+
     day = args[0] if args else date.today().isoformat()
     try:
         _ = date.fromisoformat(day)
@@ -204,6 +196,9 @@ def day_report(args: list[str]) -> int:
 
 
 def moments_report(args: list[str]) -> int:
+    import index
+    import report
+
     day = args[0] if args else date.today().isoformat()
     try:
         if len(args) > 1:
@@ -230,6 +225,13 @@ def screenshot_hourly() -> int:
 
 
 def hourly() -> int:
+    import ci
+    import index
+    import rust_release
+    import store
+    import sync
+    import vault_pull
+
     status = 0
     for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
                       ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release)):
@@ -249,6 +251,9 @@ def hourly() -> int:
 
 def run_in_user_zone() -> None:
     """Make the user's zone this process's zone: every printed time and every `localtime` day in the SQL follows it."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+    from user_zone import user_zone_name
+
     os.environ["TZ"] = user_zone_name()
     time.tzset()
 
@@ -262,9 +267,20 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
+    if command == "costs":
+        import costs
+
+        return costs.main(rest)
+    if command == "charts":
+        import charts
+
+        return charts.main(rest)
     if command == "moments":
         return moments_report(rest)
     if command == "usage-hours":
+        import index
+        import report
+
         if len(rest) > 1:
             print("usage: buildlog usage-hours [YYYY-MM-DD]", file=sys.stderr)
             return 2
@@ -282,24 +298,34 @@ def main(argv: list[str]) -> int:
             connection.close()
         return 0
     if command == "mac-report":
+        import mac_report
+
         return mac_report.main(rest)
     if command == "launches":
+        import launches
+
         if rest:
             print("usage: buildlog launches", file=sys.stderr)
             return 2
         print(f"buildlog launches: {launches.collect().summary()}")
         return 0
     if command == "tree-key":
+        import treekey
+
         key = treekey.tree_key(rest[0] if rest else os.getcwd())
         if key is None:
             return 1
         print(key)
         return 0
     if command == "reindex":
+        import index
+
         lines = index.reindex()
         print(f"buildlog reindex: {lines} records indexed in {index.index_path()}")
         return 0
     if command == "sync":
+        import sync
+
         if not rest:
             return sync.sync()
         if rest[0] == "pause" and len(rest) > 1:
@@ -309,13 +335,19 @@ def main(argv: list[str]) -> int:
         print("usage: buildlog sync [pause <why> | resume]", file=sys.stderr)
         return 2
     if command == "ci":
+        import ci
+
         return ci.ci()
     if command == "vault":
+        import vault_pull
+
         if rest:
             print("usage: buildlog vault", file=sys.stderr)
             return 2
         return vault_pull.vault()
     if command == "disk":
+        import disk
+
         try:
             disk.write_snapshot(disk.snapshot())
         except disk.InvalidFloor as error:
@@ -323,6 +355,10 @@ def main(argv: list[str]) -> int:
             return 1
         return 0
     if command == "sample":
+        import sample
+        import memory
+        import mac_idle
+
         if rest:
             print("usage: buildlog sample", file=sys.stderr)
             return 2
@@ -338,16 +374,22 @@ def main(argv: list[str]) -> int:
                 print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
         return 0
     if command == "snapshot":
+        import memory
+
         if rest:
             print("usage: buildlog snapshot", file=sys.stderr)
             return 2
         print(json.dumps(memory.snapshot(), separators=(",", ":")))
         return 0
     if command == "memory":
+        import memory
+
         return memory.memory_command(rest)
     if command == "hourly":
         return hourly()
     if command == "backfill-verify":
+        import record
+
         return record.main(["backfill-verify", *rest])
     print(__doc__, file=sys.stderr)
     return 0 if command in ("-h", "--help", "help") else 2

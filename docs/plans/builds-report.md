@@ -49,6 +49,22 @@ sdlc corrected its rerun figure: 46% → 16% (same folder, next start 0–10 min
 
 Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's number beside it. For phases, use natedev only and say so. The fail-then-fail gap (ours 80 h against 50–55) goes on the report as a note.
 
+2026-11-03 15:3x EST (the user, to report-unit, after an interview)
+
+The build report is too long for the user and is not used for analysis. Retire it. Keep all the data. report-unit's job is now a loop like the test improvement work. Each round has five steps:
+
+1. Rank the largest build cost.
+2. State a prediction.
+3. Fix the cost where it lives.
+4. Measure the result.
+5. Repeat.
+1. Score: phase time, the wall time of each finished phase. Build hours per phase are the second view.
+2. Scope: all build capacity (natedev, the Mac, CI, and the AWS build machine when it opens), every repository and production. Rank by cost only.
+3. Authority: report-unit fixes buildlog code itself and owns every hypothesis and measurement. A fix in another unit's code goes through the showrunner, and that unit edits. Money (AWS hours), machine changes and worker rule changes go to the user first.
+4. Speed: one or two rounds open. A round is measured after at least 10 finished hana phases, plus one more day if the result is not clear. This is a starting point.
+5. Reports: keep the showrunner informed; the showrunner and report-unit agree when the user hears. The user always hears a measured change, up or down.
+6. Later, lower priority: a way to see the build history as charts, not tables.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the build log and its report.
@@ -172,3 +188,49 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - Not added: rates per landed commit. A move of the note to one place per report is not made; the note stays under each table.
 
 **Files:** `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/test_moments.py`.
+
+### Phase 6 — Dylib A/B timing for hana  · status: todo
+**Depends on:** none
+
+2026-11-03 (the user approved, through the builds showrunner): real-use data cannot isolate the Bevy dylib's effect. Time the same hana commit on the same machine with the dylib on and off. Run each side through verify.sh:
+
+1. Run one cold build.
+2. Run three incremental test runs.
+
+The result goes to the showrunner. No repository code changes.
+
+Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases.
+
+### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
+**Depends on:** none (runs beside Phase 6)
+
+#### As-built
+
+- `buildlog costs [--days N]` (`scripts/buildlog/costs.py`) prints one ranked list of build hours lost by machine and cause, as h/day and h/finished phase. Causes: memory wait, cold rebuilds (50+ crates), failed runs, reruns after a pass, cancelled CI, and Mac idle while natedev waits. It runs in 0.45–0.70 s.
+- The machine comes from `steps.target`, else from `record.target_hosts()`. No host list is copied.
+- Mac idle = candidate waits minus Mac execution and complete Mac holds. Holds with no recorded end make the row an upper bound, with its unknown part beside it (`MacIdleEstimate`, `RankedCost.unknown_seconds`).
+- Phase time reads only `phase_finished` events (wall time = finish minus `phase_started_at`). It prints the median and p90 for hana phases and for all phases.
+- `moments.py` holds the shared `window_bounds`, `nextest_outcome`, `previous_nextest` and `nearest_rank`. `number_option.py` parses `--days` and `--hours`. `holds.py` and `mac_outcome.py` import coordination and recorder modules only where a reader needs them.
+- `docs/plans/builds-report-rounds.md` holds the round record, with four round-1 rows.
+- `/build:report` (`commands/build/report.md`) is retired. `buildlog report`, the index and every collector remain.
+
+**Files:** `scripts/buildlog/costs.py`, `scripts/buildlog/number_option.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/holds.py`, `scripts/buildlog/mac_report.py`, `scripts/buildlog/mac_outcome.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `docs/plans/builds-report-rounds.md`.
+
+### Phase 8 — Build history as charts  · status: done
+**Depends on:** Phase 7
+
+The user, 2026-11-03: tables do not work for them. Lower priority. Design a chart view of the build history (costs and phase time over time, each build change marked). Design first; the build waits for the user's go.
+
+Constraints from Phase 7 (the design must answer each one):
+
+1. Buckets: `costs.collect_costs()` pairs reruns and Mac execution only inside one window. One call per bucket loses reruns across a bucket edge and earlier Mac runs that overlap later waits. Pair in one continuous pass, then split into buckets. Name the interval edges and add test fixtures that cross an edge.
+2. Uncertainty: keep the Mac idle upper bound and its unknown part (`MacIdleEstimate`), missing phase times and unavailable per-phase costs visible in each chart. Never show them as zero. Test each state.
+3. Readers: reuse `moments.progress_events()` and the costs readers. Read history once per chart set, read-only. Set a measured speed limit for the full series.
+4. Do not restore `/build:report`.
+
+Design: `docs/plans/builds-report-charts-design.md`. The user, 2026-11-03, relayed by builds: "go" on the browser page. Build it as designed: `buildlog charts`, daily buckets, 7-day default, start-based cost attribution.
+
+### Phase 9 — Round 1: find why natedev rebuilds cold  · status: done
+**Depends on:** Phase 7
+
+Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second largest cost. Find the cause before a fix. Query the index for cold steps: worktree, target folder, and the event before each (new clone, branch switch, toolchain or flag change, sweep deletion). Write the cause with counts and hours to `docs/plans/builds-report-rounds.md`, then send it to the showrunner, which names the owner. No code changes.
