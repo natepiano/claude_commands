@@ -31,7 +31,7 @@ with (root / 'commands').open('a') as log:
 def save(): path.write_text(json.dumps(s))
 def output(value): print(json.dumps(value))
 def versions(command, remote=False):
-    if 'rustc' in command: print('rustc fixture')
+    if 'rustc' in command: print(s.get('local_rustc', 'rustc fixture') if not remote else 'rustc fixture')
     elif 'nextest' in command: print('cargo-nextest fixture\n  release fixture  ' if not s.get('mismatch') or not remote else 'cargo-nextest wrong')
     elif 'mend' in command: print('mend fixture')
     else: raise AssertionError(command)
@@ -152,6 +152,18 @@ class FakeTailnet:
 
 
 @final
+class FakeMonotonicClock:
+    def __init__(self) -> None:
+        self.now: float = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@final
 class BoxTests(unittest.TestCase):
     def __init__(self, methodName: str = 'runTest') -> None:
         super().__init__(methodName)
@@ -160,7 +172,8 @@ class BoxTests(unittest.TestCase):
         self.directory = Path()
         self.tailnet = FakeTailnet()
         self.starts = 0
-        self.subject = box.BoxSetup(self.settings, self.directory, self.start, admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet)
+        self.monotonic = FakeMonotonicClock()
+        self.subject = box.BoxSetup(self.settings, self.directory, self.start, admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet, monotonic=self.monotonic, pause=self.monotonic.advance)
 
     @override
     def setUp(self) -> None:
@@ -195,12 +208,13 @@ class BoxTests(unittest.TestCase):
                    'desired': SYSTEM})
         self.tailnet = FakeTailnet()
         self.starts = 0
-        self.subject = box.BoxSetup(self.settings, self.directory, self.start, admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet)
+        self.monotonic = FakeMonotonicClock()
+        self.subject = box.BoxSetup(self.settings, self.directory, self.start, admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet, monotonic=self.monotonic, pause=self.monotonic.advance)
 
     def start(self) -> str:
         self.starts += 1
         state = self.live()
-        state['online'] = True
+        state.update(online=True, ec2='running', observations=0)
         self.save(state)
         return 'running'
 
@@ -306,6 +320,16 @@ class BoxTests(unittest.TestCase):
         self.subject.join()
         self.assertEqual(len(self.tailnet.requests), before)
 
+    def test_stopped_join_proof_cannot_replace_a_missing_saved_node_identity(self) -> None:
+        self.change(joined=True, ec2='stopped')
+        record = {'idle-stop': {'instance_id': 'i-box', 'proved_at': 1}, 'box-join': {'status': 'done'}}
+        _ = (self.directory / 'up.json').write_text(json.dumps(record))
+        self.assertTrue(self.subject.join_present())
+        saved = box.json_record((self.directory / 'deployment.json').read_text())
+        self.assertEqual(saved['tailscale_node_id'], 'node-box')
+        self.assertEqual(saved['tailscale_instance_id'], 'i-box')
+        self.assertTrue(any('send-command' in command for command in self.commands()))
+
     def test_failed_join_revokes_the_key_and_a_retry_joins(self) -> None:
         self.change(join_failure=True)
         with self.assertRaisesRegex(box.BoxRefused, 'SSM join failed'):
@@ -390,15 +414,81 @@ class BoxTests(unittest.TestCase):
         self.assertFalse(self.live().get('forced_stop', False))
         self.assertEqual(mapping(box.json_record((self.directory / 'up.json').read_text())['idle-stop'])['instance_id'], 'i-box')
 
+    def test_idle_stop_starts_a_stopped_instance_before_recording_the_proof(self) -> None:
+        self.change(ec2='stopped', joined=True, online=False, stop_after=3)
+        self.assertFalse(self.subject.idle_stop_present())
+        self.subject.idle_stop()
+        self.assertEqual(self.starts, 1)
+        self.assertEqual(self.live()['ec2'], 'stopped')
+        self.assertTrue(self.subject.idle_stop_present())
+        self.assertFalse(self.live().get('forced_stop', False))
+
+    def test_idle_stop_waits_for_pending_and_health_before_proving_the_stop(self) -> None:
+        with mock.patch.object(box.BoxSetup, '_instance_state', side_effect=['pending', 'running', 'stopped']) as state, \
+             mock.patch.object(box.BoxSetup, '_health', side_effect=[False, True]) as health:
+            self.subject.idle_stop()
+        self.assertEqual(state.call_count, 3)
+        self.assertEqual(health.call_count, 2)
+        self.assertEqual(self.starts, 0)
+        self.assertTrue(self.subject.idle_stop_present())
+
+    def test_idle_stop_waits_for_stopping_before_starting_again(self) -> None:
+        with mock.patch.object(box.BoxSetup, '_instance_state', side_effect=['stopping', 'stopped', 'running', 'stopped']) as state, \
+             mock.patch.object(box.BoxSetup, '_health', return_value=True):
+            self.subject.idle_stop()
+        self.assertEqual(state.call_count, 4)
+        self.assertEqual(self.starts, 1)
+        self.assertTrue(self.subject.idle_stop_present())
+
+    def test_idle_stop_refuses_a_live_claim_before_starting_a_stopped_instance(self) -> None:
+        self.change(ec2='stopped')
+        with mock.patch.object(mac_test, 'live_claims', return_value=('fixture-claim',)):
+            with self.assertRaisesRegex(box.BoxRefused, 'no active AWS claims'):
+                self.subject.idle_stop()
+        self.assertEqual(self.starts, 0)
+        self.assertFalse(self.subject.idle_stop_present())
+
+    def test_idle_stop_stops_its_restart_when_health_fails(self) -> None:
+        self.change(ec2='stopped', self_stop=False)
+        with mock.patch.object(box.BoxSetup, '_health', return_value=False):
+            with self.assertRaisesRegex(box.BoxRefused, 'healthy running box'):
+                self.subject.idle_stop()
+        self.assertEqual(self.starts, 1)
+        self.assertEqual(sum('stop-instances' in command for command in self.commands()), 1)
+        self.assertEqual(self.live()['ec2'], 'stopped')
+        self.assertFalse(self.subject.idle_stop_present())
+
+    def test_idle_stop_stops_its_restart_when_health_wait_is_interrupted(self) -> None:
+        self.change(ec2='stopped', self_stop=False)
+        with mock.patch.object(box.BoxSetup, '_health', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.subject.idle_stop()
+        self.assertEqual(self.starts, 1)
+        self.assertEqual(sum('stop-instances' in command for command in self.commands()), 1)
+        self.assertEqual(self.live()['ec2'], 'stopped')
+        self.assertFalse(self.subject.idle_stop_present())
+
+    def test_idle_stop_health_failure_keeps_an_instance_it_did_not_start(self) -> None:
+        self.change(ec2='running', self_stop=False)
+        with mock.patch.object(box.BoxSetup, '_health', return_value=False):
+            with self.assertRaisesRegex(box.BoxRefused, 'healthy running box'):
+                self.subject.idle_stop()
+        self.assertEqual(self.starts, 0)
+        self.assertFalse(any('stop-instances' in command for command in self.commands()))
+        self.assertEqual(self.live()['ec2'], 'running')
+        self.assertFalse(self.subject.idle_stop_present())
+
     def test_idle_stop_deadline_stops_the_instance_and_refuses_without_a_proof(self) -> None:
         self.change(joined=True, self_stop=False)
         with self.assertRaisesRegex(box.BoxRefused, 'up stopped the instance'):
             self.subject.idle_stop()
         self.assertEqual(self.live()['ec2'], 'stopped')
         self.assertTrue(self.live()['forced_stop'])
+        self.assertGreaterEqual(self.monotonic(), 0.06)
         self.assertFalse(self.subject.idle_stop_present())
-        self.change(ec2='running', self_stop=True, observations=0)
+        self.change(self_stop=True)
         self.subject.idle_stop()
+        self.assertEqual(self.starts, 1)
         self.assertTrue(self.subject.idle_stop_present())
 
     def test_activation_uses_external_state_and_recovers_after_service_failure(self) -> None:
@@ -439,6 +529,36 @@ class BoxTests(unittest.TestCase):
         self.assertIn('test aws-routing-proof --target aws --no-cache', command)
         self.assertIn(str(Path(box.__file__).resolve().parent / 'proof_crate'), command)
         self.assertNotIn('cargo-liner', command)
+
+    def test_stopped_setup_rechecks_changed_system_and_local_versions(self) -> None:
+        self.change(joined=True)
+        self.subject.configure()
+        self.subject.checks()
+        self.subject.idle_stop()
+        self.subject.activate()
+        self.subject.routing_proof()
+        saved = (self.directory / 'up.json').read_bytes()
+        tools = (self.directory / 'box-tools.json').read_bytes()
+        for change in ('system', 'tools'):
+            with self.subTest(change=change):
+                _ = (self.directory / 'up.json').write_bytes(saved)
+                _ = (self.directory / 'box-tools.json').write_bytes(tools)
+                self.change(ec2='stopped', desired=SYSTEM if change == 'tools' else SYSTEM + '-new',
+                            local_rustc='rustc new' if change == 'tools' else 'rustc fixture')
+                subject = box.BoxSetup(self.settings, self.directory, self.start,
+                                       admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet, monotonic=self.monotonic, pause=self.monotonic.advance)
+                if change == 'system':
+                    self.assertFalse(subject.configuration_present())
+                else:
+                    self.assertTrue(subject.configuration_present())
+                    self.assertFalse(subject.checks_present())
+                self.assertFalse(subject.idle_stop_present())
+                self.assertFalse(subject.routing_proof_present())
+        commands = self.commands()
+        self.assertEqual(sum(c[0] == 'nix' and 'eval' in c for c in commands), 3)
+        record = box.json_record((self.directory / 'deployment.json').read_text())
+        self.assertEqual(record['tailscale_node_id'], 'node-box')
+        self.assertEqual(record['tailscale_instance_id'], 'i-box')
 
     def test_replacement_instance_invalidates_both_proofs(self) -> None:
         self.change(joined=True)

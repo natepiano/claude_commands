@@ -521,6 +521,8 @@ Any later deletion requires a separate user decision.
 Run `python3 scripts/aws_target/deploy.py up --approve-resources` at your terminal.
 
 1. Allow `idle_stop_minutes` plus `idle_stop_margin_s` for the idle-stop proof.
+   Without a saved proof, the stage waits for pending or stopping instances to reach a stable state.
+   It starts a stopped instance through the existing spending checks and waits for health.
    The command observes EC2 while the box stops itself.
    Active AWS claims prevent this proof.
    A timeout makes `up` stop the instance and report a refusal.
@@ -584,3 +586,67 @@ Correct any reported failure and repeat the same removal command.
 Do not remove `down.json` to bypass incomplete removal.
 Use the normal `up --approve-resources` command to create the target again.
 Past spending still counts against the same caps.
+
+
+### Deployment ownership and changed setup inputs
+
+Preparation saves a deployment ID in deployment.json.
+The helper records the caller account and region before creating resources.
+A CREATE change set reserves the StackId before the foundation deploy creates resources.
+The helper saves that StackId before resource creation.
+The helper records the scaler resource's IAM name, ARN, and UserId from the verified stack.
+The confirmed Tailscale node ID stays with its instance ID in the deployment record.
+The data volume has a DeploymentId tag.
+A new Budget name includes the deployment ID.
+Migration preserves the existing Budget name.
+The deployment record saves the actual volume ID and Budget name.
+
+Removal checks the saved account, region, and StackId before changing routing or deleting resources.
+Missing or mismatched ownership evidence causes a refusal.
+Removal uses the StackId for every stack mutation.
+Removal deletes only the saved Tailscale node after checking tag:build-aws.
+Removal checks all required saved identities before changing routing or writing `down.json`.
+A missing identity causes a refusal that names `deploy.py up` as the recovery command.
+This refusal leaves `up` available to record the missing identity.
+One exception applies when the box never joined Tailscale.
+The record must have no node ID, and `up.json` must have no successful box-join stage.
+The Tailscale API must list no device with hostname `aws-build` and tag `tag:build-aws`.
+Then removal reports `tailscale-device: no device` and deletes no device.
+Any matching device without a saved node ID causes a refusal before routing changes.
+Removal resolves ScalerUser through the verified stack and checks its saved ARN and UserId before deleting keys.
+Removal requires the saved volume ID and a matching DeploymentId tag.
+Removal uses the saved Budget name after a live check confirms that name.
+Removal never selects a device or resource through a name or tag alone.
+Removal refuses a stale down.json with another deployment ID.
+A completed removal keeps a public down-complete.json receipt for repeated commands.
+The next up creates a new deployment identity.
+A reused volume requires its previous DeploymentId receipt, or no DeploymentId tag.
+The helper verifies the volume and sets its new DeploymentId before attachment.
+
+An interrupted removal can leave a retained volume that continues to incur charges.
+AWS status shows down incomplete, the retained resource IDs, and their daily storage cost.
+It shows the action deploy.py down --approve-destroy.
+The spend ledger keeps counting retained storage during the interruption.
+The helper does not create a background removal job.
+
+The box-configuration proof includes the evaluated desired system path from /etc/nixos.
+The helper evaluates that path once during each up run.
+The box-tools proof includes natedev's normalized tool versions.
+Changed inputs invalidate that stage and every later proof.
+A stopped instance must complete the changed checks before the helper accepts its old proofs.
+
+### Legacy identity migration and reservation recovery
+
+An existing deployment without StackId can migrate through up.
+The helper checks the configured region and the caller account against the live StackId.
+The helper requires a complete stack and the saved physical InstanceId.
+The helper checks the volume, Budget, and scaler identities before it changes state.
+The helper saves these identities and tags the verified volume with DeploymentId.
+The existing Budget name and ExistingDataVolumeId parameter stay the same during the update.
+The box-join stage records the confirmed Tailscale node ID.
+A failed migration check changes no resource or deployment record.
+A missing deletion identity requires deploy.py up before deploy.py down.
+
+Before CREATE, the helper checks identity-<deployment_id> for a previous reservation.
+It verifies the saved DeploymentId and the StackId account before it saves the StackId.
+It resumes the change-set waiter without a second CREATE request.

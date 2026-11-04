@@ -92,7 +92,7 @@ class AwsCli:
                               timeout=self.timeout_s, check=False)
         if result.returncode:
             raise AwsUnavailable(result.stderr.strip() or f'{operation}: failed')
-        if service == 'cloudformation' and operation == 'deploy':
+        if not result.stdout.strip() or service == 'cloudformation' and operation == 'deploy':
             return {}
         raw = cast(object, json.loads(result.stdout))
         if not isinstance(raw, dict):

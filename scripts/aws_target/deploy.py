@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from typing import Literal, cast, final
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -64,7 +65,7 @@ class StageResult:
     reason: str = ''
 
 def deployment_parameters(path: Path, settings: DeploymentSettings, bootstrap_path: Path,
-                          notification: BudgetNotificationAddress) -> dict[str, str]:
+                          notification: BudgetNotificationAddress, deployment_id: str) -> dict[str, str]:
     spending = read_settings(path)
     bootstrap = bootstrap_path.read_text()
     if not bootstrap.startswith('#!'):
@@ -86,6 +87,7 @@ def deployment_parameters(path: Path, settings: DeploymentSettings, bootstrap_pa
         'CostTagValue': spending.cost_explorer_tag_value, 'Bootstrap': bootstrap_payload,
         'ExistingDataVolumeId': settings.existing_data_volume_id,
         'ScalerUserName': settings.scaler_user_name,
+        'DeploymentId': deployment_id,
     }
 
 
@@ -108,6 +110,150 @@ class Deployment:
         self.clock = clock
         self.notify = notify
         self.admin: admin_secrets.AdminSecretSession = admin_secrets.AdminSecretSession(settings_path)
+
+    def _migrate_legacy(self, settings: DeploymentSettings) -> None:
+        saved = deployment_record(self.directory)
+        outputs = ledger.mapping(saved.get('outputs', {}))
+        if saved.get('stack_id') or not outputs.get('InstanceId') or saved.get('stack') != settings.stack_name:
+            return
+        api = self._api(settings)
+        account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
+        if saved.get('region') != settings.region or saved.get('account_id', account) != account:
+            raise DeploymentRefused('legacy deployment account or region differs; restore the matching configuration')
+        stacks = ledger.rows(api.call('describe-stacks', '--stack-name', settings.stack_name, service='cloudformation'), 'Stacks')
+        if len(stacks) != 1 or stacks[0].get('StackStatus') not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE'):
+            raise DeploymentRefused('legacy migration requires one complete stack')
+        stack_id = ledger.text(stacks[0], 'StackId')
+        if not stack_id.startswith(f'arn:aws:cloudformation:{settings.region}:{account}:stack/{settings.stack_name}/'):
+            raise DeploymentRefused('legacy stack account or region differs; restore the matching configuration')
+        def physical(logical: str) -> str:
+            resource = ledger.mapping(api.call('describe-stack-resource', '--stack-name', stack_id,
+                '--logical-resource-id', logical, service='cloudformation').get('StackResourceDetail'))
+            return ledger.text(resource, 'PhysicalResourceId')
+        if physical('Instance') != outputs['InstanceId']:
+            raise DeploymentRefused('legacy InstanceId differs; restore the matching deployment record')
+        live = self._stack(settings)
+        volume_id, budget_name = live.get('DataVolumeId', ''), live.get('BudgetName', '')
+        if not volume_id or not budget_name:
+            raise DeploymentRefused('legacy migration requires the live volume ID and Budget name')
+        if outputs.get('DataVolumeId', volume_id) != volume_id or outputs.get('BudgetName', budget_name) != budget_name:
+            raise DeploymentRefused('legacy resources differ; restore the matching deployment record')
+        volumes = ledger.rows(api.call('describe-volumes', '--volume-ids', volume_id), 'Volumes')
+        if len(volumes) != 1 or volumes[0].get('VolumeId') != volume_id:
+            raise DeploymentRefused('legacy volume identity differs')
+        tags = {ledger.text(row, 'Key'): str(row.get('Value', '')) for row in ledger.rows(volumes[0], 'Tags')}
+        if tags.get('aws:cloudformation:stack-id') != stack_id:
+            raise DeploymentRefused('legacy volume lacks the verified StackId tag')
+        # The immutable StackId keeps a migration retry stable after a lost tagging response.
+        deployment_id = str(saved.get('deployment_id') or sha256(stack_id.encode()).hexdigest()[:32])
+        if tags.get('DeploymentId') and tags['DeploymentId'] != deployment_id:
+            raise DeploymentRefused('legacy volume belongs to another deployment')
+        budget = ledger.mapping(api.call('describe-budget', '--account-id', account,
+            '--budget-name', budget_name, service='budgets').get('Budget'))
+        if budget.get('BudgetName') != budget_name:
+            raise DeploymentRefused('legacy Budget identity differs')
+        name = physical('ScalerUser')
+        user = ledger.mapping(api.call('get-user', '--user-name', name, service='iam').get('User'))
+        scaler = {'name': name, 'arn': ledger.text(user, 'Arn'), 'user_id': ledger.text(user, 'UserId')}
+        if not scaler['arn'].startswith(f'arn:aws:iam::{account}:user/'):
+            raise DeploymentRefused('legacy scaler account differs')
+        _ = api.call('create-tags', '--resources', volume_id, '--tags', 'Key=DeploymentId,Value=' + deployment_id)
+        saved.update(account_id=account, region=settings.region, stack_id=stack_id, deployment_id=deployment_id,
+                     scaler_user=scaler, data_volume_id=volume_id, budget_name=budget_name, preserve_budget_name=True, outputs=live)
+        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+
+    def _deployment_id(self) -> str:
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        self._migrate_legacy(settings)
+        saved = deployment_record(self.directory)
+        if saved.get('stack') and saved['stack'] != settings.stack_name:
+            if not saved.get('replacement_deployment_id'):
+                saved['replacement_deployment_id'] = uuid4().hex
+                write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+            return ledger.text(saved, 'replacement_deployment_id')
+        if not saved.get('deployment_id'):
+            saved.update(deployment_id=uuid4().hex)
+            _ = saved.setdefault('stack', settings.stack_name)
+            _ = saved.setdefault('region', settings.region)
+            _ = saved.setdefault('outputs', {})
+            write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+        return ledger.text(saved, 'deployment_id')
+
+    def _parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress) -> dict[str, str]:
+        deployment_id = self._deployment_id()
+        saved = deployment_record(self.directory)
+        parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification, deployment_id)
+        parameters['BudgetName'] = str(saved.get('budget_name', '')) if saved.get('preserve_budget_name') else ''
+        return parameters
+
+    def _reserve_stack(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
+        api = self._api(settings)
+        self._migrate_legacy(settings)
+        saved = deployment_record(self.directory)
+        account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
+        if saved.get('account_id', account) != account or saved.get('region') != settings.region:
+            raise DeploymentRefused('the deployment account or region differs')
+        stacks: tuple[dict[str, object], ...]
+        try:
+            stacks = ledger.rows(api.call('describe-stacks', '--stack-name', settings.stack_name, service='cloudformation'), 'Stacks')
+        except AwsUnavailable as error:
+            if 'ValidationError' not in str(error) or 'does not exist' not in str(error):
+                raise
+            stacks = ()
+        if stacks and stacks[0].get('StackStatus') != 'REVIEW_IN_PROGRESS':
+            if saved.get('stack_id') != stacks[0].get('StackId'):
+                raise DeploymentRefused('the stack lacks the saved immutable identity')
+            return
+        if stacks and saved.get('stack_id') and saved.get('stack_id') == stacks[0].get('StackId'):
+            return
+        if saved.get('stack') != settings.stack_name:
+            outputs = ledger.mapping(saved.get('outputs', {}))
+            outputs['ExistingDataInput'] = parameters['ExistingDataVolumeId']
+            saved['outputs'] = outputs
+            for key in ('scaler_user', 'stack_id', 'budget_name', 'replacement_deployment_id', 'preserve_budget_name'):
+                _ = saved.pop(key, None)
+        saved.update(account_id=account, region=settings.region, stack=settings.stack_name,
+                     deployment_id=parameters['DeploymentId'])
+        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+        change_name = 'identity-' + parameters['DeploymentId']
+        try:
+            reply = api.call('describe-change-set', '--stack-name', settings.stack_name,
+                             '--change-set-name', change_name, service='cloudformation')
+        except AwsUnavailable as error:
+            if 'does not exist' not in str(error) and 'ChangeSetNotFound' not in str(error):
+                raise
+            reply = {}
+        if reply:
+            values = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue') for row in ledger.rows(reply, 'Parameters')}
+            stack_id = ledger.text(reply, 'StackId')
+            if (values.get('DeploymentId') != parameters['DeploymentId'] or not stack_id.startswith(
+                    f'arn:aws:cloudformation:{settings.region}:{account}:stack/{settings.stack_name}/')):
+                raise DeploymentRefused('the reserved change set differs from the saved deployment identity')
+        else:
+            # A CREATE change set reserves the StackId before any resource can exist.
+            reply = api.call('create-change-set', '--stack-name', settings.stack_name,
+                             '--change-set-name', change_name, '--change-set-type', 'CREATE',
+                             '--template-body', 'file://' + str(self.output / 'template.json'),
+                             '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps([
+                                 {'ParameterKey': key, 'ParameterValue': value} for key, value in
+                                 {**parameters, 'EnableCompute': 'false'}.items()]), service='cloudformation')
+        saved['stack_id'] = ledger.text(reply, 'StackId')
+        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+        _ = api.call('wait', 'change-set-create-complete', '--stack-name', ledger.text(saved, 'stack_id'),
+                     '--change-set-name', change_name, service='cloudformation')
+
+    def _save_scaler_identity(self, settings: DeploymentSettings) -> None:
+        saved = deployment_record(self.directory)
+        api = self._api(settings)
+        resource = ledger.mapping(api.call('describe-stack-resource', '--stack-name', ledger.text(saved, 'stack_id'),
+                                           '--logical-resource-id', 'ScalerUser', service='cloudformation').get('StackResourceDetail'))
+        name = ledger.text(resource, 'PhysicalResourceId')
+        user = ledger.mapping(api.call('get-user', '--user-name', name, service='iam').get('User'))
+        identity = {'name': name, 'arn': ledger.text(user, 'Arn'), 'user_id': ledger.text(user, 'UserId')}
+        if saved.get('scaler_user', identity) != identity:
+            raise DeploymentRefused('the scaler IAM identity differs from the deployment record')
+        saved['scaler_user'] = identity
+        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
 
     def _guard(self) -> ledger.SpendingAllowed:
         decision = ledger.spending_guard(self.settings_path, self.directory, 'deployment',
@@ -158,6 +304,8 @@ class Deployment:
         path = self.directory / 'deployment.json'
         if path.exists():
             saved = remote.read_record(path)
+            if not ledger.mapping(saved.get('outputs', {})).get('InstanceId'):
+                return
             if saved.get('region') != settings.region:
                 raise DeploymentRefused('preserve the region of the saved deployment')
             outputs = ledger.mapping(saved.get('outputs'))
@@ -184,7 +332,7 @@ class Deployment:
         if stack.get('ComputeEnabled') != 'true' or not stack.get('InstanceId') or not stack.get('DataVolumeId'):
             raise DeploymentRefused('resource identities are missing; reconcile the stack before retry')
         write_text_atomic(self.directory / 'deployment.json', json.dumps({
-            'stack': request.stack, 'region': request.region, 'at': int(self.clock()), 'outputs': stack,
+            **deployment_record(self.directory), 'stack': request.stack, 'region': request.region, 'at': int(self.clock()), 'outputs': stack,
         }, sort_keys=True) + '\n')
         observation = self._observe(requested, stack['InstanceId'], confirms_transition=True)
         previous_instances = {r.resolution.instance_id for r in book.read_snapshot().compute_requests
@@ -199,7 +347,7 @@ class Deployment:
         settings = read_deployment_settings(self.settings_path, self.directory)
         if refresh:
             self._refresh_observation(settings)
-        parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification)
+        parameters = self._parameters(settings, notification)
         self._before_request(settings, parameters)
         return settings, parameters
 
@@ -214,7 +362,7 @@ class Deployment:
             now = int(self.clock())
             price_at, price = deployment_price(self.settings_path, now)
             notification = read_budget_notification_address(self.settings_path)
-            parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification)
+            parameters = self._parameters(settings, notification)
             spending = read_settings(self.settings_path)
             book = ledger.CostLedger(self.directory)
             state = book.read_snapshot() if book.path.exists() else ledger.LedgerEvidence()
@@ -249,6 +397,10 @@ class Deployment:
         if len(stacks) != 1:
             raise DeploymentRefused('expected one stack')
         stack = stacks[0]
+        saved = deployment_record(self.directory)
+        if (saved.get('stack_id') and saved.get('stack') == settings.stack_name
+                and stack.get('StackId') != saved['stack_id']):
+            raise DeploymentRefused('the live StackId differs from the deployment record')
         status = ledger.text(stack, 'StackStatus')
         if status == 'REVIEW_IN_PROGRESS':
             return {}
@@ -296,7 +448,33 @@ class Deployment:
                     or tags.get(parameters['CostTagKey']) != parameters['CostTagValue']):
                 raise DeploymentRefused('the retained volume must match its instance, encryption, tags and selected zone')
 
+    def _adopt_volume(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
+        volume_id = settings.existing_data_volume_id
+        if not volume_id:
+            return
+        api = self._api(settings)
+        volumes = ledger.rows(api.call('describe-volumes', '--volume-ids', volume_id), 'Volumes')
+        if len(volumes) != 1 or volumes[0].get('VolumeId') != volume_id:
+            raise DeploymentRefused('the reused volume identity differs')
+        tags = {ledger.text(row, 'Key'): str(row.get('Value', '')) for row in ledger.rows(volumes[0], 'Tags')}
+        owner = tags.get('DeploymentId', '')
+        if owner and owner != parameters['DeploymentId']:
+            receipt = self.directory / 'down-complete.json'
+            previous = remote.read_record(receipt) if receipt.exists() else {}
+            if previous.get('deployment_id') != owner or previous.get('data_volume_id') != volume_id:
+                raise DeploymentRefused('the reused volume owner has no matching down-complete receipt')
+        if owner != parameters['DeploymentId']:
+            _ = api.call('create-tags', '--resources', volume_id,
+                         '--tags', 'Key=DeploymentId,Value=' + parameters['DeploymentId'])
+        saved = deployment_record(self.directory)
+        saved['data_volume_id'] = volume_id
+        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+
     def _deploy(self, settings: DeploymentSettings, parameters: dict[str, str], *, compute: bool) -> None:
+        self._before_request(settings, parameters)
+        self._adopt_volume(settings, parameters)
+        self._reserve_stack(settings, parameters)
+        self._confirm_preparation(settings, parameters, renew=True)
         self._before_request(settings, parameters)
         if compute:
             ledger.CostLedger(self.directory).record_compute_request(
@@ -307,11 +485,19 @@ class Deployment:
             '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset',
             '--parameter-overrides', *[f'{key}={value}' for key, value in parameters.items()],
             f'EnableCompute={str(compute).lower()}', service='cloudformation')
+        self._save_scaler_identity(settings)
+        outputs = self._stack(settings)
+        saved = deployment_record(self.directory)
+        if outputs.get('DataVolumeId'):
+            saved['data_volume_id'] = outputs['DataVolumeId']
+        if outputs.get('BudgetName'):
+            saved['budget_name'] = outputs['BudgetName']
+        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
 
     def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], *, renew: bool = False) -> None:
         current = read_deployment_settings(self.settings_path, self.directory)
         notification = BudgetNotificationAddress(parameters['NotificationEmail'])
-        current_parameters = deployment_parameters(self.settings_path, current, self.output / 'bootstrap.sh', notification)
+        current_parameters = self._parameters(current, notification)
         preflight = remote.read_record(self.output / 'preflight.json')
         at = ledger.instant(preflight, 'at')
         template = TEMPLATE.read_bytes()
@@ -386,7 +572,7 @@ class Deployment:
             settings, parameters = self._load(read_budget_notification_address(self.settings_path), refresh=True)
             stack = self._stack(settings)
             previous_path = self.directory / 'deployment.json'
-            if previous_path.exists():
+            if previous_path.exists() and ledger.mapping(remote.read_record(previous_path).get('outputs', {})):
                 previous = remote.read_record(previous_path)
                 saved = ledger.mapping(previous.get('outputs'))
                 if previous.get('region') != settings.region:
@@ -448,8 +634,13 @@ class Deployment:
 
     def _stacks_present(self) -> bool:
         settings = read_deployment_settings(self.settings_path, self.directory)
+        self._migrate_legacy(settings)
         stack = self._stack(settings)
         saved = deployment_record(self.directory)
+        if saved.get('account_id'):
+            account = ledger.text(self._api(settings).call('get-caller-identity', service='sts'), 'Account')
+            if account != saved['account_id']:
+                raise DeploymentRefused('the caller account differs from the deployment record')
         outputs = deployment_outputs(self.directory)
         if not stack or stack.get('ComputeEnabled') != 'true' or not outputs:
             return False
@@ -459,8 +650,7 @@ class Deployment:
             return False
         if ledger.CostLedger(self.directory).pending_compute_requests():
             return False
-        parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh',
-                                           read_budget_notification_address(self.settings_path))
+        parameters = self._parameters(settings, read_budget_notification_address(self.settings_path))
         return saved.get('fingerprint') == fingerprint(settings, parameters, TEMPLATE.read_bytes())
 
     def _apply_stacks(self) -> None:

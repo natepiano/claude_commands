@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 import base64
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import partial
 import gzip
 from io import BytesIO, StringIO
 import json
@@ -26,7 +27,7 @@ from scripts.aws_target import admin_secrets, aws_target, box, config as aws_con
 from scripts.aws_target.config import read_control_settings
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.measurement_test_support import DAY, narrow
-from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeTailnet
+from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeMonotonicClock, FakeTailnet
 from scripts.buildlog import sync
 from scripts.lib import conf
 from scripts.mac_test import mac_test
@@ -74,6 +75,31 @@ if service == 'sts' and operation == 'get-caller-identity':
         print('The profile is not ready', file=sys.stderr)
         sys.exit(1)
     reply({'Arn': 'arn:aws:iam::123456789012:user/build-scaler'})
+elif service == 'iam' and operation == 'get-user':
+    if (root / 'deleted-stack').exists():
+        print('NoSuchEntity', file=sys.stderr); sys.exit(1)
+    user = args[args.index('--user-name') + 1]
+    reply({'User': {'Arn': 'arn:aws:iam::123456789012:user/' + user, 'UserId': 'user-fixture'}})
+elif service == 'cloudformation' and operation == 'describe-stack-resource':
+    logical = args[args.index('--logical-resource-id') + 1]
+    reply({'StackResourceDetail': {'PhysicalResourceId': state['outputs']['InstanceId'] if logical == 'Instance' else 'build-scaler'}})
+elif service == 'cloudformation' and operation == 'wait':
+    reply({})
+elif service == 'cloudformation' and operation == 'describe-change-set':
+    change = root / 'change-set.json'
+    if not change.exists():
+        print('ChangeSetNotFound: does not exist', file=sys.stderr); sys.exit(1)
+    reply(json.loads(change.read_text()))
+elif service == 'cloudformation' and operation == 'create-change-set':
+    name = args[args.index('--stack-name') + 1]
+    stack_id = 'arn:aws:cloudformation:us-east-1:123456789012:stack/' + name + '/fixture-id'
+    (root / 'reserved-stack').write_text(stack_id)
+    change = root / 'change-set.json'
+    assert not change.exists(), 'duplicate change-set name'
+    change.write_text(json.dumps({'StackId': stack_id, 'Parameters': json.loads(args[args.index('--parameters') + 1])}))
+    if (root / 'lose-create-reply').exists():
+        print('lost CREATE response', file=sys.stderr); sys.exit(1)
+    reply({'StackId': stack_id})
 elif service == 'iam' and operation == 'create-access-key':
     keys.append('new-key')
     keys_path.write_text(json.dumps(keys))
@@ -87,13 +113,13 @@ elif service == 'iam' and operation == 'delete-access-key':
     keys_path.write_text(json.dumps(keys))
     reply({})
 elif service == 'cloudformation' and operation == 'describe-stacks':
-    if not state and (root / 'review-stack').exists():
-        reply({'Stacks': [{'StackStatus': 'REVIEW_IN_PROGRESS'}]})
+    if not state and ((root / 'review-stack').exists() or (root / 'change-set.json').exists()):
+        reply({'Stacks': [{'StackStatus': 'REVIEW_IN_PROGRESS', 'StackId': (root / 'reserved-stack').read_text() if (root / 'reserved-stack').exists() else ''}]})
         sys.exit(0)
-    if not state or state.get('stack_name') != args[args.index('--stack-name') + 1]:
+    if not state or args[args.index('--stack-name') + 1] not in (state.get('stack_name'), state.get('stack_id')):
         print('ValidationError: Stack does not exist', file=sys.stderr)
         sys.exit(1)
-    reply({'Stacks': [{'StackStatus': state.get('status', 'UPDATE_COMPLETE'),
+    reply({'Stacks': [{'StackId': state.get('stack_id'), 'StackStatus': state.get('status', 'UPDATE_COMPLETE'),
         'Parameters': [{'ParameterKey': k} for k in ('EnableCompute', 'NotificationEmail', 'ExistingDataVolumeId')], 'Outputs': [
         {'OutputKey': key, 'OutputValue': value} for key, value in state['outputs'].items()]}]})
 elif service == 'cloudformation' and operation == 'update-stack':
@@ -112,15 +138,22 @@ elif service == 'cloudformation' and operation == 'deploy':
         sys.exit(1)
     start = args.index('--parameter-overrides') + 1
     params = dict(word.split('=', 1) for word in args[start:] if '=' in word)
-    outputs = {'ComputeEnabled': params['EnableCompute'], 'BudgetName': 'fixture-monthly',
+    outputs = {'ComputeEnabled': params['EnableCompute'], 'BudgetName': params['BudgetName'] or args[args.index('--stack-name') + 1] + '-monthly-' + params['DeploymentId'],
                'ExistingDataInput': params['ExistingDataVolumeId']}
     if params['EnableCompute'] == 'true':
         outputs.update(InstanceId='i-fixture', DataVolumeId=params['ExistingDataVolumeId'] or 'vol-created')
-    state = {'outputs': outputs, 'stack_name': args[args.index('--stack-name') + 1]}
+    owner = json.loads((root / 'state/deployment.json').read_text())
+    assert owner['account_id'] == '123456789012'
+    assert owner['stack_id'] == (root / 'reserved-stack').read_text()
+    assert owner['deployment_id'] == params['DeploymentId']
+    state = {'outputs': outputs, 'stack_name': args[args.index('--stack-name') + 1], 'stack_id': owner['stack_id']}
     (root / 'deleted-stack').unlink(missing_ok=True)
     (root / 'deleted-volume').unlink(missing_ok=True)
     (root / 'deleted-budget').unlink(missing_ok=True)
     state_path.write_text(json.dumps(state))
+    (root / 'change-set.json').unlink(missing_ok=True)
+    if params['EnableCompute'] == 'true' and not params['ExistingDataVolumeId']:
+        (root / 'volume-owner').write_text(params['DeploymentId'])
     if params['EnableCompute'] == 'false' and (root / 'slow-foundation').exists():
         (root / 'clock').write_text(str(clock + 301))
     reply({})
@@ -129,19 +162,23 @@ elif operation == 'describe-images':
                        'State': 'available', 'Name': 'nixos-26.05-x86_64', 'RootDeviceName': '/dev/xvda'}]})
 elif operation == 'describe-subnets':
     reply({'Subnets': [{'VpcId': 'vpc-fixture', 'AvailabilityZone': 'us-east-1a'}]})
+elif operation == 'create-tags':
+    (root / 'volume-owner').write_text(args[args.index('--tags') + 1].split('Value=', 1)[1]); reply({})
 elif operation == 'describe-volumes':
     if (root / 'deleted-volume').exists():
         print('InvalidVolume.NotFound', file=sys.stderr); sys.exit(1)
     reply({'Volumes': [{'AvailabilityZone': 'us-east-1a', 'Encrypted': True, 'State': 'available',
-                        'VolumeId': 'vol-created', 'Attachments': [],
+                        'VolumeId': args[args.index('--volume-ids') + 1], 'Attachments': [],
                         'Size': 500, 'VolumeType': 'gp3', 'Iops': 6000, 'Throughput': 500,
-                        'Tags': [{'Key': 'Project', 'Value': 'fixture-build'}]}]})
+                        'Tags': [{'Key': 'Project', 'Value': 'fixture-build'},
+                                 {'Key': 'DeploymentId', 'Value': (root / 'volume-owner').read_text() if (root / 'volume-owner').exists() else ''},
+                                 {'Key': 'aws:cloudformation:stack-id', 'Value': (root / 'reserved-stack').read_text() if (root / 'reserved-stack').exists() else ''}]}]})
 elif operation == 'delete-volume':
     (root / 'deleted-volume').touch(); reply({})
 elif service == 'budgets' and operation == 'describe-budget':
     if (root / 'deleted-budget').exists():
         print('NotFoundException', file=sys.stderr); sys.exit(1)
-    reply({'Budget': {'BudgetName': 'fixture-monthly'}})
+    reply({'Budget': {'BudgetName': args[args.index('--budget-name') + 1]}})
 elif service == 'budgets' and operation == 'delete-budget':
     (root / 'deleted-budget').touch(); reply({})
 elif operation == 'describe-instances':
@@ -152,11 +189,21 @@ elif operation == 'describe-instances':
         live_path = root / 'live.json'
         live = json.loads(live_path.read_text())
         live['observations'] = live.get('observations', 0) + 1
-        if live['observations'] >= 3: live['ec2'] = 'stopped'
+        if live['observations'] >= live.get('stop_after', 3): live['ec2'] = 'stopped'
         live_path.write_text(json.dumps(live))
         state['instance_state'] = live['ec2']
     reply({'Reservations': [{'Instances': [{'InstanceId': 'i-fixture', 'LaunchTime': 'fixture-boot',
                                             'State': {'Name': state.get('instance_state', 'stopped')}}]}]})
+elif operation == 'stop-instances':
+    assert args[args.index('--instance-ids') + 1] == state['outputs']['InstanceId']
+    state['instance_state'] = 'stopped'
+    state_path.write_text(json.dumps(state))
+    if os.environ.get('BOX_FIXTURE'):
+        live_path = root / 'live.json'
+        live = json.loads(live_path.read_text())
+        live.update(ec2='stopped', forced_stop=True)
+        live_path.write_text(json.dumps(live))
+    reply({'StoppingInstances': [{'InstanceId': 'i-fixture', 'CurrentState': {'Name': 'stopped'}}]})
 elif operation == 'start-instances':
     assert args[args.index('--instance-ids') + 1] == state['outputs']['InstanceId']
     state['instance_state'] = 'pending'
@@ -190,6 +237,7 @@ class DeploymentTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.object(box, 'urlopen', side_effect=AssertionError('tests require a fake tailnet transport'))))
         _ = self.settings.write_text((deploy.TEMPLATE.parents[3] / 'config/aws_target.conf').read_text())
         self.now = int(datetime.fromisoformat(DAY + "T23:59:00+00:00").timestamp())
         self.bundle = self.root / 'bundle'
@@ -334,7 +382,7 @@ class DeploymentTests(CostFixture):
             _ = subject.apply(approve_resources=True)
         book = ledger.CostLedger(self.state)
         self.assertEqual(len(book.pending_compute_requests()), 1)
-        self.assertEqual((self.state / 'deployment.json').exists(), failure == 'instance')
+        self.assertEqual(bool(ledger.mapping(remote.read_record(self.state / 'deployment.json').get('outputs', {}))), failure == 'instance')
         self.set_clock(start + 7200)
         self.assertEqual(self.instance_intervals(self.now), [(start, self.now, Decimal('2'), 0)])
         self.write_price()
@@ -388,6 +436,7 @@ class DeploymentTests(CostFixture):
         subject = self.deployment()
         outputs = subject.apply(approve_resources=True)
         (self.root / 'fake-stack.json').unlink()
+        _ = (self.state / 'down-complete.json').write_text((self.state / 'deployment.json').read_text())
         self.replace('stack_name', 'replacement-build')
         self.replace('existing_data_volume_id', outputs['DataVolumeId'])
         _ = subject.prepare()
@@ -546,7 +595,7 @@ class DeploymentTests(CostFixture):
         self.assertEqual(set(results), {'price', 'bootstrap', 'stacks', 'scaler-key'})
         self.assertTrue(all(ledger.mapping(result)['status'] == 'present' for result in results.values()))
 
-    def removal_fixture(self) -> dict[str, object]:
+    def removal_fixture(self, *, save_node: bool = True) -> dict[str, object]:
         success, output = self.up_output(self.deployment())
         self.assertTrue(success, output)
         self.fake_commands(f'#!{sys.executable}\n' + r'''import json, os, pathlib, sys
@@ -565,6 +614,10 @@ else: raise AssertionError(args)
         (self.root / 'controller-enabled').touch()
         devices: dict[str, object] = {'devices': [{'id': 'device-box', 'hostname': 'aws-build', 'tags': ['tag:build-aws']},
                                                 {'id': 'device-other', 'hostname': 'other', 'tags': []}]}
+        if save_node:
+            saved = remote.read_record(self.state / 'deployment.json')
+            saved.update(tailscale_node_id='device-box', tailscale_instance_id='i-fixture')
+            _ = (self.state / 'deployment.json').write_text(json.dumps(saved))
         policy = FakeTailnet()
         def tailnet(method: str, endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> box.PolicyReply:
             self.assertGreater(timeout, 0)
@@ -576,13 +629,11 @@ else: raise AssertionError(args)
                 return box.PolicyReply({'access_token': 'fixture-token'})
             if method == 'GET' and endpoint == 'tailnet/-/devices':
                 return box.PolicyReply(devices)
-            if method == 'DELETE' and endpoint == 'device/device-box':
-                devices['devices'] = [row for row in ledger.rows(devices, 'devices') if row['id'] != 'device-box']
+            if method == 'DELETE' and endpoint.startswith('device/'):
+                device_id = endpoint.removeprefix('device/')
+                self.assertTrue(any(row['id'] == device_id for row in ledger.rows(devices, 'devices')))
+                devices['devices'] = [row for row in ledger.rows(devices, 'devices') if row['id'] != device_id]
                 return box.PolicyReply({})
-            if endpoint.endswith('/keys') and method == 'POST':
-                existing = ledger.rows(devices, 'devices')
-                name = 'aws-build-1' if any(row['hostname'] == 'aws-build' for row in existing) else 'aws-build'
-                devices['devices'] = [*existing, {'id': 'new-device', 'hostname': name, 'tags': ['tag:build-aws']}]
             if '/acl' in endpoint or '/keys' in endpoint:
                 return policy(method, endpoint, body, headers, timeout)
             raise AssertionError((method, endpoint))
@@ -590,11 +641,125 @@ else: raise AssertionError(args)
         _ = cast(object, self.enterContext(mock.patch.object(mac_test, 'state_paths', return_value=mac_test.StatePaths(self.state, 'aws'))))
         return devices
 
+    def join_fixture(self, devices: dict[str, object], arguments: Sequence[str], key: str,
+                     timeout: float, *, env: dict[str, str]) -> None:
+        box.join_session(arguments, key, timeout, env=env)
+        # Register the node after the join succeeds, using the node ID returned by the SSM fake.
+        existing = ledger.rows(devices, 'devices')
+        if any(row.get('nodeId', row.get('id')) == 'node-box' for row in existing):
+            return
+        name = 'aws-build-1' if any(row['hostname'] == 'aws-build' for row in existing) else 'aws-build'
+        devices['devices'] = [*existing, {'id': 'new-device', 'nodeId': 'node-box',
+                                         'hostname': name, 'tags': ['tag:build-aws']}]
+
     def down_output(self) -> tuple[bool, str]:
         output = StringIO()
         with redirect_stdout(output):
             success = self.deployment().down(approve_destroy=True)
         return success, output.getvalue()
+
+    def test_down_missing_node_refuses_without_changes_then_up_and_down_complete(self) -> None:
+        devices = self.removal_fixture(save_node=False)
+        ledger.rows(devices, 'devices')[0]['nodeId'] = 'node-box'
+        self.set_clock(self.now + 1)
+        fake = BOX_FAKE.replace('i-box', 'i-fixture').replace('volbox', 'volcreated')
+        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'bash')
+        _ = (self.root / 'box-aws').write_text(fake.replace("name = pathlib.Path(sys.argv[0]).name", "name = 'aws'"))
+        _ = (self.root / 'live.json').write_text(json.dumps({'online': True, 'joined': False, 'active': True,
+            'system': SYSTEM, 'desired': SYSTEM, 'ec2': 'running', 'stop_after': 5}))
+        for key, value in (('box_check_delay_s', '0.001'), ('idle_stop_minutes', '0.001'), ('idle_stop_margin_s', '0')):
+            self.replace(key, value)
+        # Advance the fixture clock so a self-stop follows the earlier running observation.
+        def clock() -> int:
+            self.set_clock(self.now + 1)
+            return self.now
+        subject = deploy.Deployment(self.settings, self.state, self.bundle, clock=clock, notify=lambda _event: True)
+        original_setup = box.BoxSetup
+        def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
+                  admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
+            monotonic = FakeMonotonicClock()
+            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request,
+                                  session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
+        with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
+             mock.patch.object(box, 'BoxSetup', side_effect=setup), \
+             mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),)):
+            with mock.patch.object(original_setup, 'join', side_effect=box.BoxRefused('fixture join failure')):
+                success, output = self.up_output(subject, include_box=True)
+            self.assertFalse(success, output)
+            self.assertIn('box-join: refused: fixture join failure', output)
+            self.assertNotIn('tailscale_node_id', remote.read_record(self.state / 'deployment.json'))
+            before = {path: path.read_bytes() for path in self.state.rglob('*') if path.is_file()}
+            commands = len(self.commands())
+            with mock.patch.object(box.Tailnet, 'delete_device') as delete:
+                success, output = self.down_output()
+            self.assertFalse(success, output)
+            self.assertIn('identity: refused: missing saved Tailscale node id; run deploy.py up', output)
+            delete.assert_not_called()
+            self.assertEqual({path: path.read_bytes() for path in self.state.rglob('*') if path.is_file()}, before)
+            self.assertFalse((self.state / 'down.json').exists())
+            self.assertFalse((self.root / 'systemctl-commands').exists())
+            self.assertTrue((self.root / 'controller-enabled').exists())
+            self.assertFalse(any(cast(list[str], row['args'])[5].startswith(('delete-', 'update-'))
+                                 for row in self.commands()[commands:]))
+            success, output = self.up_output(subject, include_box=True)
+            self.assertTrue(success, output)
+            self.assertIn('routing-proof: done', output)
+            self.assertEqual(self.commands('stop-instances'), [])
+            self.assertEqual(remote.read_record(self.state / 'deployment.json')['tailscale_node_id'], 'node-box')
+            self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-box', 'device-other'])
+            success, output = self.down_output()
+            self.assertTrue(success, output)
+        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other'])
+
+    def test_down_never_joined_box_reports_no_device_without_deleting_one(self) -> None:
+        devices = self.removal_fixture(save_node=False)
+        devices['devices'] = [row for row in ledger.rows(devices, 'devices') if row['id'] == 'device-other']
+        stages = remote.read_record(self.state / 'up.json')
+        self.assertNotIn('box-join', stages)
+        self.assertNotIn('tailscale_node_id', remote.read_record(self.state / 'deployment.json'))
+        with mock.patch.object(box.Tailnet, 'delete_device') as delete:
+            success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertIn('tailscale-device: no device', output)
+        delete.assert_not_called()
+        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other'])
+        self.assertFalse((self.state / 'deployment.json').exists())
+
+    def test_down_second_node_identity_check_refuses_without_a_journal(self) -> None:
+        devices = self.removal_fixture(save_node=False)
+        with mock.patch.object(box.Tailnet, 'call', side_effect=[box.PolicyReply({'devices': []}),
+                                                               box.PolicyReply(devices)]) as check, \
+             mock.patch.object(box.Tailnet, 'delete_device') as delete:
+            success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('tailscale-device: refused: missing saved Tailscale node id; run deploy.py up', output)
+        self.assertEqual(check.call_args_list, [mock.call('GET', 'devices'), mock.call('GET', 'devices')])
+        delete.assert_not_called()
+        self.assertFalse((self.state / 'down.json').exists())
+        self.assertTrue((self.state / 'deployment.json').exists())
+        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-box', 'device-other'])
+
+    def test_down_checks_each_required_saved_identity_before_changes(self) -> None:
+        _ = self.removal_fixture()
+        path = self.state / 'deployment.json'
+        original = path.read_text()
+        fields = ('data_volume_id', 'budget_name', 'deployment_id', 'tailscale_instance_id',
+                  'scaler_user', 'name', 'arn', 'user_id')
+        for field in fields:
+            with self.subTest(field=field):
+                saved = ledger.mapping(cast(object, json.loads(original)))
+                parent = ledger.mapping(saved['scaler_user']) if field in ('name', 'arn', 'user_id') else saved
+                del parent[field]
+                _ = path.write_text(json.dumps(saved))
+                before = {file: file.read_bytes() for file in self.state.rglob('*') if file.is_file()}
+                success, output = self.down_output()
+                self.assertFalse(success, output)
+                self.assertIn('identity: refused:', output)
+                self.assertIn('run deploy.py up once to record it', output)
+                self.assertEqual({file: file.read_bytes() for file in self.state.rglob('*') if file.is_file()}, before)
+                self.assertFalse((self.state / 'down.json').exists())
+                self.assertFalse((self.root / 'systemctl-commands').exists())
+        _ = path.write_text(original)
 
     def test_down_dry_run_changes_nothing_and_needs_no_credentials(self) -> None:
         before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
@@ -678,7 +843,8 @@ else: raise AssertionError(args)
         self.assertIn('AWS claims remain live', output)
         self.assertFalse(remote.read_record(self.state / 'routing.json')['enabled'])
         self.assertFalse((self.root / 'controller-enabled').exists())
-        self.assertEqual(len(self.commands()), before)
+        self.assertEqual([cast(list[str], row['args'])[5] for row in self.commands()[before:]],
+                         ['get-caller-identity', 'describe-stacks'])
         success, output = self.down_output()
         self.assertTrue(success, output)
 
@@ -697,7 +863,9 @@ else: raise AssertionError(args)
         original_setup = box.BoxSetup
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
                   admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
-            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request)
+            monotonic = FakeMonotonicClock()
+            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request,
+                                  session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \
              mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),)):
@@ -712,6 +880,10 @@ else: raise AssertionError(args)
         self.assertEqual(sum('EnableCompute=true' in args for args in later), 1)
         self.assertEqual(sum('create-access-key' in args for args in later), 1)
         self.assertEqual([row['hostname'] for row in ledger.rows(devices, 'devices')], ['other', 'aws-build'])
+        self.assertEqual(remote.read_record(self.state / 'deployment.json')['tailscale_node_id'], 'node-box')
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other'])
 
     def test_down_resumes_local_cleanup_without_removing_spending_history(self) -> None:
         devices = self.removal_fixture()
@@ -734,6 +906,210 @@ else: raise AssertionError(args)
         self.assertTrue(success, output)
         self.assertFalse(any(cast(list[str], row['args'])[5].startswith(('delete-', 'update-')) for row in self.commands()[before:]))
         self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'terminated')
+
+    def test_down_verifies_immutable_account_region_and_stack_before_any_change(self) -> None:
+        devices = self.removal_fixture()
+        self.assertIn('devices', devices)
+        path = self.state / 'deployment.json'
+        original = path.read_bytes()
+        saved = remote.read_record(path)
+        for field, value in (('account_id', '999999999999'), ('region', 'us-west-2'),
+                             ('stack_id', 'arn:aws:cloudformation:us-east-1:123456789012:stack/fixture-build/other')):
+            with self.subTest(field=field):
+                _ = path.write_text(json.dumps({**saved, field: value}))
+                files = {p: p.read_bytes() for p in self.state.rglob('*') if p.is_file()}
+                before = len(self.commands())
+                success, output = self.down_output()
+                self.assertFalse(success, output)
+                self.assertIn('identity: refused:', output)
+                self.assertEqual({p: p.read_bytes() for p in self.state.rglob('*') if p.is_file()}, files)
+                self.assertTrue((self.root / 'controller-enabled').exists())
+                self.assertFalse(any(cast(list[str], r['args'])[5].startswith(('delete-', 'update-')) for r in self.commands()[before:]))
+        path.unlink()
+        success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('saved deployment identity', output)
+        _ = path.write_bytes(original)
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        mutations = [cast(list[str], r['args']) for r in self.commands() if cast(list[str], r['args'])[5] in ('update-stack', 'delete-stack')]
+        self.assertTrue(mutations)
+        self.assertTrue(all(args[args.index('--stack-name') + 1] == saved['stack_id'] for args in mutations))
+
+    def test_down_deletes_only_the_saved_node_and_refuses_missing_node_identity(self) -> None:
+        devices = self.removal_fixture()
+        path = self.state / 'deployment.json'
+        saved = remote.read_record(path)
+        del saved['tailscale_node_id']
+        _ = path.write_text(json.dumps(saved))
+        success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('run deploy.py up once to record it', output)
+        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-box', 'device-other'])
+        devices['devices'] = [*ledger.rows(devices, 'devices'), {'id': 'other-box', 'hostname': 'aws-build', 'tags': ['tag:build-aws']}]
+        ledger.rows(devices, 'devices')[0]['nodeId'] = 'node-confirmed'
+        saved.update(tailscale_node_id='node-confirmed', tailscale_instance_id='i-fixture')
+        _ = path.write_text(json.dumps(saved))
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other', 'other-box'])
+
+    def test_down_refuses_a_replaced_scaler_user_before_deleting_keys(self) -> None:
+        devices = self.removal_fixture()
+        self.assertIn('devices', devices)
+        self.replace('scaler_user_name', 'another-user')
+        override = self.root / 'get-user.json'
+        _ = override.write_text(json.dumps({'User': {'Arn': 'arn:aws:iam::123456789012:user/build-scaler', 'UserId': 'recreated-user'}}))
+        before = len(self.commands('delete-access-key'))
+        success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('scaler ARN or UserId differs', output)
+        self.assertEqual(len(self.commands('delete-access-key')), before)
+        override.unlink()
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        args = cast(list[str], self.commands('delete-access-key')[-1]['args'])
+        self.assertEqual(args[args.index('--user-name') + 1], 'build-scaler')
+
+    def test_down_refuses_stale_journals_and_foreign_retained_volume_tags(self) -> None:
+        devices = self.removal_fixture()
+        self.assertIn('devices', devices)
+        saved = remote.read_record(self.state / 'deployment.json')
+        journal = self.state / 'down.json'
+        _ = journal.write_text(json.dumps({**saved, 'deployment_id': '0' * 32}))
+        success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('removal journal differs', output)
+        self.assertTrue((self.root / 'controller-enabled').exists())
+        journal.unlink()
+        override = self.root / 'describe-volumes.json'
+        _ = override.write_text(json.dumps({'Volumes': [{'VolumeId': 'vol-created', 'State': 'available', 'Attachments': [],
+                                                         'Tags': [{'Key': 'DeploymentId', 'Value': 'another-deployment'},
+                                                                  {'Key': 'aws:cloudformation:stack-id', 'Value': saved['stack_id']}]}]}))
+        success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('deployment ownership tag', output)
+        self.assertEqual(self.commands('delete-volume'), [])
+        override.unlink()
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        args = cast(list[str], self.commands('delete-budget')[-1]['args'])
+        self.assertEqual(args[args.index('--budget-name') + 1], 'fixture-build-monthly-' + str(saved['deployment_id']))
+
+    def test_legacy_up_preserves_the_volume_and_budget_then_down_uses_saved_identities(self) -> None:
+        devices = self.removal_fixture()
+        stack_path = self.root / 'fake-stack.json'
+        stack = remote.read_record(stack_path)
+        outputs = ledger.mapping(stack['outputs'])
+        outputs['BudgetName'] = 'fixture-build-monthly'
+        _ = stack_path.write_text(json.dumps(stack))
+        path = self.state / 'deployment.json'
+        _ = path.write_text(json.dumps({'stack': 'fixture-build', 'region': 'us-east-1', 'outputs': outputs}))
+        (self.root / 'volume-owner').unlink()
+        self.set_clock(self.now + 1)
+        before = len(self.commands('deploy'))
+        fake = BOX_FAKE.replace('i-box', 'i-fixture').replace('volbox', 'volcreated')
+        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'bash')
+        _ = (self.root / 'box-aws').write_text(fake.replace("name = pathlib.Path(sys.argv[0]).name", "name = 'aws'"))
+        _ = (self.root / 'live.json').write_text(json.dumps({'online': True, 'joined': True, 'active': True,
+            'system': SYSTEM, 'desired': SYSTEM, 'ec2': 'running', 'stop_after': 5}))
+        for key, value in (('box_check_delay_s', '0.001'), ('idle_stop_minutes', '0.001'), ('idle_stop_margin_s', '0')):
+            self.replace(key, value)
+        original_setup = box.BoxSetup
+        def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
+                  admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
+            monotonic = FakeMonotonicClock()
+            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request,
+                                  monotonic=monotonic, pause=monotonic.advance)
+        with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
+             mock.patch.object(box, 'BoxSetup', side_effect=setup), \
+             mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),)):
+            success, output = self.up_output(self.deployment(), include_box=True)
+        self.assertTrue(success, output)
+        saved = remote.read_record(path)
+        self.assertEqual(saved['data_volume_id'], 'vol-created')
+        self.assertEqual(saved['budget_name'], 'fixture-build-monthly')
+        self.assertEqual((self.root / 'volume-owner').read_text(), saved['deployment_id'])
+        updates = self.commands('deploy')[before:]
+        self.assertEqual(len(updates), 1)
+        arguments = cast(list[str], updates[0]['args'])
+        self.assertIn('BudgetName=fixture-build-monthly', arguments)
+        self.assertIn('ExistingDataVolumeId=', arguments)
+        self.assertNotIn('ExistingDataVolumeId=vol-created', arguments)
+        self.assertIn('EnableCompute=true', arguments)
+        self.assertIn('routing-proof: done', output)
+        node = ledger.text(remote.read_record(path), 'tailscale_node_id')
+        ledger.rows(devices, 'devices')[0]['nodeId'] = node
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        arguments = cast(list[str], self.commands('delete-budget')[-1]['args'])
+        self.assertEqual(arguments[arguments.index('--budget-name') + 1], 'fixture-build-monthly')
+        self.assertEqual([device['id'] for device in ledger.rows(devices, 'devices')], ['device-other'])
+
+    def test_legacy_migration_refuses_a_different_live_instance_without_changes(self) -> None:
+        devices = self.removal_fixture()
+        self.assertIn('devices', devices)
+        path = self.state / 'deployment.json'
+        saved = remote.read_record(path)
+        del saved['stack_id']
+        ledger.mapping(saved['outputs'])['InstanceId'] = 'i-foreign'
+        _ = path.write_text(json.dumps(saved))
+        before = path.read_bytes()
+        requests = len(self.commands())
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'legacy InstanceId differs'):
+            _ = self.deployment().prepare()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(any(cast(list[str], row['args'])[5] in ('create-tags', 'deploy') for row in self.commands()[requests:]))
+
+    def test_lost_create_reply_recovers_the_reserved_change_set_without_a_duplicate(self) -> None:
+        failure = self.root / 'lose-create-reply'
+        failure.touch()
+        success, output = self.up_output(self.deployment())
+        self.assertFalse(success, output)
+        self.assertIn('stacks: refused:', output)
+        self.assertNotIn('stack_id', remote.read_record(self.state / 'deployment.json'))
+        failure.unlink()
+        success, output = self.up_output(self.deployment())
+        self.assertTrue(success, output)
+        self.assertEqual(len(self.commands('create-change-set')), 1)
+        saved = remote.read_record(self.state / 'deployment.json')
+        self.assertEqual(saved['stack_id'], (self.root / 'reserved-stack').read_text())
+
+    def test_reserved_change_set_recovery_refuses_foreign_parameters_or_account(self) -> None:
+        failure = self.root / 'lose-create-reply'
+        failure.touch()
+        success, output = self.up_output(self.deployment())
+        self.assertFalse(success, output)
+        failure.unlink()
+        path = self.root / 'change-set.json'
+        original = remote.read_record(path)
+        for changes in ({'Parameters': [{'ParameterKey': 'DeploymentId', 'ParameterValue': 'f' * 32}]},
+                        {'StackId': str(original['StackId']).replace('123456789012', '999999999999')}):
+            with self.subTest(changes=changes):
+                _ = path.write_text(json.dumps({**original, **changes}))
+                success, output = self.up_output(self.deployment())
+                self.assertFalse(success, output)
+                self.assertIn('reserved change set differs', output)
+                self.assertEqual(len(self.commands('create-change-set')), 1)
+                self.assertEqual(self.commands('deploy'), [])
+
+    def test_reused_volume_requires_a_completed_owner_and_transfers_the_tag(self) -> None:
+        self.replace('existing_data_volume_id', 'vol-retained')
+        _ = (self.root / 'volume-owner').write_text('a' * 32)
+        success, output = self.up_output(self.deployment())
+        self.assertFalse(success, output)
+        self.assertIn('no matching down-complete receipt', output)
+        self.assertEqual(self.commands('create-tags'), [])
+        self.assertEqual(self.commands('create-change-set'), [])
+        _ = (self.state / 'down-complete.json').write_text(json.dumps({
+            'deployment_id': 'a' * 32, 'data_volume_id': 'vol-retained'}))
+        success, output = self.up_output(self.deployment())
+        self.assertTrue(success, output)
+        saved = remote.read_record(self.state / 'deployment.json')
+        self.assertEqual((self.root / 'volume-owner').read_text(), saved['deployment_id'])
+        self.assertEqual(saved['data_volume_id'], 'vol-retained')
+        self.assertEqual(len(self.commands('create-tags')), 1)
+        self.assertIn('ExistingDataVolumeId=vol-retained', cast(list[str], self.commands('deploy')[-1]['args']))
 
     def test_up_retries_failed_compute_without_a_second_foundation(self) -> None:
         failure = self.root / 'fail-compute'
@@ -776,7 +1152,7 @@ else: raise AssertionError(args)
         self.assertNotIn('fixture-secret-only-in-credentials', output)
         self.assertEqual(self.credentials.read_bytes(), before)
         self.assertEqual(json.loads((self.root / 'fake-keys.json').read_text()), ['old-key'])
-        self.assertEqual(len(self.commands('get-caller-identity')), 3)
+        self.assertEqual(sum(cast(list[str], row['args'])[1] == 'build-scaler' for row in self.commands('get-caller-identity')), 3)
         self.assertEqual(len(self.commands('delete-access-key')), 1)
 
     def test_up_refuses_without_approval_before_any_price_or_resource_read(self) -> None:
@@ -1282,6 +1658,7 @@ else: raise AssertionError(args)
         claim = self.state / 'retained-claim.json'
         _ = claim.write_text('keep')
         (self.root / 'fake-stack.json').unlink()
+        _ = (self.state / 'down-complete.json').write_text((self.state / 'deployment.json').read_text())
         self.replace('stack_name', 'replacement-build')
         self.replace('existing_data_volume_id', outputs['DataVolumeId'])
         _ = subject.prepare()
@@ -1352,9 +1729,10 @@ else: raise AssertionError(args)
         subject = self.deployment()
         _ = subject.prepare()
         _ = subject.apply(approve_resources=True)
-        volume = {'AvailabilityZone': 'us-east-1a', 'Encrypted': True, 'State': 'in-use',
+        volume = {'VolumeId': 'vol-retained', 'AvailabilityZone': 'us-east-1a', 'Encrypted': True, 'State': 'in-use',
                   'Size': 500, 'VolumeType': 'gp3', 'Iops': 6000, 'Throughput': 500,
-                  'Tags': [{'Key': 'Project', 'Value': 'fixture-build'}],
+                  'Tags': [{'Key': 'Project', 'Value': 'fixture-build'},
+                                 {'Key': 'DeploymentId', 'Value': ledger.text(remote.read_record(self.state / 'deployment.json'), 'deployment_id')}],
                   'Attachments': [{'InstanceId': 'i-fixture'}]}
         override_path = self.root / 'describe-volumes.json'
         _ = override_path.write_text(json.dumps({'Volumes': [volume]}))
@@ -1848,6 +2226,7 @@ esac
         outputs = subject.apply(approve_resources=True)
         (self.root / 'fake-stack.json').unlink()
         _ = (self.root / 'missing-instance').write_text('deleted')
+        _ = (self.state / 'down-complete.json').write_text((self.state / 'deployment.json').read_text())
         self.replace('stack_name', 'replacement-build')
         self.replace('existing_data_volume_id', outputs['DataVolumeId'])
         self.set_clock(self.now + 600)

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 from http.client import HTTPResponse
+from functools import cached_property
 import selectors
 import shlex
 import subprocess
@@ -18,7 +19,7 @@ from urllib.request import Request, urlopen
 
 from scripts.aws_target import admin_secrets, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
-from scripts.aws_target.config import deployment_outputs, read_deployment_settings
+from scripts.aws_target.config import deployment_outputs, deployment_record, read_deployment_settings
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf
@@ -144,7 +145,8 @@ def join_session(arguments: Sequence[str], key: str, timeout: float, *, env: dic
 class BoxSetup:
     def __init__(self, settings: Path, directory: Path, start: Callable[[], object], *,
                  admin: admin_secrets.AdminSecretSession, execute: AwsExecutor = execute_command, tailnet: TailnetTransport = tailnet_request,
-                 session: JoinSession = join_session, pause: Callable[[float], object] = time.sleep) -> None:
+                 session: JoinSession = join_session, pause: Callable[[float], object] = time.sleep,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
         self.settings = settings
         self.directory = directory
         self.start = start
@@ -153,6 +155,7 @@ class BoxSetup:
         self.tailnet = Tailnet(settings, self.admin, tailnet)
         self.session = session
         self.pause = pause
+        self.monotonic = monotonic
         self.joined: JoinedBox | UnjoinedBox = UnjoinedBox()
 
     def _run(self, arguments: Sequence[str]) -> str:
@@ -277,7 +280,9 @@ class BoxSetup:
             raise BoxRefused('Tailscale policy did not retain the requested rules')
 
     def join_present(self) -> bool:
-        if self._proved_stopped_setup('box-join'):
+        saved = deployment_record(self.directory)
+        if (saved.get('tailscale_node_id') and saved.get('tailscale_instance_id') == self._instance()
+                and self._proved_stopped_setup('box-join')):
             return True
         self.joined = UnjoinedBox()
         if not self.ssm_online():
@@ -294,6 +299,10 @@ class BoxSetup:
         if address not in ipaddress.ip_network('100.64.0.0/10') and address not in ipaddress.ip_network('fd7a:115c:a1e0::/48'):
             raise BoxRefused('SSM returned an address outside Tailscale')
         self.joined = JoinedBox(str(address), ledger.text(state, 'id'))
+        saved = deployment_record(self.directory)
+        if (saved.get('tailscale_node_id'), saved.get('tailscale_instance_id')) != (self.joined.node_id, self._instance()):
+            saved.update(tailscale_node_id=self.joined.node_id, tailscale_instance_id=self._instance())
+            write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
         return True
 
     def join(self) -> None:
@@ -323,6 +332,10 @@ class BoxSetup:
         return self._run(['ssh', *offload.ssh_options(connection), 'natepiano@' + self.joined.address, command])
 
     def _desired_system(self) -> str:
+        return self.desired_system
+
+    @cached_property
+    def desired_system(self) -> str:
         source = Path(conf.read(self.settings).text('nixos_configuration_directory')).expanduser().resolve()
         if self._run(['git', '-C', str(source), 'branch', '--show-current']) != 'main':
             raise BoxRefused('the NixOS source must use main')
@@ -334,11 +347,18 @@ class BoxSetup:
         return result
 
     def configuration_present(self) -> bool:
+        desired = self._desired_system()
+        record = self._stage_record('box-configuration')
+        if record.get('system') != desired:
+            self._invalidate_from('box-configuration')
         if self._proved_stopped_setup('box-configuration'):
             return True
         if not self.join_present():
             return False
-        return self._ssh('readlink -f /run/current-system') == self._desired_system() and self._remote_active()
+        present = self._ssh('readlink -f /run/current-system') == desired and self._remote_active()
+        if present:
+            self._save_proof('box-configuration', system=desired)
+        return present
 
     def _remote_active(self) -> bool:
         try:
@@ -384,6 +404,7 @@ class BoxSetup:
                     except (BoxRefused, OSError, subprocess.SubprocessError):
                         return False
                 self._wait(switched, 'the detached switch did not confirm the system and remote service')
+                self._save_proof('box-configuration', system=desired)
             finally:
                 # A failed reconnect leaves the poweroff timer armed.
                 try:
@@ -425,6 +446,11 @@ class BoxSetup:
         return self._ssh(command) == 'healthy'
 
     def checks_present(self) -> bool:
+        expected = self._versions(on_box=False)
+        path = self.directory / 'box-tools.json'
+        saved = json_record(path.read_text()) if path.exists() else {}
+        if saved.get('instance_id') != self._instance() or saved.get('versions') != expected:
+            self._invalidate_from('checks')
         if self._proved_stopped_setup('checks'):
             return True
         if not self._health():
@@ -439,6 +465,9 @@ class BoxSetup:
 
     def checks(self) -> None:
         if not self._health():
+            _ = self.start()
+            self._wait(self.join_present, 'tool checks require the joined instance')
+        if not self._health():
             raise BoxRefused('box checks require SSM, the expected /home volume, and aws-build-remote')
         expected = self._versions(on_box=False)
         actual = self._versions(on_box=True)
@@ -450,6 +479,23 @@ class BoxSetup:
         write_text_atomic(self.directory / 'box-tools.json', json.dumps({
             'instance_id': self._instance(), 'versions': expected}) + '\n')
 
+
+    def _stage_record(self, stage: str) -> dict[str, object]:
+        path = self.directory / 'up.json'
+        return ledger.mapping(json_record(path.read_text()).get(stage, {})) if path.exists() else {}
+
+    def _invalidate_from(self, stage: str) -> None:
+        stages = ('box-configuration', 'checks', 'idle-stop', 'activation', 'routing-proof')
+        path = self.directory / 'up.json'
+        record = json_record(path.read_text()) if path.exists() else {}
+        invalid = stages[stages.index(stage):]
+        if any(name in record for name in invalid):
+            for name in invalid:
+                if name in record:
+                    del record[name]
+            write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
+        if (self.directory / 'box-tools.json').exists():
+            (self.directory / 'box-tools.json').unlink()
 
     def _proof_present(self, stage: str) -> bool:
         path = self.directory / 'up.json'
@@ -482,30 +528,48 @@ class BoxSetup:
             return
         if mac_test.live_claims(mac_test.state_paths('aws')):
             raise BoxRefused('idle stop requires no active AWS claims')
-        if not self._health():
-            raise BoxRefused('idle stop requires a healthy running box')
-        values = conf.read(self.settings)
-        duration = values.number('idle_stop_minutes') * 60 + values.whole('idle_stop_margin_s')
-        delay = values.number('box_check_delay_s')
-        # Hold controller actions so only the box can satisfy the self-stop proof.
-        with control_lock(self.directory):
-            if self._instance_state() != 'running':
-                raise BoxRefused('idle stop requires a running instance')
-            deadline = time.monotonic() + duration
-            while True:
-                if mac_test.live_claims(mac_test.state_paths('aws')):
-                    raise BoxRefused('idle stop requires no active AWS claims')
+        state = self._instance_state()
+        def stable() -> bool:
+            nonlocal state
+            if state in ('pending', 'stopping'):
                 state = self._instance_state()
-                if state == 'stopped':
-                    self._save_proof('idle-stop')
-                    return
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                _ = self.pause(min(delay, remaining))
-            _ = self._api().call('stop-instances', '--instance-ids', self._instance())
-            self._wait(lambda: self._instance_state() == 'stopped', 'idle stop failed; EC2 stop did not confirm')
-        raise BoxRefused('idle stop exceeded its deadline; up stopped the instance')
+            return state not in ('pending', 'stopping')
+        self._wait(stable, 'idle stop requires a stable instance state')
+        started = state == 'stopped'
+        try:
+            if state == 'stopped':
+                # The start path takes the controller lock and checks spending before the proof begins.
+                _ = self.start()
+                self._wait(lambda: self._instance_state() == 'running', 'idle stop start did not reach running')
+            elif state != 'running':
+                raise BoxRefused(f'idle stop cannot use an instance in state {state}')
+            self._wait(self._health, 'idle stop requires a healthy running box')
+            values = conf.read(self.settings)
+            duration = values.number('idle_stop_minutes') * 60 + values.whole('idle_stop_margin_s')
+            delay = values.number('box_check_delay_s')
+            # Hold controller actions so only the box can satisfy the self-stop proof.
+            with control_lock(self.directory):
+                deadline = self.monotonic() + duration
+                while True:
+                    if mac_test.live_claims(mac_test.state_paths('aws')):
+                        raise BoxRefused('idle stop requires no active AWS claims')
+                    state = self._instance_state()
+                    if state == 'stopped':
+                        self._save_proof('idle-stop')
+                        return
+                    remaining = deadline - self.monotonic()
+                    if remaining <= 0:
+                        break
+                    _ = self.pause(min(delay, remaining))
+                _ = self._api().call('stop-instances', '--instance-ids', self._instance())
+                self._wait(lambda: self._instance_state() == 'stopped', 'idle stop failed; EC2 stop did not confirm')
+            raise BoxRefused('idle stop exceeded its deadline; up stopped the instance')
+        except BaseException:
+            if started and not self.idle_stop_present():
+                # A failed proof must not leave an instance that this stage started running.
+                _ = self._api().call('stop-instances', '--instance-ids', self._instance())
+                self._wait(lambda: self._instance_state() == 'stopped', 'idle stop cleanup did not confirm EC2 stopped')
+            raise
 
     def _routing_path(self) -> Path:
         return target_config.ssh_target_state_directory('aws') / 'routing.json'
