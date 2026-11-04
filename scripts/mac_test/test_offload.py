@@ -562,6 +562,50 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assert_claimed_commands()
 
+    def test_copy_refusal_keeps_rsync_stderr_in_output_and_the_result(self) -> None:
+        self.fixture["rsync_status"] = 23
+        self.sync_fixture()
+        stub = self.bin_directory / "command-stub"
+        source = stub.read_text().replace('    exit "$rsync_status"',
+            "    printf '%s\\n' 'rsync: destination denied' 'rsync error: code 23' >&2\n"
+            + '    exit "$rsync_status"')
+        _ = stub.write_text(source)
+
+        result = self.command()
+
+        self.assert_declined(result, "copy: rsync: rsync: destination denied; rsync error: code 23")
+        self.assert_claimed_commands()
+        self.assertEqual(len(self.events_for("rsync")), 1)
+        self.assertEqual(len(self.events_for("ssh")), 1)
+
+    def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
+        controller = offload.ProcessController()
+        config = offload.read_config(self.config_path)
+        commands: list[list[str]] = []
+
+        def capture(arguments: Sequence[str],
+                    deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT) -> offload.CapturedCommandResult:
+            del deadline
+            argv = list(arguments)
+            commands.append(argv)
+            if argv[0] == "rsync":
+                return offload.CommandOutput(23, "", "rsync: config denied\n")
+            if "ls-files" in argv:
+                return offload.CommandOutput(0, "scripts/mac_test/linux_runner.py\0", "")
+            if "rev-parse" in argv:
+                return offload.CommandOutput(0, "fixture-commit\n", "")
+            return offload.CommandOutput(0, "", "")
+
+        parity: offload.PublicToolParity = {"rustc": "fixture", "nextest": "fixture",
+                                           "mend": "fixture", "scripts_commit": "fixture-commit"}
+        with mock.patch.object(controller, "capture", side_effect=capture), \
+                mock.patch.object(offload, "expected_linux_parity", return_value=parity):
+            copied = offload.copy_tracked_scripts(controller, config)
+
+        self.assertFalse(copied)
+        self.assertEqual(controller.copy_failure_detail, "copy: rsync: rsync: config denied")
+        self.assertEqual(commands[-1][0], "rsync")
+
     def test_each_mac_verb_keeps_arguments_and_names_its_claim(self) -> None:
         self.write_portable_workspace()
         self.config["mac_skip.hana"] = "test(skip-this)"

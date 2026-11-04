@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from typing import final
 
 from scripts.direct.tree_watch_test_support import (
@@ -14,11 +15,38 @@ from scripts.direct.tree_watch_test_support import (
     WATCH_DEADLINE,
     write_workspace as write_workspace,
 )
+from scripts.direct import tree_watch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class TreeWatchTests(TreeWatchFixture):
+    def test_lint_versions_reuse_the_call_reading_and_keep_failed_reads_disabled(self) -> None:
+        saved = self.root / "lint-versions"
+        formatter = self.root / "rustfmt-version"
+        with mock.patch.dict(os.environ, {"VERIFY_LINT_VERSIONS_FILE": str(saved),
+                                         "VERIFY_LINT_RUSTFMT_VERSION_FILE": str(formatter)}):
+            with mock.patch.object(subprocess, "check_output", return_value=b"tool version\n") as probe:
+                first = tree_watch.lint_tool_versions()
+                self.assertEqual(tree_watch.lint_tool_versions(), first)
+                self.assertEqual(probe.call_count, 4)
+                self.assertEqual(formatter.read_bytes(), b"tool version")
+            saved.unlink()
+            with mock.patch.object(subprocess, "check_output", side_effect=OSError("tool missing")) as probe:
+                with self.assertRaises(OSError):
+                    _ = tree_watch.lint_tool_versions()
+                with self.assertRaises(ValueError):
+                    _ = tree_watch.lint_tool_versions()
+                probe.assert_called_once()
+
+    def test_lint_keys_without_result_caching_do_not_probe_versions(self) -> None:
+        import json
+
+        with mock.patch.object(tree_watch, "lint_tool_versions", side_effect=AssertionError("unexpected probe")):
+            key, watched = tree_watch.TreeInputs(["--", "lint"], json.dumps(self.metadata)).keys(lint_versions=False)
+        self.assertRegex(key, r"^[0-9a-f]{64}$")
+        self.assertRegex(watched, r"^[0-9a-f]{64}$")
+
     def test_fired_path_names_the_changed_watched_file(self) -> None:
         process, fired, before = self.start_watcher(os.getpid())
         relative = "sample/src/lib.rs"

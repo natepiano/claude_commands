@@ -136,6 +136,10 @@ if [ "$1 $2" = "nextest run" ] && [ -n "$EDIT_DURING_TEST" ]; then
     printf "// changed during the test run\n" >> "$PACKAGE_ROOT/${EDIT_DURING_TEST_PATH:-src/lib.rs}"
 fi
 case "$1 $2" in
+    "mend --version"|"clippy --version"|"+nightly fmt")
+        case " $* " in *" --version "*) printf 'cargo fixture 1.0\n'; exit 0 ;; esac ;;
+esac
+case "$1 $2" in
     "check --workspace") exit "$FAKE_CHECK_EXIT" ;;
     "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
     *) echo "Unexpected cargo call: $*" >&2; exit 99 ;;

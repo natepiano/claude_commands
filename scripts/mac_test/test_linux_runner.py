@@ -1248,6 +1248,26 @@ class LinuxCopyTests(unittest.TestCase):
     def config(self) -> offload.OffloadConfig:
         return offload.read_config(self.root / "aws.conf")
 
+    def test_first_linux_copy_creates_the_missing_repository_and_slot_directories(self) -> None:
+        _ = self.write_source("src/lib.rs", "first source\n")
+        remote_home = self.root / "remote-home"
+        remote_home.mkdir()
+        ssh = self.root / "ssh"
+        _ = ssh.write_text('#!/bin/bash\nwhile [[ $1 == -o ]]; do shift 2; done\n'
+                           + 'shift\ncd "$TEST_REMOTE_HOME" || exit 1\nexec bash -c "$*"\n')
+        ssh.chmod(0o755)
+        controller = offload.ProcessController()
+        request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), target="aws")
+        identity = offload.KnownRepository("source", "https://example.invalid/team/hana")
+        environment = {**os.environ, "PATH": f"{self.root}:{os.environ['PATH']}",
+                       "TEST_REMOTE_HOME": str(remote_home)}
+        with mock.patch.dict(os.environ, environment):
+            copied = offload.copy_tree_with_key(controller, self.config(), request, identity)
+
+        self.assertIsInstance(copied, offload.CopiedTree, controller.copy_failure_detail)
+        received = remote_home / offload.remote_mirror(identity, "aws", 1) / "src/lib.rs"
+        self.assertEqual(received.read_text(), "first source\n")
+
     def test_second_copy_removes_deleted_files_sends_new_files_and_excludes_ignored_files(self) -> None:
         _ = self.write_source(".gitignore", "private/\n.env\n")
         dropped = self.write_source("tests/b.rs", "old test\n")
