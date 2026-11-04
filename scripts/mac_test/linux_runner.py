@@ -278,6 +278,26 @@ SLOT_PROCESSES_UNRESOLVED = 3
 STARTUP_REFUSAL_RECORD = 'linux_startup=unresolved'
 
 
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """Public process fields that remain readable for non-dumpable processes."""
+
+    real_uid: int
+    parent: int
+    group: int
+    start_time: int
+    state: str
+
+
+def process_identity(pid: int, proc_root: Path) -> ProcessIdentity:
+    fields = process_fields(pid, proc_root)
+    status = (proc_root / str(pid) / 'status').read_text()
+    uid = re.search(r'^Uid:\s+(\d+)\b', status, re.MULTILINE)
+    if uid is None:
+        raise ValueError('process real UID is unavailable')
+    return ProcessIdentity(int(uid[1]), int(fields[1]), int(fields[2]), int(fields[19]), fields[0])
+
+
 def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
                           require_boot_identity: bool = False) -> SlotProcessSelection:
     """Read each ownership source independently before deciding uncertainty."""
@@ -292,37 +312,42 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
     root = mirror.resolve()
     own_pid = os.getpid()
     own_uid = os.getuid()
+    identities: dict[int, ProcessIdentity] = {}
     for process in proc_root.glob('[0-9]*'):
         pid = int(process.name)
         try:
-            # The real UID identifies the user even when proc ownership changes.
-            status = (process / 'status').read_text()
-            uid = re.search(r'^Uid:\s+(\d+)\b', status, re.MULTILINE)
-            if uid is None:
-                raise ValueError('process real UID is unavailable')
-            if int(uid[1]) != own_uid:
-                continue
-            fields = process_fields(pid, proc_root)
+            identities[pid] = process_identity(pid, proc_root)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
             uncertain.add(pid)
-            continue
-        if fields[0] in ('Z', 'X'):
+    # The checking process and its ancestors cannot be leftovers of a lost run.
+    checking_chain: set[int] = set()
+    ancestor = own_pid
+    while ancestor in identities and ancestor not in checking_chain:
+        checking_chain.add(ancestor)
+        ancestor = identities[ancestor].parent
+    for pid, identity in identities.items():
+        if identity.real_uid != own_uid or identity.state in ('Z', 'X'):
             continue
         if not isinstance(lease, UnmarkedSlot):
             if pid == lease['pid']:
-                if (int(fields[19]) != lease['start_time']
-                        or int(fields[2]) != lease['process_group']):
+                if (identity.start_time != lease['start_time']
+                        or identity.group != lease['process_group']):
                     raise ValueError('slot process identity changed')
                 selected.add(pid)
-                parents[pid] = int(fields[1])
+                parents[pid] = identity.parent
                 continue
-            if int(fields[19]) < lease['start_time']:
+            if identity.start_time < lease['start_time']:
                 continue
-        parents[pid] = int(fields[1])
-        if pid == own_pid:
+        if pid in checking_chain:
             continue
+        # Slot children keep their user; only an orphan can acquire a root parent (PID 1).
+        parent = identities.get(identity.parent)
+        if identity.parent != 1 and parent is not None and parent.real_uid != own_uid:
+            continue
+        parents[pid] = identity.parent
+        process = proc_root / str(pid)
         denied = False
         try:
             command = (process / 'cmdline').read_bytes().split(b'\0')

@@ -907,6 +907,49 @@ class LinuxProcessTests(unittest.TestCase):
         self.assertNotIn("mac_cleanup=unconfirmed", output.getvalue())
         self.assertNotIn("Traceback", output.getvalue() + errors.getvalue() + selector.stderr)
 
+    def test_checking_ssh_ancestors_do_not_block_slot_cleanup(self) -> None:
+        marker = self.marker()
+        self.process(10, start=1, group=10, cwd=self.root)
+        _ = (self.proc / "10/status").write_text("Uid:\t0\t0\t0\t0\n")
+        self.process(200, parent=10, start=150, group=200, cwd=self.root)
+        self.process(201, parent=200, start=151, group=200, cwd=self.root)
+        self.process(900, parent=201, start=152, group=900, cwd=self.root)
+        self.deny_reads(environ=(200, 201), cwd=(200, 201), cmdline=(200, 201))
+
+        selected = linux_runner.select_slot_processes(self.mirror, self.proc)
+
+        self.assertEqual(selected, linux_runner.SlotProcessSelection((), False))
+        self.assertEqual(linux_runner.slot_processes(self.mirror, self.proc), ())
+        self.assertFalse(marker.exists())
+
+    def test_concurrent_ssh_session_with_a_root_parent_does_not_block_cleanup(self) -> None:
+        marker = self.marker()
+        self.process(10, start=1, group=10, cwd=self.root)
+        _ = (self.proc / "10/status").write_text("Uid:\t0\t0\t0\t0\n")
+        self.process(200, parent=10, start=150, group=200, cwd=self.root)
+        other = self.root / "mirror/2"
+        other.mkdir()
+        self.process(201, parent=200, start=151, group=200, cwd=other, token="another-run")
+        self.deny_reads(environ=(200,), cwd=(200,), cmdline=(200,))
+
+        self.assertEqual(linux_runner.select_slot_processes(self.mirror, self.proc),
+                         linux_runner.SlotProcessSelection((), False))
+        self.assertEqual(linux_runner.slot_processes(self.mirror, self.proc), ())
+        self.assertFalse(marker.exists())
+
+    def test_unreadable_reparented_leftover_after_the_lease_stays_unresolved(self) -> None:
+        marker = self.marker()
+        self.process(1, start=1, group=1, cwd=self.root)
+        _ = (self.proc / "1/status").write_text("Uid:\t0\t0\t0\t0\n")
+        self.process(102, parent=1, start=150, group=102, cwd=self.root)
+        self.deny_reads(environ=(102,), cwd=(102,), cmdline=(102,))
+
+        self.assertEqual(linux_runner.select_slot_processes(self.mirror, self.proc),
+                         linux_runner.SlotProcessSelection((), True))
+        with self.assertRaises(linux_runner.SlotProcessesUnresolved):
+            _ = linux_runner.slot_processes(self.mirror, self.proc)
+        self.assertTrue(marker.exists())
+
     def test_unreadable_leased_process_and_parent_chain_keep_confirmed_ownership(self) -> None:
         marker = self.marker()
         self.process(100, cwd=self.root)

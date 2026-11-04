@@ -58,6 +58,36 @@ class LintVerbTests(unittest.TestCase):
                     self.assertEqual(answer.stdout.splitlines(), expected)
 
 
+class RunnerCompletionTests(unittest.TestCase):
+    def test_missing_completion_reports_the_runner_exit_without_claiming_link_loss(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            answer = offload.ProcessController().stream_mac_run([
+                "/bin/sh", "-c", "echo admission-wait-ended; exit 143",
+            ])
+        self.assertIsInstance(answer, offload.MissingMacStatus)
+        if not isinstance(answer, offload.MissingMacStatus):
+            self.fail("The runner did not send a completion marker")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result"
+            target = target_config.SshTarget("aws", "linux", Path(directory) / "aws.conf")
+            with redirect_stdout(output), mock.patch.object(target_config, "read_targets", return_value=(target,)):
+                status = offload.write_result(offload.LostMacRun(1, answer.detail), offload.ResultFile(path), target="aws")
+            self.assertEqual(status, 75)
+            self.assertIn("reason=runner exited with status 143 without a final status\n", path.read_text())
+        self.assertIn("the aws runner exited with status 143 without a final status", output.getvalue())
+        self.assertNotIn("link", output.getvalue())
+        self.assertNotIn("running on natedev instead", output.getvalue())
+
+    def test_interruption_reports_the_instance_generation_without_claiming_link_loss(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = offload.write_result(offload.InterruptedTargetRun("generation-one", 1),
+                                          offload.NO_RESULT_FILE, target="aws")
+        self.assertEqual(status, 75)
+        self.assertEqual(output.getvalue(), "mac_test: the aws instance was interrupted (generation generation-one)\n")
+
+
 class OffloadSettingsTests(unittest.TestCase):
     root: Path = Path()
     settings: Path = Path()

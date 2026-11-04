@@ -41,7 +41,19 @@ This includes all lines from `cargo nextest --version`.
 
 Linux cleanup reads the real UID from `/proc/<pid>/status` before it reads process ownership evidence.
 It excludes processes from other users.
-Unreadable evidence from the same user keeps the slot busy.
+Cleanup excludes processes that started before the recorded run and ancestors of the checking process.
+It also excludes direct children of another user, except children of PID 1.
+Slot processes keep their user, but an orphan can acquire PID 1 as its parent.
+Other same-user processes with unreadable evidence keep the slot busy.
+
+`verify-linux` steps use the target slots and build budget for admission.
+They do not contact natedev's admission service or obey natedev's hold.
+The controller still checks spending before AWS admission.
+
+A missing completion marker reports the runner exit status when available.
+It does not prove a link failure.
+The attempt record keeps the reason.
+An interruption marker reports the instance generation.
 
 ### Routing: `scripts/direct/verify.sh`, `scripts/build_targets/build_targets.py`
 
