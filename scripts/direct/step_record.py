@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import socket
 import tempfile
+import time
 from typing import cast
 
 
@@ -318,6 +319,7 @@ def main() -> int:
     _ = create.add_argument("--eligible-targets", default="")
     _ = create.add_argument("--mac-targets", default="")
     _ = create.add_argument("--pinned-target", default="")
+    _ = create.add_argument("--clock-offset", action="store_true", help="print wall minus monotonic time in microseconds")
     update = commands.add_parser("state")
     _ = update.add_argument("--call-id", required=True)
     _ = update.add_argument("--target", default="")
@@ -357,6 +359,8 @@ def main() -> int:
                              if location == "ssh_allowed" else NatedevOnly(reason),
                              StepState(cast(str, args.state)), datetime.now(timezone.utc).isoformat(),
                              selection=Pinned(pinned_target) if pinned_target else ROUTED))
+            if cast(bool, args.clock_offset):
+                print((time.time_ns() - time.monotonic_ns()) // 1000)
     except (OSError, ValueError, IndexError) as error:
         parser.exit(2, f"step record: {error}; step refused\n")
     return 0

@@ -54,7 +54,7 @@ def stub_build_tool_path(directory: Path) -> str:
         "mv", "cp", "sort", "wc", "touch", "env", "chmod", "id", "hostname",
         "flock", "timeout", "seq", "tail", "realpath", "perl", "nproc", "getconf",
         "lscpu", "du", "df", "journalctl", "which", "setsid", "ln", "printf",
-        "cmp", "rmdir", "true", "false", "install", "readelf", "file",
+        "cmp", "rmdir", "true", "false", "install", "readelf", "file", "sha256sum", "shasum",
     ):
         target = directory / name
         source = shutil.which(name)
@@ -613,30 +613,21 @@ runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")
 '''
 
 
-ROUTING_CLOCK_SHIM = r'''#!/bin/sh
-# Only verify's four clock expressions use fixture time. Forward every other
-# invocation directly, preserving argv and the interpreter's exit/signal status.
-if [ "${1:-}" = -c ] && [ -n "${TEST_ROUTING_CLOCK:-}" ]; then
-    read -r now < "$TEST_ROUTING_CLOCK"
-    case "$2" in
-        'import time; print(time.monotonic())')
-            printf '%s\n' "$now"
-            exit 0 ;;
-        'import time; print(time.monotonic() + 180)')
-            awk -v now="$now" 'BEGIN { print now + 180 }'
-            exit $? ;;
-        'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))')
-            printf '%s\n' "$now" >> "$TEST_RUNNER_STATE/retry-probes"
-            awk -v now="$now" -v deadline="$3" 'BEGIN { exit (now < deadline) }'
-            exit $? ;;
-        'import sys, time
-with open(sys.argv[2], "a") as output:
-    output.write("%.6f\n" % max(0, time.monotonic() - float(sys.argv[1])))')
-            awk -v now="$now" -v started="$3" 'BEGIN { d = now - started; printf "%.6f\n", (d > 0 ? d : 0) }' >> "$4"
-            exit $? ;;
-    esac
-fi
-exec "$TEST_REAL_PYTHON" "$@"
+ROUTING_CLOCK_BASH = r'''
+# Use fixture time only in the disposable verify copy.
+# Export the probe for child wait helpers.
+fixture_routing_clock() {
+    local now
+    read -r now < "$TEST_ROUTING_CLOCK" || [[ -n "$now" ]]
+    printf '%s.000000\n' "$now"
+}
+fixture_routing_probe() {
+    local now
+    read -r now < "$TEST_ROUTING_CLOCK" || [[ -n "$now" ]]
+    printf '%s\n' "$now" >> "$TEST_RUNNER_STATE/retry-probes"
+    printf '%s000000\n' "$now"
+}
+export -f fixture_routing_clock fixture_routing_probe
 '''
 
 
@@ -653,6 +644,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self.runner_state: Path = Path()
         self.cargo_events_path: Path = Path()
         self.environment: dict[str, str] = {}
+        self.verify_script: Path = VERIFY
 
     fixture_root: ClassVar[Path]
     fixture_seed: ClassVar[Path]
@@ -882,7 +874,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> subprocess.Popen[str]:
         return subprocess.Popen(
-            ["bash", str(VERIFY), *arguments],
+            ["bash", str(self.verify_script), *arguments],
             cwd=self.root,
             env={**self.environment, **(extra or {})},
             stdout=subprocess.PIPE,
@@ -960,12 +952,25 @@ class VerifyMacOffloadFixture(unittest.TestCase):
     def control_routing_clock(self) -> Path:
         clock = self.runner_state / "routing-clock"
         _ = clock.write_text("100")
-        library = self.home / ".claude" / "scripts" / "lib"
-        library.unlink()
-        library.mkdir()
-        self.write_executable(library / "py", ROUTING_CLOCK_SHIM)
-        for name in ("build_folders.py", "conf.py", "process_group.py", "unit_runs.py"):
-            _ = shutil.copy2(VERIFY.parent.parent / "lib" / name, library / name)
+        # Preserve relative helper paths. Replace only clock expressions.
+        scripts = self.root / "clock-scripts"
+        direct = scripts / "direct"
+        direct.mkdir(parents=True)
+        for sibling in VERIFY.parent.parent.iterdir():
+            if sibling.name != "direct":
+                (scripts / sibling.name).symlink_to(sibling, target_is_directory=sibling.is_dir())
+        for helper in VERIFY.parent.iterdir():
+            if helper.name != "verify.sh":
+                (direct / helper.name).symlink_to(helper, target_is_directory=helper.is_dir())
+        source = VERIFY.read_text()
+        source = source.replace("local now=$EPOCHREALTIME", "local now=$(fixture_routing_clock)")
+        source = source.replace("ROUTING_WAIT_STARTED=$EPOCHREALTIME", "ROUTING_WAIT_STARTED=$(fixture_routing_clock)")
+        source = source.replace("${EPOCHREALTIME/./}", "$(fixture_routing_probe)")
+        # Fixture time uses monotonic seconds. Its offset is zero.
+        source = source.replace(" - VERIFY_MONOTONIC_OFFSET_US", "")
+        source = source.replace('"$VERIFY_MONOTONIC_OFFSET_US" "${deadline/./}"', '0 "${deadline/./}"')
+        self.verify_script = direct / "verify.sh"
+        _ = self.verify_script.write_text(source.replace("set -euo pipefail", ROUTING_CLOCK_BASH + "\nset -euo pipefail", 1))
         self.environment["TEST_ROUTING_CLOCK"] = str(clock)
         return clock
 

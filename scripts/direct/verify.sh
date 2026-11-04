@@ -173,13 +173,78 @@
 # the same command unsandboxed; anything else is the underlying tool status.
 
 set -euo pipefail
+# Trace the helper in its interpreter. CPU time excludes child processes.
+# The normal path starts no extra interpreter.
+VERIFY_START_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$VERIFY_START_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_START_DIR=.
+VERIFY_START_DIR="$(cd -- "$VERIFY_START_DIR" && pwd -P)"
+PY="$VERIFY_START_DIR/../lib/py"
+if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
+    if [[ "$VERIFY_PY_TRACE" != /* ]]; then export VERIFY_PY_TRACE="$PWD/$VERIFY_PY_TRACE"; fi
+    export VERIFY_TRACE_REAL_PY="$PY"
+    PY="${VERIFY_PY_TRACE}.$$.runner"
+    cat > "$PY" <<'VERIFY_TRACE_RUNNER'
+#!/usr/bin/env bash
+options=()
+while [[ "${1:-}" == -S || "${1:-}" == -u ]]; do
+    options+=("$1"); shift
+done
+exec "$VERIFY_TRACE_REAL_PY" "${options[@]}" -c '
+import atexit, os, signal, sys, time, types
+started = float(sys.argv[1])
+arguments = sys.argv[2:]
+helper = os.environ.get("VERIFY_PY_HELPER", "") or os.path.basename(arguments[0])
+if helper == "-c": helper = "INLINE_PY"
+if helper == "-": helper = "STDIN_PY"
+process = os.getpid()
+recorded = False
+
+def record_trace():
+    global recorded
+    if recorded or os.getpid() != process:
+        return
+    recorded = True
+    with open(os.environ["VERIFY_PY_TRACE"], "a") as trace:
+        trace.write(f"{helper}\t{round((time.time() - started) * 1000)}\t{round(time.process_time() * 1000)}\n")
+
+def terminate_trace(signum, _frame):
+    record_trace()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+signal.signal(signal.SIGTERM, terminate_trace)
+atexit.register(record_trace)
+sys.addaudithook(lambda event, _arguments: record_trace() if event == "os.exec" else None)
+if arguments[0] == "-c":
+    helper = helper or "INLINE_PY"
+    source, filename = arguments[1], "<string>"
+    sys.argv = ["-c", *arguments[2:]]
+elif arguments[0] == "-":
+    helper = helper or "STDIN_PY"
+    source, filename = sys.stdin.read(), "<stdin>"
+    sys.argv = arguments
+else:
+    filename = arguments[0]
+    helper = os.path.basename(filename)
+    with open(filename, "rb") as script:
+        source = script.read()
+    sys.argv = arguments
+    sys.path[0] = os.path.dirname(os.path.abspath(filename))
+module = types.ModuleType("__main__")
+module.__file__ = filename
+sys.modules["__main__"] = module
+exec(compile(source, filename, "exec"), module.__dict__)
+' "${EPOCHREALTIME:-$(date +%s)}" "$@"
+VERIFY_TRACE_RUNNER
+    chmod +x "$PY"
+fi
 # Read-only queries run before environment setup and build admission.
 if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final-pass ) ]]; then
     if [[ "$1" == --session-dir ]]; then shift 2; fi
     shift
     VERIFY_QUERY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
-    exec "$VERIFY_QUERY_DIR/../lib/py" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
+    exec "$PY" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
 fi
 # Create the inherited temporary parent before environment commands use it.
 VERIFY_INVOKE_DIR="${BASH_SOURCE[0]%/*}"
@@ -198,7 +263,7 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
     export VERIFY_NIX_ENV_REEXEC=1
-    exec "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/py" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
+    exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
         exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
 fi
 unset VERIFY_NIX_ENV_REEXEC
@@ -213,7 +278,11 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.12.
-PY="${HOME}/.claude/scripts/lib/py"
+if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
+    export VERIFY_TRACE_REAL_PY="${HOME}/.claude/scripts/lib/py"
+else
+    PY="${HOME}/.claude/scripts/lib/py"
+fi
 
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
@@ -226,6 +295,7 @@ BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
 STEP_RECORD_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/step_record.py"
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
+VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_metadata.py"
 FINAL_PASS_START=""
 final_pass_finish() {
     [[ -n "$FINAL_PASS_START" ]] || return 0
@@ -466,164 +536,6 @@ except (OSError, ValueError):
 print(",".join(features))
 '
 
-MEMBER_PY='
-import json
-import sys
-
-package_name = sys.argv[1]
-meta = json.load(sys.stdin)
-if any(package["name"] == package_name for package in meta["packages"]):
-    sys.exit(0)
-print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
-sys.exit(2)
-'
-
-EXAMPLE_FEATURES_PY='
-import json
-import sys
-
-package_name = sys.argv[1]
-example_name = sys.argv[2]
-meta = json.load(sys.stdin)
-for package in meta["packages"]:
-    if package["name"] != package_name:
-        continue
-    for target in package["targets"]:
-        if target["name"] == example_name and "example" in target["kind"]:
-            print(",".join(target.get("required-features", [])))
-            sys.exit(0)
-    print(
-        "verify.sh: example " + example_name + " not found in package " + package_name,
-        file=sys.stderr,
-    )
-    sys.exit(2)
-print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
-sys.exit(2)
-'
-
-# The cargo words that select what `build` builds, then the binaries it makes:
-# `select <word>` lines, `features <list>` for an example's required features,
-# and `binary <path under the profile folder>` lines. Bin and example names
-# are unique across the workspace, so --workspace --bin builds the one target
-# under the workspace's feature set, the set `test` already compiled.
-BUILD_TARGETS_PY='
-import json
-import sys
-
-package_name, kind, name = sys.argv[1], sys.argv[2], sys.argv[3]
-meta = json.load(sys.stdin)
-package = next(package for package in meta["packages"] if package["name"] == package_name)
-wanted = [target for target in package["targets"] if (kind or "bin") in target["kind"] and name in ("", target["name"])]
-if not wanted:
-    what = f"{kind} {name}" if name else "binary"
-    advice = "" if name else "; name an example with --example <name>"
-    print(f"verify.sh: package {package_name} has no {what}{advice}", file=sys.stderr)
-    sys.exit(2)
-for target in wanted:
-    print("select --" + (kind or "bin"))
-    print("select " + target["name"])
-    if kind == "example" and target.get("required-features"):
-        print("features " + ",".join(target["required-features"]))
-    print(("binary examples/" if kind == "example" else "binary ") + target["name"])
-print("target " + meta["target_directory"])
-'
-
-# Select the named package's test targets. Named targets with unavailable
-# required features would error instead of being skipped by --tests, and names
-# shared across members would select both; either case uses the broad flags.
-TEST_TARGETS_PY='
-import json
-import sys
-
-package_name = sys.argv[1]
-meta = json.load(sys.stdin)
-package = next(package for package in meta["packages"] if package["name"] == package_name)
-features = package["features"]
-enabled = set()
-pending = features.get("default", []) + [
-    name[len(package_name) + 1 :] for name in sys.argv[2].split(",") if name.startswith(package_name + "/")
-]
-while pending:
-    name = pending.pop()
-    if name in features and name not in enabled:
-        enabled.add(name)
-        pending += features[name]
-flags = {"bin": "--bin", "test": "--test", "bench": "--bench"}
-shared = {
-    (target["kind"][0], target["name"])
-    for other in meta["packages"]
-    if other["name"] != package_name
-    for target in other["targets"]
-}
-has_lib = any(target["kind"][0] in {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"} for target in package["targets"])
-selection = ["--lib"] if has_lib else []
-for target in package["targets"]:
-    kind = target["kind"][0]
-    if kind not in flags or (kind != "bin" and not target["test"]):
-        continue
-    if not set(target.get("required-features", [])) <= enabled or (kind, target["name"]) in shared:
-        selection = (["--lib"] if has_lib else []) + ["--bins", "--tests"]
-        break
-    selection += [flags[kind], target["name"]]
-print("\n".join(selection or ["--bins", "--tests"]))
-'
-
-UNTESTED_EXAMPLES_PY='
-import json
-from pathlib import Path
-import re
-import sys
-
-meta = json.load(sys.stdin)
-members = set(meta["workspace_members"])
-packages = [package for package in meta["packages"] if package["id"] in members]
-package_name = sys.argv[1]
-if package_name != "--workspace":
-    packages = [package for package in packages if package["name"] == package_name]
-    if not packages:
-        print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
-        sys.exit(2)
-
-test_marker = re.compile(r"^\s*(#\[(?:cfg\(test\)|(?:\w+::)*test)\])")
-offenders = []
-for package in packages:
-    for target in package["targets"]:
-        if "example" not in target["kind"]:
-            continue
-        example_name = target["name"]
-        owner_package = package["name"]
-        manifest_path = package["manifest_path"]
-        source = Path(target["src_path"])
-        if source.name == "main.rs" and source.parent.parent.name == "examples":
-            sources = sorted(source.parent.rglob("*.rs"))
-        else:
-            sources = [source]
-        for path in sources:
-            for line_number, line in enumerate(path.read_text().splitlines(), 1):
-                if match := test_marker.match(line):
-                    offenders.append((
-                        f"example {example_name} holds a test: {path}:{line_number} has {match.group(1)}, and examples carry no tests.",
-                        f"move it into {owner_package}\x27s src/ or tests/, or delete it.",
-                    ))
-                    break
-            else:
-                continue
-            break
-        if target.get("test", False):
-            offenders.append((
-                f"example {example_name} sets test = true in {manifest_path}, and examples carry no tests.",
-                "remove test = true from its [[example]] entry.",
-            ))
-
-for index, (reason, fix) in enumerate(offenders):
-    if index:
-        print(file=sys.stderr)
-    print(reason, file=sys.stderr)
-    print(fix, file=sys.stderr)
-if offenders:
-    sys.exit(2)
-'
-
 # Workspace members with a file that differs from HEAD: staged, unstaged,
 # deleted, or new and not ignored. A phase commits nothing before its
 # checkpoint, so HEAD is where the phase started and this is the whole phase's
@@ -697,10 +609,68 @@ read_metadata() {
     fi
 }
 
-require_member() {
-    if ! read_metadata | "$PY" -c "$MEMBER_PY" "$1"; then
-        exit 2
+# Read the metadata once. Later requests use the shell values.
+# Validate dev features before Cargo. Find changed members after mend.
+METADATA_READY=0
+load_metadata() {
+    [[ "$METADATA_READY" == 0 ]] || return 0
+    local values features="" kind="" name="" valid=1
+    local requests=() words=("${ARGS[@]:1}")
+    local package="${ARGS[0]:-}" index word
+    if [[ "${CHECK_UNTESTED_EXAMPLES:-0}" == 1 ]]; then
+        requests+=("untested-examples:$EXAMPLE_SCOPE")
     fi
+    case "$CMD" in
+        check|build|test) requests+=("member:$package") ;;
+        lint)
+            if [[ "$package" != --workspace ]]; then requests+=("member:$package"); fi
+            requests+=(workspace-root)
+            ;;
+        example) requests+=("example-features:$package:${ARGS[1]:-}") ;;
+        doc) requests+=(target-directory) ;;
+    esac
+    case "$CMD" in
+        test)
+            for ((index=0; index<${#words[@]}; index++)); do
+                if [[ "${words[index]}" == --features ]]; then
+                    features="${words[index+1]:-}"
+                fi
+            done
+            features="$(merge_dev_features "$features")"
+            features="$(qualify_features "$package" "$features")"
+            requests+=("test-targets:$package:$features")
+            ;;
+        build)
+            # Match take_build_args without emitting its usage error early:
+            # the existing member check still wins over malformed arguments.
+            while [[ ${#words[@]} -gt 0 ]]; do
+                word=${words[0]}
+                case "$word" in
+                    --bin|--example)
+                        if [[ -n "$kind" || -z "${words[1]:-}" || "${words[1]:-}" == --* ]]; then
+                            valid=0; break
+                        fi
+                        kind=${word#--}; name=${words[1]}; words=("${words[@]:2}")
+                        ;;
+                    --release) words=("${words[@]:1}") ;;
+                    --features)
+                        if [[ -z "${words[1]:-}" ]]; then valid=0; break; fi
+                        words=("${words[@]:2}")
+                        ;;
+                    *) valid=0; break ;;
+                esac
+            done
+            if [[ "$valid" == 1 ]]; then requests+=("build-targets:$package:$kind:$name"); fi
+            ;;
+    esac
+    GATE_METADATA="$(read_metadata)" || exit 2
+    values="$("$PY" "$VERIFY_METADATA_SCRIPT" "${requests[@]}" <<< "$GATE_METADATA")" || exit 2
+    eval "$values"
+    METADATA_READY=1
+}
+
+require_member() {
+    load_metadata
 }
 
 require_taplo() {
@@ -744,20 +714,19 @@ workspace_taplo() (
 )
 
 example_features() {
-    cargo metadata --no-deps --format-version 1 \
-        | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
+    load_metadata
+    printf '%s\n' "$EXAMPLE_FEATURES"
 }
 
 TEST_SELECTION=()
 take_test_targets() {
-    local words word
-    words="$(read_metadata \
-        | "$PY" -c "$TEST_TARGETS_PY" "$PKG" "${FEATURE_FLAGS[1]:-}")"
+    local word
+    load_metadata
     while IFS= read -r word; do
         if [[ -n "$word" ]]; then
             TEST_SELECTION+=("$word")
         fi
-    done <<< "$words"
+    done <<< "$TEST_TARGETS"
 }
 
 # Qualify each feature name in a comma list with the package, leaving names
@@ -850,7 +819,7 @@ take_build_args() {
                 ;;
         esac
     done
-    words="$(read_metadata | "$PY" -c "$BUILD_TARGETS_PY" "$PKG" "$kind" "$name")" || exit 2
+    words="$BUILD_TARGETS"
     while IFS= read -r line; do
         case "$line" in
             "select "*) BUILD_ARGS+=("${line#select }") ;;
@@ -935,7 +904,7 @@ compose_nextest_args() {
         TEST_FILTER="package($PKG)"
     fi
     # Build only the targets this package's tests live in
-    # (TEST_TARGETS_PY): --lib, which cannot be narrowed to one member
+    # (verify_metadata.py): --lib, which cannot be narrowed to one member
     # under --workspace and is left out for a package without a lib,
     # and the package's own bins and test-enabled targets. --bins
     # --tests linked every member's test executables, 78 in hana, to
@@ -1063,7 +1032,7 @@ if [[ -n "$PINNED_TARGET" ]]; then
     NO_CACHE=1
 fi
 export BUILDLOG_PINNED_TARGET="$PINNED_TARGET"
-DEV_FEATURES="$("$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml")" || exit 2
+DEV_FEATURES="$(VERIFY_PY_HELPER=DEV_FEATURES_PY "$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml")" || exit 2
 if [[ "$LOCAL_ONLY" -eq 1 ]]; then
     export BUILDLOG_LOCAL_REASON="$LOCAL_REASON"
 else
@@ -1141,10 +1110,10 @@ buildlog_memory_event() {
 collect_routing_wait() {
     phase_wait_finish hold
     if [[ -n "$ROUTING_WAIT_STARTED" ]]; then
-        "$PY" -c 'import sys, time
-with open(sys.argv[2], "a") as output:
-    output.write("%.6f\n" % max(0, time.monotonic() - float(sys.argv[1])))' \
-            "$ROUTING_WAIT_STARTED" "$BUILDLOG_HOLD_WAIT_FILE"
+        local now=$EPOCHREALTIME elapsed
+        elapsed=$(( 10#${now/./} - 10#${ROUTING_WAIT_STARTED/./} ))
+        (( elapsed >= 0 )) || elapsed=0
+        printf '%d.%06d\n' "$(( elapsed / 1000000 ))" "$(( elapsed % 1000000 ))" >> "$BUILDLOG_HOLD_WAIT_FILE"
         ROUTING_WAIT_STARTED=""
     fi
 }
@@ -1159,7 +1128,7 @@ collect_hold_wait() {
 
 interrupt_hold_wait() {
     if [[ -n "${BUILDLOG_HOLD_WAITER_FILE:-}" && -f "$BUILDLOG_HOLD_WAITER_FILE" ]]; then
-        python3 "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
+        "$PY" "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
     fi
 }
 
@@ -1321,7 +1290,7 @@ finish_tree_watch() {
 # Git's staged tree identity. A private copy avoids updating the real index's
 # cache-tree extension when write-tree runs.
 doc_tree() {
-    "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
+    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
 import os
 from pathlib import Path
 import subprocess
@@ -1346,7 +1315,7 @@ PYDOC
 # The caller holds DOC_CHECKOUT/lock until rustdoc and its record are complete.
 # The private index and persistent path preserve unchanged source mtimes.
 doc_checkout() {
-    "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$DOC_CHECKOUT" <<'PYDOC'
+    VERIFY_PY_HELPER=DOC_CHECKOUT_PY "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$DOC_CHECKOUT" <<'PYDOC'
 import os
 from pathlib import Path
 import shutil
@@ -1390,7 +1359,7 @@ doc_record() {
         echo 'verify.sh: the staged tree changed while doc ran; no doc pass record was written.'
         return 0
     fi
-    "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID" <<'PYDOC'
+    VERIFY_PY_HELPER=DOC_RECORD_PY "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID" <<'PYDOC'
 from datetime import datetime, timezone
 import json
 import os
@@ -1717,7 +1686,7 @@ finish_mac_pass() {
 check_routing_hold() {
     local admission=0
     if build_hold_nothing_held; then return 0; fi
-    python3 "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
+    "$PY" "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
         2>"$HOLD_WAIT_DIR/routing-diagnostic" || admission=$?
     if ! cmp -s "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"; then
         cat "$HOLD_WAIT_DIR/routing-diagnostic" >&2
@@ -1735,7 +1704,7 @@ initialize_step_record() {
     if [[ "$CMD" == test ]]; then arguments+=(--package "$PKG"); fi
     if [[ "$LOCAL_ONLY" == 1 ]]; then arguments+=(--local "$LOCAL_REASON"); fi
     if [[ -n "$PINNED_TARGET" ]]; then arguments+=(--target "$PINNED_TARGET"); fi
-    answer=$(python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
+    answer=$("$PY" "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
     if (( status != 0 )); then
         printf 'verify.sh: target eligibility check failed (exit %s); step refused\n' "$status" >&2
         exit "$status"
@@ -1794,7 +1763,8 @@ initialize_step_record() {
     fi
     if [[ -n "$PINNED_TARGET" ]]; then STEP_RECORD_ARGS+=(--pinned-target "$PINNED_TARGET"); fi
     if [[ "$CMD" == test ]]; then STEP_RECORD_ARGS+=(--package "$PKG"); fi
-    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" || exit 2
+    VERIFY_MONOTONIC_OFFSET_US="$(env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" \
+        "${STEP_RECORD_ARGS[@]}" --clock-offset)" || exit 2
     STEP_RECORD_ACTIVE=1
     export BUILDLOG_MEM_WAIT_FIRST_FILE="${BUILDLOG_MEM_WAIT_FIRST_FILE:-$HOLD_WAIT_DIR/first-queued-at}"
     if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
@@ -1926,7 +1896,9 @@ remember_mac_retry() {
         return 0
     fi
     if [[ "${LAST_TARGET_OUTCOME:-$BUILDLOG_MAC}" != declined || ! "$MAC_LEAVE_REASON" =~ ^(busy|blocked|disk)$ ]]; then
-        MAC_RETRY_AFTER="$("$PY" -c 'import time; print(time.monotonic() + 180)')"
+        local now=$EPOCHREALTIME deadline
+        deadline=$(( 10#${now/./} - VERIFY_MONOTONIC_OFFSET_US + 180000000 ))
+        printf -v MAC_RETRY_AFTER '%d.%06d' "$(( deadline / 1000000 ))" "$(( deadline % 1000000 ))"
         if [[ "$MAC_RETRY_NOTICE_SHOWN" == 0 ]]; then
             echo "verify.sh: Mac attempt ended ($BUILDLOG_MAC${BUILDLOG_MAC_REASON:+: $BUILDLOG_MAC_REASON}); waiting 180 s before each retry while natedev waits." >&2
             MAC_RETRY_NOTICE_SHOWN=1
@@ -1973,7 +1945,10 @@ ssh_reserve_hook() {
     done
     if [[ "$MAC_LEAVE_SETTINGS" == "$settings" ]]; then deadline=$MAC_RETRY_AFTER; fi
     if [[ "$deadline" != 0 && "$STEP_RUNS_ON" != mac_allowed ]]; then
-        printf '%q ' "$PY" -c 'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))' "$deadline"
+        # The retry hook expands the clock when it runs.
+        # shellcheck disable=SC2016
+        printf 'test "$(( ${EPOCHREALTIME/./} - %q ))" -ge %q' \
+            "$VERIFY_MONOTONIC_OFFSET_US" "${deadline/./}"
         printf ' && '
     fi
     printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
@@ -2032,7 +2007,11 @@ mac_retry_hook() {
     if [[ "$2" != 0 ]]; then
         printf '{ '
         if [[ -n "$MAC_IDLE_MARKER" ]]; then printf 'test -f %q || ' "$MAC_IDLE_MARKER"; fi
-        printf '%q ' "$PY" -c 'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))' "$2"
+        local deadline=$2
+        # The retry hook expands the clock when it runs.
+        # shellcheck disable=SC2016
+        printf 'test "$(( ${EPOCHREALTIME/./} - %q ))" -ge %q' \
+            "$VERIFY_MONOTONIC_OFFSET_US" "${deadline/./}"
         printf '; } && '
     fi
     if [[ "${3:-}" == reserve ]]; then printf '{ if SSH_RETRY_AVAILABILITY="$('; fi
@@ -2164,7 +2143,7 @@ route_test() {
         fi
         phase_wait_start hold "build hold"
         if [[ -z "$ROUTING_WAIT_STARTED" ]]; then
-            ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
+            ROUTING_WAIT_STARTED=$EPOCHREALTIME
         fi
         "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
         HOLD_WAITER_PID=$!
@@ -2363,7 +2342,7 @@ build_seconds() {
 # or when the tree has changed since that verdict.
 # The time in the user's zone setting, with its label; UTC (labeled) when the setting cannot be read.
 user_clock() {
-    TZ="$(python3 -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
+    TZ="$("$PY" -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
 }
 
 cache_record() {
@@ -2454,17 +2433,16 @@ finish_run() {
 # Checked before the cache lookup and any build, so a recorded pass never
 # stands in for the rule that examples carry no tests.
 GATE_METADATA=""
+CHECK_UNTESTED_EXAMPLES=0
 if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
     || ( ${#ARGS[@]} -eq 3 && "${ARGS[1]}" == --features ) ) ) ]]; then
-    GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
+    CHECK_UNTESTED_EXAMPLES=1
     if [[ "$CMD" == final ]]; then
         EXAMPLE_SCOPE=--workspace
     else
         EXAMPLE_SCOPE="${ARGS[0]}"
     fi
-    if ! "$PY" -c "$UNTESTED_EXAMPLES_PY" "$EXAMPLE_SCOPE" <<< "$GATE_METADATA"; then
-        exit 2
-    fi
+    load_metadata
 fi
 # A test record's key reads the package's dependencies from it (tree_key).
 if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
@@ -2522,7 +2500,7 @@ while [[ -z "$PINNED_TARGET" ]] && ! build_hold_nothing_held; do
     if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]]; then
         HOLD_WAIT_ARGS+=(--leave-hook "$(ssh_retry_hook)")
     fi
-    python3 "$BUILD_TARGETS_SCRIPT" "${HOLD_WAIT_ARGS[@]}" &
+    "$PY" "$BUILD_TARGETS_SCRIPT" "${HOLD_WAIT_ARGS[@]}" &
     HOLD_WAITER_PID=$!
     HOLD_WAIT_STATUS=0
     wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
@@ -2631,8 +2609,13 @@ token_waiters_key() {
     if [[ "$CMD" == lint && ${#key_args[@]} -gt 0 && "${key_args[0]}" != --* ]]; then
         key_args=("${key_args[@]:1}")
     fi
-    "$PY" -c 'import hashlib, sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:16])' \
-        "$(pwd -P)" "$CMD" ${key_args[@]+"${key_args[@]}"}
+    local hash
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash="$( { printf '%s' "$(pwd -P)"; printf '\0%s' "$CMD" ${key_args[@]+"${key_args[@]}"}; } | sha256sum)"
+    else
+        hash="$( { printf '%s' "$(pwd -P)"; printf '\0%s' "$CMD" ${key_args[@]+"${key_args[@]}"}; } | shasum -a 256)"
+    fi
+    printf '%s\n' "${hash:0:16}"
 }
 supersede_older_waiters() {
     local file name pid stamp own=${TOKEN_WAITER_FILE%.*}
@@ -2689,7 +2672,8 @@ count_token_waiters_ahead() {
 # ended on "starting anyway" for hours (2026-10-22).
 token_wait_note() {
     local kind=$1 waited_min=$2 holder="" who
-    read -r holder < "${BOARD_DIR}/locks/cargo.d/holder" 2>/dev/null || holder=""
+    # Keep the value when read reaches EOF without a final newline.
+    read -r holder < "${BOARD_DIR}/locks/cargo.d/holder" 2>/dev/null || true
     if [[ -n "$holder" ]]; then
         who="$holder holds it"
     elif (( TOKEN_WAITERS_AHEAD > 0 )); then
@@ -2699,7 +2683,7 @@ token_wait_note() {
     fi
     case "$kind" in
         first) printf 'waiting for the cargo token since %s: %s; calls ahead of this one: %d\n' \
-            "$(TZ="$(python3 -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%H:%M %Z')" \
+            "$(TZ="$("$PY" -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%H:%M %Z')" \
             "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
         still) printf 'still waiting for the cargo token (%d min): %s; calls ahead of this one: %d\n' \
             "$waited_min" "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
@@ -2929,7 +2913,7 @@ sys.exit(shell_status(subprocess.call(command)))
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" python3 -c "$STEP_OWNER_PY" \
+        VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
             "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
     else
         buildlog_exec_unowned "$@"
@@ -2990,7 +2974,8 @@ buildlog_wait_for_memory() {
         buildlog_token_wait || return $?
         acquire_token || return $?
         local token_back_at
-        token_back_at=$(buildlog_memory_python -c 'import time; print(time.time())') || return $?
+        buildlog_now
+        token_back_at=$BUILDLOG_NOW
         memory_wait=$BUILDLOG_MEM_WAIT_S
         # The second pass keeps the step's place in the memory queue from its first wait.
         BUILDLOG_MEM_TOKEN_BACK_AT=$token_back_at BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
@@ -3220,8 +3205,7 @@ case "$CMD" in
         if [[ "$HOLD_LINT" == 1 ]]; then
             # Format locally; the Mac judges the resulting tree without fixes.
             fmt_cargo --all
-            GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
-            WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
+            load_metadata
             workspace_taplo
             lint_status=0
             if lint_config_enabled mend; then
@@ -3258,8 +3242,7 @@ case "$CMD" in
             else
                 lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
             fi
-            GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
-            WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
+            load_metadata
             if ! workspace_taplo --check; then
                 lint_status=1
             fi
@@ -3317,8 +3300,8 @@ case "$CMD" in
             FMT_SCOPE=(--all)
         else
             FMT_SCOPE=(-p "$PKG")
-            FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
-            | "$PY" -c "$CHANGED_MEMBERS_PY")"
+            FMT_MEMBERS="$(read_metadata \
+            | VERIFY_PY_HELPER=CHANGED_MEMBERS_PY "$PY" -c "$CHANGED_MEMBERS_PY")"
             while IFS= read -r member; do
                 if [[ -n "$member" && "$member" != "$PKG" ]]; then
                     FMT_SCOPE+=(-p "$member")
@@ -3338,8 +3321,7 @@ case "$CMD" in
         fi
         # Cargo's workspace root can differ from the caller's directory.
         # Run there so Taplo uses the same config and scope as the push gate.
-        GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
-        WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
+        load_metadata
         TAPLO_ARGS=(--check)
         if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(); fi
         if workspace_taplo ${TAPLO_ARGS[@]+"${TAPLO_ARGS[@]}"}; then
@@ -3401,12 +3383,12 @@ case "$CMD" in
         # Cargo resolves its configured target at the original repo, never at
         # the isolated source checkout. Relative env overrides use that top.
         if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
-            CARGO_TARGET_DIR="$(cd "$DOC_REPO_TOP" && cargo metadata --no-deps --format-version 1 \
-                | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+            load_metadata
+            CARGO_TARGET_DIR="$TARGET_DIRECTORY"
         fi
-        CARGO_TARGET_DIR="$("$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
+        CARGO_TARGET_DIR="$(VERIFY_PY_HELPER=DOC_TARGET_PATH_PY "$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
         export CARGO_TARGET_DIR
-        DOC_CHECKOUT="$CARGO_TARGET_DIR/verify-doc/$("$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:24])' "$DOC_REPO_TOP")"
+        DOC_CHECKOUT="$CARGO_TARGET_DIR/verify-doc/$(VERIFY_PY_HELPER=DOC_CHECKOUT_HASH_PY "$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:24])' "$DOC_REPO_TOP")"
         mkdir -p "$DOC_CHECKOUT"
         # fd 8 holds the doc checkout lock; fd 9 belongs to nextest sharing.
         exec 8>"$DOC_CHECKOUT/lock"
