@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_evidence
 from scripts.build_queue.queue_evidence import step_labels as step_labels
-from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pad_left, pad_right, plain, field
-from scripts.lib.terminal_cells import terminal_width
+from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, plain, field
+from scripts.lib.terminal_cells import pad_left, pad_right, terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses

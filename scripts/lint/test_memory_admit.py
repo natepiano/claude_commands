@@ -23,7 +23,7 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol, cast, override
+from typing import TYPE_CHECKING, BinaryIO, Literal, cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -40,13 +40,18 @@ import nextest_budget as budget
 from build_shape import BuildShape, build_shape
 from memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
 if TYPE_CHECKING:
+    from ..buildlog import store
+    from ..buildlog import record as buildlog_record
+    from ..buildlog import index as file_marks
     from ..lib import test_hang_guard
     from ..message.roster import UnitLabels
 else:
+    import store
+    import record as buildlog_record
+    import index as file_marks
     from scripts.lib import test_hang_guard
     from scripts.message.roster import UnitLabels
 
-store = gate.store
 READY_FOR_ADMISSION = gate.ReadyForAdmission()
 
 
@@ -109,13 +114,6 @@ class SnapshotCompatibilityTests(unittest.TestCase):
                 }, gate.RunningStep)
 
 
-class BuildStepRecorder(Protocol):
-    store: gate.BuildLogStore
-
-    def step(self, arguments: list[str]) -> None: ...
-
-
-buildlog_record = cast(BuildStepRecorder, cast(object, gate.record))
 
 GIB = gate.GIB
 NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
@@ -838,7 +836,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         path = self.root / self.host / f"{NOW:%Y-%m}.jsonl"
         offset = path.stat().st_size
         with path.open("rb") as handle:
-            marks = gate.file_marks.marks(handle, offset)
+            marks = file_marks.marks(handle, offset)
         source = path.relative_to(self.root).as_posix()
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
             _ = db.execute("ALTER TABLE steps ADD COLUMN test_build_key TEXT")
@@ -987,8 +985,8 @@ class FreshTestPromiseTests(unittest.TestCase):
                     patch.object(buildlog_record, "git_facts", return_value={"worktree": str(self.worktree)}), \
                     patch("treekey.tree_key", return_value=ending_source), \
                     patch.object(buildlog_record, "rustc_version", return_value="rustc fixture"), \
-                    patch.object(buildlog_record.store, "host_name", return_value=self.host), \
-                    patch.object(buildlog_record.store, "host_file", return_value=path):
+                    patch.object(store, "host_name", return_value=self.host), \
+                    patch.object(store, "host_file", return_value=path):
                 ended = NOW.timestamp() - seconds
                 buildlog_record.step(["0", str(ended - 5), str(ended), "1", "", "",
                                       "cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"])
@@ -1160,7 +1158,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         meminfo = self.root / 'meminfo'
         _ = meminfo.write_text('MemAvailable: 67108864 kB\n')
         arguments = ['cargo', 'nextest', 'run', '-E', 'package(hana) & test(native_rate)']
-        with patch.dict(os.environ, {'BUILDLOG_TEST_BUILD_KEY': 'current-key', 'BUILDLOG_TREE': 'source-only-key', 'BUILDLOG_TEST_TARGET_DIR': str(configured), 'BUILDLOG_TEST_BUILD_DIR': str(configured), 'CARGO_TARGET_DIR': str(self.worktree / 'target')}), patch.object(gate, 'git_identity', return_value=(HANA, 'checkout')), patch.object(gate.store, 'host_name', return_value=self.host), patch.object(gate.record, 'git_directory', return_value=str(self.worktree)), patch.object(gate.record, 'git_facts', return_value={'worktree': str(self.worktree)}), patch.object(gate, 'process_start_time', return_value=None):
+        with patch.dict(os.environ, {'BUILDLOG_TEST_BUILD_KEY': 'current-key', 'BUILDLOG_TREE': 'source-only-key', 'BUILDLOG_TEST_TARGET_DIR': str(configured), 'BUILDLOG_TEST_BUILD_DIR': str(configured), 'CARGO_TARGET_DIR': str(self.worktree / 'target')}), patch.object(gate, 'git_identity', return_value=(HANA, 'checkout')), patch.object(store, 'host_name', return_value=self.host), patch.object(buildlog_record, 'git_directory', return_value=str(self.worktree)), patch.object(buildlog_record, 'git_facts', return_value={'worktree': str(self.worktree)}), patch.object(gate, 'process_start_time', return_value=None):
             fresh = gate.step_estimate(arguments, str(self.worktree), gate.INFER_FROM_ARGV, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
             self.assertEqual(fresh.profile.peak.bytes, 2 * GIB)
             _ = (self.state / 'target-deletes.json').write_text(json.dumps({str(configured): (NOW - timedelta(seconds=30)).timestamp()}))
@@ -1962,7 +1960,7 @@ class ServicePriorityRepairTests(unittest.TestCase):
             prefix = b"this old prefix is not JSON\n"
             _ = path.write_bytes(prefix)
             request = wire.PrioritySetRequest("stopped-set", "chosen", "saved reason", "director")
-            with patch.object(gate.record, "queue_priority", side_effect=KeyboardInterrupt):
+            with patch.object(buildlog_record, "queue_priority", side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
                     _ = fixture.server.handle_request(request)
             priority = fixture.server.priority
@@ -2662,11 +2660,10 @@ class BuildFinalizerTests(BuildPromiseFixture):
                 reads_at_expiry = 0
                 history_reader = gate.anonymous_history_rows
                 history_scans = 0
-                def count_history_scans(source: Path | BinaryIO) -> Iterator[dict[str, object]]:
+                def count_history_scans(path: Path) -> Iterator[dict[str, object]]:
                     nonlocal history_scans
-                    if isinstance(source, Path):
-                        history_scans += 1
-                    return history_reader(source)
+                    history_scans += 1
+                    return history_reader(path)
                 def observe(reply: wire.Wait) -> None:
                     nonlocal reads_at_expiry
                     replies.append(reply)
@@ -2835,6 +2832,13 @@ class BuildNeedBasisTests(BuildPromiseFixture):
 
 
 class ProgramProfileTests(MemoryQueueFixture):
+    def test_absent_history_uses_the_first_program_peak(self) -> None:
+        history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
+        self.assertFalse(history.exists())
+        self.assertEqual(list(gate.anonymous_history_rows(history)), [])
+        self.assertEqual(gate.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB),
+                         gate.FirstProgramPeak(4 * GIB))
+
     def test_unfinished_rows_do_not_change_the_program_estimate(self) -> None:
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         _ = history.write_text(json.dumps({

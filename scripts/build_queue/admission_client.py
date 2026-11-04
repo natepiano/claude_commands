@@ -27,6 +27,11 @@ from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit as gate
 
 if TYPE_CHECKING:
+    from scripts.buildlog import store
+else:
+    import store
+
+if TYPE_CHECKING:
     from scripts.lib import conf
 else:
     import conf
@@ -601,7 +606,7 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
                  ) -> wire.AdmitRequest:
     config = gate.read_memory_config()
     estimate = gate.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
-                                  gate.store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
+                                  store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
                                   budget=gate.resolve_admission_limits(gate.UnknownHostTotal(), config).budget,
                                   build_history_generation=lambda: build_history_generation(config))
     width_value = gate.test_threads(argv)

@@ -18,7 +18,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from typing import TypedDict, Unpack, cast, override
+from typing import TYPE_CHECKING, TypedDict, Unpack, cast, override
 from unittest import mock
 
 from scripts.build_queue import queue_evidence, head_facts, build_queue, queue_card, queue_view
@@ -26,6 +26,12 @@ from scripts.build_queue.queue_lines import Line, plain
 from scripts.build_queue.queue_fixture import write_process, fixture_queue_read, write_recovery_fixture
 from scripts.build_queue.queue_fixture import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
+
+if TYPE_CHECKING:
+    from scripts.buildlog import store
+else:
+    import store
+
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
 from scripts.lib.user_zone import user_zone
@@ -115,7 +121,7 @@ class QueueEvidenceTests(unittest.TestCase):
         folder = "/tmp/p34-merge" if name == "widget" else f"/tmp/{name}"
         row: dict[str, object] = {
             "pid": pid, "start_time": str(pid), "need": gib(need), "repo": "hana", "step": step,
-            "worktree": folder, "sidecar": "", "admitted_at": gate.store.utc_iso(NOW - age),
+            "worktree": folder, "sidecar": "", "admitted_at": store.utc_iso(NOW - age),
             "test_threads": 8 if step == "nextest" else None, "call_id": None,
             "session_id": f"id-{name}", "session_name": f"stale-{name}",
         }
@@ -942,7 +948,7 @@ class QueueEvidenceTests(unittest.TestCase):
         facts.assert_called_once()
 
     def test_bump_read_failure_prints_unknown_and_preserves_success_exit(self) -> None:
-        gate.store.host_file(gate.store.host_name(), NOW).mkdir(parents=True)
+        store.host_file(store.host_name(), NOW).mkdir(parents=True)
         output = self.output()
         self.assertRegex(self.line(output, "Bumps since it joined:"),
                          r"^Bumps since it joined: unknown \(.+\)$")

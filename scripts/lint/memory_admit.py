@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import fcntl
-from contextlib import AbstractContextManager, closing
+from contextlib import closing
 import importlib
 import json
 import math
@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
 from functools import lru_cache
 from itertools import chain
 from types import UnionType, MappingProxyType
@@ -41,60 +41,20 @@ import conf
 
 
 from test_phase import (
-    NoTestPhaseRecord,
     ObservedTestPhase,
     TestPhaseRecord,
     UnobservedTestPhase,
-    UnreadableTestPhaseRecord,
 )
 
 
-class GitFacts(TypedDict):
-    repo_path: str | None
-    worktree: str | None
-    branch: str | None
-    sha: str | None
-
-
-class StepParser(Protocol):
-    def step_name(self, argv: list[str]) -> str: ...
-
-
-class GitIdentityReader(Protocol):
-    def read_test_phase(self, path: Path) -> TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord: ...
-
-    def git_directory(self, argv: list[str], cwd: str) -> str: ...
-    def git_facts(self, directory: str) -> GitFacts: ...
-    def queue_priority(self, action: Literal["set", "clear"], unit: str,
-                       why: str, set_by: str, at: float, *, transition_id: str = "", start: int = 0) -> None: ...
-    def head_admission(self, action: Literal["set", "admitted", "lapsed"], unit: str,
-                       step: str, need: int, free: int, reserve: int, why: str,
-                       set_by: str, at: float) -> None: ...
-
-
-class BuildLogStore(Protocol):
-    INDEX_NAME: str
-    UNKNOWN_IDENTITY: str
-
-    def root(self) -> Path: ...
-    def host_name(self) -> str: ...
-    def utc_iso(self, epoch: float) -> str: ...
-    def append_line(self, path: Path, record: object) -> None: ...
-    def locked_append(self, path: Path) -> AbstractContextManager[BinaryIO]: ...
-    def append_locked(self, handle: BinaryIO, record: object) -> None: ...
-    def whole_rows(self, handle: BinaryIO, start: int) -> Iterator[dict[str, object]]: ...
-    def read_last_whole_row_end(self, path: Path) -> int: ...
-    def host_file(self, host: str, epoch: float) -> Path: ...
-
-
-class BuildLogFileMarks(Protocol):
-    def marks(self, handle: BinaryIO, offset: int) -> str: ...
-
-
-parse: StepParser = cast(StepParser, cast(object, importlib.import_module("parse")))
-record: GitIdentityReader = cast(GitIdentityReader, cast(object, importlib.import_module("record")))
-store: BuildLogStore = cast(BuildLogStore, cast(object, importlib.import_module("store")))
-file_marks: BuildLogFileMarks = cast(BuildLogFileMarks, cast(object, importlib.import_module("index")))
+if TYPE_CHECKING:
+    from ..buildlog import parse, record, store
+    from ..buildlog import index as file_marks
+else:
+    import parse
+    import record
+    import store
+    import index as file_marks
 
 GIB = 1 << 30
 # 111 natedev filtered single-test runs with no recompilation in the 14 days
@@ -1535,14 +1495,9 @@ class ProgramProfile:
         return "full"
 
 
-def anonymous_history_rows(source: Path | BinaryIO) -> Iterator[dict[str, object]]:
-    """Read whole anonymous-history rows; an open handle must already be locked."""
-    if isinstance(source, Path):
-        with source.open("rb") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            yield from anonymous_history_rows(handle)
-        return
-    yield from store.whole_rows(source, 0)
+def anonymous_history_rows(path: Path) -> Iterator[dict[str, object]]:
+    """Read complete anonymous-history rows under a shared lock."""
+    return store.locked_rows(path)
 
 
 def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
@@ -1550,20 +1505,17 @@ def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
     """Read one program's peak history, without using cargo estimates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []
-    try:
-        for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
-            try:
-                if row.get("host") != host or row.get("step") != program:
-                    continue
-                peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
-                if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
-                    continue
-                if cutoff <= datetime.fromisoformat(ended.replace("Z", "+00:00")) <= now:
-                    peaks.append(peak)
-            except (ValueError, TypeError, AttributeError):
+    for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+        try:
+            if row.get("host") != host or row.get("step") != program:
                 continue
-    except FileNotFoundError:
-        pass
+            peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
+            if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
+                continue
+            if cutoff <= datetime.fromisoformat(ended.replace("Z", "+00:00")) <= now:
+                peaks.append(peak)
+        except (ValueError, TypeError, AttributeError):
+            continue
     return MeasuredProgramPeak(percentile(peaks), len(peaks)) if peaks else FirstProgramPeak(first_peak_bytes)
 
 
@@ -2384,6 +2336,7 @@ def current_worktree_steps(root: Path, host: str, worktree: str,
     The index is only an acceleration: missing, replaced or incompatible data
     makes us read the canonical file instead. Partial or corrupt tails refuse
     freshness rather than hiding a more recent build.
+    This reader holds one lock for os.fstat and file_marks.marks and rejects partial tails that whole_rows skips.
     """
     prefixes: dict[str, tuple[int, str]] = {}
     indexed: dict[str, list[dict[str, object]]] = {}

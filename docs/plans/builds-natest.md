@@ -295,7 +295,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `basedpyright scripts/production/gate_modules.py scripts/production/merge_gate.py scripts/test_times` prints `0 errors, 0 warnings, 0 notes`
 - `python3 -X importtime scripts/test_times/show.py top` lists no `scripts.production.merge_gate` import
 
-### Phase 9 — Memory admission and the disk sweeper read the build log through the locked reader  · status: todo
+### Phase 9 — Memory admission and the disk sweeper read the build log through the locked reader  · status: done
 **Depends on:** Phase 4
 **Blocked by:** resources P51/P53 and queue 10c reach origin/builds (builds showrunner order, 2026-11-03).
 

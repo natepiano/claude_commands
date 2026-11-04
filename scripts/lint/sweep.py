@@ -1691,22 +1691,21 @@ def load_trim_for_recovery(path: Path) -> TrimTake | DamagedTrimIntentSetAside:
 
 
 def build_log_rows(paths: Iterable[Path], start: int = 0) -> Iterator[dict[str, object]]:
-    """One JSON-line reader for rebuild evidence and trim publication recovery."""
+    """Read rows of each build-log file through store.locked_rows for rebuild evidence."""
     for path in paths:
-        with path.open("rb") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            yield from store.whole_rows(handle, start)
+        yield from store.locked_rows(path, start)
+        # A month that disappears after enumeration must fail the rebuild report.
+        if not path.exists():
+            raise FileNotFoundError(path)
 
 
 def trim_row_recorded(take: TrimTake) -> bool:
     path = store.host_file(store.host_name(), take.at)
-    if not path.exists():
-        return False
     extent = "whole" if take.remaining_groups == 0 else "partial"
     return any(row.get("kind") == "sweep_trim" and row.get("folder") == take.target
                and row.get("cause") == take.cause and row.get("at") == store.utc_iso(take.at)
                and row.get("bytes_freed") == take.bytes_freed and row.get("extent") == extent
-               for row in build_log_rows([path], take.log_offset))
+               for row in store.locked_rows(path, take.log_offset))
 
 
 @contextmanager
@@ -3587,18 +3586,9 @@ def sweep_removals_path() -> Path:
     return floor_record_path().with_name("removals.jsonl")
 
 
-def parse_sweep_removals(lines: Iterable[str]) -> list[SweepRemoval]:
+def parse_sweep_removals(rows: Iterable[dict[str, object]]) -> list[SweepRemoval]:
     events: list[SweepRemoval] = []
-    for line in lines:
-        if not line.endswith("\n"):
-            continue
-        try:
-            raw = cast(object, json.loads(line))
-        except ValueError:
-            continue
-        if not isinstance(raw, dict):
-            continue
-        row = cast(dict[str, object], raw)
+    for row in rows:
         at, path, cause = row.get("at"), row.get("path"), row.get("cause")
         if (_finite_number(at) and isinstance(path, str) and os.path.isabs(path)
                 and cause in ("budget take", "floor take")):
@@ -3619,11 +3609,7 @@ def record_sweep_removal(target: str, cause: Literal["budget take", "floor take"
 
 def read_sweep_removals() -> list[SweepRemoval]:
     try:
-        with sweep_removals_path().open(encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            return parse_sweep_removals(handle)
-    except FileNotFoundError:
-        return []
+        return parse_sweep_removals(store.locked_rows(sweep_removals_path()))
     except OSError as error:
         print(f"lint sweep: could not read removals: {error}", file=sys.stderr)
         return []
