@@ -5154,7 +5154,9 @@ class CiSliceMemoryTests(unittest.TestCase):
         _ = (self.ci / "memory.max").write_text(str(18 * GIB))
 
     def reading(self) -> gate.UnownedSliceMemory:
-        reading, = gate.unowned_slice_memory([], {}, self.proc, ci_memory_slice="hana-ci.slice")
+        config = gate.read_memory_config()
+        reading, = gate.unowned_slice_memory([], {}, self.proc, ci_memory_slice=config.ci_memory_slice,
+                                              ci_memory_margin_bytes=config.ci_memory_margin_bytes)
         return reading
 
     def test_idle_ci_charges_live_memory_and_swap(self) -> None:
@@ -5165,22 +5167,38 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.assertEqual(reading.swap_bytes, GIB)
         self.assertEqual(gate.growth_headroom(reading), 0)
 
-    def test_running_job_reserves_the_slice_limit_and_free_memory_growth(self) -> None:
+    def test_running_job_reserves_the_margin_and_free_memory_growth(self) -> None:
         _ = (self.proc / "123/comm").write_text("Runner.Worker\n")
         reading = self.reading()
         self.assertEqual(reading.bytes, 3 * GIB)
-        self.assertEqual(reading.promise, gate.LifetimePromise(18 * GIB))
-        self.assertEqual(gate.build_charge(reading), 18 * GIB)
-        self.assertEqual(gate.growth_headroom(reading), 15 * GIB)
+        self.assertEqual(reading.promise, gate.LifetimePromise(9 * GIB))
+        self.assertEqual(gate.build_charge(reading), 9 * GIB)
+        self.assertEqual(gate.growth_headroom(reading), 6 * GIB)
         decision = gate.decide(60 * GIB, 64 * GIB, 7 * GIB, [reading],
                                limits=gate.AdmissionLimits(24 * GIB, 0))
-        self.assertEqual(decision.state, "hold")
+        self.assertEqual(decision.state, "admit")
 
     def test_slice_limit_is_read_again_for_each_measurement(self) -> None:
         _ = (self.proc / "123/comm").write_text("Runner.Worker\n")
-        self.assertEqual(gate.build_charge(self.reading()), 18 * GIB)
-        _ = (self.ci / "memory.max").write_text(str(40 * GIB))
-        self.assertEqual(gate.build_charge(self.reading()), 40 * GIB)
+        self.assertEqual(gate.build_charge(self.reading()), 9 * GIB)
+        _ = (self.ci / "memory.max").write_text(str(5 * GIB))
+        self.assertEqual(gate.build_charge(self.reading()), 5 * GIB)
+
+    def test_margin_is_read_from_config_for_each_measurement(self) -> None:
+        _ = (self.proc / "123/comm").write_text("Runner.Worker\n")
+        self.assertEqual(gate.build_charge(self.reading()), 9 * GIB)
+        write_memory_config(self.root / "lint.conf", ci_memory_margin_gib="2")
+        self.assertEqual(gate.build_charge(self.reading()), 5 * GIB)
+        write_memory_config(self.root / "lint.conf", ci_memory_margin_gib="0")
+        self.assertEqual(gate.build_charge(self.reading()), 3 * GIB)
+
+    def test_active_ci_margin_includes_swap_and_preserves_live_use(self) -> None:
+        _ = (self.proc / "123/comm").write_text("Runner.Worker\n")
+        _ = (self.ci / "memory.swap.current").write_text(str(GIB))
+        self.assertEqual(gate.build_charge(self.reading()), 10 * GIB)
+        _ = (self.ci / "memory.max").write_text(str(3 * GIB))
+        self.assertEqual(gate.build_charge(self.reading()), 4 * GIB)
+        self.assertEqual(gate.growth_headroom(self.reading()), 0)
 
     def test_missing_or_unbounded_limit_refuses_the_reading(self) -> None:
         for content in (None, "max"):

@@ -776,7 +776,8 @@ class AdmissionServer:
         ordered, priority = self._queue_order()
         try:
             unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path,
-                                               ci_memory_slice=config.ci_memory_slice)
+                                               ci_memory_slice=config.ci_memory_slice,
+                                               ci_memory_margin_bytes=config.ci_memory_margin_bytes)
         except gate.SliceMemoryUnavailable as error:
             readings = replace(readings, host=gate.ReadingUnavailable(str(error)))
             unowned = ()
