@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -170,6 +171,28 @@ def _perform(part: Part) -> int:
         paths.add(str(vault / "hana hierarchy.md"))
         timestamps = (r"^date_modified:", r"^weekly_usage_checked_at:", r"^weekly_remaining_usage:",
                       r"^credit_balance:", r"^resets:", r"^limit_reset:", r"^Snapshot taken ")
+        # Phase notes join an existing content commit without causing another commit.
+        patterns = [re.compile(pattern) for pattern in timestamps]
+        relative = [str(Path(path).relative_to(vault)) for path in paths]
+        if vault_commit.changed(str(vault), relative, patterns):
+            from scripts.direct import phase_table
+
+            phase_notes = vault / "showrunners"
+            tracked_phases = vault_commit.git(str(vault), "ls-files", "-z", "--", "showrunners")
+            candidates = set(phase_notes.glob("*/*.md"))
+            candidates.update(
+                vault / path for path in tracked_phases.stdout.split("\0")
+                if Path(path).suffix == ".md" and Path(path).parent.parent == Path("showrunners")
+            )
+            for path in candidates:
+                content = vault_commit.read(str(path))
+                if isinstance(content, vault_commit.NoteAbsent):
+                    shown = vault_commit.git(str(vault), "show", f"HEAD:{path.relative_to(vault)}")
+                    if shown.returncode != 0:
+                        continue
+                    content = vault_commit.NoteContent(shown.stdout)
+                if isinstance(phase_table.phase_note_ownership(content.text), phase_table.NoteOwnership):
+                    paths.add(str(path))
         return vault_commit.main(["--job", "agent-notes", *[arg for pattern in timestamps for arg in ("--timestamp", pattern)], "--", *sorted(paths)])
     return 0
 
