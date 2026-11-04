@@ -40,4 +40,3 @@ def registered_send(argv: list[str], keys: Path, post: pushover.Post) -> int:
     entries = push_texts.catalog()
     with mock.patch.object(push_texts, "catalog", return_value=(*entries, entry)):
         return pushover.send(options, keys, post)
-

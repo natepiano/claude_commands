@@ -18,6 +18,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "production", "lib"
 from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.production import staff
 from scripts.agents import codex_mesh
+import herdr
 from inventory import CheckoutState, Host, InvalidInventory, Inventory, Session, inventory, parse_inventory
 from remote import other_machine, run_remote as run_remote
 import remote_control
@@ -149,10 +150,10 @@ def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[M
     return reports
 
 
-def wait_for_workers() -> None:
+def wait_for_workers(record: staff.StaffSnapshot) -> None:
     """Name local worker turns and wait until each turn ends."""
     names = {str(row.current_session): f"{row.name}: {row.current_session}"
-             for row in staff.initial_snapshot().rows if row.kind == "worker"}
+             for row in record.rows if row.kind == "worker"}
     announced: set[str] = set()
     while True:
         waiting: set[str] = set()
@@ -216,7 +217,16 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(shutdown_record.read()))
             return 0
         if options.command == "held-sessions":
-            wait_for_workers()
+            record = staff.StaffSnapshot(())
+            rows: list[staff.StaffRow] = []
+            try:
+                record = staff.initial_snapshot()
+                rows = restart.live_rows(record, herdr.Herdr(herdr.shared_session()), save_tabs=True)
+            except (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure) as error:
+                print(f"restart: save anomaly: {error}", file=sys.stderr)
+            shutdown_record.update(started=[], pending=[str(row.id) for row in rows])
+            print(f"saved {len(rows)} rows for restart at {time.strftime('%H:%M')}", flush=True)
+            wait_for_workers(record)
             return 0
         if options.command == "remote-control":
             result = remote_control.fix(options.session, options.pid, options.proc_start,
