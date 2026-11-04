@@ -539,7 +539,8 @@ Rules:
   worker got the phase-wide run, its 13 warnings were in the test worker's
   files, and the test worker had to be launched again.
 - Prove any claimed pre-existing failure on the pre-phase tree before mentioning
-  it. Do not stash; use the existing clean tree or a scratch checkout.
+  it. Do not stash; use the existing clean tree.
+  Use `build_folders.py run --owner O --name N -- CMD...` for a build experiment.
 - Re-run suspected environment failures unsandboxed before classifying them.
   Nested Swift `sandbox-exec` failures and missing GPU adapters are environment
   failures, not dependency or code defects.
@@ -1388,6 +1389,12 @@ Before a build goes to the user's machine (an install, a binary path given to
 the user, a deploy), run in that repository:
 
 `python3 ~/.claude/scripts/direct/assertion_guard.py --base main`
+
+Use `Assertion-Change: <path>::<test> — <why>` for one test.
+Use `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted` for deleted tests with the same prefix in that path.
+The prefix rules only `test removed` findings.
+It does not rule assertions in tests that remain.
+A prefix that matches no removed test blocks.
 
 Exit 1 (a removed, weaker or turned-off assertion or test with no
 `Assertion-Change:` ruling) or exit 2 (it could not run) stops the hand-off:

@@ -9,17 +9,17 @@ import sys
 import threading
 import time
 import unittest
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Literal, cast, final
+from typing import TYPE_CHECKING, cast, final
 from unittest import mock
 
 if TYPE_CHECKING:
     import herdr
     import unit_lookup
-    import shutdown_record
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 import herdr
@@ -29,10 +29,43 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 PANE_RESULT = herdr.Herdr.result
 
 
-def native_claude(environment: Mapping[str, str], pid: int) -> None:
+@contextmanager
+def private_process_registry() -> Generator[None]:
+    """Read private process generations and retain normal reads for other processes."""
+    import sessions
+    from scripts.message import sessions as runtime_sessions
+
+    original_start = runtime_sessions.process_start
+    original_running = runtime_sessions.running_session
+
+    def started(pid: int) -> str | None:
+        root = os.environ.get("HERDR_PROC", "")
+        path = Path(root) / str(pid) / "stat"
+        if root and path.is_file() and not (path.parent / "kernel-process").exists():
+            fields = path.read_text().rsplit(")", 1)[1].split()
+            return fields[19] if len(fields) > 19 else None
+        return original_start(pid)
+
+    def running(record: runtime_sessions.SessionRecord) -> bool:
+        root = os.environ.get("HERDR_PROC", "")
+        directory = Path(root) / str(record["pid"])
+        if root and (directory / "stat").is_file() and not (directory / "kernel-process").exists():
+            return record.get("procStart", started(record["pid"])) == started(record["pid"])
+        return original_running(record)
+
+    with (mock.patch.object(sessions, "process_start", side_effect=started),
+          mock.patch.object(runtime_sessions, "process_start", side_effect=started),
+          mock.patch.object(sessions, "running_session", side_effect=running),
+          mock.patch.object(runtime_sessions, "running_session", side_effect=running)):
+        yield
+
+
+def native_claude(environment: Mapping[str, str], pid: int, *, kernel_process: bool = False) -> None:
     """Publish the private process files needed for registry and liveness reads."""
     directory = Path(environment["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
+    if kernel_process:
+        (directory / "kernel-process").touch()
     for name, content in (("environ", b""), ("cmdline", b"claude\0")):
         if not (directory / name).exists():
             _ = (directory / name).write_bytes(content)
@@ -79,17 +112,31 @@ def environment(root: Path) -> dict[str, str]:
     }
 
 
+def _write_children(root: Path) -> None:
+    """Update thread child lists from the private process parent facts."""
+    parents = {
+        int(path.parent.name): int(path.read_text().rsplit(")", 1)[1].split()[1])
+        for path in root.glob("[0-9]*/stat")
+    }
+    for pid in parents:
+        task = root / str(pid) / "task" / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        children = sorted(child for child, parent in parents.items() if parent == pid)
+        _ = (task / "children").write_text(" ".join(str(child) for child in children))
+
+
 def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], marks: Mapping[str, str], *, started: str = "1",
             session: int | None = None, cwd: Path | None = None) -> None:
     directory = Path(env["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
-    _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} {pid} {session or pid} {session or pid} 0 " + "0 " * 13 + started)
+    _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} {pid} {session or pid} 0 {session or pid} " + "0 " * 13 + started)
     _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
     _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in marks.items()).encode())
     link = directory / "cwd"
     link.unlink(missing_ok=True)
     link.symlink_to(cwd or directory.parent.parent)
     _ = (directory / "cgroup").write_text("")
+    _write_children(directory.parent)
 
 
 def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
@@ -120,7 +167,7 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
             responses[f"--session {name} pane process-info --pane {unit.pane}"] = {
                 "code": 0, "stdout": json.dumps({"result": {"process_info": {
                     "shell_pid": shell, "foreground_process_group_id": shell,
-                    "foreground_processes": [{"name": "zsh"}]}}})}
+                    "foreground_processes": [{"name": "zsh", "argv": ["zsh"], "pid": shell}]}}})}
             responses[f"--session {name} pane close {unit.pane}"] = {
                 "code": 0, "stdout": "", "remove_paths": [str(Path(env["HERDR_PROC"]) / str(shell))]}
             for source in ("recent", "recent-unwrapped"):
@@ -165,6 +212,7 @@ def place_process(env: Mapping[str, str], pid: int, pane: str, *, session: str =
             "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": pid}}})}
         _ = responses_file.write_text(json.dumps(responses))
         shutil.rmtree(directory)
+        _write_children(directory.parent)
 
 
 def calls(env: Mapping[str, str]) -> list[list[str]]:
@@ -221,6 +269,7 @@ class PaneShellFixture:
         self.parent(self.shell)
         if not live:
             shutil.rmtree(process_root / str(self.director))
+            _write_children(process_root)
         case.enterContext(mock.patch.dict(os.environ, self.environment))
         _ = case.enterContext(mock.patch.object(herdr.Herdr, "result", PANE_RESULT))
         _ = case.enterContext(mock.patch.object(unit_move, "processes_inside", side_effect=self.inside_pids))
@@ -247,6 +296,7 @@ class PaneShellFixture:
         import unit_lookup
         self.lifecycle.append("director exited")
         shutil.rmtree(Path(self.environment["HERDR_PROC"]) / str(self.director), ignore_errors=True)
+        _write_children(Path(self.environment["HERDR_PROC"]))
         self._found = unit_lookup.MarkedUnit(self.unit, unit_lookup.ClaudeNotRunning(), self.place)
 
     def marked_unit(self, slug: str, unit: str) -> unit_lookup.MarkedUnit | None:
@@ -284,77 +334,20 @@ class PaneShellFixture:
                 session=os_session, cwd=self.worktree)
 
 
-def stopped_record(root: Path, worktree: Path, *, name: str = "alpha", cwd: Path | None = None,
-                   production: str = "demo", unit: str = "alpha-unit", doc: Path | None = None,
-                   host_session: str = "agents", branch: str = "", plan: Path | None = None,
-                   progress: Literal["waiting", "ready", "stopped"] = "stopped",
-                   runtime_id: str = "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3") -> shutdown_record.SessionShutdown:
-    """One typed unit record builder; callers override only their scenario's values."""
-    del production, doc  # Parentage is supplied by staff, never persisted here.
-    saved: shutdown_record.SessionShutdown = {
-        "login": "owner@example.com", "label": "claude2", "machine": "natedev",
-        "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
-        "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
-        "alerts": "none", "probe": False,
-        "session": {
-            "session_id": runtime_id, "config_dir": str(root), "pid": 4242, "proc_start": "1",
-            "name": name, "cwd": str(cwd or worktree), "status": "idle", "updated_at": 0, "probe": False,
-            "model": {"kind": "no reply yet"},
-            "checkout": {"kind": "git", "path": str(worktree), "head": {"kind": "branch", "name": branch},
-                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []} if branch else {"kind": "not a checkout"},
-            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "unit": unit,
-                     "session_name": host_session, "session_host": "herdr",
-                     "plan": {"kind": "plan", "path": str(plan)} if plan is not None else {"kind": "no run record"}},
-        },
-        "workers": [], "timers": [], "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-        "progress": {"kind": "stopped", "at": "2026-10-09T21:50:00+00:00"},
-        "stop_issues": [], "trail": [], "codex_seats": [],
-    }
-    if progress == "waiting":
-        saved["progress"] = {"kind": "waiting"}
-    elif progress == "ready":
-        saved["progress"] = {"kind": "ready", "at": "2026-10-09T21:50:00+00:00"}
-    return saved
-
-
-def assert_shared_stop_record(case: unittest.TestCase, seed: Callable[[], Path], path: Path) -> None:
-    """Required/default record fields come from one builder in every lifecycle fixture."""
-    def with_new_default[**P](build: Callable[P, shutdown_record.SessionShutdown]) -> Callable[P, shutdown_record.SessionShutdown]:
-        def changed(*args: P.args, **kwargs: P.kwargs) -> shutdown_record.SessionShutdown:
-            saved = build(*args, **kwargs)
-            saved["request_id"] = "shared-default-request"
-            return saved
-        return changed
-
-    with mock.patch(__name__ + ".stopped_record", side_effect=with_new_default(stopped_record)) as builder:
-        _ = seed()
-    builder.assert_called_once()
-    case.assertEqual(json.loads(path.read_text())["request_id"], "shared-default-request")
-
-
 def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path, *,
                     destination: tuple[str, str, str]) -> None:
     """A shutdown boundary that records a clean stop and one marked relaunch."""
     import rename_unit
-    import shutdown_record
     import unit_lookup
     import herdr
     stopped_event = threading.Event()
-    initial = cast(dict[str, object], json.loads(path.read_text()))
-    if cast(dict[str, object], initial['progress']).get('kind') == 'stopped':
-        stopped_event.set()
+    del path
     pane.environment['RENAME_UNIT_STOP_WAIT'] = str(TEST_HANG_GUARD_SECS)
 
     def shutdown(*arguments: str) -> None:
         pane.stop_calls.append(' '.join(arguments))
         if arguments[0] == 'stop':
             pane.stopped()
-            fields = cast(dict[str, str], json.loads(path.read_text()))
-            def stopped(saved: shutdown_record.SessionShutdown) -> None:
-                saved['progress'] = {'kind':'stopped','at':'2026-10-09T21:50:00+00:00'}
-                saved['stop_issues'] = []
-            _ = shutdown_record.update_session(fields['login'], pane.native_id, stopped)
             stopped_event.set()
         elif arguments[0] == 'restart':
             pane.slug, pane.unit, name = destination

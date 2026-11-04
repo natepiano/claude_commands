@@ -23,6 +23,7 @@ import asyncio
 import json
 import hashlib
 import math
+import re
 import os
 import subprocess
 import sys
@@ -58,7 +59,7 @@ from scripts.maintenance.settings import positive, usage_only_interval
 from user_zone import user_zone
 
 
-# Expand at refresh time so callers can substitute HOME or an absolute test path.
+# Expand at refresh time so callers can use a scratch home.
 SESSIONS_SEEN = Path("~/.local/state/agent-notes/sessions_seen.json")
 # Read low accounts every two minutes so exhaustion moves keep their cadence.
 LIVE_USAGE_REMAINING_THRESHOLD = 10
@@ -190,6 +191,8 @@ def write_note(note: Note, updates: dict[str, str | tuple[str, ...]], *,
     delimiter, body = suffix[:delimiter_end], suffix[delimiter_end:]
     if isinstance(section, SessionsSection):
         body = session_table.replace_section(body, section.section)
+    else:
+        body = re.sub(r"^## Live sessions[ \t]*$", "## Session history", body, flags=re.MULTILINE)
     text = note.text[:note.start] + "\n".join(lines) + delimiter + body
     if text == note.text:
         return False
@@ -505,7 +508,7 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
     sessions = session_table.live_sessions(os.environ)
     machines_seen: dict[str, str] = {}
     if isinstance(sessions, session_table.SessionsUnread):
-        messages.append(f"sessions: {sessions.reason}")
+        messages.append(f"sessions: anomaly: {sessions.reason}")
     else:
         machines_seen = read_sessions_seen()
         machines_seen.update({machine: checked_at.astimezone(user_zone()).isoformat(timespec="seconds")
@@ -522,16 +525,9 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
                                     if groups.get(group) == note.label)
         elif note.tool == "codex" and isinstance(codex_readings.selected_account, KnownCodexAccount):
             updates["role"] = ("worker",) if note.label == codex_readings.selected_account.label else ()
-        section: SessionsSection | KeepSections = KEEP_SECTIONS
-        if isinstance(sessions, session_table.ReadSessions):
-            kept = tuple(session_table.last_seen(row, machines_seen) for row in session_table.section_rows(note.text[note.end:])
-                         if row.machine in sessions.rows_kept)
-            live = tuple(row._replace(last_seen="", observed_at="")
-                         for row in sessions.rows_by_label.get(note.label, ()))
-            rows = live + kept
-            updates["sessions"] = str(len(live))
-            section = SessionsSection(session_table.render_section(rows, sessions.unattributed))
-        _ = write_note(note, updates, remove=frozenset({"state"}), section=section, stamp=stamp)
+        rows = sessions.rows_by_label if isinstance(sessions, session_table.ReadSessions) else {}
+        updates["sessions"] = str(len(rows.get(note.label, ())))
+        _ = write_note(note, updates, remove=frozenset({"state"}), stamp=stamp)
     if readings:
         try:
             append_readings(readings, checked_at)
@@ -586,6 +582,7 @@ def usage_only(*, poll_seconds: float = 0) -> None:
     interval = usage_only_interval() - poll_seconds / 2
     with locked_history(schedule_directory("usage-only")) as history:
         if isinstance(history, ScheduleBusy):
+            print(f"already claimed by {history.owner_id}")
             return
         with role_map.stored_role_map():
             selection = accounts.claude_account_selection(usage_only=True)
@@ -612,6 +609,7 @@ def renew_logins() -> None:
     try:
         with locked_history(schedule_directory("login-renewal")) as renewal_history:
             if isinstance(renewal_history, ScheduleBusy):
+                print(f"already claimed by {renewal_history.owner_id}")
                 return
             for line in refusal_watch.renew_expired_logins(datetime.now(timezone.utc), False):
                 print(line)

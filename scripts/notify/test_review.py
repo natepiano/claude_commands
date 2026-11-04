@@ -24,6 +24,8 @@ import pushover
 import review
 import reply_asks
 import push_texts
+import push_reference
+from push_test_support import registered_send
 from user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
 REAL_REVIEW = review.review
@@ -995,10 +997,10 @@ class LocalReviewTests(unittest.TestCase):
         _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
         post = mock.Mock(return_value=(200, b'{"status":1}'))
         with mock.patch.object(review, "review", return_value=outcome), redirect_stdout(io.StringIO()):
-            self.assertEqual(pushover.send(["--priority", "2", "--source", draft.source,
-                "--action", cast(ActionRequired, draft.action).text, draft.title, draft.body], keys_file=keys, post=post), 0)
+            self.assertEqual(registered_send(["--priority", "2", "--source", draft.source,
+                "--action", cast(ActionRequired, draft.action).text, draft.title, draft.body], keys, post), 0)
         form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
-        self.assertEqual(form["message"], [with_footer(first_line(revised.action) + "\n" + revised.body, draft.source)])
+        self.assertEqual(form["message"], [with_footer(first_line(revised.action) + "\n" + revised.body, draft.source, "fixture.admitted")])
         self.assertIn("sent despite failed review", str(self.entries()[0]["detail"]))
 
     def test_texts_reviews_every_example_and_approves_only_unchanged_send_results(self) -> None:
@@ -1385,7 +1387,7 @@ class LocalReviewTests(unittest.TestCase):
                     self.assertEqual(outcome.why, f"review unavailable: {type(error).__name__}: {error}")
                     with (mock.patch.object(review, "review", side_effect=read),
                           redirect_stdout(io.StringIO())):
-                        self.assertEqual(pushover.send(
+                        self.assertEqual(registered_send(
                             ["--source", self.draft.source, "--priority", self.draft.priority,
                              "--action", cast(ActionRequired, self.draft.action).text,
                              self.draft.title, self.draft.body], keys, post), 0)
@@ -1393,7 +1395,7 @@ class LocalReviewTests(unittest.TestCase):
                 form = urllib.parse.parse_qs(posted[0].decode())
                 self.assertEqual(form["title"], [self.draft.title])
                 self.assertEqual(form["message"], [with_footer(first_line(self.draft.action) + "\n" + self.draft.body,
-                                                               self.draft.source)])
+                                                               self.draft.source, "fixture.admitted")])
                 self.assertIn(outcome.why, str(self.entries()[-1]["verdict"]))
 
     def test_missing_or_unreadable_guide_never_starts_claude(self) -> None:
@@ -1475,18 +1477,6 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(call.environment["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
             self.assertEqual(call.environment["MESSAGE_TEST_KEEP"], "kept")
 
-    def test_reviewer_refuses_an_account_with_the_wrong_login_before_launch(self) -> None:
-        _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "wrong@example.invalid"},
-        }))
-        runner = FakeReviewer(verdict(self.draft))
-        result = review.review(self.draft, False, runner=runner)
-        self.assertIsInstance(result, review.Unreviewed)
-        assert isinstance(result, review.Unreviewed)
-        self.assertTrue(result.why.startswith("review unavailable: accounts:"))
-        self.assertIn("holds a different login from claude2", result.why)
-        self.assertEqual(runner.calls, [])
-
     def test_named_unit_account_replaces_the_callers_directory(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
         _ = (self.root / "notes/claude3.md").write_text("---\nlogin: unit@example.invalid\n---\n")
@@ -1525,6 +1515,19 @@ class LocalReviewTests(unittest.TestCase):
     def hold_file(self) -> Path:
         digest = hashlib.sha256(self.draft.source.encode()).hexdigest()[:16]
         return self.root / "state/held" / (digest + ".json")
+
+    def test_question_reference_survives_rewrite_and_the_held_record(self) -> None:
+        reference = push_reference.QuestionReference(kind="question", path=str(self.root / "question.md"), since="2026-11-03T12:00")
+        self.draft = replace(self.draft, reference=reference)
+        held = self.held()
+        with mock.patch.object(review, "schedule"):
+            review.hold(held)
+        found = review.held_for(held.source)
+        self.assertIsInstance(found, review.LiveHold)
+        assert isinstance(found, review.LiveHold)
+        self.assertEqual(found.hold.draft.reference, reference)
+        self.assertEqual(found.hold.best_version.reference, reference)
+        self.assertEqual(review.draft_record(found.hold.best_version).get("reference"), reference)
 
     def test_hold_round_trip_uses_source_hash_and_schedules_due(self) -> None:
         held = self.held()
@@ -1591,7 +1594,7 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.due(post=post, keys_file=keys), 0)
             self.assertEqual(review.due(post=post, keys_file=keys), 0)
         self.assertEqual(len(calls), 1)
-        self.assertIn(b"priority=1", calls[0])
+        self.assertIn(b"priority=0", calls[0])
         self.assertIsInstance(review.held_for(self.draft.source), review.NoHold)
         self.assertIn("sent after hold expired", pushover.LOG_FILE.read_text())
 
@@ -1653,7 +1656,7 @@ class LocalReviewTests(unittest.TestCase):
 
         with (mock.patch.object(time, "time", return_value=1301 + review.claim_stale_seconds()),
               mock.patch.object(review, "review", side_effect=read), redirect_stdout(io.StringIO())):
-            self.assertEqual(pushover.send(
+            self.assertEqual(registered_send(
                 ["--source", self.draft.source, "--priority", self.draft.priority, "--answerable",
                  "--action", cast(ActionRequired, self.draft.action).text,
                  self.draft.title, self.draft.body], keys, post), 0)

@@ -11,6 +11,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production.rename_unit_test_support import UnitRenameFixture
+from scripts.production.staff_test_support import unit_membership
+from scripts.production import staff
 import herdr
 
 
@@ -55,13 +57,15 @@ class UnitRenameVerifyTests(UnitRenameFixture):
         restarts = self.seed_record(name="demo-alpha")
         with patch.dict(os.environ, self.env):
             path = herdr.layout_path(herdr.shared_session())
+        owner = staff.snapshot().by_path("demo")
+        assert owner is not None
+        unit = unit_membership("demo", "alpha-unit")
+        other = unit_membership("demo", "mul_add-unit")
         layout = herdr.SavedLayout(at=123.0, workspaces=[
             herdr.SavedSpace(name="demo", seen=120.0, tabs=[
-                herdr.SavedName(name="demo", seen=100.0),
-                herdr.SavedName(name="demo-alpha", seen=110.0),
-                herdr.SavedName(name="mul_add", seen=115.0),
-                herdr.SavedName(name="gamma", seen=119.0),
-                herdr.SavedName(name="alpha-unit", seen=111.0),
+                herdr.SavedName(name=owner.id, seen=100.0),
+                herdr.SavedName(name=unit.id, seen=110.0),
+                herdr.SavedName(name=other.id, seen=115.0),
             ]),
             herdr.SavedSpace(name="another-production", seen=121.0,
                              tabs=[herdr.SavedName(name="alpha", seen=118.0)]),
@@ -70,22 +74,18 @@ class UnitRenameVerifyTests(UnitRenameFixture):
         self.assert_refused(self.rename("apply"), "gamma-unit is not running")
         with patch.dict(os.environ, self.env):
             saved = herdr.saved_layout(herdr.shared_session())
-        expected = herdr.SavedLayout(at=123.0, workspaces=[
-            herdr.SavedSpace(name="demo", seen=120.0, tabs=[
-                herdr.SavedName(name="demo", seen=100.0),
-                herdr.SavedName(name="gamma", seen=119.0),
-                herdr.SavedName(name="mul_add", seen=115.0),
-            ]), layout["workspaces"][1],
-        ])
+        expected = layout
         self.assertEqual(saved, expected)
         _ = self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.assert_ok(self.rename("apply"))
         self.assert_ok(self.rename("verify"))
         self.assertEqual(json.loads(path.read_text()), expected)
-        self.write(path, json.dumps(layout))
+        corrupt = cast(herdr.SavedLayout, json.loads(json.dumps(layout)))
+        corrupt["workspaces"][0]["tabs"][1]["name"] = "demo-alpha"
+        self.write(path, json.dumps(corrupt))
         self.assert_refused(self.rename("verify"), f"unclassified: {path} still holds an old name")
-        expected["workspaces"][0]["tabs"][1]["name"] = "alpha"
-        self.write(path, json.dumps(expected))
+        corrupt["workspaces"][0]["tabs"][1]["name"] = "alpha"
+        self.write(path, json.dumps(corrupt))
         self.assert_refused(self.rename("verify"), f"herdr {path}: demo tab is still labelled alpha")
         # The live incident left an older journal at step 10, after relaunch.
         journal = self.journal()
@@ -95,6 +95,6 @@ class UnitRenameVerifyTests(UnitRenameFixture):
         self.assert_ok(self.rename("apply"))
         self.assertEqual(restarts.read_bytes(), launches, "layout recovery must not restart the live unit")
         self.assertIs(self.journal()["done"], True)
-        expected["workspaces"][0]["tabs"][1]["name"] = "gamma"
+        expected["workspaces"][0]["tabs"][1]["name"] = unit.id
         self.assertEqual(json.loads(path.read_text()), expected)
         self.assert_ok(self.rename("verify"))

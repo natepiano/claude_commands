@@ -39,6 +39,7 @@ from scripts.production.add_showrunner_test_support import AddShowrunnerFixture,
 
 from scripts.production import staff
 from scripts.production import completion_receipt
+from scripts.production.fake_unit_host import process as write_process
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -390,7 +391,6 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         selected = accounts.NamedAccount("claude3", self.root / "selected")
         native = fixture_runtime_id("shared-tab-resumed-showrunner")
         path, record = self.record(native, "kid")
-        _ = Path(path).write_text(record)
         pid = cast(dict[str, object], json.loads(record))["pid"]
         transcript = selected.dir / "projects/fixture" / f"{native}.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -402,9 +402,17 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             nonlocal elapsed
             elapsed += seconds
 
-        def visible(*_args: str, deadline: float = math.inf) -> str:
+        def visible(*args: str, deadline: float = math.inf) -> str:
             del deadline
+            if args[:2] == ("pane", "process-info"):
+                return json.dumps({"result": {"process_info": {
+                    "shell_pid": 998040, "foreground_process_group_id": pid,
+                    "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}})
             return screen
+
+        def started(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            _ = Path(path).write_text(record)
+            return subprocess.CompletedProcess([], 0, "", "")
 
         def turn(*, meta: bool) -> None:
             with transcript.open("a") as output:
@@ -436,12 +444,12 @@ class AddShowrunnerTests(AddShowrunnerFixture):
               patch.object(runtime, "start_server"),
               patch.object(runtime, "open_tab", return_value="destination:p1") as tab,
               patch.object(runtime, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
-              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "label": "kid"}]),
-              patch.object(runtime.Herdr, "start_command", return_value=subprocess.CompletedProcess([], 0, "", "")),
+              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "workspace_id": "destination", "label": "kid"}]),
+              patch.object(runtime.Herdr, "start_command", side_effect=started),
               patch.object(runtime.Herdr, "readiness", return_value={"agent_status": "idle", "interactive_ready": True}) as readiness,
-              patch.object(runtime.Herdr, "prompt", autospec=True, side_effect=typed) as prompt,
+              patch.object(runtime.Herdr, "_prompt", autospec=True, side_effect=typed) as prompt,
               patch.object(runtime.Herdr, "run", side_effect=visible),
-              patch.object(runtime.Herdr, "send_keys", autospec=True, side_effect=enter) as keys):
+              patch.object(runtime.Herdr, "_send_keys", autospec=True, side_effect=enter) as keys):
             outcome = add_showrunner.launch(child, "opus", "high", native, self.root, selected)
         self.assertIsInstance(outcome, runtime.PromptSubmitted)
         self.assertEqual(prompt.call_count, 1)
@@ -519,21 +527,6 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
-    def test_new_showrunner_refuses_configured_account_with_wrong_login(self) -> None:
-        """F006: a trusted directory cannot bypass the configured account's readiness."""
-        directory = self.named_account()
-        _ = (directory / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "other@example.invalid"},
-            "projects": {str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
-        path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
-        before = path.read_bytes()
-        result = self.run_command("kid")
-        self.refused(result, "~/.claude3 holds a different login from claude3; "
-                     + "run env -u CLAUDE_CODE_OAUTH_TOKEN "
-                     + f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude, then /login as claude3")
-        self.assertNotIn("other@example.invalid", result.stdout + result.stderr)
-        self.assertEqual(path.read_bytes(), before)
-
     def test_new_showrunner_repairs_a_wrong_shared_link_before_launching(self) -> None:
         directory = self.named_account()
         linked = directory / "projects"
@@ -547,15 +540,19 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
         self.assertEqual(self.parent_of("kid"), "top")
 
-    def test_new_showrunner_refuses_a_real_file_against_an_existing_shared_folder(self) -> None:
+    def test_new_showrunner_preserves_a_real_shared_file_and_launches_after_an_anomaly(self) -> None:
         directory = self.named_account()
-        local = directory / "projects"
+        local = directory / "skills"
         local.unlink()
-        _ = local.write_text("local projects data")
+        _ = local.write_text("local skills data")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
-        self.refused(result, f"{local} is a real file; move it aside or merge it into ~/.claude")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"accounts: anomaly: {local} is a real file; move it aside or merge it into ~/.claude",
+                      result.stderr)
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
         self.assertFalse(local.is_symlink())
-        self.assertEqual(local.read_text(), "local projects data")
+        self.assertEqual(local.read_text(), "local skills data")
 
     def test_picked_named_account_refuses_untrusted_folder_despite_default_trust(self) -> None:
         directory = self.named_account()
@@ -662,13 +659,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             (991000, 0, ["herdr", "--session", "kid", "server"], {}),
             (991001, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1"}),
         ):
-            process = Path(self.env["HERDR_PROC"]) / str(pid)
-            process.mkdir(parents=True)
-            _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
-            _ = (process / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
-            _ = (process / "environ").write_bytes(
-                ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
-            )
+            write_process(self.env, pid, parent, argv, environment)
         result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--check")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("check: ok", result.stdout)

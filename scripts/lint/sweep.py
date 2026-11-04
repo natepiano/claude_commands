@@ -178,11 +178,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import send_budget
+from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS, PROC_LOCKS_READS as PROC_LOCKS_READS, lock_holder as lock_holder
 import conf
 from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from . import tmp_sweep
+    from ..copies import copies
     from ..lib import scratch
     from ..lib.atomic_file import write_text_atomic
     from ..buildlog import record, store
@@ -191,6 +195,7 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.copies import copies
     from scripts.lint import tmp_sweep
     import scratch
     from atomic_file import write_text_atomic
@@ -216,10 +221,6 @@ MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
 TARGET_DIR_FLAG = "--target-dir"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
-PROC_LOCKS = "/proc/locks"
-# The kernel writes /proc/locks one page per read and drops its lock between pages; a lock freed earlier in the
-# list moves the next page past one line. Each extra read gives a skipped line another chance to show.
-PROC_LOCKS_READS = 3
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
@@ -804,30 +805,6 @@ def process_use(target: str, owners: TargetOwnerIndex, proc: str = PROC_DIR) -> 
     check.checked_targets = (target,)
     check.rechecking = True
     return process_uses(check) if proc == PROC_DIR else process_uses(check, proc)
-
-
-def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
-    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder.
-
-    A read under load can skip a line (PROC_LOCKS_READS), so no holder is the answer only after every read agrees.
-    """
-    try:
-        stat = os.stat(lock)
-    except OSError:
-        return None
-    # "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF"; a waiter's line has "->".
-    device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
-    for _ in range(PROC_LOCKS_READS):
-        try:
-            with open(locks, encoding="ascii", errors="replace") as handle:
-                lines = handle.read().splitlines()
-        except OSError:
-            return None
-        for line in lines:
-            fields = line.split()
-            if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
-                return int(fields[4])
-    return None
 
 
 def floor_lock_holder(path: str) -> KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder:
@@ -2549,7 +2526,7 @@ def send_holder_message(session: str, message: str) -> bool:
     """Tell a session that its process holds a target the floor needs; True when send.py delivered
     the message or queued it (exit 1)."""
     try:
-        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=40)
+        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=send_budget.seconds(30))
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"lint sweep: message to {session} failed: {error}", file=sys.stderr)
         return False
@@ -2583,7 +2560,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     delivered = False
     for channel, command in commands:
         try:
-            timeout = review.user_send_seconds() + 15 if channel == "phone" else 40
+            timeout = send_budget.user_seconds(review.user_send_seconds()) if channel == "phone" else send_budget.seconds(30)
             result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
             if result.returncode == 0 or (channel == "message" and result.returncode == 1):
                 delivered = True
@@ -2659,6 +2636,11 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
     return protected
 
 
+def floor_roots() -> tuple[str, ...]:
+    """Include the standing pool wherever copies configuration places it."""
+    return (*FLOOR_ROOTS, str(copies.gates_root()))
+
+
 def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, float],
                        tree_targets: dict[str, str]) -> list[record.IdleFloorTarget]:
     """Estimate each target independently of the shortfall and all other takes."""
@@ -2693,7 +2675,7 @@ def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, f
 def hold_floor(
     floor: int,
     dry_run: bool,
-    roots: Sequence[str] = FLOOR_ROOTS,
+    roots: Sequence[str] = (),
     lock: str = "",
 ) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
@@ -2721,7 +2703,7 @@ def hold_floor(
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
         busy: dict[str, TargetUse | LockHeld | BuildHoldTarget] = {}
-        targets = target_dirs(roots)
+        targets = target_dirs(roots or floor_roots())
         owners = TargetOwnerIndex(targets)
         known_trees: dict[str, list[str]] = {}
         hold_targets = build_hold_targets(targets, known_trees)

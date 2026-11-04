@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,10 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 import session_pane
+import herdr
 from scripts.message.relay_identity import relay_session_name
 from unit_lookup import Place
 from scripts.hooks import hook_dispatch
 from scripts.lib import test_hang_guard
+from scripts.lib.script_envelope import script_prompt
 from scripts.hooks.conversation_pause_test_support import (
     ASK_AGAIN, IDLE_NOTICE, NO_CONTEXT, NOW, OTHER_ANSWER_CONTEXT, PAUSE_CONTEXT,
     QUESTION, RETURN_SCHEDULE, SESSION, SETTINGS, ConversationPauseFixture,
@@ -205,28 +208,35 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse(stamp.exists())
 
     def test_typed_prompt_in_a_showrunner_or_unit_director_records_activity(self) -> None:
+        self.environment["HERDR_PANE_ID"] = "w0:p6"
         self.record_activity()
         _ = self.create_instance("showrunner-demo")
         self.assertEqual(self.run_prompt("hello").returncode, 0)
-        self.assertEqual(self.activity_calls(1), [["active"]])
+        expected = [["active", "--source", "UserTypedPrompt", "--session-id", SESSION,
+                     "--pane-id", "w0:p6", "--prompt-hash", hashlib.sha256(b"hello").hexdigest()]]
+        self.assertEqual(self.activity_calls(1), expected)
         self.activity_log.unlink()
         _ = (self.notifier_root / "showrunner-demo" / "conf").write_text("TARGET=session:other\nEVERY=5\nCOMMAND=report\n")
         _ = (self.unit_active_root / SESSION).write_text("/tmp/claude/unit/run-1\n")
         self.assertEqual(self.run_prompt("hello").returncode, 0)
-        self.assertEqual(self.activity_calls(1), [["active"]])
+        self.assertEqual(self.activity_calls(1), expected)
 
     def test_other_sessions_and_prompts_record_no_activity(self) -> None:
         self.record_activity()
         plain = self.run_prompt("hello")
         self.assertEqual((plain.returncode, plain.stderr), (0, ""))
         _ = self.create_instance("showrunner-demo")
-        for prompt in (cross_session("natedev", "continue"), "<task-notification>done</task-notification>"):
+        for prompt in (cross_session("natedev", "continue"), "<task-notification>done</task-notification>",
+                       "<system-reminder>hook output</system-reminder>"):
             self.assertEqual(self.run_prompt(prompt).returncode, 0)
         _ = self.create_instance("unit-scheduled", sender="unit-scheduled")
         self.assertEqual(self.run_prompt(cross_session("unit-scheduled", "update")).returncode, 0)
-        # A control: a typed prompt does reach the log, so the empty reading above means something.
+        # Record ignored sources without treating them as user activity.
         self.assertEqual(self.run_prompt("hello").returncode, 0)
-        self.assertEqual(self.activity_calls(1), [["active"]])
+        calls = self.activity_calls(5)
+        self.assertCountEqual([call[2] for call in calls],
+                              ["PeerPrompt", "HarnessNotice", "HarnessNotice", "ScriptPrompt", "UserTypedPrompt"])
+        self.assertTrue(all(call[4] == SESSION for call in calls))
 
     def test_only_the_users_own_prompt_ends_auto_silence(self) -> None:
         """A mover's resume prompt, a pane typed by session_pane.py and Claude Code's notices are not the user."""
@@ -238,15 +248,28 @@ class ConversationPauseTests(ConversationPauseFixture):
                   "Paused 03:10; resumed 03:12. This was an account move, not a stop. Continue where you stopped.")
         relay = "From the user (via the showrunner): go on"
         with patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(self.pause_root),
-                                     "HERDR_BIN": shutil.which("true") or "/bin/true"}):
+                                     "HERDR_BIN": shutil.which("true") or "/bin/true"}), \
+                patch.object(herdr.Herdr, "panes", return_value=[{
+                    "pane_id": pane, "workspace_id": "w1", "session_id": SESSION}]), \
+                patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                    "shell_pid": 998041, "foreground_process_group_id": 998042,
+                    "foreground_processes": [{"pid": 998042, "argv": ["claude"]}]}}), \
+                patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(SESSION, "fixture-start", {})), \
+                patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")):
             conversation_pause.record_scheduled_prompts(SESSION, (resume,))
-            session_pane.type_place(Place("demo", pane), relay)
-        for prompt in (resume, relay, cross_session("natedev", "continue"), IDLE_NOTICE):
+            with patch.object(herdr.Herdr, "prompt") as transmitted:
+                session_pane.type_place(Place("demo", pane), relay, target=SESSION)
+            transmitted.assert_called_once_with(pane, script_prompt(relay), target=SESSION)
+            generated = cast(str, transmitted.call_args.args[1])
+        for prompt in (resume, generated, cross_session("natedev", "continue"), IDLE_NOTICE):
             with self.subTest(prompt=prompt):
                 self.assertEqual(self.run_prompt(prompt).returncode, 0)
-        # The same words typed in another pane are the user's: the record holds the pane.
+        # Raw user input remains typed input without the script envelope.
         self.assertEqual(self.run_prompt(relay, extra_env={"HERDR_PANE_ID": "w1:p8"}).returncode, 0)
-        self.assertEqual(self.activity_calls(1), [["active"]])
+        calls = self.activity_calls(5)
+        self.assertCountEqual([call[2] for call in calls],
+                              ["ScriptPrompt", "ScriptPrompt", "PeerPrompt", "HarnessNotice", "UserTypedPrompt"])
+        self.assertTrue(all(call[4] == SESSION for call in calls))
 
     def test_typed_stamp_failure_does_not_skip_report_pause(self) -> None:
         _ = self.escalate_root.write_text("not a directory")

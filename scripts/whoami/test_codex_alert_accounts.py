@@ -375,6 +375,16 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertEqual(agent_accounts.workers_home(), target.home)
         self.assertIn("direct=codex", registry_view())
 
+    def test_unreadable_next_list_reports_an_anomaly_without_losing_its_entry(self) -> None:
+        entry = next_moves.add_next_move("workers", 1, "codex2")
+        output = io.StringIO()
+        with (patch.object(next_moves, "read_next_moves", side_effect=OSError("fixture unreadable")),
+              redirect_stdout(output)):
+            self.assertFalse(quota_alert.workers_entry_pending())
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        self.assertEqual(output.getvalue().splitlines(),
+            ["account moves: anomaly: cannot read workers entries: fixture unreadable"])
+
     def test_unreadable_workers_journal_preserves_queue_and_roles_and_blocks_fallback_reminders(self) -> None:
         source, target = self.account(1), self.account(2)
         entry = next_moves.add_next_move("workers", 1, "codex2")
@@ -1079,16 +1089,17 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.save_room(old, 0)
         self.save_room(target, 1)
         readings = self.readings(old, self.report(old, 0), self.report(target, 1))
-        with patch.object(accounts, "_codex_live", return_value=Report("Codex", problem="target unavailable")):
+        with patch.object(accounts, "_write_role", side_effect=OSError("fixture workers role write failed")) as write:
             _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
                 codex_readings=readings, window=refusals.KnownWindow("weekly"))
+        write.assert_called_once()
         self.assertEqual(agent_accounts.workers_home(), old.home)
         entries = moves.read_moves()
         self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
         self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
         failed = entries[1]
         assert failed["kind"] == "failed"
-        self.assertIn("target unavailable", failed["reason"])
+        self.assertIn("fixture workers role write failed", failed["reason"])
         self.assertIn("direct=claude", registry_view())
 
     def test_no_room_fallback_restores_on_another_account_when_it_regains_room(self) -> None:

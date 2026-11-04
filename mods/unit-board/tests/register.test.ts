@@ -21,7 +21,7 @@ async function press<Surface extends RenderSurface>(ui: Mounted<Surface, "Pane">
 }
 
 describe("unit board commands and lifetime", () => {
-  test("startup registers only accounts-board", async ($, on) => {
+  test("startup registers no commands", async ($, on) => {
     mock.env(on, { HOME: "/test-home", USER_ZONE: "UTC" });
     const registered: string[] = [];
     on("session.start", (_$, event) => ({ cwd: event.cwd }));
@@ -32,7 +32,16 @@ describe("unit board commands and lifetime", () => {
     });
 
     await $.session.start(start);
-    expect(registered).toEqual(["accounts-board"]);
+    expect(registered).toEqual([]);
+  });
+
+  test("the retired accounts command does not open a pane", async ($, on) => {
+    const fake = engineFiles(on);
+    on("command.run", () => ({ text: "Command not handled by the mod." }));
+    expect(await $.command.run({ ...command(), command: "accounts-board" }))
+      .toEqual({ text: "Command not handled by the mod." });
+    expect(fake.opened).toEqual([]);
+    expect(fake.processes).toEqual([]);
   });
 
   test("the showrunner command handles open and close without a model turn and leaves the retired command alone", async ($, on) => {
@@ -520,7 +529,7 @@ describe("unit board commands and lifetime", () => {
 
 
 describe("accounts pane clock", () => {
-  const accountsCommand: CommandRunInput = { ...command(), command: "accounts-board" };
+  const accountsCommand: CommandRunInput = { ...command(), command: "showrunner:accounts" };
 
   function accountsClockHost(on: Parameters<typeof hostEngine>[0]) {
     const host = hostEngine(on);
@@ -543,7 +552,7 @@ describe("accounts pane clock", () => {
         isStdoutTruncated: false, isStderrTruncated: false } };
     });
     on("state.set", { plugin: "unit-board", key: "accountsPanes" }, (_$, event, next) => {
-      const state = event.value["accounts-board"];
+      const state = event.value["accounts"];
       if (state?.kind === "accounts") snapshots.push({ ...state });
       return next(event);
     });
@@ -584,7 +593,7 @@ describe("accounts pane clock", () => {
       const midnight = Date.UTC(2026, 9, 17, 4, 0);
       await fake.clock.advance(midnight - NOW - 5_000);
       await $.command.run(accountsCommand);
-      const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts-board", component: "Pane", surface,
+      const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts", component: "Pane", surface,
         props: { ...props, title: "Accounts", bodyColumns: 120 } });
       const before = drawnText(await ui.drawn()).replace(/\s+/g, " ");
       expect(before).toContain("account left role busy shell idle total resets credits enabled");

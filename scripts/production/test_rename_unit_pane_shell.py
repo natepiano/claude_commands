@@ -1,5 +1,7 @@
 """Rename completes a pane-shell unit through a clean stop and exact pane close."""
 import json
+import io
+from contextlib import redirect_stderr
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast
@@ -16,13 +18,10 @@ from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production import staff
 from scripts.production import fake_unit_host
 
-from scripts.production.fake_unit_host import PaneShellFixture, record_shutdown, assert_shared_stop_record
+from scripts.production.fake_unit_host import PaneShellFixture, record_shutdown
 
 
 class RenamePaneShellTests(UnitRenameFixture):
-    def test_seed_inherits_shared_stop_record_defaults(self) -> None:
-        assert_shared_stop_record(self, self.seed_record,
-            self.home / '.local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json')
 
     def pane_shell(self, *, live: bool) -> None:
         _ = self.seed_record(progress='ready' if live else 'stopped')
@@ -211,8 +210,10 @@ class RenamePaneShellTests(UnitRenameFixture):
         responses = cast(dict[str, CommandResponse], json.loads(responses_path.read_text()))
         responses["--session agents pane close w1:p1"] = {"code": 1, "stdout": "", "stderr": "close unavailable"}
         _ = responses_path.write_text(json.dumps(responses))
-        with self.assertRaisesRegex(RenameRefused, "close unavailable"):
+        with redirect_stderr(io.StringIO()) as errors:
             rename_unit.stop_unit(renamed, lambda: None)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("close unavailable", errors.getvalue())
         competitor = self.publish_stopped_panes(pane, renamed, ("5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", "sid-unrelated"))
         with mock.patch.object(unit_lookup, "marked_unit", return_value=competitor):
             rename_unit.stop_unit(renamed, lambda: None)

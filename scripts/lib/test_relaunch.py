@@ -180,6 +180,19 @@ class RelaunchTests(ShutdownTestCase):
             arguments, _ = relaunch.restored_launch(["claude", "--resume", "session"], environment)
         self.assertEqual(arguments, ["claude", "--resume", "session"])
 
+    def test_enveloped_resume_needs_no_source_record(self) -> None:
+        from scripts.shutdown import pane_record
+        from scripts.production import session_staff
+        from scripts.lib import script_prompts
+
+        entry = pane_record.launch("w1:p2", "session", str(self.root), {}, ["claude"])
+        with (patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(session_staff, "record_membership", return_value=entry),
+              patch.object(script_prompts, "record", side_effect=AssertionError("recorded resume"))):
+            arguments, _ = relaunch.restored_launch(["claude", "--resume", "session"],
+                {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p2"})
+        self.assertTrue(arguments[-1].startswith('<system-reminder source="script">'))
+
     def test_staged_request_relaunches_with_same_parent_pid_and_new_environment(self) -> None:
         process = self.start(self.waiting_child())
         self.wait_for_file(self.root / "ready", process)

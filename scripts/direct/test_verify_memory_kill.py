@@ -20,9 +20,20 @@ WORKER_FREE_ENVIRONMENT = {name: value for name, value in os.environ.items()
 
 
 def classifier_functions() -> str:
-    source = VERIFY.read_text()
-    functions: list[str] = []
-    for name in ("memory_kill_in_journal", "step_was_killed_for_memory", "lint_failure_is_the_tree", "run", "note_event"):
+    # Keep routing outside these classifier tests. Token tests cover admission.
+    functions = [
+        'route_compiling_step() { STEP_RAN_ON_MAC=0; STEP_RUNS_ON=natedev_only; }',
+        'step_state() { :; }',
+        'step_stopped_by_hold() { return 1; }',
+        'collect_hold_wait() { :; }',
+    ]
+    for path, name in (
+        (VERIFY.parent.parent / "lint" / "invoke.sh", "buildlog_step_compiles"),
+        *((VERIFY, name) for name in (
+            "memory_kill_in_journal", "step_was_killed_for_memory", "lint_failure_is_the_tree",
+            "step_writes_tree", "finish_step_token", "run", "run_step", "note_event")),
+    ):
+        source = path.read_text()
         start = source.index(f"\n{name}() {{") + 1
         end = source.index("\n}\n", start) + 2
         functions.append(source[start:end])

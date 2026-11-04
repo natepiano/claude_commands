@@ -90,15 +90,18 @@ class StepRetryPermissionTests(unittest.TestCase):
         for rows in cases:
             for ordered in (rows, tuple(reversed(rows))):
                 table = "\n".join(f"{name}\texcluded\t{reason}\t/{name}.conf" for name, reason in ordered)
-                for local_only, kind in (("0", "test"), ("1", "test"), ("0", "build"), ("0", "final")):
-                    with self.subTest(rows=ordered, local_only=local_only, kind=kind):
+                for local_only, kind, writes_tree in (("0", "test", "0"), ("1", "test", "0"),
+                                                      ("0", "build", "0"), ("0", "final", "0"),
+                                                      ("0", "lint", "1"), ("0", "test", "1")):
+                    with self.subTest(rows=ordered, local_only=local_only, kind=kind, writes_tree=writes_tree):
                         result = subprocess.run(
                             ["bash", "-c", predicate + "\nstep_can_retry"], capture_output=True, text=True,
                             env={**os.environ, "LOCAL_ONLY": local_only, "CMD": kind,
-                                 "STEP_RUNS_ON": "natedev_only",
+                                 "STEP_RUNS_ON": "natedev_only", "STEP_WRITES_TREE": writes_tree,
                                  "STEP_TARGET_TABLE": table}, timeout=TEST_HANG_GUARD_SECS,
                         )
-                        expected = local_only == "0" and kind == "test" and any(reason == "disk" for _, reason in rows)
+                        expected = (local_only == "0" and kind == "test" and writes_tree == "0"
+                                    and any(reason == "disk" for _, reason in rows))
                         self.assertEqual(result.returncode, 0 if expected else 1, result.stdout + result.stderr)
 
 

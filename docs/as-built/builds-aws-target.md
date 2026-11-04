@@ -2,9 +2,20 @@
 
 ## What it is
 
-AWS is a Linux SSH build target named `aws` on host `aws-build`. It runs `test`, `check` and staged `doc` steps. `build`, `example`, `final` and lint stay on natedev. The machine is one persistent Spot `m7a.4xlarge` (x86_64, NixOS) with a retained, encrypted 500 GiB gp3 data volume at `/home`. A durable cost ledger and one spending guard refuse AWS work at either cap: `monthly_limit_usd=400` and `daily_limit_usd=20` in `config/aws_target.conf`. The user approved the $400 monthly cap on 2026-11-01. `daily_limit_usd=20` is derived (the monthly cap / 20) and waits for the user's approval at go-live. No code may raise either cap or copy it.
+AWS is a Linux SSH build target named `aws` on host `aws-build`. It runs `test`, `check` and staged `doc` steps. `build`, `example`, `final` and lint stay on natedev. The machine is one persistent Spot `m7a.4xlarge` (x86_64, NixOS) with a retained, encrypted 500 GiB gp3 data volume at `/home`. A durable cost ledger and one spending guard refuse AWS work at either cap: `monthly_limit_usd=400` and `daily_limit_usd=20` in `config/aws_target.conf`. The user approved the $400 monthly cap on 2026-11-01. `daily_limit_usd=20` is derived (the monthly cap / 20); the user approved it on 2026-11-03. No code may raise either cap or copy it.
 
-The target is built and disabled. `offload=off`, and `targets=mac,natedev` does not list AWS. No AWS resource exists. The user's go-live gate creates the resources and turns the target on, with [the runbook](../plans/builds-aws-runbook.md). The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
+The user approved these spending and capacity values on 2026-11-03, all in `config/aws_target.conf`:
+
+1. `limit_reserve_usd=3`: the spend reserve below each cap.
+2. `drain_max_minutes=60`: at a cap, no new steps start, and the box stops within 60 minutes.
+3. `spot_max_usd_per_hour=0.483`: the Spot maximum price.
+4. `start_min_waiting=2`, `start_after_wait_s=120` and `idle_stop_minutes=15`: the box starts when 2 steps wait 120 s, and stops after 15 idle minutes.
+5. `slots=2`, `slots.hana=4`, `slots.cargo-liner=4` and `build_budget_gib=32`: the slots per repository and the build space.
+
+The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws-unit wrote that private file on natedev (mode 0600) from the address the user gave.
+The user approved `deployment_price_file=~/.config/aws-build/deployment-price` on 2026-11-03. `deploy.py price` writes the Spot price and its read time there (mode 0600), outside the repository.
+
+The target is live. The user approved go-live on 2026-11-03. The stacks exist in `us-east-2`, and the box is instance `i-0216cf933a26bd1ea`. `offload=on`, and `targets=mac,natedev,aws` lists AWS after natedev. [The runbook](../plans/builds-aws-runbook.md) gives the steps. The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
 
 ## How it works
 
@@ -26,6 +37,9 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 
 ### Routing: `scripts/direct/verify.sh`, `scripts/build_targets/build_targets.py`
 
+- `verify.sh test PACKAGE --target aws` pins one step to AWS. `check` and staged `doc` also accept `--target`.
+  A pin keeps admission, spending, and version checks. It takes no natedev grant or cargo token.
+  A refusal ends the step with a nonzero status. Remote step records include `target=aws`, `host=aws-build`, and `pinned=true`.
 - Queued `test`, `check` and staged `doc` steps try eligible SSH targets in configured order. `ssh_target_eligibility` checks configuration, backoff, capacity and reachability, with no shell evaluation.
 - `build_targets.py reserve` returns 0 (reserved or recovered), 11 (busy macOS target) or 1 (no reservation). `--recover-only` recovers only an existing claim. `MacClaimFromWait` moves ownership from the wait to the claim with no unclaimed interval.
 - `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE` keep the first queue time across remote loss and local fallback. Local fallback needs admission. A confirmed remote failure does not cause a local rerun.
@@ -45,7 +59,8 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 ### Control: `aws_target.py`, `remote.py`
 
 - `aws_target.py tick|start|stop|serve` runs `Controller` under `control_lock`. `AwsCli` is the one AWS CLI adapter. `controller.json` holds the state (`off`, `refused`, `stopped`, `starting`, `running`, `draining`, `stopping`), `generation`, `permitted_generation`, the drain deadline and the capacity backoff.
-- `tick` reads `admission/queue.json` and starts the box only for enough eligible waiting rows, guard permission and an ended backoff. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
+- `tick` starts the box for one live pinned waiting step or enough eligible rows in `admission/queue.json`.
+  Both paths require guard permission and an ended backoff. Unpinned steps keep their queue thresholds. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
 - `remote.py` publishes an `AdmissionEnvelope` (target, purpose, generation, decision time, expiry) only after a confirmed guard write. The runner checks it before and after shell preparation. Other Linux targets use `IndependentLinuxExecution` and need no AWS permission.
 - On the box, `RemoteAgent` stops the instance after `idle_stop_minutes` idle and polls IMDSv2 every `interruption_poll_s`. An interrupted slot prints `aws_interrupted=<generation>` once, after `mac_exit` and `mac_cleanup`, and exits with the child status. Offload reads it as `InterruptedTargetRun` and records `ON_NATEDEV` before local work.
 - `release_stopped_claims` releases only claims bound to the stopped host and generation, and writes `release-evidence/`.
@@ -57,9 +72,18 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
+- `deploy.py price` reads the current Spot price through the deployment profile.
+  It writes the price and its read time to the state file named by `deployment_price_file`.
+  The default path is `~/.config/aws-build/deployment-price`. The file stays outside the repository and has mode `0600`.
+  `prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
+
+- `prepare` and `apply` read the Budget address from the private file named by `notification_email_file`.
+  The default path is `~/.config/aws-build/notification-email`.
+  The file must stay outside the public repository. `bootstrap` needs no address file.
+  Prepared parameters and their fingerprint retain `NotificationEmail`. `setup-start` uses that prepared value.
 - `deploy.py prepare` writes the CloudFormation parameters, priced inventory and preflight evidence locally, with no AWS command. `apply` and `setup_start` run only at the user's terminal. They create the monthly Budget (emails at 50, 80 and 100 percent, a stop action at 100 percent) before any chargeable resource.
 - `cloudformation.json` defines the Spot instance, the root volume and the retained data volume. Shutdown behavior is `stop`, IMDSv2 is required and inbound is UDP 41641 only. The scaler IAM policy allows start and stop on the one instance, the needed describe calls and `ce:GetCostAndUsage`.
-- `nixos.patch` adds host `aws-build` and the natedev `aws-target` user unit, stopped by default. It is on `/etc/nixos` main as commit 78746da. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03): `aws-target.service` is installed and disabled. The box is not built.
+- `nixos.patch` adds host `aws-build` and the natedev `aws-target` user unit, stopped by default. It is on `/etc/nixos` main as commit 78746da. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03): `aws-target.service` is installed and disabled. `/etc/nixos` main 25966d8 adds sccache (one shared module with natedev), mold, natedev's cargo config and cargo-tile to `hosts/aws-build.nix`. The box is not built.
 
 ## Invariants
 
@@ -81,7 +105,7 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 - An established day total can exceed a later bill or estimate. That is the cost of a total that never falls.
 - `limit_reserve_usd` covers one drain and one idle interval. The Budget action is the late backstop, not the cap.
 - A user stop disables the persistent Spot request until the next start. AWS restarts only a box it interrupted.
-- The compressed bootstrap must fit the 4096-byte CloudFormation parameter limit.
+- The compressed bootstrap must fit the 4096-byte CloudFormation parameter limit. On 2026-11-03 the encoded bootstrap measured 3908 bytes. `aws-build-base.nix` is copied into it, so put new box packages and services in `hosts/aws-build.nix` (`modules/linux/aws-build.nix` is the natedev `aws-target` unit).
 - A pending notice that keeps failing delays each guard call by up to `notification_timeout_s`.
 - A verify module that hits the 1800 s test limit has so far been a route defect, not machine load.
 - Fake AWS tests do not prove real bootstrap or persistent-request behavior. The runbook's user checks prove them.

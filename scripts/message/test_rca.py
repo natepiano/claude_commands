@@ -88,6 +88,17 @@ def flags(argv: list[str]) -> dict[str, str]:
 
 
 class RcaTests(unittest.TestCase):
+    def test_owner_send_uses_the_current_configured_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                for seconds in (12, 18):
+                    _ = (config / "rca.conf").write_text(f"# range: 0.001..\nsend_seconds={seconds}\n")
+                    result = subprocess.CompletedProcess([], 0, "SENT: fixture", "")
+                    with mock.patch.object(subprocess, "run", return_value=result) as run:
+                        self.assertEqual(rca.send(["--text", "body"]), (True, "SENT: fixture"))
+                    self.assertEqual(run.call_args.kwargs["timeout"], seconds)
+
     root: Path = Path()
     log: Path = Path()
     owner_processes: list[bool] = []

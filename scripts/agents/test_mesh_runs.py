@@ -64,6 +64,8 @@ class MeshRunsTests(unittest.TestCase):
         config.mkdir()
         _ = (config / "mesh_runs.conf").write_text(
             (Path(__file__).resolve().parents[2] / "config/mesh_runs.conf").read_text())
+        _ = (config / "send.conf").write_text(
+            (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
         self.stack.enter_context(patch.dict(os.environ, {"CONF_DIR": str(config)}))
         self.sent = []
         _ = self.stack.enter_context(patch.object(treekey, "tree_key", return_value="key-1"))

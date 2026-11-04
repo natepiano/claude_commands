@@ -14,9 +14,10 @@ from unittest.mock import patch
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
 import add_unit
 import herdr
-import unit_lookup
+from scripts.production import unit_lookup
 import sessions
 import resume_unit
+import unit_lookup as script_unit_lookup
 import retire_unit
 import atomic_file
 from production_units import Refusal, read_production
@@ -75,7 +76,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         with (patch.dict(os.environ, self.env),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive())):
             selected = add_unit.account_for_launch(request)
-            with self.assertRaisesRegex(Refusal, "its Units row names"):
+            with self.assertRaisesRegex(Refusal, "its staff row names"):
                 _ = add_unit.preflight(request, selected)
         assert isinstance(request.session, add_unit.ResumedSession)
         with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
@@ -83,7 +84,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             checked = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume",
                                request.session.session_id, "--cwd", str(wrong), "--check")
         self.assertEqual(checked.returncode, 2, checked.stdout + checked.stderr)
-        self.assertIn("its Units row names", checked.stderr)
+        self.assertIn("its staff row names", checked.stderr)
         self.assertEqual(pending.read_bytes(), before)
 
     def test_dead_pending_lookup_keeps_the_marked_unit_fallback_and_evidence(self) -> None:
@@ -173,7 +174,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             assert row is not None
             self.assertEqual((row.name, row.worktree), ("alpha", staff.PresentWorktree("natedev", path.parent)))
             submitted.append(row.id)
-            client.prompt(pane, opening.text)
+            client.prompt(pane, opening.text, target=opening.transcript.session_id)
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
 
         with patch.object(herdr.Herdr, "submit_opening_prompt", submit):
@@ -211,6 +212,7 @@ class AddUnitRerunTests(AddUnitTestCase):
 
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(1234)),
               patch.object(unit_lookup, "marked_unit", return_value=marked),
+              patch.object(script_unit_lookup, "marked_unit", return_value=marked),
               patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked),
               patch.object(retire_unit, "run", side_effect=run_resume),

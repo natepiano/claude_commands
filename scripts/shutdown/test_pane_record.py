@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stderr
 from typing import cast, final, override
 from unittest import mock
 
@@ -67,6 +69,51 @@ class PaneRecordTests(unittest.TestCase):
 
     def entries(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], json.loads((self.records / "agents.json").read_text()))
+
+    def test_plugin_directories_survive_hook_capture_and_resume(self) -> None:
+        directories = ["/fixture/postmaster", "/fixture/second plugin"]
+        started = self.start("w1:p2", "plugin-session", "--plugin-dir", directories[0],
+                             "--plugin-dir=" + directories[1], "-n", "postmaster")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+            entry = pane_record.read_strict("agents")["w1:p2"]
+        self.assertEqual(entry.get("plugin_directories"), directories)
+        arguments = pane_record.resume_arguments(entry)
+        parsed = pane_record.parse_claude_arguments(["claude", *arguments])
+        self.assertEqual(parsed.plugin_directories, tuple(directories))
+        self.assertFalse(parsed.has_prompt)
+        self.assertEqual(arguments.count("--plugin-dir"), 2)
+
+    def test_relative_plugin_paths_keep_their_target_after_a_folder_move(self) -> None:
+        original = self.root / "work/unit"
+        moved = self.root / "elsewhere/unit"
+        entry = pane_record.launch("w1:p2", "plugin-session", str(original), {},
+                                   ["claude", "--plugin-dir", "../shared/postmaster"])
+        entry["cwd"] = str(moved)
+        arguments = pane_record.resume_arguments(entry)
+        self.assertEqual(arguments[arguments.index("--plugin-dir") + 1],
+                         str(self.root / "work/shared/postmaster"))
+        self.assertEqual(entry.get("plugin_directories"), [str(self.root / "work/shared/postmaster")])
+
+    def test_plugin_options_after_the_terminator_are_only_prompt_text(self) -> None:
+        arguments = ["claude", "--plugin-dir", "/wanted", "--", "--plugin-dir=/unwanted"]
+        parsed = pane_record.parse_claude_arguments(arguments)
+        self.assertTrue(parsed.has_prompt)
+        self.assertEqual(parsed.plugin_directories, ("/wanted",))
+        entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, arguments)
+        self.assertEqual(entry.get("plugin_directories"), ["/wanted"])
+        self.assertNotIn("/unwanted", pane_record.resume_arguments(entry))
+
+    def test_plugin_directories_require_nonempty_paths_in_launch_records(self) -> None:
+        entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, ["claude"])
+        self.records.mkdir()
+        for invalid in ("/not-a-list", [""], [1]):
+            with self.subTest(invalid=invalid):
+                document: dict[str, object] = {**entry, "plugin_directories": invalid}
+                _ = (self.records / "agents.json").write_text(json.dumps({"w1:p2": document}))
+                with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+                    with self.assertRaisesRegex(ValueError, "plugin_directories"):
+                        _ = pane_record.read_strict("agents")
 
     def test_moved_session_uses_newest_launch_across_accounts_and_record_files(self) -> None:
         old = pane_record.launch("old-pane", "moved", "/old", {"CLAUDE_CONFIG_DIR": "/accounts/.claude4"},
@@ -280,15 +327,59 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual([(entry.read_bytes(), entry.stat().st_mtime_ns) for entry in paths], moved)
         self.assertEqual(path.read_bytes(), before)
 
-    def test_folder_move_refuses_an_owner_launch_from_an_unrelated_folder(self) -> None:
+    def test_folder_move_moves_internal_plugins_and_keeps_external_plugins(self) -> None:
+        owner, _current, _path = self.current_owner()
+        old, new = self.root / "old", self.root / "new"
+        external = self.root / "old-sibling/postmaster"
+        entry = pane_record.launch("w1:p2", owner.id, str(old), {}, [
+            "claude", "--plugin-dir", "./mods/postmaster",
+            "--plugin-dir", str(external),
+        ])
+        pane_record.write("agents", entry)
+        record = staff.snapshot()
+
+        pane_record.move_cwd(owner.id, old, new, record)
+
+        moved = pane_record.read_strict("agents")["w1:p2"]
+        self.assertEqual(moved["cwd"], str(new))
+        self.assertEqual(moved.get("plugin_directories"), [str(new / "mods/postmaster"), str(external)])
+        resumed = pane_record.parse_claude_arguments(["claude", *pane_record.resume_arguments(moved)])
+        self.assertEqual(resumed.plugin_directories, (str(new / "mods/postmaster"), str(external)))
+        path = pane_record.record_path("agents")
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        pane_record.move_cwd(owner.id, old, new, record)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_folder_move_skips_an_owner_launch_from_an_unrelated_folder(self) -> None:
         owner, _current, path = self.current_owner()
         retained = pane_record.launch("w1:p2", owner.id, str(self.root / "unrelated"), {}, ["claude"])
         pane_record.write("agents", retained)
         record_path = self.records / "agents.json"
         before = path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns
-        with self.assertRaisesRegex(ValueError, "different working folder"):
+        output = io.StringIO()
+        with redirect_stderr(output):
             pane_record.move_cwd(owner.id, self.root / "old", self.root / "new", staff.snapshot())
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("different working folder", output.getvalue())
         self.assertEqual((path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns), before)
+
+    def test_folder_move_updates_later_records_after_a_different_folder_is_skipped(self) -> None:
+        owner, current, path = self.current_owner()
+        old, new = self.root / "old", self.root / "new"
+        skipped = pane_record.launch("w1:p1", owner.id, str(self.root / "elsewhere"), {}, ["claude"])
+        selected = pane_record.launch("w2:p1", current, str(old), {}, ["claude"])
+        pane_record.write("agents", skipped)
+        with pane_record.locked("later"):
+            pane_record.save("later", {"w2:p1": selected})
+        before = path.read_bytes()
+        output = io.StringIO()
+        with redirect_stderr(output):
+            pane_record.move_cwd(owner.id, old, new, staff.snapshot())
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("different working folder", output.getvalue())
+        self.assertEqual(pane_record.read("agents")["w1:p1"], skipped)
+        self.assertEqual(pane_record.read("later")["w2:p1"], {**selected, "cwd": str(new)})
+        self.assertEqual(path.read_bytes(), before)
 
     def test_current_conversation_lookup_projects_only_its_exact_retained_pane_without_writing(self) -> None:
         owner, current, path = self.current_owner()

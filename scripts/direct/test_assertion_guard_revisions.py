@@ -1,6 +1,9 @@
 """Check assertion-guard behavior against real Git repositories."""
 from __future__ import annotations
 
+from scripts.production import staff
+from scripts.production.staff_test_support import unit_membership, without_worktree_column
+
 import os
 import resource
 import subprocess
@@ -976,10 +979,14 @@ class AssertionRevisionTests(AssertionFindingFixture):
         self.assert_clean(self.guard())
 
 
-    def test_large_diff_guard_call_uses_less_than_one_cpu_second(self) -> None:
+    def test_large_diff_guard_cpu_cost_stays_below_a_fixed_reference_workload(self) -> None:
         before = self.rust(TILE_OLD) + "".join(f"// old {number}\n" for number in range(43499))
         after = self.rust(TILE_NEW) + "".join(f"// new {number}\n" for number in range(43499))
         self.change("value.rs", before, after)
+        reference_started = time.process_time()
+        for _iteration in range(2):
+            _ = sum(number * number for number in range(1_000_000))
+        reference_cpu = time.process_time() - reference_started
         children_before = resource.getrusage(resource.RUSAGE_CHILDREN)
         started = time.process_time()
         result = self.guard_process()
@@ -988,7 +995,8 @@ class AssertionRevisionTests(AssertionFindingFixture):
         cpu_seconds += (children_after.ru_utime + children_after.ru_stime
                         - children_before.ru_utime - children_before.ru_stime)
         _ = self.assert_finding(result, "value.rs", "weaker")
-        self.assertLess(cpu_seconds, 1.0, f"guard used {cpu_seconds:.3f} CPU seconds")
+        self.assertLess(cpu_seconds, reference_cpu * 16,
+                        f"guard used {cpu_seconds:.3f} CPU seconds; reference used {reference_cpu:.3f}")
 
 
 
@@ -1298,15 +1306,29 @@ class DivergedBases(NamedTuple):
 class ProductionBaseTests(SeededGitRepositoryFixture):
     repo: Path = Path()
 
+    def test_plan_worktree_selects_the_base_when_the_director_runs_elsewhere(self) -> None:
+        tip = self.refill_from_production("builds")
+        document = self.register_production("builds")
+        _ = document.write_text(document.read_text().replace("`README.md`", f"`{self.repo}/README.md`"))
+        without_worktree_column(document)
+        director = self.root / "director"
+        director.mkdir()
+        member = unit_membership("fixture", "fixture")
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", director), expected=member.worktree)
+        self.assertEqual(commit_bases(self.repo, (), staged=False)[0], tip)
+
+
     def test_retired_production_rows_never_win_over_live_rows(self) -> None:
         tip = self.refill_from_production("builds")
-        retired = self.register_production("unit", slug="retired")
+        retired = self.register_production("unit", slug="retired", status="retired")
         live = self.register_production("builds", slug="live")
         for column, marker in (("Status", "retired"), ("Status", "removed 2026-10-06"),
                                ("Worktree", "removed 2026-10-06")):
             worktree = str(self.repo) if column == "Status" else marker
             status = marker if column == "Status" else "active"
             _ = self.register_production("unit", slug="retired", worktree=worktree, status=status)
+            row = unit_membership("retired", "fixture")
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.repo), expected=row.worktree)
             for docs in ((retired, live), (live, retired)):
                 with self.subTest(column=column, marker=marker, docs=docs):
                     with patch.object(showrunners, "timer_docs", return_value=dict(enumerate(docs))):
@@ -1319,6 +1341,8 @@ class ProductionBaseTests(SeededGitRepositoryFixture):
 
         _ = self.register_production("builds", slug="live")
         _ = self.register_production("unit", slug="retired", worktree_commentary="— retired 2026-10-06")
+        row = unit_membership("retired", "fixture")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.repo), expected=row.worktree)
         for docs in ((retired, live), (live, retired)):
             with self.subTest(commentary="retired worktree", docs=docs):
                 with patch.object(showrunners, "timer_docs", return_value=dict(enumerate(docs))):

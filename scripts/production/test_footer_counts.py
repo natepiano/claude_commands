@@ -27,7 +27,7 @@ from scripts.production.test_change_review import producer_rows
 from scripts.statusline import counts_row
 from footer_counts import FooterCounts
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+    fixture_member, isolated_source_readers, isolated_staff_file, production_staff_record, source_environment,
 )
 
 LIST = """# Change review
@@ -336,9 +336,12 @@ class FooterCountsTests(unittest.TestCase):
         configuration.mkdir()
         source = configuration / "change_review.conf"
         _ = source.write_text(f"lists_directory={self.root}\nreview_links_directory={self.root / 'links'}\n")
+        root_configuration = configuration / "review_links.conf"
+        _ = root_configuration.write_text("unrouted_alert_recipient=top\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)}):
             paths = footer_counts.routing_sources(staff.snapshot())
         self.assertIn(source, paths)
+        self.assertIn(root_configuration, paths)
         self.assertIn(self.root, paths)
         self.assertIn(self.root / "links", paths)
 
@@ -366,7 +369,7 @@ class FooterCountsTests(unittest.TestCase):
         from dataclasses import replace
         broken = replace(snapshot, rows=tuple(replace(row, parent=None) if row.id == one.id else row
                                                for row in snapshot.rows))
-        with (mock.patch.object(staff, "snapshot", return_value=broken),
+        with (mock.patch.object(staff, "snapshot", return_value=broken), production_staff_record(),
               mock.patch.object(unrouted_alert, "send_message") as send, contextlib.redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(footer_counts.changes(doc), 0)
             self.assertEqual(footer_counts.unrouted_changes(doc), 2)
@@ -395,6 +398,33 @@ class FooterCountsTests(unittest.TestCase):
         counts = [footer_counts.changes(doc) for doc in self.tree.values()]
         self.assertEqual(counts, [4, 0, 0])
         self.assertEqual(counts, [forms.counts[name] for name in self.tree])
+
+    def test_orphan_rows_count_under_the_root_tab_before_and_after_a_document_is_stamped(self) -> None:
+        from scripts.review_links import change_browser, change_page
+        from scripts.production import change_review as page_review
+
+        listing = self.root / "change-review - orphan.md"
+        doc = self.root / "top-production.md"
+        own_list = self.root / "change-review - top.md"
+        _ = doc.write_text(f"# Top\n- **Change review:** `{own_list}`\n")
+        _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", doc))
+        self.tree = {"top": doc}
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
+        _ = (config / "change_review.conf").write_text(
+            f"lists_directory={self.root}\nreview_links_directory={self.root / 'links'}\n")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              mock.patch.object(page_review, "lists_directory", return_value=self.root)):
+            for document in (self.root / "missing-production.md", doc):
+                with self.subTest(document=document):
+                    _ = listing.write_text(f'---\nproductions:\n  - "{document}"\n---\n' + LIST)
+                    prepared = change_browser.prepare(change_page.ReviewBrowser("token"),
+                        change_page.DeliveryStatus(self.root / "links"))
+                    waiting = [item for item in prepared.changes if item.waiting]
+                    self.assertEqual([item.key for item in waiting], ["orphan/C1", "orphan/C2"])
+                    self.assertEqual([item.tab for item in waiting], ["top", "top"])
+                    self.assertEqual(footer_counts.change_counts(doc, staff.snapshot()), (2, 0))
 
     def test_rows_without_producers_in_independent_lists_stay_with_their_showrunners(self) -> None:
         from scripts.review_links import change_browser, change_page

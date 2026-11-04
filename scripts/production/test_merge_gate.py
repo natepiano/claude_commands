@@ -10,17 +10,29 @@ import io
 import os
 from pathlib import Path
 import re
-from typing import cast, final
-from contextlib import redirect_stdout
+from typing import cast, final, override
+from contextlib import AbstractContextManager, redirect_stdout
 from unittest import mock
 from scripts.production import change_review, merge_gate, staff
+from scripts.lint import memory_admit
 from scripts.production.test_change_review import ProducerFixture
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import (
+    fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+)
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        environment = source_environment(self.root / "staff-sources")
+        environment["NOTIFIER_STATE_DIR"] = self.environment["NOTIFIER_STATE_DIR"]
+        self.environment.update(environment)
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+
     def review_producer(self, doc: Path) -> staff.StaffId:
         """Give the checkpoint unit a private staff record and a Units row."""
         self.write(doc, doc.read_text() + "\n## Units\n\n"
@@ -28,9 +40,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
                    + f"| fixture | unit-phase | {self.unit} |\n")
         path = Path(self.environment["HOME"]) / ".local/state/staff/staff.json"
         with isolated_staff_file(path, self.environment):
-            runner = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
-            unit = fixture_member("unit", name="fixture-unit", parent=runner.id,
-                                  worktree=staff.PresentWorktree("natedev", self.unit))
+            runner = recorded_showrunner("fixture-showrunner", doc)
+            unit = fixture_unit_location(runner, "fixture-unit", self.unit)
         return unit.id
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
@@ -60,6 +71,47 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(excludes.count("/.scratch.json"), 1)
         with (checkout / ".claude-busy").open("a") as contender:
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_checkpoint_names_its_unit_before_admission_and_suites(self) -> None:
+        observed: list[str] = []
+
+        def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+            observed.append(os.environ[memory_admit.BUILDLOG_UNIT])
+            return merge_gate.GateRun((), 0, 0, tests_reused=True)
+
+        with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(observed, ["fixture-unit"])
+
+    def test_checkpoint_restores_the_unit_after_success_and_failure(self) -> None:
+        checkpoint = merge_gate.merge_checkpoint
+        for previous in (None, "previous-unit"):
+            for outcome in ("pass", "red", "exception"):
+                with self.subTest(previous=previous, outcome=outcome):
+                    if previous is None:
+                        _ = self.environment.pop(memory_admit.BUILDLOG_UNIT, None)
+                    else:
+                        self.environment[memory_admit.BUILDLOG_UNIT] = previous
+                    restored: list[str | None] = []
+
+                    def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+                        self.assertEqual(os.environ.get(memory_admit.BUILDLOG_UNIT), "fixture-unit")
+                        if outcome == "exception":
+                            raise merge_gate.GateRefused("injected suite failure")
+                        return merge_gate.GateRun((), 0, 0, memory_within_cap=outcome != "red", tests_reused=True)
+
+                    def merge(arguments: merge_gate.GateArguments) -> int:
+                        try:
+                            return checkpoint(arguments)
+                        finally:
+                            restored.append(os.environ.get(memory_admit.BUILDLOG_UNIT))
+
+                    with mock.patch.object(merge_gate, "run_suites", side_effect=suites), \
+                         mock.patch.object(merge_gate, "merge_checkpoint", side_effect=merge):
+                        result = self.run_gate()
+                    self.assertEqual(result.returncode == 0, outcome == "pass", result.stdout + result.stderr)
+                    self.assertEqual(restored, [previous])
 
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
         checked = merge_gate.checked_git
@@ -274,6 +326,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         result = self.run_gate(checkpoint=checkpoint)
         self.assert_refused_before_gate(result)
         self.assertIn("checkpoint(fixture): grid fades: no Change-Review line", result.stderr)
+        self.assertIn(change_review.HELD_NEXT_STEP, result.stderr)
 
     def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
         review, doc = self.review_list()
@@ -466,6 +519,13 @@ if __name__ == "__main__":
 
 
 class MergeGateProducerTests(ProducerFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        environment = source_environment(self.root / "staff-sources")
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+
     def test_record_changes_writes_the_checkpoint_units_staff_id(self) -> None:
         merged = self.merge()
         commits = change_review.merge_commits(self.repo, merged)

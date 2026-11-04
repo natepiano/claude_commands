@@ -47,7 +47,7 @@ class StaffLabels:
         if row is None:
             return result
         result["CLAUDE_CODE_SESSION_ID"] = row.current_session
-        if row.kind == "showrunner":
+        if row.kind in ("showrunner", "agent"):
             _ = result.pop("SHOWRUNNER_UNIT", None)
             _ = result.pop("SHOWRUNNER_UNIT_ID", None)
         elif row.kind == "unit":

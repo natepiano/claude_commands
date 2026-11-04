@@ -25,6 +25,8 @@ import rules
 import style_ledger
 
 from style_plan_test_support import StylePlanFixture
+from scripts.production import staff, unit_names
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -55,6 +57,7 @@ class StylePlanTests(StylePlanFixture):
     def test_family_plans_use_each_units_plan_cell_for_old_and_full_ids(self) -> None:
         expected: dict[rules.Family, str] = {}
         rows: list[str] = []
+        owner = recorded_showrunner("sample-style", self.doc)
         families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
         for index, family in enumerate(families):
             unit = f"sample-style-{family}-unit" if index % 2 else f"{family}-unit"
@@ -65,8 +68,10 @@ class StylePlanTests(StylePlanFixture):
             expected[family] = f"# {family} unit settings\n"
             _ = plan.write_text(expected[family])
             _ = (plan.parent / f"{unit}.md").write_text("Do not read this path.\n")
+            _ = fixture_unit_location(owner, unit, worktree)
             rows.append(f"| {unit} | {relative} | {worktree} | demo-style-{family} |")
         rows.append(f"| feature-unit | missing.md | {self.root / 'feature'} | feature |")
+        _ = fixture_unit_location(owner, "feature-unit", self.root / "feature")
         prefix = self.doc.read_text().split("## Units", 1)[0]
         _ = self.doc.write_text(prefix + "## Units\n\n| Unit | Plan | Worktree | Branch |\n"
                                 + "| --- | --- | --- | --- |\n" + "\n".join(rows) + "\n")
@@ -79,8 +84,10 @@ class StylePlanTests(StylePlanFixture):
         original_doc = self.doc.read_text()
         retained = self.plan.with_name("retained-names-plan.md")
         _ = self.plan.rename(retained)
+        member = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "names-unit", self.unit)
         for unit in ("names-unit", "sample-style-names-unit"):
             with self.subTest(unit=unit):
+                member = staff.rename(member.id, unit_names.name(unit))
                 _ = self.doc.write_text(original_doc.replace("| names-unit |", f"| {unit} |")
                                         .replace("units/names-unit.md", "units/retained-names-plan.md"))
                 _ = retained.write_text(self.plan_header().replace("`names-unit`", f"`{unit}`"))
@@ -107,6 +114,7 @@ class StylePlanTests(StylePlanFixture):
         _ = types_plan.write_text(self.plan_header().replace("names-unit", "types-unit"))
         _ = self.doc.write_text(self.doc.read_text() +
                                 f"| types-unit | docs/style-production/units/types-unit.md | {types} | demo-style-types |\n")
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "types-unit", types)
         self.sync()
         names_candidates = self.candidates("names")
         types_candidates = self.candidates("types")
@@ -225,6 +233,8 @@ class StylePlanTests(StylePlanFixture):
         _ = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
         self.sync()
         unit = "sample-style-names-unit"
+        member = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "names-unit", self.unit)
+        _ = staff.rename(member.id, unit_names.name(unit))
         retained = self.plan.with_name("retained-names-plan.md")
         _ = self.plan.rename(retained)
         first = self.sources[-1]
@@ -436,6 +446,7 @@ class StylePlanTests(StylePlanFixture):
             "## Phases", "- **First files:** a.rs, a.rs\n\n## Phases"))
         _ = self.doc.write_text(self.doc.read_text() +
                                 f"| types-unit | docs/style-production/units/types-unit.md | {types} | types |\n")
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "types-unit", types)
 
         with self.subTest(selection="names queue"):
             output = io.StringIO()
