@@ -115,15 +115,10 @@ A unit's run state is stored nowhere. `unit_lookup.read_run_states()` reads each
 
 `docs/production_format.md`, `commands/showrunner/produce.md` and `docs/direct/final_gate_commit.md` allow any unit or showrunner to correct a file under `docs/as-built/` when it contradicts the code. No approval from the user, showrunner or owning unit is required. A unit still names the file as `also touches` in its checkpoint notice, and the showrunner does not delay a merge because of that correction.
 
-Every repository phone alert goes through `send.py --to user`. A session writes its own text:
+Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id ID --value KEY=VALUE`. Use `decision.choices` for choices, `alert.blocked` for emergencies, and `nate.adhoc` for notes without an action. Each template supplies its need and action. Emergency pushes also need `--clears-when "<check>"`. A decision uses normal priority unless its explicit-offset `--due` falls inside the configured window. Use a specific registered template when one fits. Run `review.py show ID` for its values. For `decision.choices`, pass `choices` as a JSON list of objects with `label` and `effect`. Also supply `sender`, `title`, `session`, `machine`, `situation`, `recommended_choice`, and `recommendation_reason`.
 
-```text
-scripts/message/send.py --to user \
-  --need note|decision|blocked \
-  (--action "<what the user does>" | --no-action) \
-  --summary "<title>" \
-  --text "<message>"
-```
+For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
+Filing a question alone never sends a push.
 
 `send.py` owns the user channel.
 Notes use priority 0, and blocked pushes use priority 2.
@@ -133,14 +128,14 @@ The channel recalculates decision priority when it releases a kept push.
 An overdue decision uses priority 0 and prints a diagnostic.
 `--priority 1` cannot bypass the deadline rule.
 
-A user message specifies `--action` or `--no-action`.
+A registered template supplies the action state.
 Decisions and blocked pushes require `--action`, including priority 0 decisions.
 Missing action flags cause a usage error with exit 2.
 `scripts/notify/pushover.py` reviews each push before delivery.
 Callers use `send.py`; they do not invoke `pushover.py` directly.
 Mac callers add `--machine natedev`.
 
-A script never writes a literal phone text. It renders a catalog entry from `scripts/notify/push_catalog.py` and sends it with `push_texts.user_send_argv`, which becomes `send.py --to user --text-id ID --value k=v…`; the entry sets the need and the action. The script callers are `rust_release.send_release_text(push)` (`rust.*`), the phone branch of `sweep.send_floor_alert` (`sweep.disk_floor`), `codex_winddown` (`codex.reset_ready`), `quota_alert` (`quota.*`) and `restart_support.alert_user` (`shutdown.*`, the only phone path in `scripts/shutdown/`). `escalate.py`'s held messages send with the hold's own `--need` and action. `ci_points.review_watch` writes its alert to the production log and sends no push. The showrunner, build-report and fix instructions use the session command.
+A script never writes a literal phone text. It renders a catalog entry from `scripts/notify/push_catalog.py` and sends it with `push_texts.user_send_argv`, which becomes `send.py --to user --text-id ID --value k=v…`; the entry sets the need and the action. The script callers are `rust_release.send_release_text(push)` (`rust.*`), the phone branch of `sweep.send_floor_alert` (`sweep.disk_floor`), `codex_winddown` (`codex.reset_ready`), `quota_alert` (`quota.*`) and `restart_support.alert_user` (`shutdown.*`, the only phone path in `scripts/shutdown/`). `escalate.py` delivers registered holds through the same helper. It retains legacy free-text holds without delivery. `ci_points.review_watch` writes its alert to the production log and sends no push. The showrunner, build-report and fix instructions use the session command.
 
 ## Invariants
 
@@ -155,7 +150,7 @@ A script never writes a literal phone text. It renders a catalog entry from `scr
 - Both hooks have a five-second budget, print at most one error line, and exit 0 so a prompt or reply cannot fail because the pause failed.
 - `unit_lookup.read_run_states().state(worktree)`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
 - Correcting an as-built doc that contradicts the code is always allowed; cross-unit notice rules still apply.
-- Every scripted phone alert enters `scripts/message/send.py --to user`, with `--action` or `--no-action` or with a catalog `--text-id`; channel choice stays inside `send.py`.
+- Every scripted phone alert enters `scripts/message/send.py --to user`, with a catalog `--text-id`; channel choice stays inside `send.py`.
 
 ## Gotchas
 
