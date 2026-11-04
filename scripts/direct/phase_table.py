@@ -29,10 +29,8 @@ sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, session_staff, staff, unit_config, unit_names
-from scripts.production.unit_table import Refusal, cell_value
-from scripts.production.production_units import production_field
+from scripts.production.production_doc import PromoteTo, Refusal, cell_value, production_field, promotion_from_doc
 from scripts.shutdown import remote
-from scripts.production.production_doc import PromoteTo, promotion_from_doc
 
 # The finding_opened event schema uses these severities. Importing findings to
 # read its SEVERITIES also validates command-only convergence configuration.

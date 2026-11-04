@@ -30,7 +30,7 @@ from scripts.direct import progress_history
 from scripts.message import sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 import merge_checkpoint
-import production_units
+from scripts.production.production_doc import Production, read_production
 import rename
 from scripts.production import showrunners
 import stall_watch
@@ -411,7 +411,8 @@ EMPTY_LOCATIONS: Mapping[tuple[str, str], Path] = {}
 
 
 def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members: dict[str, tuple[str, ...]],
-                       *, locations: Mapping[tuple[str, str], Path] = EMPTY_LOCATIONS) -> None:
+                       *, locations: Mapping[tuple[str, str], Path] = EMPTY_LOCATIONS,
+                       plans: Mapping[tuple[str, str], Path] = EMPTY_LOCATIONS) -> None:
     """Bind legacy source fixtures to the one staff fixture and seed their members."""
     case.staff_file = case.root / "state/staff/staff.json"
     environment.update(STAFF_FILE=str(case.staff_file), STAFF_TEST_OWNER_FILE=str(case.staff_file))
@@ -429,16 +430,16 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
         state = Path(environment["SHOWRUNNER_STATE_DIR"])
         with mock.patch.object(tidy_wrapped, "STATE_DIR", state), unit_move.production_lock():
             pass
-    productions: dict[str, production_units.Production] = {}
+    productions: dict[str, Production] = {}
     for source in showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.RAISE):
         if source.timer.slug in members:
-            production = production_units.read_production(source.timer.doc)
+            production = read_production(source.timer.doc)
             productions[source.timer.slug] = production
             with merge_checkpoint.merge_lock(production.checkout, source.timer.slug):
                 pass
     for slug in members.keys() - productions.keys():
         candidates = [production for path in sorted(case.root.rglob(f"{slug}-production.md"))
-                      if (production := production_units.read_production(path)).doc.is_relative_to(production.checkout)]
+                      if (production := read_production(path)).doc.is_relative_to(production.checkout)]
         case.assertEqual(len(candidates), 1, f"{slug}: expected one production document in its checkout")
         production = candidates[0]
         productions[slug] = production
@@ -449,19 +450,15 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
             production = productions[slug]
             row = fixture_member("showrunner", name=slug,
                                  doc=staff.LiveDoc(remote.local_machine(), production.doc))
-            cells_by_name = {unit_names.name(production_units.cell_value(cells["Unit"])): cells
-                             for cells in production_units.unit_table(production.doc.read_text().splitlines())}
             for unit in units:
                 name = unit_names.name(unit)
-                cells = cells_by_name[name]
                 tree = locations[(slug, unit)]
                 _ = fixture_member("unit", name=name, parent=row.id,
                                    worktree=staff.PresentWorktree(remote.local_machine(), tree))
                 if not tree.is_dir():
                     continue
-                plan = production_units.cell_value(cells["Plan"])
-                mode = (unit_config.StandbyPlan() if plan == "standby" else
-                        unit_config.PermanentPlan() if plan == "permanent" else unit_config.PlanFile(Path(plan)))
+                plan = plans.get((slug, unit))
+                mode = unit_config.StandbyPlan() if plan is None else unit_config.PlanFile(plan)
                 _ = unit_config.write(tree, unit_config.UnitConfig(mode, unit_config.NoAppPort(), ()))
 
 
@@ -511,7 +508,8 @@ class ProductionRenameFixture(StaffTestCase):
         self.bind_fixture(self.fixture_root)
         self.old_tip = self.fixture_tip
         bind_staff_fixture(self, self.env, {OLD: UNITS},
-                           locations={(OLD, unit): self.worktrees / unit for unit in UNITS})
+                           locations={(OLD, unit): self.worktrees / unit for unit in UNITS},
+                           plans={(OLD, unit): Path(f"docs/plans/{unit}.md") for unit in UNITS})
         production = next(row for row in staff.find(kind="showrunner") if row.name == OLD)
         _ = fixture_member("showrunner", name="child", parent=production.id)
 
@@ -617,14 +615,11 @@ class ProductionRenameFixture(StaffTestCase):
         return self.stall / f"{digest}.json"
 
     def production_doc(self) -> str:
-        rows = [f"| {unit} | docs/plans/{unit}.md | `{self.worktrees / unit}` | old-{unit} |"
-                for unit in UNITS]
         return "\n".join([
             "# Production — old", "", "> **Status: PRODUCTION — running.**", "",
             "## Production Context", "", "- **Merge branch:** `old`",
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Log:** `production.log`", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
-            *rows, "", "## Production rules", "", "History mentions old and stays unchanged.", "",
+            "## Production rules", "", "History mentions old and stays unchanged.", "",
         ])
 
     def saved_state(self) -> dict[str, str]:
@@ -651,18 +646,13 @@ class ProductionRenameFixture(StaffTestCase):
         return self.worktrees / f"repo.name_with_punctuation-{slug}-{unit}"
 
     def prepare_unit_moves(self) -> None:
-        text = self.doc.read_text()
         for unit in UNITS:
             old = self.worktrees / unit
             destination = self.unit_worktree(OLD, unit)
             _ = self.git("worktree", "move", str(old), str(destination))
             row = unit_membership(OLD, unit)
             _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination), expected=row.worktree)
-            text = text.replace(f"`{old}`", f"`{destination}`")
             _ = self.git("push", "origin", f"old-{unit}")
-        self.write(self.doc, text)
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Record conventional unit worktree paths")
 
     def run_command(self, *arguments: str, wrapper: str = "", **environment: str) -> subprocess.CompletedProcess[str]:
         return run_rename(list(arguments), {**self.env, **environment}, self.checkout, wrapper)
@@ -676,11 +666,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual(self.git("rev-parse", f"new-{unit}"), self.old_tip)
         self.assertEqual(self.git("for-each-ref", "--format=%(refname)", f"refs/heads/old-{unit}"), "")
         self.assertIn(f"worktree {new}\n", self.git("worktree", "list", "--porcelain") + "\n")
-        row = next(line for line in self.new_doc.read_text().splitlines() if line.startswith(f"| {unit} |"))
         self.assertEqual(unit_membership(NEW, unit).worktree, staff.PresentWorktree("natedev", new))
-        self.assertIn("| — |", row)
-        self.assertIn(f"`new-{unit}`", row)
-        self.assertNotIn(f"old-{unit}", row)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def assert_applied(self) -> None:
@@ -695,7 +681,6 @@ class ProductionRenameFixture(StaffTestCase):
             self.assertRegex(plan, r"(?m)^> \*\*Production:(?: new\*\*|\*\* new) — unit")
             self.assertIn("production doc `docs/plans/new-production.md`", plan)
             self.assertIn("Historical example: old stays in ordinary prose.", plan)
-            self.assertIn(f"| old-{unit} |", text)
             self.assertEqual(self.git("rev-parse", f"old-{unit}"), self.old_tip)
             self.assertTrue((self.worktrees / unit / ".git").exists())
             self.assertFalse(self.stall_path(OLD, unit).exists())

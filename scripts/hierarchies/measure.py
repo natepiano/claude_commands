@@ -42,7 +42,7 @@ from scripts.hierarchies.log_records import EventSource as EventSource
 from scripts.lib import unit_runs
 from scripts.message import roster
 from scripts.production import showrunners, session_staff, staff, issues, change_review, dailies_render
-from scripts.production.unit_table import Refusal
+from scripts.production.production_doc import Refusal
 from scripts.message import unit_labels
 from scripts.shutdown import remote
 from scripts.production import unit_lookup
@@ -1528,7 +1528,7 @@ def read_issues(folder: Path) -> list[issues.Issue]:
     return found
 
 
-def read_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
+def staff_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
     result: list[Unit] = []
     try:
         record = staff.snapshot()
@@ -1826,7 +1826,7 @@ def load_sources(window: log_records.Window) -> BaselineSources:
 def load_window_sources(window: log_records.Window, notifications: push_audit.AuditSources) -> BaselineSources:
     state, vault = Path.home() / ".local/state", Path.home() / "rust/hanadocs"
     problems: list[log_records.SourceProblem] = []
-    units = read_source("staff rows", lambda: read_units(problems), [], problems, event_source=log_records.SourceNotApplicable.STATE)
+    units = read_source("staff rows", lambda: staff_units(problems), [], problems, event_source=log_records.SourceNotApplicable.STATE)
     # The roster and usage store do not depend on the other sources. Read them
     # while the main thread reads files. Each reader keeps its own diagnostics.
     worker_problems: list[log_records.SourceProblem] = []

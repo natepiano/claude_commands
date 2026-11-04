@@ -10,7 +10,7 @@ hanadocs-info diagrams unit wrote (productions/hanadocs-info-diagrams.md, Phase 
 and its Generator spec), so the hand-written note and this one read the same.
 
 Sources, and nothing else: `roster.py --here --json`, which already joins the
-showrunners, the Units tables and each unit's live mesh_roster.json, and
+showrunners, the staff rows and each unit's live mesh_roster.json, and
 `showrunners.py list` and `children <production>` for the production file and
 the showrunners below hana. --here because every hana session runs on natedev:
 reading the Mac adds nothing to this tree, and a sleeping Mac would report a

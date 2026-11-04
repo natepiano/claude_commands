@@ -133,7 +133,6 @@ class UnitWatchdogTests(unittest.TestCase):
                 {entry["sessionId"] for entry in self.fixture.live} else sessions.SessionNotLive())
 
     def write_doc(self) -> None:
-        rows = ["# Fixture", "- **Production slug:** fixture", "## Units", "| Unit | Plan | Worktree |", "| --- | --- | --- |"]
         for name in self.units:
             tree = self.home / name
             member = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
@@ -146,9 +145,7 @@ class UnitWatchdogTests(unittest.TestCase):
             if name in self.finished:
                 events.append({"event_type": "run_finished"})
             _ = (self.runs / (name + ".jsonl")).write_text("\n".join(json.dumps(event) for event in events))
-            plan = "(retired)" if name in self.retired else "docs/plan.md"
-            rows.append(f"| {name} | {plan} | — |")
-        _ = self.doc.write_text("\n".join(rows) + "\n")
+        _ = self.doc.write_text("# Fixture\n- **Production slug:** fixture\n")
 
     def add_unit(self, name: str, *, label: str = "claude4") -> inventory.Session:
         owner = self.fixture.owner(name, host="unit", label=label)

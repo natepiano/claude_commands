@@ -29,11 +29,10 @@ Show the output. On a nonzero exit, show the error and stop. Use this order:
    `anomaly: <step>: <reason>`, and the next step runs. Run `apply` again
    until it prints `unchanged`.
 3. For each unit that is not retired, run `unit <new> <unit>` with its exact
-   Units-row name. `unit` uses the folder move: it stops the unit and its
+   staff row name. `unit` uses the folder move: it stops the unit and its
    workers, moves the worktree, writes the staff worktree and starts them
-   again. Then it renames the unit branch with `git branch -m`, commits the
-   Worktree and Branch cells and pushes the merge branch. A rerun with nothing
-   to change prints `<unit>: unchanged`.
+   again. Then it renames the unit branch with `git branch -m`. A rerun with
+   nothing to change prints `<unit>: unchanged`.
 4. `checkout <new> [<path>]` moves the showrunner checkout to `<path>`, by
    default its folder name with the old slug replaced by `<new>`. It stops
    this showrunner session and restarts it in the new folder, so end the turn

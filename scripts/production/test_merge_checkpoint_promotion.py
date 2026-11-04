@@ -28,7 +28,7 @@ from scripts.message import sessions
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from merge_checkpoint import promote, request_from
 import merge_checkpoint
-from production_units import Production
+from scripts.production.production_doc import Production
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 

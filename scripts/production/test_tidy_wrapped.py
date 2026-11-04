@@ -23,7 +23,7 @@ SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
 
 
 def production(status: str) -> str:
-    return f"# Example\n\n> **Status: PRODUCTION — {status}.** One line.\n\n## Units\n"
+    return f"# Example\n\n> **Status: PRODUCTION — {status}.** One line.\n"
 
 
 class TidyWrappedTests(unittest.TestCase):

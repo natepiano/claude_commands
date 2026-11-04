@@ -13,8 +13,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from production_units import read_production  # noqa: E402
-import production_units  # noqa: E402
+from scripts.production.production_doc import Refusal, cell_value, read_production  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import stall_watch  # noqa: E402
@@ -28,7 +27,7 @@ from rename_state import RenameRefused, write_text  # noqa: E402
 
 from scripts.astra import design_roles  # noqa: E402
 from scripts.herdr import herdr  # noqa: E402
-from scripts.production import staff, staff_sources
+from scripts.production import staff, staff_sources, unit_config, unit_names
 from scripts.shutdown import remote
 
 
@@ -63,10 +62,6 @@ class RenamePlan:
     def branch(self) -> str:
         """The merge branch after the rename."""
         return self.new if self.renames_branch else self.merge_branch
-
-
-def _check_unit_tip(plan: RenamePlan, record: dict[str, object]) -> None:
-    unit_move.check_tip(plan.checkout, _string(record, "old_branch"), _string(record, "tip"))
 
 
 def _validate_slug(slug: str) -> None:
@@ -107,7 +102,7 @@ def _merge_line(text: str, branch: str) -> str:
         if lines[index].startswith("- **Merge branch:**"):
             prefix = "- **Merge branch:**"
             raw = lines[index][len(prefix):]
-            value = production_units.cell_value(raw.strip())
+            value = cell_value(raw.strip())
             updated = raw.replace(f"`{value}`", f"`{branch}`", 1) if "`" in raw else raw.replace(value, branch, 1)
             lines[index] = prefix + updated
             return "".join(lines)
@@ -165,31 +160,30 @@ def plan(old: str, new: str) -> RenamePlan:
             raise RenameRefused(f"{new} is already the production's name")
         old = former[0]
     _ = unit_move.git(production.checkout, "check-ref-format", "--branch", new)
-    lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units: list[str] = []
-    plans: list[Path] = []
-    for row in production_units.unit_table(lines):
-        unit = production_units.cell_value(row.get("Unit", ""))
-        if not unit:
-            raise RenameRefused("Units row has no unit name")
-        units.append(unit)
-        raw = row.get("Plan", "")
-        if production_units.plan_cell_is_retired(raw):
-            continue
-        if raw.strip() in ("", "—", "-", "permanent"):
-            continue
-        for path in unit_move.plan_paths(raw, production.checkout):
-            if path not in plans:
-                plans.append(path)
     new_doc = production.doc.with_name(f"{new}-production.md")
     old_doc = production.doc.with_name(f"{old}-production.md") if production.doc == new_doc else production.doc
+    staff_id = _staff_id(old_doc, new_doc)
+    rows = staff.snapshot().find(kind="unit", parent=staff_id)
+    units = tuple(unit_names.unit_id(row.name) for row in rows)
     return RenamePlan(
         old, new, old_doc, new_doc, production.checkout, production.merge_branch,
-        tuple(units), tuple(plans), PathMove(instance.with_name(f"showrunner-{old}"), instance.with_name(f"showrunner-{new}")),
+        units, _plans(rows, production.checkout), PathMove(instance.with_name(f"showrunner-{old}"), instance.with_name(f"showrunner-{new}")),
         tuple(PathMove(source, destination) for source, destination in
               zip(tidy_wrapped.owned_paths(old), tidy_wrapped.owned_paths(new), strict=True)),
         tuple(PathMove(stall_watch.stretch_path(old, unit), stall_watch.stretch_path(new, unit)) for unit in units),
-        _staff_id(old_doc, new_doc))
+        staff_id)
+
+
+def _plans(rows: list[staff.StaffRow], checkout: Path) -> tuple[Path, ...]:
+    """The tracked plan files that the active units' `.unit.toml` files name."""
+    plans: list[Path] = []
+    for row in rows:
+        if not isinstance(row.worktree, staff.PresentWorktree):
+            continue
+        config = unit_config.read(row.worktree.path, cleanup=False)
+        if isinstance(config, unit_config.UnitConfig) and isinstance(config.plan, unit_config.PlanFile):
+            plans.extend(path for path in unit_move.plan_paths(str(config.plan.path), checkout) if path not in plans)
+    return tuple(plans)
 
 
 def _staff_id(old_doc: Path, new_doc: Path) -> staff.StaffId:
@@ -201,13 +195,6 @@ def _staff_id(old_doc: Path, new_doc: Path) -> staff.StaffId:
     if len(found) != 1:
         raise staff.StaffRefused(f"{old_doc}: expected one showrunner staff row, found {len(found)}")
     return found[0]
-
-
-def _string(fields: dict[str, object], key: str) -> str:
-    value = fields.get(key)
-    if not isinstance(value, str) or not value:
-        raise RenameRefused(f"invalid rename journal: {key}")
-    return value
 
 
 def _describe(plan: RenamePlan) -> list[str]:
@@ -227,7 +214,7 @@ def _describe(plan: RenamePlan) -> list[str]:
             *(f"4. parent {path}: {plan.old} -> {plan.new}" for path in parents),
             f"4. held design roles: holder {plan.old} showrunner -> {plan.new} showrunner",
             *rename_outside.describe(plan.old, plan.new, plan.old_doc, plan.new_doc),
-            *(stretches or ["5. stall-watch: no Units rows"]),
+            *(stretches or ["5. stall-watch: no units"]),
             (f"6. merge branch {plan.merge_branch} -> {plan.new} (git branch -m); commit {plan.message!r}; "
              + f"push origin {plan.new}" if plan.renames_branch else
              f"6. merge branch {plan.merge_branch} kept (not named for the production); commit {plan.message!r}; "
@@ -390,100 +377,51 @@ def apply(old: str, new: str) -> RenamePlan:
         for step in STEPS:
             try:
                 step(result)
-            except (OSError, ValueError, production_units.Refusal, tidy_wrapped.TidyRefused,
+            except (OSError, ValueError, Refusal, tidy_wrapped.TidyRefused,
                     staff.StaffRefused, herdr.HerdrFailure, WorkerUnavailable) as error:
                 print(f"anomaly: {step.__name__.lstrip('_')}: {error}", file=sys.stderr)
         print(f"{result.old} is now {result.new}")
     return result
 
 
-def _unit_row(plan: RenamePlan, name: str) -> dict[str, str]:
-    rows = [row for row in production_units.unit_table(plan.new_doc.read_text(encoding="utf-8").splitlines())
-            if production_units.cell_value(row.get("Unit", "")) == name]
-    if len(rows) != 1:
-        raise RenameRefused(f"{name}: expected one Units row")
-    if production_units.plan_cell_is_retired(rows[0].get("Plan", "")):
+def _unit_row(plan: RenamePlan, name: str) -> staff_sources.MemberFound:
+    found = staff_sources.member(staff_sources.UnitMember(plan.new, name), staff.snapshot())
+    if isinstance(found, staff_sources.NoSuchMember):
+        raise RenameRefused(f"{plan.new}/{name}: no unit staff row")
+    if isinstance(found.row.worktree, staff.RemovedWorktree):
         raise RenameRefused(f"{name} is retired and has no live worktree")
-    return rows[0]
+    return found
 
 
-def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str, object]:
-    for field in ("Branch",):
-        if field not in row:
-            raise RenameRefused(f"{name}: Units table lacks {field} column")
-    branch = production_units.cell_value(row.get("Branch", ""))
-    stem = branch.removeprefix(plan.new + "-").removeprefix(plan.old + "-")
-    old_branch, new_branch = f"{plan.old}-{stem}", f"{plan.new}-{stem}"
-    # Read from the checkout: a rerun after an interrupted folder move finds no folder at the staff path.
-    tip = unit_move.branch_tip(plan.checkout, old_branch) or unit_move.branch_tip(plan.checkout, new_branch)
-    return {"old_branch": old_branch, "new_branch": new_branch, "tip": tip}
+def _destination(source: Path, old_branch: str, new_branch: str) -> Path:
+    """The unit folder named for the new branch; a folder not named for the old branch keeps its path."""
+    suffix = f"-{old_branch}"
+    return source.with_name(source.name.removesuffix(suffix) + f"-{new_branch}") if source.name.endswith(suffix) else source
 
 
-def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
-    lines = plan.new_doc.read_text(encoding="utf-8").splitlines(keepends=True)
-    headings = production_units.unit_headings([line.rstrip("\n") for line in lines])
-    for field in ("Branch",):
-        if field not in headings:
-            raise RenameRefused(f"{name}: Units table lacks {field} column")
-    in_units = False
-    for index, line in enumerate(lines):
-        if line.startswith("## "):
-            in_units = line.strip() == "## Units"
-        if not in_units or not line.startswith("|"):
-            continue
-        cells = production_units.row_cells(line)
-        if cells and production_units.cell_value(cells[0]) == name:
-            for field, value in (("Worktree", "—"),
-                                 ("Branch", _string(record, "new_branch"))):
-                if field not in headings:
-                    continue
-                column = headings.index(field)
-                cells[column] = value if field == "Worktree" else f"`{value}`"
-            lines[index] = "| " + " | ".join(cells) + " |\n"
-            write_text(plan.new_doc, "".join(lines))
-            return
-    raise RenameRefused(f"{name}: Units row disappeared")
-
-
-def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
-    _check_unit_tip(plan, record)
-    message = f"chore({plan.new}): rename unit {name} from {plan.old}"
-    if unit_move.git(plan.checkout, "branch", "--show-current") != plan.branch:
-        raise RenameRefused(f"showrunner checkout switched away from the merge branch {plan.branch}")
-    path = _relative(plan, plan.new_doc)
-    rows = production_units.unit_table(unit_move.git(plan.checkout, "show", f"HEAD:{path}").splitlines())
-    matching = [row for row in rows if production_units.cell_value(row.get("Unit", "")) == name]
-    committed = (len(matching) == 1
-                 and production_units.cell_value(matching[0].get("Branch", "")) == _string(record, "new_branch"))
-    changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
-    changed.update(set(unit_move.git(plan.checkout, "diff", "--cached", "--name-only", "-z", "HEAD").split("\0")) - {""})
-    untracked = [path for path in unit_move.git(plan.checkout, "ls-files", "--others", "--exclude-standard").splitlines()
-                 if path not in rename_outside.log_paths(plan.old, plan.new, plan.new_doc)]
-    if changed - {path} or untracked or (committed and changed):
-        raise RenameRefused("unrelated checkout changes during unit rename")
-    if not committed:
-        _unit_doc(plan, name, record)
-        _ = unit_move.git(plan.checkout, "add", "--", path)
-        _ = unit_move.git(plan.checkout, "commit", "-m", message)
-    _check_unit_tip(plan, record)
-    _ = unit_move.git(plan.checkout, "push", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
+def _unit_branches(plan: RenamePlan, name: str, source: Path) -> tuple[str, str]:
+    """The unit's old and new branch names, from the branch checked out at the staff folder or its renamed folder."""
+    # A rerun after an interrupted folder move finds no folder at the staff path, so read from the checkout.
+    listed = unit_move.git(plan.checkout, "for-each-ref", "--format=%(refname:short)%00%(worktreepath)",
+                           f"refs/heads/{plan.old}-*", f"refs/heads/{plan.new}-*")
+    for line in listed.splitlines():
+        branch, _, path = line.partition("\0")
+        stem = branch.removeprefix(plan.new + "-").removeprefix(plan.old + "-")
+        old_branch, new_branch = f"{plan.old}-{stem}", f"{plan.new}-{stem}"
+        if path and Path(path).resolve() in (source.resolve(), _destination(source, old_branch, new_branch).resolve()):
+            return old_branch, new_branch
+    raise RenameRefused(f"{name}: no {plan.old}- or {plan.new}- branch is checked out at {source}")
 
 
 def unit(new: str, name: str) -> None:
-    """Move one unit's folder (the folder move stops and starts it), run git branch -m, and set its Units cells."""
+    """Move one unit's folder (the folder move stops and starts it), then run git branch -m."""
     with staff.operation(), design_roles.record_operation(), unit_move.production_lock():
         current = showrunners.canonical_slug(new)
         result = plan(current, current)
-        found = staff_sources.member(staff_sources.UnitMember(result.new, name), staff.snapshot())
-        if isinstance(found, staff_sources.NoSuchMember):
-            raise RenameRefused(f"{result.new}/{name}: no unit staff row")
+        found = _unit_row(result, name)
         source = unit_lookup.local_worktree(found).path
-        record = _prepare_unit(result, name, _unit_row(result, name))
-        old_branch, new_branch = _string(record, "old_branch"), _string(record, "new_branch")
-        suffix = f"-{old_branch}"
-        destination = (source.with_name(source.name.removesuffix(suffix) + f"-{new_branch}")
-                       if source.name.endswith(suffix) else source)
-        head = unit_move.git(result.checkout, "rev-parse", "HEAD")
+        old_branch, new_branch = _unit_branches(result, name, source)
+        destination = _destination(source, old_branch, new_branch)
         if destination != source:
             unit_move.move_folder(found.row.id, destination)
             _move_held_roles(design_roles.UnitHolder(result.old, name), design_roles.UnitHolder(result.new, name),
@@ -491,8 +429,7 @@ def unit(new: str, name: str) -> None:
         renamed = unit_move.git(destination, "branch", "--show-current") == old_branch
         if renamed:
             _ = unit_move.git(destination, "branch", "-m", old_branch, new_branch)
-        _commit_unit(result, name, record)
-        changed = destination != source or renamed or unit_move.git(result.checkout, "rev-parse", "HEAD") != head
+        changed = destination != source or renamed
         print(f"{name}: {'moved to ' + str(destination) if changed else 'unchanged'}")
 
 
@@ -528,7 +465,7 @@ def _main(argv: list[str]) -> int:
             _ = apply(cast(str, args.old), new)
     except (staff.StaffRefused, staff.StaffNotFound, staff.StaffUnreadable):
         raise
-    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable,
+    except (RenameRefused, Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable,
             herdr.HerdrFailure, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1

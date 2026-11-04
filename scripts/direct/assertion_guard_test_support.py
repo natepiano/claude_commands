@@ -179,11 +179,8 @@ class GitRepositoryFixture(unittest.TestCase):
             _ = self.git("branch", merge_branch, "HEAD")
         _ = self.git("-C", str(production_tree), "symbolic-ref", "HEAD", f"refs/heads/{merge_branch}")
         doc = production_tree / f"{slug}-production.md"
-        worktree_cell = f"`{worktree or self.repo}`" + (f" {worktree_commentary}" if worktree_commentary else "")
         _ = doc.write_text(
-            f"- **Merge branch:** `{merge_branch}`\n- **Showrunner checkout:** `{self.repo}`\n\n## Units\n\n"
-            + "| Unit | Worktree | Branch | Plan | Status |\n| --- | --- | --- | --- | --- |\n"
-            + f"| fixture | {worktree_cell} | `{branch}` | `README.md` | {status} |\n", encoding="utf-8")
+            f"- **Merge branch:** `{merge_branch}`\n- **Showrunner checkout:** `{self.repo}`\n", encoding="utf-8")
         timer = self.notifier_dir / f"showrunner-{slug}"
         timer.mkdir(exist_ok=True)
         _ = (timer / "conf").write_text(

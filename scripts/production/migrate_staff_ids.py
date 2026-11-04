@@ -17,7 +17,7 @@ from typing import cast
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file, unit_runs
-from scripts.production import staff, staff_sources, unit_config, showrunners, rename_state, unit_names, unit_move
+from scripts.production import staff, staff_sources, unit_config, showrunners, rename_state, unit_move
 from scripts.shutdown import pane_record, remote
 from scripts.message import sessions
 
@@ -189,8 +189,6 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
                 evidence[matches[0].id].update(observed.identity.values())
             elif matches:
                 missing.append(f"{observed.name}: no unique worker row under {observed.owner.match.id}")
-    retirements, retired_missing = staff_sources.migration_retirements(record)
-    missing.extend(retired_missing)
     parked: dict[staff.StaffId, unit_config.UnitConfig] = {}
     for row in record.rows:
         try:
@@ -216,12 +214,6 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
                     target = source.timer.target.removeprefix("session:")
                     if target:
                         evidence[row.id].add(target)
-    for candidate in retirements.units.values():
-        if isinstance(candidate.member, staff_sources.MemberFound):
-            config = candidate.config
-            if isinstance(config.retired, unit_config.RetiredSession):
-                evidence[candidate.member.row.id].add(config.retired.session_id)
-                parked[candidate.member.row.id] = config
     historical_workers(record, evidence, missing)
     # A recorded handoff is conversation evidence, never a new member identity.
     for row in record.rows:
@@ -258,35 +250,14 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
         for row in unowned:
             del identities[row.id]
             missing.append(f"{row.id} {row.name}: missing proved native parent {row.parent}")
-    additions: list[staff.StaffRow] = []
     publications: list[ParkedPublication] = [ParkedPublication(identities.get(identity, identity), config)
                                            for identity, config in parked.items() if identity in identities]
-    for (slug, name), candidate in retirements.units.items():
-        if isinstance(candidate.member, staff_sources.MemberFound):
-            continue
-        owner = sources.member(staff_sources.ShowrunnerMember(slug), record)
-        config = candidate.config
-        try:
-            if not isinstance(owner, staff_sources.MemberFound) or owner.row.id not in identities:
-                raise staff.StaffRefused("missing proved native showrunner owner")
-            if not isinstance(config.retired, unit_config.RetiredSession):
-                raise staff.StaffRefused("missing retired session evidence")
-            native = staff.native_id(config.retired.session_id)
-            parent = identities[owner.row.id]
-            row = staff.StaffRow(native, "unit", unit_names.name(name), parent, candidate.worktree, current_session=native)
-            occupied = next((entry for entry in record.rows if identities.get(entry.id, entry.id) == native), None)
-            if occupied is not None or any(entry.id == native for entry in additions):
-                raise staff.StaffRefused(f"{native}: retired destination already occupied")
-            additions.append(row)
-            publications.append(ParkedPublication(native, config))
-        except (ValueError, staff.StaffRefused) as error:
-            missing.append(f"{candidate.source} {name}: {error}")
     # Optional historical sources can be unreadable while independent runtime
     # evidence proves a row. Conflicting identities have already been withheld
     # above; report each proved row only as proved.
     unresolved = [line for line in missing
                   if staff.StaffId(line.split(maxsplit=1)[0].removesuffix(":")) not in identities]
-    return MigrationPlan(identities, tuple(additions), tuple(dict.fromkeys(unresolved)), record, tuple(publications))
+    return MigrationPlan(identities, (), tuple(dict.fromkeys(unresolved)), record, tuple(publications))
 
 
 def _replace_references(value: object, identities: dict[staff.StaffId, staff.StaffId]) -> object:

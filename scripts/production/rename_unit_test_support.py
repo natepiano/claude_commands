@@ -76,7 +76,9 @@ class UnitRenameFixture(StaffTestCase):
         self.bind_fixture(self.fixture_root)
         bind_staff_fixture(self, self.env, {SLUG: ("alpha-unit", "mul_add-unit")},
                            locations={(SLUG, "alpha-unit"): self.rust / "claude-demo-alpha",
-                                      (SLUG, "mul_add-unit"): self.rust / "claude-demo-mul-add"})
+                                      (SLUG, "mul_add-unit"): self.rust / "claude-demo-mul-add"},
+                           plans={(SLUG, "alpha-unit"): Path("docs/plans/alpha.md"),
+                                  (SLUG, "mul_add-unit"): Path("docs/plans/mul-add.md")})
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.home / ".local/state/herdr-panes"))
         _ = self.enterContext(mock.patch.object(pane_record, "PROC", self.root / "proc"))
 
@@ -156,10 +158,7 @@ class UnitRenameFixture(StaffTestCase):
             "# Production — demo", "", "## Production Context", "", "- **Merge branch:** `demo`",
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Log:** `production.log`",
             f"- **Proposals:** `{self.root / 'issues'}`", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
-            f"| alpha-unit | docs/plans/alpha.md | `{self.rust / 'claude-demo-alpha'}` | demo-alpha |",
-            f"| mul_add-unit | docs/plans/mul-add.md | `{self.rust / 'claude-demo-mul-add'}` | demo-mul-add |",
-            "", "## Hub files", "", "| File | Owner unit | Other units that touch it |", "| --- | --- | --- |",
+            "## Hub files", "", "| File | Owner unit | Other units that touch it |", "| --- | --- | --- |",
             "| `docs/alpha-unit.md` | alpha-unit | beta-unit (after alpha-unit Phase 2) |",
             "", "## Gates", "", "| Gate | Waiting | Waits on | Clears when |", "| --- | --- | --- | --- |",
             "| alpha-unit gate | beta-unit | alpha-unit Phase 2 | alpha-unit merges |",
@@ -245,12 +244,8 @@ class UnitRenameFixture(StaffTestCase):
         _ = self.git("push", "origin", SLUG)
         plan = Path("docs/style-production/units/names-unit.md")
         self.write(self.checkout / ".git/info/exclude", "docs/plans/demo-production.md\ndocs/style-production/\n")
-        text = self.production_doc().replace(
-            "- **Log:**", f"- **Kind:** style\n- **Repository:** `{self.checkout}`\n- **Log:**")
-        text = text.replace(
-            f"| alpha-unit | docs/plans/alpha.md | `{self.rust / 'claude-demo-alpha'}` | demo-alpha |",
-            f"| names-unit | `{plan}` | `{worktree}` | demo-names |")
-        self.write(self.doc, text)
+        self.write(self.doc, self.production_doc().replace(
+            "- **Log:**", f"- **Kind:** style\n- **Repository:** `{self.checkout}`\n- **Log:**"))
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
         _ = fixture_member("unit", name="names", parent=parent.id,
                            worktree=staff.PresentWorktree("natedev", worktree))

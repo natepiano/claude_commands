@@ -13,12 +13,11 @@ Run in the showrunner session. `<unit>` is the unit's id or stem.
 
 Print the script output without changes.
 
-`/showrunner:retire_unit` keeps what a resume needs in the Units row: the worktree path, the branch,
-the plan, and the director's last session in the note `(retired <date>, worktree removed, session <id>)`.
-Unmerged work adds `, ref refs/retired/<staff id>, tip <SHA>` before the closing parenthesis.
+`/showrunner:retire_unit` keeps what a resume needs: the staff row keeps the worktree path in
+`RemovedWorktree`, and the parked `.unit.toml` keeps the plan, the branch and the director's last session.
 
 It refuses, and changes nothing, when:
-- the row is not retired, or its note names no session;
+- the row is not retired, or its parked `.unit.toml` names no session;
 - no account has that session's transcript under the worktree's project folder: `claude --resume`
   finds a transcript only under the folder where the session started. Every account links the same
   `projects` folder, so a units account that moved since the retire still finds it;
@@ -31,12 +30,10 @@ Then it:
    worktree HEAD, then deletes the origin ref. With no ref, it uses the merge branch as before;
 2. restores `.unit.toml`, sets `PresentWorktree` on the retained row, and resumes that session through `add_unit.py --resume`, on the units account, with the unit's
    name and Remote Control;
-3. takes the retired note out of the Plan cell, committed on the merge branch (the next merge push
-   takes it out). The Units row is live again. Parked facts go only after the running session
-   and its pane `STAFF_ID` are proven.
+3. deletes the parked `.unit.toml` after the running session and its pane `STAFF_ID` are proven.
 
-A rerun after a failure resumes: each step checks whether it is done, and the note goes last,
-while the parked file keeps the session facts until launch is proven.
+A rerun after a failure resumes: each step checks whether it is done, and the parked file keeps
+the session facts until launch is proven.
 
 `--dry-run` prints each refusal and each step, and changes nothing.
 

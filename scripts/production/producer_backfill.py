@@ -10,7 +10,7 @@ from pathlib import Path
 
 from scripts.production import change_review, change_routing, staff
 from scripts.production.proposals_folder import owner_docs
-from production_units import Refusal
+from scripts.production.production_doc import Refusal
 import unit_names
 from scripts.shutdown import remote
 

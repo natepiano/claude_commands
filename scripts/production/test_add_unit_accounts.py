@@ -421,7 +421,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
                 with self.subTest(production=document.name, name=name):
                     request = add_unit.launch_request(argparse.Namespace(
                         production=str(document), name=name, plan="docs/plans/given.md", brief=None,
-                        standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
+                        standby=False, permanent=False, port=None, timeout=90.0, check=False,
                         resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
                         probe=False,
                     ))

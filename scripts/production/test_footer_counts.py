@@ -27,7 +27,8 @@ from scripts.production.test_change_review import producer_rows
 from scripts.statusline import counts_row
 from footer_counts import FooterCounts
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+    fixture_member, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+    unit_membership,
 )
 
 LIST = """# Change review
@@ -71,11 +72,12 @@ def issue(folder: Path, name: str, status: str, tags: str, proposed_by: str = "p
 
 
 def production_doc(folder: Path, slug: str, proposals: Path, *units: str) -> Path:
-    """A production doc that names the shared proposals folder and its units."""
-    rows = "".join(f"| {unit} | `docs/plans/{unit}.md` |\n" for unit in units)
+    """A production doc that names the shared proposals folder, with staff rows for its units."""
     path = folder / f"{slug}-production.md"
-    _ = path.write_text(f"# {slug}\n\n- **Proposals:** {proposals}\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n{rows}",
-                        encoding="utf-8")
+    _ = path.write_text(f"# {slug}\n\n- **Proposals:** {proposals}\n", encoding="utf-8")
+    _ = recorded_showrunner(slug, path)
+    for unit in units:
+        _ = unit_membership(slug, unit)
     return path
 
 

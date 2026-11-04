@@ -67,7 +67,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import copy_record  # noqa: E402
@@ -449,10 +449,7 @@ def registered_plan(unit: str) -> Path:
     """Resolve the plan from the unit's staff parent and production record."""
     from scripts.direct import phase_table
     from scripts.production import proposals_table, staff, unit_lookup
-    if TYPE_CHECKING:
-        from scripts.production.production_units import Refusal
-    else:
-        from production_units import Refusal
+    from scripts.production.production_doc import Refusal
 
     try:
         parent = unit_lookup.unit_parent(unit, record=staff.snapshot(), sources=unit_lookup.member_sources())
@@ -467,7 +464,7 @@ def registered_plan(unit: str) -> Path:
         record = records.get(unit)
         cause = cast(dict[str, object], record).get("unavailable") if isinstance(record, dict) else None
         raise ScratchError(f"{unit}: no registered plan in production {parent.doc}: "
-                           + (str(cause) if cause else "no Units row or plan"))
+                           + (str(cause) if cause else "no staff row or plan"))
     return plans[unit]
 
 

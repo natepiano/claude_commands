@@ -250,10 +250,6 @@ class RosterTests(unittest.TestCase):
         self.production_doc = self.root / "alpha-production.md"
         _ = self.production_doc.write_text("\n".join((
             "- **User zone:** America/New_York",
-            "## Units",
-            "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |",
-            f"| unit-one | docs/plan.md | {director_cwd} | unit-one | — | — |",
         )), encoding="utf-8")
         _ = recorded_unit("alpha", "unit-one", director_cwd, self.production_doc, plan="docs/plan.md")
         self._write_showrunner_timer()
@@ -471,7 +467,7 @@ class RosterTests(unittest.TestCase):
         env_file = self.root / "herdr-proc/991100/environ"
         _ = env_file.write_bytes(env_file.read_bytes() + f"\0CODEX_THREAD_ID={row.id}".encode())
         doc = self.root / "receiving-production.md"
-        _ = doc.write_text("# Receiving\n\n## Units\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n")
+        _ = doc.write_text("# Receiving\n")
         _ = staff.set_doc(receiving.id, staff.LiveDoc("natedev", doc))
         timer = self.notifier / "showrunner-receiving"
         timer.mkdir()
@@ -1850,7 +1846,7 @@ class RosterTests(unittest.TestCase):
     def test_unreadable_herdr_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
         owner = unit_membership("alpha", "unit-one")
         _ = staff.set_worktree(owner.id, staff.PresentWorktree(roster.remote.local_machine(), self.home / "projects/unit-one"), expected=owner.worktree)
-        _ = self.production_doc.write_text("# Production without a Units table\n")
+        _ = self.production_doc.write_text("# Production\n")
         worker_path = self.sessions / "worker.json"
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))
         worker["cwd"] = str(self.home / "projects" / "unit-one")
@@ -2310,9 +2306,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
             "--session native agent list": {"code": 0, "stdout": '{"ok": true, "result": {"agents": []}}'},
         }))
         doc = self.root / "production.md"
-        _ = doc.write_text("## Units\n| Unit | Plan | Worktree | Branch | Port | Owns |\n"
-                           + "| --- | --- | --- | --- | --- | --- |\n"
-                           + f"| report-unit | plan.md | {self.root / 'report-director'} | report | — | — |\n")
+        _ = doc.write_text("# builds\n")
         timer = notifier / "showrunner-builds"
         timer.mkdir()
         _ = (timer / "conf").write_text(f"TARGET=session:{self.runner_id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
@@ -2471,11 +2465,7 @@ class UnitLabelsTests(unittest.TestCase):
         worker = fixture_worker("types-review", unit.id)
         doc = root / "production.md"
         _ = staff.set_doc(unit.parent, staff.LiveDoc("natedev", doc))
-        _ = doc.write_text(
-            "## Units\n| Unit | Plan | Worktree | Branch | Port | Owns |\n"
-            + "| --- | --- | --- | --- | --- | --- |\n"
-            + "| cargo-liner-style-types-unit | plan.md | /fixture/style | style | — | — |\n",
-        )
+        _ = doc.write_text("# cargo-liner\n")
         records: list[sessions.SessionRecord] = [
             {"pid": pid, "sessionId": sid, "name": name, "messagingSocketPath": f"/fixture/{sid}.sock",
              "updatedAt": 1, "tmux": "", "formerNames": []}

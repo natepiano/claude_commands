@@ -6,7 +6,7 @@
 operation 5 of `docs/plans/staff-lifecycle.md`: write `name`, move the folder
 (the folder move), run `git branch -m`, set the displays. `/showrunner:rename`
 gives the order: `plan <old> <new>`, `apply <old> <new>`, then
-`unit <new> <unit>` for each non-retired row. `checkout <new> [<path>]` moves
+`unit <new> <unit>` for each non-retired unit. `checkout <new> [<path>]` moves
 the showrunner checkout. Old names resolve through a `**Formerly:**` line in
 the production doc. A merge branch named for the production (`<old>`) takes
 the name `<new>`. A merge branch with another name (`main`, `init/catalyst`)
@@ -21,7 +21,8 @@ keeps its name.
 | `scripts/production/unit_move.py` | Supplies `PathMove`, `move`, `git`, the branch tips, the production lock and `move_folder` (the folder move). |
 | `scripts/production/tidy_wrapped.py` | Supplies `SLUG`, the reserved `SHARED` names and `owned_paths(slug)`, the six owned state paths (the state folder last). |
 | `scripts/production/rename_outside.py` | The apply state outside the showrunner state folder: /next pins, change-review Production cells, children's Parent production line, the bevy upgrade watch, the derived unit board, a slug-named log. |
-| `scripts/production/production_units.py` | Reads the production doc, the Units table and its cells; `plan_cell_is_retired`. |
+| `scripts/production/production_doc.py` | Reads the production doc (`read_production`, `cell_value`, `Refusal`). |
+| `scripts/production/unit_config.py` | Reads each active unit's `.unit.toml`, which names its plan. |
 | `scripts/production/showrunners.py` | Reads timer CHECK paths and resolves Formerly names. |
 | `scripts/production/unit_lookup.py` | Reads a unit's local worktree from its staff row. |
 | `scripts/production/stall_watch.py` | Supplies the hashed stall-watch paths. |
@@ -41,8 +42,8 @@ class RenamePlan:
     new_doc: Path
     checkout: Path
     merge_branch: str              # from the doc's Merge branch line; may differ from old
-    units: tuple[str, ...]         # every Units row, retired included
-    plans: tuple[Path, ...]        # unit plans of non-retired rows
+    units: tuple[str, ...]         # unit id of every unit staff row, retired included
+    plans: tuple[Path, ...]        # plans that active units' .unit.toml files name
     timer: PathMove                # showrunner-<old> -> showrunner-<new>
     state: tuple[PathMove, ...]    # owned_paths(old) -> owned_paths(new)
     stall: tuple[PathMove, ...]    # one per unit
@@ -97,7 +98,7 @@ left to change, it prints `unchanged`. Otherwise it writes the staff `name`
 | `_rewrite_plans` | Rewrite unit-plan Production headers (both header forms) and their production-doc references; add a header where a plan has none. |
 | `_rename_timer` | Rename `showrunner-<old>` to `showrunner-<new>` and keep the updated CHECK. |
 | `_rename_showrunner_state` | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, `counts/<slug>`, `reports/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each held design the showrunner holds takes `ShowrunnerHolder(<new>)` (`design_roles.move_holder`). Then `rename_outside.apply`: move the `next-`, `proposal-` and `question-<slug>` pins (and their `-all-below` forms) and rename their `<old>: ` item keys; rewrite Production cells naming `<old>` on the change-review list; point each child doc's Parent production line at the new doc; move the bevy upgrade record and notifier job (`RUN` names the new doc, `FROM` the new instance) and drop its lock; remove the derived `unit-board/<old>.json`; a Log line naming `<old>-log.md` takes `<new>-log.md`, the log and its `-recovered` copy move, and an info/exclude line naming an old one gains one for the new. |
-| `_rename_stall_watch` | Move each Units row's stall-watch file from `sha256(old\0unit).json` to `sha256(new\0unit).json`. |
+| `_rename_stall_watch` | Move each unit's stall-watch file from `sha256(old\0unit).json` to `sha256(new\0unit).json`. |
 | `_rename_unit_workers` | Move the units' worker ledgers from the old production to the new one (`workers.move_unit`). |
 | `_retarget_phase_notes` | Retarget phase notes from the old production to the new doc (`phase_table.retarget_phase_notes`). |
 | `_rename_branch` | A merge branch named for the production: `git branch -m <old> <new>` and update the Merge branch line. Then commit the changed documents and push the merge branch with upstream. |
@@ -111,24 +112,25 @@ and stall-watch paths, a plan header, the old merge branch, uncommitted doc
 or plan changes, and a merge branch that origin does not have at its local
 tip. Then a rerun prints `unchanged`.
 
-Retired Units rows (Plan cell starting `(retired`) still contribute
-stall-watch moves, but never unit-plan paths. Other Plan cells select
-existing, tracked `docs/plans/*.md` paths quoted in backticks or given as a
-single bare path, ignoring as-built paths and prose. A plan path that is
-missing or not tracked in git is skipped. Saved logs and backups move without
+The units are the unit staff rows under the showrunner row. A retired unit
+(a removed staff worktree) still contributes a stall-watch move, but never a
+unit-plan path. An active unit's `.unit.toml` names its plan file; only an
+existing, tracked `docs/plans/*.md` path is used. A plan path that is missing
+or not tracked in git is skipped. Saved logs and backups move without
 content edits.
 
 The document and plan changes form one commit on the merge branch after the
 rename (`RenamePlan.branch`): `chore(<new>): rename production from <old>`.
-Apply leaves unit branches, worktrees and their Units-row cells to `unit`.
+Apply leaves unit branches and worktrees to `unit`.
 
 ## Unit changes
 
 `unit <new> <unit>` holds the same locks as apply. It resolves the production
 through `canonical_slug` and reads the unit's staff row and its local
-worktree. The unit needs one non-retired Units row with a Branch column. The
-old branch is `<old>-<stem>` and the new branch is `<new>-<stem>`. The tip is
-read from the checkout's old branch, or from the new branch on a rerun.
+worktree. A retired unit (a removed staff worktree) is refused. The branch
+comes from the checkout: the `<old>-<stem>` or `<new>-<stem>` branch that is
+checked out at the staff folder or at its renamed folder. A rerun after an
+interrupted folder move finds the branch at the renamed folder.
 
 1. The destination is the worktree's sibling with the `-<old>-<stem>` suffix
    replaced by `-<new>-<stem>`. A folder without that suffix keeps its path.
@@ -138,13 +140,9 @@ read from the checkout's old branch, or from the new branch on a rerun.
    `UnitHolder(<new>, <unit>)` and the new worktree paths
    (`design_roles.move_holder`).
 3. When the worktree is on the old branch, `git branch -m` renames it.
-4. The Units row's Worktree cell becomes `—` and its Branch cell names the
-   new branch. The commit is `chore(<new>): rename unit <unit> from <old>`.
-   Then the merge branch is pushed. A Units row at HEAD that already names the
-   new branch makes no second commit.
 
 `unit` prints `<unit>: moved to <destination>`, or `<unit>: unchanged` when a
-rerun has nothing to change. It does not push the unit branch.
+rerun has nothing to change. It makes no commit and does not push the unit branch.
 
 ## Showrunner checkout
 

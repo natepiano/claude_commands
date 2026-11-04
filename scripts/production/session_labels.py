@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from scripts.production import staff, showrunners, unit_names
-from scripts.production.unit_table import unit_spellings
 
 
 def showrunner_owner(record: staff.StaffSnapshot, slug: str, document: str) -> staff.StaffRow | None:
@@ -57,13 +56,10 @@ class StaffLabels:
             slugs = [slug for slug, owner in self.showrunners.items() if owner.id == parent.id]
             slug = slugs[0] if len(slugs) == 1 else parent.name
             result["SHOWRUNNER_UNIT"] = slug
-            source = self.productions.get(slug)
-            spellings = unit_spellings(source.document.splitlines()) if source is not None else {}
             retained_id = result.get("SHOWRUNNER_UNIT_ID", "")
             try:
                 retained_owner = unit_names.name(retained_id) if retained_id else ""
             except unit_names.BadName:
                 retained_owner = ""
-            result["SHOWRUNNER_UNIT_ID"] = spellings.get(
-                row.name, retained_id if retained_owner == row.name else unit_names.unit_id(row.name))
+            result["SHOWRUNNER_UNIT_ID"] = retained_id if retained_owner == row.name else unit_names.unit_id(row.name)
         return result

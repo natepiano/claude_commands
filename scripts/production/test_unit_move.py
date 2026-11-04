@@ -38,7 +38,6 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
         from datetime import datetime, timezone
 
         old = self.root / "project-alpha"
-        self.commit_prepared_row(self.unit_row())
         owner = self.prepare_restored_worktree("alpha", old)
         records = self.root / "move-launches"
         self.env["HERDR_PANE_RECORD_DIR"] = str(records)

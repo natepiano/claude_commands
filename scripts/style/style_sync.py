@@ -28,7 +28,7 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 import process_group
 
 from add_style import NoStyleProduction, standing_style_production
-from production_units import Refusal
+from scripts.production.production_doc import Refusal
 from scripts.message import send_result
 from scripts.message import send_budget
 from scripts.production import showrunners

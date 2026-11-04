@@ -19,17 +19,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import fake_unit_host
 import production_lifecycle
-import unit_lookup
 from scripts.production import showrunners
 import showrunner_tree
 import showrunner_parent
-from production_units import read_production
 from fake_unit_host import HostedUnit
 
 
 from scripts.production import production_doc, staff, unit_config
+from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
-from scripts.production.production_lifecycle_test_support import LifecycleFixture, SCRIPT
+from scripts.production.production_lifecycle_test_support import LifecycleFixture
 
 
 @final
@@ -57,18 +56,6 @@ class ProductionNameTests(unittest.TestCase):
 
 @final
 class LifecycleTests(LifecycleFixture):
-    def test_wrap_retires_staff_locations_without_the_worktree_column(self) -> None:
-        from scripts.production.staff_test_support import without_worktree_column
-        self.running()
-        without_worktree_column(self.doc)
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Remove the display column")
-        result = self.run_lifecycle("wrap", "--no-ci")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(self.alpha.exists())
-        self.assertFalse(self.beta.exists())
-
-
     def test_wrap_preserves_each_units_standing_responsibilities_in_its_parked_file(self) -> None:
         runner, alpha, beta, child = self.staff_tree()
         original = unit_config.read(self.alpha)
@@ -136,7 +123,6 @@ class LifecycleTests(LifecycleFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.staff.write_document({"schema": 2, "rows": []})
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
 
     @override
@@ -249,11 +235,10 @@ class LifecycleTests(LifecycleFixture):
 
     def permanent_staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
         runner, alpha, beta, child = self.staff_tree()
-        permanent = fixture_member("unit", name="nightly", parent=runner.id)
-        text = self.doc.read_text().replace("## Close-out", "| nightly-unit | permanent | /not-here | nightly | — | — | — |\n\n## Close-out")
-        self.write(self.doc, text)
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "record permanent unit")
+        folder = self.root / "nightly"
+        self.write(folder / ".unit.toml", 'plan = "permanent"\nresponsibilities = []\n')
+        permanent = fixture_member("unit", name="nightly", parent=runner.id,
+                                   worktree=staff.PresentWorktree("natedev", folder))
         return runner, alpha, beta, child, permanent
 
     def test_permanent_wrap_keeps_every_row_and_edge_until_its_child_is_transferred(self) -> None:
@@ -449,6 +434,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("commit", "-m", "prepare units before their plans")
         _ = self.git("switch", "-c", "production")
         alpha = (self.checkout / "docs/plans/alpha.md").read_text()
+        for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
+            self.write(folder / ".unit.toml", f'plan = "docs/plans/{name}.md"\nresponsibilities = []\n')
 
         first = self.run_lifecycle("open")
 
@@ -1030,7 +1017,7 @@ class LifecycleTests(LifecycleFixture):
         other = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other_doc))
         folder = self.root / "questions"
         self.write(self.doc, self.doc.read_text().replace(
-            "## Units", f"- **Proposals:** `{folder}`\n\n## Units"))
+            "## Close-out", f"- **Proposals:** `{folder}`\n\n## Close-out"))
         records: list[Path] = []
         for owner, title in ((runner, "Choose the layout"), (other, "Choose the release")):
             fields = {"since": "2026-10-06T08:00", "text": title,
@@ -1107,10 +1094,7 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("worktree", "add", "-b", "style-names", str(unit), "style/main")
         style_doc = style / "docs/kid-production.md"
         self.write(style_doc, "# Production — kid\n\n- **Kind:** style\n"
-                   + f"- **Showrunner checkout:** `{style}`\n\n## Units\n\n"
-                   + "| Unit | Plan | Worktree | Branch | Port | Owns |\n"
-                   + "| --- | --- | --- | --- | --- | --- |\n"
-                   + f"| names-unit | docs/style-production/names.md | {unit} | style-names | — | none |\n")
+                   + f"- **Showrunner checkout:** `{style}`\n")
         plan = unit / "docs/style-production/names.md"
         pinned = unit / "docs/style-production/rules/names.md"
         ledger = self.state / "style/ledger.sqlite3"
@@ -1201,17 +1185,11 @@ if __name__ == "__main__":
 
 class PermanentUnitTests(StaffTestCase):
     def test_wrap_neither_waits_on_nor_retires_a_permanent_unit(self) -> None:
-        sys.path.insert(0, str(SCRIPT.parent))
-        import production_lifecycle
-        from production_units import Production
-        from zoneinfo import ZoneInfo
-
-        lines = ["## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |", "| --- | --- | --- | --- | --- | --- |",
-                 "| alpha-unit | docs/plans/alpha.md | /w/alpha | demo-alpha | — | — |",
-                 "| nightly-review-unit | permanent | /w/nightly | demo-nightly-review | — | — |", ""]
         owner = fixture_member("showrunner", name="demo")
-        _ = fixture_member("unit", name="alpha", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", Path("/w/alpha")))
-        production = Production(Path("/c/docs/demo-production.md"), "demo", "demo", Path("/c"), Path("/c/log.md"), ZoneInfo("UTC"))
+        for name, plan in (("alpha", "docs/plans/alpha.md"), ("nightly-review", "permanent")):
+            _ = (self.root / name).mkdir()
+            _ = (self.root / name / ".unit.toml").write_text(f'plan = "{plan}"\nresponsibilities = []\n')
+            _ = fixture_member("unit", name=name, parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", self.root / name))
         with self.assertRaisesRegex(production_lifecycle.LifecycleStop, "permanent child nightly-review-unit: transfer it before wrapping"):
-            _ = production_lifecycle.units(lines, production, unit_lookup.member_sources())
+            _ = production_lifecycle.units(owner, staff.snapshot())

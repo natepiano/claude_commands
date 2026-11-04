@@ -14,7 +14,8 @@ Show the output; stop on a nonzero exit.
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/style/add_style.py" --production <parent production doc> --model <your model id> --effort <your effort level> [--check]
 ```
 
-On creation, repeat `--pilot` to launch only named units; package names after
+On creation, repeat `--pilot` to launch only named units. They go in the doc's
+`**Pilot units:**` field, and the style showrunner launches only them. Package names after
 `=` restrict that unit's crates. All four plans are still written. Example:
 `--pilot modules --pilot cargo-liner-style-names-unit=cargo-handler --pilot types-unit=cargo-port`.
 A pilot accepts a family, its old `<family>-unit` id, or its full id.

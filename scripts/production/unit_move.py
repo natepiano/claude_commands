@@ -84,7 +84,7 @@ def json_object(value: object) -> dict[str, object]:
 
 
 def plan_paths(cell: str, checkout: Path) -> tuple[Path, ...]:
-    """The tracked plan files under docs/plans that a Units Plan cell names."""
+    """The tracked plan files under docs/plans that a unit's plan value names."""
     names = [match[1] for match in re.finditer(r"`([^`]+)`", cell)]
     if not names:
         if re.search(r"\s", cell.strip()):

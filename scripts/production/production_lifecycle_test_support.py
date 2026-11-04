@@ -213,14 +213,7 @@ class LifecycleFixture(unittest.TestCase):
         ]
         if promote:
             lines.append(f"- **Promote:** {promote}")
-        lines.extend([
-            "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| alpha-unit | docs/plans/alpha.md | `{self.alpha}` | alpha-branch | alpha | — | `alpha.txt` |",
-            f"| beta-unit | docs/plans/beta.md | `{self.beta}` | beta-branch | beta | — | `beta.txt` |",
-            "", "## Close-out", "",
-        ])
+        lines.extend(["", "## Close-out", ""])
         if close_out:
             lines.append(close_out)
         lines.extend(["", "## Production rules", "", "- No CI, smoke launch, Mac run, or validate_and_push.sh."])

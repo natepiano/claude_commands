@@ -17,8 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders
 
 from scripts.lib.process_failure import failure_detail
-from production_units import Production, read_production
-from production_units import Refusal, cell_value
+from scripts.production.production_doc import Production, Refusal, cell_value, read_production
 from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history, merge_lock
 
 

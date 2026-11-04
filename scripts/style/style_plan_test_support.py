@@ -31,6 +31,7 @@ import mechanical_classes
 import rules
 import style_ledger
 import style_rules
+from scripts.production import unit_config
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 
@@ -129,7 +130,6 @@ class StylePlanFixture(unittest.TestCase):
         _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
         owner = recorded_showrunner("sample-style", self.doc)
         _ = fixture_unit_location(owner, "names-unit", self.unit)
-        _ = fixture_unit_location(owner, "modules-unit", self.root / "modules")
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
         _ = self.enterContext(mock.patch.object(berth_board, "read_board", return_value=self.board()))
         _ = self.enterContext(mock.patch.object(style_proposals, "renumber"))
@@ -194,6 +194,7 @@ class StylePlanFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-q", "-b", "style/main", str(self.style))
         _ = self.git("worktree", "add", "-q", "-b", "demo-style-names", str(self.unit))
         _ = (self.repo / ".git/info/exclude").write_text("/docs/style-production/\n/docs/*production.md\n")
+        self.unit_plan_config(self.unit, "names-unit.md")
         self.doc = self.style / "docs/sample-style-production.md"
         parent = self.repo / "docs/product-production.md"
         parent.parent.mkdir(parents=True)
@@ -210,11 +211,18 @@ class StylePlanFixture(unittest.TestCase):
     def production(self, branch: str, checkout: Path, parent: str) -> str:
         return "\n".join([
             "# Production", f"- **Merge branch:** {branch}", f"- **Showrunner checkout:** {checkout}",
-            "- **Log:** docs/log.md", "- **Branch point:** main", f"- **Parent production:** {parent}", "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
-            *([f"| names-unit | docs/style-production/units/names-unit.md | {self.unit} | demo-style-names |",
-               f"| modules-unit | docs/style-production/units/modules-unit.md | {self.root / 'modules'} | demo-style-modules |"] if parent else []), "",
+            "- **Log:** docs/log.md", "- **Branch point:** main", f"- **Parent production:** {parent}", "",
         ])
+
+    def unit_plan_config(self, worktree: Path, plan_name: str) -> None:
+        """Name the unit's standing plan file in its `.unit.toml`."""
+        plan = unit_config.PlanFile(Path("docs/style-production/units") / plan_name)
+        _ = unit_config.write(worktree, unit_config.UnitConfig(plan, unit_config.NoAppPort(), ()))
+
+    def proposals_field(self, folder: Path) -> None:
+        """Name the Proposals folder in the production doc once."""
+        if "**Proposals:**" not in self.doc.read_text():
+            _ = self.doc.write_text(self.doc.read_text() + f"- **Proposals:** {folder}\n")
 
     def plan_header(self) -> str:
         return "\n".join([
@@ -266,12 +274,14 @@ class StylePlanFixture(unittest.TestCase):
         return style_plan.unit_base(self.repo, f"demo-style-{family}")
 
     def modules_unit(self) -> Path:
-        """Add the modules unit's worktree and branch at the main tip, and return its plan."""
+        """Add the modules unit's worktree, branch and staff row at the main tip, and return its plan."""
         worktree = self.root / "modules"
         _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
         plan = worktree / "docs/style-production/units/modules-unit.md"
         plan.parent.mkdir(parents=True)
         _ = plan.write_text(self.plan_header())
+        self.unit_plan_config(worktree, "modules-unit.md")
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "modules-unit", worktree)
         return plan
 
     def unit_takes_tip(self) -> None:
@@ -311,14 +321,13 @@ class StylePlanFixture(unittest.TestCase):
         return rows[0][0]
 
     def types_unit(self) -> Path:
-        """Add the types unit's worktree, branch and Units row at the main tip, and return its plan."""
+        """Add the types unit's worktree, branch and staff row at the main tip, and return its plan."""
         types = self.root / "types"
         _ = self.git("worktree", "add", "-q", "-b", "demo-style-types", str(types))
         plan = types / "docs/style-production/units/types-unit.md"
         plan.parent.mkdir(parents=True)
         _ = plan.write_text(self.plan_header().replace("names-unit", "types-unit"))
-        _ = self.doc.write_text(self.doc.read_text() +
-                                f"| types-unit | docs/style-production/units/types-unit.md | {types} | demo-style-types |\n")
+        self.unit_plan_config(types, "types-unit.md")
         _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "types-unit", types)
         return plan
 
@@ -417,8 +426,7 @@ class StylePlanFixture(unittest.TestCase):
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-        if "**Proposals:**" not in self.doc.read_text():
-            _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        self.proposals_field(folder)
         return issue
 
     def commit_to_every_checkout(self) -> None:
@@ -489,8 +497,7 @@ class StylePlanFixture(unittest.TestCase):
         self.pending_judge_tickets |= {judge}
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nplan: approved\n"
                              + f"unit: {family}-unit\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-        if "**Proposals:**" not in self.doc.read_text():
-            _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        self.proposals_field(folder)
         return issue
 
     def judged_findings(self, rule: str, sites: tuple[tuple[str, int, str], ...], *, kind: style_ledger.FindingKind = "type",

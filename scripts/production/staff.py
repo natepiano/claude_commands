@@ -1117,7 +1117,7 @@ def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
         if existing.kind != "unit":
             raise StaffRefused("restore-unit requires a unit")
         if isinstance(existing.worktree, WorktreeUnfilled):
-            raise StaffRefused(f"{existing.name}: staff worktree is unfilled; run staff_sources.py fill --retired")
+            raise StaffRefused(f"{existing.name}: staff worktree is unfilled")
         if (existing.worktree.machine, existing.worktree.path) != (worktree.machine, worktree.path):
             raise StaffRefused(f"{existing.name}: restore worktree conflicts with retained location")
         pending.discard(staff_id)
