@@ -274,3 +274,7 @@ The user unit `buildlog.service` on natedev failed from 21:29 EST. The vault ste
 Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command_failed`. The next hourly `buildlog.service` run ends without failure.
 
 **Files:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.
+
+### Phase 13 — Buildlog tests import their own modules  · status: done
+
+Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHONPATH. test_costs subprocess tests fail with no module cli or costs; test_vault_pull fails to import conf. Each test sets its own import path.
