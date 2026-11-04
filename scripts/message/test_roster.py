@@ -1147,6 +1147,16 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(roster.mesh_shown_name(mesh, "review-address", {
             "held_design_id": design_id, "held_role": "reviewer"}).render(), "review-address")
 
+    def test_docless_row_keeps_repeated_mesh_title_reads_silent(self) -> None:
+        _ = fixture_member("showrunner", name="docless")
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            for _ in range(2):
+                self.assertEqual(roster.mesh_shown_name(
+                    str(self.root / "unplaced-run"), "unplaced-worker", {"role": "impl"}).render(),
+                    "unplaced-worker")
+        self.assertEqual(errors.getvalue(), "")
+
     def test_mesh_worker_slots_keep_full_launch_identity_in_roster_and_titles(self) -> None:
         _ = (self.director_run / unit_runs.DIRECTOR_FILE).write_text("17e44ec4-3e24-5ae1-b10d-5cf30de9455b\n")
         self._write_mesh(self.director_run, {

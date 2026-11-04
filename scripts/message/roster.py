@@ -863,8 +863,6 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     diagnostics = _StaffDiagnostics(problems)
     places = _production_places(records, set(), diagnostics,
                                 record=membership, resolver=resolver)
-    for warning in diagnostics.warnings:
-        print(f"warning: {warning}", file=sys.stderr)
     place = places.get(unit_runs.director(run))
     if place is not None:
         showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")

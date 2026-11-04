@@ -352,11 +352,8 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
             if row.parent is not None and (parent := record.by_id(row.parent)) is not None}
         places = production_places(records, set(directors), diagnostics,
                                    record=record, resolver=resolver)
-        for warning in diagnostics.warnings:
-            print(f"warning: {warning}", file=sys.stderr)
-        excluded = diagnostics.excluded_sessions
-        names: dict[str, str] = {item["sessionId"]: item["name"] for item in records
-                                if item["sessionId"] not in excluded}
+        # Label readers stay silent and retain each session's recorded name.
+        names: dict[str, str] = {item["sessionId"]: item["name"] for item in records}
         labels: dict[str, UnitLabels] = {}
         for session_id in wanted & names.keys():
             showrunner: ShowrunnerRelationship = NoShowrunner()

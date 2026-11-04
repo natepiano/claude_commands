@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import io
 import os
+from contextlib import redirect_stderr
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +20,25 @@ if TYPE_CHECKING:
 
 
 class FileOnlyLabelTests(unittest.TestCase):
+    def test_docless_holder_labels_stay_silent_across_repeated_reads(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        with tempfile.TemporaryDirectory() as directory, isolated_staff_file(Path(directory) / "staff.json", {}):
+            owner = fixture_member("showrunner", name="docless")
+            record: SessionRecord = {
+                "pid": 123, "sessionId": owner.current_session, "name": "recorded-holder",
+                "messagingSocketPath": "", "updatedAt": 1, "tmux": "", "formerNames": [],
+            }
+            errors = io.StringIO()
+            with (mock.patch.object(unit_labels, "newest_sessions", return_value=[record]),
+                  redirect_stderr(errors)):
+                for _ in range(2):
+                    self.assertEqual(unit_labels.unit_labels_for([owner.current_session], {}), {
+                        owner.current_session: unit_labels.UnitLabels("recorded-holder"),
+                    })
+            self.assertEqual(errors.getvalue(), "")
+
     def test_recorded_fact_anomalies_are_deduplicated_across_readers(self) -> None:
         from scripts.message import unit_labels
         from scripts.production import session_staff
