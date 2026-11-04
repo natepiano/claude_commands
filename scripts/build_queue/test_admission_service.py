@@ -2436,33 +2436,43 @@ class CutoverServiceTests(unittest.TestCase):
 
     def test_a_slow_estimate_does_not_block_queries_or_release(self) -> None:
         import threading
-        import time
         with AdmissionFixture() as fixture:
-            entered, resume = threading.Event(), threading.Event()
+            entered, resume, completed = threading.Event(), threading.Event(), threading.Event()
+            failures: list[BaseException] = []
 
             def delayed(*_args: object, **_kwargs: object) -> gate.TestPhaseNeed:
                 entered.set()
-                if not resume.wait(5):
-                    raise AssertionError("the estimate worker did not resume")
+                _ = resume.wait()
                 return gate.TestPhaseNeed(GIB, 5, 8, 8, "same_width", 1.2)
 
             with mock.patch.object(gate, "test_phase_need", side_effect=delayed):
                 grant = only_admitted(fixture.server.handle_request(fixture.request()))
-                self.assertTrue(entered.wait(5))
+
+                def query_and_release() -> None:
+                    try:
+                        for _ in range(20):
+                            reply = fixture.server.handle_request(wire.ViewRequest())[0]
+                            self.assertIsInstance(reply, wire.ViewReply)
+                        self.assertEqual(fixture.server.handle_request(
+                            wire.ReleaseRequest("release", grant.reservation, 0)), [wire.Ok()])
+                        self.assertFalse(resume.is_set())
+                    except BaseException as error:
+                        failures.append(error)
+                    finally:
+                        completed.set()
+
+                caller = threading.Thread(target=query_and_release)
                 try:
-                    durations: list[float] = []
-                    for _ in range(20):
-                        started = time.monotonic()
-                        reply = fixture.server.handle_request(wire.ViewRequest())[0]
-                        durations.append(time.monotonic() - started)
-                        self.assertIsInstance(reply, wire.ViewReply)
-                    started = time.monotonic()
-                    self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release", grant.reservation, 0)), [wire.Ok()])
-                    self.assertLess(time.monotonic() - started, 1)
-                    self.assertLess(max(durations), 1)
-                    self.assertLess(sorted(durations)[18], 0.25)
+                    self.assertTrue(entered.wait(10), "the estimate worker did not start")
+                    caller.start()
+                    self.assertTrue(completed.wait(10), "queries and release waited for the estimate worker")
                 finally:
                     resume.set()
+                    if caller.ident is not None:
+                        caller.join(10)
+                self.assertFalse(caller.is_alive(), "the query caller did not stop")
+                if failures:
+                    raise failures[0]
                 fixture.server.resolve_estimates()
             self.assertEqual(fixture.server.reservations, {})
             self.assertEqual(service.read_state(fixture.state_dir).reservations, {})

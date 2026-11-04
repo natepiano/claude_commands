@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.lint.memory_test_support import admission_policy_fixture
 
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, TimedChunk
 from scripts.build_queue import admission_client, admission_protocol as wire
 
 from contextlib import redirect_stderr, redirect_stdout
@@ -13,13 +13,12 @@ import io
 import json
 import os
 from pathlib import Path
-import time
 import unittest
 from unittest import mock
 from typing import Protocol, cast, override
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue import build_queue, head_facts, queue_card, queue_view
+from scripts.build_queue import build_queue, head_facts, queue_card, queue_evidence, queue_view
 from scripts.build_queue.queue_fixture import (
     NOW, ZONE, QueueFixture, bump_line, head_reading, queue_read_fixture,
     queue_time_line, token_gap_line, waiting_rows, write_bumps, write_process, write_token_gaps,
@@ -799,7 +798,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(sum("Selected running step:" in row for row in text.splitlines()), 1)
         self.assertNotIn("hidden-id", text)
 
-    def test_ten_thousand_waiting_and_running_rows_render_in_under_one_second(self) -> None:
+    def test_ten_thousand_waiting_and_running_rows_resolve_labels_once_per_row(self) -> None:
         waiting = tuple(memory_admit.WaitingStep(pid, f"session-{pid}", "", "check", f"/tmp/tree-{pid}", NOW - pid,
             12 * GIB, memory_admit.NeedsMemory(12 * GIB, 20 * GIB)) for pid in range(10000))
         running = tuple(memory_admit.RunningStep(f"session-{pid}", "", "test", f"/tmp/tree-{pid}", 8 * GIB,
@@ -807,11 +806,11 @@ class QueueTests(unittest.TestCase):
         reading = queue_read_fixture(memory_admit.QueueView(waiting, running, 20 * GIB, 10 * GIB, GIB, NOW),
                                      policy=admission_policy_fixture())
         with mock.patch.object(memory_admit, "smallest_head_release",
-                               side_effect=AssertionError("an unselected view must not search releases")):
+                               side_effect=AssertionError("an unselected view must not search releases")), \
+             mock.patch.object(queue_view, "step_labels", wraps=queue_evidence.step_labels) as labels:
             model = self.model(reading)
-        started = time.perf_counter()
-        lines = queue_view.render_view(model, 100)
-        elapsed = time.perf_counter() - started
+            lines = queue_view.render_view(model, 100)
+        self.assertEqual(labels.call_count, len(waiting) + len(running))
         self.assertEqual(len(waiting_rows(lines)), 10000)
         self.assertEqual(sum(plain([line]).startswith("●") for line in lines), 0)
         running_rows, queued_rows = plain(lines).split("Running\n", 1)[1].split("Queued\n", 1)
@@ -819,10 +818,8 @@ class QueueTests(unittest.TestCase):
             row, = [row for row in section.splitlines() if "tree-9999" in row]
             self.assertIn(step, row.split())
         self.assertEqual(sum("test" in row for row in running_rows.splitlines()), 10000)
-        self.assertLess(elapsed, 1., f"render took {elapsed:.6f} s")
-        print(f"queue render: 20000 rows in {elapsed:.6f} s")
 
-    def test_selected_card_with_thirty_two_waiters_and_eight_running_steps_stays_fast(self) -> None:
+    def test_selected_card_with_thirty_two_waiters_and_eight_running_steps_bounds_release_checks(self) -> None:
         waiting = tuple(memory_admit.WaitingStep(pid, f"waiter-{pid}", "worker", "check",
             f"/tmp/waiter-{pid}", NOW - 600, 16 * GIB,
             memory_admit.NeedsMemory(16 * GIB, 18 * GIB)) for pid in range(32))
@@ -830,18 +827,17 @@ class QueueTests(unittest.TestCase):
             f"/tmp/runner-{pid}", 8 * GIB, memory_admit.MeasuredMemory(GIB)) for pid in range(8))
         reading = queue_read_fixture(memory_admit.QueueView(waiting, running, 18 * GIB, 0, 3 * GIB, NOW),
                                      policy=admission_policy_fixture())
-        started = time.perf_counter()
         with mock.patch.object(memory_admit, "smallest_head_release",
-                               wraps=memory_admit.smallest_head_release) as release:
+                               wraps=memory_admit.smallest_head_release) as release, \
+             mock.patch.object(memory_admit, "head_after_steps_end",
+                               wraps=memory_admit.head_after_steps_end) as scenarios:
             model = self.model(reading, selected=True)
             text = plain(queue_card.render_selection(model, "1", 100))
-        elapsed = time.perf_counter() - started
         release.assert_called_once_with(reading.explanation)
+        self.assertLessEqual(scenarios.call_count, 2 + len(running) ** 2)
         self.assertIsInstance(model.release, memory_admit.HeadAdmitsAfterEnd)
         self.assertIn("#1 of 32", text)
         self.assertIn("Frees when:", text)
-        self.assertLess(elapsed, 1., f"selected card took {elapsed:.6f} s")
-        print(f"selected card: 32 waiters, 8 running steps in {elapsed:.6f} s")
 
     def test_head_reason_keeps_required_free_threshold_when_both_limits_hold(self) -> None:
         need, available = int(10.9 * GIB), 12 * GIB
@@ -1019,10 +1015,6 @@ class QueueTests(unittest.TestCase):
             reading = fixture.read()
             write_bumps(NOW, [*fixture.moves, bump_line(NOW - 5, actor="actor-only", session="bump-only")])
             write_token_gaps([token_gap_line(NOW - 200, NOW - 46, session="id-work-lead")])
-            def slow_roster(*args:object, **kwargs:object) -> roster.Roster:
-                self.assertTrue(args or kwargs)
-                time.sleep(5)
-                return roster.Roster([], [])
             seen: list[tuple[list[str], Mapping[str, str]]] = []
             def lookup(ids: list[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
                 seen.append((ids, environment))
@@ -1032,12 +1024,10 @@ class QueueTests(unittest.TestCase):
             for args in ((), ("4", )):
                 self.labels_read.reset_mock()
                 seen.clear()
-                with self.subTest(args=args), mock.patch.object(roster, "roster", side_effect=slow_roster) as full:
-                    started = time.perf_counter()
+                with self.subTest(args=args), mock.patch.object(
+                        roster, "roster", side_effect=AssertionError("the queue must not read the full roster")) as full:
                     status, text, errors = self.invoke(reading, *args)
-                    elapsed = time.perf_counter() - started
                     self.assertEqual(status, 0, errors)
-                    self.assertLess(elapsed, 1.0, f"queue {args} took {elapsed:.6f}s")
                     self.labels_read.assert_called_once()
                     ids, environment = seen[0]
                     self.assertEqual(set(ids), expected if args else
@@ -1151,28 +1141,30 @@ if __name__ == "__main__":
 
 
 class ServiceQueryFailureTests(unittest.TestCase):
-    def test_views_fail_within_one_second_for_missing_and_silent_services(self) -> None:
+    def test_views_use_one_query_deadline_for_missing_and_silent_services(self) -> None:
         for silent in (False, True):
             with self.subTest(silent=silent), AdmissionFixture() as fixture:
-                if silent:
-                    # The fixture accepts requests but sends no complete reply line.
-                    _ = self.enterContext(fixture.server.silent_replies())
-                else:
-                    fixture.server.close()
-                    fixture.socket_path.unlink(missing_ok=True)
-                with fixture.serving() if silent else mock.patch.dict(os.environ, {}):
-                    for arguments in ([], ["4"], ["--json", "1"]):
-                        output, errors = io.StringIO(), io.StringIO()
-                        started = time.monotonic()
-                        with mock.patch("sys.argv", ["queue", *arguments]), \
-                             redirect_stdout(output), redirect_stderr(errors):
-                            status = build_queue.main()
-                        self.assertLess(time.monotonic() - started, 1)
-                        self.assertEqual(status, 2)
-                        self.assertEqual(output.getvalue(), "")
-                        reason = "no answer in 0.5 s" if silent else "no socket"
-                        self.assertEqual(errors.getvalue(),
-                            f"build queue: admission service unavailable: {reason}\n")
+                timeout = memory_admit.read_memory_config().query_timeout_seconds
+                for arguments in ([], ["4"], ["--json", "1"]):
+                    exchange = (Exchange(TimedChunk(timeout / 4, b"{"), TimeoutError()) if silent
+                                else Exchange(connect_error=FileNotFoundError()))
+                    transport = ScriptedTransport(fixture.clock, exchange)
+                    output, errors = io.StringIO(), io.StringIO()
+                    started = fixture.clock.monotonic()
+                    with mock.patch.object(admission_client, "CLOCK", fixture.clock), \
+                         mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket), \
+                         mock.patch("time.sleep", side_effect=AssertionError("a query must not retry")), \
+                         mock.patch("sys.argv", ["queue", *arguments]), \
+                         redirect_stdout(output), redirect_stderr(errors):
+                        status = build_queue.main()
+                    self.assertEqual(fixture.clock.monotonic() - started, timeout if silent else 0)
+                    self.assertEqual(len(transport.attempts), 1)
+                    self.assertEqual(len(transport.requests), 1 if silent else 0)
+                    self.assertEqual(status, 2)
+                    self.assertEqual(output.getvalue(), "")
+                    reason = "no answer in 0.5 s" if silent else "no socket"
+                    self.assertEqual(errors.getvalue(),
+                        f"build queue: admission service unavailable: {reason}\n")
 
     def test_queue_read_returns_the_private_services_exact_reading(self) -> None:
         with AdmissionFixture() as fixture:

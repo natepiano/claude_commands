@@ -3,13 +3,12 @@ from __future__ import annotations
 
 from scripts.lint.memory_test_support import admission_policy_fixture
 
+from collections.abc import Iterator
 from dataclasses import replace
 import os
 from pathlib import Path
-from statistics import median
-import time
 import unittest
-from typing import cast, override
+from typing import Self, cast, override
 from unittest import mock
 
 from scripts.build_queue import head_facts, queue_card, queue_view
@@ -24,6 +23,21 @@ from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
 from scripts.build_queue.queue_fixture import write_memory_config
+
+
+class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
+    visits: int
+
+    def __new__(cls, records: tuple[head_facts.BumpRecord, ...]) -> Self:
+        result = super().__new__(cls, records)
+        result.visits = 0
+        return result
+
+    @override
+    def __iter__(self) -> Iterator[head_facts.BumpRecord]:
+        for record in super().__iter__():
+            self.visits += 1
+            yield record
 
 
 class QueueViewTests(QueueFixtureTests):
@@ -258,7 +272,7 @@ class QueueViewTests(QueueFixtureTests):
                         replace(reason, older_session_id="not-waiting")):
             self.assertEqual(queue_view.reason_phrase(changed, waiting), "behind an older step that fits")
 
-    def test_unrelated_bump_history_adds_at_most_ten_percent_to_render_time(self) -> None:
+    def test_unrelated_bump_history_adds_no_record_visits_to_render(self) -> None:
         model = self.fixture.model()
         steps = tuple(replace(model.reading.view.waiting[0], pid=pid,
                               session_id=f"row-{pid}", folder=f"/tmp/row-{pid}")
@@ -267,24 +281,14 @@ class QueueViewTests(QueueFixtureTests):
         facts = model.facts
         assert isinstance(facts, head_facts.HeadFacts)
         empty = replace(model, reading=reading, facts=replace(facts, bump_records=()))
-        records = tuple(head_facts.BumpRecord(NOW - 1, "actor", f"unrelated-{index}",
-                                             "check", f"/tmp/unrelated-{index}", 20)
-                        for index in range(5000))
+        records = BumpRecordsWithVisitCount(tuple(
+            head_facts.BumpRecord(NOW - 1, "actor", f"unrelated-{index}",
+                                  "check", f"/tmp/unrelated-{index}", 20)
+            for index in range(5000)))
         history = replace(empty, facts=replace(facts, bump_records=records))
         expected = plain(queue_view.render_view(empty, 100))
         self.assertEqual(plain(queue_view.render_view(history, 100)), expected)
-        samples: dict[bool, list[float]] = {False: [], True: []}
-        # Alternate order and use CPU time to avoid attributing another worker's
-        # scheduling delay to bump-history lookup.
-        for repetition in range(6):
-            for has_history in ((False, True) if repetition % 2 else (True, False)):
-                started = time.process_time()
-                _ = queue_view.render_view(history if has_history else empty, 100)
-                samples[has_history].append(time.process_time() - started)
-        baseline, indexed = median(samples[False]), median(samples[True])
-        self.assertLessEqual(indexed, baseline * 1.1,
-                             f"5000 unrelated moves: {indexed:.6f}s; none: {baseline:.6f}s")
-        print(f"queue history render: none {baseline:.6f}s; 5000 unrelated {indexed:.6f}s")
+        self.assertEqual(records.visits, 0, "the view must not scan unrelated bump records")
 
 
     def test_name_column_stays_aligned_when_places_grow_to_three_digits(self) -> None:

@@ -453,25 +453,26 @@ class QueueEvidenceTests(unittest.TestCase):
         final = self.line(self.output(), "Frees when:")
         self.assertIn("still leaves pressure holding the head", final)
 
-    def test_twenty_running_steps_explain_and_render_in_under_one_second(self) -> None:
+    def test_twenty_running_steps_bound_release_scenarios_and_reuse_the_result(self) -> None:
         self.reset_running(available=15, need=18)
         # Charge and free-memory constraints favor different halves of the running list.
         for index in range(20):
             charge, used = (10.0, 0.1) if index < 10 else (1.0, 1.0)
             _ = self.running(800 + index, f"holder-{index}", "clippy", charge, used, 3600, peak=charge)
-        started = time.perf_counter()
         reading = gate.queue_read()
         explanation = reading.explanation
+        with mock.patch.object(gate, "head_after_steps_end", wraps=gate.head_after_steps_end) as scenarios:
+            release = gate.smallest_head_release(explanation)
+        self.assertLessEqual(scenarios.call_count, 2 + len(explanation.running) ** 2)
         model = queue_view.QueueModel(reading, {}, head_facts.read_head_facts(reading),
-            head_facts.PaceUnavailable(), user_zone(), queue_view.HostLoadUnavailable(),
-            gate.smallest_head_release(reading.explanation))
-        lines = plain(queue_card.render_selection(model, "1", 400)).splitlines()
-        elapsed = time.perf_counter() - started
+            head_facts.PaceUnavailable(), user_zone(), queue_view.HostLoadUnavailable(), release)
+        with mock.patch.object(gate, "smallest_head_release",
+                               side_effect=AssertionError("the card must reuse the release result")):
+            lines = plain(queue_card.render_selection(model, "1", 400)).splitlines()
         self.assertEqual(len(explanation.running), 20)
         final = " ".join("\n".join(lines).partition("Frees when:")[2].split())
         self.assertNotIn("still leaves", final)
         self.assertIn("end (budget charge drops", final)
-        self.assertLess(elapsed, 1.0, f"20-step explanation and render took {elapsed:.6f} s")
 
     def test_tonight_arithmetic_matches_the_actual_admission_decision(self) -> None:
         reading = gate.queue_read()
