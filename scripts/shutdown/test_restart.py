@@ -282,8 +282,8 @@ class RestartTests(ShutdownTestCase):
             if arguments == ("tab", "list"):
                 return {"tabs": [{"workspace_id": "w1", "tab_id": "t1", "label": "unit-0"}]}
             if arguments == ("pane", "list"):
-                return {"panes": [{"pane_id": "w1:sibling", "tab_id": "t1", "terminal_id": "sibling-terminal"},
-                                  {"pane_id": "w1:own", "tab_id": "t1", "terminal_id": "own-terminal"}]}
+                return {"panes": [{"pane_id": "w1:sibling", "workspace_id": "w1", "tab_id": "t1", "terminal_id": "sibling-terminal"},
+                                  {"pane_id": "w1:own", "workspace_id": "w1", "tab_id": "t1", "terminal_id": "own-terminal"}]}
             raise AssertionError(arguments)
 
         client = herdr.Herdr("fixture")
