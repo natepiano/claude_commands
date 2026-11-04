@@ -414,7 +414,10 @@ Missing store paths force a new evaluation. Each claimed slot retains its own wa
 
 `parity.rustc`, `parity.nextest`, `parity.mend`, and `parity.scripts_commit` can pin the public tool versions and script commit.
 An empty pin uses the sender's version. A mismatch prevents execution.
-The sender transfers clean tracked scripts and named public configuration before the probe.
+`aws_target.conf` sets `version_pin_file=nixos hosts/aws-build.nix`.
+A version refusal names each mismatched tool, both versions, and this file.
+The verify output and the step attempt record keep this reason.
+The sender transfers every tracked file under `scripts/` and `config/` before the probe.
 It checks their contents and commit before and after transfer. A dirty script set prevents execution.
 Source transfers include untracked files and omit ignored paths, Git metadata, and the target folder.
 Directory transfers delete removed source files from warm mirrors.

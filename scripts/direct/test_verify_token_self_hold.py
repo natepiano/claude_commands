@@ -38,7 +38,7 @@ BOARD_DIR="$TEST_ROOT/board"; BOARD_SLOT=step
 BOARD_HELPER="$TEST_BOARD"
 TOKEN_USED=1; TOKEN_HELD=0; TOKEN_WAITED=0
 TOKEN_WAIT_FILE="$TEST_ROOT/token-wait"
-CMD=lint; STEP_RUNS_ON=natedev_only; STEP_RAN_ON_MAC=0
+CMD=lint; LOCAL_ONLY=1; STEP_RUNS_ON=natedev_only; STEP_RAN_ON_MAC=0
 LINT_LEFT_QUEUE_STATUS=75; SWEEP_EVERY_S=0
 XDG_RUNTIME_DIR="$TEST_ROOT/runtime"
 mkdir -p "$XDG_RUNTIME_DIR/lint-sweep"
@@ -65,7 +65,7 @@ run_once() {
 }
 '''
             script += functions(VERIFY, ("sync_token_state", "token_acquired", "release_token",
-                                          "step_writes_tree", "finish_step_token", "run", "run_step"))
+                                          "step_writes_tree", "step_can_retry", "finish_step_token", "run", "run_step"))
             script += "\n" + functions(INVOKE, ("sweep_after_step",)) + "\n" + body
             return subprocess.run(
                 ["bash", "-c", script], env={**environment, "TEST_BOARD": str(VERIFY.with_name("board.sh"))},

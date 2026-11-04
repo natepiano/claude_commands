@@ -171,7 +171,7 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 - Offloaded Mac nextest rows in the build log have an empty `repo`; filter them with `coalesce(repo,'')=''` and `host <> 'natedev'`. The log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so Mac selection is `host <> 'natedev'`, never one name.
 - A `gh` set that times out after GitHub applied it reads `still_on`, then `off_before` at the next settle. Turning the switch back on after `off_unconfirmed` can undo a hand-made switch-off in between.
 - `world_panel_words_match_drawn_pixels` fails only on the Mac, cause not found; it is excluded there, so only natedev runs and CI cover it.
-- `basedpyright scripts/mac_test` exits 3 on a clean pass (no `.venv`); the result is its last line.
+- `basedpyright scripts/mac_test` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 

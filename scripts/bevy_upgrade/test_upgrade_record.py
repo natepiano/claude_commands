@@ -14,11 +14,9 @@ from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-
-import production_units
 import pins
 import upgrade_record
+from scripts.production.production_doc import Production, read_production
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -38,7 +36,7 @@ class RecordTests(unittest.TestCase):
     @override
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.production = production_units.Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"))
+        self.production = Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"))
         self.current_pins = pins.Pins((), frozenset(), ())
 
     @override
@@ -57,10 +55,10 @@ class RecordTests(unittest.TestCase):
         _ = doc.write_text(
             "# Demo\n\n- **Merge branch:** demo\n"
             + f"- **Showrunner checkout:** {checkout}\n"
-            + "- **Log:** log.md\n- **User zone:** America/New_York\n\n## Units\n",
+            + "- **Log:** log.md\n- **User zone:** America/New_York\n",
             encoding="utf-8",
         )
-        self.production = production_units.read_production(doc)
+        self.production = read_production(doc)
         self.current_pins = pins.Pins(("0.19.1",), frozenset({"bevy_ecs"}),
                                       (dependent("alpha"), dependent("zeta")))
         _ = cast(object, self.enterContext(mock.patch.dict(

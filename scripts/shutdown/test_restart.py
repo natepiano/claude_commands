@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, override
@@ -18,6 +19,7 @@ import inventory
 import herdr
 import sessions
 import restart
+import shutdown
 from unit_staff_test_support import unit_host
 from scripts.production import staff
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
@@ -353,11 +355,101 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(client.saved_row_tab("row-0", "unit-0"), herdr.SplitPane("w1:sibling", "right", 0.5, "unit-0"))
             activity.assert_not_called()
 
+    def test_held_sessions_saves_live_rows_and_tabs_and_keeps_pending_rows(self) -> None:
+        shutdown_record.save(["earlier"])
+        self.running.remove(str(self.rows[2].current_session))
+        with (patch.object(shutdown, "restart", restart), patch.object(shutdown, "wait_for_workers") as wait,
+              patch.object(herdr.Herdr, "save_layout") as save,
+              patch.object(herdr.Herdr, "remember_row_tab") as remember,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["held-sessions"]), 0)
+        self.assertEqual(shutdown_record.read(), ["earlier", "row-0", "row-1"])
+        save.assert_called_once()
+        self.assertEqual([call.args for call in remember.call_args_list], [("row-0", "w1:p0"), ("row-1", "w1:p1")])
+        wait.assert_called_once()
+        self.assertRegex(output.getvalue(), r"^saved 2 rows for restart at \d{2}:\d{2}\n$")
+        self.assertEqual(self.stops, [])
+
+    def test_staff_read_error_keeps_pending_rows_and_reports_one_anomaly(self) -> None:
+        shutdown_record.save(["earlier"])
+        with (patch.object(shutdown, "restart", restart), patch.object(shutdown, "wait_for_workers") as wait,
+              patch.object(staff, "initial_snapshot", side_effect=OSError("staff unavailable")),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(shutdown.main(["held-sessions"]), 0)
+        self.assertEqual(shutdown_record.read(), ["earlier"])
+        wait.assert_called_once_with(staff.StaffSnapshot(()))
+        self.assertTrue(output.getvalue().startswith("saved 0 rows for restart at "))
+        self.assertEqual(errors.getvalue(), "restart: save anomaly: staff unavailable\n")
+
+    def test_bare_dry_run_reports_record_time_and_missing_rows(self) -> None:
+        shutdown_record.save(["row-0", "gone"])
+        saved_at = time.strftime("%H:%M", time.localtime(shutdown_record.record_path().stat().st_mtime))
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(restart.restart(dry_run=True), 0)
+        self.assertEqual(output.getvalue().splitlines(), [f"restart record: 2 rows saved at {saved_at}",
+            "unit-1: live, not in the restart record", "unit-2: live, not in the restart record",
+            "unit-0: row-0, unit, workspace live, tab 1 (unit-0)"])
+        self.assertEqual(errors.getvalue(), "gone: in the restart record, no staff row\n")
+        self.assertEqual(shutdown_record.read(), ["row-0", "gone"])
+
+    def test_layout_error_keeps_the_live_rows_and_other_tab_saves(self) -> None:
+        with (patch.object(herdr.Herdr, "save_layout", side_effect=herdr.HerdrFailure("layout unavailable")),
+              patch.object(herdr.Herdr, "remember_row_tab") as remember,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("fixture"), save_tabs=True),
+                             list(self.rows))
+        self.assertEqual(remember.call_count, 3)
+        self.assertEqual(errors.getvalue(), "restart: layout anomaly: layout unavailable\n")
+
     def test_restart_all_starts_each_row_in_its_saved_tab(self) -> None:
-        self.assertEqual(restart.restart(stop_all=True), 0)
+        with (patch.object(herdr.Herdr, "save_layout") as save,
+              patch.object(herdr.Herdr, "remember_row_tab") as remember):
+            self.assertEqual(restart.restart(stop_all=True), 0)
+        save.assert_called_once()
+        self.assertEqual([call.args for call in remember.call_args_list[:3]],
+                         [(str(row.id), f"w1:p{n}") for n, row in enumerate(self.rows)])
         self.assertEqual(self.stops, [str(row.id) for row in self.rows])
         self.assertEqual(self.launches, [(row.name, herdr.NewTab("saved", row.name)) for row in self.rows])
         self.assertEqual(self.running, {str(row.current_session) for row in self.rows})
+
+    def test_inventory_keeps_sessions_with_unknown_staff_folders(self) -> None:
+        for session in (unit("unknown-unit"), worker_session("unknown-worker", owner=None)):
+            for record in (staff.StaffSnapshot(()), staff.StaffSnapshot((
+                    replace(self.rows[0], current_session=staff.StaffId(session["session_id"]),
+                            worktree=staff.WORKTREE_UNFILLED),))):
+                with self.subTest(kind=session["kind"], rows=len(record.rows)):
+                    with patch.object(staff, "snapshot", return_value=record):
+                        parsed = inventory.parse_session(session, "fixture")
+                    self.assertEqual(parsed["session_id"], session["session_id"])
+                    self.assertEqual(parsed["cwd"], {"kind": "unknown folder"})
+                    self.assertEqual(parsed["checkout"], {"kind": "not a checkout"})
+
+    def test_inventory_uses_the_current_staff_folder_without_rewriting_the_record(self) -> None:
+        session = unit(str(self.rows[0].current_session))
+        saved = json.dumps(session)
+        for folder in (self.root / "before", self.root / "after"):
+            record = staff.StaffSnapshot((replace(self.rows[0],
+                worktree=staff.PresentWorktree("natedev", folder)),))
+            with patch.object(staff, "snapshot", return_value=record):
+                parsed = inventory.parse_session(session, "fixture")
+            self.assertEqual(parsed["cwd"], str(folder))
+            self.assertEqual(json.dumps(session), saved)
+
+    def test_restart_skips_an_unknown_unit_folder_and_starts_the_other_rows(self) -> None:
+        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "parent", None,
+                               current_session=staff.StaffId("parent-session"),
+                               doc=staff.LiveDoc("natedev", self.root / "production.md"))
+        self.rows = (replace(self.rows[0], parent=parent.id, worktree=staff.WORKTREE_UNFILLED), *self.rows[1:])
+        record = staff.StaffSnapshot((*self.rows, parent))
+        self.running.clear()
+        shutdown_record.save([str(row.id) for row in self.rows])
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual([name for name, _ in self.launches], [row.name for row in self.rows[1:]])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "unit-0: restart anomaly: unit-0: the staff worktree is unavailable"])
+        self.assertEqual(shutdown_record.read(), [str(self.rows[0].id)])
 
     def test_socketless_running_sessions_restart_or_print_and_unassigned_sessions_print_once(self) -> None:
         for dry_run in (True, False):
