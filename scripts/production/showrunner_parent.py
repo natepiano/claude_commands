@@ -120,8 +120,8 @@ def attach_parent(child: str, parent: str = "") -> None:
         print(f"{child} now reports to {parent}")
         _tell(child, {
             child: f"{child} now reports to {parent}. The root is {top}: send it each item for the user. {showrunners.RULES}",
-            parent: f"{child} now reports to {parent}. It is a child showrunner, never a unit: it has no Units "
-                    + f"row, and no broadcast is passed on to it. {showrunners.RULES}",
+            parent: f"{child} now reports to {parent}. It is a child showrunner, never a unit: "
+                    + f"no broadcast is passed on to it. {showrunners.RULES}",
         })
 
 

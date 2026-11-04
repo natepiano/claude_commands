@@ -39,14 +39,16 @@ class UnitStatusTests(UnitStatusFixture):
                     "peer": "— holding: publishing\n"},),
             units=("hook", "peer"),
         )
-        peer_routed = self.parse_status(peer_outputs[0], ("hook", "peer"))[0]
+        peer_routed = self.status_block(peer_outputs[0], "hook", ("hook", "peer"))
         self.assertEqual(peer_routed.flags, ())
         self.assertTrue(any("gate: peer" in line.text for line in peer_routed.activity))
 
     def test_a_unit_with_no_marked_session_reads_gone_while_a_marked_one_lives(self) -> None:
         outputs, _, _ = self.run_statuses(None, "ok", 0, panes=({},), units=("hook", "hookworm"),
                                           missing_units=("hook",), stopped_units=("hookworm",))
-        gone, live = self.parse_status(outputs[0], ("hook", "hookworm"))
+        # A unit without a marked session prints its staff unit id.
+        gone = self.status_block(outputs[0], "hook-unit", ("hook-unit", "hookworm"))
+        live = self.status_block(outputs[0], "hookworm", ("hook-unit", "hookworm"))
         self.assertIsInstance(gone.state, SessionGone, outputs[0])
         self.assertIsInstance(live.state, ClaudeNotRunning, outputs[0])
 

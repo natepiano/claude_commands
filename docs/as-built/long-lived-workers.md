@@ -200,11 +200,9 @@ selects a private root). On first ledger binding, a production unit's run
 saves explicit production and unit fields in `progress_history_state.json`.
 Plan headers accept both Production forms and resolve former production names.
 Later reads use the saved identity, so moving a worktree does not change owners.
-`rename.py unit` also repoints run worktree and plan paths and worker roster
-launch paths, while keeping paused threads and Codex homes. For older moves,
-use `rename.py repair-workers <production> [--dry-run]`. It matches current
-Units rows with saved run or worker paths even without journaled moves, and
-skips ambiguous unit matches; see `production-rename.md`.
+`rename.py unit` uses the folder move (`unit_move.move_folder`): it pauses
+the unit's workers and starts the same threads with a note that names the new
+folder; see `production-rename.md`.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 
@@ -366,7 +364,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 | Account move | `retire_workers_servers` adds `design_roles.durable_meshes()` and takes the holder from `design_context.json`. A running role gets the move marker before interruption (`_interrupt_worker_for_account_move`); an idle one has its queue parked and its thread released. `command_resume_account_move` reads the saved header and writes to its `reply_path`. `list` shows `RolePausedForMove` while the marker exists. `accounts.py` `_swap_workers` needs no held-role code. |
 | Crash or uncertainty | `recover` refuses while the launcher pid lives, resumes the recorded thread on the mesh server, requires the same thread ID and `ThreadIdle`, then sets `RoleOpen` and clears the claim. A resume that cannot keep the same thread gives `RoleNeedsRecovery`; no replacement thread starts. |
 | End | Holder only, idle, not during an adoption. Write `transition.json`, run `codex_mesh.py end`, then require `held_thread_end_confirmed(session_dir, thread_id)`: every recorded live server shows the thread idle or unloaded. Unconfirmed gives `RoleNeedsRecovery` with the roster end marker kept. Confirmed sets `RoleEnded` and releases the census hold. Evidence stays. |
-| Retire | `retire_unit.py` `retire` calls `design_roles.end_holder(production, unit)` after the unit's sessions stop; only the production showrunner's session may run it; each open role must be idle. A failure leaves the unit not retired. |
+| Retire | `retire_unit.py` stops the unit and its staff worker rows through each row's `current_session`. It does not scan held-role records. |
 
 **Pending messages.** `codex_mesh.py send` to a held entry calls `design_roles.queue_message` and prints `queued for <name>; holder adds it to the next authorized assignment`. `mesh_runs.py` queues a held role's detached result with a stable `uuid5` ID and source `mesh_runs:<run_id>`, following a `transfer_route` to the adoption destination. Nothing wakes the role. `commands/message.md` and `codex/AGENTS-messaging.md` `<HeldRoleMessages>` state the same rules for senders.
 

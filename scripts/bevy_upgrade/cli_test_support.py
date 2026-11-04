@@ -87,7 +87,7 @@ class CliFixture(unittest.TestCase):
         _ = self.doc.write_text(
             "# Demo\n\n- **Merge branch:** demo\n"
             + f"- **Showrunner checkout:** {self.checkout}\n"
-            + f"- **Log:** log.md\n- **User zone:** {ZONE.key}\n\n## Units\n",
+            + f"- **Log:** log.md\n- **User zone:** {ZONE.key}\n",
             encoding="utf-8",
         )
         helper = self.root / "tool.py"

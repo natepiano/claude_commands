@@ -27,7 +27,7 @@ from scripts.production.delivery_state import (
     ValidationRequested as ValidationRequested,
 )
 from scripts.lib import atomic_file, conf, file_lock, urgency
-from scripts.production.production_units import Refusal as Refusal, production_field
+from scripts.production.production_doc import Refusal as Refusal, production_field
 from scripts.production.proposals_folder import owner_docs, slug_of
 from scripts.feature_log import feature_log
 from scripts.review_links import review_link

@@ -5,7 +5,7 @@ description: List unit phases and style tickets.
 # Units
 
 Run this in the showrunner session. Run
-`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/units_table.py"`
+`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's update timer. Print its total line too, when present.
 Both tables have one row per live unit. **Unit** is the session name now, or

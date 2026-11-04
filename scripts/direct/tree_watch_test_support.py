@@ -197,20 +197,20 @@ class TreeWatchFixture(unittest.TestCase):
         scope = [] if package == "--workspace" else ["--package", package]
         return [*scope, "--"]
 
-    def key(self, package: str = "sample") -> str:
+    def key(self, package: str = "sample", *, start: str = "") -> str:
+        arguments = ["--watch-key", *(["--watch-start", start] if start else []), *self.key_arguments(package)]
         with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.metadata))):
-            result = invoke_cli(tree_watch, lambda: tree_watch.main(["--watch-key", *self.key_arguments(package)]),
+            result = invoke_cli(tree_watch, lambda: tree_watch.main(arguments),
                                 [], self.environment, self.root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertRegex(result.stdout.strip(), r"^[a-f0-9]{64}$")
         return result.stdout.strip()
 
     def start_watcher(self, parent: int, package: str = "sample", *, real_process: bool = False) -> tuple[EventWatcher | subprocess.Popen[str], Path, str]:
-        before = self.key(package)
         start = self.root / "start-key"
+        before = self.key(package, start=str(start))
         fired = self.root / "fired-key"
         fired.unlink(missing_ok=True)
-        _ = start.write_text(before + "\n")
         if real_process:
             process = subprocess.Popen([sys.executable, str(WATCHER), str(start), str(fired),
                                         str(parent), *self.key_arguments(package)],
