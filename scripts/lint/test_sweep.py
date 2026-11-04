@@ -2540,6 +2540,14 @@ with open(sys.argv[1], 'a') as lock:
         self.assertEqual([(event.path, event.cause) for event in events],
                          [(str(tree.parent), "floor take")])
 
+    def test_floor_dry_run_above_the_floor_prints_the_free_size(self) -> None:
+        base = self.base()
+        _, output = cargo_target(base, "repo", APP, time.time() - DAY)
+        status, printed = self.hold(base, 10 * GIB, [12 * GIB, 12 * GIB], dry_run=True)
+        self.assertEqual(status, 0)
+        self.assertTrue(output.exists())
+        self.assertIn("12.0 GiB free, at or above the 10.0 GiB floor; nothing to remove", printed)
+
     def test_floor_dry_run_writes_no_removal_record(self) -> None:
         base = self.base()
         _, output = cargo_target(base, "repo", APP, time.time() - DAY)

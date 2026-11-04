@@ -1150,8 +1150,8 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 1. **The headroom fits the build's size.** Replace the single dev multiplier with a headroom rule that covers small builds without scaling their ratio onto large ones (for example a fixed margin plus a smaller factor, or a factor that falls with the peak). Fit the rule by replay on the same 126-build cohort that fit `DEV_HEADROOM`, plus every build in the last 3 days. Each replayed promise caps at the build budget in force when its build ran (`[memory] build_budget_gib` in `config/lint.conf` on main at that time, else `FALLBACK_BUILD_BUDGET_BYTES`); the fit and the report name the budget of each cohort, so a budget change does not read as the new rule's effect. Keep `RELEASE_HEADROOM` unless the replay shows the same defect for release builds; say so in the summary either way.
 2. **One source.** The rule and its fitted numbers live in one place in `memory_admit.py`, with a comment that names the replay (cohort, date, the build that limits each number). The need basis row records the rule so `need_basis` still reads back (`read_need_basis` (written by `need_basis_record`); a basis saved before this phase still reads back). No second copy of the shape logic anywhere, tests included: tests import the constants.
-   - **The basis keeps the cap it applied.** `CappedAtBudget` (:180) holds only `uncapped`. `need_basis_record` (:1653) writes only that, `read_need_basis` (:1671) refuses a row whose `uncapped` is at or below today's `build_budget_bytes()` (:1686), and `build_why.need_text` prints today's budget as the cap (`scripts/build_queue/build_why.py` :102). So a basis saved under one budget does not read back under another: uncapped 22 GiB under a 21 GiB budget becomes `BasisNotRecorded` under a 24 GiB budget. Make it `CappedAtBudget(uncapped, cap)` with `cap: int | CapNotRecorded`. `build_expected_peak` (:1612) stores the budget it applied. The codec writes `cap` and checks `uncapped > cap`, never today's budget. A saved row with no `cap` decodes to `CapNotRecorded()` and checks only `uncapped > 0`. `need_text` prints the saved cap, and for `CapNotRecorded` prints `capped at the build budget of that time (uncapped <GiB>)`.
-   - **Old factors read back.** The factor decode compares a saved factor with today's constant (`RELEASE_HEADROOM` :1707, `DEV_HEADROOM` :1709), so a dev basis saved with the old factor decodes to a named old-rule state after the rule changes, never to `BasisNotRecorded`.
+   - **The basis keeps the cap it applied.** `CappedAtBudget` (:211) holds only `uncapped`. `_need_record` (:1997, behind `need_basis_record` :2091) writes only that, `_read_need_record` (:2023, behind `read_need_basis` :2095) refuses a row whose `uncapped` is at or below today's `build_budget_bytes()` (:2052), and `build_why.need_text` prints today's budget as the cap (`scripts/build_queue/build_why.py` :110). So a basis saved under one budget does not read back under another: uncapped 22 GiB under a 21 GiB budget becomes `BasisNotRecorded` under a 24 GiB budget. Make it `CappedAtBudget(uncapped, cap)` with `cap: int | CapNotRecorded`. `build_expected_peak` (:1956) stores the budget it applied. The codec writes `cap` and checks `uncapped > cap`, never today's budget. A saved row with no `cap` decodes to `CapNotRecorded()` and checks only `uncapped > 0`. `need_text` prints the saved cap, and for `CapNotRecorded` prints `capped at the build budget of that time (uncapped <GiB>)`.
+   - **Old factors read back.** The factor decode compares a saved factor with today's constant (`RELEASE_HEADROOM` :2073, `DEV_HEADROOM` :2075), so a dev basis saved with the old factor decodes to a named old-rule state after the rule changes, never to `BasisNotRecorded`.
 3. **The kill retry stays.** The existing retry after a memory kill stays the safety for a build that goes over its promise. Do not change it.
 4. **Replay report.** The phase ships a replay over the last 3 days of natedev step rows: for each build, the old promise, the new promise and the measured peak. The report gives how many builds would have gone over their new promise, and by how much (each one, and the largest).
 5. **Docs.** `docs/as-built/build-memory-admission.md` states the new rule and its source.
@@ -1162,7 +1162,7 @@ Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlie
 
 **Files:**
 - `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `docs/as-built/build-memory-admission.md` — items 1-5.
-- `scripts/build_queue/build_why.py`, `scripts/build_queue/test_build_why.py` — `need_text` renders `DevHeadroom`'s multiplier today; the new rule is a named basis variant with its own text, and an old saved basis keeps its text. `need_text` prints the saved cap, not today's budget (:102).
+- `scripts/build_queue/build_why.py`, `scripts/build_queue/test_build_why.py` — `need_text` renders `DevHeadroom`'s multiplier today; the new rule is a named basis variant with its own text, and an old saved basis keeps its text. `need_text` prints the saved cap, not today's budget (:110).
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `memory_admit.py`, `build_why.py`, the replay and the doc.
@@ -1397,3 +1397,28 @@ Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlie
 - `scripts/lint/folder_audit.py` — guarded delete of a checkout's outside cache
 - `scripts/buildlog/disk.py`, `scripts/buildlog/sample.py`, `scripts/buildlog/report.py` — per-drive reports
 - `scripts/mac_test/linux_runner.py` — the probe's free-space read
+
+### Phase 54 — The floor dry run prints the free size above the floor  · status: done
+**Depends on:** Phase 53
+
+**Approved:** natedev 2026-11-03, change row C210 returned: "Make the dry-run print the free size, so an empty result is never ambiguous."
+
+#### Work Order
+
+**Goal:** `sweep.py --floor-only --dry-run` never prints an empty result.
+
+**Spec:**
+
+1. When free space is at or above the floor, a dry run prints one line: `lint sweep: <path>: <N> GiB free, at or above the <F> GiB floor; nothing to remove`. A real run (the 2-minute timer) prints nothing new.
+
+Tests: `scripts/lint/test_sweep.py`: a dry run above the floor prints that line and removes nothing.
+
+**Acceptance:** `scripts/lint/test_sweep.py` and `basedpyright` on the changed files pass from the worktree.
+
+**Files:**
+- `scripts/lint/sweep.py` — the line.
+- `scripts/lint/test_sweep.py` — the test.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `scripts/lint/sweep.py`.
+- `test` — `scripts/lint/test_sweep.py`.

@@ -3310,6 +3310,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     home = filesystem.probe_path if isinstance(filesystem, FilesystemFloor) else os.path.expanduser("~")
     free = free_bytes(home)
     if free >= floor:
+        if dry_run:
+            print(f"lint sweep: {home}: {gib(free)} free, at or above the {gib(floor)} floor; nothing to remove")
         return FloorOutcome(0, 0, free, free, 0)
     guard = None
     if not dry_run:
