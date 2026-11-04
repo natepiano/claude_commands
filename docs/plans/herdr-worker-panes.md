@@ -1684,6 +1684,21 @@ Fix the input readiness gate (accounts-unit finding, 2026-11-04).
 herdr.py is shared with 3v and 4e writers: post the function you take on the board before you edit it.
 Files: scripts/herdr/herdr.py (`prompt_input_state` and a small helper beside it) and scripts/herdr/test_herdr.py.
 
+### Phase 4y — Rename edges after Step B  · status: todo
+
+**Depends on:** 4g Step B (rename_unit.py on the row, journal in unit_move.py).
+
+**Work Order:**
+
+Close the Step B review edges routed at repair round 10 (4g review, 2026-11-04). The rename rule stays as sdlc set it.
+1. Recovery identity (F009): `unit_move._recoverable_folder` returns success only when the journal's source, destination and Git admin path all match. Keep the branch checks. A test puts another linked worktree of the same repository on the requested branch at the destination and expects no adoption.
+2. Same name (F017): a row already named `port` with request `port-unit → port` and no journal writes nothing and moves nothing (rule 1).
+3. Output (F018): the printed line follows the operation result. A finished pending move prints `done`; a rerun with nothing to do prints only `unchanged`.
+4. Pending kinds (F019): a folder-only move and a pending rename are distinct journal variants, not `FolderMove.name == ""`.
+5. Order (F020): set the displays before the folder and branch move (rule 2).
+Files: scripts/production/rename_unit.py, scripts/production/unit_move.py and their tests.
+The restart deadline (F007) moved to shutdown-unit Phase 4l.
+
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: todo
 
 **Depends on:** 4h (its `_session_without_foreground_agent` in `unit_move.py` is the model) and 4g (the user put rename first; sdlc ruling 2026-11-02 07:03). No ETA yet.

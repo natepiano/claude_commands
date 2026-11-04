@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
@@ -441,7 +442,7 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
         _ = scope.enter_context(mock.patch.object(subprocess, "run", side_effect=run))
-        _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback)))
+        _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback, monotonic=time.monotonic)))
         # Failure injection scripts assign these names just as they do in a CLI
         # subprocess. Each call restores them before another test can observe it.
         for module, names in ((os, ("rename", "replace")),

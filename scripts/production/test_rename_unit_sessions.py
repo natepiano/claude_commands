@@ -31,7 +31,7 @@ class UnitRenameSessionsTests(UnitRenameFixture):
         displays.assert_called_once_with("w1:p1", "gamma")
         launches.assert_not_called()
         self.assertEqual(staff.by_id(row.id), replace(
-            row, name="gamma", worktree=staff.PresentWorktree("natedev", self.home / "worktrees/gamma")))
+            row, name="gamma", worktree=staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma")))
 
 
 if __name__ == "__main__":

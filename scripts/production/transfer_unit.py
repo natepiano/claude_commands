@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import subprocess
 import sys
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.production import showrunners, staff, staff_move, staff_sources, unit_move, unit_names
+from scripts.production import showrunners, staff, staff_move, staff_sources, unit_names
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused
 
@@ -46,7 +47,7 @@ def build(from_slug: str, given: str, to_doc: Path) -> UnitTransfer:
 
 def apply(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
     request = build(from_slug, unit, to_doc)
-    with unit_move.folder_move_lock(request.member.id), staff.operation():
+    with staff.row_operation(str(request.member.id)):
         changed = request.member.parent != request.parent.id
         if changed:
             _ = staff.move(request.member.id, request.parent.id)
@@ -72,6 +73,9 @@ def main(argv: list[str]) -> int:
             else:
                 _ = apply(cast(str, args.from_slug), cast(str, args.unit), cast(Path, args.to_doc))
             return 0
+        except subprocess.TimeoutExpired as error:
+            print(f"transfer_unit: error: {str(error).splitlines()[0]}", file=sys.stderr)
+            return 1
         except (ValueError, OSError, RenameRefused, Refusal) as error:
             print(f"transfer_unit: {error}", file=sys.stderr)
             return 1
