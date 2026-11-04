@@ -23,7 +23,7 @@ from scripts.lint.memory_test_support import config_environment
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase
-from scripts.production import staff, unit_config
+from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import rename_unit
@@ -249,7 +249,7 @@ class UnitRenameFixture(StaffTestCase):
         self.write(self.doc, self.production_doc().replace(
             "- **Log:**", f"- **Kind:** style\n- **Repository:** `{self.checkout}`\n- **Log:**"))
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
-        _ = fixture_member("unit", name="names", parent=parent.id,
+        unit = fixture_member("unit", name="names", parent=parent.id,
                            worktree=staff.PresentWorktree("natedev", worktree))
         _ = unit_config.write(worktree, unit_config.UnitConfig(
             unit_config.PlanFile(plan), unit_config.NoAppPort(), ()))
@@ -263,7 +263,7 @@ class UnitRenameFixture(StaffTestCase):
         database = self.root / "state/style" / self.checkout.name / "ledger.sqlite"
         with mock.patch.dict(os.environ, self.env):
             with style_ledger.Ledger(self.checkout, database) as ledger:
-                ledger.wait_for_sync("names-unit")
+                ledger.wait_for_sync(unit.id)
         with closing(sqlite3.connect(database)) as connection, connection:
             _ = connection.executemany(
                 "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,"
@@ -309,6 +309,7 @@ class FolderRenameFixture(StaffTestCase):
         self.env = {
             **config_environment(self.root),
             "HOME": str(self.home), "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_PROC": str(self.root / "proc"), "HERDR_PLATFORM": "linux",
             "CODEX_HOME": str(self.home / ".codex"), "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
             "HERDR_PANE_RECORD_DIR": str(self.records),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -316,6 +317,7 @@ class FolderRenameFixture(StaffTestCase):
         }
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.env)))
         self.home.mkdir(exist_ok=True)
+        (self.root / "proc").mkdir()
         self.checkout.mkdir()
         self.source.parent.mkdir(parents=True)
         self.records.mkdir()
@@ -348,6 +350,27 @@ class FolderRenameFixture(StaffTestCase):
         arguments = ["apply", "folder-production", self.old_name, new or self.new_name]
         return invoke_cli(folder_rename, lambda: folder_rename.main(arguments), arguments,
                           dict(os.environ), self.checkout)
+
+    def publish_session_process(self, kind: Literal["claude", "codex"], *, live: bool, pid: int = 998041) -> None:
+        """Publish private process evidence for the current conversation."""
+        row = staff.by_id(self.owner.id)
+        if row is None or not isinstance(row.worktree, staff.PresentWorktree):
+            raise AssertionError("The fixture needs a present worktree")
+        folder = row.worktree
+        fake_unit_host.process(os.environ, 998040, 1, ["zsh"], {}, cwd=folder.path)
+        arguments = [kind, "resume", self.owner.current_session] if kind == "codex" else [kind]
+        environment = {"CODEX_HOME": str(self.home / ".codex")} if kind == "codex" else {
+            "CLAUDE_CONFIG_DIR": str(self.home / ".claude"), "CLAUDE_CODE_SESSION_ID": self.owner.current_session}
+        fake_unit_host.process(os.environ, pid, 998040 if live else 1, arguments if live else [],
+                               environment, cwd=folder.path)
+        descriptor = self.root / "proc" / str(pid) / "fd/4"
+        descriptor.parent.mkdir(exist_ok=True)
+        descriptor.unlink(missing_ok=True)
+        if live and kind == "codex":
+            record = self.root / "rollout-folder-current.jsonl"
+            _ = record.write_text(json.dumps({"type": "session_meta", "payload": {
+                "id": self.owner.current_session}}) + "\n")
+            descriptor.symlink_to(record)
 
     def transcript(self, kind: Literal["claude", "codex"]) -> None:
         for directory in (self.home / ".claude", self.home / ".codex"):

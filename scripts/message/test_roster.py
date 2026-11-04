@@ -463,8 +463,7 @@ class RosterTests(unittest.TestCase):
             status = send.main(["--to", "peer-only", "--from", "fixture-reviewer", "--text", "fixture text"])
             self.assertEqual(status, 0, output.getvalue() + errors.getvalue())
             self.assertEqual(output.getvalue(), "SENT: fixture peer\n")
-            self.assertEqual(errors.getvalue().splitlines(),
-                             ["send.py: roster: warning: bad: the production document is not recorded"])
+            self.assertEqual(errors.getvalue(), "")
             peer.assert_called_once()
             deliver.assert_called_once()
             message = cast(send.Message, deliver.call_args.args[0])
@@ -1152,7 +1151,7 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(decoded.reach, roster.Messageable("worker:run/fixed-address"))
 
 
-    def test_bad_durable_binding_warns_once_and_a_named_peer_still_receives_the_send(self) -> None:
+    def test_bad_durable_binding_leaves_a_named_peer_send_quiet(self) -> None:
         bad = write_empty_binding_record(self.root)
         peer = self._entry('natedev', 'freestanding', 'session:peer-session')
         os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([peer], [])).encode()
@@ -1171,8 +1170,7 @@ class RosterTests(unittest.TestCase):
             code = send.main(['--to', 'natedev', '--from', 'fixture-reviewer', '--text', 'owner update'])
         self.assertEqual(code, 0, output.getvalue() + errors.getvalue())
         self.assertEqual(output.getvalue(), 'SENT: fixture peer\n')
-        self.assertEqual(errors.getvalue().splitlines(), [
-            f'send.py: roster: warning: durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
+        self.assertEqual(errors.getvalue(), "")
         self.assertEqual(deliver.call_count, 1)
         forwarded = cast(send.Message, deliver.call_args.args[0])
         self.assertEqual(forwarded.to, 'session:peer-session')

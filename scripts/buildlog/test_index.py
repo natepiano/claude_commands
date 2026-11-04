@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from datetime import datetime
@@ -23,9 +24,11 @@ import report
 import record as recorder
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lint.memory_test_support import write_config_fixture
     from ..test_times.gate_record_test_support import gate_run
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lint.memory_test_support import write_config_fixture
     from scripts.test_times.gate_record_test_support import gate_run
 from record import TARGET_DIR_UNSET
 from store import UNKNOWN_IDENTITY
@@ -33,6 +36,7 @@ from store import UNKNOWN_IDENTITY
 CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")
 STAMP = "2026-10-02T12:00:00.000Z"
+FIXTURE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS fixture_index ON steps (status)"
 Record = dict[str, object]
 _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
@@ -241,19 +245,98 @@ class IndexTests(unittest.TestCase):
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
 
-    def test_cost_indexes_extend_an_existing_index_without_rebuilding_rows(self) -> None:
+    def test_schema_files_keep_independent_rows_and_offsets(self) -> None:
+        _ = self.configure_cleanup()
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
-        with closing(sqlite3.connect(index.index_path())) as connection:
-            for name in ("steps_session_previous", "steps_execution_end", "steps_wait_started", "calls_copy"):
-                _ = connection.execute(f"DROP INDEX {name}")
+        original_path = index.index_path()
+        with closing(sqlite3.connect(original_path)) as connection, connection:
             _ = connection.execute("UPDATE steps SET duration_s=123 WHERE id='retained'")
-            connection.commit()
+        original_bytes = original_path.read_bytes()
+        alternate = {"fixture_rows": ([("src", "TEXT", "source"), ("value", "TEXT", "fixture value")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            alternate_path = index.index_path()
+            self.assertNotEqual(alternate_path, original_path)
+            self.assertEqual(index.update(), 1)
+            self.assertEqual(self.rows("SELECT duration_s FROM steps"), [(10.0,)])
+            self.assertEqual(index.update(), 0)
+        self.assertEqual(index.index_path(), original_path)
         self.assertEqual(index.update(), 0)
-        self.assertEqual(self.rows("SELECT duration_s FROM steps WHERE id='retained'"), [(123,)])
-        names = {row[1] for row in self.rows("PRAGMA index_list(steps)")}
-        self.assertTrue({"steps_session_previous", "steps_execution_end", "steps_wait_started"} <= names)
-        self.assertIn("calls_copy", {row[1] for row in self.rows("PRAGMA index_list(calls)")})
+        self.assertEqual(original_path.read_bytes(), original_bytes)
+        self.assertEqual(self.rows("SELECT duration_s FROM steps"), [(123,)])
+        self.assertTrue(alternate_path.is_file())
+
+    def test_schema_path_changes_with_columns_and_indexes(self) -> None:
+        original_path = index.index_path()
+        columns, key, description = index.TABLES["steps"]
+        without_group = [column for column in columns if column[0] != "build_history_group"]
+        without_history = tuple(statement for statement in index.COST_INDEXES
+                                if "steps_build_group_history" not in statement)
+        with mock.patch.dict(index.TABLES, {"steps": (without_group, key, description)}):
+            self.assertNotEqual(index.index_path(), original_path)
+        with mock.patch.object(index, "COST_INDEXES", without_history):
+            self.assertNotEqual(index.index_path(), original_path)
+
+    def test_cleanup_reads_the_unused_schema_age_from_config_at_use(self) -> None:
+        config = self.configure_cleanup()
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        active_path = index.index_path()
+        alternate = {"fixture_rows": ([("src", "TEXT", "source")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            self.assertEqual(index.update(), 1)
+            old_path = index.index_path()
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            self.assertEqual(index.update(), 1)
+            recent_path = index.index_path()
+        now = time.time()
+        old = now - 10 * 86400
+        os.utime(old_path, (old, old))
+        os.utime(recent_path, (old, now))
+        self.assertEqual(index.update(), 0)
+        self.assertTrue(old_path.is_file())
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=7")
+        os.utime(active_path, (old, old))
+        self.assertEqual(index.update(), 0)
+        self.assertFalse(old_path.exists())
+        self.assertTrue(recent_path.is_file())
+        os.utime(recent_path, (now, old))
+        self.assertEqual(index.update(), 0)
+        self.assertTrue(recent_path.is_file())
+        self.assertEqual(self.ids(), ["retained"])
+
+    def test_missing_tables_rebuild_records_before_the_saved_offsets(self) -> None:
+        self.write(self.host_file, step("retained"), call("retained-call"))
+        self.assertEqual(index.update(), 2)
+        original = self.host_file.read_bytes()
+        for table in (next(iter(index.TABLES)), "files"):
+            with self.subTest(table=table):
+                with closing(sqlite3.connect(index.index_path())) as connection:
+                    _ = connection.execute(f"DROP TABLE {table}")
+                self.assertEqual(index.update(), 2)
+                self.assertEqual(self.ids(), ["retained"])
+                self.assertEqual(self.rows("SELECT id FROM calls"), [("retained-call",)])
+                self.assertEqual(index.update(), 0)
+                self.assertEqual(self.host_file.read_bytes(), original)
+
+    def configure_cleanup(self) -> Path:
+        config = self.root.parent / "config"
+        _ = write_config_fixture(config / "buildlog.conf")
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        return config
+
+    def test_update_preserves_an_old_index_during_other_schema_cleanup(self) -> None:
+        _ = self.configure_cleanup()
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        retained_path = index.index_path()
+        old = time.time() - 40 * 86400
+        os.utime(retained_path, (old, old))
+        self.assertEqual(index.update(), 0)
+        self.assertGreater(retained_path.stat().st_mtime, old)
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            self.assertEqual(index.update(), 1)
+        self.assertTrue(retained_path.is_file())
 
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1155,7 +1238,7 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT count(*) FROM queue_bumps"), [(1,)])
         schema = subprocess.run([sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False)
         self.assertIn("TABLE queue_bumps", schema.stdout)
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection:
+        with closing(sqlite3.connect(index.index_path_in(self.root))) as connection:
             _ = connection.execute("PRAGMA user_version = 1")
         _ = index.update()
         self.assertEqual(self.rows("SELECT old_position FROM queue_bumps"), [(3,)])

@@ -10,7 +10,7 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from unittest import mock
 
 from scripts.production import session_staff, staff, unit_move
@@ -107,29 +107,37 @@ class UnitFolderMoveTests(FolderRenameFixture):
 
     def test_real_restart_resumes_each_family_in_the_destination_and_keeps_the_terminal(self) -> None:
         import herdr
-        import sessions
+        from scripts.message import sessions
         from scripts.accounts import accounts
         from scripts.shutdown import stop_resume
 
-        for kind in ("claude", "codex"):
+        kinds: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
+        for kind in kinds:
             with self.subTest(kind=kind), saved_fixture(self.root) as restore:
                 self.transcript(kind)
                 backend = FolderSessionFixture(self.owner, live=True)
                 real_start = restart.start_row
+                self.publish_session_process(kind, live=True)
                 panes: list[herdr.PaneIdentity] = [{"pane_id": "w1:p1", "workspace_id": "w1",
                     "terminal_id": "kept-terminal", "label": self.owner.name, "session_id": self.owner.current_session}]
                 resumed: list[tuple[str, list[str]]] = []
                 def liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
                     self.assertEqual(identity, self.owner.current_session)
                     return sessions.LiveSessionProcess(998041) if backend.live else sessions.SessionNotLive()
+                def stop(row: staff.StaffRow, client: object, *, kind: Literal["claude", "codex"] = kind) -> bool:
+                    stopped = backend.stop(row, client)
+                    self.publish_session_process(kind, live=False)
+                    return stopped
                 def prepare(identity: str, folder: str, environment: dict[str, str],
                             unset: frozenset[str]) -> herdr.PreparedAgentEnvironment:
                     self.assertEqual((identity, folder), (self.owner.current_session, str(self.destination)))
                     return herdr.PreparedAgentEnvironment(Path(folder), environment, unset)
                 def launch(session: str, target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                            environment: herdr.PreparedAgentEnvironment, family: str, arguments: list[str],
-                           opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *, agent: str) -> herdr.AgentLaunched:
+                           opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *, agent: str,
+                           reported_unknown: str = "", kind: Literal["claude", "codex"] = kind) -> herdr.AgentLaunched:
                     _ = (session, opening, timeout, agent)
+                    self.assertEqual(reported_unknown, "")
                     self.assertFalse(backend.live)
                     self.assertEqual(target, herdr.ExistingPane("w1:p1", "kept-terminal"))
                     self.assertEqual(environment.directory, self.destination)
@@ -138,8 +146,10 @@ class UnitFolderMoveTests(FolderRenameFixture):
                     self.assertEqual(family, kind)
                     resumed.append((family, arguments.copy()))
                     backend.live = True
+                    self.publish_session_process(kind, live=True)
                     return herdr.AgentLaunched("w1:p1", herdr.PromptSubmissionNotRequired())
                 with (backend.installed(), mock.patch.object(restart, "start_row", side_effect=real_start),
+                      mock.patch.object(restart, "stop_row", side_effect=stop),
                       mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude1", self.home / ".claude")),
                       mock.patch.object(accounts, "account_dir", return_value=self.home / ".claude"),
                       mock.patch.object(stop_resume, "heal_account_trust"),
@@ -244,7 +254,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
 
     def test_unsafe_resume_sends_no_keystroke_or_second_session(self) -> None:
         import herdr
-        import sessions as native_sessions
+        from scripts.message import sessions as native_sessions
         from scripts.accounts import accounts
         from scripts.shutdown import stop_resume
 
@@ -265,6 +275,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(herdr, "open_tab") as second):
             for live in (native_sessions.SessionNotLive(), native_sessions.LiveSessionProcess(998099)):
+                self.publish_session_process("claude", live=isinstance(live, native_sessions.LiveSessionProcess), pid=998099)
                 with self.subTest(live=live), mock.patch.object(native_sessions, "session_liveness", return_value=live):
                     with (mock.patch.object(restart, "session_launch", return_value=("claude", {}, ["--resume", self.owner.current_session])),
                           mock.patch.object(herdr, "launch_prepared_agent", wraps=herdr.launch_prepared_agent) as launch,
@@ -554,7 +565,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
             self.assertEqual(transfer_unit.apply("folder-production", "source-unit", production.doc), request)
         row_lock.assert_called_once_with(str(self.owner.id))
         projection.assert_called_once()
-        self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, parent=parent.id))
+        self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, parent=staff.ReportsTo(parent.id)))
 
     def test_f006_hard_kill_states_finish_without_cleanup_or_automatic_starts(self) -> None:
         from scripts.production import rename_unit, unit_move
