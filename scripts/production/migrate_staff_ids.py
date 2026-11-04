@@ -370,7 +370,7 @@ def migrate(*, dry_run: bool = False) -> int:
         for line in migration.missing:
             print("missing " + line.replace("\n", " "))
         if not dry_run:
-            if not staff._is_owner():  # pyright: ignore[reportPrivateUsage]
+            if not staff.is_owner():
                 raise staff.StaffRefused("run the migration on the staff owner's machine")
             source = staff._file()  # pyright: ignore[reportPrivateUsage]
             backup = source.with_name(source.name + ".before-native-ids")

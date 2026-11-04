@@ -221,7 +221,7 @@ def stop(promotion: Promotion) -> bool:
     """
     place = promotion.marked.place
     try:
-        type_place(place, "/exit")
+        type_place(place, "/exit", target=promotion.claude.session_id)
     except (OSError, HerdrFailure) as error:
         raise Refusal(f"cannot type /exit into {promotion.unit}'s pane: {error}") from error
     deadline = time.monotonic() + STOP_WAIT_S

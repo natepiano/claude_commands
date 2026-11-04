@@ -21,7 +21,7 @@ from unittest import mock
 from typing import cast, override
 
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, gate_isolation_environment
+from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_service as service
 from scripts.build_queue.queue_fixture import write_process
@@ -288,6 +288,8 @@ class AdmissionFixture(ExitStack):
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
+        if configuration := os.environ.get("CONF_DIR"):
+            _ = config_environment(Path(configuration))
         self.root: Path = root if root is not None else self.enter_context(
             build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
                 prefix=build_folders.FOLDER_PREFIXES["admit-test"])))
@@ -685,7 +687,7 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
     if not launcher.exists():
         launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
-    for key in ("ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
+    for key in ("USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
                 "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
         environment[key] = os.environ[key]
     _ = fixture.enter_context(fixture.serving())

@@ -62,6 +62,7 @@ class Identity:
     name: str
     step: str
     folder: str
+    unit: str = ""
 
 
 Profile = gate.StepProfile | gate.ProgramProfile
@@ -269,6 +270,9 @@ def _encode(value: object, variants: dict[str, type], *, main_service: bool = Fa
     if name is None:
         raise ValueError("unknown admission message")
     data = gate.snapshot_value(value)
+    if main_service and isinstance(value, (AdmitRequest, LaunchRequest)):
+        identity = cast(dict[str, object], cast(dict[str, object], data)["identity"])
+        del identity["unit"]
     # Remove these main-service field omissions after the admission cut-over.
     omitted: set[str] = {"run"} if isinstance(value, AdmitRequest) and isinstance(value.run, NoRun) else set()
     if main_service and isinstance(value, CallerCode):

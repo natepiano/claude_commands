@@ -12,6 +12,7 @@ from dataclasses import replace
 import io
 import json
 import os
+import re
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -20,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_queue import build_queue, head_facts, queue_card, queue_evidence, queue_view
 from scripts.build_queue.queue_fixture import (
-    NOW, ZONE, QueueFixture, bump_line, head_reading, queue_read_fixture,
+    NOW, ZONE, GOLDEN, QueueFixture, bump_line, head_reading, queue_read_fixture,
     queue_time_line, token_gap_line, waiting_rows, write_bumps, write_process, write_token_gaps,
 )
 from scripts.build_queue.queue_lines import QueueLines, Span, json_form, plain
@@ -98,6 +99,24 @@ class QueueTests(unittest.TestCase):
             mine.assert_not_called()
         return status, output.getvalue(), errors.getvalue()
 
+    def test_cli_keeps_running_grants_above_numbered_waiters(self) -> None:
+        with QueueFixture() as fixture:
+            reading = fixture.read()
+            grants = tuple(replace(reading.view.running[0], session_id=f"gate-{index}",
+                step="merge-gate", promise=6 * GIB, unit="queue-unit") for index in range(3))
+            reading = queue_read_fixture(replace(reading.view, running=grants), policy=admission_policy_fixture())
+            self.labels_read.return_value = {**fixture.labels,
+                **{step.session_id: UnitLabels("gate", "builds", "wrong-unit") for step in grants}}
+            text = self.snapshot_text(self.snapshot(reading))
+            rows = text.splitlines()
+            running = [line for line in rows if line.lstrip().startswith("run")]
+            self.assertEqual(len(running), 3)
+            self.assertTrue(all("builds" in row and "queue-unit" in row and "merge-gate" in row for row in running))
+            self.assertTrue(all("6.0 / 5.1" in row for row in running))
+            positions = re.findall(r"^\s*(\d+)[ ▸]", text, re.MULTILINE)
+            self.assertEqual(positions, [str(index) for index in range(1, 33)])
+            self.assertLess(text.index(running[-1]), text.index(next(line for line in rows if line.lstrip().startswith("1 "))))
+
     def test_queue_command_warns_about_a_missing_key_once_per_process(self) -> None:
         config = self.root / "build_admission.conf"
         write_memory_config(config)
@@ -130,14 +149,12 @@ class QueueTests(unittest.TestCase):
         fixture = self.enterContext(QueueFixture())
         reading = fixture.read()
         self.labels_read.return_value = fixture.labels
-        fixture_path = Path(__file__).parents[2] / "mods/unit-board/tests/selected_page_fixture.ts"
-        recorded = cast(QueueLines, json.loads(fixture_path.read_text().removeprefix("export default ").strip().removesuffix(";")))
-        # The shared fixture uses the pane width of 100 columns.
         status, output, errors = self.invoke(reading, "--json", "--columns", "100", "1")
         self.assertEqual((status, errors), (0, ""))
-        self.assertEqual(json.loads(output), recorded)
+        recorded = cast(QueueLines, json.loads(output))
         status, terminal, errors = self.invoke(reading, "--columns", "100", "1")
         self.assertEqual((status, errors), (0, ""))
+        self.assertEqual(terminal, (GOLDEN / "card_1.txt").read_text())
         def cells(text: str) -> str:
             return text.translate(str.maketrans({glyph: "█" for glyph in "░▏▎▍▌▋▊▉"}))
         self.assertEqual(cells(self.snapshot_text(recorded)), cells(terminal.rstrip("\n")))
@@ -346,8 +363,8 @@ class QueueTests(unittest.TestCase):
                 waiting=(first, *model.reading.view.waiting[1:]))))
             rows = waiting_rows(queue_view.render_view(model, 140))
         self.assertEqual(len(rows), 32)
-        self.assertEqual([row[:2] for row in rows[:10]], [f"{n:>2}" for n in range(1, 11)])
-        self.assertEqual([row.index("nextest") for row in rows[:2]], [39, 39])
+        self.assertEqual([row[:3] for row in rows[:10]], [f"{n:>3}" for n in range(1, 11)])
+        self.assertEqual([row.index("nextest") for row in rows[:2]], [40, 40])
         self.assertTrue(all("| ---" not in row for row in rows))
 
     def test_head_line_short_forms_share_the_recorded_head_and_bump_facts(self) -> None:
@@ -635,7 +652,7 @@ class QueueTests(unittest.TestCase):
         self.assertIn("style-types", text)
         self.assertNotIn("cargo-liner-style-types", text)
         self.assertEqual(text.count("nextest"), 1)
-        self.assertIn("clippy", text)
+        self.assertEqual(text.count("clippy"), 1)
         self.labels_read.assert_called_once_with(["style-id", "style-id"], os.environ)
         self.assertNotIn("recorded-name", text)
 
@@ -722,8 +739,8 @@ class QueueTests(unittest.TestCase):
         self.assertIn("Free memory: free 23.1 GiB", text)
         self.assertNotIn("head-id", text)
         self.assertNotIn("follower-id", text)
-        self.assertIn("\nRunning\n", self.render(view))
-        self.assertIn("\nQueued\n", self.render(view))
+        self.assertEqual(sum(line.lstrip().startswith("# ") for line in self.render(view).splitlines()), 1)
+        self.assertEqual(len(waiting_rows(queue_view.render_view(self.model(queue_read_fixture(view, policy=admission_policy_fixture())), 140))), 2)
 
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
         write_process(self.fixture.proc, 100)
@@ -813,10 +830,11 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(labels.call_count, len(waiting) + len(running))
         self.assertEqual(len(waiting_rows(lines)), 10000)
         self.assertEqual(sum(plain([line]).startswith("●") for line in lines), 0)
-        running_rows, queued_rows = plain(lines).split("Running\n", 1)[1].split("Queued\n", 1)
+        running_rows = "\n".join(plain([line]) for line in lines if plain([line]).lstrip().startswith("run"))
+        queued_rows = "\n".join(waiting_rows(lines))
         for section, step in ((running_rows, "test"), (queued_rows, "check")):
-            row, = [row for row in section.splitlines() if "tree-9999" in row]
-            self.assertIn(step, row.split())
+            self.assertEqual(len(section.splitlines()), 10000)
+            self.assertTrue(all(step in row.split() for row in section.splitlines()))
         self.assertEqual(sum("test" in row for row in running_rows.splitlines()), 10000)
 
     def test_selected_card_with_thirty_two_waiters_and_eight_running_steps_bounds_release_checks(self) -> None:
@@ -947,7 +965,7 @@ class QueueTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "20"}):
             decision = memory_admit.decide(available, 60 * GIB, need,
                                            [memory_admit.MeasuredMemory(19 * GIB)],
-                                           pressure=memory_admit.MemoryPressure(23.4))
+                                           pressure=memory_admit.MemoryPressure(23.4, condition="full"))
         row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need, "since": NOW - 300}
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
                                        memory_admit.head_wait_reason(decision, need, available, row, NOW, policy=admission_policy_fixture()))
@@ -1042,13 +1060,12 @@ class QueueTests(unittest.TestCase):
         fixture = self.enterContext(QueueFixture())
         reading = fixture.budget_model().reading
         self.labels_read.return_value = fixture.labels
-        for session, count in (("id-work-lead", 2), ("id-widget", 0), ("unknown", 0)):
+        for session, expected in (("id-work-lead", ["2", "3"]), ("id-widget", ["run"]), ("unknown", [])):
             with self.subTest(session=session):
                 status, text, errors = self.invoke(reading, "--you", session)
                 self.assertEqual(status, 0, errors)
-                self.assertEqual(text.count("▸"), count)
-                self.assertEqual([row[:row.index("▸")].strip() for row in text.splitlines() if "▸" in row],
-                                 ["2", "3"] if count else [])
+                self.assertEqual(text.count("▸"), len(expected))
+                self.assertEqual([row[:row.index("▸")].strip() for row in text.splitlines() if "▸" in row], expected)
 
     def test_inline_you_defaults_to_the_caller_and_a_shell_has_no_mark(self) -> None:
         fixture = self.enterContext(QueueFixture())

@@ -132,7 +132,8 @@ def main() -> int:
         pace = head_facts.read_pace(reading.explanation.now) if words else head_facts.PaceUnavailable()
         load = read_host_load() if words else HostLoadUnavailable()
         release = memory_admit.smallest_head_release(reading.explanation) if words else memory_admit.NoWaiter()
-        model = QueueModel(reading, labels, facts, pace, user_zone(), load, release)
+        model = QueueModel(reading, labels, facts, pace, user_zone(), load, release,
+                           ci_memory_slice=memory_admit.read_memory_config().ci_memory_slice)
         lines = render_view(model, arguments.columns, colour=arguments.json, you=arguments.you,
                             selector=words[0] if words else "")
         if words:

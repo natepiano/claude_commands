@@ -17,7 +17,7 @@ from collections.abc import Generator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import IOBase
 from datetime import UTC, datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest import mock
@@ -35,6 +35,18 @@ SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
 FixtureMachine = Literal["natedev", "mac"]
 UNFILLED_WORKTREE = staff.WorktreeUnfilled()
 UNFILLED_DOC = staff.DocUnfilled()
+
+
+@contextmanager
+def production_staff_record() -> Generator[None, None, None]:
+    """Mark each fixture snapshot as production within one alert test."""
+    read_snapshot = staff.snapshot
+
+    def snapshot() -> staff.StaffSnapshot:
+        return replace(read_snapshot(), production=True)
+
+    with mock.patch.object(staff, "snapshot", side_effect=snapshot):
+        yield
 
 
 def fixture_runtime_id(label: str) -> str:
