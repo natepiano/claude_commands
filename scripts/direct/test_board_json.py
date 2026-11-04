@@ -239,20 +239,24 @@ class BoardJsonTests(unittest.TestCase):
         root = self.root / ".local/state/style" if default_path else self.root / "style-ledgers"
         database = root / fixture.checkout.name / "ledger.sqlite"
         database.parent.mkdir(parents=True, exist_ok=True)
+        parent = next(row for row in staff.find(kind="showrunner") if row.name == fixture.slug)
+        unit_ids = {f"{row.name}-unit": row.id for row in staff.find(kind="unit", parent=parent.id)}
         connection = sqlite3.connect(database)
         try:
             _ = connection.execute(
                 "CREATE TABLE tickets (id TEXT, unit TEXT, state TEXT, created_at INTEGER)",
             )
             _ = connection.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?)", [
-                ("alpha-unit-1", "alpha-unit", "merged", 1),
-                ("alpha-unit-2", "alpha-unit", "merged", 2),
-                ("alpha-unit-3", "alpha-unit", "open", 3),
-                ("alpha-unit-4", "alpha-unit", "rejected", 4),
-                ("other-unit-1", "other-unit", "merged", 5),
-                ("alpha-1", "alpha", "merged", 6),
-                *tickets,
-            ])
+                (ticket, unit_ids.get(owner, fixture_runtime_id(owner)), state, created_at)
+                for ticket, owner, state, created_at in [
+                    ("alpha-unit-1", "alpha-unit", "merged", 1),
+                    ("alpha-unit-2", "alpha-unit", "merged", 2),
+                    ("alpha-unit-3", "alpha-unit", "open", 3),
+                    ("alpha-unit-4", "alpha-unit", "rejected", 4),
+                    ("other-unit-1", "other-unit", "merged", 5),
+                    ("alpha-1", "alpha", "merged", 6),
+                    *tickets,
+            ]])
             connection.commit()
         finally:
             connection.close()
@@ -811,6 +815,27 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(connect.call_args.args, (f"file:{database}?mode=ro",))
         self.assertEqual(connect.call_args.kwargs, {"uri": True, "timeout": 0})
 
+    def test_unit_rename_preserves_merged_count_and_active_ticket(self) -> None:
+        fixture = self.production(unit_name="names-unit")
+        self.standing_plan(fixture, phase_id="124", title="Current work")
+        owner = self.unit_member(fixture.slug, "names")
+        database = self.ledger(fixture, tickets=(
+            ("123", "names-unit", "merged", 123),
+            ("124", "names-unit", "merged", 124),
+            ("125", "names-unit", "assigned", 125),
+        ))
+        before = database.read_bytes(), database.stat().st_mtime_ns
+        _ = staff.rename(owner.id, "renamed")
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["key"], "renamed")
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "125", "title": "Current work", "merged": 2,
+        })
+        self.assertEqual(unit["stage"], "Ticket 125 running")
+        self.assertEqual((database.read_bytes(), database.stat().st_mtime_ns), before)
+
     def test_renamed_unit_selects_the_open_phase_by_its_unchanged_ledger_ticket_id(self) -> None:
         fixture = self.production(unit_name="cargo-liner-style-names-unit")
         self.standing_plan(fixture, phase_id="63", title="names-unit-63 — Fix names")
@@ -839,19 +864,20 @@ class BoardJsonTests(unittest.TestCase):
         fixture = self.production(unit_name="types-unit")
         self.standing_plan(fixture, phase_id="124", title="types-unit-124")
         database = self.ledger(fixture)
+        unit_id = self.unit_member(fixture.slug, "types").id
         for state in ("assigned", "checkpointed"):
             with self.subTest(state=state):
                 connection = sqlite3.connect(database)
                 try:
                     _ = connection.execute("DELETE FROM tickets")
                     _ = connection.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?)", [
-                        ("types-unit-125", "types-unit", state, 500),
-                        ("types-unit-126", "types-unit", "assigned", 300),
-                        ("types-unit-124", "types-unit", "checkpointed", 400),
-                        ("types-unit-127", "types-unit", "merged", 600),
-                        ("types-unit-128", "types-unit", "rejected", 700),
-                        ("types-unit-129", "types-unit", "open", 800),
-                        ("types-unit-extra-999", "types-unit-extra", "assigned", 900),
+                        ("types-unit-125", unit_id, state, 500),
+                        ("types-unit-126", unit_id, "assigned", 300),
+                        ("types-unit-124", unit_id, "checkpointed", 400),
+                        ("types-unit-127", unit_id, "merged", 600),
+                        ("types-unit-128", unit_id, "rejected", 700),
+                        ("types-unit-129", unit_id, "open", 800),
+                        ("types-unit-extra-999", fixture_runtime_id("types-unit-extra"), "assigned", 900),
                     ])
                     connection.commit()
                 finally:

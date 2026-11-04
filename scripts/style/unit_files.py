@@ -20,6 +20,7 @@ from scripts.production import session_staff, staff, unit_lookup, unit_names
 
 @dataclass(frozen=True)
 class UnitWorktree:
+    staff_id: staff.StaffId
     unit: str
     branch: str
     worktree: Path
@@ -28,12 +29,14 @@ class UnitWorktree:
 
 @dataclass(frozen=True)
 class UnitFilesWithoutBranches:
+    staff_id: staff.StaffId
     unit: str
     worktree: Path
 
 
 @dataclass(frozen=True)
 class UnitTicketsOnly:
+    staff_id: staff.StaffId
     unit: str
 
 
@@ -47,10 +50,10 @@ def file_text(repo: Path, commit: str, path: str) -> str:
 
 
 def unit_worktrees(doc: Path, *,
-                   record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitWorktree, ...]:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
-    resolver = session_staff.RowResolver(record)
-    return tuple(row for row in _unit_file_sources(unit_lookup.doc_owner(doc, record), resolver)
+                   resolver: session_staff.RowResolver | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitWorktree, ...]:
+    if isinstance(resolver, session_staff.ReadCurrentStaff):
+        resolver = session_staff.RowResolver(staff.snapshot())
+    return tuple(row for row in _unit_file_sources(unit_lookup.doc_owner(doc, resolver.record), resolver)
                  if isinstance(row, UnitWorktree))
 
 
@@ -65,21 +68,21 @@ def _unit_file_sources(owner: staff.StaffRow, resolver: session_staff.RowResolve
             location = unit_lookup.local_worktree(session_staff.MemberFound(row))
         except staff.StaffUnreadable as error:
             _unit_problem(unit, str(error))
-            result.append(UnitTicketsOnly(unit))
+            result.append(UnitTicketsOnly(row.id, unit))
             continue
         if isinstance(location, staff.RemovedWorktree):
             continue
         branch = resolver.merge_branch(row)
         if isinstance(branch, session_staff.BranchUnreadable):
             _unit_problem(unit, branch.reason)
-            result.append(UnitFilesWithoutBranches(unit, location.path))
+            result.append(UnitFilesWithoutBranches(row.id, unit, location.path))
             continue
         match resolver.unit_branch(row):
             case session_staff.Branch(name):
-                result.append(UnitWorktree(unit, name, location.path, branch.name))
+                result.append(UnitWorktree(row.id, unit, name, location.path, branch.name))
             case problem:
                 _unit_problem(unit, problem.reason)
-                result.append(UnitFilesWithoutBranches(unit, location.path))
+                result.append(UnitFilesWithoutBranches(row.id, unit, location.path))
     return tuple(result)
 
 
@@ -113,8 +116,8 @@ def _unit_problem(unit: str, reason: str) -> None:
 
 
 def unit_file_holders(repo: Path, doc: Path, ledger: style_ledger.Ledger, own_unit: str = "") -> dict[str, frozenset[str]]:
-    record = staff.snapshot()
-    resolver = session_staff.RowResolver(record)
+    resolver = ledger.staff_resolver()
+    record = resolver.record
     owner = unit_lookup.doc_owner(doc, record)
     parent = record.by_id(owner.parent) if owner.parent else None
     units = _unit_file_sources(owner, resolver)
@@ -134,8 +137,8 @@ def unit_file_holders(repo: Path, doc: Path, ledger: style_ledger.Ledger, own_un
                 busy.update(filter(None, git(repo, "diff", "--name-only", "--no-renames", "-z", f"{row.merge_branch}...{row.branch}").split("\0")))
         if not isinstance(row, UnitTicketsOnly) and (row.worktree / ".git").exists():
             busy.update(changed_files(row.worktree))
-        if row.unit != own_unit:
-            for ticket in ledger.ticket_open(row.unit):
+        if str(row.staff_id) != own_unit:
+            for ticket in ledger.ticket_open(str(row.staff_id)):
                 busy.update(ticket["files"])
         holders[row.unit] = holders.get(row.unit, frozenset()) | frozenset(busy)
     return holders

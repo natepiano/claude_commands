@@ -1060,7 +1060,7 @@ Make no unproved write and create no second row.
 **Shared rename files:** this writer owns the rename-file changes for 3x, 3z, and 4a, including their tests and fixtures.
 Each change lands inside its store's landing, with the migration and rewriter removal.
 
-### Phase 3z — Shutdown and style stores keyed by staff id  · status: todo
+### Phase 3z — Shutdown and style stores keyed by staff id  · status: done
 
 **Owner:** shutdown-unit and style-unit (sdlc split, 2026-11-02 08:23).
 

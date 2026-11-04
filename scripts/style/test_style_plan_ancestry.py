@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import sys
 import unittest
 from pathlib import Path
@@ -14,6 +16,7 @@ import style_plan
 import style_ledger
 
 from style_plan_test_support import StylePlanFixture
+from scripts.production import staff
 
 
 @final
@@ -39,11 +42,11 @@ class StylePlanTests(StylePlanFixture):
         _ = self.git("merge", "-q", "--ff-only", "style/main")
         self.tip = merged
         self.sync()
-        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
+        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
         # The synced change to other.rs makes its crate-scope cell stale too.
         self.assertEqual((ticket["files"], ticket["base"]), (list(self.sources[:2]), merged))
-        self.record(read, self.sources[0], merged, ticket="names-unit-1")
+        self.record(read, self.sources[0], merged, ticket="1")
         self.assertEqual(self.cell_state(read, self.sources[0]), "current")
 
     def test_refill_issues_a_stale_cell_whose_inputs_at_the_unit_tip_changed_since_its_judgment(self) -> None:
@@ -62,7 +65,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.candidates(), ())
 
         self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
-        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], [str(next(row.id for row in staff.initial_snapshot().find(kind="unit") if row.name == "names"))])
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.unit), unit_tip)
         self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
@@ -73,8 +76,8 @@ class StylePlanTests(StylePlanFixture):
                          (6, f"merge the style branch first: 2 cells judged at {unit_tip[:7]} wait for style/main\n", ""))
         self.assertEqual(self.sync_wait_rows(), [])
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
-        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
+        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
         self.assertEqual((ticket["files"], ticket["rules"], ticket["base"]), (list(self.sources[:2]), [read], self.tip))
 
     def test_refill_names_a_style_branch_missing_on_origin(self) -> None:
@@ -195,8 +198,8 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo),
                          style_plan.MergeStyleBranchFirst(2, unit_tip, "refs/heads/style/main"))
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.root / "modules")
-        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten("modules-unit-1"))
-        ticket = self.ledger().ticket_open("modules-unit")[0]
+        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten("1"))
+        ticket = self.ledger().ticket_open(ticket_owner_id("modules-unit"))[0]
         self.assertEqual((ticket["kind"], ticket["files"], ticket["base"]), ("structure", list(self.sources[:2]), self.tip))
 
 if __name__ == "__main__":
