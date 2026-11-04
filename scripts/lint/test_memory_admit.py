@@ -139,11 +139,33 @@ def buildlog_rows(root: Path) -> list[dict[str, object]]:
             for line in path.read_text().splitlines()]
 
 
-def write_history_rows(root: Path, rows: Iterable[dict[str, object]]) -> None:
-    """One anonymous-history writer for every estimate fixture."""
+def write_history_rows(root: Path, rows: Iterable[dict[str, object]], *,
+                       indexed: bool = False, crates: int | None = 1) -> None:
+    """Write anonymous samples and optional matching Cargo step evidence."""
     path = gate.admission_dir(root) / "anon_peaks.jsonl"
     with path.open("a") as output:
-        for row in rows:
+        for original in rows:
+            row = dict(original)
+            if indexed:
+                with closing(sqlite3.connect(root / store.INDEX_NAME)) as db, db:
+                    _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, "
+                                   + "started_at TEXT, peak_mem_bytes INTEGER, argv TEXT, call_id TEXT, "
+                                   + "crates_compiled INTEGER DEFAULT 1, repo_identity TEXT)")
+                    columns = {str(value[1]) for value in cast(list[tuple[object, ...]],
+                               db.execute("PRAGMA table_info(steps)").fetchall())}
+                    for name, kind in (("argv", "TEXT"), ("call_id", "TEXT"),
+                                       ("crates_compiled", "INTEGER")):
+                        if name not in columns:
+                            _ = db.execute(f"ALTER TABLE steps ADD COLUMN {name} {kind}")
+                    call_id = row.get("call_id")
+                    if not call_id:
+                        call_id = f"sample-{output.tell()}"
+                        row["call_id"] = call_id
+                    _ = db.execute("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv,"
+                                   + "call_id,crates_compiled) VALUES (?,?,?,?,?,?,?,?)",
+                                   (row.get("host"), row.get("repo"), row.get("step"),
+                                    store.utc_iso((datetime.fromisoformat(str(row["ended_at"])) - timedelta(seconds=1)).timestamp()),
+                                    0, json.dumps(["cargo", row.get("step")]), call_id, crates))
             _ = output.write(json.dumps(row) + "\n")
 
 
@@ -372,6 +394,7 @@ class HistoryTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
         self.admission = self.root / "admission"
         self.admission.mkdir()
         self.host = "test-host"
@@ -389,13 +412,13 @@ class HistoryTests(unittest.TestCase):
             if test_threads is not None:
                 row["test_threads"] = test_threads
             rows.append(row)
-        write_history_rows(self.root, rows)
+        write_history_rows(self.root, rows, indexed=True)
 
     def add_index(self, *, at: datetime = HISTORY_AT) -> None:
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
-            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER)")
+            _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER, crates_compiled INTEGER DEFAULT 1)")
             for index in range(5):
-                _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?)",
+                _ = db.execute("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes) VALUES (?, ?, ?, ?, ?)",
                                (self.host, "hana", "nextest", store.utc_iso(at.timestamp()), (index + 1) * GIB))
 
     def peak(self) -> gate.ExpectedPeak:
@@ -417,10 +440,10 @@ class HistoryTests(unittest.TestCase):
         self.add_measured(5, host="other-host")
         self.assertEqual(self.peak(), gate.ExpectedPeak(12 * GIB, "fallback", 0))
 
-    def test_a_repo_with_few_runs_uses_the_step_p90_over_every_repo(self) -> None:
+    def test_a_repo_with_few_runs_keeps_its_largest_peak_below_the_pool(self) -> None:
         self.add_measured(3, repo="other")
         self.add_measured(4, start_gib=10)
-        self.assertEqual(self.peak(), gate.ExpectedPeak(13 * GIB, "pooled", 7))
+        self.assertEqual(self.peak(), gate.ExpectedPeak(13 * GIB, "measured", 4))
 
     def test_own_buildlog_history_comes_before_the_pooled_p90(self) -> None:
         self.add_index()
@@ -431,6 +454,20 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.peak().source, "fallback")
         self.add_index()
         self.assertEqual(self.peak().source, "buildlog")
+
+    def test_legacy_index_without_compile_counts_keeps_its_clippy_peaks(self) -> None:
+        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                (self.host, "hana", "clippy", HISTORY_AT.isoformat(), 4 * GIB,
+                 json.dumps(["cargo", "clippy"]))
+            ] * 5)
+        config = admission_configuration_fixture()
+        peak = gate.expected_peak(HANA, "clippy", self.host, NOW, self.root,
+                                  first_peak_bytes=config.program_first_peaks["cargo"],
+                                  budget=config.build_budget_bytes)
+        self.assertEqual(peak, gate.ExpectedPeak(int(4 * GIB * gate.ANON_SHARE), "buildlog", 5))
 
     def test_measured_history_pools_every_width_unless_one_is_named(self) -> None:
         self.add_measured(5, test_threads=16)
@@ -461,7 +498,7 @@ class HistoryTests(unittest.TestCase):
             _ = db.execute("ALTER TABLE steps ADD COLUMN argv TEXT")
             _ = db.execute("UPDATE steps SET argv = ?", (json.dumps(["cargo", "nextest", "run"]),))
             for _ in range(5):
-                _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)",
+                _ = db.execute("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)",
                                (self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), 2 * GIB,
                                 json.dumps(["cargo", "nextest", "run", "-E", "test(one)"])))
         self.assertEqual(self.peak(), gate.ExpectedPeak(int(5 * GIB * gate.ANON_SHARE), "buildlog", 5))
@@ -482,18 +519,103 @@ class FilteredPromiseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
         (self.root / "admission").mkdir()
 
     def samples(self, peaks: list[int], *, package: str = "hana", filters: tuple[str, ...] = (),
                 scope: gate.TestScope = "filtered", step: str = "nextest",
                 repository: gate.RepositoryIdentity = HANA, host: str = "test-host",
-                at: datetime = HISTORY_AT) -> None:
+                at: datetime = HISTORY_AT, crates: int | None = 1,
+                keyed: bool = True, indexed: bool = True) -> None:
         write_history_rows(self.root, ({
-            "host": host, "repo": repository.name, "repo_identity": repository.key,
+            "host": host, "repo": repository.name, "repo_identity": repository.key if keyed else "",
             "step": step, "test_scope": scope, "package": package,
             "filters": list(filters), "anon_peak_bytes": peak,
             "ended_at": store.utc_iso(at.timestamp()),
-        } for peak in peaks))
+        } for peak in peaks), indexed=indexed, crates=crates)
+
+    def test_five_keyed_runs_exclude_older_unkeyed_peaks(self) -> None:
+        self.samples([19 * GIB] * 10, scope="full", keyed=False)
+        self.samples([2 * GIB] * 4, scope="full")
+        before = gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
+                                    first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"],
+                                    budget=admission_configuration_fixture().build_budget_bytes)
+        self.assertEqual((before.bytes, before.count), (19 * GIB, 14))
+        self.samples([2 * GIB], scope="full")
+        after = gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
+                                   first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"],
+                                   budget=admission_configuration_fixture().build_budget_bytes)
+        self.assertEqual((after.bytes, after.count), (2 * GIB, 5))
+
+    def test_sparse_repository_history_uses_own_largest_or_a_lower_pool(self) -> None:
+        parent = self.root
+        other = gate.RepositoryIdentity("https://example.org/nate/other", "other", "other")
+        for count in range(1, 5):
+            for pool, expected in ((18, 6), (2, 2)):
+                with self.subTest(own_runs=count, pool=pool):
+                    self.root = parent / f"{count}-{pool}"
+                    (self.root / "admission").mkdir(parents=True)
+                    self.samples([6 * GIB] * count, scope="full")
+                    self.samples([pool * GIB] * 50, scope="full", repository=other)
+                    peak = gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
+                                              first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"],
+                                              budget=admission_configuration_fixture().build_budget_bytes)
+                    self.assertEqual(peak.bytes, expected * GIB)
+        self.root = parent
+
+    def test_compile_history_excludes_known_zero_counts_and_keeps_unknown_counts(self) -> None:
+        self.samples([7 * GIB], filters=("native_rate",), crates=3)
+        self.samples([20 * GIB] * 10, filters=("native_rate",), crates=0)
+        self.assertEqual(self.promise(), gate.ExpectedPeak(7 * GIB, "measured", 1))
+        self.samples([21 * GIB] * 10, filters=("native_rate",), crates=None)
+        self.assertEqual(self.promise(), gate.ExpectedPeak(21 * GIB, "measured", 11))
+
+    def test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak(self) -> None:
+        self.samples([7 * GIB], filters=("native_rate",), crates=0)
+        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+            for count in (None, 0):
+                _ = db.execute("INSERT INTO steps(host,repo,step,started_at,call_id,crates_compiled) "
+                               + "SELECT host,repo,step,started_at,call_id,? FROM steps LIMIT 1", (count,))
+        self.assertEqual(self.promise(), gate.ExpectedPeak(7 * GIB, "measured", 1))
+
+    def test_legacy_index_without_compile_counts_keeps_its_filtered_nextest_peaks(self) -> None:
+        arguments = ["cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"]
+        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                (self.host, "hana", "nextest", HISTORY_AT.isoformat(), 8 * GIB, json.dumps(arguments))
+            ] * 5)
+        peak = gate.filtered_peak(HANA, "nextest", self.host, NOW, self.root,
+                                  None, ("native_rate",), "hana")
+        self.assertEqual(peak, gate.ExpectedPeak(int(8 * GIB * gate.ANON_SHARE), "buildlog", 5))
+
+    def test_missing_call_and_step_matches_keep_peaks_until_classification(self) -> None:
+        self.samples([3 * GIB], filters=("native_rate",))
+        self.samples([20 * GIB] * 10, filters=("native_rate",), indexed=False)
+        write_history_rows(self.root, [{
+            "host": self.host, "repo": "hana", "repo_identity": HANA.key,
+            "step": "nextest", "test_scope": "filtered", "package": "hana",
+            "filters": ["native_rate"], "anon_peak_bytes": 21 * GIB,
+            "call_id": "different-step", "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
+        }])
+        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+            _ = db.execute("INSERT INTO steps(host,repo,step,started_at,call_id,crates_compiled) "
+                           + "VALUES (?,?,?,?,?,?)",
+                           (self.host, "hana", "check", HISTORY_AT.isoformat(), "different-step", 5))
+        self.assertEqual(self.promise(), gate.ExpectedPeak(20 * GIB, "measured", 12))
+
+    def test_gate_history_remains_saved_without_entering_cargo_estimates(self) -> None:
+        self.samples([3 * GIB] * 5, scope="full")
+        self.samples([20 * GIB] * 10, scope="full", step="merge-gate", indexed=False)
+        path = self.root / "admission/anon_peaks.jsonl"
+        before = path.read_bytes()
+        peak = gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
+                                  first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"],
+                                  budget=admission_configuration_fixture().build_budget_bytes)
+        self.assertEqual(peak, gate.ExpectedPeak(3 * GIB, "measured", 5))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(sum(row["step"] == "merge-gate" for row in gate.anonymous_history_rows(path)), 10)
 
     def promise(self, filters: tuple[str, ...] = ("native_rate",)) -> gate.ExpectedPeak:
         return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
@@ -528,10 +650,11 @@ class FilteredPromiseTests(unittest.TestCase):
         self.samples([19 * GIB] * 10, scope="full")
         self.assertEqual(self.promise(), gate.ExpectedPeak(9 * GIB, "measured", 10))
 
-    def test_no_filtered_history_uses_floor_when_compile_peak_is_lower(self) -> None:
-        self.samples([gate.FILTERED_FLOOR // 2] * 5, step="check", scope="full")
+    def test_measured_compile_peak_below_the_floor_keeps_its_promise(self) -> None:
+        compile_peak = gate.FILTERED_FLOOR // 2
+        self.samples([compile_peak] * 5, step="check", scope="full")
         self.samples([19 * GIB] * 5, scope="full")
-        self.assertEqual(self.promise().bytes, gate.FILTERED_FLOOR)
+        self.assertEqual(self.promise().bytes, compile_peak)
 
     def test_no_filtered_history_keeps_compile_peak_above_the_floor(self) -> None:
         compile_peak = 2 * gate.FILTERED_FLOOR
@@ -547,10 +670,10 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_compile_fallback_can_use_same_package_buildlog_history(self) -> None:
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
-            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
-                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for package, peak in (("hana", 8 * GIB), ("hana-ui", 20 * GIB)):
-                _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)", [
                     (self.host, "hana", "check", store.utc_iso(HISTORY_AT.timestamp()), peak,
                      json.dumps(["cargo", "check", "-p", package]))
                 ] * 5)
@@ -559,15 +682,15 @@ class FilteredPromiseTests(unittest.TestCase):
     def test_exact_buildlog_filters_precede_broader_filtered_anon_history(self) -> None:
         self.samples([19 * GIB] * 10, filters=("other",))
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
-            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
-                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for package, names, peaks in (
                 ("hana", "test(render) | test(native_rate)", list(range(1, 11))),
                 ("hana-ui", "test(render) | test(native_rate)", [20] * 10),
                 ("hana", "test(other)", [21] * 10),
             ):
                 argv = ["cargo", "nextest", "run", "-E", f"package({package}) & ({names})"]
-                _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)", [
                     (self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), peak * GIB,
                      json.dumps(argv)) for peak in peaks
                 ])
@@ -642,10 +765,10 @@ class FilteredPromiseTests(unittest.TestCase):
     def test_negated_index_expression_cannot_supply_a_positive_exact_promise(self) -> None:
         self.samples([9 * GIB] * 5, filters=("other",))
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
-            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
-                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for expression in ("package(hana) & not test(native_rate)", "package(hana) & !test(native_rate)"):
-                _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)",
+                _ = db.execute("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)",
                                (self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), GIB,
                                 json.dumps(["cargo", "nextest", "run", "-E", expression])))
         self.assertEqual(self.promise(), gate.ExpectedPeak(9 * GIB, "measured", 5))
@@ -658,21 +781,21 @@ class FilteredPromiseTests(unittest.TestCase):
             gate.ExpectedPeak(12 * GIB, "fallback", 0),
         )
 
-    def test_unscoped_filtered_run_with_sparse_history_retains_the_legacy_sample_minimum(self) -> None:
+    def test_unscoped_filtered_run_uses_its_single_measured_peak(self) -> None:
         self.samples([2 * GIB], package="", filters=("native_rate",))
         self.assertEqual(
             gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
                                scope="filtered", filters=("native_rate",), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
-            gate.ExpectedPeak(12 * GIB, "fallback", 0),
+            gate.ExpectedPeak(2 * GIB, "measured", 1),
         )
 
-    def test_unscoped_filtered_run_retains_the_cross_repository_pool(self) -> None:
+    def test_unscoped_filtered_run_keeps_its_own_peaks_below_the_pool(self) -> None:
         self.samples([2 * GIB] * 3, package="")
         other = gate.RepositoryIdentity("https://example.org/nate/other", "other", "other")
         self.samples([9 * GIB] * 5, package="", repository=other)
         self.assertEqual(
             gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope="filtered", first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
-            gate.ExpectedPeak(9 * GIB, "pooled", 8),
+            gate.ExpectedPeak(2 * GIB, "measured", 3),
         )
 
     def test_no_filtered_history_uses_same_package_build_measurements(self) -> None:
@@ -683,9 +806,9 @@ class FilteredPromiseTests(unittest.TestCase):
     def test_build_measurements_precede_compile_index_history(self) -> None:
         self.samples([8 * GIB] * 5, step="build", scope="full")
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
-            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
-                           + "peak_mem_bytes INTEGER, argv TEXT)")
-            _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+            _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
+            _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)", [
                 (self.host, "hana", "check", store.utc_iso(HISTORY_AT.timestamp()), 20 * GIB,
                  json.dumps(["cargo", "check", "-p", "hana"]))
             ] * 5)
@@ -693,21 +816,21 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_no_filtered_history_uses_same_package_build_index_measurements(self) -> None:
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
-            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
-                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for package, peak in (("hana", 8 * GIB), ("hana-ui", 20 * GIB)):
-                _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)", [
                     (self.host, "hana", "build", store.utc_iso(HISTORY_AT.timestamp()), peak,
                      json.dumps(["cargo", "build", "-p", package]))
                 ] * 5)
         self.assertEqual(self.promise(), gate.ExpectedPeak(int(8 * GIB * gate.ANON_SHARE), "buildlog", 5))
 
-    def test_indexed_member_filter_promises_never_exceed_the_full_suite(self) -> None:
+    def test_indexed_member_compile_promise_can_exceed_the_full_suite(self) -> None:
         self.samples([12 * GIB] * 5, scope="full")
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
-            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
-                           + "peak_mem_bytes INTEGER, argv TEXT)")
-            _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+            _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
+            _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)", [
                 (self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), 30 * GIB,
                  json.dumps(["cargo", "nextest", "run", "-E",
                              "package(hana_diegetic) & test(native_rate)"]))
@@ -717,39 +840,39 @@ class FilteredPromiseTests(unittest.TestCase):
                 self.assertEqual(
                     gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
                                        scope="filtered", package="hana_diegetic", filters=filters, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
-                    gate.ExpectedPeak(12 * GIB, "buildlog", 66),
+                    gate.ExpectedPeak(int(30 * GIB * gate.ANON_SHARE), "buildlog", 66),
                 )
         self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
                          gate.ExpectedPeak(12 * GIB, "measured", 5))
 
-    def test_exact_filtered_measurements_are_capped_without_raising_smaller_promises(self) -> None:
+    def test_exact_compile_measurements_can_exceed_the_full_suite_promise(self) -> None:
         self.samples([7 * GIB] * 5, scope="full")
         self.samples([20 * GIB], filters=("native_rate",))
         self.samples([2 * GIB], filters=("small_test",))
-        self.assertEqual(self.promise(), gate.ExpectedPeak(7 * GIB, "measured", 1))
+        self.assertEqual(self.promise(), gate.ExpectedPeak(20 * GIB, "measured", 1))
         self.assertEqual(self.promise(("small_test",)), gate.ExpectedPeak(2 * GIB, "measured", 1))
 
-    def test_compile_fallback_is_capped_by_the_full_suite_promise(self) -> None:
+    def test_compile_fallback_can_exceed_the_full_suite_promise(self) -> None:
         self.samples([4 * GIB] * 5, scope="full")
         self.samples([8 * GIB] * 5, step="build", scope="full")
-        self.assertEqual(self.promise(), gate.ExpectedPeak(4 * GIB, "measured", 5))
+        self.assertEqual(self.promise(), gate.ExpectedPeak(8 * GIB, "measured", 5))
 
-    def test_filtered_cap_uses_the_requested_test_width(self) -> None:
-        with (self.root / "admission/anon_peaks.jsonl").open("a") as output:
-            for scope, width, peak, count in (("full", 16, 6 * GIB, 5),
-                                               ("full", 4, 30 * GIB, 5),
-                                               ("filtered", 16, 20 * GIB, 1)):
-                for _ in range(count):
-                    _ = output.write(json.dumps({
-                        "host": self.host, "repo": HANA.name, "repo_identity": HANA.key,
-                        "step": "nextest", "test_scope": scope, "test_threads": width,
-                        "package": "hana", "filters": ["native_rate"], "anon_peak_bytes": peak,
-                        "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
-                    }) + "\n")
+    def test_compile_estimate_uses_the_requested_test_width(self) -> None:
+        for scope, width, peak, count in (("full", 16, 6 * GIB, 5),
+                                           ("full", 4, 30 * GIB, 5),
+                                           ("filtered", 16, 20 * GIB, 1),
+                                           ("filtered", 4, 30 * GIB, 1)):
+            for _ in range(count):
+                write_history_rows(self.root, [{
+                    "host": self.host, "repo": HANA.name, "repo_identity": HANA.key,
+                    "step": "nextest", "test_scope": scope, "test_threads": width,
+                    "package": "hana", "filters": ["native_rate"], "anon_peak_bytes": peak,
+                    "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
+                }], indexed=True)
         self.assertEqual(
             gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, test_threads=16,
                                scope="filtered", package="hana", filters=("native_rate",), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
-            gate.ExpectedPeak(6 * GIB, "measured", 1),
+            gate.ExpectedPeak(20 * GIB, "measured", 1),
         )
 
 
@@ -763,6 +886,7 @@ class FreshTestPromiseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
         self.worktree = self.root / "checkout"
         (self.worktree / "target").mkdir(parents=True)
         self.state = self.root / "sweep-state"
@@ -1170,6 +1294,7 @@ class RepositoryHistoryTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
         self.admission = self.root / "admission"
         self.admission.mkdir()
 
@@ -1200,7 +1325,7 @@ class RepositoryHistoryTests(unittest.TestCase):
             "repo_identity": repository.key, "test_scope": scope,
             "anon_peak_bytes": gib * GIB,
             "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
-        } for _ in range(5)))
+        } for _ in range(5)), indexed=True)
 
     def estimate(self, repository: gate.Repository, scope: gate.TestScope = "full") -> gate.ExpectedPeak:
         return gate.expected_peak(repository, "nextest", self.host, NOW, self.root, scope=scope, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
@@ -1226,14 +1351,14 @@ class RepositoryHistoryTests(unittest.TestCase):
                            check=True, capture_output=True)
         identity = self.identity(worktree)
         peaks = self.admission / "anon_peaks.jsonl"
-        rows = [{"host": self.host, "repo": "hana", "step": "nextest",
+        rows: list[dict[str, object]] = [{"host": self.host, "repo": "hana", "step": "nextest",
                  "anon_peak_bytes": 3 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())}] * 5
-        _ = peaks.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        write_history_rows(self.root, rows, indexed=True)
         self.assertEqual(self.estimate(identity), gate.ExpectedPeak(3 * GIB, "measured", 5))
         peaks.unlink()
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
-            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER)")
-            _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?)",
+            _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER, crates_compiled INTEGER DEFAULT 1)")
+            _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes) VALUES (?, ?, ?, ?, ?)",
                                [(self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), 4 * GIB)] * 5)
         self.assertEqual(self.estimate(identity), gate.ExpectedPeak(int(4 * GIB * gate.ANON_SHARE), "buildlog", 5))
         scratch = self.identity(self.checkout("repo", "https://example.org/nate/hana.git"))
@@ -1733,7 +1858,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
         bases: tuple[gate.NeedBasis | gate.BasisNotRecorded, ...] = (
             "measured", "buildlog", "pooled", "fallback", gate.BasisNotRecorded(),
             gate.ShapeP90(10, gate.FailedPeakFloor(4 * GIB, HISTORY_AT.isoformat()),
-                          gate.DevHeadroom(), gate.CappedAtBudget(25 * GIB, gate.CapNotRecorded())),
+                          gate.LegacyDevMultiplierHeadroom(), gate.CappedAtBudget(25 * GIB, gate.CapNotRecorded())),
             gate.ShapeLargest(2, factor=gate.ReleaseHeadroom(gate.read_memory_config(report=False).release_headroom)), gate.ShapeFallback())
         for basis in bases:
             with self.subTest(basis=basis):
@@ -2280,7 +2405,7 @@ class BuildPromiseFixture(MemoryQueueFixture):
     def sample(self, peak: float, *, shape: BuildShape = RELEASE_SHAPE,
                at: datetime = HISTORY_AT, outcome: str = "completed", need: float = 21,
                host: str = "test-host", repository: gate.RepositoryIdentity = HANA,
-               call_id: str = "", record_shape: bool = True) -> None:
+               call_id: str = "", record_shape: bool = True, crates: int | None = 1) -> None:
         row: dict[str, object] = {
             "host": host, "repo": repository.name, "repo_identity": repository.key,
             "step": "build", "ended_at": store.utc_iso(at.timestamp()),
@@ -2290,16 +2415,17 @@ class BuildPromiseFixture(MemoryQueueFixture):
             row["shape"] = shape.key
         if outcome:
             row["outcome"] = outcome
-        write_history_rows(self.root, [row])
+        write_history_rows(self.root, [row], indexed=record_shape, crates=crates)
 
-    def index_build(self, call_id: str, arguments: list[str]) -> None:
+    def index_build(self, call_id: str, arguments: list[str], *,
+                    at: datetime = HISTORY_AT, crates: int = 1) -> None:
         with closing(sqlite3.connect(self.root / "index.sqlite")) as connection, connection:
             _ = connection.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, "
                                    + "repo_identity TEXT, step TEXT, started_at TEXT, "
-                                   + "call_id TEXT, argv TEXT, peak_mem_bytes INTEGER)")
-            _ = connection.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                   ("test-host", "hana", HANA.key, "build", HISTORY_AT.isoformat(),
-                                    call_id, json.dumps(arguments), 0))
+                                   + "call_id TEXT, argv TEXT, peak_mem_bytes INTEGER, crates_compiled INTEGER DEFAULT 1)")
+            _ = connection.execute("INSERT INTO steps(host,repo,repo_identity,step,started_at,call_id,argv,peak_mem_bytes,crates_compiled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                   ("test-host", "hana", HANA.key, "build", at.isoformat(),
+                                    call_id, json.dumps(arguments), 0, crates))
 
     def estimate(self, shape: BuildShape = RELEASE_SHAPE, *, now: datetime = NOW) -> gate.ExpectedPeak:
         return gate.expected_peak(HANA, "build", "test-host", now, self.root, shape=shape, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
@@ -2364,6 +2490,84 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.assertEqual(self.same_shape_basis(after).factor, rule)
         self.assertIsInstance(self.same_shape_basis(after).cap, gate.UnderBudget)
         self.assertEqual(gate.read_need_basis(saved_basis), before.basis)
+
+    def test_changed_dev_margin_changes_only_the_next_estimate(self) -> None:
+        from scripts.build_queue.queue_evidence import need_text
+        from scripts.lib.user_zone import user_zone
+
+        shape = build_shape(["cargo", "build", "--bin", "hana"])
+        self.sample(6.3, shape=shape)
+        before = self.estimate(shape)
+        saved = gate.need_basis_record(before.basis)
+        write_memory_config(self.root / "build_admission.conf", dev_size_margin_gib="2.0")
+        config = gate.read_memory_config(report=False)
+        rule = gate.DevSizeHeadroom(config.dev_size_factor, config.dev_size_margin_bytes)
+        after = self.estimate(shape)
+        self.assertGreater(after.bytes, before.bytes)
+        self.assertEqual(after.count, before.count)
+        self.assertEqual(after.bytes, gate.shape_headroom_bytes(int(6.3 * GIB), rule))
+        self.assertEqual(self.same_shape_basis(after).factor, rule)
+        self.assertEqual(gate.read_need_basis(saved), before.basis)
+        text = need_text(gate.RecordedNeed(after.source, after.count, 14, "full", "", (),
+                                         gate.WidthNotRecorded(), after.basis), zone=user_zone())
+        self.assertIn(f"{config.dev_size_margin_bytes / GIB:.1f} GiB", text)
+        self.assertIn(f"{config.dev_size_factor:g}", text)
+
+    def test_changed_release_headroom_changes_only_the_next_estimate(self) -> None:
+        from scripts.build_queue.queue_evidence import need_text
+        from scripts.lib.user_zone import user_zone
+
+        self.sample(6)
+        before = self.estimate()
+        saved = gate.need_basis_record(before.basis)
+        write_memory_config(self.root / "build_admission.conf", release_headroom="1.5")
+        config = gate.read_memory_config(report=False)
+        rule = gate.ReleaseHeadroom(config.release_headroom)
+        after = self.estimate()
+        self.assertGreater(after.bytes, before.bytes)
+        self.assertEqual(after.count, before.count)
+        self.assertEqual(after.bytes, gate.shape_headroom_bytes(6 * GIB, rule))
+        self.assertEqual(self.same_shape_basis(after).factor, rule)
+        self.assertEqual(gate.read_need_basis(saved), before.basis)
+        text = need_text(gate.RecordedNeed(after.source, after.count, 14, "full", "", (),
+                                         gate.WidthNotRecorded(), after.basis), zone=user_zone())
+        self.assertIn(f"release headroom × {config.release_headroom:g}", text)
+
+    def test_sparse_build_history_keeps_its_shape_rule_above_a_lower_pool(self) -> None:
+        other = gate.RepositoryIdentity("https://example.org/nate/other", "other", "other")
+        shape = build_shape(["cargo", "build", "--bin", "hana"])
+        for count in range(1, 5):
+            self.sample(6.3, shape=shape)
+            self.sample(0.5, shape=shape, repository=other)
+            with self.subTest(own_runs=count):
+                peak = self.estimate(shape)
+                self.assertEqual(peak.count, count)
+                self.assertIsInstance(peak.basis, gate.ShapeLargest)
+                self.assertEqual(peak.bytes, gate.shape_headroom_bytes(int(6.3 * GIB), self.dev_size_headroom))
+
+    def test_stored_build_shape_does_not_bypass_compile_classification(self) -> None:
+        self.sample(3)
+        self.sample(20, crates=0)
+        self.assertEqual((self.estimate().bytes, self.estimate().count),
+                         (gate.shape_headroom_bytes(3 * GIB, self.release_headroom), 1))
+        self.sample(20, crates=None)
+        self.assertEqual((self.estimate().bytes, self.estimate().count), (21 * GIB, 2))
+
+    def test_repeated_step_with_a_zero_count_keeps_its_compile_peak(self) -> None:
+        self.sample(16, call_id="retried-build", crates=652)
+        self.index_build("retried-build", RELEASE_BUILD, crates=0)
+        peak = self.estimate()
+        self.assertEqual(peak.count, 1)
+        self.assertEqual(peak.bytes, min(21 * GIB, gate.shape_headroom_bytes(16 * GIB, self.release_headroom)))
+
+    def test_legacy_index_without_compile_counts_keeps_its_build_peak(self) -> None:
+        self.index_build("legacy-build", RELEASE_BUILD)
+        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as connection, connection:
+            _ = connection.execute("ALTER TABLE steps DROP COLUMN crates_compiled")
+        self.sample(5, call_id="legacy-build", record_shape=False)
+        peak = self.estimate()
+        self.assertEqual((peak.bytes, peak.count),
+                         (gate.shape_headroom_bytes(5 * GIB, self.release_headroom), 1))
 
     def test_small_dev_history_still_covers_the_limiting_build(self) -> None:
         shape = build_shape(["cargo", "build", "--bin", "cargo-berth"])
@@ -2522,6 +2726,18 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.assertEqual(self.same_shape_basis(peak).floor, gate.FailedPeakFloor(int(15.76 * GIB), store.utc_iso(HISTORY_AT.timestamp())))
         self.assertAlmostEqual(peak.bytes / GIB, 20.70864, places=6)
 
+    def test_failed_peak_floor_uses_completion_time_for_the_history_window(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        ended = NOW - timedelta(days=13, hours=23)
+        self.index_build("long-build", RELEASE_BUILD, at=NOW - timedelta(days=14, hours=1))
+        self.sample(15.76, outcome="killed", at=ended, call_id="long-build", record_shape=False)
+        peak = self.estimate()
+        self.assertEqual(peak.count, 10)
+        self.assertEqual(peak.bytes, gate.shape_headroom_bytes(int(15.76 * GIB), self.release_headroom))
+        self.assertEqual(self.same_shape_basis(peak).floor,
+                         gate.FailedPeakFloor(int(15.76 * GIB), store.utc_iso(ended.timestamp())))
+
     def test_later_success_below_the_floor_does_not_end_it(self) -> None:
         for _ in range(9):
             self.sample(10)
@@ -2637,6 +2853,29 @@ class BuildLifetimePromiseTests(BuildPromiseFixture):
 
 
 class BuildFinalizerTests(BuildPromiseFixture):
+    def test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it(self) -> None:
+        with AdmissionFixture() as fixture, patch.object(self, "root", fixture.state_dir.parent):
+            fixture.clock.epoch = NOW_EPOCH
+            before = self.estimate()
+            request = fixture.request(step="build", owner=fixture.fixture_owner(100, "publisher"))
+            assert isinstance(request.profile, gate.StepProfile)
+            request = replace(request, argv=tuple(RELEASE_BUILD), profile=gate.StepProfile(
+                "hana", "build", "hana-clone", before, HANA, "full", NOW_EPOCH,
+                request.profile.build_history_generation), sidecar=str(fixture.scope(request.owner)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant, 16 * GIB)
+            self.assertEqual(fixture.server.handle_request(
+                wire.ReleaseRequest("publish-before-index", grant.reservation, 137)), [wire.Ok()])
+            refreshed = self.estimate(now=NOW + timedelta(seconds=1))
+            self.assertGreater(refreshed.bytes, before.bytes)
+            self.assertEqual(refreshed.count, 1)
+            self.assertEqual(refreshed.bytes,
+                             min(21 * GIB, gate.shape_headroom_bytes(16 * GIB, self.release_headroom)))
+            self.assertIsInstance(self.same_shape_basis(refreshed).floor, gate.FailedPeakFloor)
+            assert isinstance(request.call, gate.CallRecord)
+            self.index_build(request.call.call_id, RELEASE_BUILD, crates=0)
+            self.assertEqual(self.estimate(now=NOW + timedelta(seconds=1)), before)
+
     def test_publication_during_a_delayed_generation_query_cannot_admit_the_old_need(self) -> None:
         with AdmissionFixture() as fixture, patch.object(self, "root", fixture.state_dir.parent):
             fixture.clock.epoch = NOW_EPOCH
@@ -2878,7 +3117,7 @@ class BuildNeedBasisTests(BuildPromiseFixture):
             "cap": {"kind": "none"},
         }
         basis = gate.read_need_basis(encoded)
-        self.assertEqual(basis, gate.ShapeLargest(2, factor=gate.DevHeadroom()))
+        self.assertEqual(basis, gate.ShapeLargest(2, factor=gate.LegacyDevMultiplierHeadroom()))
         self.assertEqual(gate.need_basis_record(basis), encoded)
 
     def test_recorded_budget_cap_requires_a_positive_cap_below_the_uncapped_need(self) -> None:

@@ -35,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
-from build_shape import BuildShape, NoBuildShape, build_shape, index_shapes, recorded_build_shape
+from build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
+                         StepEvidence, build_shape, index_step_evidence, recorded_build_shape)
 from atomic_file import write_text_atomic
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 import conf
@@ -158,7 +159,7 @@ class ReleaseHeadroom:
 
 
 @dataclass(frozen=True)
-class DevHeadroom:
+class LegacyDevMultiplierHeadroom:
     """The multiplier recorded before the dev size rule."""
 
     factor: float = DEV_HEADROOM
@@ -170,10 +171,10 @@ class DevSizeHeadroom:
     margin_bytes: int
 
 
-HeadroomRule = ReleaseHeadroom | DevHeadroom | DevSizeHeadroom | NoHeadroom
-HEADROOM_FACTOR_CLASSES: dict[str, type[ReleaseHeadroom | DevHeadroom | DevSizeHeadroom]] = {
+HeadroomRule = ReleaseHeadroom | LegacyDevMultiplierHeadroom | DevSizeHeadroom | NoHeadroom
+HEADROOM_FACTOR_CLASSES: dict[str, type[ReleaseHeadroom | LegacyDevMultiplierHeadroom | DevSizeHeadroom]] = {
     "release": ReleaseHeadroom,
-    "dev": DevHeadroom,
+    "dev": LegacyDevMultiplierHeadroom,
     "dev_size": DevSizeHeadroom,
 }
 
@@ -1894,76 +1895,90 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
         return fresh_test_peak(repository, step, host, now, root, test_threads,
                                scope, tuple(sorted(set(filters))), package, compile_peak)
     if scope == "filtered" and package:
-        filtered = filtered_peak(repository, step, host, now, root, test_threads,
-                                 tuple(sorted(set(filters))), package)
-        full = expected_peak(repository, step, host, now, root, test_threads, scope="full",
-                             first_peak_bytes=first_peak_bytes, budget=budget)
-        # A filtered run builds the same targets and runs fewer tests than the full suite.
-        return ExpectedPeak(min(filtered.bytes, full.bytes), filtered.source, filtered.count)
+        return filtered_peak(repository, step, host, now, root, test_threads,
+                             tuple(sorted(set(filters))), package)
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
-    measured: list[int] = []
-    # Every repo's runs of this step on this host: a checkout with fewer than 5 runs of its own (a gate
-    # copy, a clone) uses their p90, not the configured first peak. Doc steps held 2157 of 4702 wait minutes in the week
-    # to 2026-10-28 on that fallback; the measured doc p90 over all repos was 4.15 GiB.
-    pooled: list[int] = []
-    try:
-        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
-            try:
-                if ((item.get("host"), item.get("step")) == (host, step)
-                        and item.get("test_scope", "full") == scope
-                        and (item.get("repo_identity") or item.get("repo") not in GENERIC_REPO_NAMES)
-                        and (test_threads is None or item.get("test_threads") == test_threads)
-                        and cutoff <= str(item.get("ended_at", "")) < before):
-                    peak = item.get("anon_peak_bytes")
-                    if isinstance(peak, int) and peak > 0:
-                        pooled.append(peak)
-                        if (item.get("repo_identity") == repository.key
-                                or (not item.get("repo_identity") and repository.legacy_name
-                                    and item.get("repo") == repository.legacy_name)):
-                            measured.append(peak)
-            except (ValueError, TypeError, AttributeError):
-                continue
-    except OSError:
-        pass
+    rows = [entry[0] for entry in compiling_history(root, host, step, now)
+            if entry[0].get("test_scope", "full") == scope
+            and (test_threads is None or entry[0].get("test_threads") == test_threads)
+            and (entry[0].get("repo_identity") or entry[0].get("repo") not in GENERIC_REPO_NAMES)]
+    measured = [int(cast(int, item["anon_peak_bytes"]))
+                for item in repository_history(rows, repository)]
+    pooled = [int(cast(int, item["anon_peak_bytes"])) for item in rows]
     if len(measured) >= 5:
         return ExpectedPeak(percentile(measured), "measured", len(measured))
     peaks: list[int] = []
-    index = root / store.INDEX_NAME
     try:
-        connection = sqlite3.connect(f"file:{index}?mode=ro", uri=True)
-        try:
-            # Old index rows have no repository key. Use them only for a named
-            # checkout of that repository, and read argv to separate test scopes.
-            columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
-                       connection.execute("PRAGMA table_info(steps)").fetchall())}
+        with closing(sqlite3.connect((root / store.INDEX_NAME).resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             if repository.legacy_name:
+                columns = {row[1] for row in cast(list[tuple[object, ...]],
+                           connection.execute("PRAGMA table_info(steps)").fetchall())}
                 argv_column = "argv" if "argv" in columns else "NULL"
-                rows = cast(list[tuple[int, str | None]], connection.execute(
-                    f"SELECT peak_mem_bytes, {argv_column} FROM steps WHERE host = ? AND repo = ? AND step = ? "
-                    + "AND started_at >= ? AND started_at < ? AND peak_mem_bytes > 0",
+                compile_clause = " AND crates_compiled > 0" if "crates_compiled" in columns else ""
+                indexed = cast(list[tuple[int, str | None]], connection.execute(
+                    f"SELECT peak_mem_bytes, {argv_column} FROM steps WHERE host=? AND repo=? AND step=? "
+                    + "AND started_at>=? AND started_at<? AND peak_mem_bytes>0" + compile_clause,
                     (host, repository.legacy_name, step, cutoff, before),
                 ).fetchall())
-                for value, raw_argv in rows:
-                    arguments: list[str] = []
-                    if raw_argv:
-                        try:
-                            decoded = cast(object, json.loads(raw_argv))
-                            if isinstance(decoded, list):
-                                arguments = [word for word in cast(list[object], decoded) if isinstance(word, str)]
-                        except (ValueError, TypeError):
-                            continue
-                    if test_scope(arguments) == scope:
-                        peaks.append(int(value))
-        finally:
-            connection.close()
+                for value, raw_argv in indexed:
+                    if test_scope(history_arguments(raw_argv)) == scope:
+                        peaks.append(value)
     except (OSError, sqlite3.Error):
         pass
     if len(peaks) >= 5:
         return ExpectedPeak(int(percentile(peaks) * ANON_SHARE), "buildlog", len(peaks))
+    if measured:
+        peak = max(measured)
+        if len(pooled) >= 5:
+            peak = min(peak, percentile(pooled))
+        return ExpectedPeak(peak, "measured", len(measured))
+    if peaks:
+        peak = int(max(peaks) * ANON_SHARE)
+        if len(pooled) >= 5:
+            peak = min(peak, percentile(pooled))
+        return ExpectedPeak(peak, "buildlog", len(peaks))
     if len(pooled) >= 5:
         return ExpectedPeak(percentile(pooled), "pooled", len(pooled))
     return ExpectedPeak(first_peak_bytes, "fallback", 0)
+
+
+def repository_history(rows: Sequence[dict[str, object]],
+                       repository: RepositoryIdentity) -> list[dict[str, object]]:
+    """Use legacy rows only while the keyed history has fewer than five rows."""
+    keyed = [row for row in rows if row.get("repo_identity") == repository.key]
+    if len(keyed) >= 5:
+        return keyed
+    return [row for row in rows if history_matches_repository(row, repository)]
+
+
+def compiling_history(root: Path, host: str, step: str,
+                      now: datetime, *, include_current_end: bool = False) -> list[tuple[dict[str, object], StepEvidence]]:
+    """Exclude only peaks whose known attempts compiled no crates."""
+    cutoff = now - timedelta(days=HISTORY_DAYS)
+    evidence = index_step_evidence(root / store.INDEX_NAME, host, step,
+                                   datetime.min.replace(tzinfo=now.tzinfo), now)
+    peaks: list[tuple[dict[str, object], StepEvidence]] = []
+    try:
+        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+            if item.get("host") != host or item.get("step") != step:
+                continue
+            joined = evidence.get((str(item.get("call_id", "")), step),
+                                  StepEvidence(NoBuildShape(), CompileCountUnknown()))
+            if isinstance(joined.compilation, NoCratesCompiled):
+                continue
+            try:
+                ended_at = datetime.fromisoformat(str(item.get("ended_at", "")))
+                peak = item.get("anon_peak_bytes")
+                if (cutoff <= ended_at and (ended_at <= now if include_current_end else ended_at < now)
+                        and isinstance(peak, int)
+                        and not isinstance(peak, bool) and peak > 0):
+                    peaks.append((item, joined))
+            except (ValueError, TypeError):
+                continue
+    except OSError:
+        pass
+    return peaks
 
 
 @dataclass(frozen=True)
@@ -1997,36 +2012,23 @@ def history_matches_repository(row: Mapping[str, object], repository: Repository
 
 
 def build_peaks(repository: RepositoryIdentity, host: str, now: datetime, root: Path) -> list[BuildPeak]:
-    """Read anonymous peaks; old rows need an argv join to establish their shape."""
-    cutoff = now - timedelta(days=HISTORY_DAYS)
-    joins: dict[tuple[str, str], BuildShape] = {}
-    joined = False
+    """Keep compile peaks and resolve each shape from its recorded evidence."""
+    history = compiling_history(root, host, "build", now, include_current_end=True)
+    shaped: dict[BuildShape, list[dict[str, object]]] = {}
+    for item, evidence in history:
+        shape = recorded_build_shape(item.get("shape"))
+        if isinstance(shape, NoBuildShape) and "shape" not in item:
+            shape = evidence.shape
+        if isinstance(shape, BuildShape):
+            shaped.setdefault(shape, []).append(item)
     peaks: list[BuildPeak] = []
-    try:
-        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
-            try:
-                if not history_matches_repository(item, repository) or item.get("host") != host or item.get("step") != "build":
-                    continue
-                ended_at = datetime.fromisoformat(str(item.get("ended_at", "")))
-                peak = item.get("anon_peak_bytes")
-                if not cutoff <= ended_at <= now or not isinstance(peak, int) or peak <= 0:
-                    continue
-                shape = recorded_build_shape(item.get("shape"))
-                if isinstance(shape, NoBuildShape) and "shape" not in item:
-                    if not joined:
-                        joins = index_shapes(root / store.INDEX_NAME, host, "build", cutoff, now)
-                        joined = True
-                    shape = joins.get((str(item.get("call_id", "")), "build"), NoBuildShape())
-                if isinstance(shape, NoBuildShape):
-                    continue
-                need = item.get("need")
-                peaks.append(BuildPeak(shape, peak, ended_at,
-                                       need if isinstance(need, int) and need > 0 else 0,
-                                       history_outcome(item.get("outcome"))))
-            except (ValueError, TypeError, AttributeError):
-                continue
-    except OSError:
-        pass
+    for shape, rows in shaped.items():
+        for item in repository_history(rows, repository):
+            need = item.get("need")
+            peaks.append(BuildPeak(shape, cast(int, item["anon_peak_bytes"]),
+                                   datetime.fromisoformat(str(item["ended_at"])),
+                                   need if isinstance(need, int) and need > 0 else 0,
+                                   history_outcome(item.get("outcome"))))
     return peaks
 
 
@@ -2034,7 +2036,7 @@ def shape_headroom_bytes(base: int, rule: HeadroomRule) -> int:
     """Apply the recorded headroom rule to the same-shape base."""
     if isinstance(rule, DevSizeHeadroom):
         return math.ceil(base * rule.factor + rule.margin_bytes)
-    if isinstance(rule, (ReleaseHeadroom, DevHeadroom)):
+    if isinstance(rule, (ReleaseHeadroom, LegacyDevMultiplierHeadroom)):
         return math.ceil(base * rule.factor)
     return base
 
@@ -2194,7 +2196,7 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
                     return BasisNotRecorded()
                 factor = DevSizeHeadroom(value, margin)
             else:
-                factor = cast(type[ReleaseHeadroom | DevHeadroom], factor_class)(value)
+                factor = cast(type[ReleaseHeadroom | LegacyDevMultiplierHeadroom], factor_class)(value)
         elif factor_kind != "none":
             return BasisNotRecorded()
         runs = row["runs"]
@@ -2328,37 +2330,27 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
     exact: list[int] = []
     compile_peaks: list[int] = []
     compile_index: list[int] = []
-    try:
-        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
-            try:
-                own = (item.get("repo_identity") == repository.key
-                       or (not item.get("repo_identity") and repository.legacy_name
-                           and item.get("repo") == repository.legacy_name))
-                if (not own or item.get("host") != host
-                        or not cutoff <= str(item.get("ended_at", "")) < before):
-                    continue
-                peak = item.get("anon_peak_bytes")
-                if not isinstance(peak, int) or peak <= 0:
-                    continue
-                sample_package = item.get("package", "")
-                if (item.get("step") in ("check", "build")
-                        and (sample_package == package
-                             or (not sample_package and package == repository.name))):
-                    compile_peaks.append(peak)
-                if (item.get("step") != step or item.get("test_scope") != "filtered"
-                        or sample_package != package
-                        or (width is not None and item.get("test_threads") != width)):
-                    continue
-                measured.append(peak)
-                names = item.get("filters")
-                if (filters and isinstance(names, list)
-                        and all(isinstance(name, str) for name in cast(list[object], names))
-                        and tuple(sorted(set(cast(list[str], names)))) == filters):
-                    exact.append(peak)
-            except (ValueError, TypeError, AttributeError):
+    histories = {name: compiling_history(root, host, name, now)
+                 for name in dict.fromkeys((step, "check", "build"))}
+    for sample_step, history in histories.items():
+        selected = repository_history([entry[0] for entry in history], repository)
+        for item in selected:
+            peak = cast(int, item["anon_peak_bytes"])
+            sample_package = item.get("package", "")
+            if (sample_step in ("check", "build")
+                    and (sample_package == package
+                         or (not sample_package and package == repository.name))):
+                compile_peaks.append(peak)
+            if (sample_step != step or item.get("test_scope") != "filtered"
+                    or sample_package != package
+                    or (width is not None and item.get("test_threads") != width)):
                 continue
-    except OSError:
-        pass
+            measured.append(peak)
+            names = item.get("filters")
+            if (filters and isinstance(names, list)
+                    and all(isinstance(name, str) for name in cast(list[object], names))
+                    and tuple(sorted(set(cast(list[str], names)))) == filters):
+                exact.append(peak)
     if exact:
         return ExpectedPeak(percentile(exact), "measured", len(exact))
     indexed: list[int] = []
@@ -2370,10 +2362,11 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
                 columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
                            connection.execute("PRAGMA table_info(steps)").fetchall())}
                 argv_column = "argv" if "argv" in columns else "NULL"
+                compile_clause = " AND crates_compiled > 0" if "crates_compiled" in columns else ""
                 rows = cast(list[tuple[int, str | None, str]], connection.execute(
                     f"SELECT peak_mem_bytes, {argv_column}, step FROM steps "
                     + "WHERE host = ? AND repo = ? AND step IN (?, 'check', 'build') "
-                    + "AND started_at >= ? AND started_at < ? AND peak_mem_bytes > 0",
+                    + "AND started_at >= ? AND started_at < ? AND peak_mem_bytes > 0" + compile_clause,
                     (host, repository.legacy_name, step, cutoff, before),
                 ).fetchall())
                 for value, raw_argv, sample_step in rows:
@@ -2400,9 +2393,9 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
                 peak = int(peak * ANON_SHARE)
             return ExpectedPeak(peak, cast(Literal["measured", "buildlog"], source), len(values))
     if compile_peaks:
-        return ExpectedPeak(max(FILTERED_FLOOR, percentile(compile_peaks)), "measured", len(compile_peaks))
+        return ExpectedPeak(percentile(compile_peaks), "measured", len(compile_peaks))
     if compile_index:
-        return ExpectedPeak(max(FILTERED_FLOOR, int(percentile(compile_index) * ANON_SHARE)),
+        return ExpectedPeak(int(percentile(compile_index) * ANON_SHARE),
                             "buildlog", len(compile_index))
     return ExpectedPeak(FILTERED_FLOOR, "fallback", 0)
 

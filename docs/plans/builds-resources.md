@@ -190,7 +190,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Binds later work:** A new script whose owner must show in the table needs an Owns entry in its production doc. Regenerate `working_set_owners.json` from the production docs after an Owns cell changes.
 
 ### Phase 8 — Shared build state is written only by the installed copy  · status: todo
-**Depends on:** Phases 2, 10, 12 and 19. Phase 56 lands before Phase 11. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
+**Depends on:** Phases 2, 10, 12 and 19. Phase 56 lands before Phase 11. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29. The edit to `docs/plans/builds-production.md` is approved.
 
@@ -336,8 +336,8 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Gotchas:** Releasing a measured reservation frees only its resident bytes. Its swap bytes stay part of the build charge but do not count as freed RAM.
 
-### Phase 11 — Memory admission promises what each repository's steps really use  · status: todo
-**Depends on:** Phases 10, 12 and 56, plus verify-unit's freshness change on `origin/builds`. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
+### Phase 11 — Memory admission promises what each repository's steps really use  · status: done
+**Depends on:** Phases 10, 12 and 56, plus verify-unit's freshness change on `origin/builds`. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29 (ETA 22:00 EDT, after Phase 12), from the widget wait study (07:09–11:43 EDT): a measured floor per repository for filtered test runs, and the promises that are 3x or more too high.
 
@@ -553,7 +553,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Ruled out:** a split of cargo waits by gate presence from old logs (no gate recorded its start); the 24 h check after `queue_times.jsonl` reaches main makes it.
 
 ### Phase 17 — The nextest promise splits by compile size  · status: todo
-**Depends on:** Phase 11, including its compile classification and shared step-evidence reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
+**Depends on:** Phase 11, including its compile classification and shared step-evidence reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).
 
@@ -660,7 +660,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Change-Review line: a small-compile test run on a warm tree gets a small promise | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic --filter <one test>` once, then add a comment line to one source file of that crate (a small compile that is not zero; an unchanged tree takes the freshness path instead), run it again and read that run's memory wait line | its need is near the small band's p90 that the replay gives, and its basis names the compile band it picked.
 
 ### Phase 18 — History splits on the dylib feature and each step's commit, not on a time  · status: todo
-**Depends on:** Phase 17, including its compile bands. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
+**Depends on:** Phase 17, including its compile bands. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).
 
@@ -746,7 +746,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Change-Review line: a dylib hana test is promised only from dylib history | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` and read its first memory wait line | the need and its source match the dylib-side p90 that the replay gives.
 
 ### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: todo
-**Depends on:** Phases 18 and 20. Phase 20 records the lifecycle events and supplies their reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
+**Depends on:** Phases 18 and 20. Phase 20 records the lifecycle events and supplies their reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its files do not overlap the chain files. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29, rescoped (no ETA given).
 
@@ -1603,7 +1603,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Ruled out:** caller-side `store` imports in six files, replaced by the one re-export.
 
 ### Phase 57 — The gate comparison shows Cargo waits with and without running gates  · status: todo
-**Depends on:** Phase 20 on `origin/main` for 24 hours. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its run-folder files do not overlap the chain files.
+**Depends on:** Phase 20 on `origin/main` for 24 hours. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its run-folder files do not overlap the chain files.
 
 #### Work Order
 
@@ -1665,3 +1665,112 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Pressure comparisons remain unavailable until the PSI record supports them.
 - The follow-up notice records the Phase 20 deployment time and the due time 24 hours later.
 - Spec 7: the build hold, head facts and memory admission tests pass on this branch and with `origin/builds-queue` merged in a copy. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the four Spec 7 files.
+
+### Phase 58 — The disk floor alert stays silent during a live sweep, and the floor pass finishes quickly  · status: todo
+**Depends on:** none. Runs beside Phase 11 (showrunner request 2026-11-04 09:45 EST). Its files do not overlap the Phase 11 files.
+
+#### Work Order
+
+**Goal:** the floor lock alert reports only a real block, and a floor-only sweep finishes within its 2-minute timer.
+
+**Measured:**
+1. At 09:45 EST on 2026-11-04, natedev had 291.5 GiB free, under the 300 GiB floor.
+2. `alert_floor_lock()` in `scripts/lint/sweep.py` sent "the disk floor sweep cannot run". The floor.lock holder was pid 3304614, `sweep.py --floor-only`, the sweep itself.
+3. That sweep ran over 21 minutes in state R at 90% CPU. It read 0.9 GB in 361,385 read calls and wrote 27 MB. Its RSS was 30 MB, one thread.
+4. `py-spy dump` is refused: `kernel.yama.ptrace_scope=1`, and sudo is not available to the unit.
+5. Only a sweep writes the floor.lock identity, so every `KnownFloorLockHolder` is a sweep. An `UnreadableFloorLockHolder` gets no alert today.
+
+**Spec:**
+1. `alert_floor_lock()` sends nothing while the holder is a live `sweep.py` process.
+   Any other holder of floor.lock gets the alert after `floor_lock_alert_minutes`, `UnreadableFloorLockHolder` included. The message names its pid and command.
+2. Find where the floor-only pass spends its time.
+   Profile `python3 -m cProfile -s cumtime scripts/lint/sweep.py --floor-only --dry-run` on natedev. A dry run deletes nothing and takes no lock.
+   Save the top 30 cumulative rows to `phases/58/profile_before.txt` in the unit run folder.
+3. Fix the costliest work at its cause. Remove repeated scans, repeated reads of one file and per-file work that a directory total can replace.
+   Keep every safety check: build holds, process uses, Mac claims and the 300 GiB floor arithmetic.
+4. Profile again after the fix into `phases/58/profile_after.txt`. Report both wall times in the notice.
+
+**Constraints from prior phases:**
+- Phase 50 and Phase 53 own the floor rules, Mac claims and outside caches. Keep their behavior.
+- Do not kill or signal a live sweep. Do not delete a target to test the fix; use `--dry-run` or private fixtures.
+
+**Files:**
+- `scripts/lint/sweep.py` — the alert condition and the speed fix.
+- `scripts/lint/test_sweep.py` — tests for both specs.
+
+**Workers:** `1 writer`
+- `impl` owns the code, the tests and the two profiles (fix2 has no durable worker identity).
+
+**Acceptance gate:**
+- A test proves the alert is silent for a live sweep holder and fires for another holder after the configured minutes.
+- A test proves the speed fix keeps each removed repeat at one call (call count, not wall time).
+- `profile_after.txt` shows a floor-only dry run on natedev under 120 seconds wall time.
+- `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the two changed files.
+
+### Phase 59 — Idle hana runners hold no swap: the runner home moves from tmpfs to disk  · status: todo
+**Depends on:** none. Runs beside Phases 11 and 58 (showrunner request 2026-11-04 10:1x EST). It changes only the nixos repository.
+
+#### Work Order
+
+**Goal:** while CI is idle, each hana runner service holds near zero swap, and the NVIDIA shader cache stays useful.
+
+**Measured:**
+1. At 10:1x EST on 2026-11-04, each idle hana runner service held about 1.0 GiB of swap.
+2. Shmem resident was 2-5 MiB. The two `Runner.Listener` processes held only 0.14 GiB of swap together.
+3. The runner home is the RuntimeDirectory `/run/github-runner/hana-linux-N` on the `/run` tmpfs, about 1.8 GiB used, mode 700.
+4. It holds `_actions`, `_diag`, `.nv` (NVIDIA shader cache), `.config` and `.dbus`. Tmpfs files are charged to the runner cgroup and swap out.
+5. `modules/linux/hana-runners.nix` keeps build caches under `cacheRoot = "/var/lib/hana-ci"` on disk, one `cacheDir` per runner.
+
+**Spec:**
+1. Confirm from `modules/linux/hana-runners.nix` and the upstream nixpkgs `github-runner` module which settings put each listed folder on the tmpfs. Record the source line of each.
+2. Move the runner home to disk under the runner's `cacheDir` (decision: disk keeps the shader cache across restarts, and a hook cleanup would delete it). Keep mode 700 and the per-runner account as owner.
+3. If upstream ties the work directory to the RuntimeDirectory, move `_actions` and `_diag` to disk by the same setting. Keep registration state on the tmpfs.
+4. Keep the existing `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` sweep hook unchanged.
+5. Commit the change on branch `resources-runner-home` in a plain git copy of `/etc/nixos` and push that branch. Never push or edit the `/etc/nixos` main checkout. Send the hash to natedev through the director.
+6. After the user's rebuild, read `memory.swap.current` of each `github-runner-hana-linux-N.service` while CI is idle. Save the values to `phases/59/swap_after.txt`.
+
+**Constraints from prior phases:**
+- The nixos main checkout belongs to natedev. Units push only branches.
+- The unit has no sudo. Read the live files with ordinary user access only.
+
+**Files:**
+- `phases/59/runner_home.md` — in the unit run folder: the source line of each folder, the branch, the commit hash and the nix diff.
+- `phases/59/swap_after.txt` — in the unit run folder: the swap of each runner service after the rebuild.
+
+**Workers:** `1 writer`
+- `sweep-impl` owns the nix change, the branch push and both run-folder files.
+
+**Acceptance gate:**
+- `nix-instantiate --parse` of the changed file succeeds, and `nixos-rebuild dry-build` in the copy succeeds or its failure is unrelated and named.
+- The runner home, `_actions` and `_diag` resolve to paths under `/var/lib/hana-ci` in the built unit files.
+- After the rebuild, each idle runner service shows `memory.swap.current` under 64 MiB.
+
+### Phase 60 — A filtered compile run's promise comes from that filter's own compile history  · status: todo
+**Depends on:** Phase 11 (compile classification, `index_step_evidence`, the replay). Runs next after Phase 11 and before Phase 17 (showrunner ruling 2026-11-04). Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8.
+
+#### Work Order
+
+**Goal:** a filtered compile run gets a promise near what that filter's compile runs use, so Phase 11's rise in over-promises goes back down.
+
+**Measured (Phase 11 replay, 15,053 runs, 2026-10-21 to 2026-11-04):**
+1. Phase 11 missed its bar: under-half 491 → 430, but over-three 2,605 → 2,620.
+2. The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 → 7, over-three 101 → 166.
+3. Cause: a filtered compile run takes its promise from compile history, and the full-run estimate no longer caps it. The package pool and the check/build peaks are larger than one filter's compile runs.
+
+**Spec:**
+1. In `filtered_peak` (`scripts/lint/memory_admit.py`), a filtered compile run uses the compile runs of its exact filter set first. Only when that set has no compile history does it use the package's filtered compile runs, then the check/build compile peaks.
+2. Keep Phase 11's rules: compile and no-compile runs never mix; fresh runs keep `fresh_test_peak` and its 1 GiB floor; the full-run estimate does not cap a compile promise.
+3. Rerun the Phase 11 replay (`phases/11/replay.py` in the run folder) before and after, with the same frozen inputs.
+4. Tests in `scripts/lint/test_memory_admit.py`: a filter with its own compile history ignores a larger package pool; a filter with none falls back in the stated order. Each test fakes both memory readings.
+5. Update `docs/as-built/build-memory-admission.md`: the new order and the replay result.
+
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `docs/as-built/build-memory-admission.md`.
+
+**Workers:** `2 writers`
+- `impl` owns `memory_admit.py` and the as-built doc; `test` owns `test_memory_admit.py`.
+
+**Acceptance gate:**
+- The replay brings cargo-liner nextest over-three back to 101 or lower, and its under-half is no worse than Phase 11's 7.
+- The memory admission tests pass; `basedpyright` over the changed files reports `0 errors, 0 warnings, 0 notes`.
+- Change-Review line: none (no behavior the user sees beyond fewer held starts).

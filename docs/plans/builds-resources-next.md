@@ -49,3 +49,9 @@
   - Target: `mods/unit-board/hooks/register.tsx`, `mods/unit-board/tests/queue.test.ts`, the shared queue-priority writer and its tests, and `commands/build/queue.md`.
   - Completion condition: typed `/build:queue bump <unit>` from any pane sets or replaces persistent priority through the existing writer, without a session-role check on the plugin route; tests cover a non-showrunner pane and replacement, while direct priority commands retain their existing caller checks.
   - Revealed by: Phase 26; approved by builds in `S/next_items_pending.md`.
+
+- [ ] **The floor sweep takes its target folders from the build queue record**
+  - Target: `scripts/lint/sweep.py` (`discover_cargo_outputs`, `_hold_floor`), the Phase 11 step-evidence reader, and their tests
+  - Why needed: the build queue owns build folders (user, 2026-11-03), and Phase 11 records each step's target folder. The sweep still finds folders by running `cargo metadata` per checkout, which made the floor pass run 37 minutes and delete nothing (Phase 58 part B).
+  - Completion condition: the floor pass reads its target folders from the recorded step rows, with a named state for a folder no record names; it runs no `cargo metadata`; a test pins the source, and a floor-only dry run on natedev stays under 120 s.
+  - Revealed by: Phase 58 part B (builds showrunner 2026-11-04: next, after the Phase 58 fix)
