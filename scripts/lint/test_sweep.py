@@ -711,7 +711,9 @@ class TargetDirTests(SweepCase):
         config = target.root.parent / "lint.conf"
         _ = write_config_fixture(config)
         environ = {**config_environment(config.parent), sweep.BUDGET_ENV: "0"}
-        with mock.patch.dict(os.environ, environ), redirect_stdout(output):
+        # The machine's real disk floor is not this test's subject; below it, main would page.
+        with (mock.patch.dict(os.environ, environ), redirect_stdout(output),
+              mock.patch.object(sweep, "hold_floor", return_value=0)):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
         self.assertEqual(status, 0)
         self.assertIn(f"lint sweep: pid {worker.pid} works in {target.root}; {target.root} skipped", output.getvalue())
