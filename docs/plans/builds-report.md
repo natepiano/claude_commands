@@ -282,3 +282,44 @@ Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command
 ### Phase 13 — Buildlog tests import their own modules  · status: done
 
 Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHONPATH. test_costs subprocess tests fail with no module cli or costs; test_vault_pull fails to import conf. Each test sets its own import path.
+
+### Phase 14 — Build history charts open and show every machine's costs  · status: done
+**Depends on:** Phase 8, Phase 10
+
+The user, 2026-11-04, change reviews C950 (Build history charts) and C951 (Chart labels): "not works".
+
+Cause, found 2026-11-04:
+
+1. The aws-build target is now in the target config, but it has no monthly log. `charts.py` `cost_value` marks a machine with no recorded coverage as unavailable. "All machines" needs every configured machine, so every cost chart on every day shows "Unavailable — no complete indexed aws monthly log covers this day".
+2. `buildlog` is not on the terminal PATH. The change-review step "type buildlog charts" gives "command not found". The PATH is in `/etc/nixos`; the builds showrunner routes it.
+
+The change:
+
+1. A configured machine that has no recorded source before or in a day is not required for that day. It adds nothing to "All machines" and does not make the day unavailable.
+2. The machine's own chart still shows that the machine has no data, in one plain line, not one unavailable chart per cause.
+3. A machine with recorded coverage that is missing for a day (for example, a Mac sync that is late) still makes that day unavailable. A missing applicable wait stays unavailable, never 0.
+4. Tests pin all three rules with a fixture that has a configured machine with no log.
+
+Acceptance: `buildlog charts --no-open` on natedev shows measured cost lines for "All machines" for 2026-10-28 to 2026-11-04. A browser screenshot of the page shows the lines. Speed stays in the Phase 8 limits.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
+
+### Phase 15 — The build page ranks the top costs with the action that cuts each  · status: todo
+**Depends on:** Phase 14; the builds showrunner names the build page
+
+The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to builds to review - i'm not sure about this". The builds showrunner ran it. The data is useful: memory wait is 236 step-hours a day, eight times the next cost. The output does not tell the user what to do. Ruling:
+
+1. Delete the `buildlog costs` command. The ranking moves onto the one build page the user uses. builds names that page.
+2. Show at most the top 3 costs. Each line gives the cost in plain words and hours, then the action that cuts it and its owner. The action text lives in config, not code.
+3. Show hours in the user's zone. No seconds, no UTC, no microseconds.
+4. Move the Definitions block into the as-built doc.
+5. Check the memory-wait number first. 236 h a day means about 10 steps wait at all times. queue-unit's 10l bug (on main now) made a waiting step with the AWS hook hold its grant and never start. Say how many of the 236 h came from that bug.
+6. The build history charts (C950) go on the same page. No second page.
+
+The page is queue-unit's Build Memory page (`memory_live.html`, fed by `memory_feed.py`); queue's 10m moves it into the repo. Agreed with queue-unit 2026-11-04: report-unit gives typed data, no HTML, from `charts.page_section(days)` and `costs.top_costs(n=3)`. queue's feed calls them and its page draws them. A 7-day read stays under 1 s. Send queue-unit the signatures and types when they land.
+
+Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder): the 236 h/day is a 7-day average that old days drive. Oct 29-31 had 347-533 h/day; Nov 1-3 had 7-90 h/day. The 10l bug adds at most 125 h in total (Nov 2-4). `costs.py` counts each wait correctly. builds ruling: the top 3 rank the last 2 days, so a fixed cost does not stay on top. Each line shows one number. It shows the 7-day value beside it only when the two differ by more than half. The window length lives in config.
+
+Each fix returns as a new Change-Review row.
+
+**Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `docs/as-built/` (Definitions).
