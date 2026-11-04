@@ -239,6 +239,16 @@ class RestartTests(ShutdownTestCase):
                                         environment, herdr.NO_ENVIRONMENT_REMOVALS)
         self.assertEqual(pane, "w1:p0")
 
+    def test_start_row_trusts_the_codex_folder(self) -> None:
+        self.running.clear()
+        row = self.rows[0]
+        with (patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", row.current_session])),
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p0", herdr.PromptSubmissionNotRequired())) as launch):
+            _ = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"))
+        self.assertEqual(launch.call_args.args[4], ["-c",
+            'projects={' + json.dumps(str(self.root)) + '={trust_level="trusted"}}', "resume", row.current_session])
+
     def test_account_trust_reports_anomalies_and_returns_the_result(self) -> None:
         target = self.root / ".claude4"
         for result in (herdr.Untrusted(self.root, target / ".claude.json", (self.root,)),
