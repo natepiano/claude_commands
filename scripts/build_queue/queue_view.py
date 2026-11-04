@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cache, cached_property
 from typing import assert_never
 from zoneinfo import ZoneInfo
 
+from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses, ManagedCISlice
 from scripts.build_queue import head_facts
+from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pad_left, pad_right, plain, terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
@@ -40,14 +42,6 @@ def step_checks(model: QueueModel, position: int) -> gate.HeadExplanation | gate
 
 def field(text: str) -> str:
     return " ".join(text.split())
-
-
-def step_labels(step: gate.WaitingStep | gate.RunningStep, labels: Mapping[str, UnitLabels]) -> UnitLabels:
-    identity = labels.get(step.session_id)
-    if identity is not None:
-        return identity
-    fallback = field(step.session_name) or step.folder.rstrip("/").rpartition("/")[2] or "unknown"
-    return UnitLabels(fallback)
 
 
 def shown_waiters(selector: str, reading: gate.QueueRead, labels: Mapping[str, UnitLabels]) -> list[int]:
@@ -227,6 +221,30 @@ def budget_bar(budget: float, free: float, *, colour: bool) -> Line:
     return (*result, Span(size_bar(remaining / 8, budget), "suggestion"))
 
 
+@dataclass(frozen=True)
+class RunningBuild:
+    step: gate.RunningStep
+    used: int
+    grant: int
+    started_at: float
+    measured: bool
+
+
+def running_builds(model: QueueModel) -> list[RunningBuild]:
+    """Show each granted step with its recorded admission time."""
+    return [RunningBuild(row.step, row.step.measured.bytes if isinstance(row.step.measured, gate.MeasuredMemory) else 0,
+                         row.step.promise, row.admitted_at if isinstance(row.admitted_at, float) else 0,
+                         isinstance(row.step.measured, gate.MeasuredMemory))
+            for row in model.reading.explanation.running
+            if not isinstance(row.step.measured, (gate.GoneMemory, gate.CompilerServiceMemory, gate.UnownedSliceMemory))]
+
+
+def running_bar(used: float, grant: float, budget: float) -> Line:
+    solid = size_bar(used, budget)
+    rest = max(0, (bar_eighths(max(used, grant), budget) + 7) // 8 - len(solid))
+    return (Span(solid, "suggestion"), Span("░" * rest, "inactive"))
+
+
 def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: str = "") -> list[Line]:
     explanation = model.reading.explanation
     head, host = explanation.head, explanation.host
@@ -236,17 +254,28 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     taken = explanation.totals.charged / gate.GIB
     free = max(0.0, budget - taken)
     waiting = model.reading.view.waiting
-    identities = [step_labels(step, model.labels) for step in waiting]
-    names = [(field(identity.showrunner) or "—",
-              field(identity.unit).removeprefix(field(identity.showrunner) + "-") or "—") for identity in identities]
+    running = running_builds(model)
+
+    def names(step: gate.WaitingStep | gate.RunningStep) -> tuple[str, str]:
+        identity = step_labels(step, model.labels)
+        show = field(identity.showrunner) or "—"
+        unit = field(identity.unit).removeprefix(show + "-")
+        return show, unit
+
+    waiting_names = [names(step) for step in waiting]
+    running_names = [names(row.step) for row in running]
+    all_names = [*waiting_names, *running_names]
     bars = [size_bar(step.need / gate.GIB, budget) for step in waiting]
     status = head_status(model, budget_bytes)
     labels: Line = (Span(f"free {free:.1f}", "success"), Span(" │ ", "inactive"),
                     Span(f"taken {taken:.1f}", "suggestion"))
-    place_width = max(2, len(str(len(waiting))))
-    minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0))
-    # All rows share these widths, including when the head's state needs more room.
-    fixed = place_width + 1 + 1 + 1 + 7 + 1 + minutes_width + 1
+    place_width = max(3, len(str(len(waiting))))
+    minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0),
+                        max((len(str(age(row.started_at, explanation.now))) for row in running if row.started_at), default=0))
+    step_width = max(7, min(13, max(
+        max((terminal_width(row.step.step) for row in running), default=7),
+        max((terminal_width(step.step) for step in waiting), default=7))))
+    fixed = place_width + step_width + minutes_width + 5
     tail = max(terminal_width(plain([labels])), (bar_eighths(budget, budget) + 7) // 8,
                max((len(bar) + len(f" {step.need / gate.GIB:.1f}") +
                     (terminal_width(plain([status])) if index == 0 else 0)
@@ -254,8 +283,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     show_width, unit_width = 12, 10
     room = columns - fixed - tail
     if columns > 60:
-        longest_show = max((terminal_width(show) for show, _ in names), default=12)
-        longest_unit = max((terminal_width(unit) for _, unit in names), default=10)
+        longest_show = max((terminal_width(show) for show, _ in all_names), default=12)
+        longest_unit = max((terminal_width(unit) for _, unit in all_names), default=10)
         while show_width + unit_width < room and (show_width < longest_show or unit_width < longest_unit):
             if show_width < longest_show:
                 show_width += 1
@@ -269,34 +298,77 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     bar_column = fixed + show_width + unit_width
     budget_label = f"budget {budget:.1f}"
     lines: list[Line] = [
-        (Span(f"Build queue · {clock(model, explanation.now)}",
-              "inactive"),), (),
+        (Span(f"Build queue · {clock(model, explanation.now)}", "inactive"),), (),
         (Span(" " * bar_column), *labels),
         (Span(pad_right(budget_label, bar_column), "inactive"), *budget_bar(budget, free, colour=colour)), (),
-        (Span(pad_left("#", place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "
-              + pad_right(cut_tail("unit", unit_width), unit_width) + " " + pad_right("step", 7) + " "
-              + pad_left("min", minutes_width) + " need", "inactive"),),
     ]
     priority = head_facts.priority_text(explanation.priority)
     if priority:
         lines.insert(2, (Span(priority),))
-    for index, (step, (show, unit), bar) in enumerate(zip(waiting, names, bars)):
-        tone = "warning" if index == 0 else "inactive"
-        row: Line = (
-            Span(pad_left(str(index + 1), place_width), tone),
-            Span("▸", "suggestion") if you and step.session_id == you else Span(" "),
-            Span(pad_right(cut_tail(show, show_width), show_width) + " "),
-            Span(pad_right(cut_tail(unit, unit_width), unit_width) + " ", "suggestion"),
-            Span(pad_right(cut_tail(field(step.step), 7), 7) + " "),
-            Span(pad_left(str(age(step.since, explanation.now)), minutes_width) + " ", "inactive"),
-            Span(bar, "warning"), Span(f" {step.need / gate.GIB:.1f}", tone),
-        )
+
+    def heading() -> Line:
+        place, memory = "#", "GiB: reserve/use; need"
+        return (Span(pad_left(place, place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "
+                     + pad_right(cut_tail("unit", unit_width), unit_width) + " " + pad_right("step", step_width) + " "
+                     + pad_left("min", minutes_width) + " " + memory, "inactive"),)
+
+    @cache
+    def column(text: str, width: int) -> str:
+        if text.isascii():
+            return (text if len(text) <= width else text[:max(0, width - 1)] + "…").ljust(width) + " "
+        return pad_right(cut_tail(text, width), width) + " "
+
+    def identity_columns(place: str, step: str, pair: tuple[str, str], minutes: str, marker: str = " ") -> Line:
+        show, unit = pair
+        return (Span(pad_left(place, place_width), "warning" if place == "1" else "inactive"),
+                Span(marker, "suggestion"),
+                Span(column(show, show_width)),
+                Span(column(unit, unit_width), "suggestion"),
+                Span(column(field(step), step_width)),
+                Span(pad_left(minutes, minutes_width) + " ", "inactive"))
+
+    lines.append(heading())
+    for row, pair in zip(running, running_names):
+        used = row.used / gate.GIB
+        grant = row.grant / gate.GIB
+        text = f" {grant:.1f} / {used:.1f}" if row.measured else f" {grant:.1f} / —"
+        bar = running_bar(used, grant, budget)
+        if bar_column + terminal_width(plain([bar])) + len(text) > columns:
+            text = f" {grant:.1f}"
+        bar = clip(bar, max(0, columns - bar_column - len(text)))
+        minutes = str(age(row.started_at, explanation.now)) if row.started_at else "—"
+        lines.append((*identity_columns("run", row.step.step, pair, minutes,
+                                        "▸" if you and row.step.session_id == you else " "), *bar, Span(text)))
+    for index, (step, pair, bar) in enumerate(zip(waiting, waiting_names, bars)):
+        row = (*identity_columns(str(index + 1), step.step, pair, str(age(step.since, explanation.now)),
+                                "▸" if you and step.session_id == you else " "),
+               Span(bar, "warning"), Span(f" {step.need / gate.GIB:.1f}", "warning" if index == 0 else "inactive"))
         lines.append((*row, *status) if index == 0 else row)
     head = explanation.head
     if isinstance(head, gate.HeadExplanation) and head.decision.state == "hold":
         lines.append((Span(f"Head: free {head.free.available / gate.GIB:.1f} GiB; "
             + f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need {head.free.need / gate.GIB:.1f} GiB"),))
+    ended: list[tuple[gate.RunningStep, gate.UnownedSliceMemory, ScopeProcesses]] = []
     for step in model.reading.view.running:
-        if isinstance(step.measured, gate.UnownedSliceMemory):
+        if not isinstance(step.measured, gate.UnownedSliceMemory):
+            continue
+        activity = step.measured.activity
+        if isinstance(activity, ManagedCISlice):
+            continue
+        if isinstance(activity, ScopeProcesses) and not isinstance(activity.run, LiveBuildRun):
+            ended.append((step, step.measured, activity))
+        elif not isinstance(activity, ScopeProcesses):
             lines.append((Span(f"{step.measured.owner}: {step.measured.bytes / gate.GIB:.1f} GiB (unowned)"),))
+    if ended:
+        count = sum(activity.count for _, _, activity in ended)
+        total = sum(memory.bytes for _, memory, _ in ended)
+        noun = "process" if count == 1 else "processes"
+        lines.extend([(), (Span(f"Still running after their build ended ({count} {noun}, {total / gate.GIB:.1f} GiB)",
+                               bold=True),),
+                      (Span("These processes outlive their builds; ask the named owner to stop them if no longer needed."),)])
+        for step, memory, activity in ended:
+            identity = model.labels.get(activity.session_id)
+            owner = field(identity.session if identity else "") or field(activity.session_name) or "unlabelled session"
+            minutes = str(age(activity.started_at, explanation.now)) if activity.started_at else "—"
+            lines.append((Span(f"   {owner} · {field(activity.program)} · {minutes} min · {memory.bytes / gate.GIB:.1f} GiB"),))
     return [clip(line, columns) for line in lines]

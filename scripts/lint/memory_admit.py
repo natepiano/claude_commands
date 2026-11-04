@@ -28,6 +28,8 @@ from types import UnionType, MappingProxyType
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+from scripts.build_queue.scope_activity import EmptyBuildScope, ManagedCISlice, LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -531,6 +533,7 @@ class CompilerServiceMemory(MeasuredMemory):
 class UnownedSliceMemory(MeasuredMemory):
     cgroup: str = ""
     owner: str = ""
+    activity: ScopeProcesses | EmptyBuildScope | ManagedCISlice = EmptyBuildScope()
 
 
 @dataclass(frozen=True)
@@ -579,6 +582,7 @@ class Waiter(TypedDict):
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]
+    unit: NotRequired[str]
     step: NotRequired[str]
     folder: NotRequired[str]
     priority_rank: NotRequired[int]
@@ -684,6 +688,12 @@ class UnitMembership(Protocol):
     def unit(self) -> str: ...
 
 
+def queue_unit(unit: str, session_id: str, labels: Mapping[str, UnitMembership]) -> str:
+    """Use the caller's unit before the session's unit."""
+    label = labels.get(session_id)
+    return unit or (label.unit if label is not None else "")
+
+
 class PriorityRoster(Protocol):
     def unit_labels_for(self, session_ids: list[str], environment: Mapping[str, str]) -> Mapping[str, UnitMembership]: ...
 
@@ -724,9 +734,9 @@ def resolve_queue_order(directory: Path, rows: list[tuple[Path, Waiter]], *, fin
 def apply_queue_priority(rows: list[tuple[Path, Waiter]], context: QueueOrderContext
                          ) -> tuple[list[tuple[Path, Waiter]], QueuePriority | NoQueuePriority]:
     for _, row in rows:
-        label = context.labels.get(row.get("session_id", ""))
         row["priority_rank"] = (0 if not isinstance(context.priority, NoQueuePriority)
-                                and label is not None and label.unit == context.priority["unit"] else 1)
+                                and queue_unit(row.get("unit", ""), row.get("session_id", ""), context.labels)
+                                == context.priority["unit"] else 1)
     return sorted(rows, key=lambda item: waiter_order(item[1])), context.priority
 
 
@@ -1018,6 +1028,7 @@ class WaitingStep:
     since: float
     need: int
     reason: WaitReason
+    unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -1028,6 +1039,9 @@ class RunningStep:
     folder: str
     promise: int
     measured: StepMemory
+    unit: str = ""
+    run: LiveBuildRun | NoLiveBuildRun = NoLiveBuildRun()
+    started_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -3168,13 +3182,20 @@ def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: in
     return directory / f"{pid}-{start_time}-{admitted_ns}"
 
 
+BUILDLOG_UNIT = "BUILDLOG_UNIT"
+
+
 def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
     session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    return {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
-            "step": step, "folder": os.getcwd() if worktree else ""}
+    identity: WaiterIdentity = {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
+                                "step": step, "folder": os.getcwd() if worktree else ""}
+    if unit := os.environ.get(BUILDLOG_UNIT):
+        identity["unit"] = unit
+    return identity
 
 
 class WaiterIdentity(TypedDict):
+    unit: NotRequired[str]
     session_id: str
     session_name: str
     step: str
@@ -3182,7 +3203,7 @@ class WaiterIdentity(TypedDict):
 
 
 def waiter_unit_name(identity: WaiterIdentity, pid: int) -> str:
-    return identity["session_name"] or Path(identity["folder"]).name or str(pid)
+    return identity.get("unit") or identity["session_name"] or Path(identity["folder"]).name or str(pid)
 
 
 class QueueIdentityReader:
@@ -3396,8 +3417,12 @@ class RecordedQueueIdentities:
     """Identity evidence already resolved by gather_queue_inputs."""
 
     def identity(self, _pid: int, row: dict[str, object]) -> WaiterIdentity:
-        return {"session_id": str(row.get("session_id", "")), "session_name": str(row.get("session_name", "")),
-                "step": str(row.get("step", "")), "folder": str(row.get("folder", ""))}
+        identity: WaiterIdentity = {"session_id": str(row.get("session_id", "")),
+            "session_name": str(row.get("session_name", "")),
+            "step": str(row.get("step", "")), "folder": str(row.get("folder", ""))}
+        if row.get("unit"):
+            identity["unit"] = str(row["unit"])
+        return identity
 
 
 class QueueIdentities(Protocol):
@@ -3447,7 +3472,7 @@ def queue_read_from_pass(inputs: QueueInputs, limits: AdmissionLimits, policy: A
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
         reason = admission.reason
         step = WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
-                           identity["folder"], row["since"], row["need"], reason)
+                           identity["folder"], row["since"], row["need"], reason, row.get("unit", ""))
         waiting.append(step)
         if row is ordered[0][1]:
             width = row.get("test_threads")
@@ -3563,8 +3588,30 @@ def parse_snapshot_value(value: object, schema: object) -> object:
             raise ValueError("missing snapshot row field")
         return {name: parse_snapshot_value(item, annotations[name]) for name, item in record.items()
                 if name in annotations}
+    if schema is QueueRead and "diagnostics" in record and "fallbacks" not in record:
+        diagnostics = record["diagnostics"]
+        if not isinstance(diagnostics, list):
+            raise ValueError("invalid service diagnostics")
+        fallbacks: list[object] = []
+        for item in cast(list[object], diagnostics):
+            if not isinstance(item, dict):
+                raise ValueError("invalid service diagnostic")
+            diagnostic = cast(dict[str, object], item)
+            if diagnostic.get("kind") != "ConfigurationDiagnostic":
+                raise ValueError("invalid service diagnostic")
+            fallbacks.append({**diagnostic, "kind": "ConfigFallback"})
+        record = {name: item for name, item in record.items() if name != "diagnostics"}
+        record["fallbacks"] = fallbacks
+    if schema is RunningStep:
+        for member in fields(RunningStep):
+            if member.name not in record and member.name in ("run", "started_at"):
+                record = {**record, member.name: snapshot_value(member.default)}
+    if schema is UnownedSliceMemory and "activity" not in record:
+        record = {**record, "activity": snapshot_value(EmptyBuildScope())}
     if schema is StepProfile and record.keys() == annotations.keys() - {"build_history_generation"} | {"kind"}:
         record = {**record, "build_history_generation": snapshot_value(NoBuildHistoryGeneration())}
+    if schema.__name__ in ("Identity", "WaitingStep", "RunningStep") and "unit" in annotations and "unit" not in record:
+        record = {**record, "unit": ""}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
         raise ValueError("invalid snapshot record tag")
     if record.keys() != annotations.keys() | {"kind"}:
@@ -3857,11 +3904,16 @@ def build_queue_inputs(ordered: list[tuple[Path, Waiter]],
             continue
         identity = reservation_identity(row)
         running.append(RunningStep(identity["session_id"], identity["session_name"],
-                                   identity["step"], identity["folder"], row["need"], memory))
+                                   identity["step"], identity["folder"], row["need"], memory, identity.get("unit", "")))
         rows.append(row)
     running.extend(RunningStep("", "sccache.service", "compile", "builds.slice", 0, value)
                    for value in readings.compilers)
-    running.extend(RunningStep("", value.owner, "unowned", value.cgroup, 0, value) for value in unowned)
+    for value in unowned:
+        activity = value.activity
+        running.append(RunningStep(
+            activity.session_id if isinstance(activity, ScopeProcesses) else "",
+            activity.session_name if isinstance(activity, ScopeProcesses) else "",
+            "unowned", activity.folder if isinstance(activity, ScopeProcesses) else value.cgroup, 0, value))
     return QueueInputs(sorted(ordered, key=lambda item: waiter_order(item[1])), tuple(running), tuple(rows),
                        readings.host, readings.pressure, readings.recovery, override, now, priority)
 
@@ -3922,6 +3974,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
         else:
             tree_pids.update(process_tree({row["pid"]: row["start_time"]}, processes))
     result: list[UnownedSliceMemory] = []
+    activity_reader = ScopeActivityReader(processes, proc)
     try:
         children = list(directory.iterdir())
     except OSError:
@@ -3960,7 +4013,8 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             if amount or (required and members):
                 result.append(UnownedSliceMemory(amount, promise=promise,
                                                  swap_bytes=swapped if required else 0,
-                                                 cgroup=str(child), owner=child.name))
+                                                 cgroup=str(child), owner=child.name,
+                                                 activity=ManagedCISlice() if required else activity_reader.scope(members, child.name)))
         except (OSError, ValueError) as error:
             if required:
                 raise SliceMemoryUnavailable(f"{ci_memory_slice}: cannot read slice memory at {child}: {error}") from error

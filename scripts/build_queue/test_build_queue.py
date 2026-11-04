@@ -10,6 +10,7 @@ from dataclasses import replace
 import io
 import json
 import os
+import re
 from pathlib import Path
 import time
 import unittest
@@ -87,6 +88,24 @@ class QueueTests(unittest.TestCase):
             read.assert_called_once_with()
             mine.assert_not_called()
         return status, output.getvalue(), errors.getvalue()
+
+    def test_cli_keeps_running_grants_above_numbered_waiters(self) -> None:
+        with QueueFixture() as fixture:
+            reading = fixture.read()
+            grants = tuple(replace(reading.view.running[0], session_id=f"gate-{index}",
+                step="merge-gate", promise=6 * GIB, unit="queue-unit") for index in range(3))
+            reading = queue_read_fixture(replace(reading.view, running=grants), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
+            self.labels_read.return_value = {**fixture.labels,
+                **{step.session_id: UnitLabels("gate", "builds", "wrong-unit") for step in grants}}
+            text = self.snapshot_text(self.snapshot(reading))
+            rows = text.splitlines()
+            running = [line for line in rows if line.lstrip().startswith("run")]
+            self.assertEqual(len(running), 3)
+            self.assertTrue(all("builds" in row and "queue-unit" in row and "merge-gate" in row for row in running))
+            self.assertTrue(all("6.0 / 5.1" in row for row in running))
+            positions = re.findall(r"^\s*(\d+)[ ▸]", text, re.MULTILINE)
+            self.assertEqual(positions, [str(index) for index in range(1, 33)])
+            self.assertLess(text.index(running[-1]), text.index(next(line for line in rows if line.lstrip().startswith("1 "))))
 
     def test_queue_command_warns_about_a_missing_key_once_per_process(self) -> None:
         config = self.root / "lint.conf"
@@ -320,8 +339,8 @@ class QueueTests(unittest.TestCase):
                 waiting=(first, *model.reading.view.waiting[1:]))))
             rows = waiting_rows(queue_view.render_view(model, 140))
         self.assertEqual(len(rows), 32)
-        self.assertEqual([row[:2] for row in rows[:10]], [f"{n:>2}" for n in range(1, 11)])
-        self.assertEqual([row.index("nextest") for row in rows[:2]], [39, 39])
+        self.assertEqual([row[:3] for row in rows[:10]], [f"{n:>3}" for n in range(1, 11)])
+        self.assertEqual([row.index("nextest") for row in rows[:2]], [40, 40])
         self.assertTrue(all("| ---" not in row for row in rows))
 
     def test_head_line_short_forms_share_the_recorded_head_and_bump_facts(self) -> None:
@@ -604,7 +623,7 @@ class QueueTests(unittest.TestCase):
         self.assertIn("style-types", text)
         self.assertNotIn("cargo-liner-style-types", text)
         self.assertEqual(text.count("nextest"), 1)
-        self.assertNotIn("clippy", text)
+        self.assertEqual(text.count("clippy"), 1)
         self.labels_read.assert_called_once_with(["style-id", "style-id"], os.environ)
         self.assertNotIn("recorded-name", text)
 
@@ -997,13 +1016,12 @@ class QueueTests(unittest.TestCase):
         fixture = self.enterContext(QueueFixture())
         reading = fixture.budget_model().reading
         self.labels_read.return_value = fixture.labels
-        for session, count in (("id-work-lead", 2), ("id-widget", 0), ("unknown", 0)):
+        for session, expected in (("id-work-lead", ["2", "3"]), ("id-widget", ["run"]), ("unknown", [])):
             with self.subTest(session=session):
                 status, text, errors = self.invoke(reading, "--you", session)
                 self.assertEqual(status, 0, errors)
-                self.assertEqual(text.count("▸"), count)
-                self.assertEqual([row[:row.index("▸")].strip() for row in text.splitlines() if "▸" in row],
-                                 ["2", "3"] if count else [])
+                self.assertEqual(text.count("▸"), len(expected))
+                self.assertEqual([row[:row.index("▸")].strip() for row in text.splitlines() if "▸" in row], expected)
 
     def test_inline_you_defaults_to_the_caller_and_a_shell_has_no_mark(self) -> None:
         fixture = self.enterContext(QueueFixture())

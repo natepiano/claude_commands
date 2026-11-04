@@ -120,6 +120,7 @@ def private_scope_start() -> None:
 
 class QueuePlaceFixture(ExitStack):
     """Private config, ledger and memory files shared by all helper scenarios."""
+
     def __init__(self, *, private_slice: str = "") -> None:
         super().__init__()
         self.private_slice: str = private_slice or f"queueplacetest{os.getpid()}{time.monotonic_ns()}.slice"
@@ -263,6 +264,17 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_program_admission_carries_the_unit_override(self) -> None:
+        with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {gate.BUILDLOG_UNIT: "queue-unit"}):
+            with queue.queue_place("rust-analyzer", fixture.root):
+                _, row = fixture.reservation()
+                self.assertIn("queue_waiter", row)
+                assert "queue_waiter" in row
+                waiter = row["queue_waiter"]
+                self.assertEqual(waiter.get("unit"), "queue-unit")
+                self.assertEqual(waiter.get("session_id"), gate.waiter_identity("", "")["session_id"])
+
+
     def require_transient_scope(self) -> None:
         if not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             reason = "transient scope test needs cgroup v2 (not available on the Mac)"

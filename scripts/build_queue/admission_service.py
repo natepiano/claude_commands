@@ -700,7 +700,7 @@ class AdmissionServer:
             "pid": request.owner.pid, "start_time": request.owner.start_time,
             "need": profile.peak.bytes, "since": place.since, "priority_rank": place.priority_rank,
             "session_id": identity.session_id, "session_name": identity.name,
-            "step": identity.step, "folder": identity.folder,
+            "step": identity.step, "folder": identity.folder, "unit": identity.unit,
             "estimated_at": profile.estimated_at or self.clock.now(),
             "fresh_test": isinstance(request, wire.AdmitRequest) and request.fresh_test,
             "need_source": profile.peak.source, "need_runs": profile.peak.count,
@@ -743,8 +743,8 @@ class AdmissionServer:
         lifetimes = {episode: self.proc.lifetime(reservation_row(record),
             self.proc.owner_start(record.owner.pid) == LiveOwnerIdentity(record.owner.start_time))
             for episode, record in self.reservations.items()}
-        processes = (self.proc.processes() if any(isinstance(lifetime, gate.LiveOwnerProcess)
-                     for lifetime in lifetimes.values()) else {})
+        live_owner = any(isinstance(lifetime, gate.LiveOwnerProcess) for lifetime in lifetimes.values())
+        processes = self.proc.processes() if live_owner else {}
         memories: list[tuple[gate.Reservation, gate.StepMemory]] = []
         for episode, record in list(self.reservations.items()):
             if isinstance(record.finalization, dict) or not isinstance(record.ending, NotEnding):
@@ -775,7 +775,8 @@ class AdmissionServer:
                                              self.readings.compilers(), policy=policy)
         ordered, priority = self._queue_order()
         try:
-            unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path,
+            scope_processes = processes if live_owner else self.proc.processes()
+            unowned = gate.unowned_slice_memory([item[0] for item in memories], scope_processes, self.proc.path,
                                                ci_memory_slice=config.ci_memory_slice,
                                                ci_memory_margin_bytes=config.ci_memory_margin_bytes)
         except gate.SliceMemoryUnavailable as error:
@@ -854,7 +855,7 @@ class AdmissionServer:
                 del self.launches[episode]
         self.persist(config)
         waiting_steps = tuple(gate.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
-            row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason)
+            row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
             for (_, row), decision in zip(inputs.ordered, result.rows, strict=True))
         for position, decision in enumerate(result.rows, 1):
             episode = by_owner[decision.owner]
@@ -1073,11 +1074,12 @@ class AdmissionServer:
             if isinstance(request, wire.PrioritySetRequest):
                 if not request.unit.strip():
                     return self._mutation_reply(key, wire.Refused("unit is required"))
-                sessions = [waiting.row.get("session_id", "") for waiting in self.waiters.values()]
-                sessions.extend(record.queue_waiter.get("session_id", "") for record in self.reservations.values())
-                labels = gate.priority_labels(sessions)
+                rows = [waiting.row for waiting in self.waiters.values()]
+                rows.extend(record.queue_waiter for record in self.reservations.values())
+                labels = gate.priority_labels([row.get("session_id", "") for row in rows])
                 if request.unit == "—" or not any(
-                        session in labels and labels[session].unit == request.unit for session in sessions):
+                        gate.queue_unit(row.get("unit", ""), row.get("session_id", ""), labels) == request.unit
+                        for row in rows):
                     return self._mutation_reply(key, wire.Refused(
                         f"no waiting step or current reservation belongs to unit {request.unit}"))
                 priority: gate.QueuePriority = {"unit": request.unit, "why": request.why,

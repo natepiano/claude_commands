@@ -3541,6 +3541,13 @@ class QueueApiTests(MemoryQueueFixture):
 
 
 
+    def test_waiter_identity_reads_the_unit_override_without_changing_the_session(self) -> None:
+        with patch.dict(os.environ, {gate.BUILDLOG_UNIT: "queue-unit", "CODEX_THREAD_ID": "showrunner"}):
+            identity = gate.waiter_identity("merge-gate", "tree")
+            self.assertEqual(identity.get("unit"), "queue-unit")
+            self.assertEqual(identity["session_id"], "showrunner")
+            self.assertEqual(gate.waiter_unit_name(identity, 123), "queue-unit")
+
     def test_waiter_identity_keeps_the_bare_step_and_caller_identity(self) -> None:
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_CODE_SESSION_ID": "parent-id",
                                      "CLAUDE_SESSION_NAME": "recorded-name"}), \

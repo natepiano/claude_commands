@@ -8,9 +8,19 @@ from scripts.build_queue import head_facts, queue_card, queue_view
 from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixtureTests, queue_read_fixture
 from scripts.build_queue.queue_lines import plain, terminal_width
 from scripts.lint import memory_admit as gate
+from scripts.message.unit_labels import UnitLabels
 
 
 class QueueCardTests(QueueFixtureTests):
+    def test_unit_override_card_heading_matches_golden(self) -> None:
+        model = self.fixture.model()
+        waiting = model.reading.view.waiting
+        step = replace(waiting[0], unit="queue-unit", step="merge-gate")
+        model = replace(model, labels={**model.labels, step.session_id: UnitLabels("gate", "builds")},
+            reading=replace(model.reading, view=replace(model.reading.view, waiting=(step, *waiting[1:]))))
+        heading = plain(queue_card.render_selection(model, "1", 140)).splitlines()[0]
+        self.assertEqual(heading + "\n", (GOLDEN / "unit_override_card.txt").read_text())
+
     def test_expired_follower_prints_estimate_before_its_own_resource_checks(self) -> None:
         inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
         path, row = inputs.ordered[1]

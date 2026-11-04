@@ -1,3 +1,4 @@
+import selectedPageFixture from './selected_page_fixture';
 import { describe, expect, mock, test } from 'claude-code/testing';
 import type { Engine } from 'claude-code/testing';
 import type { CommandRunInput, EngineInterface, On, TurnCompleteInput, UiPane } from 'claude-code';
@@ -214,6 +215,23 @@ describe('build queue pane', () => {
       expect(fake.processes).toEqual([READ]);
     });
   }
+
+  test('the recorded board paints running grants before numbered waiting rows', async ($, on) => {
+    const fake = queueHost(on);
+    fake.replace(selectedPageFixture as QueueLines);
+    await $.command.run(command());
+    const ui = await mount($, 'terminal');
+    const tree = await ui.drawn();
+    const lines = inspectDrawing(tree).lines;
+    expect(lines).toEqual(selectedPageFixture.lines.map(line => line.map(span => span.text).join('')));
+    const running = lines.findIndex(line => line.startsWith('run'));
+    const waiting = lines.findIndex(line => line.trimStart().startsWith('1 '));
+    expect(running).toBeGreaterThanOrEqual(0);
+    expect(waiting).toBeGreaterThan(running);
+    expect(lines.filter(line => line.startsWith('run'))).toHaveLength(1);
+    expect(lines.filter(line => /^\s+[12] /.test(line))).toHaveLength(2);
+    expect(lines.at(-1)).toContain('(unowned)');
+  });
 
   test('a span with omitted style fields paints with the default foreground, background and weight', async ($, on) => {
     const fake = queueHost(on);

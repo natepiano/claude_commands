@@ -37,6 +37,7 @@ class Identity:
     name: str
     step: str
     folder: str
+    unit: str = ""
 
 
 Profile = gate.StepProfile | gate.ProgramProfile
@@ -219,11 +220,15 @@ def parse_record(text: str, schema: type[T]) -> T:
     return cast(T, gate.parse_snapshot_value(value, schema))
 
 
-def _encode(value: object, variants: dict[str, type]) -> str:
+def _encode(value: object, variants: dict[str, type], *, main_service: bool = False) -> str:
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
-    return encode_record({"v": VERSION, "type": name, "data": value}) + "\n"
+    data = gate.snapshot_value(value)
+    if main_service and isinstance(value, (AdmitRequest, LaunchRequest)):
+        identity = cast(dict[str, object], cast(dict[str, object], data)["identity"])
+        del identity["unit"]
+    return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
 
 
 def _parse(line: str | bytes, variants: dict[str, type]) -> object:
@@ -242,8 +247,8 @@ def _parse(line: str | bytes, variants: dict[str, type]) -> object:
         raise ValueError("invalid admission message") from error
 
 
-def encode_request(request: Request) -> str:
-    return _encode(request, _REQUESTS)
+def encode_request(request: Request, *, main_service: bool = False) -> str:
+    return _encode(request, _REQUESTS, main_service=main_service)
 
 
 def parse_request(line: str | bytes) -> Request:
