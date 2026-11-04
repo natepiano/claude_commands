@@ -81,15 +81,7 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
         if row.kind == "unit" and name and name != row.name:
             print(f"herdr title: {name!r} differs from unit {row.name!r}; use /showrunner:rename_unit.", file=sys.stderr)
         client = herdr.Herdr(shared)
-        if row.kind == "worker":
-            pane_row = next((item for item in client.panes() if item["pane_id"] == pane), None)
-            if pane_row is None:
-                raise herdr.HerdrFailure(f"no pane {pane!r}")
-            if pane_row.get("label") == row.name:
-                return False
-            _ = client.run("pane", "rename", pane, row.name)
-            return True
-        return client.retitle(pane, row.name)
+        return client.retitle(pane, row.name, tab=row.kind != "worker")
     if _clear_handoff_pending(session_id, shared, pane, record):
         print(f"herdr title: no staff row for current session {session_id}.", file=sys.stderr)
     if not name:
