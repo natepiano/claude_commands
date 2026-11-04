@@ -5,6 +5,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, caller_
 from scripts.lint.memory_test_support import write_config_fixture
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -19,8 +20,13 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 
-CANCEL_LINE = ("verify.sh: cancelled — the tree changed while {cmd} ran, so this result "
-               + "would be stale. Resubmit the {cmd} when your edits are done.")
+def cancellation_lines(output: str, command: str) -> list[re.Match[str]]:
+    pattern = re.compile(
+        re.escape(f"verify.sh: cancelled — the tree changed while {command} ran")
+        + r"(?: \((?P<path>[^\n]+)\))?"
+        + re.escape(f", so this result would be stale. Resubmit the {command} when your edits are done."),
+    )
+    return [match for line in output.splitlines() if (match := pattern.fullmatch(line)) is not None]
 
 # Keep a real long-lived descendant: stopping only Cargo must fail cleanup.
 CARGO = r'''
@@ -33,13 +39,13 @@ from pathlib import Path
 
 args = sys.argv[1:]
 root = Path(os.environ["TEST_CONTROL"])
+if "--version" in args:
+    print("cargo fixture 1.0")
+    raise SystemExit(0)
 with (root / "events.jsonl").open("a") as events:
     events.write(json.dumps(args) + "\n")
 if args[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
-    raise SystemExit(0)
-if "--version" in args:
-    print("cargo fixture 1.0")
     raise SystemExit(0)
 stage = ""
 if args[:2] == ["nextest", "run"]:
@@ -127,7 +133,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         (stubs / "git").unlink()
         (stubs / "git").symlink_to(git)
         self.write_tool(stubs / "cargo", CARGO)
-        self.write_shell_tool(stubs / "taplo", "exit 0\n")
+        self.write_shell_tool(stubs / "taplo", 'if [ "$1" = --version ]; then printf "taplo fixture 1.0\\n"; fi\n')
         self.write_shell_tool(stubs / "rustc", "printf 'rustc fixture\\n'\n")
         # Keep real heartbeat/board sleeps; only controlled memory transitions
         # use already-published routing readiness or the meminfo change event.
@@ -229,11 +235,11 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             self.assertEqual(list((self.board / "verify_cache").glob(suffix)), [],
                              "cancelled run recorded a cache verdict")
 
-    def assert_cancelled(self, process: subprocess.Popen[str], command: str) -> None:
+    def assert_cancelled(self, process: subprocess.Popen[str], command: str) -> re.Match[str]:
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 77, output + errors)
-        self.assertEqual((output + errors).splitlines().count(CANCEL_LINE.format(cmd=command)), 1,
-                         output + errors)
+        matches = cancellation_lines(output + errors, command)
+        self.assertEqual(len(matches), 1, output + errors)
         self.assert_no_cache_verdict()
         try:
             self.assert_resources_released()
@@ -242,6 +248,8 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         records = self.records()
         self.assertEqual(len(records), 1, records)
         self.assertEqual((records[0].get("outcome"), records[0].get("status")), ("cancelled", 77), records)
+
+        return matches[0]
 
     def mac_environment(self, *, local_first: bool = False) -> dict[str, str]:
         runner = self.root / "mac-runner.py"

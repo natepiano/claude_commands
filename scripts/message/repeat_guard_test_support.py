@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import select
+import shutil
+import socket
 import importlib
 import subprocess
 import sys
@@ -13,6 +16,8 @@ from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
+from types import SimpleNamespace
+from threading import Thread
 from unittest.mock import patch
 
 from scripts.message.process_test_support import OwnedTestProcesses
@@ -49,6 +54,45 @@ def install_guard_test_budget() -> None:
         paths.append(existing)
     _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.dict(
         os.environ, {"PYTHONPATH": os.pathsep.join(paths)})))
+
+
+def install_notice_test_config(home: Path) -> Path:
+    """Give notice fixtures real settings without repository recovery."""
+    config = home / ".claude/config"
+    config.mkdir(parents=True, exist_ok=True)
+    source = Path(__file__).resolve().parents[2] / "config/send.conf"
+    _ = shutil.copyfile(source, config / "send.conf")
+    return config
+
+
+def wait_for_notice_readiness(path: Path, runner: subprocess.Popen[bytes]) -> None:
+    """Fail when the runner exits before its descendants report readiness."""
+    exited, notification = socket.socketpair()
+
+    def report_exit() -> None:
+        with notification:
+            _ = runner.wait()
+            try:
+                _ = notification.send(b"exit")
+            except BrokenPipeError:
+                pass  # The readiness wait already ended.
+
+    watcher = Thread(target=report_exit, daemon=True)
+    with exited, ExitStack() as contexts:
+        ready = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        _ = contexts.callback(os.close, ready)
+        watcher.start()
+        received = b""
+        with LauncherHangGuard("delivery descendants").protect():
+            while b"\n" not in received:
+                readable, _, _ = select.select([ready, exited], [], [])
+                if ready in readable:
+                    received += os.read(ready, len(b"ready\n"))
+                if b"\n" not in received and exited in readable:
+                    watcher.join()
+                    raise AssertionError(f"delivery runner exited {runner.returncode} before readiness")
+        if received != b"ready\n":
+            raise AssertionError(f"delivery descendants reported invalid readiness: {received!r}")
 
 
 @dataclass
@@ -117,7 +161,9 @@ def run_ready_notice_attempt(
             return child
 
         try:
-            _ = contexts.enter_context(patch.object(subprocess, "Popen", start))
+            processes = SimpleNamespace(Popen=start, PIPE=subprocess.PIPE,
+                                        TimeoutExpired=subprocess.TimeoutExpired)
+            _ = contexts.enter_context(patch.object(sys.modules[run.__module__], "subprocess", processes))
             return run(command, request, timeout)
         finally:
             if writer_open:

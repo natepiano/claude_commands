@@ -6,6 +6,8 @@ import json
 import re
 import unittest
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member
 from scripts.production.update_registration_test_support import RegistrationFixture
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
@@ -27,9 +29,11 @@ class RegistrationTests(RegistrationFixture):
         self.assertRegex(result.stdout, r"^time: ok — 09:05 P[DS]T\n$")
 
     def test_tenth_log_event_lists_every_doc_unit_without_state(self) -> None:
-        doc = self.doc.read_text(encoding="utf-8")
-        doc = doc.replace("\n## Gates", "| `beta-unit` | `docs/beta.md` | `/tmp/beta` | `beta` | `beta-session` | — | — |\n\n## Gates")
-        _ = self.doc.write_text(doc, encoding="utf-8")
+        alpha = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        beta = self.root / "beta"
+        beta.mkdir()
+        _ = (beta / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        _ = fixture_member("unit", name="beta", parent=alpha.parent, worktree=staff.PresentWorktree("natedev", beta))
         for number in range(1, 11):
             result = self.run_command("log", f"event {number}")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

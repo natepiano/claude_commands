@@ -20,6 +20,7 @@ import coverage_report
 import rules
 import style_ledger
 import style_rules
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, unit_membership
 
 
 @dataclass(frozen=True)
@@ -156,32 +157,31 @@ class CoverageReportTests(unittest.TestCase):
             return ledger.hold(rule, self.sources[0], line, "pub fn value() {}", "rename",
                                "value", "count", definition.blob, "report-1").finding_id
 
-    def production_units(self, *units: str) -> None:
+    def staff_units(self, *units: str) -> None:
         doc = self.root / "sample-style/docs/sample-style-production.md"
         doc.parent.mkdir(parents=True, exist_ok=True)
-        _ = doc.write_text("\n".join([
-            "# Style production", "- **Kind:** style", "- **Branch point:** main", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch |",
-            "| --- | --- | --- | --- |",
-            *(f"| {unit} | docs/{unit}.md | {self.root / unit} | main |" for unit in units), "",
-        ]))
+        _ = doc.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = recorded_showrunner("sample-style", doc)
+        for unit in units:
+            _ = unit_membership("sample-style", unit)
 
 
-    def test_production_units_use_full_ids_without_a_document_and_mixed_ids_with_one(self) -> None:
+    def test_staff_units_use_full_ids_without_a_document_and_mixed_ids_with_one(self) -> None:
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:
             self.assertEqual(set(coverage_report.production(ledger, self.tip).units), {
                 "sample-style-names-unit", "sample-style-types-unit",
                 "sample-style-values-unit", "sample-style-modules-unit",
             })
-            self.production_units("names-unit", "sample-style-types-unit", "feature-unit")
+            self.staff_units("names-unit", "sample-style-types-unit", "feature-unit")
             self.assertEqual(coverage_report.production(ledger, self.tip).units,
                              ("names-unit", "sample-style-types-unit"))
 
     def test_report_finds_a_moved_ticket_by_the_declared_full_unit_id(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.production_units("sample-style-names-unit")
+        self.staff_units("sample-style-names-unit")
         with style_ledger.open_ledger(self.repo) as ledger:
             ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
@@ -194,7 +194,7 @@ class CoverageReportTests(unittest.TestCase):
     def test_report_shows_each_widened_path_of_an_open_ticket_under_its_line(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.production_units("names-unit")
+        self.staff_units("names-unit")
         with style_ledger.open_ledger(self.repo) as ledger:
             ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
@@ -418,7 +418,7 @@ class CoverageReportTests(unittest.TestCase):
         other = self.rule("other")
         self.sync()
         units = ("names-unit", "sample-style-names-unit", "other-style-names-unit", "types-unit")
-        self.production_units(*units)
+        self.staff_units(*units)
         with style_ledger.open_ledger(self.repo) as ledger:
             for number, rule in enumerate((selected, selected, selected, other), start=1):
                 unit = units[number - 1]
@@ -441,7 +441,7 @@ class CoverageReportTests(unittest.TestCase):
     def test_crate_filter_limits_cells_and_prints_the_oldest_open_ticket(self) -> None:
         read = self.rule("read")
         self.sync()
-        self.production_units("names-unit", "sample-style-names-unit", "types-unit")
+        self.staff_units("names-unit", "sample-style-names-unit", "types-unit")
         for path in self.sources[:2]:
             self.record(read, path)
         with style_ledger.open_ledger(self.repo) as ledger:

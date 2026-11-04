@@ -16,6 +16,44 @@ from scripts.message.unit_labels import UnitLabels
 
 
 class QueueCardTests(QueueFixtureTests):
+    def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
+        model = self.fixture.model()
+        for position in (1, 2, 4):
+            with self.subTest(position=position):
+                text = plain(queue_card.render_card(model, [position], 400))
+                self.assertEqual(text.count("queue priority: cables (captured priority)"), 1)
+                self.assertNotIn("moved up", text)
+                self.assertNotIn("from #27", text)
+                self.assertNotIn("from #1 by", text)
+                self.assertNotIn("the user's bump", text)
+                if position > 1:
+                    self.assertIn(f"{min(position - 1, 3)} of cables (queue priority)", text)
+                need, total = ("11.5", "22.6") if position == 2 else ("7.6", "18.7")
+                self.assertIn(f"Build budget: charged 11.1 + need {need} = {total} GiB", text)
+                self.assertIn("21.0 GiB", text)
+
+    def test_follower_names_the_eligible_heads_place_after_a_token_waiter(self) -> None:
+        inputs = self.fixture.inputs(policy=admission_policy_fixture())
+        (token_path, token), (head_path, head), (follower_path, follower) = inputs.ordered[:3]
+        inputs = replace(inputs,
+            host=gate.HostMemory(14 * gate.GIB, 60 * gate.GIB), pressure=gate.NoPressureHold(),
+            running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB)),),
+            reservations=({**inputs.reservations[0], "need": gate.GIB},), ordered=[
+                (token_path, {**token, "token_left_at": NOW - 10}),
+                (head_path, {**head, "need": 21 * gate.GIB, "priority_since": NOW - 60}),
+                (follower_path, {**follower, "need": 10 * gate.GIB}),
+            ])
+        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB),
+                                       policy=admission_policy_fixture())
+        self.assertEqual([step.pid for step in reading.view.waiting], [token["pid"], head["pid"], follower["pid"]])
+        self.assertIsInstance(reading.view.waiting[2].reason, gate.BehindHead)
+        self.assertEqual(queue_view.reason_phrase(reading.view.waiting[2].reason, reading.view.waiting), "#2's turn")
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        text = plain(queue_card.render_card(model, [3], 400))
+        self.assertIn("#2's turn", text)
+        self.assertNotIn("#1's turn", text)
+        self.assertIn("younger steps wait", text)
+
     def test_unit_override_card_heading_matches_golden(self) -> None:
         model = self.fixture.model()
         waiting = model.reading.view.waiting
@@ -190,7 +228,7 @@ class QueueCardTests(QueueFixtureTests):
 
     def test_fourth_card_counts_moves_and_join_order_with_recorded_checks(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [4], 400))
-        self.assertIn("Next? No. 3 steps are ahead of it: 3 moved up, 0 joined earlier.", text)
+        self.assertIn("Next? No. 3 steps are ahead of it: 3 of cables (queue priority), 0 joined earlier.", text)
         self.assertIn("joined 10:10, 3 min after it", text)
         self.assertIn("It joined 1st of the steps waiting now.", text)
         self.assertIn("✓ queue order", text)
@@ -304,7 +342,7 @@ class QueueCardTests(QueueFixtureTests):
 
     def test_rows_ahead_cap_at_five_and_report_the_remainder(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [9], 400))
-        self.assertIn("8 steps are ahead of it: 3 moved up, 5 joined earlier.", text)
+        self.assertIn("8 steps are ahead of it: 3 of cables (queue priority), 5 joined earlier.", text)
         for place in range(1, 6):
             self.assertIn(f"\n  #{place} ", text)
         self.assertNotIn("\n  #6 ", text)
@@ -316,7 +354,7 @@ class QueueCardTests(QueueFixtureTests):
                 lines = queue_card.render_card(self.fixture.model(), [5], columns)
                 text = " ".join(plain(lines).split())
                 self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
-                self.assertIn("Next? No. 4 steps are ahead of it: 3 moved up, 1 joined earlier.", text)
+                self.assertIn("Next? No. 4 steps are ahead of it: 3 of cables (queue priority), 1 joined earlier.", text)
                 self.assertIn("Folder/home/natepiano/rust/cargo-liner/repo.", text.replace(" ", ""))
 
     def test_missing_pace_never_invents_a_likely_start(self) -> None:

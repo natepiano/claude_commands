@@ -1171,11 +1171,11 @@ class StaffTests(StaffTestCase):
         self.assertEqual(self.staff_file.read_bytes(), original)
         self.assertCountEqual(staff.find(), rows)
 
-    def test_missing_file_is_unreadable_for_reads_but_bootstraps_on_write(self) -> None:
-        for read in (lambda: staff.by_id(MISSING_ID), lambda: staff.by_path("sdlc"), staff.find):
-            with self.subTest(read=read), self.assertRaises(staff.StaffUnreadable) as raised:
-                _ = read()
-            self.assertIsInstance(raised.exception, OSError)
+    def test_missing_file_reads_as_empty_and_bootstraps_on_write(self) -> None:
+        record = staff.initial_snapshot()
+        self.assertIsNone(record.by_id(MISSING_ID))
+        self.assertIsNone(record.by_path("sdlc"))
+        self.assertEqual(record.find(), [])
         self.assertFalse(self.staff_file.exists())
         created = fixture_member("showrunner", name="sdlc")
         self.assertEqual(staff.by_id(created.id), created)
@@ -1573,11 +1573,10 @@ class StaffTests(StaffTestCase):
                 with staff.operation():
                     self.fail("entered an operation without acquiring its lock")
 
-    def test_absent_records_have_the_same_typed_signal_on_owner_and_mac(self) -> None:
+    def test_absent_records_are_empty_on_owner_and_mac(self) -> None:
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
-                with self.assertRaises(staff.StaffAbsent):
-                    _ = staff.snapshot()
+                self.assertEqual(staff.initial_snapshot(), staff.StaffSnapshot(()))
         self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
         self.assertFalse(self.staff_file.exists())
         self.assertFalse(self.mac_file.exists())

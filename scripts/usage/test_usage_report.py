@@ -477,17 +477,12 @@ raise SystemExit(result)
 
     def test_unit_is_resolved_from_current_production_docs_with_longest_worktree(self) -> None:
         self.assert_report("unit", "weighted", "--by", "unit")
-        document = self.production_docs / "fixture-production.md"
-        _ = document.write_text(document.read_text(encoding="utf-8").replace("| Deep |", "| Renamed |"), encoding="utf-8")
         deep = next(row for row in staff.snapshot().find(kind="unit") if row.name == "Deep")
         _ = staff.rename(deep.id, "Renamed")
         self.assert_report("unit-renamed", "weighted", "--by", "unit")
 
     def test_unit_containment_does_not_match_a_neighbor_with_the_same_prefix(self) -> None:
-        document = self.production_docs / "other-production.md"
-        _ = document.write_text("## Units\n\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n| Wrong | `/invented/loos` | docs/plan.md |\n",
-                                encoding="utf-8")
-        owner = staff.snapshot().by_doc("natedev", document)
+        owner = staff.snapshot().by_doc("natedev", self.production_docs / "other-production.md")
         assert owner is not None
         _ = fixture_member("unit", name="Wrong", parent=owner.id,
                            worktree=staff.PresentWorktree("natedev", Path("/invented/loos")))
@@ -891,27 +886,25 @@ print(json.dumps(results))
 
 
 
-from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+from scripts.production.staff_test_support import StaffTestCase
 from scripts.usage import usage_report
 
 
 class BranchUsageLocationTests(StaffTestCase):
-    def test_usage_attribution_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+    def test_usage_attribution_uses_the_staff_worktree(self) -> None:
         fixture = self.separated_unit_folders()
-        without_worktree_column(fixture.doc)
         self.assertEqual(usage_report.document_units(fixture.doc),
-                         (usage_report.UnitWorktree("member-unit", fixture.worktree),))
+                         (usage_report.UnitWorktree("member", fixture.worktree),))
 
     def test_unfilled_unit_reports_its_fact_and_keeps_the_other_units(self) -> None:
         fixture = self.separated_unit_folders()
         from scripts.production.staff_test_support import fixture_member
         _ = fixture_member("unit", name="unfilled", parent=fixture.runner.id)
-        _ = fixture.doc.write_text(fixture.doc.read_text() + "| unfilled-unit | /wrong | bad | /missing/plan.md | — |\n")
         import io
         from contextlib import redirect_stderr
         with redirect_stderr(io.StringIO()) as errors:
             rows = usage_report.document_units(fixture.doc)
-        self.assertEqual(rows, (usage_report.UnitWorktree("member-unit", fixture.worktree),))
+        self.assertEqual(rows, (usage_report.UnitWorktree("member", fixture.worktree),))
         self.assertIn("unfilled", errors.getvalue())
 
 

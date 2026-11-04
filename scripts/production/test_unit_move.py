@@ -18,10 +18,11 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.agents import codex_mesh
 from scripts.production import staff
+from scripts.direct import progress_history
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import FolderMoveBackend, FolderMoveFixture
 from scripts.production.add_unit_test_support import AddUnitTestCase
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
 from scripts.shutdown import pane_record
 from scripts.message import sessions
 import herdr
@@ -37,7 +38,6 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
         from datetime import datetime, timezone
 
         old = self.root / "project-alpha"
-        self.commit_prepared_row(self.unit_row())
         owner = self.prepare_restored_worktree("alpha", old)
         records = self.root / "move-launches"
         self.env["HERDR_PANE_RECORD_DIR"] = str(records)
@@ -85,7 +85,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
             self.assertEqual(moved.returncode, 0, moved.stderr)
             publications = [entry for entry in pane_record.read("agents").values()
                             if entry["session_id"] in (owner.id, owner.current_session)]
-            self.assertEqual([(entry["pane_id"], entry["cwd"]) for entry in publications],
+            self.assertEqual([(entry["pane_id"], pane_record.resume_launch(entry)["cwd"]) for entry in publications],
                              [("w7:p3", str(destination))])
 
 
@@ -103,13 +103,16 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(staff.by_id(self.owner.id),
                          replace(self.owner, worktree=staff.PresentWorktree("natedev", self.new_folder)))
         launch = pane_record.read("agents")["w1:p1"]
-        self.assertEqual((launch["cwd"], launch["session_id"], launch["name"]),
+        self.assertEqual((pane_record.resume_launch(launch)["cwd"], launch["session_id"], launch["name"]),
                          (str(self.new_folder), self.owner.id, "kept-name"))
         state = cast(dict[str, object], json.loads((self.run_dir / "progress_history_state.json").read_text()))
         event = cast(dict[str, object], json.loads(self.history.read_text().splitlines()[0]))
         for fields in (state, event):
             self.assertEqual((fields["working_dir"], fields["branch"], fields["plan_doc"], fields["run_id"]),
-                             (str(self.new_folder), "unit-branch", str(self.new_folder / "plan.md"), "move-run"))
+                             (str(self.old_folder), "unit-branch", str(self.old_folder / "plan.md"), "move-run"))
+        current = cast(Callable[[Path], dict[str, object]], getattr(progress_history, "_read_state"))(self.run_dir)
+        self.assertEqual(current["working_dir"], str(self.new_folder))
+        self.assertEqual((Path(str(current["working_dir"])) / str(current["plan_doc"])), self.new_folder / "plan.md")
         self.assertEqual(tuple((pane["pane_id"], pane.get("terminal_id")) for pane in backend.panes()),
                          (("w1:p1", "kept-terminal"), ("w1:p2", "neighbour-terminal")))
 
@@ -183,8 +186,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
                     *, expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
             self.assertEqual(events, ["stop", "pause", "move"])
             self.assertFalse(self.old_folder.exists())
-            self.assertEqual(pane_record.read("agents")["w1:p1"]["cwd"], str(self.new_folder))
-            self.assertEqual((self.run_dir / "working_dir").read_text().strip(), str(self.new_folder))
+            self.assertEqual(pane_record.read("agents")["w1:p1"]["cwd"], str(self.old_folder))
+            self.assertEqual((self.run_dir / "working_dir").read_text().strip(), str(self.old_folder))
             result = set_worktree(unit, worktree, expected=expected)
             events.append("staff")
             return result
@@ -204,7 +207,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
                                 side_effect=AssertionError("The director resumes the worker")),
               mock.patch.object(unit_move, "git", side_effect=git),
               mock.patch.object(staff, "set_worktree", side_effect=publish),
-              mock.patch.object(backend, "run_in_pane", side_effect=resumed)):
+              mock.patch.object(backend, "run_in_pane", side_effect=resumed),
+              mock.patch("unit_move.Popen") as workers):
             result = self.move_folder()
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assertEqual(events, ["stop", "pause", "move", "staff", "resume"])
@@ -215,10 +219,10 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(command[command.index("--resume") + 1], self.owner.current_session)
         prompt = command[-1]
         self.assertIn(f"moved from {self.old_folder} to {self.new_folder}", prompt)
-        self.assertIn("impl1 (impl, was working): bash", prompt)
-        self.assertIn("--to impl1", prompt)
-        self.assertIn(str(worker_prompt), prompt)
-        self.assertIn(str(reviewer_prompt), prompt)
+        self.assertEqual(workers.call_count, 2)
+        self.assertEqual([command[command.index("--to") + 1]
+                          for call in workers.call_args_list for command in [cast(list[str], call.args[0])]], ["impl1", "review1"])
+        self.assertTrue(all(call.kwargs["cwd"] == self.new_folder for call in workers.call_args_list))
         note = (f"Your unit folder moved from {self.old_folder} to {self.new_folder}. "
                 f"Use {self.new_folder} for commands. Continue your current task.\n")
         self.assertEqual(worker_prompt.read_text(), task + note)
@@ -315,7 +319,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assert_moved(backend)
         self.assertEqual((len(backend.starts), len(backend.stops)), (1, 1))
 
-    def test_crash_after_git_move_finishes_staff_paths_without_starting_a_stopped_unit(self) -> None:
+    def test_crash_after_git_move_finishes_staff_paths_and_starts_the_unit(self) -> None:
         backend = self.folder_backend()
         assert self.owner.parent is not None
         _ = staff.set_doc(self.owner.parent, staff.LiveDoc("natedev", self.checkout / "plan.md"))
@@ -325,11 +329,13 @@ class UnitFolderMoveTests(FolderMoveFixture):
         with mock.patch.object(unit_move, "git", wraps=unit_move.git) as calls:
             result = self.move_folder()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertIn("crash recovery starts no session", result.stderr)
+        self.assertEqual(result.stderr, "")
         self.assertFalse(any(call.args[1:3] == ("worktree", "move") for call in calls.call_args_list))
         self.assert_moved(backend)
-        self.assertEqual((backend.stops, backend.starts, backend.live), ([], [], False))
+        self.assertEqual(backend.stops, [])
+        self.assertEqual(len(backend.starts), 1)
+        self.assertTrue(backend.live)
+        self.assertEqual(backend.cwd, self.new_folder)
         self.assert_finished_rerun(backend)
 
     def test_unknown_pane_identity_does_not_stop_a_different_conversation(self) -> None:
@@ -395,6 +401,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         state = cast(dict[str, object], json.loads((self.run_dir / "progress_history_state.json").read_text()))
         state.update(run_id="older-run", history_file=str(history))
         self.write_json(second / "progress_history_state.json", state)
+        _ = (second / "director").write_text(self.owner.current_session + "\n")
         _ = history.write_text(json.dumps({**state, "event_type": "run_started", "run_started_at": 0}) + "\n")
         for run in (self.run_dir, second):
             self.write_json(run / "mesh_roster.json", {})
@@ -410,19 +417,21 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertCountEqual(paused,
                               [{"session_dir": str(run), "pause": True} for run in (self.run_dir, second)])
         self.assert_moved(backend)
-        self.assertEqual((backend.stops, backend.starts), ([], []))
+        self.assertEqual(backend.stops, [])
+        self.assertEqual(len(backend.starts), 1)
+        self.assertEqual(backend.cwd, self.new_folder)
 
     def test_stopped_unit_with_a_closed_pane_moves_records_without_starting(self) -> None:
         backend = self.folder_backend()
         entries = pane_record.read("agents")
-        with mock.patch.object(backend, "panes", return_value=[backend.panes()[1]]):
+        with (mock.patch.object(backend, "panes", return_value=[backend.panes()[1]]),
+              mock.patch.object(backend, "pane_activity", side_effect=herdr.HerdrFailure("pane is closed"))):
             result = self.move_folder()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_moved(backend)
         self.assertEqual(pane_record.read("agents"),
-                         {**entries, "w1:p1": {**entries["w1:p1"], "cwd": str(self.new_folder)}})
+                         entries)
         self.assertEqual((backend.starts, backend.stops), ([], []))
-        self.assert_finished_rerun(backend)
 
     def test_normal_codex_launch_moves_without_a_claude_launch_record(self) -> None:
         client_type = herdr.Herdr
@@ -482,7 +491,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertIn(str(self.new_folder), command)
         self.assert_finished_rerun(backend)
 
-    def test_open_phase_paused_unit_stays_paused_after_the_move(self) -> None:
+    def test_open_phase_paused_unit_starts_after_the_move(self) -> None:
         with self.history.open("a") as history:
             _ = history.write(json.dumps({"event_type": "phase_started",
                 "phase_instance_id": "phase-one", "phase_id": "1"}) + "\n")
@@ -490,25 +499,107 @@ class UnitFolderMoveTests(FolderMoveFixture):
         result = self.move_folder()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_moved(backend)
-        self.assertEqual((backend.starts, backend.stops, backend.live), ([], [], False))
-        self.assertIs(pane_record.read("agents")["w1:p1"].get("ended"), True)
+        self.assertEqual(backend.stops, [])
+        self.assertEqual(len(backend.starts), 1)
+        self.assertTrue(backend.live)
+        self.assertEqual(backend.cwd, self.new_folder)
+        self.assertIs(pane_record.read("agents")["w1:p1"].get("ended"), False)
         self.assert_finished_rerun(backend)
 
-    def test_stopped_move_updates_every_path_without_starting_or_renaming(self) -> None:
+    def test_stopped_move_starts_the_unit_without_renaming(self) -> None:
         backend = self.folder_backend()
         before = pane_record.read("agents")
         plan = (self.old_folder / "plan.md").read_bytes()
         result = self.move_folder()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_moved(backend)
-        self.assertEqual(pane_record.read("agents"),
-                         {**before, "w1:p1": {**before["w1:p1"], "cwd": str(self.new_folder)}})
+        before["w1:p1"]["ended"] = False
+        self.assertEqual(pane_record.read("agents"), before)
         self.assertEqual((self.new_folder / "plan.md").read_bytes(), plan)
-        self.assertEqual((backend.starts, backend.stops, backend.live), ([], [], False))
+        self.assertEqual(backend.stops, [])
+        self.assertEqual(len(backend.starts), 1)
+        self.assertTrue(backend.live)
+        self.assertEqual(backend.cwd, self.new_folder)
         self.assertFalse(staff.folder_move_path(self.owner.id).exists())
         found = self.cli("get", str(self.new_folder), "--json")
         self.assertEqual(json.loads(found.stdout)["id"], self.owner.id)
         self.assert_finished_rerun(backend)
+
+    def test_rerun_starts_a_director_that_is_down_after_staff_publication(self) -> None:
+        backend = self.folder_backend()
+        self.new_folder.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.folder_git(self.checkout, "worktree", "move", str(self.old_folder), str(self.new_folder))
+        _ = staff.set_worktree(self.owner.id, staff.PresentWorktree("natedev", self.new_folder),
+                               expected=self.owner.worktree)
+        with (mock.patch.object(unit_move, "stop_folder_session",
+                                side_effect=AssertionError("A rerun must not stop a session")),
+              mock.patch.object(unit_move, "pause_folder_workers",
+                                side_effect=AssertionError("A rerun must not pause workers")),
+              mock.patch.object(unit_move, "git",
+                                side_effect=AssertionError("A rerun must not move the folder"))):
+            result = self.move_folder()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertNotEqual(result.stdout, "unchanged\n")
+        self.assertEqual(backend.stops, [])
+        self.assertEqual(len(backend.starts), 1)
+        self.assertTrue(backend.live)
+        self.assertEqual(backend.cwd, self.new_folder)
+        self.assert_finished_rerun(backend)
+
+    def test_incomplete_stop_report_still_starts_a_director_that_has_exited(self) -> None:
+        backend = self.folder_backend(live=True)
+        stop = unit_move.stop_folder_session
+
+        def incomplete(row: staff.StaffRow, launch: unit_move.FolderLaunch) -> bool:
+            _ = stop(row, launch)
+            raise ValueError("session stop is incomplete")
+
+        with mock.patch.object(unit_move, "stop_folder_session", side_effect=incomplete):
+            result = self.move_folder()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("session stop is incomplete", result.stderr)
+        self.assertEqual(backend.stops, [self.owner.current_session])
+        self.assertEqual(len(backend.starts), 1)
+        self.assertTrue(backend.live)
+        self.assertEqual(backend.cwd, self.new_folder)
+
+    def test_live_director_with_several_retained_launches_restarts_its_current_session(self) -> None:
+        backend = self.folder_backend(live=True)
+        entries = pane_record.read("agents")
+        current = entries["w1:p1"].copy()
+        current["session_id"] = self.owner.current_session
+        entries["w1:p1"] = current
+        previous = current.copy()
+        previous.update(pane_id="w1:p9", session_id=self.owner.id, ended=True)
+        entries["w1:p9"] = previous
+        pane_record.save("agents", entries)
+        result = self.move_folder()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(backend.stops, [self.owner.current_session])
+        self.assertEqual(len(backend.starts), 1)
+        self.assertEqual(backend.starts[0][0], "w1:p1")
+        self.assertEqual(backend.cwd, self.new_folder)
+
+    def test_folder_move_resumes_the_same_worker_thread_with_the_staff_folder(self) -> None:
+        backend = self.folder_backend(live=True)
+        worker = fixture_worker("impl1", self.owner.id)
+        self.write_json(self.run_dir / "mesh_roster.json", {"impl1": {
+            "thread_id": worker.current_session, "role": "impl", "status": "paused", "paused_turn": True}})
+        with (mock.patch.object(codex_mesh, "command_stop", return_value=0) as stop,
+              mock.patch("unit_move.Popen") as start):
+            result = self.move_folder()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stop.assert_called_once()
+        start.assert_called_once()
+        command = cast(list[str], start.call_args.args[0])
+        self.assertEqual(command[command.index("--to") + 1], "impl1")
+        self.assertEqual(start.call_args.kwargs["cwd"], self.new_folder)
+        self.assertIn(str(self.new_folder), command)
+        resume = cast(Callable[[str, str, str], dict[str, object]], getattr(codex_mesh, "_resume_params"))
+        params = resume(str(self.run_dir), "impl1", worker.current_session)
+        self.assertEqual((params["threadId"], params["cwd"]), (worker.current_session, str(self.new_folder)))
+        self.assertEqual(self.read_rows()["impl1"]["thread_id"], worker.current_session)
+        self.assertTrue(backend.live)
 
     def test_next_worker_dispatch_uses_the_moved_run_folder(self) -> None:
         from scripts.agents import codex_mesh
@@ -542,7 +633,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
             self.assertEqual(opened["thread_id"], native)
             self.assertEqual(server.call_args.kwargs["cwd"], str(self.new_folder))
             self.assertEqual(requests[0][1]["cwd"], str(self.new_folder))
-            state = cast(dict[str, object], json.loads((self.run_dir / "progress_history_state.json").read_text()))
+            state = cast(Callable[[Path], dict[str, object]], getattr(progress_history, "_read_state"))(self.run_dir)
             arguments = argparse.Namespace(turn_cwd=state["working_dir"], session_dir=str(self.run_dir), name="impl1",
                                            model="gpt-fixture", effort="high", service_tier="default")
             start = cast(Callable[..., str], getattr(codex_mesh, "_start_turn"))
