@@ -333,12 +333,15 @@ Acceptance: the call costs less CPU, and the rows it writes are unchanged. Do no
 ### Phase 17 — The build log stores each memory reading once each minute  · status: done
 **Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
 
-Each tick writes the builds slice fields in both the sample row and the memory_snapshot row, so the log grows faster than it needs to.
+#### As-built
 
-1. The slice fields live only in the sample row. memory_snapshot keeps its old fields.
-2. Every reader of the slice fields reads them from the sample row.
-3. A test pins each row's fields.
+- Each `buildlog sample` tick writes the slices once, in the sample row. The tick `memory_snapshot` row (`TickMemorySnapshot`) holds `kind`, `at`, `host` and `zram` only. `memory.write_snapshot(at, host) -> None` writes it.
+- The standalone `buildlog snapshot` row (`MemorySnapshot`) keeps its slices, because no sample row is beside it.
+- `memory.nearest_snapshot` takes the nearest non-null slices from `samples` UNION ALL `memory_snapshots` (snapshot row first on equal distance), and the nearest zram in a second query. Old logs, new ticks and standalone snapshots give the same report. No slice reading in the window reads as unavailable, never as absent.
+- Log size: 8,321,760 bytes/day before, 4,808,160 after (1,440 ticks).
 
-Acceptance: one tick writes each slice field once; every report that showed slice memory shows the same values. Do not edit `index.py` or `store.py`.
+**Files:** `scripts/buildlog/memory.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_memory_window.py`, `docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`.
 
-**Files:** `scripts/buildlog/memory.py`, `scripts/buildlog/sample.py`, their readers and tests.
+**Gotchas:** old logs keep slices in `memory_snapshots`, so the reader reads both tables.
+
+**Ruled out:** a join on equal `at` text between the two writers (a miss showed the slice as absent).
