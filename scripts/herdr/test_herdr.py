@@ -1378,6 +1378,29 @@ class LaunchDestinationTests(StaffTestCase):
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
 
+    def test_pane_launch_waits_for_shell_cleanup_before_sending_the_command(self) -> None:
+        client = herdr.Herdr("agents")
+        clock = StartupClock()
+
+        def advance(seconds: float) -> None:
+            clock.elapsed += seconds
+
+        def checked(*_args: object, **_kwargs: object) -> bool:
+            self.assertFalse(run.called)
+            if clock.elapsed < 0.2:
+                raise herdr.HerdrFailure("pane runs other work: direnv, bash", "wrong_target")
+            return clock.elapsed >= 0.4
+
+        with (patch.object(herdr, "check_target", side_effect=checked) as check,
+              patch.object(herdr, "_pane_row", return_value=herdr.NoPane("worker")),
+              patch.object(time, "monotonic", lambda: clock.elapsed),
+              patch.object(time, "sleep", side_effect=advance),
+              patch.object(client, "run") as run):
+            client.run_in_pane("worker", ["claude", "--resume", "thread"])
+        self.assertGreaterEqual(check.call_count, 5)
+        self.assertGreaterEqual(clock.elapsed, 0.4)
+        run.assert_called_once_with("pane", "run", "worker", "claude --resume thread")
+
     def test_all_destinations_start_and_label_before_start(self) -> None:
         run_in_pane = herdr.Herdr.run_in_pane
         for destination in (herdr.NewTab("workers", "worker"),
