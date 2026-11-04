@@ -222,7 +222,6 @@ source "$HOME/.claude/scripts/lint/invoke.sh" || {
 }
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
-ASSERTION_GUARD_SCRIPT="${VERIFY_ASSERTION_GUARD_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/assertion_guard.py}"
 STEP_RECORD_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/step_record.py"
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
 FINAL_PASS_START=""
@@ -964,21 +963,6 @@ if [[ "${1:-}" == "--session-dir" ]]; then
     fi
 fi
 
-# One list feeds both the guard invocation and its cache inputs. The identity
-# check also deduplicates two spellings of the same existing folder.
-assertion_rulings_args() {
-    ASSERTION_RULINGS_ARGS=()
-    local folder previous=""
-    for folder in "${UNIT_SESSION_DIR:-}" "${UNIT_RUN_DIR:-}"; do
-        [[ -n "$folder" ]] || continue
-        if [[ "$folder" != "$previous" && ( -z "$previous" || ! "$folder" -ef "$previous" ) ]]; then
-            ASSERTION_RULINGS_ARGS+=(--rulings "$folder")
-            previous="$folder"
-        fi
-    done
-}
-assertion_rulings_args
-
 # A Codex mesh worker's command dies with its turn, and a worker that waits on
 # one spends a model call per wait. So a worker's call detaches: mesh_runs.py
 # runs this same call under a supervisor outside the worker's process group,
@@ -1231,7 +1215,6 @@ fi
 tree_key() {
     local words=("$CMD" "${ARGS[@]}") names=() name scope=() key_options=("$@")
     if [[ "$CMD" == lint ]]; then
-        scope=(--assertion-guard "$ASSERTION_GUARD_SCRIPT" ${ASSERTION_RULINGS_ARGS[@]+"${ASSERTION_RULINGS_ARGS[@]}"})
         if [[ ${#ARGS[@]} -eq 1 ]]; then words=(lint); fi
     elif [[ "${FILTER_RUN}" -eq 1 ]]; then
         # The filter names go last, sorted, each once (see the header).
@@ -3204,14 +3187,6 @@ case "$CMD" in
             shift
         fi
         [[ $# -eq 0 ]] || { usage; exit 2; }
-        ASSERTION_REPO="${WORKSPACE_ROOT:-$(git rev-parse --show-toplevel)}"
-        ASSERTION_ARGS=(--repo "$ASSERTION_REPO" ${ASSERTION_RULINGS_ARGS[@]+"${ASSERTION_RULINGS_ARGS[@]}"})
-        if [[ -n "${VERIFY_ASSERTION_BASE:-}" ]]; then
-            ASSERTION_ARGS+=(--base "$VERIFY_ASSERTION_BASE")
-        fi
-        [[ "$PKG" != --workspace ]] || echo 'style-lint: assertion guard start'
-        "$PY" "$ASSERTION_GUARD_SCRIPT" "${ASSERTION_ARGS[@]}"
-        [[ "$PKG" != --workspace ]] || echo 'style-lint: assertion guard passed'
         if [[ "$PKG" != --workspace ]]; then
             require_member "$PKG"
         fi

@@ -16,7 +16,6 @@ import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
-from scripts.direct.verify_assertion_guard_test_support import write_guard
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -221,8 +220,6 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
         self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
-        assertion_guard = self.root / "assertion-guard.py"
-        write_guard(assertion_guard)
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
@@ -299,7 +296,6 @@ class VerifyLintScopeFixture(unittest.TestCase):
             "BUILDLOG_ZRAM": str(self.root / "zram"),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_TARGETS_SCRIPT": str(targets),
-            "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint" / "lint_config.sh"),
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
         })

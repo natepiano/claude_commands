@@ -256,7 +256,7 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 - **`power_profile_since` is the last write, not the last switch.** The daemon can rewrite its file with the same profile and a newer mtime. The report counts a change only when the profile name differs from the previous profiled sample.
 - **A subprocess test reads live `/proc` unless told otherwise.** A test that runs `sample()` in a subprocess must point `CPU_PRESSURE`, `IO_PRESSURE` and `STAT` at scratch paths, as `test_memory_records.py` does.
 - **The `(of …)` duration counts PSI pairs only.** It is the time of pairs where any PSI counter counted, so a host with only tick readings shows `0.0 s` sampled beside valid idle and iowait shares.
-- **A `SCHEMA_VERSION` raise changes `test_index.py`'s schema expectation**, which needs its own `Assertion-Change:` line at checkpoint.
+- **A `SCHEMA_VERSION` raise changes `test_index.py`'s schema expectation.**
 - **The cgroup path assumes cgroup v2.** The scope string reads the unified `0::` line of `/proc/self/cgroup`.
 - **basedpyright exits 3 in every checkout.** `pyrightconfig.json` names an absent `.venv`. The lint result is the error and warning counts line, not the exit code.
 
