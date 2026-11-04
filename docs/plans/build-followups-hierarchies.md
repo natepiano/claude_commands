@@ -533,16 +533,15 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 19 — The hierarchy measure command and its tests are deleted  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+- The hierarchy measure command is deleted (user, 2026-11-03: "delete it and its tests"). `scripts/hierarchies/` and `config/hierarchies/` no longer exist.
+- Deleted with it: the helper modules that only it used (`log_records.py`, `worker_owners.py`, `push_audit.py`), all four test files, and `config/hierarchies/coverage.toml` and `sessions.toml`.
+- The `scripts/hierarchies` entries in `pyrightconfig.json` and `scripts/build_targets/working_set_owners.json` are removed.
+- No new code. The change removes 10991 lines.
 
-**Goal:** `scripts/hierarchies/measure.py` and its tests are gone. Nothing runs the command and no phase reads its output (user, 2026-11-03: "delete it and its tests"; change-review row C201 returned for it).
+**Files:**
+- `pyrightconfig.json`, `scripts/build_targets/working_set_owners.json`.
+- `scripts/production/test_transfer_unit.py` — its fixture file is now `work.py`, not `measure.py`.
 
-**Spec:**
-- Delete `scripts/hierarchies/measure.py` and `scripts/hierarchies/test_measure.py`.
-- Delete each helper module that only the measure uses (check `log_records.py`, `worker_owners.py`, `push_audit.py` and their tests); keep a module that another script still imports.
-- Remove every remaining reference in code, tests, commands, config and as-built docs (`grep -rn "measure.py\|hierarchies.measure\|hierarchies/measure"`). Done plan phases stay as history.
-- The phase deletes code; it adds no new code.
-
-**Acceptance gate:** `grep -rn "hierarchies/measure\|hierarchies.measure" scripts commands config docs/as-built` prints nothing; the unittest modules of every changed test file pass; basedpyright on every changed file ends `0 errors, 0 warnings, 0 notes`.
+**Gotchas:** the assertion guard needs a ruling for each helper function in a deleted test file, not only `::test_*`.
