@@ -342,7 +342,7 @@ class StaffSourcesTests(StaffTestCase):
         old_timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-builds"
         (old_timer / "conf").unlink()
         old_timer.rmdir()
-        self.register_production("legacy-builds", doc)
+        self.register_production("legacy-builds", doc, name=owner.name)
         self.pane("w1:builds", session_id=owner.id, environment={"STAFF_ID": owner.id})
         for missing in (True, False):
             with self.subTest(missing=missing):
@@ -1220,7 +1220,8 @@ class StaffSourcesTests(StaffTestCase):
             self.assertCountEqual(record.rows, expected)
 
     def test_seed_rerun_uses_timers_parent_files_docs_and_pane_records(self) -> None:
-        _ = self.production("parent", workspace="umbrella")
+        parent_doc = self.production("parent", workspace="umbrella")
+        _ = staff.set_doc(fixture_member("showrunner", name="umbrella").id, staff.LiveDoc("natedev", parent_doc))
         _ = self.production("sdlc", "models-unit", workspace="tools", parent="parent")
         self.pane("w1:p1", session_id="1d7d742d-e609-510b-bc96-dc9075f7b72b", environment={})
         self.pane("w1:p2", session_id="86591fc4-4d3f-59f2-8ad1-7e155ba0787e", environment={"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})

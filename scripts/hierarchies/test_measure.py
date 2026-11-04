@@ -3693,6 +3693,27 @@ class SourcesTest(unittest.TestCase):
 
 
 class CanonicalQuestionWaitingTests(RegistrationFixture):
+    def test_unreadable_question_staff_reports_one_note_but_absent_staff_does_not(self) -> None:
+        self.timer("example")
+        self.write_open_for("example", {"since": "2026-10-05T12:00", "text": "Choose the layout",
+                                        "question": "Keep this layout?"})
+        self.outstanding().unlink()
+        path = Path(self.env["STAFF_FILE"])
+        _ = path.write_text("{invalid")
+        problems: list[log_records.SourceProblem] = []
+        with patch.dict(os.environ, self.env), production_paths(self.env):
+            waiting = m.read_waiting(self.state, self.root / "vault", [], problems)
+        self.assertEqual([item for item in waiting if item.kind == "questions"], [])
+        notes = [problem for problem in problems if problem.source == "showrunner questions"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn(str(path), notes[0].reason)
+        path.unlink()
+        problems.clear()
+        with patch.dict(os.environ, self.env), production_paths(self.env):
+            waiting = m.read_waiting(self.state, self.root / "vault", [], problems)
+        self.assertEqual([item for item in waiting if item.kind == "questions"], [])
+        self.assertEqual([problem for problem in problems if problem.source == "showrunner questions"], [])
+
     def test_waiting_counts_question_records_without_an_outstanding_json_file(self) -> None:
         self.timer("example")
         self.write_open_for("example", {"since": "2026-10-05T12:00", "text": "Choose the layout",

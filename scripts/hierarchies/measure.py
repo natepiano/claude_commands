@@ -1795,7 +1795,7 @@ def read_waiting(
     from scripts.production.update_registration import QuestionStaff, OutstandingReminder, read_open_items
 
     def read_questions() -> list[WaitingItem]:
-        identities = QuestionStaff.read()
+        identities = QuestionStaff.for_record(staff.initial_snapshot())
         documents = identities.documents()
         folder = state / "showrunner/outstanding"
         paths = {path.stem: path for path in folder.glob("*.json")}

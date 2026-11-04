@@ -1545,19 +1545,18 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
 
 
 def nightly_owner(args: GateArguments) -> str:
-    from scripts.production import showrunners
-    from scripts.production.production_units import Refusal, production_field
+    from scripts.production import session_staff, showrunners, staff
+    from scripts.shutdown import remote
 
     try:
         doc = change_review.production_doc(args.production)
     except change_review.ChangeReviewError:
         matching: list[Path] = []
+        record = staff.initial_snapshot()
+        resolver = session_staff.RowResolver(record)
         for candidate in showrunners.timer_docs().values():
-            try:
-                branch = production_field(candidate.read_text().splitlines(), "Merge branch")
-            except Refusal:
-                continue
-            if branch == args.merge_branch:
+            row = record.by_doc(remote.local_machine(), candidate)
+            if row is not None and resolver.merge_branch(row) == session_staff.Branch(args.merge_branch):
                 matching.append(candidate)
         if len(matching) != 1:
             return copies.fallback_owner("nightly")

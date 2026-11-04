@@ -720,9 +720,11 @@ class HerdrNameTests(unittest.TestCase):
         named, unnamed = root / "prod-production.md", root / "other-production.md"
         _ = named.write_text("# Prod\n\n- **Showrunner checkout:** `/repo`\n- **Showrunner session:** boss\n")
         _ = unnamed.write_text("# Other\n")
-        self.assertEqual(showrunners.herdr_space("prod", str(named)), "boss")
-        self.assertEqual(showrunners.herdr_space("other", str(unnamed)), "other")
-        self.assertEqual(showrunners.herdr_space("gone", str(root / "gone-production.md")), "gone")
+        with mock.patch.dict(os.environ, {"STAFF_FILE": str(root / "staff.json")}):
+            _ = fixture_member("showrunner", name="boss", doc=staff.LiveDoc("natedev", named))
+            self.assertEqual(showrunners.herdr_space("prod", str(named)), "boss")
+            self.assertEqual(showrunners.herdr_space("other", str(unnamed)), "other")
+            self.assertEqual(showrunners.herdr_space("gone", str(root / "gone-production.md")), "gone")
 
 if __name__ == "__main__":
     _ = unittest.main()

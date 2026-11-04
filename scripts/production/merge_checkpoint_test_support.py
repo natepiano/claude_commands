@@ -84,8 +84,7 @@ TRIAL = ("review trial: ux 2 findings, code 3 findings, review-worker minutes 14
 SIMPLE_OWNS = ("src/alpha.txt", "crates/alpha/", "docs/plans/alpha.md", "docs/plans/alpha-next.md")
 SIMPLE_MERGE_TESTS = "- **Merge tests:** `checkpoint-test`"
 REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` "
-                    "and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 "
-                    "because pyrightconfig names a `.venv` no checkout has), run in the showrunner checkout")
+                    "and `basedpyright scripts/buildlog` (status zero and a clean summary), run in the showrunner checkout")
 DELIVERS = "Delivers checkpoint merge behavior."
 PARALLEL = "Parallel: none — no phase is waiting"
 STUB = '''#!/usr/bin/env python3
@@ -136,7 +135,7 @@ if (state / ("fail-" + name)).exists():
 if name == "basedpyright":
     print("0 errors, 0 warnings, 0 notes", flush=True)
     print("venv .venv subdirectory not found in venv path " + os.getcwd() + ".", file=sys.stderr)
-    raise SystemExit(3)
+    raise SystemExit(0)
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
 
 

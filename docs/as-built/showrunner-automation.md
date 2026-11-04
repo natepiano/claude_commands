@@ -282,7 +282,7 @@ The pass shares one absolute monotonic deadline across discovery, pane text and 
 
 - `ssh`'s own exit status is always 0 here; the Mac pull is read from the `rc=` line it prints. The Mac pulls from `natedev:<first Promote checkout>`.
 
-- `merge_checkpoint.py` counts a `basedpyright` Merge tests command green when its last line is `0 errors, 0 warnings[, 0 notes]`, whatever its exit status.
+- `merge_checkpoint.py` accepts a Merge tests command only with status zero.
 
 - CI point: due at 5 code merges; `ci collect` requires job `Test Suite` by name. The review table is `report --since 2026-09-28`.
 

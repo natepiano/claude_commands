@@ -62,10 +62,7 @@ def showrunner_member(record: staff.StaffSnapshot, sources: session_staff.Member
                 raise ValueError("rename journal needs old and new slugs")
         except (OSError, ValueError) as error:
             raise staff.StaffUnreadable(f"{path}: {error}") from error
-        source = sources.productions.get(new)
-        former = showrunners.former_slugs(source.document) if source is not None else ()
-        # Formerly is supporting evidence, never a replacement for the journal.
-        if slug != old or (former and old not in former):
+        if slug != old:
             continue
         current = sources.member(session_staff.ShowrunnerMember(new), record)
         if isinstance(current, session_staff.MemberFound):

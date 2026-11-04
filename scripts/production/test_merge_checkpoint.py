@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff
 
 import os
@@ -55,7 +55,29 @@ class ReviewNumbersTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
-    def test_checkpoint_ignores_unavailable_worktrees_of_other_units(self) -> None:
+    def test_checkpoint_refuses_another_staff_parent_without_changes_on_retry(self) -> None:
+        checkpoint = self.checkpoint()
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            parent = recorded_showrunner("receiving", self.root / "receiving-production.md")
+            unit = unit_membership("example", "alpha-unit")
+            _ = staff.move(unit.id, parent.id)
+        before = self.git("show-ref"), self.git("status", "--porcelain")
+        origin = self.git("show-ref", cwd=self.origin)
+        document = self.doc.read_bytes()
+        record = Path(self.env["STAFF_FILE"]).read_bytes()
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.run_checkpoint(checkpoint).process
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("alpha-unit: staff parent is", result.stdout)
+                self.assertIn("receiving", result.stdout)
+                self.assertEqual((self.git("show-ref"), self.git("status", "--porcelain")), before)
+                self.assertEqual(self.git("show-ref", cwd=self.origin), origin)
+                self.assertEqual(self.doc.read_bytes(), document)
+                self.assertEqual(Path(self.env["STAFF_FILE"]).read_bytes(), record)
+                self.assertEqual(self.events("checkpoint-test"), [])
+
+    def test_checkpoint_merges_into_its_staff_parent_and_ignores_unavailable_worktrees(self) -> None:
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             row = unit_membership("example", "retired-unit")
@@ -423,10 +445,11 @@ class TestPassedTests(unittest.TestCase):
 
     def judge(self, status: int, stdout: str, stderr: str = "") -> bool:
         result = subprocess.CompletedProcess(["basedpyright"], status, stdout, stderr)
-        return merge_checkpoint.test_passed(["/nix/bin/basedpyright", "scripts/buildlog"], result)
+        return merge_checkpoint.test_passed(result)
 
-    def test_clean_basedpyright_passes_with_trailing_venv_line_on_stderr(self) -> None:
-        self.assertTrue(self.judge(3, "0 errors, 0 warnings, 0 notes\n", self.VENV))
+    def test_clean_basedpyright_requires_status_zero(self) -> None:
+        self.assertTrue(self.judge(0, "0 errors, 0 warnings, 0 notes\n", self.VENV))
+        self.assertFalse(self.judge(3, "0 errors, 0 warnings, 0 notes\n", self.VENV))
 
     def test_basedpyright_with_errors_fails(self) -> None:
         self.assertFalse(self.judge(1, "/checkout/a.py:1:1 - error: x\n2 errors, 0 warnings, 0 notes\n", self.VENV))
@@ -434,8 +457,8 @@ class TestPassedTests(unittest.TestCase):
 
     def test_other_commands_pass_only_on_status_zero(self) -> None:
         result = subprocess.CompletedProcess(["python3"], 3, "0 errors, 0 warnings, 0 notes\n", "")
-        self.assertFalse(merge_checkpoint.test_passed(["python3", "-m", "unittest"], result))
-        self.assertTrue(merge_checkpoint.test_passed(["python3"], subprocess.CompletedProcess(["python3"], 0, "", "")))
+        self.assertFalse(merge_checkpoint.test_passed(result))
+        self.assertTrue(merge_checkpoint.test_passed(subprocess.CompletedProcess(["python3"], 0, "", "")))
 
 
 @final

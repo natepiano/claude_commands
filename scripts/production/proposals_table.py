@@ -333,7 +333,12 @@ def scope_issues(doc: Path, below: bool = False) -> list[Issue]:
 
 def improvement_ledgers(doc: Path, below: bool = False) -> list[Path]:
     """The Improvement queue ledger of the production, and with `below` of each one below it, once each."""
-    return list(dict.fromkeys(found for each in scope_docs(doc, below) if (found := ledger(each)) is not None))
+    paths: dict[Path, None] = {}
+    for each in scope_docs(doc, below):
+        found = ledger(each)
+        if found is not None:
+            paths[found] = None
+    return list(paths)
 
 
 def waiting_entries(doc: Path, below: bool = False) -> tuple[list[urgency.Entry[Row]], list[Row]]:

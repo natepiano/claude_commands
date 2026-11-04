@@ -479,23 +479,15 @@ def former_slugs(text: str) -> tuple[str, ...]:
 
 def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
     """Map a former production name to its current slug; leave other slugs unchanged."""
-    timers: list[Timer] = []
+    sources: list[ShowrunnerSource] = []
     for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
         try:
-            timer = _timer(instance)
+            sources.append(_source(instance))
         except (OSError, KeyError, ValueError, UnicodeError):
             continue
-        if timer.slug == slug:
-            return slug
-        timers.append(timer)
-    for timer in timers:
-        try:
-            text = timer.doc.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            continue
-        if slug in former_slugs(text):
-            return timer.slug
-    return slug
+    if any(source.timer.slug == slug for source in sources):
+        return slug
+    return next((source.timer.slug for source in sources if slug in former_slugs(source.document)), slug)
 
 
 def current_name(slug: str) -> str:
@@ -516,16 +508,9 @@ def _name_in(slug: str, runners: list[Showrunner]) -> str:
 
 
 def herdr_space(slug: str, doc: str) -> str:
-    """The shared herdr session's workspace for a production, named for its showrunner.
-
-    The doc's `Showrunner session:` line names it, else the slug. The name never depends on whether
-    the showrunner runs, so a unit restarted before its showrunner finds the same workspace.
-    """
-    try:
-        text = Path(doc).read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        text = ""
-    return space_from_text(slug, text)
+    """Use the staff name for the workspace, or the slug before registration."""
+    row = staff.initial_snapshot().by_doc(remote.local_machine(), Path(doc))
+    return row.name if row is not None else slug
 
 
 def space_from_text(slug: str, text: str) -> str:

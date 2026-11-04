@@ -811,10 +811,8 @@ def question_folder(document: Path, identities: QuestionStaff) -> QuestionFolder
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
     folder = issues_folder(owner.doc.path)
-    if folder is None:
-        root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-        folder = root / owner.id / "questions"
-    return QuestionFolder(folder, owner.id)
+    root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+    return QuestionFolder(folder if folder is not None else root / owner.id / "questions", owner.id)
 
 
 @dataclass(frozen=True)
@@ -1042,15 +1040,7 @@ def read_all_open_fields() -> list[OutstandingItem]:
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     paths = {path.stem: path for path in (root / "outstanding").glob("*.json")}
     fields: list[OutstandingItem] = []
-    try:
-        identities = QuestionStaff.read()
-    except staff.StaffUnreadable:
-        for path in sorted(paths.values()):
-            try:
-                fields.extend(stored_entries(path))
-            except (OSError, InputError, ValueError):
-                continue
-        return fields
+    identities = QuestionStaff.for_record(staff.initial_snapshot())
     documents = identities.documents()
     for slug in sorted(set(paths) | set(documents)):
         try:

@@ -450,7 +450,7 @@ class StaffTestCase(unittest.TestCase):
         """Write real timer/doc sources; each listed unit has a staff row and a folder."""
         doc = self.source_root / f"{slug}-production.md"
         self.write_production_doc(doc, workspace=workspace or slug)
-        self.register_production(slug, doc)
+        self.register_production(slug, doc, name=workspace or slug)
         for unit in units:
             _ = self.worktree(unit)
             owner = fixture_runtime_id("showrunner::" + (workspace or slug))
@@ -469,20 +469,18 @@ class StaffTestCase(unittest.TestCase):
             write_text_atomic(parent_file, parent + "\n")
         return doc
 
-    def register_production(self, slug: str, doc: Path) -> None:
+    def register_production(self, slug: str, doc: Path, *, name: str = "") -> None:
         """Register an existing fixture document without making a second production."""
         timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
-        from scripts.production import showrunners
-
-        name = showrunners.herdr_space(slug, str(doc))
-        identity = fixture_runtime_id("showrunner::" + name)
+        identity = fixture_runtime_id("showrunner::" + (name or slug))
         write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
 
     def record_production(self, slug: str, doc: Path) -> staff.StaffRow:
         """Register the timer and record its private owner document."""
-        self.register_production(slug, doc)
-        return recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
+        row = recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
+        self.register_production(slug, doc, name=row.name)
+        return row
 
     def write_production_doc(self, doc: Path, *, workspace: str) -> None:
         write_text_atomic(doc, f"# Fixture production\n- **Showrunner session:** `{workspace}`\n")

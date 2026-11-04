@@ -304,12 +304,18 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertTrue((checkout / ".git").is_dir())
 
     def test_nightly_notice_resolves_the_production_from_its_branch_without_a_calling_session(self) -> None:
-        from scripts.production import showrunners
+        from scripts.production import showrunners, staff
+        from scripts.production.staff_test_support import fixture_member
+        from scripts.shutdown import remote
 
-        self.write(self.quiet_production, "- **Merge branch:** `integration`\n")
+        production = self.checkout / "quiet-production.md"
+        self.write(production, "# Quiet production\n")
         output = io.StringIO()
-        with mock.patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}), \
-                mock.patch.object(showrunners, "timer_docs", return_value={"quiet": self.quiet_production}), \
+        environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "", "STAFF_FILE": str(self.root / "staff.json")}
+        with mock.patch.dict(os.environ, environment):
+            _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc(remote.local_machine(), production))
+        with mock.patch.dict(os.environ, environment), \
+                mock.patch.object(showrunners, "timer_docs", return_value={"quiet": production}), \
                 mock.patch.object(showrunners, "tell", return_value="could not tell quiet: offline") as send, \
                 redirect_stdout(output):
             merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"),
