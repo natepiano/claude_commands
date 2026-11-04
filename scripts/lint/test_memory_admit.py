@@ -5144,6 +5144,7 @@ class CiSliceMemoryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = fake_memory_readings(self.root)
+        write_memory_config(self.root / "lint.conf", ci_memory_margin_gib="6")
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         self.ci = self.root / "ci.slice"
         self.proc = self.root / "proc"
