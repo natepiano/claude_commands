@@ -2941,18 +2941,9 @@ class PhaseTableTests(unittest.TestCase):
                     "",
                     "**Phase 1 of 1 — Current delivery**",
                     "",
-                    "| | |",
-                    "| --- | --- |",
-                    "| Started | 01-01 00:16 |",
-                    "| Done | — |",
-                    "| ETA | — |",
-                    "| ETA from | — |",
-                    "| Plan finish | — |",
-                    "| Updated | 01-01 00:20 UTC |",
-                    "",
-                    "| Phase | What it delivers | Status | Start | Finish |",
-                    "| --- | --- | --- | --- | --- |",
-                    "| 1 | Current delivery | running | 01-01 00:16 | — |",
+                    "| Phase | What it delivers | Status |",
+                    "| --- | --- | --- |",
+                    "| 1 | Current delivery | running |",
                     "",
                 )
             ),
@@ -3003,6 +2994,127 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(lines[5], 'now: "No phase running — 1 of 2 done"')
         heading = next(line for line in lines if line.startswith("**"))
         self.assertEqual(json.loads(lines[5].removeprefix("now: ")), heading[2:-2])
+
+    def test_refresh_keeps_bases_filter_group_and_link_properties_in_frontmatter(self) -> None:
+        self.write_production_plan()
+        self.mark_unit("table")
+        for arguments in (
+            ("remote", "add", "origin", "git@github.com:someone/tools.git"),
+            ("symbolic-ref", "HEAD", "refs/heads/main"),
+        ):
+            _ = subprocess.run(
+                ["git", "-C", str(self.working_dir), *arguments],
+                check=True,
+                capture_output=True,
+            )
+        production = self.working_dir / "docs" / "show-production.md"
+        original = production.read_text(encoding="utf-8")
+        cases = (
+            ("github", self.working_dir, "https://github.com/someone/tools/blob/main/docs/show-production.md"),
+            ("vault", self.vault_root.parent, "[[docs/show-production]]"),
+        )
+        for label, checkout, link in cases:
+            with self.subTest(link=label):
+                _ = production.write_text(
+                    original.replace(
+                        "## Production Context\n",
+                        f"## Production Context\n\n- **Promote:** {checkout}\n",
+                    ),
+                    encoding="utf-8",
+                )
+
+                result = self.run_refresh()
+
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                note = self.vault_root / "showrunner" / "table.md"
+                self.assertEqual(
+                    note.read_text(encoding="utf-8").splitlines()[:7],
+                    [
+                        "---",
+                        "phase_table: true",
+                        "showrunner: showrunner",
+                        f"production_file: {json.dumps(link)}",
+                        "unit: table-unit",
+                        'now: "Phase 1 of 1 — Current delivery"',
+                        "---",
+                    ],
+                )
+
+    def test_refresh_keeps_note_bytes_and_mtime_when_only_time_and_progress_change(self) -> None:
+        self.write_production_plan()
+        self.mark_unit("table")
+        vault = self.vault_root.parent
+        _ = subprocess.run(["git", "init", "-q", str(vault)], check=True, capture_output=True)
+        self.assertEqual(self.run_refresh().returncode, 0)
+        note = self.vault_root / "showrunner" / "table.md"
+        before = note.read_bytes()
+        _ = subprocess.run(["git", "-C", str(vault), "add", "showrunners"], check=True, capture_output=True)
+        _ = subprocess.run(
+            ["git", "-C", str(vault), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+             "commit", "-qm", "Initial phase notes"], check=True, capture_output=True,
+        )
+        os.utime(note, ns=(123_000_000_000, 123_000_000_000))
+        before_stat = note.stat()
+        _ = self.write_run(
+            "current", 900,
+            self.phase_event("phase_started", "1", "one", 1_000, phase_title="Current delivery"),
+            self.phase_event(
+                "progress_reported", "1", "one", 1_250,
+                phase_percent=50, phase_elapsed_seconds=250,
+            ),
+            self.phase_event("eta_stated", "1", "one", 1_250, eta_at=1_300, basis="checkpoint"),
+        )
+
+        for at in (1_260, 10_000):
+            with self.subTest(at=at):
+                result = self.run_refresh(at=at)
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                self.assertEqual(note.read_bytes(), before)
+                self.assertEqual(note.stat().st_mtime_ns, before_stat.st_mtime_ns)
+                self.assertEqual(note.stat().st_ino, before_stat.st_ino)
+                status = subprocess.run(
+                    ["git", "-C", str(vault), "status", "--porcelain"],
+                    check=True, capture_output=True, text=True,
+                )
+                self.assertEqual(status.stdout, "")
+
+    def test_refresh_writes_a_changed_phase_and_keeps_the_next_refresh_unchanged(self) -> None:
+        self.write_production_plan()
+        self.mark_unit("table")
+        self.assertEqual(self.run_refresh().returncode, 0)
+        note = self.vault_root / "showrunner" / "table.md"
+        before = note.read_bytes()
+        _ = self.write_run(
+            "current", 900,
+            self.phase_event("phase_started", "1", "one", 1_000, phase_title="Current delivery"),
+            self.phase_event(
+                "phase_finished", "1", "one", 1_300,
+                status="completed", phase_elapsed_seconds=300,
+            ),
+        )
+        self.write_plan(self.plan.read_text().replace("status: todo", "status: done"))
+
+        result = self.run_refresh(at=1_400)
+
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertNotEqual(note.read_bytes(), before)
+        self.assertIn('now: "No phase running — 1 of 1 done"', note.read_text())
+        self.assertIn("| 1 | Current delivery | done |", note.read_text())
+        before_stat = note.stat()
+        self.assertEqual(self.run_refresh(at=1_500).returncode, 0)
+        self.assertEqual(note.stat().st_mtime_ns, before_stat.st_mtime_ns)
+        self.assertEqual(note.stat().st_ino, before_stat.st_ino)
+        _ = self.write_run(
+            "current", 900,
+            self.phase_event("phase_started", "1", "one", 1_000, phase_title="Current delivery"),
+            self.phase_event(
+                "phase_finished", "1", "one", 1_450,
+                status="completed", phase_elapsed_seconds=450,
+            ),
+        )
+        self.assertEqual(self.run_refresh(at=2_000).returncode, 0)
+        self.assertEqual(note.stat().st_mtime_ns, before_stat.st_mtime_ns)
+        self.assertEqual(note.stat().st_ino, before_stat.st_ino)
 
     def test_refresh_with_phase_outside_the_plan_drops_the_plan_count(self) -> None:
         self.write_production_plan()
@@ -3066,7 +3178,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assertNotIn("old copy", refreshed)
         self.assertEqual(refreshed.splitlines()[4], text.splitlines()[4])
         self.assertIn(f"**Phase 1 of 1 — {title}**\n", refreshed)
-        self.assertIn("| Updated | 01-01 00:21 UTC |", refreshed)
+        self.assertNotIn("| Updated |", refreshed)
 
     def test_refresh_replaces_three_key_note_with_current_heading(self) -> None:
         self.write_production_plan()
@@ -3290,7 +3402,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertTrue(target.is_file())
         text = target.read_text(encoding="utf-8")
-        self.assertIn("| Updated | 01-01 00:21 UTC |", text)
+        self.assertNotIn("| Updated |", text)
         self.assertIn("\nshowrunner: last-known-showrunner\n", text)
         self.assertEqual(
             [path.relative_to(self.vault_root) for path in self.vault_root.rglob("*.md")],
@@ -3400,7 +3512,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(len(result.stderr.splitlines()), 1)
 
-    def test_refresh_adds_showrunners_to_containing_checkout_exclude_once(self) -> None:
+    def test_refresh_keeps_showrunners_available_to_git(self) -> None:
         self.write_production_plan()
         self.mark_unit("table")
         self.vault_root = self.working_dir / "showrunners"
@@ -3410,10 +3522,15 @@ class PhaseTableTests(unittest.TestCase):
 
         exclude = self.working_dir / ".git" / "info" / "exclude"
         self.assertEqual((first.returncode, second.returncode), (0, 0))
-        self.assertEqual(exclude.read_text(encoding="utf-8").splitlines().count("showrunners/"), 1)
+        self.assertNotIn("showrunners/", exclude.read_text(encoding="utf-8").splitlines())
+        untracked = subprocess.run(
+            ["git", "-C", str(self.working_dir), "ls-files", "--others", "--exclude-standard", "--", "showrunners"],
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(untracked.stdout.strip(), "showrunners/showrunner/table.md")
         self.assertFalse((self.vault_root / ".gitignore").exists())
 
-    def test_refresh_excludes_vaults_relative_path_once(self) -> None:
+    def test_refresh_does_not_exclude_a_custom_vault_path(self) -> None:
         self.write_production_plan()
         self.mark_unit("table")
         self.vault_root = self.working_dir / "notes" / "tables"
@@ -3425,7 +3542,7 @@ class PhaseTableTests(unittest.TestCase):
         exclude = self.working_dir / ".git" / "info" / "exclude"
         lines = exclude.read_text(encoding="utf-8").splitlines()
         self.assertEqual((first.returncode, second.returncode), (0, 0))
-        self.assertEqual(lines.count("notes/tables/"), 1)
+        self.assertNotIn("notes/tables/", lines)
         self.assertNotIn("showrunners/", lines)
 
         before_top_level_refresh = exclude.read_bytes()
@@ -3772,7 +3889,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assertFalse(source.exists())
         self.assertTrue(archived.is_file())
         self.assertEqual(archived_ignore.returncode, 1)
-        self.assertEqual(source_ignore.returncode, 0)
+        self.assertEqual(source_ignore.returncode, 1)
         self.assertNotIn(
             "archive",
             gitignore.read_text(encoding="utf-8") if gitignore.exists() else "",
