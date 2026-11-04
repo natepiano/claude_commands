@@ -15,9 +15,12 @@
   - Revealed by: Phase 25 review (Phase 4 Spec 6; builds showrunner 2026-10-30: next, dated on or after 2026-12-05)
 
 - [ ] **Measure EASY backfill against the deployed Rule A queue policy**
-  - Start after Phase 31 has run on main for a day; bound the cohort at any later queue-priority or head-policy change.
-  - Compare EASY with the deployed ordered walk, including Rule A and recovery spacing, and report additional wait savings and head delay using the same admission function.
-  - Revealed by: Phase 30; baseline corrected after Phase 31's Work Order.
+  - Start after both Phase 39 checkpoints reach main and one day of observations exists.
+  - Bound the cohort at changes to queue priority, head policy, estimation, running charge, budget, or headroom settings.
+  - Compare EASY with the deployed ordered walk, including Rule A and recovery spacing.
+  - Use the same admission function and cohort settings for both policies.
+  - Report additional wait savings and head delay.
+  - Revealed by: Phase 30; baseline corrected after Phase 31's Work Order and Phase 39.
 
 - [ ] **Make the build_targets.py call from verify.sh cheap: it costs 199 ms of CPU on every step**
   - Why needed: verify measured `build_targets.py` at 199 ms of CPU each time `verify.sh` starts it, on every step; it is the most costly helper.
