@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import errno
+from contextlib import redirect_stderr
+import io
 import subprocess
 import sys
 import unittest
@@ -13,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import unit_files
 from git_process import GitReadFailed
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_member
 
 
 class UnitFilesTests(unittest.TestCase):
@@ -43,10 +47,37 @@ class UnitFilesTests(unittest.TestCase):
 
     def test_production_document_failure_stays_a_file_error(self) -> None:
         failure = PermissionError('document unreadable')
-        with mock.patch.object(unit_files, 'read_production'), mock.patch.object(Path, 'read_text', side_effect=failure):
+        with mock.patch.object(staff, 'snapshot', return_value=staff.StaffSnapshot(())), mock.patch.object(Path, 'read_text', side_effect=failure):
             with self.assertRaises(PermissionError) as refused:
                 _ = unit_files.unit_worktrees(Path('/unreadable.md'))
         self.assertIs(refused.exception, failure)
+
+
+class UnitWorktreeAvailabilityTests(StaffTestCase):
+    def test_unavailable_rows_keep_the_live_unit_and_report_each_skipped_row(self) -> None:
+        doc = self.source_root / 'style-production.md'
+        _ = doc.write_text(
+            '# Style production\n- **Merge branch:** main\n\n## Units\n\n'
+            + '| Unit | Branch | Plan |\n| --- | --- | --- |\n'
+            + '| standby-unit | standby-branch | standby |\n'
+            + '| missing-unit | missing-branch | docs/missing.md |\n'
+            + '| live-unit | live-branch | docs/live.md |\n')
+        owner = fixture_member('showrunner', name='style', doc=staff.LiveDoc('natedev', doc))
+        live_folder = self.root / 'live'
+        live_folder.mkdir()
+        for name in ('standby', 'live'):
+            _ = fixture_member('unit', name=name, parent=owner.id,
+                               worktree=staff.PresentWorktree('natedev', self.root / name))
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            result = unit_files.unit_worktrees(doc)
+        self.assertEqual(result, (unit_files.UnitWorktree('live-unit', 'live-branch', live_folder, 'main'),))
+        messages = errors.getvalue().splitlines()
+        self.assertEqual(len(messages), 2)
+        self.assertIn('standby-unit', messages[0])
+        self.assertIn('Plan folder is unavailable', messages[0])
+        self.assertIn('missing-unit', messages[1])
+        self.assertIn('no matching staff member', messages[1])
 
 
 if __name__ == '__main__':

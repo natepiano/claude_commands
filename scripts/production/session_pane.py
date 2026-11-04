@@ -14,6 +14,7 @@ from herdr import AgentBlocked, Herdr  # noqa: E402
 from herdr import HerdrFailure as HerdrFailure  # noqa: E402
 from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
 from unit_lookup import LiveClaude, Place, marked_unit, sessions_dir  # noqa: E402
+from scripts.lib.script_envelope import script_prompt  # noqa: E402
 
 USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <slug> <unit>|session <id>> "
          "[--lines N --joined --ansi | <text> | <key>...]")
@@ -37,7 +38,7 @@ def agent_status(place: Place, *, deadline: float = math.inf) -> herdr.AgentStat
 
 
 def type_place(place: Place, text: str, *, target: str) -> None:
-    Herdr(place.session).prompt(place.pane, text, target=target)
+    Herdr(place.session).prompt(place.pane, script_prompt(text), target=target)
 
 
 def keys_place(place: Place, *keys: str, target: str) -> None:

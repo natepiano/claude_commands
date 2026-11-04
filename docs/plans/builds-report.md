@@ -49,6 +49,22 @@ sdlc corrected its rerun figure: 46% → 16% (same folder, next start 0–10 min
 
 Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's number beside it. For phases, use natedev only and say so. The fail-then-fail gap (ours 80 h against 50–55) goes on the report as a note.
 
+2026-11-03 15:3x EST (the user, to report-unit, after an interview)
+
+The build report is too long for the user and is not used for analysis. Retire it. Keep all the data. report-unit's job is now a loop like the test improvement work. Each round has five steps:
+
+1. Rank the largest build cost.
+2. State a prediction.
+3. Fix the cost where it lives.
+4. Measure the result.
+5. Repeat.
+1. Score: phase time, the wall time of each finished phase. Build hours per phase are the second view.
+2. Scope: all build capacity (natedev, the Mac, CI, and the AWS build machine when it opens), every repository and production. Rank by cost only.
+3. Authority: report-unit fixes buildlog code itself and owns every hypothesis and measurement. A fix in another unit's code goes through the showrunner, and that unit edits. Money (AWS hours), machine changes and worker rule changes go to the user first.
+4. Speed: one or two rounds open. A round is measured after at least 10 finished hana phases, plus one more day if the result is not clear. This is a starting point.
+5. Reports: keep the showrunner informed; the showrunner and report-unit agree when the user hears. The user always hears a measured change, up or down.
+6. Later, lower priority: a way to see the build history as charts, not tables.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the build log and its report.
@@ -86,7 +102,7 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 #### As-built
 
 - `scripts/buildlog/moments.py` is the one place for build moments and the hana set:
-  - `MOMENTS` holds 6 fixed moments (herdr cgroup move, baloo off, hana opt-level 1, hana Bevy dylib, the floor sweep, Build rules 1). Moment 1 carries sdlc's week baseline; the floor sweep carries sdlc's clone repeat figures. Moment 2 is one new `MOMENTS` entry when its hash lands.
+  - `MOMENTS` holds 6 fixed moments (herdr cgroup move, baloo off, hana opt-level 1, hana Bevy dylib, the floor sweep, Build rules 1); Phase 3 adds a seventh. Moment 1 carries sdlc's week baseline; the floor sweep carries sdlc's clone repeat figures. Moment 2 is one new `MOMENTS` entry when its hash lands.
   - `HANA_CTE` is the one hana set: sdlc's `nat` predicate, with sessions and calls classified over each measured window, natedev only.
   - `MetricKey` names each metric; `RATE_ROWS` lists the rate rows.
   - `window_rates(connection, start, end, *, phases=())` makes one SQL population read and one Python pass for every row. A step with a NULL session or cwd counts in the totals but never pairs.
@@ -132,3 +148,129 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_memory_window.py`, `scripts/lint/test_invoke_scope.py` — tests
 
 **Gotchas:** earlyoom joins argv with spaces and no shell quotes, so only the text before the first space is the program. A journal that cannot be read is `unavailable`, never zero.
+
+### Phase 3 — The build report splits build rates at the queue test-phase charge  · status: done
+**Depends on:** Phase 1
+
+#### As-built
+
+- `MOMENTS` in `scripts/buildlog/moments.py` gains `BuildMoment(2026-10-31 20:36 UTC, "Queue test-phase charge (2a819dfd)", "all")`, 16:36 EDT, with no sdlc baseline. The showrunner set it when queue's test-phase charge and one decision pass reached main.
+- It is not Moment 2. Moment 2 stays phases-unit's prompt and lint change.
+- `buildlog moments` shows it as the newest section, with Build rules 1 (Moment 1) as its before window. Its after window is thin until a day of data exists.
+
+**Files:** `scripts/buildlog/moments.py`; `scripts/buildlog/test_moments.py` (the pinned moment order).
+
+### Phase 4 — /build:report names the hourly memory table  · status: done
+**Depends on:** Phase 1
+
+#### As-built
+
+- `commands/build/report.md` names `buildlog usage-hours [YYYY-MM-DD]` near its top. The line lists what the table holds: hourly build memory, process memory, file cache, build and CI CPU, disk traffic, lowest free disk and free pool tokens.
+- A second line tells the agent to run it for questions about memory, CPU or disk by hour, and to answer from its table in a few lines.
+- Source: the user's change review C682 (2026-11-02). The table is hard to read in the CLI; agents use it for analysis.
+
+**Files:** `commands/build/report.md`.
+
+### Phase 5 — The build report compares moments per phase, not per day  · status: done
+**Depends on:** Phase 1
+
+2026-11-03 (the user, through the builds showrunner): the machines ran much lighter after Build rules 1. A time comparison per day does not show whether matters improved. The report needs a comparison per a unit of work.
+
+#### As-built
+
+- The unit of work is the finished natedev hana phase (`WindowRates.phase_count`).
+- Each build moment's rate table leads with rows per phase: nextest, clippy, run hours, wait hours, failed nextest, nextest reruns, clone rebuilds, clone rebuild hours and fail-then-fail runs.
+- One row shows hana wait hours per hana run hour. It is unavailable when run hours are zero.
+- The per-day rows follow. Each cell suffix states its unit (`/phase`, `h /phase`, `/day`, `h /day`, `%`, `h wait / h run`). The header is `| Rate | Before | After | Change |`.
+- Under the table: `Hana phases finished: before N, after M.` and a note. The note says per-day rows follow load, per-phase counts do not, and per-phase hours still fall on a quieter machine.
+- `RateRow.formula` is `PerDay | Ratio`. One loop over `RATE_ROWS` computes every rate. Units `runs_per_phase` and `hours_per_phase` replace `per_phase`.
+- Both moment tables and the Moment 1 baseline table use `table()`, `rate_change()` and `rate_window_days()`. The baseline line reads `Hana phases finished in the baseline: N.`
+- Not added: rates per landed commit. A move of the note to one place per report is not made; the note stays under each table.
+
+**Files:** `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/test_moments.py`.
+
+### Phase 6 — Dylib A/B timing for hana  · status: todo
+**Depends on:** none
+
+2026-11-03 (the user approved, through the builds showrunner): real-use data cannot isolate the Bevy dylib's effect. Time the same hana commit on the same machine with the dylib on and off. Run each side through verify.sh:
+
+1. Run one cold build.
+2. Run three incremental test runs.
+
+The result goes to the showrunner. No repository code changes.
+
+Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases.
+
+### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
+**Depends on:** none (runs beside Phase 6)
+
+#### As-built
+
+- `buildlog costs [--days N]` (`scripts/buildlog/costs.py`) prints one ranked list of build hours lost by machine and cause, as h/day and h/finished phase. Causes: memory wait, cold rebuilds (50+ crates), failed runs, reruns after a pass, cancelled CI, and Mac idle while natedev waits. It runs in 0.45–0.70 s.
+- The machine comes from `steps.target`, else from `record.target_hosts()`. No host list is copied.
+- Mac idle = candidate waits minus Mac execution and complete Mac holds. Holds with no recorded end make the row an upper bound, with its unknown part beside it (`MacIdleEstimate`, `RankedCost.unknown_seconds`).
+- Phase time reads only `phase_finished` events (wall time = finish minus `phase_started_at`). It prints the median and p90 for hana phases and for all phases.
+- `moments.py` holds the shared `window_bounds`, `nextest_outcome`, `previous_nextest` and `nearest_rank`. `number_option.py` parses `--days` and `--hours`. `holds.py` and `mac_outcome.py` import coordination and recorder modules only where a reader needs them.
+- `docs/plans/builds-report-rounds.md` holds the round record, with four round-1 rows.
+- `/build:report` (`commands/build/report.md`) is retired. `buildlog report`, the index and every collector remain.
+
+**Files:** `scripts/buildlog/costs.py`, `scripts/buildlog/number_option.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/holds.py`, `scripts/buildlog/mac_report.py`, `scripts/buildlog/mac_outcome.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `docs/plans/builds-report-rounds.md`.
+
+### Phase 8 — Build history as charts  · status: done
+**Depends on:** Phase 7
+
+The user, 2026-11-03: tables do not work for them. Lower priority. Design a chart view of the build history (costs and phase time over time, each build change marked). Design first; the build waits for the user's go.
+
+#### As-built
+
+- Design: `docs/plans/builds-report-charts-design.md`. The user said "go" on 2026-11-03, relayed by builds.
+- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html` and opens it. The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
+- Charts: hana phase time (daily median and p90), costs by cause as small multiples, and costs by machine. Each has numbered moment lines, a crosshair tooltip and a table view.
+- `costs.py` is the shared cost reader for `buildlog costs` and `buildlog charts`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
+- `index.py` `COST_INDEXES` (made in `create_schema` and `open_for_update`) give indexed window reads instead of whole-table scans.
+- Speed, as process CPU time (user+sys): 7 days 0.60–0.71 s (limit 1.5 s); 30 days 1.76–1.82 s (limit 3 s).
+- The fresh design check found two label defects; Phase 10 fixes them.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/index.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_index.py`, `docs/plans/builds-report-charts-design.md`.
+
+### Phase 9 — Round 1: find why natedev rebuilds cold  · status: done
+**Depends on:** Phase 7
+
+Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second largest cost. Find the cause before a fix. Query the index for cold steps: worktree, target folder, and the event before each (new clone, branch switch, toolchain or flag change, sweep deletion). Write the cause with counts and hours to `docs/plans/builds-report-rounds.md`, then send it to the showrunner, which names the owner. No code changes.
+
+### Phase 10 — Chart labels do not collide  · status: todo
+**Depends on:** Phase 8
+
+The fresh design check of the Phase 8 shots (dataviz label rules) found two defects on the `buildlog charts` page:
+
+1. The moment numbers above each of the six cost panels sit on the panel title (for example "2 1" over "Memory wait · h/day"). Keep the numbers clear of every panel title, at desktop and phone width.
+2. Costs by machine: the mac and CI lines are both 0, so the CI line hides the mac line. The end labels move apart to avoid each other, so "mac" sits beside the natedev line end and "natedev" sits far above it. Each end label must sit beside its own line end, or the chart must name the series in another clear way; a line hidden under another must stay visible (dataviz: 2px surface ring on overlapping marks).
+
+Acceptance: new tests in `scripts/buildlog/test_charts.py` pin both rules (no moment number box overlaps a panel title box; each end label is nearest its own line end). Fresh shots at 1280 px light and dark and at 500 px, judged once more under the dataviz rules.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/test_charts.py`.
+
+### Phase 11 — Every build step records its real target folder  · status: todo
+**Depends on:** none (runs beside Phase 10)
+
+The builds showrunner, 2026-11-03: add-on 1 is current and belongs to report-unit (its Units row owns `scripts/buildlog/`, the build log and its writer). Phase 9 found that 1,399 of 1,517 cold natedev steps in 7 days have no absolute target folder (678 `unknown`, 721 unset). Cold-cause rounds cannot tell which folder went cold.
+
+1. Every step the build log records carries its resolved absolute target folder.
+2. A step with no target folder records an explicit none state, never a blank or a missing field.
+3. One owner switches all callers: edit each caller that records a step (verify.sh call sites and any other). Tell verify-unit the exact lines before they are edited.
+
+Acceptance: tests pin the target folder for each step kind and the explicit none state. A live run of one step shows its folder in the index.
+
+**Files:** `scripts/buildlog/` (writer and index), each caller that records a step (found by search; `scripts/direct/verify.sh` first).
+
+### Phase 12 — A vault stop that waits on the user does not fail buildlog.service  · status: done
+**Depends on:** none (urgent bump from the builds showrunner, 2026-11-03)
+
+The user unit `buildlog.service` on natedev failed from 21:29 EST. The vault step stopped on uncommitted files in `~/rust/hanadocs` on the Mac and returned exit 1 (`vault_pull.py:310` returns 1 for every stop except "Mac unreachable"). The stop already alerts the user to commit or discard the files.
+
+1. A vault stop that waits on a user action, with its alert sent, exits 0 and keeps its printed stop line.
+2. A real failure (`command_failed`) still exits 1.
+
+Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command_failed`. The next hourly `buildlog.service` run ends without failure.
+
+**Files:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.

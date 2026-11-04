@@ -3110,10 +3110,10 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(sync.sync_time("2026-10-02T16:14:00+00:00", now), "2026-10-02 12:14 EDT")
 
     def test_nearest_rank_matches_p95_boundaries_and_single_value(self) -> None:
-        self.assertEqual(report.nearest_rank(list(range(1, 21)), 95), 19)
-        self.assertEqual(report.nearest_rank(list(range(1, 22)), 95), 20)
-        self.assertEqual(report.nearest_rank([37], 95), 37)
-        self.assertEqual(report.nearest_rank([360, 720, 1080, 1440], 75), 1080)
+        self.assertEqual(moments.nearest_rank(list(range(1, 21)), 95), 19)
+        self.assertEqual(moments.nearest_rank(list(range(1, 22)), 95), 20)
+        self.assertEqual(moments.nearest_rank([37], 95), 37)
+        self.assertEqual(moments.nearest_rank([360, 720, 1080, 1440], 75), 1080)
 
     def test_ci_freshness_for_today_and_a_past_day(self) -> None:
         now = datetime.now(UTC)

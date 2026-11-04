@@ -41,6 +41,7 @@ class PaneLaunch(TypedDict):
     cwd: str
     name: str
     model: str
+    plugin_directories: NotRequired[list[str]]
     remote_control: bool
     environment: dict[str, str]
     # False when the launch flags could not be read: a restore refuses it.
@@ -95,6 +96,12 @@ def _validated_launch(path: Path, pane_id: str, value: object, *, required_strin
             or not all(isinstance(name, str) and isinstance(setting, str)
                        for name, setting in cast(dict[object, object], environment).items())):
         raise ValueError(f"{location}: environment must contain string names and settings")
+    if "plugin_directories" in launch:
+        directories = launch["plugin_directories"]
+        if (not isinstance(directories, list)
+                or not all(isinstance(directory, str) and directory
+                           for directory in cast(list[object], directories))):
+            raise ValueError(f"{location}: plugin_directories must contain nonempty paths")
     return cast(PaneLaunch, cast(object, launch))
 
 
@@ -348,6 +355,7 @@ def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
 class ClaudeArguments:
     values: dict[str, str]
     has_prompt: bool
+    plugin_directories: tuple[str, ...] = ()
 
     def value(self, flags: frozenset[str]) -> str:
         return next((value for name, value in reversed(tuple(self.values.items())) if name in flags), "")
@@ -355,17 +363,21 @@ class ClaudeArguments:
 
 # Claude options used by launch commands; all consumers share this parse.
 CLAUDE_VALUE_FLAGS = frozenset({"--resume", "-r", "--remote-control", "--settings",
-    "--model", "--name", "-n", "--permission-mode", "--session-id"})
+    "--model", "--name", "-n", "--permission-mode", "--session-id", "--plugin-dir"})
 RESUME_FLAGS = frozenset({"--resume", "-r"})
 
 
 def parse_claude_arguments(arguments: Sequence[str]) -> ClaudeArguments:
     values: dict[str, str] = {}
     prompt = False
+    plugin_directories: list[str] = []
     index = 1
     while index < len(arguments):
         argument = arguments[index]
         index += 1
+        if argument == "--":
+            prompt = prompt or index < len(arguments)
+            break
         option, equals, value = argument.partition("=")
         if option in CLAUDE_VALUE_FLAGS:
             if not equals and index < len(arguments) and not arguments[index].startswith("-"):
@@ -373,9 +385,11 @@ def parse_claude_arguments(arguments: Sequence[str]) -> ClaudeArguments:
                 index += 1
             _ = values.pop(option, None)
             values[option] = value
-        elif not argument.startswith("-") or argument == "--":
+            if option == "--plugin-dir" and value:
+                plugin_directories.append(value)
+        elif not argument.startswith("-"):
             prompt = True
-    return ClaudeArguments(values, prompt)
+    return ClaudeArguments(values, prompt, tuple(plugin_directories))
 
 
 def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],

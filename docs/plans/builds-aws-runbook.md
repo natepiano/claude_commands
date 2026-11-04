@@ -19,7 +19,7 @@ The AWS host imports no desktop configuration or natedev jobs.
 Keep the configured `instance_type`, x86_64, persistent Spot, interruption behavior `stop`, and hostname `aws-build`.
 Keep the encrypted retained `/home` volume with the configured `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput`.
 Keep `monthly_limit_usd=400` and `ci_repo=`.
-Approve `daily_limit_usd=20` (derived: the monthly cap / 20). Do not raise it.
+Keep `daily_limit_usd=20` (derived: the monthly cap / 20; the user approved it on 2026-11-03). Do not raise it.
 Keep AWS lint disabled.
 AWS accepts only test, check, and doc work.
 Build, example, and final work remain on natedev.
@@ -35,12 +35,26 @@ There is no separate charge timer.
 1. Create the AWS account and administrator login in the AWS console.
 2. Set the billing notification email and confirm its subscription.
 3. Prepare the administrator profile named by `deployment_profile` in the same private credential file at your terminal.
-4. Read the free placement scores for `m7a.4xlarge` in `us-east-1` and `us-east-2`.
+4. Read the free placement scores for `m7a.4xlarge` in `us-east-2`.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
-6. Select the region and one available zone from those reads.
-7. Record the public prices and their read time in configuration.
-8. Confirm that the fixed components sum to `fixed_usd_per_month`.
-9. Confirm that `limit_reserve_usd` covers the configured drain and idle intervals.
+6. Select one available zone in `us-east-2` from those reads.
+7. Read the standard Spot vCPU quota. Request an increase if it is below 16.
+8. Run `python3 scripts/aws_target/deploy.py price` just before `deploy.py prepare`.
+   Deployment refuses a price older than `price_max_age_seconds`.
+   Confirm that `notification_email_file` names an existing private file before `deploy.py prepare`.
+9. Confirm that the fixed components sum to `fixed_usd_per_month`.
+10. Confirm that `limit_reserve_usd` covers the configured drain and idle intervals.
+
+A placement score for one instance type is always low. AWS needs at least three types for a useful score. On 2026-11-03 every `us-east-2` zone scored 1, so the zone choice uses price. The user approved `us-east-2c` (`use2-az3`) at $0.2250/h on 2026-11-03.
+
+A new account's "All Standard Spot Instance Requests" quota (`L-34B43A08`) defaults to 5 vCPU. `m7a.4xlarge` needs 16. A start below the quota fails with "Max spot instance count exceeded".
+
+The account (created 2026-11-03) is a project account. The user activated advanced features on 2026-11-03. Its service control policies now set these limits:
+
+- `RegionFloor` allows only `us-east-1`, `us-east-2` and `us-west-2`. The policy denies most actions in `us-east-1`, the Pricing API included. Use `us-east-2`, and read prices from the public AWS price pages.
+- No policy denies Spot. Activation removed the Paid Plan policy. A `run-instances --dry-run` with `MarketType=spot` in `us-east-2` succeeded on 2026-11-03.
+- The AWS spend limit is gone. The stack's $400 Budget with its stop action is the AWS-side backstop.
+- The four `BudgetsSpendLimit*` policies must have no target. In the Organizations console, open each policy's Targets tab, and detach the project account if it is listed.
 
 The following commands are user-run examples.
 Replace the uppercase values with public account inputs from the configuration.
@@ -54,18 +68,26 @@ export AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials"
 (umask 077; aws configure --profile build-admin)
 chmod 0600 "$AWS_SHARED_CREDENTIALS_FILE"
 aws --profile build-admin ec2 get-spot-placement-scores \
-  --region us-east-1 --instance-types m7a.4xlarge --target-capacity 1 \
-  --single-availability-zone --region-names us-east-1 us-east-2
+  --region us-east-2 --instance-types m7a.4xlarge --target-capacity 1 \
+  --single-availability-zone --region-names us-east-2
 aws --profile build-admin ec2 describe-spot-price-history \
-  --region REGION --instance-types m7a.4xlarge \
+  --region us-east-2 --instance-types m7a.4xlarge \
   --product-descriptions Linux/UNIX --max-results 20
-aws --profile build-admin pricing get-products --region us-east-1 \
-  --service-code AmazonEC2 --filters \
-  Type=TERM_MATCH,Field=regionCode,Value=REGION \
-  Type=TERM_MATCH,Field=volumeApiName,Value=gp3
+aws --profile build-admin service-quotas get-service-quota \
+  --region us-east-2 --service-code ec2 --quota-code L-34B43A08 \
+  --query Quota.Value
+aws --profile build-admin service-quotas request-service-quota-increase \
+  --region us-east-2 --service-code ec2 --quota-code L-34B43A08 \
+  --desired-value 32
 ```
 
-Use the [AWS price list documentation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/price-changes.html) for other price dimensions.
+Run the increase request only when the quota is below 16. The value 32 also covers a later move to `m7a.8xlarge`. A quota request has no charge.
+
+Read gp3, root storage and public IPv4 prices for `us-east-2` from the public [EC2](https://aws.amazon.com/ec2/pricing/on-demand/) and [EBS](https://aws.amazon.com/ebs/pricing/) price pages.
+Use the price history to select the zone.
+Run `python3 scripts/aws_target/deploy.py price` before each `deploy.py prepare` command.
+The command saves the price and its read time outside the repository.
+Do not edit tracked files to record the price.
 Price-list and placement reads do not launch capacity.
 Cost Explorer reads have the configured query fee.
 
@@ -87,7 +109,14 @@ Record the image's root device name.
 Do not substitute an unverified third-party image.
 
 1. Fill `region`, `availability_zone`, `ami_id`, `ami_owner_id`, and `nixos_release`.
-2. Fill `vpc_id`, `subnet_id`, `notification_email`, and the deployment profile.
+2. Fill `vpc_id`, `subnet_id`, and the deployment profile.
+   Write the Budget address to its private file at your terminal:
+
+   ```sh
+   (umask 077; mkdir -p ~/.config/aws-build; printf '%s\n' '<address>' > ~/.config/aws-build/notification-email)
+   ```
+
+   Keep the address outside the public repository. Never put it in a tracked file, commit, message, or test fixture.
 3. Confirm public HTTPS egress and a usable route for SSM and public packages.
 4. Permit inbound UDP 41641 for Tailscale transport.
 5. Permit no inbound TCP ports.
@@ -162,10 +191,13 @@ Never delete its ledger, inventory, charges, claims, or deployment evidence to p
 ```sh
 cd "$HOME/.claude"
 export AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials"
+python3 scripts/aws_target/deploy.py price
 python3 scripts/aws_target/deploy.py prepare
 ```
 
-Preparation runs locally.
+The price command reads AWS through the deployment profile.
+It requires the private credential file.
+Preparation reads the saved price locally.
 It records priced inventory, current price evidence, generated parameters, and a deployment-purpose guard decision.
 Inspect the generated public template, parameters, and preflight evidence.
 Confirm the monthly Budget amount equals `monthly_limit_usd`.
@@ -224,6 +256,7 @@ Restart the instance for the next setup interval:
 2. Run preparation again.
 
 ```sh
+python3 scripts/aws_target/deploy.py price
 python3 scripts/aws_target/deploy.py prepare
 ```
 
@@ -258,8 +291,9 @@ sudo tailscale up --ssh --advertise-tags=tag:build-aws
 Use the [Tailscale SSH policy documentation](https://tailscale.com/docs/features/tailscale-ssh) when editing the tailnet policy.
 Give `tag:build-aws` no initiated connections to natedev or the Mac.
 Remove broader grants that would permit those connections.
-Permit natedev's user to reach `tag:build-aws`.
-Permit that user to enter the box's `natepiano` account through Tailscale SSH.
+Permit natedev's user and the Mac's user to reach `tag:build-aws`.
+Permit each user to enter the box's `natepiano` account through Tailscale SSH.
+The user asked for this access on 2026-11-03, to run `cargo tile` on the box by hand.
 Test the permitted and denied directions in the policy console.
 Do not store a Tailscale auth key on either branch.
 
@@ -441,7 +475,10 @@ Use this replacement procedure from the deployment owner:
 2. Keep its retained Budget and DataVolumeId.
 3. Set a new stack_name and existing_data_volume_id to the saved DataVolumeId.
 4. Preserve the ledger directory.
-5. Render bootstrap, run prepare, then apply --approve-resources.
+5. Render bootstrap.
+6. Run `deploy.py price`.
+7. Run `deploy.py prepare`.
+8. Run `deploy.py apply --approve-resources`.
 
 Confirm the old instance stops before deleting its stack.
 Use your administrator profile for these user-run commands:
@@ -462,6 +499,7 @@ After recording the new stack name and saved volume ID, run these commands:
 
 ```sh
 python3 scripts/aws_target/deploy.py bootstrap
+python3 scripts/aws_target/deploy.py price
 python3 scripts/aws_target/deploy.py prepare
 python3 scripts/aws_target/deploy.py apply --approve-resources
 ```

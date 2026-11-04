@@ -28,14 +28,11 @@ from rename_state import RenameRefused
 
 if TYPE_CHECKING:
     from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
-    from scripts.shutdown import shutdown_record
 else:
     from unit_staff_test_support import PARENTS, isolated_parents
     # rename_unit puts the shutdown folder on the path.
-    import shutdown_record
 
 from scripts.production.rename_unit_test_support import SLUG, UnitRenameFixture
-from scripts.production.fake_unit_host import stopped_record
 from scripts.issue_score.selection import UseConfiguredValue
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -44,7 +41,6 @@ from scripts.lint.memory_test_support import config_environment
 
 # An app-server's idle-stop watcher, as codex_mesh starts it: the run folder is its fourth argument.
 WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2"; done'
-STOPPED_RECORD = stopped_record(Path(), Path())
 
 
 class RunRecordLookupTests(unittest.TestCase):
@@ -129,7 +125,6 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(mesh_runs, "_process_args", self.arguments))
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
         _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
-        _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", lambda: [STOPPED_RECORD]))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", return_value=None))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", self.no_units))
         _ = self.enterContext(mock.patch.object(unit_lookup, "observed_staff_marks", return_value=()))

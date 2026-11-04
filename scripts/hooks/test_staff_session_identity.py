@@ -73,6 +73,7 @@ class StaffSessionIdentityTests(StaffTestCase):
         record_start = cast(Callable[[], None], namespace["main"])
         with (mock.patch.dict(os.environ, self.fixture.environment),
               mock.patch("sys.stdin", io.StringIO(json.dumps(self.fixture.payload))),
+              mock.patch.object(pane_record, "claude_arguments", return_value=["claude"]),
               mock.patch.object(os, "getppid", return_value=os.getpid()),
               mock.patch.object(staff, "runtime_id", return_value=self.fixture.new_id)):
             record_start()

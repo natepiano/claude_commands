@@ -125,9 +125,12 @@ def _execute_request(path: Path) -> None:
 
 def child_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[str], dict[str, str]]:
     """Build the exact child arguments and environment for a supervisor launch."""
-    argv, environment = restored_launch(argv, environment)
+    program = ""
     if argv and argv[0] in ("claude", "codex"):
-        argv = [resolve_program("claude" if argv[0] == "claude" else "codex"), *argv[1:]]
+        program = resolve_program("claude" if argv[0] == "claude" else "codex")
+    argv, environment = restored_launch(argv, environment)
+    if program:
+        argv = [program, *argv[1:]]
     return argv, environment
 
 

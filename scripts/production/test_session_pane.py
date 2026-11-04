@@ -10,7 +10,10 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
+from scripts.lib.script_envelope import script_prompt
 from typing import cast, override
 from unittest import mock
 
@@ -38,6 +41,46 @@ class SessionPaneTests(unittest.TestCase):
     root: Path = Path()
     records: Path = Path()
     environment: dict[str, str] = {}
+
+    @contextmanager
+    def prompt_submission(self) -> Generator[mock.Mock]:
+        run = herdr.Herdr.run
+        submit = mock.Mock(return_value="")
+
+        def transport(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> str:
+            if arguments[:2] == ("agent", "prompt"):
+                return cast(str, submit(*arguments))
+            return run(client, *arguments, deadline=deadline)
+
+        with mock.patch.object(herdr.Herdr, "run", new=transport):
+            yield submit
+
+    def test_source_record_failure_prevents_pane_input(self) -> None:
+        import script_prompts
+
+        with (mock.patch.object(script_prompts, "record", side_effect=OSError("record failed")),
+              self.prompt_submission() as submit):
+            with self.assertRaisesRegex(OSError, "record failed"):
+                session_pane.type_place(HerdrPlace("native", "w1:p1"), "/resume",
+                                        target=unit_membership("show", "herdr-unit").current_session)
+        submit.assert_not_called()
+
+    def test_queued_script_input_stays_non_typed_after_six_hours(self) -> None:
+        from scripts.hooks import conversation_pause
+
+        for text in ("Continue the review", "/resume"):
+            with self.subTest(text=text), self.prompt_submission() as submit:
+                session_pane.type_place(HerdrPlace("native", "w1:p1"), text,
+                                        target=unit_membership("show", "herdr-unit").current_session)
+                sent = script_prompt(text)
+                submit.assert_called_once_with("agent", "prompt", "w1:p1", sent)
+                for path in (self.root / "conversation-pause" / "script-prompts").glob("*"):
+                    if path.name != ".lock":
+                        then = time.time() - 6 * 3600 - 60
+                        os.utime(path, (then, then))
+                with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}):
+                    source = conversation_pause.prompt_source(sent, lambda: frozenset(), lambda: ())
+                self.assertIs(source, conversation_pause.PromptSource.SCHEDULED)
 
     @override
     def setUp(self) -> None:
@@ -82,7 +125,7 @@ class SessionPaneTests(unittest.TestCase):
         refusal: HerdrRefusal = {"error": {"code": "agent_blocked", "message": "permission prompt"}}
         responses: dict[str, CommandResponse] = {
             "--session default session list --json": {"stdout": json.dumps(sessions), "code": 0},
-            "--session native agent prompt w1:p1 hello": {
+            "--session native agent prompt w1:p1 " + script_prompt("hello"): {
                 "stdout": json.dumps(refusal) if blocked else "", "code": 1 if blocked else 0},
             "default": {"stdout": "native screen\n", "code": 1 if failed else 0},
         }
@@ -228,7 +271,7 @@ class SessionPaneTests(unittest.TestCase):
                          (4, "unit show herdr-unit: blocked at a prompt; nothing typed"))
         actions = [row for row in self.log("herdr") if row[2:4] not in (
             ["session", "list"], ["pane", "list"], ["pane", "process-info"])]
-        self.assertEqual(actions, [["--session", "native", "agent", "prompt", "w1:p1", "hello"]])
+        self.assertEqual(actions, [["--session", "native", "agent", "prompt", "w1:p1", script_prompt("hello")]])
         with self.assertRaises(AgentBlocked):
             session_pane.type_place(HerdrPlace("native", "w1:p1"), "hello",
                                     target=unit_membership("show", "herdr-unit").id)
@@ -321,7 +364,7 @@ class SessionPaneTests(unittest.TestCase):
                 for verb in ("type", "keys", "close"):
                     with self.subTest(target=target, verb=verb):
                         send(verb, target)
-                self.assertIn(("agent", "prompt", place.pane, "selected text"), commands)
+                self.assertIn(("agent", "prompt", place.pane, script_prompt("selected text")), commands)
                 self.assertIn(("pane", "send-keys", place.pane, "Enter"), commands)
                 self.assertIn(("pane", "close", place.pane), commands)
 

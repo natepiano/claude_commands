@@ -25,7 +25,7 @@ import approved_renames
 import declarations
 import style_plan
 from scripts.production import showrunners
-from scripts.production.staff_test_support import isolated_staff_file, production_membership, recorded_unit
+from scripts.production.staff_test_support import isolated_staff_file, production_membership, recorded_showrunner, recorded_unit
 from scripts.build_hold import build_hold
 from scripts.build_queue import queue_place
 import live_units
@@ -47,7 +47,14 @@ class StylePlanTests(StylePlanFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        production_membership("sample-style", "names-unit")
+        _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
+        _ = recorded_unit("sample-style", "names-unit", self.unit, self.doc,
+                          plan="docs/style-production/units/names-unit.md")
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member
+        owner = recorded_showrunner("sample-style", self.doc)
+        _ = fixture_member("unit", name="modules", parent=owner.id,
+                           worktree=staff.PresentWorktree("natedev", self.root / "modules"))
 
     def test_split_partitions_the_table_left_total_including_ticketed_and_unselected_findings(self) -> None:
         rule = self.rule("split-population")
@@ -649,6 +656,22 @@ class RefillRecordingTests(unittest.TestCase):
                                                       "--repo", "/tmp/claude/repo"]), 2)
                 recorded.assert_not_called()
                 self.assertIn(str(error), output.getvalue())
+
+
+
+
+from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+from scripts.style import unit_files
+
+
+class BranchFileLocationTests(StaffTestCase):
+    def test_file_ownership_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+        fixture = self.separated_unit_folders()
+        without_worktree_column(fixture.doc)
+        rows = unit_files.unit_worktrees(fixture.doc)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].worktree, fixture.worktree)
+        self.assertEqual(rows[0].unit, "member-unit")
 
 
 if __name__ == "__main__":

@@ -1472,6 +1472,8 @@ def warn_config_fallbacks(fallbacks: tuple[ConfigFallback, ...]) -> None:
 @dataclass(frozen=True)
 class MemoryConfig:
     policy: AdmissionPolicy
+    ci_memory_slice: str
+    ci_memory_margin_bytes: int
     test_phase_margin: float
     build_budget_bytes: int
     running_pass_seconds: float
@@ -1505,6 +1507,12 @@ def _test_phase_margin_value(raw: object) -> float:
 
 def test_phase_margin() -> float:
     return conf.read("lint").number("test_phase_margin")
+
+
+def _ci_slice_name(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*\.slice", value) is None:
+        raise ValueError("expected a systemd slice name")
+    return value
 
 
 def build_budget_bytes() -> int:
@@ -1564,7 +1572,14 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
         first_peaks = {key.removeprefix("program_first_peak_gib."):
                        max(1, int(settings_read.number(key) * GIB))
                        for key in values if key.startswith("program_first_peak_gib.")}
+        ci_slice = settings_read.origin("ci_memory_slice", _ci_slice_name)
+        if isinstance(ci_slice, conf.UnavailableValue):
+            raise conf.Unusable(ci_slice.reason)
+        if isinstance(ci_slice, conf.RecoveredValue):
+            diagnostics.append(f"warning: {ci_slice.reason}")
         config = MemoryConfig(
+            ci_memory_slice=ci_slice.value,
+            ci_memory_margin_bytes=int(settings_read.number("ci_memory_margin_gib") * GIB),
             policy=AdmissionPolicy(timing, pressure, PeakHold(settings_read.whole("peak_hold_seconds"), kinds)),
             test_phase_margin=settings_read.number("test_phase_margin"),
             build_budget_bytes=max(1, int(settings_read.number("build_budget_gib") * GIB)),
@@ -3851,8 +3866,47 @@ def build_queue_inputs(ordered: list[tuple[Path, Waiter]],
                        readings.host, readings.pressure, readings.recovery, override, now, priority)
 
 
-def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path
-                         ) -> tuple[UnownedSliceMemory, ...]:
+class SliceMemoryUnavailable(RuntimeError):
+    """A required slice reading cannot authorize another grant."""
+
+
+def ci_slice_cgroup(name: str) -> Path:
+    """Resolve the configured system slice through systemd."""
+    private = os.environ.get("BUILDLOG_CI_CGROUP", "")
+    if private:
+        return Path(private)
+    try:
+        reply = subprocess.run(["systemctl", "show", "--property=ControlGroup", "--value", name],
+                               capture_output=True, text=True, check=True, timeout=5)
+        group = reply.stdout.strip()
+        if not group.startswith("/") or group == "/" or ".." in Path(group).parts:
+            raise ValueError("systemd returns no slice cgroup")
+        return Path("/sys/fs/cgroup") / group.lstrip("/")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise SliceMemoryUnavailable(f"{name}: cannot read ControlGroup: {error}") from error
+
+
+def slice_working_set(directory: Path) -> MeasuredMemory:
+    """Measure resident memory without inactive file cache, plus swap."""
+    current = directory / "memory.current"
+    check_memory_reading(current)
+    amount = int(current.read_text())
+    stat = directory / "memory.stat"
+    check_memory_reading(stat)
+    contents = stat.read_text()
+    try:
+        fields = dict(line.split() for line in contents.splitlines())
+        inactive_file = int(fields["inactive_file"])
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"{stat}: expected inactive_file bytes") from error
+    swap = directory / "memory.swap.current"
+    check_memory_reading(swap)
+    swapped = int(swap.read_text()) if swap.exists() else 0
+    return MeasuredMemory(max(0, amount - inactive_file) + swapped, swap_bytes=swapped)
+
+
+def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
+                         *, ci_memory_slice: str = "", ci_memory_margin_bytes: int = 0) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
     directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
         f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
@@ -3871,23 +3925,45 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
     try:
         children = list(directory.iterdir())
     except OSError:
-        return ()
+        children = []
+    ci_groups = (ci_slice_cgroup(ci_memory_slice),) if ci_memory_slice else ()
+    children.extend(group for group in ci_groups if group not in children)
     for child in children:
-        if child in owned or child.name == "sccache.service" or not child.is_dir():
+        required = child in ci_groups
+        if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
             continue
         try:
-            current = child / "memory.current"
-            check_memory_reading(current)
-            amount = int(current.read_text())
-            swap = child / "memory.swap.current"
-            check_memory_reading(swap)
-            swapped = int(swap.read_text()) if swap.exists() else 0
+            working_set = slice_working_set(child)
+            amount = working_set.bytes
+            swapped = working_set.swap_bytes
             members = {int(pid) for membership in child.rglob("cgroup.procs") for pid in membership.read_text().split()}
             duplicate = process_memory(members & tree_pids, proc).bytes
-            amount = max(0, amount + swapped - duplicate)
-            if amount:
-                result.append(UnownedSliceMemory(amount, cgroup=str(child), owner=child.name))
-        except (OSError, ValueError):
+            amount = max(0, amount - duplicate)
+            promise: MemoryPromise = NoPromise()
+            if required:
+                limit_path = child / "memory.max"
+                check_memory_reading(limit_path)
+                try:
+                    limit = int(limit_path.read_text().strip())
+                except ValueError as error:
+                    raise ValueError(f"{limit_path}: expected a finite memory limit") from error
+                if limit <= 0:
+                    raise ValueError(f"{limit_path}: no finite positive memory limit")
+                for pid in members:
+                    try:
+                        program = (proc / str(pid) / "comm").read_text().strip()
+                    except FileNotFoundError:
+                        continue
+                    if program == "Runner.Worker":
+                        promise = LifetimePromise(min(amount + ci_memory_margin_bytes, limit))
+                        break
+            if amount or (required and members):
+                result.append(UnownedSliceMemory(amount, promise=promise,
+                                                 swap_bytes=swapped if required else 0,
+                                                 cgroup=str(child), owner=child.name))
+        except (OSError, ValueError) as error:
+            if required:
+                raise SliceMemoryUnavailable(f"{ci_memory_slice}: cannot read slice memory at {child}: {error}") from error
             continue
     return tuple(result)
 

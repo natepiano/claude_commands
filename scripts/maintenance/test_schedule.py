@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import tempfile
+import os
 import unittest
 from pathlib import Path
 
@@ -20,6 +21,8 @@ class ScheduleTests(unittest.TestCase):
                 before = history.path.read_bytes(), history.path.stat().st_mtime_ns
                 with locked_history(directory) as busy:
                     self.assertIsInstance(busy, ScheduleBusy)
+                    assert isinstance(busy, ScheduleBusy)
+                    self.assertEqual(busy.owner_id, str(os.getpid()))
                 self.assertEqual((history.path.read_bytes(), history.path.stat().st_mtime_ns), before)
             with locked_history(directory) as reopened:
                 assert isinstance(reopened, IntervalHistory)

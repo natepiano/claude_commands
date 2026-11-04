@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
     from . import record
-else:
-    import record
 
 MacRunOutcome = Literal["passed", "passed_filter", "passed_full", "failed"]
 OffloadDeclineReason = Literal[
@@ -192,6 +190,8 @@ _report_identity: ContextVar[record.LocalStepIdentity | None] = ContextVar('repo
 
 @contextmanager
 def target_predicate_scope() -> Generator[None, None, None]:
+    import record
+
     token = _report_identity.set(record.local_step_identity())
     try:
         yield
@@ -200,6 +200,8 @@ def target_predicate_scope() -> Generator[None, None, None]:
 
 
 def local_identity() -> record.LocalStepIdentity:
+    import record
+
     current = _report_identity.get()
     return record.local_step_identity() if current is None else current
 
@@ -209,6 +211,8 @@ def local_target_names() -> tuple[str, ...]:
 
 
 def natedev_step_predicate(step: str = "steps") -> str:
+    import record
+
     identity = local_identity()
     targets = ','.join("'" + name.replace("'", "''") + "'" for name in identity.targets)
     permitted = ' AND '.join(f"{step}.caller IS NOT '" + caller.replace("'", "''") + "'"

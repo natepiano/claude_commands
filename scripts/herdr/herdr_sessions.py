@@ -25,7 +25,6 @@ sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
 from scripts.production.showrunners import registered_showrunners, require_complete  # noqa: E402
 
-from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 from scripts.production import staff  # noqa: E402
@@ -137,10 +136,6 @@ def _launch(verb: str, arguments: list[str]) -> int:
     else:
         config_dir = selected.dir
         pane_environment = account.named_account_environment(config_dir)
-    environment = dict(os.environ)
-    for variable in unset_variables:
-        _ = environment.pop(variable, None)
-    environment.update(pane_environment)
     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = herdr.NoOpeningPrompt()
     if options.prompt_file:
         try:
@@ -148,45 +143,25 @@ def _launch(verb: str, arguments: list[str]) -> int:
                                           herdr.SessionTranscript(config_dir, options.session_id))
         except OSError as error:
             print(f"herdr_sessions: {options.name}: prompt file is unreadable: {error}", file=sys.stderr)
-    purpose: launch_permission.LaunchPurpose = (
-        launch_permission.RecordedSessionRestoreLaunchPurpose(options.session_id)
-        if options.restore else launch_permission.NewWorkLaunchPurpose()
-    )
-    try:
-        barrier = launch_permission.launch_barrier()
-        _ = barrier.__enter__()
-    except OSError as error:
-        print(f"herdr_sessions: shutdown state unreadable: launch barrier: {error}", file=sys.stderr)
-        return 1
-    try:
-        permission = launch_permission.launch_permission(environment, purpose)
-        if isinstance(permission, launch_permission.BlockedByShutdown):
-            print(f"herdr_sessions: {permission.reason}", file=sys.stderr)
-            return 1
-        if isinstance(permission, launch_permission.ShutdownStateUnreadable):
-            print(f"herdr_sessions: shutdown state unreadable: {permission.detail}", file=sys.stderr)
-            return 1
-        shared = herdr.shared_session()
-        _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
-        panes = herdr.Herdr(shared).panes()
-        taken = {pane.get("label") for pane in panes}
-        name = options.name or next(candidate for candidate in (
-            herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
-            if candidate not in taken)
-        if verb == "resume":
-            claude_arguments.extend(["--resume", options.session_id])
-        claude_arguments.extend(["-n", name])
-        launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
-            kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000,
-            unset_environment=frozenset(unset_variables))
-        if isinstance(launched, herdr.nix_env.Refused):
-            raise herdr.HerdrFailure(launched.reason)
-        pane, outcome = launched.pane, launched.outcome
-        if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
-            reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
-            print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
-    finally:
-        _ = barrier.__exit__(None, None, None)
+    shared = herdr.shared_session()
+    _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
+    panes = herdr.Herdr(shared).panes()
+    taken = {pane.get("label") for pane in panes}
+    name = options.name or next(candidate for candidate in (
+        herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
+        if candidate not in taken)
+    if verb == "resume":
+        claude_arguments.extend(["--resume", options.session_id])
+    claude_arguments.extend(["-n", name])
+    launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
+        kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000,
+        unset_environment=frozenset(unset_variables))
+    if isinstance(launched, herdr.nix_env.Refused):
+        raise herdr.HerdrFailure(launched.reason)
+    pane, outcome = launched.pane, launched.outcome
+    if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
+        reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
+        print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
     if verb == "start" or options.attach:
         _attach(pane)
     return 0

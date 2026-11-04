@@ -25,6 +25,7 @@ import disk
 import health
 import memory
 import moments
+from moments import COLD_BUILD_MIN_CRATES
 import store
 import record
 import sync
@@ -101,8 +102,7 @@ NO_REBUILD_CRATES = 0
 EDITED_CRATE_MIN_CRATES = NO_REBUILD_CRATES + 1
 EDITED_CRATE_MAX_CRATES = 3
 CASCADE_MIN_CRATES = EDITED_CRATE_MAX_CRATES + 1
-CASCADE_MAX_CRATES = 49
-COLD_BUILD_MIN_CRATES = CASCADE_MAX_CRATES + 1
+CASCADE_MAX_CRATES = COLD_BUILD_MIN_CRATES - 1
 NO_REBUILD_LABEL = "none"
 EDITED_CRATE_LABEL = f"edited crate ({EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates)"
 CASCADE_LABEL = f"cascade ({CASCADE_MIN_CRATES}–{CASCADE_MAX_CRATES} crates)"
@@ -244,17 +244,13 @@ def gib(value: object) -> str:
     return f"{float(value) / GIB:.1f} GiB" if isinstance(value, int | float) else ""
 
 
-def nearest_rank(values: Sequence[float], percent: int) -> float:
-    return sorted(values)[(percent * len(values) + 99) // 100 - 1]
-
-
 def percentile_values(value: object) -> list[float]:
     return [float(part) for part in value.split(",")] if isinstance(value, str) and value else []
 
 
 def p95(value: object) -> str:
     values = percentile_values(value)
-    return seconds(nearest_rank(values, 95)) if values else ""
+    return seconds(moments.nearest_rank(values, 95)) if values else ""
 
 
 @dataclass(frozen=True)
@@ -783,8 +779,8 @@ def package_rebuild_rows(steps: Sequence[KnownCrateStep]) -> list[list[str]]:
         [
             name,
             count(rebuilds.steps),
-            seconds(nearest_rank(rebuilds.compile_samples, 50)) if rebuilds.compile_samples else "—",
-            seconds(nearest_rank(rebuilds.compile_samples, 95)) if rebuilds.compile_samples else "—",
+            seconds(moments.nearest_rank(rebuilds.compile_samples, 50)) if rebuilds.compile_samples else "—",
+            seconds(moments.nearest_rank(rebuilds.compile_samples, 95)) if rebuilds.compile_samples else "—",
             seconds(rebuilds.compile_s),
         ]
         for name, rebuilds in ranked
@@ -1245,7 +1241,7 @@ def test_builds_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
     for scope, values in builds.items():
         if values:
-            body.append([day, scope, seconds(sum(values)), seconds(nearest_rank([float(value) for value in values], 75))])
+            body.append([day, scope, seconds(sum(values)), seconds(moments.nearest_rank([float(value) for value in values], 75))])
 
     return [
         "### Test builds (temporary)",
@@ -1305,7 +1301,9 @@ def profile_step_durations(
 def rate_text(value: float | moments.RateUnavailable, row: moments.RateRow) -> str:
     if isinstance(value, moments.RateUnavailable):
         return "—"
-    suffix = {"hours": " h", "runs": "", "percent": "%", "per_phase": " /phase"}[row.unit]
+    suffix = {"hours": " h /day", "runs": " /day", "percent": "%",
+              "runs_per_phase": " /phase", "hours_per_phase": " h /phase",
+              "per_run_hour": " h wait / h run"}[row.unit]
     return f"{value:.1f}{suffix}"
 
 
@@ -1332,27 +1330,37 @@ def rate_with_baseline(value: float | moments.RateUnavailable, row: moments.Rate
     return text
 
 
+def rate_change(before: float | moments.RateUnavailable, after: float | moments.RateUnavailable) -> str:
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before > 0:
+        return f"{(after-before)/before:+.0%}".replace("-", "−")
+    return "—"
+
+
+def rate_window_days(before_days: float, after_days: float) -> str:
+    before_thin = " (thin)" if before_days < MIN_RATE_WINDOW_DAYS else ""
+    after_thin = " (thin)" if after_days < MIN_RATE_WINDOW_DAYS else ""
+    return f"Before: {before_days:.3f} days{before_thin}; after: {after_days:.3f} days{after_thin}."
+
+
 def moment_rate_table(before: moments.WindowRates, after: moments.WindowRates,
                       moment: moments.BuildMoment) -> list[str]:
-    lines = ["| Rate | Before/day | After/day | Change |", "|---|--:|--:|--:|"]
+    body: list[list[str]] = []
+    # Compare Moment 1's quoted baseline with the full week below.
+    baseline = (moments.NoSdlcBaseline() if isinstance(moment.baseline, moments.SdlcBaseline)
+                and moment.baseline.window == "week" else moment.baseline)
     for row in moments.RATE_ROWS:
         if moment.scope == "hana" and row.scope != "hana":
             continue
         left, right = before.rates[row.key], after.rates[row.key]
-        change = "—"
-        if isinstance(left, float) and isinstance(right, float) and left > 0:
-            change = f"{(right-left)/left:+.0%}".replace("-", "−")
-        # Moment 1's quoted week is compared below against the full week,
-        # rather than against this adjacent-moment slice.
-        baseline = (moments.NoSdlcBaseline() if isinstance(moment.baseline, moments.SdlcBaseline)
-                    and moment.baseline.window == "week" else moment.baseline)
-        lines.append("| " + " | ".join((row.label,
+        body.append([row.label,
             rate_with_baseline(left, row, baseline, "before", before.days),
-            rate_with_baseline(right, row, baseline, "after", after.days), change)) + " |")
-    before_thin = " (thin)" if before.days < MIN_RATE_WINDOW_DAYS else ""
-    after_thin = " (thin)" if after.days < MIN_RATE_WINDOW_DAYS else ""
-    lines += [f"Before: {before.days:.3f} days{before_thin}; after: {after.days:.3f} days{after_thin}.", ""]
-    return lines
+            rate_with_baseline(right, row, baseline, "after", after.days), rate_change(left, right)])
+    return [*table(["Rate", "Before", "After", "Change"], body),
+            rate_window_days(before.days, after.days),
+            f"Hana phases finished: before {before.phase_count}, after {after.phase_count}.",
+            "Per-day rows follow load; per-phase counts do not. "
+            + "Per-phase hours still fall on a quieter machine. "
+            + "We assume phases have about the same size on both sides.", ""]
 
 
 def moment_p50_table(before: dict[tuple[str, str, str], list[float]],
@@ -1360,7 +1368,7 @@ def moment_p50_table(before: dict[tuple[str, str, str], list[float]],
     rows: list[list[str]] = []
     for key in sorted(before.keys() & after.keys(), key=lambda key: (-len(after[key]), key)):
         before_runs, after_runs = before[key], after[key]
-        before_p50, after_p50 = nearest_rank(before_runs, 50), nearest_rank(after_runs, 50)
+        before_p50, after_p50 = moments.nearest_rank(before_runs, 50), moments.nearest_rank(after_runs, 50)
         difference = "—"
         if len(before_runs) >= MIN_PROFILE_RUNS and len(after_runs) >= MIN_PROFILE_RUNS and before_p50 > 0:
             difference = f"{(after_p50 - before_p50) / before_p50:+.0%}".replace("-", "−")
@@ -1424,12 +1432,11 @@ def memory_window_rows(connection: sqlite3.Connection, start: datetime, end: dat
     stall = (100 * stall_us / (sampled_s * 1_000_000) if sampled_s
              else moments.RateUnavailable("no known full-stall intervals"))
     parameters = moments.window_parameters(start, end)
-    bounds = ("started_at >= :first_day AND started_at < :last_day"
-              + " AND julianday(started_at) >= julianday(:start) AND julianday(started_at) < julianday(:end)")
+    bounds = moments.window_bounds("started_at")
     waits = cast(list[tuple[float]], connection.execute(
         f"SELECT mem_wait_s FROM steps WHERE {bounds} AND {natedev_step_predicate()} AND mem_wait_s IS NOT NULL",
         parameters).fetchall())
-    wait_p90 = (nearest_rank([row[0] for row in waits], 90) if waits
+    wait_p90 = (moments.nearest_rank([row[0] for row in waits], 90) if waits
                 else moments.RateUnavailable("no recorded waits"))
     retries, stopped = cast(tuple[int, int], connection.execute(
         "SELECT coalesce(sum(mem_kills), 0) - coalesce(sum(mem_kill_stopped), 0),"
@@ -1462,14 +1469,9 @@ def memory_moment_table(before: Sequence[MemoryRateRow], after: Sequence[MemoryR
                         before_days: float, after_days: float) -> list[str]:
     body: list[list[str]] = []
     for left, right in zip(before, after, strict=True):
-        change = "—"
-        if isinstance(left.value, (int, float)) and isinstance(right.value, (int, float)) and left.value > 0:
-            change = f"{(right.value-left.value)/left.value:+.0%}".replace("-", "−")
-        body.append([left.label, memory_row_text(left), memory_row_text(right), change])
-    thin_before = " (thin)" if before_days < MIN_RATE_WINDOW_DAYS else ""
-    thin_after = " (thin)" if after_days < MIN_RATE_WINDOW_DAYS else ""
+        body.append([left.label, memory_row_text(left), memory_row_text(right), rate_change(left.value, right.value)])
     return [*table(["Memory", "Before", "After", "Change"], body),
-            f"Before: {before_days:.3f} days{thin_before}; after: {after_days:.3f} days{thin_after}.", ""]
+            rate_window_days(before_days, after_days), ""]
 
 
 def memory_overlap_lines(window: moments.ComparisonWindow, events: Sequence[moments.Moment]) -> list[str]:
@@ -1508,9 +1510,11 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
         "Reruns: start 0–10 min after the previous nextest end in the same folder (cwd without /target/verify-doc).",
         "Queue-hidden repeats: submit (start − mem_wait_s) at most 600 s after the previous nextest end in that folder, different call_id, no lower bound.",
         "Same-worker reruns: consecutive nextest steps in the same session, submit at most 60 min after the previous end, no lower bound; after a pass means both passed, fail then fail means both failed. Hours count the later step.",
-        "Load ratios divide hana nextest or clippy counts by phase_finished events in natedev's progress history whose working_dir matches the hana name patterns; the Mac's phases are not counted. Repeated phase_instance_id counts once.",
+        "Per-phase rows divide totals by finished hana phases in natedev's progress history. "
+        + "The working_dir must match the hana name patterns. The Mac's phases are not counted. Repeated phase_instance_id counts once.",
+        "Hana wait hours / run hour divides hana wait hours by hana run hours.",
         "Clone rebuilds: hana nextest with crates_compiled >= 300; clone repeats are the percentage whose previous nextest in the same session was also a clone rebuild ending at most 4 h before, no lower bound.",
-        f"Per-day = total ÷ window days; percentages and /phase ratios are not divided by days. A window shorter than {MIN_RATE_WINDOW_DAYS} day is thin; — means no denominator.",
+        f"Per-day = total ÷ window days; other rows are not divided by days. A window shorter than {MIN_RATE_WINDOW_DAYS} day is thin; — means no denominator.",
         "Windows: before covers 7 days cut at the previous moment on the same track; after ends at the next moment on that track or report end. Build and memory moments do not cut each other's windows. Pair histories and hana classification use each measured window.", "",
     ]
     if any(isinstance(window.moment, moments.MemoryMoment) for window in windows):
@@ -1562,12 +1566,11 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
         if isinstance(moment.baseline, moments.SdlcBaseline):
             if moment.baseline.window == "week":
                 week = measured(moment.at - timedelta(days=7), moment.at)
+                body = [[row.label, rate_with_baseline(
+                    week.rates[row.key], row, moment.baseline, "before", week.days)] for row in moments.RATE_ROWS]
                 lines += ["7-day baseline before Moment 1 (uncut):", "",
-                          "| Rate | Before/day |", "|---|--:|"]
-                for row in moments.RATE_ROWS:
-                    lines.append(f"| {row.label} | " + rate_with_baseline(
-                        week.rates[row.key], row, moment.baseline, "before", week.days) + " |")
-                lines += [f"Natedev hana phases in the baseline: {week.phase_count}.", ""]
+                          *table(["Rate", "Before"], body),
+                          f"Hana phases finished in the baseline: {week.phase_count}.", ""]
             lines += [*moment.baseline.notes, ""]
     return lines
 
@@ -1687,7 +1690,7 @@ def matched_local_failures(
 
 
 def median_duration(values: Sequence[float]) -> float:
-    return nearest_rank(values, 50) if values else 0.0
+    return moments.nearest_rank(values, 50) if values else 0.0
 
 
 def mac_step_predicate(alias: str = "steps") -> str:
@@ -1761,7 +1764,7 @@ def copy_saving_estimate(call: ReportedTestCall, steps: Sequence[ComparableNated
         step.duration_s for step in steps if step.package == call.package
     ]
     remaining = [duration - elapsed for duration in durations if duration > elapsed]
-    return nearest_rank(remaining, 50) if remaining else 0.0
+    return moments.nearest_rank(remaining, 50) if remaining else 0.0
 
 
 def daily_mac_copies(connection: sqlite3.Connection, day: str, calls: Sequence[ReportedTestCall]) -> DailyMacCopies:
@@ -2187,7 +2190,7 @@ def tests_per_edit_section(connection: sqlite3.Connection, day: str) -> list[str
         ])
     recovery_rows = [
         [label, count(recovery.failures), seconds(recovery.minutes_to_green * 60 / recovery.recovered) if recovery.recovered else "",
-         seconds(nearest_rank(recovery.recovery_minutes, 95) * 60) if recovery.recovery_minutes else ""]
+         seconds(moments.nearest_rank(recovery.recovery_minutes, 95) * 60) if recovery.recovery_minutes else ""]
         for label, recovery in zip(EDIT_BINS, window.recovery_bins, strict=True)
     ]
     unresolved = sum(recovery.failures - recovery.recovered for recovery in window.recovery_bins)

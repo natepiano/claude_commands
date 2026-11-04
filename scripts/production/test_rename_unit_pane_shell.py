@@ -18,13 +18,10 @@ from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production import staff
 from scripts.production import fake_unit_host
 
-from scripts.production.fake_unit_host import PaneShellFixture, record_shutdown, assert_shared_stop_record
+from scripts.production.fake_unit_host import PaneShellFixture, record_shutdown
 
 
 class RenamePaneShellTests(UnitRenameFixture):
-    def test_seed_inherits_shared_stop_record_defaults(self) -> None:
-        assert_shared_stop_record(self, self.seed_record,
-            self.home / '.local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json')
 
     def pane_shell(self, *, live: bool) -> None:
         _ = self.seed_record(progress='ready' if live else 'stopped')

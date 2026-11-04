@@ -168,8 +168,6 @@ def load() -> dict[str, AccountRefusal]:
 
 def write_refusal(refusal: AccountRefusal) -> None:
     """Merge one account under a lock and replace the store atomically."""
-    if refusal.at.tzinfo is None or isinstance(refusal.reset, KnownReset) and refusal.reset.at.tzinfo is None:
-        raise RefusalsError("refusal time needs an offset")
     path = store_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a", encoding="utf-8") as lock:

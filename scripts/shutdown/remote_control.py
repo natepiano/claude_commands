@@ -19,7 +19,7 @@ for dependency in ("message", "production", "notify", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import detached
-from launch_permission import shutdown_state_root
+from scripts.shutdown.stop_results import shutdown_state_root
 import session_pane
 import sessions
 from herdr import AgentBlocked

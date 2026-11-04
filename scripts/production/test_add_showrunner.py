@@ -527,21 +527,6 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
-    def test_new_showrunner_refuses_configured_account_with_wrong_login(self) -> None:
-        """F006: a trusted directory cannot bypass the configured account's readiness."""
-        directory = self.named_account()
-        _ = (directory / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "other@example.invalid"},
-            "projects": {str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
-        path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
-        before = path.read_bytes()
-        result = self.run_command("kid")
-        self.refused(result, "~/.claude3 holds a different login from claude3; "
-                     + "run env -u CLAUDE_CODE_OAUTH_TOKEN "
-                     + f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude, then /login as claude3")
-        self.assertNotIn("other@example.invalid", result.stdout + result.stderr)
-        self.assertEqual(path.read_bytes(), before)
-
     def test_new_showrunner_repairs_a_wrong_shared_link_before_launching(self) -> None:
         directory = self.named_account()
         linked = directory / "projects"
@@ -555,15 +540,19 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
         self.assertEqual(self.parent_of("kid"), "top")
 
-    def test_new_showrunner_refuses_a_real_file_against_an_existing_shared_folder(self) -> None:
+    def test_new_showrunner_preserves_a_real_shared_file_and_launches_after_an_anomaly(self) -> None:
         directory = self.named_account()
-        local = directory / "projects"
+        local = directory / "skills"
         local.unlink()
-        _ = local.write_text("local projects data")
+        _ = local.write_text("local skills data")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
-        self.refused(result, f"{local} is a real file; move it aside or merge it into ~/.claude")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"accounts: anomaly: {local} is a real file; move it aside or merge it into ~/.claude",
+                      result.stderr)
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
         self.assertFalse(local.is_symlink())
-        self.assertEqual(local.read_text(), "local projects data")
+        self.assertEqual(local.read_text(), "local skills data")
 
     def test_picked_named_account_refuses_untrusted_folder_despite_default_trust(self) -> None:
         directory = self.named_account()

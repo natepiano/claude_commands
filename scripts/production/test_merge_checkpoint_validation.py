@@ -13,6 +13,7 @@ from typing import final
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
+from scripts.production import staff
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
@@ -97,11 +98,15 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
     def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
+        import change_review
+
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades")
         result = self.run_checkpoint(sha)
-        self.assertNotEqual(result.process.returncode, 0)
+        self.assertEqual(result.process.returncode, 1)
         self.assert_stopped_before_merge(result, "held", "checkpoint(alpha): grid fades: no Change-Review line")
-        self.assertIn("Change-Review-Covers", result.process.stdout)
+        self.assertIn(sha[:change_review.SHORT], result.process.stdout)
+        self.assertIn("a plain commit, not a merge: a merge may carry only `Change-Review: none` lines", result.process.stdout)
+        self.assertIn(change_review.COVERS, result.process.stdout)
     def test_a_merge_adds_a_row_per_visible_change_to_the_named_list(self) -> None:
         review = self.root / "change-review.md"
         _ = review.write_text("## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
@@ -113,8 +118,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         merged = self.git("rev-parse", "--short=8", "HEAD")
+        with mock.patch.dict(os.environ, self.env):
+            producer = next(row.id for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
         self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
-                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| example \|  \|$")
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| example \| {producer} \|$")
         self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")

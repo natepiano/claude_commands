@@ -1,8 +1,7 @@
 """Resume restored Claude and Codex panes on their retained accounts.
 
 herdr restores the layout without starting agents. A restore opens a tab on the retained account.
-It proves the current conversation before it closes the old tab.
-It preserves a stopped, running, unknown, or occupied pane.
+It keeps running sessions and occupied panes. It resumes intentionally stopped sessions when requested.
 
 Run: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]
 """
@@ -10,11 +9,10 @@ Run: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_restore.py [--sess
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 for dependency in ("whoami", "message", "herdr", "lib"):
@@ -33,41 +31,12 @@ START_TIMEOUT_MS = 90_000
 SERVER_TIMEOUT_MS = 60_000
 
 
-def _has_transcript(config_dir: Path, session_id: str, kind: Literal["claude", "codex"] = "claude") -> bool:
-    if kind == "claude":
-        return any(path.is_file() for path in (config_dir / "projects").glob(f"*/{session_id}.jsonl"))
-    for folder in ("sessions", "archived_sessions"):
-        for path in (config_dir / folder).rglob(f"*{session_id}.jsonl"):
-            with path.open(encoding="utf-8") as stream:
-                try:
-                    value = cast(object, json.loads(stream.readline()))
-                except ValueError:
-                    continue
-            if not isinstance(value, dict):
-                continue
-            record = cast(dict[str, object], value)
-            payload = record.get("payload")
-            if (record.get("type") == "session_meta" and isinstance(payload, dict)
-                    and cast(dict[str, object], payload).get("id") == session_id):
-                return True
-    return False
-
-
 def skip_reason(pane: herdr.TabSession, entry: pane_record.PaneLaunch | None, live: set[str]) -> str:
     """Why the pane stays as it is; empty when it is resumed."""
     if entry is None:
         return "no launch entry" if pane.session_id else ""
-    if pane.session_id and pane.session_id != entry["session_id"]:
-        return f"herdr has {pane.session_id}, the entry {entry['session_id']}"
-    if entry.get("ended", False):
-        return "its agent was closed by hand"
     if entry["session_id"] in live:
         return "it already runs"
-    # Entries from before the field existed were written on Linux, where the flags are read.
-    if not entry.get("flags_read", sys.platform != "darwin"):
-        return "its launch flags are unknown"
-    if not _has_transcript(Path(entry["config_dir"]), entry["session_id"], pane_launch.agent_kind(entry)):
-        return f"no transcript of {entry['session_id']} in {entry['config_dir']}"
     return ""
 
 
@@ -100,14 +69,12 @@ def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession,
         raise herdr.HerdrFailure(launched.reason)
     path = pane_record.record_path(session)
     attempt = pane_launch.resume_attempt(path, launched.pane)
-    try:
-        identity = client.native_session(launched.pane, kind, START_TIMEOUT_MS / 1000)
-        if identity != entry["session_id"]:
-            raise herdr.HerdrFailure(f"{entry['session_id']}: resumed registry identity differs: {identity}")
-    except (herdr.HerdrFailure, OSError, ValueError):
-        pane_launch.finish_restore(path, original, attempt, pane_launch.FailedResume(), close=client.close_tab_confirmed)
-        raise
     # Ordering the tabs keeps each pane's id (herdr review, 2026-10-19).
+    fresh = next((item for item in client.tab_sessions() if item.pane_id == pane.pane_id), None)
+    if fresh is not None and ((fresh.session_id and fresh.session_id != entry["session_id"])
+                              or not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell)):
+        print(f"{pane.pane_id}: pane close anomaly: pane holds other work; kept open", file=sys.stderr)
+        return
     pane_launch.finish_restore(path, original, attempt, proof, close=client.close_tab_confirmed)
 
 
@@ -118,17 +85,17 @@ def restore(session: str, *, dry_run: bool) -> int:
         if isinstance(names.record, staff.StaffSnapshot):
             for note in herdr.repair_retained_launches(names.record, pane_record.record_directory(), dry_run=dry_run):
                 print(note)
-    except (herdr.HerdrFailure, OSError, ValueError) as error:
+    except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
         print(f"pane_restore: retained launch repair failed: {error}", file=sys.stderr)
-        return 1
     entries = pane_record.read(session)
     live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
+    codex_unknown = ""
     if any(pane_launch.agent_kind(entry) == "codex" for entry in entries.values()):
         try:
             live.update(herdr.running_codex_threads(thread_host=staff_sources.codex_thread_host))
-        except (herdr.HerdrFailure, OSError, ValueError) as error:
-            print(f"pane_restore: Codex process evidence is unavailable: {error}", file=sys.stderr)
-            return 1
+        except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
+            codex_unknown = str(error)
+            print(f"pane_restore: Codex liveness anomaly: {error}", file=sys.stderr)
     failures = 0
     for pane in client.tab_sessions():
         saved = entries.get(pane.pane_id)
@@ -136,6 +103,8 @@ def restore(session: str, *, dry_run: bool) -> int:
             entry = names.resume(saved) if saved is not None else None
             if entry is not None:
                 entry["environment"] = names.environment(entry)
+            if entry is not None and pane_launch.agent_kind(entry) == "codex" and codex_unknown:
+                raise herdr.HerdrFailure(f"cannot exclude a running copy: {codex_unknown}")
             label = entry["name"] if entry is not None and entry["name"] else pane.label
             reason = skip_reason(pane, entry, live)
             if entry is None or reason:
@@ -147,11 +116,23 @@ def restore(session: str, *, dry_run: bool) -> int:
                 continue
             if saved is None:
                 raise ValueError(f"{pane.pane_id}: original launch is unavailable")
-            with herdr.restore_staff(names.tab_record, labels=names.labels):
-                _resume(session, client, pane, ResolvedResume(saved, names.resume_proof(saved, entry)))
+            owner = names.tab_record.by_member_reference(saved["session_id"])
+            reference = str(owner.id) if owner is not None else saved["session_id"]
+            with staff.row_operation(reference):
+                current_names = LaunchNames.read()
+                entry = current_names.resume({**saved, "session_id": reference})
+                entry["environment"] = current_names.environment(entry)
+                current_live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
+                if pane_launch.agent_kind(entry) == "codex":
+                    current_live.update(herdr.running_codex_threads(thread_host=staff_sources.codex_thread_host))
+                if entry["session_id"] in current_live:
+                    print(f"{pane.pane_id} {label}: unchanged")
+                    continue
+                with herdr.restore_staff(current_names.tab_record, labels=current_names.labels):
+                    _resume(session, client, pane, ResolvedResume(saved, current_names.resume_proof(saved, entry)))
             live.add(entry["session_id"])
             print(f"{pane.pane_id} {label}: resumed {entry['session_id']}")
-        except (herdr.HerdrFailure, OSError, ValueError) as error:
+        except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
             failures += 1
             print(f"{pane.pane_id} {pane.label}: not resumed: {error}", file=sys.stderr)
     return 1 if failures else 0
@@ -163,10 +144,6 @@ def main(arguments: list[str] | None = None) -> int:
     _ = parser.add_argument("--dry-run", action="store_true")
     options = parser.parse_args(arguments)
     session = cast(str, options.session) or herdr.shared_session()
-    if not session:
-        print("pane_restore: no shared herdr session is set", file=sys.stderr)
-        return 2
-    # At boot this runs as soon as the server unit starts: wait until it answers.
     _ = herdr.start_server(session, SERVER_TIMEOUT_MS)
     return restore(session, dry_run=cast(bool, options.dry_run))
 

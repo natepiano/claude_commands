@@ -260,8 +260,11 @@ Phases can be open together. State holds the most recently started open phase
 under `phase` (what `progress`, `eta`, `start-pass`, `arm-review` and
 `findings.py` use) and the older open ones under `open_phases`, each carrying
 its own percent, calibration and early-review state under `parked`.
-`start-phase` for an id already open does nothing; for any other id it leaves
-every open phase open. A phase closes only by its own `finish-phase`:
+An unchanged `start-phase` retry leaves the open phase and its records unchanged from any working directory.
+A changed title or explicit start time can trigger a restart refusal from another recorded worktree.
+Reopening a finished id removes its old worktree and baselines; the next claim records the worker's repository root, HEAD and status.
+A held reservation prevents this reset until its release is confirmed.
+Starting another id leaves every open phase open. A phase closes only by its own `finish-phase`:
 `--phase-id` names it, and without it the current one closes. Only that phase's
 passes close with it (each pass carries the phase it was opened in, under
 `phase`), and when the current phase closes, the newest older open phase is

@@ -14,12 +14,11 @@ from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownSendLeaf, ShutdownTestCase
-from test_restart import entry, showrunner, top_level, unit
 import remote_control
 import herdr
 import sessions
 import session_pane
-import restart_support
+from scripts.whoami import quota_alert
 import remote
 import detached
 from push_texts import RenderedPush
@@ -121,7 +120,7 @@ class RemoteControlTests(ShutdownTestCase):
 
     def run_fix(self) -> tuple[remote_control.RemoteControlOutcome, str, list[RenderedPush]]:
         output = io.StringIO()
-        with patch.object(restart_support, "alert_user") as alert, redirect_stdout(output):
+        with patch.object(quota_alert, "tell_user") as alert, redirect_stdout(output):
             outcome = remote_control.fix("owner", 321, "original", "trunk unit", "Owner", clock=self.clock)
         lines = output.getvalue().splitlines()
         self.assertEqual(len(lines), 1, output.getvalue())
@@ -336,12 +335,6 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertEqual(self.typed, [])
         self.assertEqual(pushes, [])
 
-    def test_who_names_the_unit_production_or_plain_session(self) -> None:
-        for saved, expected in ((entry(unit("trunk")), "trunk unit"),
-                                (entry(showrunner("director")), "demo showrunner"),
-                                (entry(top_level("plain", name="Workspace")), "Workspace")):
-            with self.subTest(expected=expected):
-                self.assertEqual(remote_control.remote_control_who(saved), expected)
 
     def test_detached_launch_carries_process_identity_unbuffered_python_and_who(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)

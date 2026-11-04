@@ -110,7 +110,7 @@ The user completes deployment before target activation.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
 `kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
 
-`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20) and waits for the user's approval at go-live.
+`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20); the user approved it on 2026-11-03.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
 The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
@@ -159,13 +159,21 @@ Deployment settings require the account inputs before preparation.
 `deployment_profile` names the administrator profile. `credentials_profile` names the scaler profile.
 `stack_name`, `availability_zone`, `vpc_id`, and `subnet_id` select the deployment location.
 `ami_id`, `ami_owner_id`, `nixos_release`, and `root_device_name` identify the official x86_64 NixOS image.
-`notification_email` receives the Budget notices. The `budget_notice_*_percent` keys set their thresholds.
+`notification_email_file` names a private file with one address for Budget notices.
+The default path is `~/.config/aws-build/notification-email`.
+Keep this file outside the public repository. Never put the address in a tracked file.
+Only `prepare` and `apply` read the address file. `bootstrap` needs no address file.
+The `budget_notice_*_percent` keys set the notice thresholds.
 `budget_stop_percent` sets the stop threshold. The live spending guard remains the primary limit.
 `root_volume_gib` sizes the root volume.
 `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.
 `existing_data_volume_id` selects a retained volume. An empty value requests a new volume.
 `spot_max_usd_per_hour` limits the Spot request price.
-`deployment_price_usd_per_hour` and `deployment_price_at` record the current public price and its Unix timestamp.
+`deployment_price_file` names the price state file outside the repository. Its default path is `~/.config/aws-build/deployment-price`.
+Run `python3 scripts/aws_target/deploy.py price` before `prepare`.
+The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
+It writes the price and its read time atomically with mode `0600`.
+`prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
 `preflight_max_age_s` limits preparation age. `deployment_timeout_s` bounds each deployment command.
 `scaler_user_name` names the IAM user.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
@@ -280,6 +288,14 @@ Transfers exclude admission and pending state directories.
 Each configured peer supplies only its own host folders.
 The `BUILDLOG_PEER` override retains the legacy transfer of all other synchronized host folders.
 Rsync replaces complete files and preserves this host's append files.
+
+## test_times.conf
+
+`SLOW_TEST_S` sets the minimum test time retained in the build log.
+Failed tests, errors, and unexpected successes remain in the log at every duration.
+`TOP_RUNS` sets the number of recent gate runs used to rank each module by its median wall time.
+Callers read these settings through `scripts/lib/conf.py` at each use.
+`CONF_DIR` selects a fixture folder for tests.
 
 ## direct.conf
 
