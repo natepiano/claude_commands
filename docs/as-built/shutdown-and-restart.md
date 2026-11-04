@@ -32,6 +32,9 @@ Resume does not stop or move a running session.
 The default reason is `resumed by name`.
 
 The shared resume path reads the saved account, environment, arguments, and folder.
+Claude units and showrunners use their group's configured account unless `--to` supplies an account.
+This rule also applies when no pane launch record exists.
+Ad hoc sessions keep their saved account.
 It restores a closed tab when a saved launch exists.
 An explicit CLI resume can restore an intentionally stopped session.
 Automatic recovery preserves an intentional stop.

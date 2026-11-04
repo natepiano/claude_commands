@@ -41,6 +41,31 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_resume_uses_the_group_account_unless_the_target_is_explicit(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        for kind in ("unit", "showrunner", "agent"):
+            for target in (None, "claude3"):
+                with self.subTest(kind=kind, target=target):
+                    pane_record.save("agents", {self.entry["pane_id"]: self.entry})
+                    row = staff.StaffRow(identity, kind, "alpha", None, current_session=identity)
+                    expected = target or ("claude4" if kind != "agent" else "claude3")
+                    with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                          patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
+                              "claude4", self.root / ".claude4")) as selection,
+                          patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(456)) as start):
+                        result = stop_resume.resume(str(identity), to=target)
+                    self.assertIsInstance(result, stop_resume.ClaudeUp)
+                    assert isinstance(result, stop_resume.ClaudeUp)
+                    self.assertEqual(result.account, expected)
+                    self.assertEqual(start.call_args.args[2], expected)
+                    entry = cast(pane_record.PaneLaunch, start.call_args.args[1])
+                    self.assertEqual(entry["config_dir"], str(self.root / f".{expected}"))
+                    self.assertEqual(entry["environment"]["CLAUDE_CONFIG_DIR"], entry["config_dir"])
+                    if target is None and kind != "agent":
+                        selection.assert_called_once_with(kind)
+                    else:
+                        selection.assert_not_called()
+
     def test_resume_without_a_pane_record_starts_the_staff_row(self) -> None:
         identity = self.entry["session_id"]
         row = staff.StaffRow(staff.StaffId("fixed-row"), "unit", "alpha", None,
@@ -349,6 +374,8 @@ class StopResumeTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(redirect_stderr(io.StringIO()))
         _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
+        _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
+            "claude3", self.root / ".claude3")))
         _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.process_account))
         _ = self.enterContext(patch.object(herdr, "repository_root", return_value=self.root))
         _ = self.enterContext(patch.object(herdr, "repository_trust_key", return_value=self.root))

@@ -355,6 +355,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
         owner = self.add_unit("alpha")
+        self.assertEqual(accounts.group_accounts().get("units"), "claude2")
         member = unit_membership("fixture", "alpha")
         record = staff.StaffSnapshot(tuple(
             replace(row, id=staff.StaffId(owner["session_id"]),
@@ -363,7 +364,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
         def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
-            self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude4"))
+            self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude2"))
             environment = {**entry["environment"], "HERDR_ENV": "1", "HERDR_SESSION": "shared",
                            "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["config_dir"]}
             payload = json.dumps({"session_id": "alpha", "cwd": owner["cwd"]})
@@ -378,7 +379,7 @@ class UnitWatchdogTests(unittest.TestCase):
             self.revive("alpha", label)
             return sessions.LiveSessionProcess(owner["pid"])
 
-        config = accounts.account_dir("claude4")
+        config = accounts.account_dir("claude2")
         with self.stop_process_leaves():
             self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("alpha", owner["pid"]))
             self.assertTrue(pane_record.read("shared")["alpha"].get("ended", False))
@@ -400,7 +401,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.die("alpha")
         for minute in (0, 2, 4):
             _ = self.pass_at(minute)
-        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
+        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude2", "--only", "alpha"]])
         self.assertEqual({entry["sessionId"] for entry in self.fixture.live}, {"alpha"})
 
     def test_crashed_unit_without_any_record_resumes_in_its_tab_on_the_launch_account(self) -> None:
