@@ -286,21 +286,14 @@ Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHON
 ### Phase 14 — Build history charts open and show every machine's costs  · status: done
 **Depends on:** Phase 8, Phase 10
 
-The user, 2026-11-04, change reviews C950 (Build history charts) and C951 (Chart labels): "not works".
+#### As-built
 
-Cause, found 2026-11-04:
-
-1. The aws-build target is now in the target config, but it has no monthly log. `charts.py` `cost_value` marks a machine with no recorded coverage as unavailable. "All machines" needs every configured machine, so every cost chart on every day shows "Unavailable — no complete indexed aws monthly log covers this day".
-2. `buildlog` is not on the terminal PATH. The change-review step "type buildlog charts" gives "command not found". The PATH is in `/etc/nixos`; the builds showrunner routes it.
-
-The change:
-
-1. A configured machine that has no recorded source before or in a day is not required for that day. It adds nothing to "All machines" and does not make the day unavailable.
-2. The machine's own chart still shows that the machine has no data, in one plain line, not one unavailable chart per cause.
-3. A machine with recorded coverage that is missing for a day (for example, a Mac sync that is late) still makes that day unavailable. A missing applicable wait stays unavailable, never 0.
-4. Tests pin all three rules with a fixture that has a configured machine with no log.
-
-Acceptance: `buildlog charts --no-open` on natedev shows measured cost lines for "All machines" for 2026-10-28 to 2026-11-04. A browser screenshot of the page shows the lines. Speed stays in the Phase 8 limits.
+- Cause (C950, C951 "not works", 2026-11-04): the aws-build target was configured with no build log, and "All machines" needed every configured machine, so every cost chart was unavailable. `buildlog` is also not on the terminal PATH; that fix is in `/etc/nixos` and goes through the builds showrunner.
+- `costs.first_source_times` gives each machine's first indexed event. Empty and eventless monthly files do not count. `CostReading.first_sources` carries the mapping; `build_series` joins it with observations.
+- `cost_value` returns `NoDataYet` for each day before a machine's first event. JS sums (All machines and grouped "Other") skip those cells. The chart, table, tooltip and detail line read the same cell. A machine with no data in the window shows one line, and the selector names it "no data yet".
+- A machine with recorded data that misses a day still makes the day unavailable. A missing applicable wait stays unavailable.
+- Page CPU: 7 days about 0.6 s, 30 days about 1.8 s.
+- The checkpoint's Change-Review rows re-check C950 and C951 with the full path.
 
 **Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
 
