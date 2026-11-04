@@ -169,12 +169,24 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         live = sessions.session_liveness(identity)
         if isinstance(live, sessions.SessionNotLive):
             client = herdr.Herdr(herdr.shared_session())
-            for pane in client.panes():
-                if pane["session_id"] == identity and not isinstance(
-                        client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
-                    if pid := client.codex_launch(pane["pane_id"], ["resume", identity]).get("pid"):
-                        live, kind = sessions.LiveSessionProcess(pid), "codex"
-                        break
+            for pane in sorted(client.panes(), key=lambda pane: pane["session_id"] != identity):
+                if pane["session_id"] and pane["session_id"] != identity:
+                    continue
+                try:
+                    if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
+                        continue
+                    launch = client.codex_launch(pane["pane_id"], ["resume", identity])
+                    pid = launch.get("pid")
+                    if not pid or launch["session_id"] != identity:
+                        continue
+                    if not pane["session_id"] and herdr.codex_rollout_thread(pid) != identity:
+                        continue
+                except (OSError, ValueError, herdr.HerdrFailure):
+                    if pane["session_id"] == identity:
+                        raise
+                    continue
+                live, kind = sessions.LiveSessionProcess(pid), "codex"
+                break
         if isinstance(live, sessions.SessionNotLive):
             return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
