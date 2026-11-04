@@ -15,6 +15,8 @@ from unittest.mock import patch
 
 from scripts.direct import workers
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
 
 
 END_SESSION = Path(__file__).with_name("end_session.sh")
@@ -40,7 +42,10 @@ class EndSessionTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.session_dir = self.root / "run"
         self.session_dir.mkdir()
-        session_id = f"end-session-test-{os.getpid()}-{self.root.name}"
+        session_id = fixture_runtime_id(f"end-session:{self.root.name}")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        owner = fixture_member("showrunner", name="end-owner")
+        _ = fixture_member("unit", name="end-unit", parent=owner.id, runtime_id=session_id)
         active_root = self.root / "active"
         active_root.mkdir()
         self.marker = active_root / session_id
@@ -86,6 +91,7 @@ class EndSessionTests(unittest.TestCase):
         environment = os.environ.copy()
         environment.update({
             "HOME": str(self.root),
+            "PYTHONPATH": str(END_SESSION.resolve().parents[2]),
             "CLAUDE_CODE_SESSION_ID": self.session_id,
             "END_SESSION_CALLS": str(self.calls),
             "UNIT_ACTIVE_DIR": str(self.marker.parent),
@@ -100,8 +106,11 @@ class EndSessionTests(unittest.TestCase):
         return environment
 
     def test_roster_without_server_record_still_runs_mesh_stop(self) -> None:
+        parent = staff.local_snapshot().by_current_session(self.session_id)
+        assert parent is not None
+        worker = fixture_worker("project-impl", parent.id)
         _ = (self.session_dir / "mesh_roster.json").write_text(json.dumps({
-            "project-impl": {"thread_id": "thread-1", "status": "done"},
+            "project-impl": {"staff_id": worker.id, "status": "done"},
         }), encoding="utf-8")
         result = subprocess.run(
             ["bash", str(self.script)],
@@ -132,7 +141,14 @@ class EndSessionTests(unittest.TestCase):
         (run / "p62_bin").mkdir()
         _ = (run / "p62_bin" / "CACHEDIR.TAG").write_text("tag\n", encoding="utf-8")
         _ = (run / "mesh_server.json").write_text("{}", encoding="utf-8")
-        _ = (run / "director").write_text(f"{director}\n", encoding="utf-8")
+        membership = staff.local_snapshot()
+        parent = membership.by_current_session(director)
+        if parent is None:
+            owner = next(row for row in membership.find(kind="showrunner") if row.name == "end-owner")
+            parent = fixture_member("unit", name="other-unit", parent=owner.id,
+                                    runtime_id=fixture_runtime_id(director))
+        member = fixture_worker(name, parent.id)
+        _ = (run / "mesh_roster.json").write_text(json.dumps({name: {"staff_id": member.id, "status": "done"}}))
         return run
 
     def test_every_run_the_director_holds_is_cleaned_and_no_other(self) -> None:
@@ -205,9 +221,15 @@ class EndSessionTests(unittest.TestCase):
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
                                   "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
         self.addCleanup(lambda: child.communicate(timeout=TEST_HANG_GUARD_SECS))
-        _ = record.write_text(json.dumps({
-            "worker": "w7", "status": "running", "pid": child.pid, "cwd": str(command_cwd)}))
         environment = self.environment()
+        environment["CODEX_HOME"] = str(self.root / "codex")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
+        owner = fixture_member("showrunner", name="demo")
+        parent = fixture_member("unit", name="builders", parent=owner.id,
+                                worktree=staff.PresentWorktree("natedev", command_cwd))
+        member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(Path(environment["CODEX_HOME"])))
+        _ = record.write_text(json.dumps({
+            "worker": "w7", "status": "running", "pid": child.pid, "staff_id": member.id}))
         environment.update({"UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
             "SCRATCH_ROOT": str(scratch.parent), "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json")})
@@ -215,8 +237,8 @@ class EndSessionTests(unittest.TestCase):
             store = workers.UnitWorkerLedger(workers.ledger_path("demo", "builders"))
             with store.locked() as ledger:
                 ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
-                    workers.CodexThread("kept-thread", str(self.root / "codex")), workers.Paused(),
-                    [workers.WorkerEvent("opened", "fixture", str(run), 1.0)])
+                    workers.CodexThread(member.current_session, str(self.root / "codex")), workers.Paused(),
+                    [workers.WorkerEvent("opened", "fixture", str(run), 1.0)], staff_id=member.id)
         result = subprocess.run(["bash", str(self.script)], env=environment,
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)

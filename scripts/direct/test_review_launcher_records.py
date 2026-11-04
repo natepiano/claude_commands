@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id
+
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
@@ -97,7 +100,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         result = subprocess.run(self.unit_review_command(session), env=environment, capture_output=True, text=True,
                                 check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((session / "director").read_text(encoding="utf-8"), "sid-director\n")
+        self.assertEqual(self.recorded_worker(session, "fixture-review").parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
 
     def test_a_phase_id_with_a_space_names_a_directory_without_it(self) -> None:
         session = self.start_implementation("phase-directory-name")
@@ -139,7 +142,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
         roster = cast(dict[str, dict[str, object]], json.loads((session / "mesh_roster.json").read_text()))
         self.assertEqual(roster["fixture-review"]["status"], "failed")
-        self.assertEqual(roster["fixture-review"]["thread_id"], "thread-fixture")
+        self.assertEqual(roster["fixture-review"]["thread_id"], fixture_runtime_id("thread-fixture"))
         _ = environment.pop("STUB_TURN_FAILURE")
         retry = subprocess.run(self.review_command(session, "contract", "", "fixture-review"), env=environment,
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -149,7 +152,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertTrue(all(record["arm"] == "own" for record in records))
         self.assertTrue(all(record["reviewer"] == "fixture-review" for record in records), records)
         self.assertCountEqual([record["status"] for record in records], ["error", "reviewed"])
-        self.assertTrue(all(record["thread_id"] == "thread-fixture" for record in records), records)
+        self.assertTrue(all(record["thread_id"] == fixture_runtime_id("thread-fixture") for record in records), records)
         self.assertTrue(all((record["unit"], record["phase"]) == ("", "3") for record in records))
 
     def test_unit_review_still_starts_and_finishes_a_pass(self) -> None:
@@ -188,7 +191,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(records[0]["started_at"], records[1]["started_at"])
         for record in records:
             self.assertEqual(record["status"], "reviewed")
-            self.assertEqual(record["thread_id"], "thread-fixture")
+            self.assertEqual(record["thread_id"], fixture_runtime_id("thread-fixture"))
 
     def test_own_review_records_the_replacement_thread(self) -> None:
         session = self.start_implementation("replacement-own")
@@ -198,7 +201,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         result = subprocess.run(self.unit_review_command(session), env=environment, capture_output=True,
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.turn_records(session)[0]["thread_id"], "thread-replacement")
+        self.assertEqual(self.turn_records(session)[0]["thread_id"], fixture_runtime_id("thread-replacement"))
         self.assertEqual(self.turn_records(session)[0]["arm"], "own")
 
 if __name__ == "__main__":

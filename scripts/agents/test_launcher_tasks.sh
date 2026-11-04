@@ -38,6 +38,7 @@ import pathlib
 import sys
 
 arguments = sys.argv[1:]
+assert '--cwd' not in arguments, arguments
 session = pathlib.Path(arguments[arguments.index('--session-dir') + 1])
 (session / 'arguments.json').write_text(json.dumps(arguments))
 PY

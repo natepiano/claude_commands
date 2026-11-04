@@ -15,6 +15,7 @@ from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -56,13 +57,13 @@ sys.meta_path.insert(0, NoRepositoryModules())
     def test_mac_timeout_or_interruption_reports_that_main_was_already_promoted(self) -> None:
         args = merge_gate.GateArguments(main_repo=str(self.main), merge_branch="integration",
                                        ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")
-        for failure in (subprocess.TimeoutExpired("fake-ssh", 25), merge_gate.GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
+        for failure in (subprocess.TimeoutExpired("fake-ssh", 25), GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
             with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "wait_for_release_lock"), mock.patch.object(
                     merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, "", "", self.base]) as checked, mock.patch.object(
                     merge_gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
                     merge_gate, "promotion_edit_conflict", return_value=""), mock.patch.object(
                     subprocess, "run", side_effect=failure):
-                with self.assertRaisesRegex(merge_gate.GateRefused, f"main promoted to {self.base}; Mac fast-forward failed"):
+                with self.assertRaisesRegex(GateRefused, f"main promoted to {self.base}; Mac fast-forward failed"):
                     merge_gate.promote(args)
             self.assertIn(mock.call(self.main, "push", "origin", "main"), checked.call_args_list)
 
@@ -72,12 +73,12 @@ sys.meta_path.insert(0, NoRepositoryModules())
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "main"):
-                raise merge_gate.GateRefused("injected push failure")
+                raise GateRefused("injected push failure")
             return checked(repo, *arguments)
 
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
                 merge_gate, "checked_git", side_effect=stop_at_push):
-            with self.assertRaisesRegex(merge_gate.GateRefused, "injected push failure"):
+            with self.assertRaisesRegex(GateRefused, "injected push failure"):
                 merge_gate.promote(args)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
@@ -183,7 +184,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
         clock = SimpleNamespace(monotonic=mock.Mock(side_effect=[10.0, 10.0, 70.0]), sleep=pause)
         with self.release_lock_held_by_child(), mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(merge_gate, "time", clock):
-            with self.assertRaisesRegex(merge_gate.GateRefused,
+            with self.assertRaisesRegex(GateRefused,
                     "^build-hold state stayed locked for 60 s; main promotion refused$"):
                 merge_gate.promote(args)
             pause.assert_called_once_with(0.2)
@@ -264,7 +265,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
 
         with mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", side_effect=edit_during_wait):
-            with self.assertRaisesRegex(merge_gate.GateRefused, 'promotion refused: tracked edits overlap promotion: "subject.txt"'):
+            with self.assertRaisesRegex(GateRefused, 'promotion refused: tracked edits overlap promotion: "subject.txt"'):
                 merge_gate.promote(args)
         self.assertEqual((self.main / "subject.txt").read_text(), "edited during hold\n")
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
@@ -310,7 +311,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
                         merge_gate.promote(args)
                         self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.checkpoint)
                     else:
-                        with self.assertRaisesRegex(merge_gate.GateRefused, 'Mac fast-forward failed:.*"subject.txt"'):
+                        with self.assertRaisesRegex(GateRefused, 'Mac fast-forward failed:.*"subject.txt"'):
                             merge_gate.promote(args)
                         self.assertEqual(self.git(mac, "rev-parse", "HEAD"), self.base)
                         self.assertEqual((mac / "subject.txt").read_text(), "Mac local contents\n")

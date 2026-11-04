@@ -24,6 +24,14 @@ from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
 from scripts.lint import memory_admit as gate
+
+if TYPE_CHECKING:
+    from scripts.buildlog import store
+    from scripts.buildlog import record as buildlog_record
+else:
+    import store
+    import record as buildlog_record
+
 if TYPE_CHECKING:
     from scripts.lib import conf
 else:
@@ -1376,8 +1384,8 @@ class ServiceTests(unittest.TestCase):
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(grant, 9 * GIB)
             history = fixture.state_dir / "anon_peaks.jsonl"
-            gate.store.append_line(history, {"reservation_id": "earlier"})
-            with mock.patch.object(gate.store, "whole_rows", side_effect=AssertionError("normal release scanned history")):
+            store.append_line(history, {"reservation_id": "earlier"})
+            with mock.patch.object(store, "whole_rows", side_effect=AssertionError("normal release scanned history")):
                 self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("end", grant.reservation, 0)), [wire.Ok()])
             rows = fixture.history()
             self.assertEqual([row["reservation_id"] for row in rows], ["earlier", grant.reservation])
@@ -1391,7 +1399,7 @@ class ServiceTests(unittest.TestCase):
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(grant, 9 * GIB)
             history = fixture.state_dir / "anon_peaks.jsonl"
-            gate.store.append_line(history, {"reservation_id": "earlier"})
+            store.append_line(history, {"reservation_id": "earlier"})
             offset = history.stat().st_size
             fixture.fault.stage = "after_history_append"
             release = wire.ReleaseRequest("end", grant.reservation, 137)
@@ -1400,7 +1408,7 @@ class ServiceTests(unittest.TestCase):
             saved = service.read_state(fixture.state_dir).reservations[request.episode].finalization
             assert isinstance(saved, dict)
             self.assertEqual(saved.get("history_start"), offset)
-            with mock.patch.object(gate.store, "whole_rows", wraps=gate.store.whole_rows) as scan:
+            with mock.patch.object(store, "whole_rows", wraps=store.whole_rows) as scan:
                 fixture.restart()
                 scan.assert_any_call(mock.ANY, offset)
             self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
@@ -1786,7 +1794,7 @@ class CutoverServiceTests(unittest.TestCase):
                 grant = only_admitted(fixture.server.handle_request(request))
                 fixture.scoped_peak(grant, 15 * GIB)
                 release = wire.ReleaseRequest("stopped-release", grant.reservation, 137)
-                with stop_history_append(gate.store, tail):
+                with stop_history_append(store, tail):
                     with self.assertRaisesRegex(OSError, "injected stop"):
                         _ = fixture.server.handle_request(release)
                 saved = service.read_state(fixture.state_dir).reservations[request.episode]
@@ -2123,7 +2131,7 @@ class CutoverServiceTests(unittest.TestCase):
                 if action == "replace":
                     _ = self.enterContext(mock.patch.object(gate, "priority_labels", return_value={
                         request.identity.session_id: UnitLabels("worker", unit="new")}))
-                with mock.patch.object(gate.record, "queue_priority", wraps=gate.record.queue_priority) as logged:
+                with mock.patch.object(buildlog_record, "queue_priority", wraps=buildlog_record.queue_priority) as logged:
                     fixture.fault.stage = "after_state_write"
                     with self.assertRaises(InjectedCrash):
                         _ = fixture.server.handle_request(mutation)
@@ -2254,7 +2262,7 @@ class CutoverServiceTests(unittest.TestCase):
             labels = {first.identity.session_id: UnitLabels("first", unit="other"),
                       second.identity.session_id: UnitLabels("second", unit="queue")}
             with mock.patch.object(gate, "priority_labels", return_value=labels), \
-                 mock.patch.object(gate.record, "queue_priority", wraps=gate.record.queue_priority) as logged:
+                 mock.patch.object(buildlog_record, "queue_priority", wraps=buildlog_record.queue_priority) as logged:
                 _ = fixture.server.handle_request(first)
                 _ = fixture.server.handle_request(second)
                 mutation = wire.PrioritySetRequest("priority-once", "queue", "urgent", "director")
@@ -2592,7 +2600,7 @@ class CutoverServiceTests(unittest.TestCase):
                 self.assertEqual(stale.profile.build_history_generation, fixture.build_history_generation())
                 fixture.free(18 * GIB)
                 with self.subTest(boundary="pending finalization"), \
-                        mock.patch.object(gate.store, "append_locked", side_effect=OSError("history unavailable")):
+                        mock.patch.object(store, "append_locked", side_effect=OSError("history unavailable")):
                     reply, = fixture.server.handle_request(stale)
                     self.assertIsInstance(reply, wire.Wait)
                     assert isinstance(reply, wire.Wait)
@@ -2606,7 +2614,7 @@ class CutoverServiceTests(unittest.TestCase):
                     fixture.clock.epoch = 1075
                     self.assertEqual(fixture.proc.owner_start(owner.owner.pid),
                         service.LiveOwnerIdentity(owner.owner.start_time))
-                    with mock.patch.object(gate.store, "append_locked",
+                    with mock.patch.object(store, "append_locked",
                             side_effect=OSError("history append failed")) as append:
                         fixture.restart()
                         with self.subTest(boundary="failed append after restart"):
@@ -2743,7 +2751,7 @@ class CutoverServiceTests(unittest.TestCase):
                 legacy = fixture.state_dir / "legacy.reservation"
                 row = {"pid": owner.pid, "start_time": owner.start_time, "need": GIB,
                        "repo": "fixture", "step": step, "worktree": "tree", "sidecar": "",
-                       "admitted_at": gate.store.utc_iso(fixture.clock.now()),
+                       "admitted_at": store.utc_iso(fixture.clock.now()),
                        "test_threads": width, "call_id": call}
                 _ = legacy.write_text(json.dumps(row))
                 fixture.server = fixture.new_server()
@@ -2772,7 +2780,7 @@ class CutoverServiceTests(unittest.TestCase):
             legacy = fixture.state_dir / "named.reservation"
             row = {"pid": owner.pid, "start_time": owner.start_time, "need": GIB,
                    "repo": "fixture", "step": "check", "worktree": "tree", "sidecar": "",
-                   "admitted_at": gate.store.utc_iso(fixture.clock.now()),
+                   "admitted_at": store.utc_iso(fixture.clock.now()),
                    "test_threads": None, "call_id": None,
                    "session_id": "legacy-session", "session_name": "legacy-holder"}
             _ = legacy.write_text(json.dumps(row))
@@ -2849,7 +2857,7 @@ class CutoverServiceTests(unittest.TestCase):
                     f"python3\0/private/{script}\0".encode())
                 argv = ["admission_service", "drain-check", "--service", "--state-dir", str(directory)]
                 output = io.StringIO()
-                with mock.patch.object(gate.store, "root", return_value=root if default_folder else root / "other"), \
+                with mock.patch.object(store, "root", return_value=root if default_folder else root / "other"), \
                      mock.patch.object(service, "SystemProc", return_value=proc), \
                      mock.patch.object(sys, "argv", argv), mock.patch("sys.stdout", output):
                     status = service.main()
@@ -2861,7 +2869,7 @@ class CutoverServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             server = mock.MagicMock()
-            with mock.patch.object(gate.store, "root", return_value=root), \
+            with mock.patch.object(store, "root", return_value=root), \
                  mock.patch.object(service, "AdmissionServer", return_value=server) as made, \
                  mock.patch.object(sys, "argv", ["admission_service", "serve"]):
                 self.assertEqual(service.main(), 0)
@@ -2905,7 +2913,7 @@ class CutoverServiceTests(unittest.TestCase):
                             _ = (fixture.state_dir / "old.reservation").write_text(json.dumps({
                                 "pid": request.owner.pid, "start_time": request.owner.start_time,
                                 "need": GIB, "repo": "fixture", "step": "check", "worktree": "tree",
-                                "admitted_at": gate.store.utc_iso(fixture.clock.now()),
+                                "admitted_at": store.utc_iso(fixture.clock.now()),
                                 "sidecar": "", "test_threads": None, "call_id": None}))
                     elif kind == "client":
                         script = "admission_client.py" if rollback else "verify.sh"

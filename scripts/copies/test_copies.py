@@ -135,6 +135,67 @@ class StandingTests(unittest.TestCase):
         self.assertFalse(checkout.parent.exists())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
 
+    def symlink_scratch_root(self) -> Path:
+        physical = self.base / "physical-scratch"
+        physical.mkdir()
+        alias = self.base / "scratch-alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        os.environ["SCRATCH_ROOT"] = str(alias)
+        return alias
+
+    def test_clone_through_symlink_scratch_root(self) -> None:
+        alias = self.symlink_scratch_root()
+        result = self.cli("clone", str(self.source), "--task", "gate:symlink", "--name", "camera")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        checkout = Path(result.stdout.strip())
+        self.assertTrue(checkout.is_relative_to(alias))
+        self.assertNotEqual(checkout, checkout.resolve())
+        self.assertEqual(self.git(checkout, "rev-parse", "--absolute-git-dir"),
+                         str((checkout / ".git").resolve()))
+        self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.head)
+        self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
+        self.assertEqual(scratch.end("gate:symlink"), [checkout.parent])
+        self.assertFalse(checkout.parent.exists())
+
+    def test_symlink_scratch_clone_refuses_foreign_git_directory(self) -> None:
+        _ = self.symlink_scratch_root()
+        checkout = copies.clone(self.source, task="gate:foreign")
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(self.source / ".git")}):
+            with self.assertRaisesRegex(copies.CopyError, "Git directory is .*expected"):
+                copies.initialize_git(checkout, self.source)
+        self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.head)
+
+    def test_symlink_scratch_clone_refuses_symlink_git_directory(self) -> None:
+        _ = self.symlink_scratch_root()
+        checkout = copies.clone(self.source, task="gate:git-link")
+        metadata = checkout / ".git"
+        saved = checkout / "saved-git"
+        _ = metadata.rename(saved)
+        metadata.symlink_to(saved, target_is_directory=True)
+        with self.assertRaisesRegex(copies.CopyError, "must own its .git directory"):
+            copies.initialize_git(checkout, self.source)
+
+    def test_apply_changes_through_symlink_scratch_root(self) -> None:
+        _ = self.symlink_scratch_root()
+        checkout = copies.clone(self.source, task="gate:apply-link")
+        _ = (self.source / "untracked.txt").write_text("new file\n")
+        copies.apply_changes(checkout, self.source, self.head)
+        self.assertEqual((checkout / "untracked.txt").read_text(), "new file\n")
+
+    def test_borrower_order_resolves_stored_git_directory(self) -> None:
+        alias = self.symlink_scratch_root()
+        with copies.workspace("verify-unit", self.source, self.head, name="a-parent", branch="parent") as parent:
+            pass
+        with copies.workspace("verify-unit", parent, self.head, name="z-child", branch="child") as child:
+            pass
+        link = alias / "parent"
+        link.symlink_to(parent, target_is_directory=True)
+        _ = scratch.update_record(child, lambda record: {
+            **(record.fields if isinstance(record, copy_record.Registered) else {}),
+            "borrows_from": str(link / ".git"),
+        })
+        self.assertEqual([tree for tree, _ in copies.owned_workspaces("verify-unit")], [child, parent])
+
     def test_first_use_owns_git_and_never_changes_source_branch(self) -> None:
         _ = self.git(self.source, "status", "--porcelain")
         before = self.snapshot(self.source)

@@ -104,6 +104,7 @@ from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
+from scripts.production import staff, session_staff  # noqa: E402
 
 GIB = 1 << 30
 HOUR_SECONDS = 3600
@@ -725,10 +726,6 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
                     kept[folder] = RunKeepReason.SESSION_WORKTREE
             if os.path.realpath(folder) in marked:
                 kept[folder] = RunKeepReason.ACTIVE_MARKER
-            # director() handles the history fallback; check its inputs before that permissive reader.
-            director = Path(folder) / unit_runs.DIRECTOR_FILE
-            if os.path.lexists(director) and not director.read_text(encoding="utf-8").strip():
-                raise ValueError("run director unreadable")
             if folder not in kept and unit_runs.director(Path(folder)) in live:
                 kept[folder] = RunKeepReason.DIRECTOR
             if not isinstance(state, MissingRecord) and state.get("history_file"):
@@ -757,6 +754,7 @@ def worker_use(guarded: dict[str, RunKeepReason]) -> WorkerUse:
     threads: set[str] = set()
     unreadable: list[str] = []
 
+    membership = staff.local_snapshot()
     for folder in guarded:
         roster_path = Path(folder) / "mesh_roster.json"
         try:
@@ -767,9 +765,7 @@ def worker_use(guarded: dict[str, RunKeepReason]) -> WorkerUse:
                         raise ValueError("worker roster unreadable")
                     worker = cast(dict[str, object], value)
                     if worker.get("status") != "ended":
-                        thread = worker.get("thread_id", "")
-                        if not isinstance(thread, str):
-                            raise ValueError("worker thread id unreadable")
+                        thread = session_staff.worker_session(worker, membership)
                         if thread:
                             threads.add(thread)
         except (OSError, UnicodeError, ValueError):

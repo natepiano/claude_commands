@@ -413,7 +413,7 @@ class NextItemTests(unittest.TestCase):
             parent = next((row.id for row in staff.find(kind="showrunner") if row.name == parent_name), None)
             existing = staff.snapshot().by_path(slug)
             if existing is not None:
-                _ = staff.move(existing.id, parent)
+                _ = staff.move(existing.id, staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
             owner = fixture_member("showrunner", name=slug, parent=parent, doc=staff.LiveDoc("natedev", doc))
             timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}"
             timer.mkdir(parents=True)

@@ -23,9 +23,6 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
                               capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout
         status = subprocess.run(["git", "-C", str(self.working_dir), "status", "--short"], check=True,
                                 capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout
-        stub = self.root / "scripts/agents/agent_exec.sh"
-        with stub.open("a") as stream:
-            _ = stream.write('cat "$UNIT_RUN_DIR/phases/3/phase_baseline" > "$UNIT_RUN_DIR/baseline-at-worker-open"\n')
         result = self.checked_launch(session, "--phase", "3")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((session / "phases/3/phase_baseline").is_file())
