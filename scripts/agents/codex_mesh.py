@@ -92,6 +92,7 @@ from scripts.lib.agent_scope import agent_scope_prefix
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
 from scripts.lib import build_folders, nix_env, process_group, unit_runs
+from scripts.lib.unit_runs import SERVER_FILE as SERVER_FILE
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import staff, worker_admission, session_staff
 from scripts.production.worker_admission import WorkerStartAllowed
@@ -272,7 +273,6 @@ def _serving_request(
                                   thread_id=_as_str(params.get("threadId")), stopped=stopped)
         raise ServingRequestFailure(detail, serving, proven) from error
 
-SERVER_FILE = "mesh_server.json"
 DEV_SHELL_FILE = "mesh_dev_shell.json"
 FAILED_DEV_SHELL_FILE = "mesh_failed_dev_shell.json"
 SERVER_START_FILE = "mesh_server_start.json"
