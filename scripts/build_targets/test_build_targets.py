@@ -24,9 +24,11 @@ import offload
 import mac_test
 import targets
 if TYPE_CHECKING:
+    from ..buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
     from ..message import roster
     from ..buildlog import record, store
 else:
+    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
     from scripts.message import roster
     import record
     import store
@@ -65,7 +67,17 @@ def pacific_zone() -> Generator[None, None, None]:
         time.tzset()
 
 
-class FolderInvocationTests(unittest.TestCase):
+class FolderInvocationTests(NotificationGuardedTestCase):
+    def test_clean_target_import_loads_mac_test_once(self) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        result = REAL_SUBPROCESS_RUN([sys.executable, "-c",
+            "import sys; import build_targets; "
+            + "names=[n for n,m in list(sys.modules.items()) if getattr(m,'__file__','') "
+            + "and m.__file__.endswith('/mac_test/mac_test.py')]; "
+            + "assert len(names)==1, names"], cwd=Path(__file__).parent, env=environment,
+            capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_folder_invocation_records_hold_events(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "unittest",
@@ -76,12 +88,13 @@ class FolderInvocationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
-class IsolatedBuildTargetTest(IsolatedTargetTest):
+class IsolatedBuildTargetTest(NotificationGuardedTestCase, IsolatedTargetTest):
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
         })))
 
 
@@ -99,6 +112,37 @@ class StatusTests(IsolatedBuildTargetTest):
         with redirect_stdout(output), redirect_stderr(errors):
             code = build_targets.command_status(probe)
         return code, output.getvalue(), errors.getvalue()
+
+    def test_mac_idle_alert_prints_first_with_red_only_on_a_terminal(self) -> None:
+        _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp())
+        config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        expected = ("MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
+                    "13:50 (P15 F11 L0 run); /build:mac unblock clears it.")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
+             mock.patch.object(time, "time", return_value=NOW.timestamp()):
+            for terminal in (False, True):
+                with self.subTest(terminal=terminal):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with redirect_stdout(output), redirect_stderr(errors), \
+                         mock.patch.object(output, "isatty", return_value=terminal):
+                        code = build_targets.command_status()
+                    first = f"\033[1;31m{expected}\033[0m" if terminal else expected
+                    self.assertEqual((code, errors.getvalue()), (0, ""))
+                    self.assertEqual(output.getvalue(), first + "\nnatedev: free\n")
+
+    def test_stale_mac_reading_prints_before_target_status(self) -> None:
+        _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp(), written_age=301)
+        config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
+             mock.patch.object(time, "time", return_value=NOW.timestamp()):
+            code, output, errors = self.capture_status()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output.splitlines(), [
+            "MAC IDLE WATCH: no reading since 13:54; check buildlog-sample.timer.", "natedev: free",
+        ])
+
+    def test_status_fields_remove_control_characters(self) -> None:
+        self.assertEqual(build_targets.format_state("ma\x1bc\n", targets.Free()), "mac: free")
 
     def test_free_line(self) -> None:
         self.assertEqual(build_targets.format_state("natedev", targets.Free()), "natedev: free")

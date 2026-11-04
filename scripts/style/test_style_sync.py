@@ -511,7 +511,7 @@ class StyleSyncTests(unittest.TestCase):
         cases = ((0, "SENT: fixture", True), (0, "SKIPPED: repeated", True),
                  (0, "KEPT: silence", True), (0, "REPLACED: revision", True),
                  (1, "QUEUED: offline", False), (3, "FAILED: unavailable", False),
-                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False), (5, "PENDING: active", False),
+                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False), (5, "PENDING: active", False), (6, "RETRY: active", False),
                  (0, "", False), (0, "QUEUED: inconsistent", False),
                  (1, "SENT: inconsistent", False), (0, "FAILED: inconsistent", False))
         for code, text, accepted in cases:
