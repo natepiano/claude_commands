@@ -44,7 +44,7 @@ class StaffSessionIdentityTests(StaffTestCase):
     @cached_property
     def fixture(self) -> ClearWorkerFixture:
         runner, unit, worker = self.tree()
-        sibling = staff.ensure_worker("test", unit.id, runtime_id=fixture_runtime_id("sibling"))
+        sibling = staff.ensure_worker(staff.native_id(fixture_runtime_id("sibling")), "test", unit.id)
         new_id = fixture_runtime_id("after-clear")
         environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p1"}
         payload: dict[str, object] = {

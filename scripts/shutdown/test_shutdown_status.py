@@ -86,7 +86,7 @@ def setUpModule() -> None:
 @final
 class ShutdownStatusTests(ShutdownTestCase):
     def test_readiness_names_a_running_worker_and_waits_until_its_turn_ends(self) -> None:
-        row = staff.StaffRow(staff.StaffId("worker-row"), "worker", "test-worker", None,
+        row = staff.StaffRow(staff.StaffId("worker-row"), "worker", "test-worker", staff.StaffRoot(),
                              current_session=staff.StaffId("current-thread"))
         client = Mock()
         replies = iter([{"type": "active"}, {"type": "idle"}])

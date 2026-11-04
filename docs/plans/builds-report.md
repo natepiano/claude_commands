@@ -282,3 +282,37 @@ Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command
 ### Phase 13 — Buildlog tests import their own modules  · status: done
 
 Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHONPATH. test_costs subprocess tests fail with no module cli or costs; test_vault_pull fails to import conf. Each test sets its own import path.
+
+### Phase 14 — Build history charts open and show every machine's costs  · status: done
+**Depends on:** Phase 8, Phase 10
+
+#### As-built
+
+- Cause (C950, C951 "not works", 2026-11-04): the aws-build target was configured with no build log, and "All machines" needed every configured machine, so every cost chart was unavailable. `buildlog` is also not on the terminal PATH; that fix is in `/etc/nixos` and goes through the builds showrunner.
+- `costs.first_source_times` gives each machine's first indexed event. Empty and eventless monthly files do not count. `CostReading.first_sources` carries the mapping; `build_series` joins it with observations.
+- `cost_value` returns `NoDataYet` for each day before a machine's first event. JS sums (All machines and grouped "Other") skip those cells. The chart, table, tooltip and detail line read the same cell. A machine with no data in the window shows one line, and the selector names it "no data yet".
+- A machine with recorded data that misses a day still makes the day unavailable. A missing applicable wait stays unavailable.
+- Page CPU: 7 days about 0.6 s, 30 days about 1.8 s.
+- The checkpoint's Change-Review rows re-check C950 and C951 with the full path.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
+
+### Phase 15 — The build page ranks the top costs with the action that cuts each  · status: todo
+**Depends on:** Phase 14; the builds showrunner names the build page
+
+The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to builds to review - i'm not sure about this". The builds showrunner ran it. The data is useful: memory wait is 236 step-hours a day, eight times the next cost. The output does not tell the user what to do. Ruling:
+
+1. Delete the `buildlog costs` command. The ranking moves onto the one build page the user uses. builds names that page.
+2. Show at most the top 3 costs. Each line gives the cost in plain words and hours, then the action that cuts it and its owner. The action text lives in config, not code.
+3. Show hours in the user's zone. No seconds, no UTC, no microseconds.
+4. Move the Definitions block into the as-built doc.
+5. Check the memory-wait number first. 236 h a day means about 10 steps wait at all times. queue-unit's 10l bug (on main now) made a waiting step with the AWS hook hold its grant and never start. Say how many of the 236 h came from that bug.
+6. The build history charts (C950) go on the same page. No second page.
+
+The page is queue-unit's Build Memory page (`memory_live.html`, fed by `memory_feed.py`); queue's 10m moves it into the repo. Agreed with queue-unit 2026-11-04: report-unit gives typed data, no HTML, from `charts.page_section(days)` and `costs.top_costs(n=3)`. queue's feed calls them and its page draws them. A 7-day read stays under 1 s. Send queue-unit the signatures and types when they land.
+
+Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder): the 236 h/day is a 7-day average that old days drive. Oct 29-31 had 347-533 h/day; Nov 1-3 had 7-90 h/day. The 10l bug adds at most 125 h in total (Nov 2-4). `costs.py` counts each wait correctly. builds ruling: the top 3 rank the last 2 days, so a fixed cost does not stay on top. Each line shows one number. It shows the 7-day value beside it only when the two differ by more than half. The window length lives in config.
+
+Each fix returns as a new Change-Review row.
+
+**Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `docs/as-built/` (Definitions).

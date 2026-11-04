@@ -27,9 +27,9 @@ from scripts.shutdown import remote
 def owned_units(doc: Path, *names: str, retired: tuple[str, ...] = ()) -> staff.StaffSnapshot:
     """The showrunner row that owns `doc`, then its unit rows in row order."""
     machine = remote.local_machine()
-    owner = staff.StaffRow(staff.StaffId("s-owner"), "showrunner", "alpha", None,
+    owner = staff.StaffRow(staff.StaffId("s-owner"), "showrunner", "alpha", staff.StaffRoot(),
                            current_session=staff.StaffId("s-owner"), doc=staff.LiveDoc(machine, doc.resolve()))
-    units = (staff.StaffRow(staff.StaffId(f"s-{name}"), "unit", name, owner.id, current_session=staff.StaffId(f"s-{name}"),
+    units = (staff.StaffRow(staff.StaffId(f"s-{name}"), "unit", name, staff.ReportsTo(owner.id), current_session=staff.StaffId(f"s-{name}"),
                             worktree=(staff.RemovedWorktree if name in retired else staff.PresentWorktree)(machine, Path("/fixture", name)))
              for name in names)
     return staff.StaffSnapshot((owner, *units))

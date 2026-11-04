@@ -18,6 +18,8 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_worker_records
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,7 +29,15 @@ ASSIGN = ROOT / "scripts/direct/assign.sh"
 def read_object(path: Path) -> dict[str, object]:
     with path.open() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-        return cast(dict[str, object], json.load(handle))
+        records = cast(dict[str, object], json.load(handle))
+    if path.name == codex_mesh.ROSTER_FILE:
+        records = fixture_worker_records(records, staff.local_snapshot())
+        for raw in records.values():
+            entry = cast(dict[str, object], raw)
+            role = codex_mesh.task_role(str(entry.get("thread_id", "")))
+            if isinstance(role, codex_mesh.AssignedWorkerRole):
+                entry["role"] = role.role
+    return records
 
 
 class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
@@ -53,6 +63,13 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         self.server.hang_guard = self.hang_guard
         self.project = self.session_dir.parent / "project"
         self.project.mkdir()
+        owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
+        assert owner is not None
+        parent = staff.local_snapshot().parent_of(owner)
+        assert parent is not None
+        _ = staff.rename(parent.id, "fixture-production")
+        owner = staff.rename(owner.id, "fixture")
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", self.project), expected=owner.worktree)
         _ = (self.project / "plan.md").write_text("## Delegation Context\n\n- **Project:** Assignment fixture\n")
         self.history = self.session_dir.parent / "history"
         self.paths = self.session_dir.parent / "paths.txt"
@@ -72,14 +89,17 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
             "NOTIFIER_SESSIONS_DIR": str(self.session_dir.parent / "sessions"),
             "SHUTDOWN_STATE_DIR": str(self.session_dir.parent / "shutdown"),
-            "UNIT_CODEX_MESH": "1", "UNIT_SYNC_WRITES": "0",
+            "UNIT_SYNC_WRITES": "0",
             "PYTHONPATH": str(ROOT), "TMPDIR": "/tmp",
         }))
+        (self.session_dir / "progress_history_state.json").unlink(missing_ok=True)
         self.record("start-run", "--working-dir", str(self.project), "--plan-doc", "plan.md",
                     "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "high",
-                    "--main-session-id", "assign-director")
+                    "--main-session-id", owner.current_session)
         self.record("set-unit", "--production", "fixture-production", "--unit", "fixture-unit")
         self.record("start-phase", "--phase-id", "7", "--phase-title", "Assignment core")
+        self.claims = []
+        self.reservations = []
         original = self.server.respond
 
         @self.hang_guard.callback
@@ -153,8 +173,9 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         return cast(dict[str, dict[str, object]], read_object(self.session_dir / codex_mesh.ROSTER_FILE))
 
     def identity_path(self, name: str) -> Path:
+        reference = self.assignment_records()[name]["staff_id"]
         return next(path for path in self.session_dir.glob("impl_worker_*.json")
-                    if read_object(path).get("name") == name)
+                    if read_object(path).get("staff_id") == reference)
 
     def commit_project(self, message: str = "Initial fixture") -> None:
         _ = subprocess.run(["git", "init", "-q"], cwd=self.project, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)

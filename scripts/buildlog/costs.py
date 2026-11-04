@@ -6,7 +6,7 @@ import sqlite3
 import json
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 from pathlib import Path
@@ -148,29 +148,66 @@ class IndexedSourceCoverage:
     end: float
 
 
-def source_coverage(connection: sqlite3.Connection, observations: Sequence[SourceObservation]) -> tuple[IndexedSourceCoverage, ...]:
-    """Recognize complete indexed monthly logs through their latest recorded event."""
-    latest: dict[str, float] = {}
-    for observation in observations:
-        latest[observation.machine] = max(latest.get(observation.machine, 0), observation.at)
+@dataclass(frozen=True)
+class IndexedMonthlySource:
+    machine: str
+    start: float
+    end: float
+    complete: bool
+    path: str
+
+
+def indexed_monthly_sources(connection: sqlite3.Connection) -> tuple[IndexedMonthlySource, ...]:
+    """Keep nonempty indexed sources, including missing or incomplete files."""
     rows = cast(list[tuple[str, int]], connection.execute("SELECT path, offset FROM files").fetchall())
-    coverage: list[IndexedSourceCoverage] = []
+    sources: list[IndexedMonthlySource] = []
     legacy_hosts: dict[str, str] = {}
     for name, offset in rows:
         path = Path(name)
-        if len(path.parts) != 2:
+        if len(path.parts) != 2 or offset == 0:
             continue
         try:
             low = datetime.strptime(path.name, "%Y-%m.jsonl").replace(tzinfo=UTC)
             high = (low.replace(day=28)+timedelta(days=4)).replace(day=1)
-            if (store.root()/path).stat().st_size != offset:
-                continue
-        except (ValueError, OSError):
+        except ValueError:
             continue
+        try:
+            complete = (store.root()/path).stat().st_size == offset
+        except OSError:
+            complete = False
         machine = "CI" if path.parent.name == "ci" else machine_name(None, path.parent.name, legacy_hosts)
-        through = min(high.timestamp(), latest.get(machine, 0))
-        if through > low.timestamp():
-            coverage.append(IndexedSourceCoverage(machine, low.timestamp(), through))
+        sources.append(IndexedMonthlySource(machine, low.timestamp(), high.timestamp(), complete, name))
+    return tuple(sources)
+
+
+def first_source_times(connection: sqlite3.Connection, sources: Sequence[IndexedMonthlySource]) -> dict[str, float]:
+    """Find each machine's first indexed event through the source indexes."""
+    event_queries: list[str] = []
+    for kind in index.ADDERS:
+        table = kind if kind in index.TABLES else kind + "s"
+        columns = index.TABLES[table][0]
+        names = {name for name, _, _ in columns}
+        stamp = "at" if "at" in names else "started_at" if "started_at" in names else ""
+        if stamp:
+            event_queries.append(f"SELECT min(unixepoch({stamp},'subsec')) AS at FROM {table} WHERE src = :src")
+    query = "SELECT min(at) FROM (" + " UNION ALL ".join(event_queries) + ")"
+    first: dict[str, float] = {}
+    for source in sorted(sources, key=lambda item: item.start):
+        if source.machine in first and source.start >= first[source.machine]:
+            continue
+        row = cast(tuple[float | None], connection.execute(query, {"src": source.path}).fetchone())
+        if row[0] is not None:
+            first[source.machine] = min(first.get(source.machine, row[0]), row[0])
+    return first
+
+
+def source_coverage(sources: Sequence[IndexedMonthlySource], observations: Sequence[SourceObservation]) -> tuple[IndexedSourceCoverage, ...]:
+    """Recognize complete indexed monthly logs through their latest recorded event."""
+    latest: dict[str, float] = {}
+    for observation in observations:
+        latest[observation.machine] = max(latest.get(observation.machine, 0), observation.at)
+    coverage = [IndexedSourceCoverage(source.machine, source.start, min(source.end, latest.get(source.machine, 0)))
+                for source in sources if source.complete and latest.get(source.machine, 0) > source.start]
     merged: list[IndexedSourceCoverage] = []
     for item in sorted(coverage, key=lambda span: (span.machine, span.start)):
         if merged and item.machine == merged[-1].machine and item.start <= merged[-1].end:
@@ -195,6 +232,7 @@ class CostReading:
     idle_spans: tuple[IdleSpan, ...]
     phases: tuple[moments.ProgressFinish, ...]
     coverage: tuple[IndexedSourceCoverage, ...] = ()
+    first_sources: dict[str, float] = field(default_factory=dict)
 
 
 def sweep_idle(events: list[tuple[float, int, int, int, int]],
@@ -314,9 +352,12 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         observations.append(SourceObservation(at, "CI"))
         if conclusion in ("cancelled", "failure"):
             contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds)))
-    coverage = source_coverage(connection, observations)
+    sources = indexed_monthly_sources(connection)
+    coverage = source_coverage(sources, observations)
+    first_sources = first_source_times(connection, sources)
     return CostReading(tuple(contributions), tuple(observations), sweep_idle(timeline, coverage),
-                       finished_phases(start, end), coverage)
+                       finished_phases(start, end), coverage,
+                       first_sources)
 
 
 def aggregate_costs(reading: CostReading, start: datetime, end: datetime) -> BuildCosts:

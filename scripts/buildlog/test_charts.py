@@ -7,12 +7,16 @@ import json
 import os
 import re
 import subprocess
+import sys
 import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import charts
 import costs
@@ -27,10 +31,14 @@ from test_index import Record, call, ci_job, ci_run
 class ChartTests(unittest.TestCase):
     fixture: fixtures.MomentTests  # pyright: ignore[reportUninitializedInstanceVariable]
 
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.targets: mock.Mock = mock.Mock(return_value=())
+
     @override
     def setUp(self) -> None:
         self.fixture = fixtures.moment_fixture(self)
-        _ = cast(object, self.enterContext(mock.patch.object(record, "configured_targets", return_value=())))
+        _ = cast(object, self.enterContext(mock.patch.object(record, "configured_targets", self.targets)))
 
     def label_page(self) -> str:
         events = tuple(moments.BuildMoment(fixtures.START+timedelta(hours=1, seconds=number*10),
@@ -226,7 +234,7 @@ for(const mark of machine.querySelectorAll('.overlap-mark'))if(mark.getAttribute
             hold_event("ended", "lost", (origin+timedelta(seconds=88000)).isoformat(), "mac"),
         )) as connection, mock.patch.object(costs, "source_coverage", return_value=(
             costs.IndexedSourceCoverage("mac", origin.timestamp(), fixtures.END.timestamp()),
-        )):
+        )), mock.patch.object(costs, "first_source_times", return_value={"mac": origin.timestamp()}):
             series = charts.collect_charts(connection, origin, fixtures.END, ZoneInfo("UTC"))
         idle = [b.costs.mac_idle for b in series.buckets]
         self.assertEqual([i.recorded_hold_seconds for i in idle], [1400, 1600])
@@ -428,6 +436,8 @@ for(const mark of machine.querySelectorAll('.overlap-mark'))if(mark.getAttribute
 
     def test_configured_machines_without_events_keep_named_unavailable_values(self) -> None:
         with mock.patch.object(record, "configured_targets", return_value=("natedev", "mac", "aws")), \
+             mock.patch.object(costs, "first_source_times", return_value={machine: fixtures.START.timestamp()-1
+                                                                       for machine in ("natedev", "mac", "aws")}), \
              closing(self.fixture.connection()) as connection:
             series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
         self.assertEqual(series.machines, ("aws", "mac", "natedev"))
@@ -436,6 +446,108 @@ for(const mark of machine.querySelectorAll('.overlap-mark'))if(mark.getAttribute
                 self.assertEqual(charts.cost_value(series.buckets[0], machine, "Memory wait"),
                                  charts.CostUnavailable("no recorded source coverage"))
         self.assertIn('"aws"', charts.render_html(series))
+
+    def configured_machine_series(self, *records: Record, targets: tuple[str, ...] = ("natedev", "aws"),
+                                  start: datetime = fixtures.START, end: datetime = fixtures.END) -> charts.ChartSet:
+        self.targets.return_value = targets
+        with closing(self.fixture.connection(*records)) as connection:
+            return charts.collect_charts(connection, start, end, ZoneInfo("UTC"))
+
+    def test_all_machines_omit_a_configured_machine_until_its_first_source(self) -> None:
+        series = self.configured_machine_series(
+            fixtures.build("local", 10, target="natedev", mem_wait_s=3600),
+            fixtures.build("later-local", 86410, target="natedev", mem_wait_s=1800),
+            fixtures.build("later-cloud", 86420, target="aws", mem_wait_s=1800),
+        )
+        probe = r"""
+const waits=causeSeries().find(series=>series.label==='Memory wait').values;
+if(waits.some(point=>point.state!=='measured'||point.value!==1))failures.push('An inactive machine hides recorded costs');
+"""
+        self.assertEqual(self.rendered_layout(charts.render_html(series), probe, 1280), "PASS")
+
+    def test_machine_without_a_log_has_one_message_and_a_named_selector_option(self) -> None:
+        series = self.configured_machine_series(fixtures.build("local", 10, target="natedev", mem_wait_s=3600))
+        probe = r"""
+const emptyOption=[...document.getElementById('machine').options].find(option=>option.value==='aws');
+if(!emptyOption?.textContent.includes('no data yet'))failures.push('The selector hides the missing source');
+document.getElementById('machine').value='aws';redraw();
+const svg=document.getElementById('cause');
+if(svg.querySelectorAll('text').length!==1||svg.textContent!=='aws: no data yet'||svg.querySelector('.plot-panel'))failures.push('The machine needs one no-data message');
+"""
+        self.assertEqual(self.rendered_layout(charts.render_html(series), probe, 500), "PASS")
+
+    def test_all_machines_retain_missing_applicable_waits_with_an_inactive_target(self) -> None:
+        series = self.configured_machine_series(
+            fixtures.build("missing", 10, target="natedev", mem_wait_s=None),
+            fixtures.build("recorded", 20, target="natedev", mem_wait_s=3600),
+        )
+        probe = self.memory_wait_unavailable_probe("1 applicable waits missing")
+        self.assertEqual(self.rendered_layout(charts.render_html(series), probe, 1280), "PASS")
+
+    def test_a_missing_historical_log_remains_required_without_steps_in_the_window(self) -> None:
+        self.monthly_mac_log(fixtures.build("old-mac", -86400, target="mac"))
+        self.fixture.fixture.write(fixtures.build("local", 10, target="natedev", mem_wait_s=3600))
+        _ = index.update()
+        (self.fixture.fixture.root/"mac/2026-10.jsonl").unlink()
+        self.targets.return_value = ("natedev", "mac", "aws")
+        with closing(index.read_only()) as connection:
+            series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
+        probe = self.memory_wait_unavailable_probe("no complete indexed mac monthly log covers this day")
+        self.assertEqual(self.rendered_layout(charts.render_html(series), probe, 1280), "PASS")
+
+    def memory_wait_unavailable_probe(self, reason: str) -> str:
+        return ("const wait=causeSeries().find(series=>series.label==='Memory wait').values[0];"
+                + "if(wait.state!=='unavailable'||wait.reason!==" + json.dumps(reason)
+                + ")failures.push('The unavailable wait lost its reason');")
+
+    def test_empty_indexed_monthly_log_keeps_the_machine_without_data(self) -> None:
+        path = self.fixture.fixture.root/"aws/2026-11.jsonl"
+        path.parent.mkdir(parents=True)
+        path.touch()
+        start = datetime(2026, 11, 1, tzinfo=UTC)
+        series = self.configured_machine_series(
+            fixtures.build("local", 10, target="natedev", mem_wait_s=3600, started_at=(start+timedelta(seconds=10)).isoformat()),
+            start=start, end=start+timedelta(days=1),
+        )
+        probe = r"""
+const wait=causeSeries().find(series=>series.label==='Memory wait').values[0];
+if(wait.state!=='measured'||wait.value!==1)failures.push('An empty log hides measured costs');
+const emptyOption=[...document.getElementById('machine').options].find(option=>option.value==='aws');
+if(!emptyOption?.textContent.includes('no data yet'))failures.push('An empty log activates its machine');
+document.getElementById('machine').value='aws';redraw();
+if(document.getElementById('cause').textContent!=='aws: no data yet')failures.push('The empty machine needs one message');
+"""
+        self.assertEqual(self.rendered_layout(charts.render_html(series), probe, 1280), "PASS")
+
+    def test_other_group_omits_members_without_a_source_in_every_view(self) -> None:
+        targets = ("natedev", "mac", "CI", "cloud-a", "cloud-b", "cloud-c", "cloud-d", "cloud-e", "cloud-f")
+        series = self.configured_machine_series(
+            fixtures.build("group-wait", 10, target="cloud-e", mem_wait_s=3600), targets=targets,
+        )
+        probe = r"""
+document.getElementById('machine').value='Other';redraw();
+const wait=causeSeries().find(series=>series.label==='Memory wait').values[0];
+if(wait.state!=='measured'||wait.value!==1)failures.push('An inactive member hides its group');
+if(!document.getElementById('causeTable').textContent.includes('1 h/day'))failures.push('The table hides its group');
+const group=machineSeries().find(series=>series.label==='Other').values[0];
+if(group.state!=='measured'||group.value!==1)failures.push('The machine plot hides its group');
+"""
+        self.assertEqual(self.rendered_layout(charts.render_html(series), probe, 500), "PASS")
+
+    def test_no_data_cells_agree_in_the_table_tooltip_and_detail(self) -> None:
+        series = self.configured_machine_series(fixtures.build("local", 10, target="natedev", mem_wait_s=3600))
+        probe = r"""
+document.getElementById('machine').value='aws';redraw();
+if(causeSeries().some(series=>series.values.some(point=>point.state!=='no data yet')))failures.push('The cell state differs');
+for(const id of ['causeTable','causeDetail']){
+ const text=document.getElementById(id).textContent;
+ if(!text.includes('no data yet')||text.includes('no complete indexed aws'))failures.push(id+' hides the no-data state');
+}
+showTooltip(configs[1],0);
+if(!document.getElementById('causeTooltip').textContent.includes('no data yet'))failures.push('The tooltip hides the no-data state');
+if(document.getElementById('cause').viewBox.baseVal.width>1120)failures.push('The empty chart exceeds the width cap');
+"""
+        self.assertEqual(self.rendered_layout(charts.render_html(series), probe, 1280), "PASS")
 
     def test_cli_uses_the_user_zone_for_edges_and_moment_labels(self) -> None:
         event = moments.BuildMoment(datetime.now(UTC)-timedelta(hours=1), "zone marker", "all")

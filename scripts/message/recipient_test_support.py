@@ -16,10 +16,11 @@ sys.path.insert(0, sys.argv.pop(1))
 from scripts.production import staff
 values = json.loads(sys.argv.pop(1))
 rows = tuple(staff.StaffRow(staff.StaffId(row['id']), row['kind'], row['name'],
-    staff.StaffId(row['parent']) if row['parent'] else None,
+    staff.ReportsTo(staff.StaffId(row['parent'])) if row['parent'] else staff.StaffRoot(),
     current_session=staff.StaffId(row['current_session'])) for row in values)
 staff.snapshot = lambda: staff.StaffSnapshot(rows)
 staff.initial_snapshot = staff.snapshot
+staff.local_snapshot = staff.snapshot
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name='__main__')
 """

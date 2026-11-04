@@ -345,7 +345,7 @@ class RecipientStaffFixture:
 
     def staff_member(self, identity: str, name: str) -> None:
         self.staff_rows[identity] = staff.StaffRow(
-            staff.StaffId(identity), "unit", name, None, current_session=staff.StaffId(identity))
+            staff.StaffId(identity), "unit", name, staff.StaffRoot(), current_session=staff.StaffId(identity))
 
     def recipient_roster(self, entries: list[roster.RosterEntry], problems: list[str],
                          warnings: list[str] | None = None) -> roster.Roster:
@@ -882,7 +882,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_fixed_staff_id_follows_the_renamed_current_session(self) -> None:
         self.session("new-session", "new label")
         self.staff_rows.clear()
-        self.staff_rows["fixed"] = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+        self.staff_rows["fixed"] = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
                                                 current_session=staff.StaffId("new-session"))
         result = send.send(local_options(["--to", "session:fixed", "--from", "test", "--text", "hello", "--key", "fixed-id"]))
         self.assertEqual(result.outcome, "sent")
@@ -890,9 +890,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(set(self.claims("fixed-id")), {"staff:fixed"})
 
     def test_duplicate_staff_paths_refuse_without_delivery_or_queue(self) -> None:
-        parent = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", None,
+        parent = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("runner"))
-        rows = [parent, *(staff.StaffRow(staff.StaffId(identity), "unit", "resources", parent.id,
+        rows = [parent, *(staff.StaffRow(staff.StaffId(identity), "unit", "resources", staff.ReportsTo(parent.id),
                                         current_session=staff.StaffId(identity)) for identity in ("one", "two"))]
         self.staff_rows = {row.id: row for row in rows}
         for target in ("resources-unit", "builds/resources-unit"):
@@ -945,7 +945,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.session("old-session", "old label")
         self.session("new-session", "new label")
         self.staff_rows = {"old-session": staff.StaffRow(
-            staff.StaffId("old-session"), "unit", "resources", None,
+            staff.StaffId("old-session"), "unit", "resources", staff.StaffRoot(),
             current_session=staff.StaffId("new-session"))}
         result = send.send(local_options(["--to", f"uds:{self.root / 'old-session.sock'}", "--text", "hello", "--key", "old-socket"]))
         self.assertEqual(result.outcome, "sent")
@@ -960,9 +960,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_parent_showrunner_path_uses_staff_current_session(self) -> None:
         self.session("runner-current", "wrong registry label")
-        runner = staff.StaffRow(staff.StaffId("runner-fixed"), "showrunner", "builds", None,
+        runner = staff.StaffRow(staff.StaffId("runner-fixed"), "showrunner", "builds", staff.StaffRoot(),
                                current_session=staff.StaffId("runner-current"))
-        unit = staff.StaffRow(staff.StaffId("unit"), "unit", "resources", runner.id,
+        unit = staff.StaffRow(staff.StaffId("unit"), "unit", "resources", staff.ReportsTo(runner.id),
                              current_session=staff.StaffId("director"))
         self.staff_rows = {row.id: row for row in (runner, unit)}
         record = staff.StaffSnapshot(tuple(self.staff_rows.values()))
@@ -1542,7 +1542,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_keyed_staff_recipient_restart_preserves_repeat_window(self) -> None:
         self.session("before", "resources")
-        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
                                 current_session=staff.StaffId("before"))
         self.staff_rows = {"fixed": member}
         options = local_options(["--to", "fixed", "--key", "settings-result", "--repeat-minutes", "120",
@@ -1583,9 +1583,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_staff_aliases_share_one_repeat_window(self) -> None:
         self.session("current", "transport label")
-        runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", None,
+        runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", staff.StaffRoot(),
                                current_session=staff.StaffId("runner"))
-        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", runner.id,
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.ReportsTo(runner.id),
                                current_session=staff.StaffId("current"))
         self.staff_rows = {row.id: row for row in (runner, member)}
         started = send.now()
@@ -1626,7 +1626,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_legacy_transport_claim_preserves_its_timestamp_after_migration(self) -> None:
         self.session("current", "resources")
-        self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+        self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
                                                   current_session=staff.StaffId("current"))}
         started = send.now()
         socket_address = f"uds:{self.root / 'current.sock'}"
@@ -1780,7 +1780,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_failed_stable_claim_does_not_clear_a_later_attempt(self) -> None:
         self.session("before", "resources")
-        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
                                current_session=staff.StaffId("before"))
         self.staff_rows = {"fixed": member}
         started = send.now()
@@ -1879,7 +1879,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_queued_staff_message_reaches_its_new_session_once(self) -> None:
         self.session("before", "resources")
-        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
                                current_session=staff.StaffId("before"))
         self.staff_rows = {"fixed": member}
         started = send.now()
@@ -1912,7 +1912,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_expired_staff_retry_replaces_the_previous_sessions_queued_body(self) -> None:
         self.session("before", "resources")
-        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
                                current_session=staff.StaffId("before"))
         self.staff_rows = {"fixed": member}
         started = send.now()
@@ -2081,7 +2081,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_pending_returns_the_newest_copy_after_interrupted_queue_replacement(self) -> None:
         self.session("before", "resources")
-        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
                                current_session=staff.StaffId("before"))
         self.staff_rows = {"fixed": member}
         started = send.now()
@@ -2140,7 +2140,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_delivered_staff_retry_removes_its_queued_copy_from_the_previous_session(self) -> None:
         self.session("before", "resources")
-        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
                                current_session=staff.StaffId("before"))
         self.staff_rows = {"fixed": member}
         started = send.now()
@@ -2164,7 +2164,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         outcomes: list[str] = []
         for identity in ("first", "second", "third"):
             self.session(identity, "resources")
-            self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+            self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
                                                       current_session=staff.StaffId(identity))}
             outcomes.append(send.send(local_options(["--to", "fixed", "--from", "sender", "--text", "Notice"])).outcome)
         self.assertEqual(outcomes, ["sent", "sent", "held"])
@@ -4702,7 +4702,7 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         current = self.row("new worker", "worker:new-run/impl")
         self.peer([previous, current])
         self.staff_rows = {"native-peer-run/impl": staff.StaffRow(
-            staff.StaffId("native-peer-run/impl"), "worker", "peer worker", None,
+            staff.StaffId("native-peer-run/impl"), "worker", "peer worker", staff.StaffRoot(),
             current_session=staff.StaffId("native-new-run/impl"))}
         status, output, errors = self.run_main("worker:peer-run/impl")
         self.assertEqual((status, errors), (0, ""), output)
@@ -4963,7 +4963,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         self.homes = (self.root / ".codex", self.root / ".codex2")
         notes = self.root / "agents"
         self.queue_contents, self.queued = {}, []
-        self.members = [staff.StaffRow(staff.StaffId("account-thread"), "unit", "Account window", None,
+        self.members = [staff.StaffRow(staff.StaffId("account-thread"), "unit", "Account window", staff.StaffRoot(),
                                       current_session=staff.StaffId("account-thread"))]
         for home, label in zip(self.homes, ("codex1", "codex2")):
             write_codex_account(home, notes, label)
@@ -5128,7 +5128,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         with ShortUnixSocket() as sender, self.daemon(self.homes[1]):
             address = f"uds:{sender.bind_socket()}"
             sender.listen(1)
-            self.members.append(staff.StaffRow(staff.StaffId("sender"), "unit", "sdlc", None,
+            self.members.append(staff.StaffRow(staff.StaffId("sender"), "unit", "sdlc", staff.StaffRoot(),
                                                current_session=staff.StaffId("sender")))
             sender.settimeout(5)
             with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": address}):

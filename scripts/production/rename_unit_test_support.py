@@ -96,7 +96,9 @@ class UnitRenameFixture(StaffTestCase):
             **config_environment(self.root),
             "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
             "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
+            "UNIT_RUN_ROOT": str(self.root / "sessions"),
             "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(config),
+            "CODEX_HOME": str(self.root / "codex-home"),
             "XDG_CONFIG_HOME": str(self.home / ".config"), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
@@ -176,7 +178,7 @@ class UnitRenameFixture(StaffTestCase):
             {"event_type": "phase_started", "phase_instance_id": "p1", "phase_id": "1"},
             {"event_type": "phase_finished", "phase_instance_id": "p1", "phase_id": "1"})) + "\n")
         self.write(self.root / "sessions/s1/progress_history_state.json", json.dumps({
-            "history_file": str(run), "working_dir": str(old), "worktree": old.name, "branch": "demo-alpha",
+            "history_file": str(run), "production": SLUG, "unit": "alpha-unit", "worktree": old.name, "branch": "demo-alpha",
             "plan_doc": f"{old}/docs/plans/alpha.md"}))
         for name, plan in (("mine", "docs/plans/alpha.md"), ("other-production", "docs/plans/elsewhere.md")):
             self.write(self.root / f"issues/{name}.md", "\n".join([
