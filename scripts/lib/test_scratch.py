@@ -91,6 +91,22 @@ class ScratchTests(unittest.TestCase):
         self.assertTrue(sweep.is_cargo_target(str(target)), "The sweep must accept the helper's cache")
         self.assertGreaterEqual((target / sweep.USE_STAMP).stat().st_mtime, started)
 
+    def test_target_uses_the_loaded_namer_after_import_access_ends(self) -> None:
+        probe = """import builtins, sys
+from scripts.lib import scratch
+original_import = builtins.__import__
+def load(name, *args, **kwargs):
+    if name == 'scripts.lib.build_folders':
+        raise ImportError('helper imports are closed after startup')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = load
+print(scratch.target('gate:proof', 'tree', False))
+"""
+        result = subprocess.run([sys.executable, "-c", probe], text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()).parent, copy_record.root())
+        self.assertRegex(Path(result.stdout.strip()).name, r"^gate-proof-tree-[a-z0-9]{6}$")
+
     def test_copy_record_with_a_legacy_shared_target_still_loads(self) -> None:
         path = self.copy()
         record_path = path / copy_record.RECORD
