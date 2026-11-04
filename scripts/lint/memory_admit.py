@@ -617,6 +617,10 @@ class RankedWaiter(Waiter):
     order: PriorityUnit | NormalOrder
 
 
+class LegacyRankedWaiter(Waiter):
+    priority_rank: NotRequired[int]
+
+
 def rank_waiter(row: Waiter, order: PriorityUnit | NormalOrder) -> RankedWaiter:
     return {**row, "order": order}
 
@@ -670,6 +674,20 @@ class QueuePriority(TypedDict):
     set_at: float
     set_by: str
     transition: SettledPriority | PendingPriorityTransition
+
+
+class LegacyPriorityTransition(TypedDict):
+    id: str
+    action: Literal["set", "clear"]
+    at: float
+
+
+class LegacyQueuePriority(TypedDict):
+    unit: str
+    why: str
+    set_at: float
+    set_by: str
+    transition: NotRequired[LegacyPriorityTransition]
 
 
 @dataclass(frozen=True)
@@ -988,6 +1006,15 @@ class NeedsMemory:
 class BehindHead:
     head_name: str
     joined_at: float
+    head_session_id: str
+
+
+@dataclass(frozen=True)
+class LegacyBehindHead:
+    """The installed service names the head's join time head_since."""
+
+    head_name: str
+    head_since: float
     head_session_id: str
 
 
@@ -3631,6 +3658,63 @@ def snapshot_value(value: object) -> object:
     return value
 
 
+def installed_waiter_order(row: LegacyRankedWaiter, priority: QueuePriority | NoQueuePriority) -> PriorityUnit | NormalOrder:
+    """Convert the installed service's rank into the current queue order."""
+    rank = row.get("priority_rank", 1)
+    if rank not in (0, 1) or rank == 0 and isinstance(priority, NoQueuePriority):
+        raise ValueError("invalid installed waiter priority")
+    return PriorityUnit(priority["unit"]) if rank == 0 and not isinstance(priority, NoQueuePriority) else NormalOrder()
+
+
+def installed_snapshot_record(record: dict[str, object], schema: type) -> dict[str, object]:
+    """Convert installed snapshot fields at the reader boundary."""
+    if schema is QueuePriority and ("transition" not in record or
+            isinstance(record["transition"], dict) and "kind" not in record["transition"]):
+        priority = cast(LegacyQueuePriority, parse_snapshot_value(record, LegacyQueuePriority))
+        transition = priority.get("transition")
+        state = (SettledPriority() if transition is None else
+                 PendingPriorityTransition(transition["id"], transition["action"], transition["at"]))
+        return {**record, "transition": snapshot_value(state)}
+    if (schema is BehindHead and record.get("kind") == "BehindHead"
+            and record.keys() == snapshot_fields(LegacyBehindHead).keys() | {"kind"}):
+        legacy = cast(LegacyBehindHead, parse_snapshot_value({**record, "kind": "LegacyBehindHead"}, LegacyBehindHead))
+        return cast(dict[str, object], snapshot_value(BehindHead(legacy.head_name, legacy.head_since, legacy.head_session_id)))
+    if schema not in (QueueInputs, QueueRead, QueueExplanation) or record.get("kind") != schema.__name__:
+        return record
+    if schema is QueueInputs:
+        if record.keys() != snapshot_fields(schema).keys() - {"waiter_orders"} | {"kind"}:
+            return record
+    else:
+        raw_ordered = cast(list[object], parse_snapshot_value(record["ordered"], list[object]))
+        legacy_order = False
+        for item in raw_ordered:
+            row = item
+            if schema is QueueRead:
+                pair = cast(list[object], parse_snapshot_value(item, list[object]))
+                if len(pair) != 2:
+                    raise ValueError("invalid snapshot tuple")
+                row = pair[1]
+            legacy_order |= isinstance(row, dict) and "order" not in row
+        if not legacy_order:
+            return record
+    context = record
+    if schema is QueueRead:
+        context = cast(dict[str, object], parse_snapshot_value(record["explanation"], dict[str, object]))
+    queue_priority = cast(QueuePriority | NoQueuePriority,
+                          parse_snapshot_value(context["priority"], QueuePriority | NoQueuePriority))
+    if schema is QueueExplanation:
+        rows = cast(tuple[LegacyRankedWaiter, ...], parse_snapshot_value(record["ordered"], tuple[LegacyRankedWaiter, ...]))
+        ordered: object = [snapshot_value(rank_waiter(row, installed_waiter_order(row, queue_priority))) for row in rows]
+    else:
+        pairs = cast(list[tuple[Path, LegacyRankedWaiter]],
+                     parse_snapshot_value(record["ordered"], list[tuple[Path, LegacyRankedWaiter]]))
+        if schema is QueueInputs:
+            return {**record, "waiter_orders": snapshot_value({waiter_owner(row): installed_waiter_order(row, queue_priority)
+                                                               for _, row in pairs})}
+        ordered = [[str(path), snapshot_value(rank_waiter(row, installed_waiter_order(row, queue_priority)))] for path, row in pairs]
+    return {**record, "ordered": ordered}
+
+
 def parse_snapshot_value(value: object, schema: object) -> object:
     """Validate the wire shape against the same domain fields that the writer serializes."""
     origin, args = get_origin(schema), cast(tuple[object, ...], get_args(schema))
@@ -3679,7 +3763,7 @@ def parse_snapshot_value(value: object, schema: object) -> object:
                 for key, item in cast(dict[str, object], value).items()}
     if not isinstance(schema, type) or not isinstance(value, dict):
         raise ValueError("invalid snapshot record")
-    record = cast(dict[str, object], value)
+    record = installed_snapshot_record(cast(dict[str, object], value), schema)
     annotations = snapshot_fields(schema)
     if is_typeddict(schema):
         if any(name not in record and get_origin(kind) is not NotRequired for name, kind in annotations.items()):

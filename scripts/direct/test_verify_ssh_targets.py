@@ -178,6 +178,7 @@ def stream(arguments):
              mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
              mock.patch.object(linux_runner, "prepare_shell", return_value=shell), \
              mock.patch.object(linux_runner, "trim_build_folder", return_value=0), \
+             mock.patch.object(linux_runner, "output_free_bytes", return_value=1000 * 1024 ** 3), \
              mock.patch.object(subprocess, "run", side_effect=interrupted_child), \
              redirect_stdout(output):
             status = linux_runner.run(mirror, values, request.package, request.verb,

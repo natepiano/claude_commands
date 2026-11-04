@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 import io
+import json
 import math
 import errno
 import os
@@ -30,7 +31,84 @@ from scripts.build_queue import queue_snapshot, queue_view
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, only_admitted
 
 
+def installed_snapshot(value: object) -> object:
+    """Write the installed service's fields for compatibility tests."""
+    if isinstance(value, list):
+        return [installed_snapshot(item) for item in cast(list[object], value)]
+    if not isinstance(value, dict):
+        return value
+    record = cast(dict[str, object], value).copy()
+    if record.get("kind") == "BehindHead":
+        record["head_since"] = record.pop("joined_at")
+    if record.get("kind") == "QueueInputs":
+        orders = cast(dict[str, dict[str, object]], record.pop("waiter_orders"))
+        for pair in cast(list[list[object]], record["ordered"]):
+            row = cast(dict[str, object], pair[1]).copy()
+            row["priority_rank"] = int(orders[f'{row["pid"]}-{row["start_time"]}']["kind"] != "PriorityUnit")
+            pair[1] = row
+    if "order" in record and "pid" in record:
+        order = cast(dict[str, object], record.pop("order"))
+        record["priority_rank"] = int(order["kind"] != "PriorityUnit")
+    if "unit" in record and "transition" in record:
+        transition = cast(dict[str, object], record.pop("transition"))
+        if transition["kind"] == "PendingPriorityTransition":
+            record["transition"] = {key: transition[key] for key in ("id", "action", "at")}
+    return {key: installed_snapshot(item) for key, item in record.items()}
+
+
 class ServiceTests(unittest.TestCase):
+    def test_installed_service_snapshots_and_replies_decode_with_the_new_reader(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            first, second = fixture.request(), fixture.request()
+            labels = {first.identity.session_id: UnitLabels("first", unit="other"),
+                      second.identity.session_id: UnitLabels("second", unit="urgent")}
+            with mock.patch.object(gate, "priority_labels", return_value=labels):
+                _ = fixture.server.handle_request(first)
+                _ = fixture.server.handle_request(second)
+                _ = fixture.server.handle_request(wire.PrioritySetRequest("legacy-priority", "urgent", "urgent", "director"))
+                expected = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(expected, queue_snapshot.QueueSnapshot)
+                path = fixture.state_dir / "queue.json"
+                _ = path.write_text(json.dumps(installed_snapshot(cast(object, json.loads(path.read_text())))))
+                restored = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                self.assertEqual(restored, expected)
+                for request in (wire.ViewRequest(), wire.ExplainRequest(), wire.MineRequest(second.identity.session_id)):
+                    reply = fixture.server.handle_request(request)[0]
+                    envelope = installed_snapshot(cast(object, json.loads(wire.encode_reply(reply))))
+                    self.assertEqual(wire.parse_reply(json.dumps(envelope)), reply)
+
+        peak = gate.ExpectedPeak(GIB, "fallback", 0)
+        decision = gate.decide(0, 60 * GIB, peak.bytes, [], limits=gate.resolve_admission_limits(60 * GIB))
+        reason = gate.BehindHead("head", 123.0, "head-session")
+        snapshot = gate.AdmissionWaitSnapshot(decision, peak, (), 0, "repo", "build",
+            gate.DEFAULT_ADMISSION_POLICY, (), GIB, "head", reason)
+        reply = wire.Wait(reason, 2, "head", "", snapshot)
+        with tempfile.TemporaryDirectory() as directory:
+            # The installed service writes head_since in both BehindHead records.
+            installed_wait = wire.encode_reply(reply).replace('"joined_at":', '"head_since":')
+            path = Path(directory) / "installed-wait.json"
+            _ = path.write_text(installed_wait)
+            self.assertEqual(wire.parse_reply(path.read_text()), reply)
+
+        priority: dict[str, object] = {"unit": "urgent", "why": "test", "set_at": 1.0, "set_by": "director"}
+        self.assertEqual(gate.parse_snapshot_value(priority, gate.QueuePriority),
+                         {**priority, "transition": gate.SettledPriority()})
+        transition = {"id": "change", "action": "set", "at": 2.0}
+        self.assertEqual(gate.parse_snapshot_value({**priority, "transition": transition}, gate.QueuePriority),
+                         {**priority, "transition": gate.PendingPriorityTransition("change", "set", 2.0)})
+        with self.assertRaises(ValueError):
+            _ = gate.parse_snapshot_value({**priority, "transition": {**transition, "at": "2"}}, gate.QueuePriority)
+
+        installed: dict[str, object] = {"kind": "BehindHead", "head_name": "head",
+                                       "head_since": 123.0, "head_session_id": "head-session"}
+        self.assertEqual(gate.parse_snapshot_value(installed, gate.WaitReason),
+                         gate.BehindHead("head", 123.0, "head-session"))
+        for invalid in ({**installed, "head_since": "123"}, {**installed, "joined_at": 123.0},
+                        {**installed, "head_since": math.inf}, {**installed, "head_since": True}):
+            with self.subTest(record=invalid), self.assertRaises(ValueError):
+                _ = gate.parse_snapshot_value(invalid, gate.WaitReason)
+
     def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)

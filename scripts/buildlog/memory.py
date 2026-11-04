@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
@@ -79,18 +80,16 @@ def cmdline_program(cmdline: str) -> str:
     return cmdline.partition(" ")[0]
 
 
-def build_output_program(program: str) -> bool:
-    """Match an executable against Cargo's resolved output roots."""
-    executable = Path(program)
-    if not executable.is_absolute():
-        return False
+@lru_cache(maxsize=1)
+def build_output_roots(index_file: Path, current_checkout: Path, host: str) -> frozenset[Path]:
+    """Keep the active ledger's Cargo roots for this process."""
     roots: set[Path] = set()
-    checkouts: set[Path] = {Path.cwd()}
+    checkouts: set[Path] = {current_checkout}
     try:
-        with closing(sqlite3.connect(f"{index.index_path().as_uri()}?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(f"{index_file.as_uri()}?mode=ro", uri=True)) as connection:
             rows = cast(list[tuple[str, str, str, str]], connection.execute(
                 "SELECT DISTINCT target_directory, build_directory, worktree, cwd FROM steps WHERE host = ?",
-                (store.host_name(),),
+                (host,),
             ).fetchall())
         for target, build, worktree, cwd in rows:
             roots.update(Path(path).resolve() for path in (target, build) if path and Path(path).is_absolute())
@@ -103,6 +102,15 @@ def build_output_program(program: str) -> bool:
         outputs = read_cargo_output_roots(checkout)
         if isinstance(outputs, CargoOutputRoots):
             roots.update((outputs.target_directory, outputs.build_directory))
+    return frozenset(roots)
+
+
+def build_output_program(program: str) -> bool:
+    """Match an executable against Cargo's resolved output roots."""
+    executable = Path(program)
+    if not executable.is_absolute():
+        return False
+    roots = build_output_roots(index.index_path(), Path.cwd(), store.host_name())
     resolved = executable.resolve()
     return any(resolved.is_relative_to(root) for root in roots)
 
