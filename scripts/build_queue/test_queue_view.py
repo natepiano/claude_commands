@@ -260,6 +260,44 @@ class QueueViewTests(QueueFixtureTests):
         assert isinstance(frozen, gate.HeadStillHeld)
         self.assertEqual(frozen.decision, head.decision)
 
+    def test_live_bump_marks_every_unit_row_without_moving_columns(self) -> None:
+        model = self.fixture.model()
+        for unit in ("cables", "widget"):
+            priority: gate.QueuePriority = {"unit": unit, "why": "test", "set_at": NOW, "set_by": "actor"}
+            bumped = replace(model, reading=replace(model.reading,
+                explanation=replace(model.reading.explanation, priority=priority)))
+            unbumped = replace(model, reading=replace(model.reading,
+                explanation=replace(model.reading.explanation, priority=gate.NoQueuePriority())))
+            for columns in (40, 60, 80, 100, 140):
+                with self.subTest(unit=unit, columns=columns):
+                    baseline = queue_view.render_view(unbumped, columns, you=ASKING_SESSION, selector="widget")
+                    with mock.patch.object(head_facts, "queue_moves", side_effect=AssertionError("bump history read")), \
+                         mock.patch.object(gate, "read_queue_priority", side_effect=AssertionError("live priority read")):
+                        lines = queue_view.render_view(bumped, columns, you=ASKING_SESSION, selector="widget")
+                    rows = [line for line in lines if len(line) >= 6]
+                    previous = [line for line in baseline if len(line) >= 6]
+                    steps = [row.step for row in queue_view.running_builds(model)] + list(model.reading.view.waiting)
+                    self.assertEqual(len(rows), len(steps))
+                    for row, before, step in zip(rows, previous, steps):
+                        expected = model.labels[step.session_id].unit == unit
+                        self.assertEqual(sum(span.text == "●" for span in row), int(expected))
+                        # The step, minutes, bars and selection mark retain their positions.
+                        unit_end = 5 if expected else 4
+                        self.assertEqual(row[unit_end:], before[4:])
+                        self.assertEqual(terminal_width(plain([row[:unit_end]])), terminal_width(plain([before[:4]])))
+                        self.assertEqual(row[:3], before[:3])
+                    data = json_form(lines, columns, NOW)
+                    self.assertEqual(sum(part["text"] == "●" and part.get("tone") == "warning"
+                                         for row in data["lines"] for part in row),
+                                     sum(model.labels[step.session_id].unit == unit for step in steps))
+
+    def test_no_live_bump_keeps_the_recorded_board_bytes(self) -> None:
+        model = self.fixture.budget_model()
+        model = replace(model, reading=replace(model.reading,
+            explanation=replace(model.reading.explanation, priority=gate.NoQueuePriority())))
+        self.assertEqual(plain(queue_view.render_view(model, 100, you=ASKING_SESSION)) + "\n",
+                         (GOLDEN / "no_bump_100.txt").read_text())
+
 
 
     def test_older_fit_phrase_requires_both_recorded_identity_and_join_time(self) -> None:
@@ -315,7 +353,8 @@ class QueueViewTests(QueueFixtureTests):
                 self.assertFalse(any(row.startswith("Session:") for row in rows))
                 self.assertIn("\nRunning\n", plain(rendered))
                 self.assertIn("\nQueued\n", plain(rendered))
-                for removed in ("●", "starts", "moved up:", "#1 waits on"):
+                self.assertEqual(plain(rendered).count("●"), 3)
+                for removed in ("starts", "moved up:", "#1 waits on"):
                     self.assertNotIn(removed, plain(rendered))
 
     def test_card_checks_keep_all_numbers_and_failure_tones_when_wrapped(self) -> None:
@@ -406,7 +445,7 @@ class BudgetViewTests(QueueFixtureTests):
         self.assertEqual(len(rows), 32)
         self.assertEqual(rows[0][36:], "██████▊ 6.8 ↑ ≤14.2 9:18")
         self.assertEqual(rows[0][3:13], "tool-base…")
-        self.assertEqual(rows[0][14:23], "cables   ")
+        self.assertEqual(rows[0][14:23], "●cables  ")
         self.assertEqual(rows[0][24:31], "mend   ")
         self.assertEqual(rows[0][32:35], " 36")
         self.assertIn("\nRunning\n", plain(lines))
@@ -558,7 +597,7 @@ class BudgetViewTests(QueueFixtureTests):
                 changed = with_waiting(model, [model.reading.view.waiting[0], step])
                 lines = queue_view.render_view(changed, 100, colour=True)
                 row = next(line for line in lines if plain([line]).lstrip().startswith("2 "))
-                self.assertEqual("".join(span.text for span in row if span.tone == "warning"), expected)
+                self.assertEqual("".join(span.text for span in row if span.tone == "warning"), "●" + expected)
                 self.assertTrue(any(f"{need:.1f}" in span.text and span.tone == "inactive" for span in row))
 
     def test_long_name_growth_and_missing_unit_session_fallback(self) -> None:

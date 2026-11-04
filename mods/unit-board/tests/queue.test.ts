@@ -238,6 +238,22 @@ describe('build queue pane', () => {
     expect(fake.processes).toEqual([READ]);
   });
 
+  test('the pane preserves the bump mark supplied by the queue JSON', async ($, on) => {
+    const fake = queueHost(on);
+    const data = snapshot();
+    data.lines = [[{ text: ' 1 tool-based-ui ' }, { text: '●', tone: 'warning' },
+      { text: 'cables   nextest' }], [{ text: ' 2 tool-based-ui lfo       nextest' }]];
+    fake.replace(data);
+    await $.command.run(command());
+    const ui = await mount($);
+    const drawing = inspectDrawing(await ui.drawn());
+    expect(drawing.lines).toEqual(data.lines.map(line => line.map(part => part.text).join('')));
+    expect(drawing.spans.filter(part => part.text === '●')).toEqual([
+      { text: '●', color: 'warning', bold: false },
+    ]);
+    expect(fake.processes).toEqual([READ]);
+  });
+
   test('a countdown repaints every second with its background and no extra script run', async ($, on) => {
     const fake = queueHost(on);
     const data = snapshot();

@@ -124,7 +124,11 @@ export default {
         "text": "tool-based-ui     "
       },
       {
-        "text": "cables            ",
+        "text": "●",
+        "tone": "warning"
+      },
+      {
+        "text": "cables           ",
         "tone": "suggestion"
       },
       {
@@ -156,7 +160,11 @@ export default {
         "text": "tool-based-ui     "
       },
       {
-        "text": "cables            ",
+        "text": "●",
+        "tone": "warning"
+      },
+      {
+        "text": "cables           ",
         "tone": "suggestion"
       },
       {
@@ -188,7 +196,11 @@ export default {
         "text": "tool-based-ui     "
       },
       {
-        "text": "cables            ",
+        "text": "●",
+        "tone": "warning"
+      },
+      {
+        "text": "cables           ",
         "tone": "suggestion"
       },
       {

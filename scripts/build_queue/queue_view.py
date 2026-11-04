@@ -284,14 +284,15 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     free = max(0.0, budget - taken)
     waiting = model.reading.view.waiting
     running = running_builds(model)
+    bumped_unit = "" if isinstance(explanation.priority, gate.NoQueuePriority) else explanation.priority["unit"]
 
-    def names(step: gate.WaitingStep | gate.RunningStep) -> tuple[str, str]:
+    def names(step: gate.WaitingStep | gate.RunningStep) -> tuple[str, str, bool]:
         identity = step_labels(step, model.labels)
         show = field(identity.showrunner) or "—"
         unit = field(identity.unit).removeprefix(show + "-")
         if not unit or unit == "—":
             unit = field(identity.session)
-        return show, unit
+        return show, unit, bool(bumped_unit and identity.unit == bumped_unit)
 
     waiting_names = [names(step) for step in waiting]
     running_names = [names(row.step) for row in running]
@@ -314,8 +315,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     show_width, unit_width = 12, 10
     room = columns - fixed - tail
     if columns > 60:
-        longest_show = max((terminal_width(show) for show, _ in all_names), default=12)
-        longest_unit = max((terminal_width(unit) for _, unit in all_names), default=10)
+        longest_show = max((terminal_width(show) for show, _, _ in all_names), default=12)
+        longest_unit = max((terminal_width(unit) for _, unit, _ in all_names), default=10)
         while show_width + unit_width < room and (show_width < longest_show or unit_width < longest_unit):
             if show_width < longest_show:
                 show_width += 1
@@ -348,12 +349,14 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
             return (text if len(text) <= width else text[:max(0, width - 1)] + "…").ljust(width) + " "
         return pad_right(cut_tail(text, width), width) + " "
 
-    def identity_columns(place: str, step: str, pair: tuple[str, str], minutes: str, marker: str = " ") -> Line:
-        show, unit = pair
+    def identity_columns(place: str, step: str, pair: tuple[str, str, bool], minutes: str, marker: str = " ") -> Line:
+        show, unit, bumped = pair
+        unit_spans = ((Span("●", "warning"), Span(column(unit, unit_width - 1), "suggestion"))
+                      if bumped else (Span(column(unit, unit_width), "suggestion"),))
         return (Span(pad_left(place, place_width), "warning" if place == "1" else "inactive"),
                 Span(marker, "suggestion"),
                 Span(column(show, show_width)),
-                Span(column(unit, unit_width), "suggestion"),
+                *unit_spans,
                 Span(column(field(step), step_width)),
                 Span(pad_left(minutes, minutes_width) + " ", "inactive"))
 
