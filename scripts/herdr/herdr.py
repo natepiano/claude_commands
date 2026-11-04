@@ -53,6 +53,8 @@ import nix_env as nix_env
 from place import HerdrPlace as HerdrPlace
 from pane_launch import MEMBER_MARKS as MEMBER_MARKS, UNIT_MARKS as UNIT_MARKS, RecordedLabels, StaffLabelsRead
 
+NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
 
