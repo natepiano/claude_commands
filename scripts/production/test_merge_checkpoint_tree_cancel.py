@@ -29,7 +29,8 @@ class CheckpointTreeCancelTests(unittest.TestCase):
                         + "would be stale. Resubmit the test when your edits are done.\n"
                         if status == 77 else "a test failed\n", "") for status in statuses]
             output = StringIO()
-            with (patch.object(merge_checkpoint, "test_steps", return_value=[("package sample", command)]),
+            step = merge_checkpoint.CheckpointTestStep("package sample", command, root)
+            with (patch.object(merge_checkpoint, "test_steps", return_value=[step]),
                   patch.object(merge_checkpoint, "run_test_command", side_effect=results) as run,
                   patch.object(merge_checkpoint, "undo_unpushed_merge") as undo,
                   redirect_stdout(output)):

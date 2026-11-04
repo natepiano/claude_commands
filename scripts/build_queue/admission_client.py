@@ -208,8 +208,9 @@ class AcquisitionRetry:
     def left_queue(self) -> bool:
         if CLOCK.monotonic() < self.next_leave:
             return False
+        left = _leave_queue()
         self.next_leave = CLOCK.monotonic() + self.leave_interval
-        return _leave_queue()
+        return left
 
     def bound(self, seconds: float) -> float:
         return max(0.0, min(seconds, self.deadline - CLOCK.monotonic(),

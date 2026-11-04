@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.production import staff  # noqa: E402
+from scripts.production.staff_test_support import isolated_staff_file, fixture_worker, fixture_runtime_id, unit_membership
 from scripts.astra.design_role_test_support import write_mesh_server_record  # noqa: E402
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
 
@@ -87,7 +88,9 @@ class AstraReviewTests(unittest.TestCase):
                             "ASTRA_ROLES_STATE": str(self.root / "roles"), "STUB_CODEX_HOME": str(self.root / "codex-home"),
                             "STUB_REVIEW": "Verdict: clear.\n\n1. Section Why: the cause is not shown."}
         _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
-        self.environment.update({"HOME": str(self.root)})
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.environment.update({"HOME": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
+                                 "HERDR_BIN": "/nonexistent/herdr"})
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment, cwd=self.root,
@@ -101,17 +104,19 @@ class AstraReviewTests(unittest.TestCase):
         return Path(argv[argv.index("-o") + 1]).with_name("prompt.md")
 
     def held_reviewer(self, status: str = "done") -> design_roles.HeldDesign:
+        parent = unit_membership("demo", "proposal-unit")
+        _ = fixture_worker("demo-proposal-astra-reviewer", parent.id, runtime_id=fixture_runtime_id("held-thread"))
         design_id = "00000000-0000-4000-8000-000000000016"
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
                                   str(self.root), str(self.document), "proposal", "2026-10-21T12:00:00+00:00",
-                                  design_roles.UnitHolder("demo", "proposal-unit"), design_roles.DesignUnbound(),
+                                  design_roles.DesignUnbound(),
                                   (design_roles.RoleInstance("designer", "demo-proposal-astra-designer", design_roles.RoleNotOpened()),
-                                   design_roles.RoleInstance("reviewer", "demo-proposal-astra-reviewer", design_roles.RoleOpen("held-thread"))))
+                                   design_roles.RoleInstance("reviewer", "demo-proposal-astra-reviewer", design_roles.RoleOpen(fixture_runtime_id("held-thread")))))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         mesh = design_roles.mesh_directory(design_id)
         mesh.mkdir(parents=True)
         _ = (mesh / "mesh_roster.json").write_text(json.dumps({"demo-proposal-astra-reviewer": {
-            "thread_id": "held-thread", "status": status, "held_design_id": design_id, "held_role": "reviewer"}}))
+            "thread_id": fixture_runtime_id("held-thread"), "status": status, "held_design_id": design_id, "held_role": "reviewer"}}))
         write_mesh_server_record(mesh, self.root / "codex-home")
         return design
 
@@ -130,7 +135,6 @@ class AstraReviewTests(unittest.TestCase):
 
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
                 patch.object(staff, "runtime_id", return_value="fixture-holder"), \
-                patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
                 patch.object(design_roles, "resolve_model", return_value=("fixture-model", "xhigh")), \
                 patch.object(design_roles, "dispatch_turn", side_effect=dispatch), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("held review started a fresh exec")), \
@@ -148,7 +152,7 @@ class AstraReviewTests(unittest.TestCase):
                     self.assertEqual((header.role, header.member), ("astra-reviewer", "demo-proposal-astra-reviewer"))
                     self.assertEqual(Path(header.reply_path).read_text(), "Held reviewer evidence.\n")
                     replies.append(header.reply_path)
-        self.assertEqual(assignments, [("held-thread", design_roles.ReadOnlyReviewer()), ("held-thread", design_roles.ReadOnlyReviewer())])
+        self.assertEqual(assignments, [(fixture_runtime_id("held-thread"), design_roles.ReadOnlyReviewer()), (fixture_runtime_id("held-thread"), design_roles.ReadOnlyReviewer())])
         self.assertEqual(len(set(replies)), 2)
         self.assertIn("held reviewer", output.getvalue())
         self.assertFalse((self.root / "calls.json").exists())
@@ -156,7 +160,6 @@ class AstraReviewTests(unittest.TestCase):
     def test_busy_held_reviewer_is_reported_without_a_fresh_thread_or_prompt(self) -> None:
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
                 patch.object(staff, "runtime_id", return_value="fixture-holder"), \
-                patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
                 patch.object(design_roles, "dispatch_turn", side_effect=AssertionError("busy role dispatched")), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("busy role used fresh exec")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
