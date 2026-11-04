@@ -15,20 +15,32 @@ require_checkout(Path(__file__))
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Update a private config. Keep existing values and limits outside the overrides."""
-    source = path if path.exists() else (
-        Path(__file__).resolve().parents[2] / "config" / (f"{template}.conf" if template else path.name))
+    """Merge committed defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
+    source = Path(__file__).resolve().parents[2] / "config" / (f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
-    for raw in overrides.splitlines():
-        key, separator, value = raw.partition("=")
-        if not separator or key.lstrip().startswith("#"):
-            continue
-        for index, line in enumerate(lines):
-            if line.partition("=")[0].strip() == key.strip():
-                lines[index] = f"{key.strip()}={value}"
-                break
-        else:
-            lines.append(raw)
+    existing = path.read_text() if path.exists() else ""
+    limit_prefixes = ("# whole:", "# range:", "# one of:")
+    for layer in (existing, overrides):
+        previous = ""
+        for raw in layer.splitlines():
+            limit = previous if previous.startswith(limit_prefixes) else ""
+            previous = raw.strip()
+            key, separator, value = raw.partition("=")
+            if not separator or key.lstrip().startswith("#"):
+                continue
+            for index, line in enumerate(lines):
+                if line.partition("=")[0].strip() == key.strip():
+                    lines[index] = f"{key.strip()}={value}"
+                    if limit:
+                        if index and lines[index - 1].strip().startswith(limit_prefixes):
+                            lines[index - 1] = limit
+                        else:
+                            lines.insert(index, limit)
+                    break
+            else:
+                if limit:
+                    lines.append(limit)
+                lines.append(raw)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

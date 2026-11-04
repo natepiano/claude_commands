@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view
 from scripts.build_queue.admission_test_support import AdmissionFixture, InjectedCrash, only_admitted
@@ -134,6 +135,7 @@ def stop_history_append(history_store: object, tail: HistoryAppendStop
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = unittest.enterModuleContext(fake_cargo_output_roots())
     _ = write_config_fixture(root / "lint.conf", "build_budget_gib=21")
     _ = (root / "meminfo").write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
     _ = (root / "pressure").write_text(

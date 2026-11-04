@@ -24,12 +24,17 @@ from scripts.lib import build_folders, copy_record, scratch, test_hang_guard
 from scripts.message import sessions
 
 from scripts.lib import conf
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 DAY = 86_400
 LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
 ENDED_SESSION = "66666666-7777-8888-9999-000000000000"
 PROJECT = "-home-natepiano-rust-hana"
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(fake_cargo_output_roots())
 
 
 def write(path: Path, text: str = "x" * 4096) -> Path:

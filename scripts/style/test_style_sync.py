@@ -35,6 +35,7 @@ from scripts.production import showrunners
 from scripts.message import send_budget
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 
 class RecordedCall(TypedDict):
@@ -119,6 +120,7 @@ class StyleSyncTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="style-sync-test-")))
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"

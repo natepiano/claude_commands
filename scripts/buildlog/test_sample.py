@@ -25,8 +25,10 @@ from cgroup_test_support import CPU, write_cgroup
 from test_index import use_test_log
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lib.cargo_output_test_support import fake_cargo_output_roots
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 use_test_log()
 
@@ -39,6 +41,7 @@ class SampleTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
         proc = self.root / "proc"
         proc.mkdir(parents=True, exist_ok=True)
@@ -432,6 +435,8 @@ class SampleTests(unittest.TestCase):
             "sample.BOOT_ID = proc / 'boot_id'; "
             "from unittest.mock import patch; from contextlib import ExitStack; "
             "stack = ExitStack(); "
+            "from scripts.lib.cargo_output_test_support import fake_cargo_output_roots; "
+            "stack.enter_context(fake_cargo_output_roots()); "
             "stack.enter_context(patch.object(sample, 'CPU_PRESSURE', proc / 'cpu_pressure')); "
             "stack.enter_context(patch.object(sample, 'IO_PRESSURE', proc / 'io_pressure')); "
             "stack.enter_context(patch.object(sample, 'STAT', proc / 'stat')); "

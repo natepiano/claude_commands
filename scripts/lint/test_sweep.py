@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sweep
 import conf
 from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.mac_test import floor_claims
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from memory_test_support import config_environment, write_config_fixture
@@ -103,6 +104,7 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = unittest.enterModuleContext(fake_cargo_output_roots())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         **config_environment(root), "USER_ZONE": "America/Los_Angeles",
     }))

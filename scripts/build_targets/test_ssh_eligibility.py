@@ -144,7 +144,7 @@ class SshEligibilityTests(unittest.TestCase):
         return build_targets.command_reserve(args)
 
     def test_a_mac_block_stops_a_memory_wait_from_reusing_its_reservation(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\n")
         self.assertEqual(self.reserve("mac"), 0)
         paths = mac_test.state_paths("mac")
         claim, = mac_test.read_claims(paths)
