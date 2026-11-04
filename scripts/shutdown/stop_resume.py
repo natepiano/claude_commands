@@ -451,6 +451,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
 
+        if to is None and row is not None and row.kind in ("unit", "showrunner") and pane_launch.agent_kind(entry) == "claude":
+            to = accounts.role_account(row.kind).label
         source = Path(entry["config_dir"])
         source_label = accounts.claude_config_label(source)
         target_dir = (accounts.account_dir(to) if to is not None else
