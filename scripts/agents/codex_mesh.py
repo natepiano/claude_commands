@@ -2249,31 +2249,31 @@ FRESH_DETACHED_RUN_SCAN = FreshDetachedRunScan()
 
 
 def _close_messages_if_empty(
-    session_dir: str, name: str, thread_id: str,
+    session_dir: str, name: str, launcher: RosterActiveLauncher,
     runs: DetachedRunWatch | FreshDetachedRunScan = FRESH_DETACHED_RUN_SCAN,
 ) -> bool:
     """Exclude senders while claiming an empty inbox and closing its launcher."""
     with worker_lifecycle.lock_worker(session_dir, name):
         entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        if not RosterActiveLauncher(thread_id, (os.getpid(),)).owns(entry):
+        if not launcher.owns(entry):
             return True
         with _pending_file(session_dir, name) as handle:
             current = _run_watch(session_dir, name, runs).current()
-            if _pending_for_thread(handle, thread_id) or current.live or current.dead:
+            if _pending_for_thread(handle, launcher.thread_id) or current.live or current.dead:
                 return False
-            _write_pending(handle, thread_id, [], accepting_messages=False)
+            _write_pending(handle, launcher.thread_id, [], accepting_messages=False)
             return True
 
 
-def _close_messages_and_keep_pending(session_dir: str, name: str, thread_id: str) -> int:
+def _close_messages_and_keep_pending(session_dir: str, name: str, launcher: RosterActiveLauncher) -> int:
     """Close the launcher's inbox while keeping its parked messages for the next launch."""
     with worker_lifecycle.lock_worker(session_dir, name):
         entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        if not RosterActiveLauncher(thread_id, (os.getpid(),)).owns(entry):
+        if not launcher.owns(entry):
             return 0
         with _pending_file(session_dir, name) as handle:
-            messages = _pending_for_thread(handle, thread_id)
-            _write_pending(handle, thread_id, messages, accepting_messages=False)
+            messages = _pending_for_thread(handle, launcher.thread_id)
+            _write_pending(handle, launcher.thread_id, messages, accepting_messages=False)
             return len(messages)
 
 
@@ -4882,7 +4882,7 @@ def _hold_messages_for_next_launch(stream: TurnStream, log: TextIO, reason: str)
     """Close the thread to messages and keep the held ones for the next launch."""
     if stream.end_marker.exists():
         return
-    kept = _close_messages_and_keep_pending(stream.session_dir, stream.name, stream.thread_id)
+    kept = _close_messages_and_keep_pending(stream.session_dir, stream.name, _stream_launcher(stream))
     if kept:
         messages = "1 message" if kept == 1 else f"{kept} messages"
         held = f"{messages} held for the next launch"
@@ -4946,7 +4946,7 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithTh
                 if stream.client.has_pending_frames:
                     stream.state_change_owed = True
                     return StreamStep.NEXT_FRAME
-                if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+                if _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
                     return StreamStep.FINISH
         _keep_resident_on_selected_server(stream, log)
     return StreamStep.NEXT_FRAME
@@ -4981,7 +4981,7 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
             return StreamStep.NEXT_FRAME
         if isinstance(moved, MovedWorker) and _adopt_moved_worker(stream, moved):
             return StreamStep.NEXT_FRAME
-        if not _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+        if not _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
             return StreamStep.NEXT_FRAME
     if quota_owed:
         return StreamStep.NEXT_FRAME
@@ -5448,7 +5448,7 @@ def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
         stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
     _end_dead_runs(stream.session_dir, stream.name, stream.runs)
-    if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+    if _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
         return StreamStep.FINISH
     # The turn ended on a run still going: stay attached until its result is held.
     if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs):
