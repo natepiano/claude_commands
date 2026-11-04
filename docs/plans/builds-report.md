@@ -238,7 +238,7 @@ The user, 2026-11-03: tables do not work for them. Lower priority. Design a char
 
 Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second largest cost. Find the cause before a fix. Query the index for cold steps: worktree, target folder, and the event before each (new clone, branch switch, toolchain or flag change, sweep deletion). Write the cause with counts and hours to `docs/plans/builds-report-rounds.md`, then send it to the showrunner, which names the owner. No code changes.
 
-### Phase 10 — Chart labels do not collide  · status: todo
+### Phase 10 — Chart labels do not collide  · status: done
 **Depends on:** Phase 8
 
 The fresh design check of the Phase 8 shots (dataviz label rules) found two defects on the `buildlog charts` page:
