@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
@@ -32,6 +33,7 @@ from scripts.lint import style_review
 from scripts.usage.agents_log import LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
+ReviewExec = Callable[[str, list[str], dict[str, str]], NoReturn]
 PYTHON = str(SCRIPTS / "../lib/py")
 MESH = str(SCRIPTS / "../agents/codex_mesh.py")
 PROGRESS = str(SCRIPTS / "progress_history.py")
@@ -635,7 +637,7 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
 
 
 def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_prompt: Path,
-                     env: dict[str, str]) -> int:
+                     env: dict[str, str], exec_review: ReviewExec) -> int:
     if conf.read("direct").text("SIMPLIFY_LENS") == "off":
         print("simplify: off")
         return 0
@@ -645,10 +647,10 @@ def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_p
     command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, "--diff", args.diff,
                "--summary", str(Path(args.summary).resolve()) if args.summary else "", str(run), str(cwd),
                str(source_prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
-    os.execvpe(command[0], command, env)
+    exec_review(command[0], command, env)
 
 
-def main() -> int:
+def main(exec_review: ReviewExec = os.execvpe) -> int:
     args = parse_arguments()
     cwd, prompt = Path(args.cwd).expanduser().resolve(), Path(args.prompt).expanduser().resolve()
     if not cwd.is_dir() or not prompt.is_file():
@@ -657,7 +659,7 @@ def main() -> int:
     env = dict(os.environ)
     run, phase = prepare_run(args, cwd, prompt, env)
     if args.lens == "simplify":
-        return execute_simplify(args, run, phase, cwd, prompt, env)
+        return execute_simplify(args, run, phase, cwd, prompt, env, exec_review)
     role = "impl" if args.role == "implement" else args.role
     check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]

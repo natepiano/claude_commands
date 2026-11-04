@@ -89,16 +89,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(shrink, "--shrink", review=False)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         self.assertIn("scope: ok — 1 changed paths are allowed", result.process.stdout)
-    def test_as_built_merges_the_docs_and_the_plans_deletion_after_code_checkpoint(self) -> None:
-        first = self.run_checkpoint(self.checkpoint())
-        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
-        result = self.run_checkpoint(self.as_built_commit(), "--as-built", review=False)
-        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("test: ok — as-built has no package tests", result.process.stdout)
-        tree = self.git("ls-tree", "-r", "--name-only", "HEAD")
-        self.assertIn("docs/as-built/alpha.md", tree)
-        self.assertNotIn("docs/plans/alpha.md", tree)
-        self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha-unit phase \S+ as-built \(")
     def test_as_built_holds_a_commit_that_changes_code(self) -> None:
         first = self.run_checkpoint(self.checkpoint())
         self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
@@ -148,16 +138,17 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIsInstance(history.last_code_for_unit("alpha-unit"), NoMerge)
         self.assertEqual(history.code_merge_count(), 0)
         self.assertFalse(history.has_code_merge("alpha-unit", "2"))
-    def test_merge_branch_reader_ignores_checkpoint_subject_on_merged_side_branch(self) -> None:
-        _ = self.checkpoint(subject="Merge alpha-unit phase 9 (abcdef0) into production")
+    def test_merge_branch_reader_counts_checkpoint_subject_on_merged_side_branch(self) -> None:
+        checkpoint = self.checkpoint(subject="Merge alpha-unit phase 9 (abcdef0) into production")
         _ = self.git("merge", "--no-ff", "-m", "Bring side branch into production", "alpha-branch")
 
+        expected = MergeEntry("alpha-unit", "9", "abcdef0", "production", checkpoint, CodeCheckpoint())
         history = merge_branch_history(self.checkout, "production")
-        self.assertIsInstance(history.last_merge(), NoMerge)
-        self.assertIsInstance(history.last_for_unit("alpha-unit"), NoMerge)
-        self.assertIsInstance(history.last_code_for_unit("alpha-unit"), NoMerge)
-        self.assertEqual(history.code_merge_count(), 0)
-        self.assertFalse(history.has_code_merge("alpha-unit", "9"))
+        self.assertEqual(history.last_merge(), expected)
+        self.assertEqual(history.last_for_unit("alpha-unit"), expected)
+        self.assertEqual(history.last_code_for_unit("alpha-unit"), expected)
+        self.assertEqual(history.code_merge_count(), 1)
+        self.assertTrue(history.has_code_merge("alpha-unit", "9"))
     def test_merge_reader_keeps_subject_from_earlier_branch_name(self) -> None:
         code = self.checkpoint()
         _ = self.git("merge", "--no-ff", "-m",

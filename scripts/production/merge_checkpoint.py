@@ -424,13 +424,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
 
 
 def merge_branch_history(checkout: Path, merge_branch: str) -> MergeBranchHistory:
-    """Read checkpoint merge subjects on a branch, newest first.
-
-    A `chore(<slug>): rename unit <old> to <new>` subject carries a unit's history over: every
-    older entry under `<old>` counts as `<new>`, through a chain of renames, while a later unit
-    that reuses `<old>` keeps its own newer entries. The commit is the record; no alias is stored.
-    """
-    output = good(git(checkout, "log", "--first-parent", merge_branch, "--format=%H%x00%s"), "ancestry")
+    """Read all reachable checkpoint subjects and unit renames, newest first."""
+    output = good(git(checkout, "log", "--topo-order", merge_branch, "--format=%H%x00%s"), "ancestry")
     pattern = re.compile(r"^Merge (.+?) phase (\S+?)( shrink| as-built)? \(([0-9a-f]+)\)")
     handoff = re.compile(r"^Merge (.+?) hand-off \(([0-9a-f]+)\)")
     rename = re.compile(r"^chore\([^)]*\): rename unit (\S+) to (\S+)$")
@@ -460,15 +455,8 @@ def merge_branch_history(checkout: Path, merge_branch: str) -> MergeBranchHistor
 def merge_history(request: MergeRequest) -> FirstMerge | LastMerged:
     latest = merge_branch_history(request.production.checkout, request.production.merge_branch).last_code_for_unit(
         request.unit.name)
-    if isinstance(latest, NoMerge):
-        return FirstMerge()
-    checkpoint = good(git(request.production.checkout, "rev-parse", latest.short + "^{commit}"), "ancestry")
-    return LastMerged(checkpoint)
-
-
-def code_merged(request: MergeRequest) -> bool:
-    history = merge_branch_history(request.production.checkout, request.production.merge_branch)
-    return history.has_code_merge(request.unit.name, request.phase)
+    return FirstMerge() if isinstance(latest, NoMerge) else LastMerged(
+        good(git(request.production.checkout, "rev-parse", latest.short + "^{commit}"), "ancestry"))
 
 
 def on_origin(request: MergeRequest) -> str | None:
@@ -510,7 +498,8 @@ def ancestry(request: MergeRequest) -> bool:
                    "push your branch to origin and resend the checkpoint")
     already = git(checkout, "merge-base", "--is-ancestor", request.commit,
                   request.production.merge_branch).returncode == 0
-    if not isinstance(request.kind, CodeCheckpoint) and not code_merged(request):
+    if not isinstance(request.kind, CodeCheckpoint) and not merge_branch_history(
+        checkout, request.production.merge_branch).has_code_merge(request.unit.name, request.phase):
         raise Stop("ancestry", "held", f"phase {request.phase} code checkpoint has not merged",
                    "wait for the phase code checkpoint to merge, then resend the shrink")
     report("ancestry", "ok", f"checkpoint exists, follows history, and is on {origin_branch}" +
@@ -1262,9 +1251,9 @@ def record_pushed_merges(production: Production, merge_head: str, source_checkpo
     """Receipts survive promotion failures and include origin/main integration merges."""
     repository = production_field(production.doc.read_text(encoding="utf-8").splitlines(), "Repository")
     project = Path(repository).expanduser().name
-    merges = good(git(production.checkout, "rev-list", "--first-parent", "--merges", "--reverse",
-                      f"{merge_head}^1..{tip}"), "receipt").splitlines()
-    for commit in merges:
+    merges = good(git(production.checkout, "rev-list", "--ancestry-path", "--merges", "--reverse",
+                      f"{merge_head}..{tip}"), "receipt").splitlines()
+    for commit in [merge_head, *merges]:
         if commit != merge_head and good(git(production.checkout, "show", "-s", "--format=%s", commit), "receipt") != (
             "Merge origin/main into " + production.merge_branch
         ):
@@ -1691,7 +1680,7 @@ def handoff_merge_evidence(production: Production, child: str, checkpoint: str) 
                      and entry.child == child and checkpoint.startswith(entry.short)), None)
     if matching is not None:
         return matching.merge_hash
-    for commit in good(git(checkout, "rev-list", "--first-parent", "--reverse", "--merges", branch), "merge").splitlines():
+    for commit in good(git(checkout, "rev-list", "--reverse", "--merges", branch), "merge").splitlines():
         if git(checkout, "merge-base", "--is-ancestor", checkpoint, commit).returncode == 0:
             return commit
     return good(git(checkout, "rev-parse", branch), "merge")
