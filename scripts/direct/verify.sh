@@ -2550,7 +2550,7 @@ token_wait_note() {
     fi
     case "$kind" in
         first) printf 'waiting for the cargo token since %s: %s; calls ahead of this one: %d\n' \
-            "$(TZ="$(buildlog_memory_python "$USER_ZONE_SCRIPT" 2>/dev/null)" date '+%H:%M %Z')" \
+            "$(TZ="$(python3 -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%H:%M %Z')" \
             "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
         still) printf 'still waiting for the cargo token (%d min): %s; calls ahead of this one: %d\n' \
             "$waited_min" "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
