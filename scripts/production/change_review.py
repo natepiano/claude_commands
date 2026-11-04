@@ -610,7 +610,9 @@ def _sort(path: Path, lines: list[str]) -> None:
 
 def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day: date, merged: str, production: Path,
                 rank: str = "", owners: Sequence[Path] = (),
-                producers: Sequence[staff.StaffId | UnknownProducer] = ()) -> list[str]:
+                producers: Sequence[staff.StaffId | UnknownProducer] = (), *,
+                record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT
+                ) -> list[str]:
     """Add the changes to To review and return the written rows.
 
     `merged` holds the merge hash or an empty string.
@@ -621,6 +623,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
     """
     if not changes:
         return []
+    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     items = [change.item if isinstance(change, PublicationChange) else change for change in changes]
     row_owners = [change.source.production if isinstance(change, PublicationChange) and change.source is not None
                   else owners[index] if owners else production for index, change in enumerate(changes)]
@@ -640,7 +643,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank),
                                      KIND: "", PRODUCER: str(row_producers[offset]) if isinstance(row_producers[offset], str) else "",
-                                     PRODUCTION: _cell(row_production(row_owners[offset]))})
+                                     PRODUCTION: _cell(row_production(row_owners[offset], record))})
                 for offset, item in enumerate(items)]
         _insert(lines, end, rows)
         return rows
@@ -835,15 +838,13 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
     return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
 
 
-def row_production(production: Path) -> str:
-    """The Production cell for a change of the production doc `production`: the slug of the production
-    it is credited to (`credited`)."""
-    return slug_of(credited(production))
+def row_production(production: Path, record: staff.StaffSnapshot) -> str:
+    """Return the credited production slug from the supplied staff snapshot."""
+    return slug_of(credited(production, record))
 
 
-def credited(production: Path) -> Path:
+def credited(production: Path, record: staff.StaffSnapshot) -> Path:
     """Credit a style production to its staff parent. Other productions keep their own credit."""
-    record = staff.initial_snapshot()
     row = record.by_doc(remote.local_machine(), production)
     while row is not None and row.parent is not None:
         try:
@@ -880,12 +881,17 @@ class UnitSource:
 
 def unit_branches(docs: Iterable[Path]) -> dict[str, UnitSource]:
     """Resolve exact branch names before plan, unit and folder aliases."""
+    return _unit_branches(docs, _branch_snapshot())
+
+
+def _branch_snapshot() -> staff.StaffSnapshot:
+    """Return the staff snapshot used to resolve branches."""
     try:
         record = staff.snapshot()
     except staff.StaffUnreadable as error:
         print(f"change review: {error}", file=sys.stderr)
         record = staff.StaffSnapshot(())
-    return _unit_branches(docs, record)
+    return record
 
 
 def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot) -> dict[str, UnitSource]:
@@ -1015,7 +1021,8 @@ class Tree:
 
     def __init__(self, docs: Iterable[Path]) -> None:
         self.docs: list[Path] = list(dict.fromkeys(docs))
-        self.branches: dict[str, UnitSource] = unit_branches(self.docs)
+        self.record: staff.StaffSnapshot = _branch_snapshot()
+        self.branches: dict[str, UnitSource] = _unit_branches(self.docs, self.record)
         self.repos: list[Path] = []
         self.targets: dict[tuple[Path, str], Path] = {}
         self._chains: dict[tuple[Path, str], set[str]] = {}
@@ -1136,7 +1143,7 @@ def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[
             continue
         found = trace(row, tree)
         if isinstance(found, Path):
-            filled[row["#"]], owners[row["#"]] = row_production(found), found
+            filled[row["#"]], owners[row["#"]] = row_production(found, tree.record), found
         else:
             untraced[row["#"]] = found
     if not write or not filled:
@@ -1645,8 +1652,9 @@ def _run(options: CommandLine) -> int:
                 print("\n".join(refused) if refused else f"{len(commits)} commit(s) carry their {TRAILER} lines")
                 return 1 if refused else 0
             production = production_doc(options.production)
-            rows = append_rows(_list(options), publication_changes(commits, production), today(), options.merged,
-                               production)
+            record = staff.snapshot()
+            rows = append_rows(_list(options), publication_changes(commits, production, record=record),
+                               today(), options.merged, production, record=record)
             print("\n".join(rows) if rows else "no visible change to add")
     return 0
 

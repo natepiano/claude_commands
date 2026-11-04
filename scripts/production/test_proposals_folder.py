@@ -15,16 +15,14 @@ class ProposalDocumentTests(unittest.TestCase):
             doc = root / "docs/plans/demo-production.md"
             doc.parent.mkdir(parents=True)
             _ = doc.write_text("# Demo\n")
-            self.assertIsInstance(proposals_folder.issues_folder(doc), proposals_folder.ProposalsUnconfigured)
-            self.assertIsInstance(proposals_folder.ledger(doc), proposals_folder.LedgerUnconfigured)
+            self.assertIsNone(proposals_folder.issues_folder(doc))
+            self.assertIsNone(proposals_folder.ledger(doc))
             ledger = root / "ledger.md"
             _ = doc.write_text(f"- **Proposals:** issues\n- **Improvement queue:** {ledger}\n")
             folder = proposals_folder.issues_folder(doc)
             queue = proposals_folder.ledger(doc)
-            assert isinstance(folder, proposals_folder.ProposalsFolder)
-            assert isinstance(queue, proposals_folder.ImprovementLedger)
-            self.assertEqual(folder.path, root / "issues")
-            self.assertEqual(queue.path, ledger)
+            self.assertEqual(folder, root / "issues")
+            self.assertEqual(queue, ledger)
 
     def test_unreadable_documents_are_unavailable_instead_of_unconfigured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -33,12 +31,11 @@ class ProposalDocumentTests(unittest.TestCase):
                 with self.subTest(content=content):
                     if content is not None:
                         _ = doc.write_bytes(content)
-                    folder = proposals_folder.issues_folder(doc)
-                    queue = proposals_folder.ledger(doc)
-                    self.assertIsInstance(folder, proposals_folder.ProposalsUnavailable)
-                    self.assertIsInstance(queue, proposals_folder.LedgerUnavailable)
-                    self.assertIn(str(doc), str(folder))
-                    self.assertIn(str(doc), str(queue))
+                    for read in (proposals_folder.issues_folder, proposals_folder.ledger):
+                        with self.subTest(reader=read.__name__):
+                            with self.assertRaises(OSError) as raised:
+                                _ = read(doc)
+                            self.assertIn(str(doc), str(raised.exception))
 
 
 if __name__ == "__main__":

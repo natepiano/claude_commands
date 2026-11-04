@@ -37,7 +37,7 @@ from scripts.production import showrunners
 from scripts.production.production_doc import Refusal
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
-from proposals_folder import ImprovementLedger, LedgerUnavailable, ledger, owners, proposal_issues, proposer, scope_docs, slug_of
+from proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs, slug_of
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
@@ -336,10 +336,8 @@ def improvement_ledgers(doc: Path, below: bool = False) -> list[Path]:
     paths: dict[Path, None] = {}
     for each in scope_docs(doc, below):
         found = ledger(each)
-        if isinstance(found, LedgerUnavailable):
-            raise OSError(f"{found.document}: {found.reason}")
-        if isinstance(found, ImprovementLedger):
-            paths[found.path] = None
+        if found is not None:
+            paths[found] = None
     return list(paths)
 
 

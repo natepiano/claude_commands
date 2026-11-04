@@ -17,7 +17,7 @@ from scripts.production import staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
-from proposals_folder import ProposalsFolder, ProposalsUnavailable, issues_folder  # noqa: E402
+from proposals_folder import issues_folder  # noqa: E402
 
 if TYPE_CHECKING:
     from update_registration import QuestionStaff
@@ -50,9 +50,7 @@ def owned_paths(slug: str) -> tuple[Path, ...]:
 def can_hold_questions(document: Path) -> bool:
     """Check for question storage before reading the staff record."""
     folder = issues_folder(document)
-    if isinstance(folder, ProposalsUnavailable):
-        raise OSError(f"{folder.document}: {folder.reason}")
-    return isinstance(folder, ProposalsFolder) or any(
+    return folder is not None or any(
         path.is_dir() for path in STATE_DIR.glob("*/questions")
     )
 

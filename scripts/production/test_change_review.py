@@ -639,8 +639,9 @@ class ActionTest(unittest.TestCase):
         owner = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", parent))
         _ = fixture_member("showrunner", name="parent-style", parent=owner.id,
                            doc=staff.LiveDoc("natedev", style))
-        self.assertEqual(change_review.credited(style), parent)
-        self.assertEqual(change_review.credited(parent), parent)
+        record = staff.snapshot()
+        self.assertEqual(change_review.credited(style, record), parent)
+        self.assertEqual(change_review.credited(parent, record), parent)
         rows = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 27), "216c4e1d", style,
                                          owners=[style])
         self.assertEqual(next(row for row in change_review.pending(self.path)

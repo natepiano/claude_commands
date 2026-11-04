@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import NamedTuple
 
 
 import sys
@@ -24,56 +23,30 @@ PRODUCTION_SUFFIX = "-production.md"
 UNIT_IN_PRODUCTION = re.compile(r".+?\s*\((?P<production>[^()]+)\)")
 
 
-class ImprovementLedger(NamedTuple):
-    path: Path
-
-
-class LedgerUnconfigured:
-    """The document has no improvement ledger."""
-
-
-class LedgerUnavailable(NamedTuple):
-    document: Path
-    reason: str
-
-
-class ProposalsFolder(NamedTuple):
-    path: Path
-
-
-class ProposalsUnconfigured:
-    """The document has no proposals folder."""
-
-
-class ProposalsUnavailable(NamedTuple):
-    document: Path
-    reason: str
-
-
-def ledger(doc: Path) -> ImprovementLedger | LedgerUnconfigured | LedgerUnavailable:
-    """Read the configured ledger and distinguish absence from a failed read."""
+def ledger(doc: Path) -> Path | None:
+    """Return the configured ledger, or None when the document has no ledger field."""
     try:
         lines = doc.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
-        return LedgerUnavailable(doc, str(error))
+    except UnicodeError as error:
+        raise OSError(f"{doc}: {error}") from error
     try:
-        return ImprovementLedger(Path(production_field(lines, IMPROVEMENT_QUEUE_FIELD)).expanduser())
+        return Path(production_field(lines, IMPROVEMENT_QUEUE_FIELD)).expanduser()
     except Refusal:
-        return LedgerUnconfigured()
+        return None
 
 
-def issues_folder(doc: Path) -> ProposalsFolder | ProposalsUnconfigured | ProposalsUnavailable:
-    """Read the configured folder and distinguish absence from a failed read."""
+def issues_folder(doc: Path) -> Path | None:
+    """Return the configured folder, or None when the document has no proposals field."""
     try:
         lines = doc.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
-        return ProposalsUnavailable(doc, str(error))
+    except UnicodeError as error:
+        raise OSError(f"{doc}: {error}") from error
     try:
         folder = Path(production_field(lines, PROPOSALS_FIELD)).expanduser()
     except Refusal:
-        return ProposalsUnconfigured()
-    # The doc lives at `<checkout>/docs/plans/<name>.md`; a relative folder is under the checkout.
-    return ProposalsFolder(folder if folder.is_absolute() else doc.parent.parent.parent / folder)
+        return None
+    # A relative folder starts at the checkout that contains docs/plans.
+    return folder if folder.is_absolute() else doc.parent.parent.parent / folder
 
 
 def slug_of(doc: Path) -> str:
@@ -119,11 +92,9 @@ def proposer(issue: Issue) -> str:
 def proposal_issues(doc: Path) -> list[Issue]:
     """The open proposal issues in the production's folder, of any proposer."""
     folder = issues_folder(doc)
-    if isinstance(folder, ProposalsUnavailable):
-        raise OSError(f"{folder.document}: {folder.reason}")
-    if isinstance(folder, ProposalsUnconfigured) or not folder.path.is_dir():
+    if folder is None or not folder.is_dir():
         return []
-    return [issue for issue in open_issues(folder.path, PROPOSAL_TAG) if issue.value("record_type") != "question"]
+    return [issue for issue in open_issues(folder, PROPOSAL_TAG) if issue.value("record_type") != "question"]
 
 
 def open_proposals(doc: Path) -> list[Issue]:

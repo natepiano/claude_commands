@@ -109,18 +109,14 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
         listed = []
     folder = proposals_folder.issues_folder(doc)
     queue = proposals_folder.ledger(doc)
-    for result in (folder, queue):
-        if isinstance(result, (proposals_folder.ProposalsUnavailable, proposals_folder.LedgerUnavailable)):
-            raise OSError(f"{result.document}: {result.reason}")
     try:
         efficiency_queue = efficiency_ledger(doc)
     except OSError:
         efficiency_queue = None
-    found = [doc, *listed, *(result.path for result in (folder, queue)
-                            if isinstance(result, (proposals_folder.ProposalsFolder, proposals_folder.ImprovementLedger)))]
+    found = [doc, *listed, *(path for path in (folder, queue) if path is not None)]
     if efficiency_queue is not None:
         found.append(efficiency_queue)
-    if isinstance(folder, proposals_folder.ProposalsFolder):
+    if folder is not None:
         try:
             found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
         except OSError:
