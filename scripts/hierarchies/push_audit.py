@@ -331,7 +331,7 @@ def read_owners(problems: list[log_records.SourceProblem]) -> ProductionOwnershi
             exact_names[row.name].add(slug)
             exact_names[slug].add(slug)
             for unit in staff.active(record, "unit"):
-                if unit.parent != row.id:
+                if unit.parent != staff.ReportsTo(row.id):
                     continue
                 state = resolver.unit_state(unit)
                 if not isinstance(state, session_staff.ActiveUnit):

@@ -18,6 +18,7 @@ from scripts.build_hold import build_hold
 from scripts.lint import sweep
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
 from scripts.test_times import gate_record
 
@@ -344,7 +345,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
         with mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(merge_gate, "finish_gate_job", side_effect=fail_hold_read_after_finish), \
                 redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(merge_gate.GateRefused, "hold state cannot be read"):
+            with self.assertRaisesRegex(GateRefused, "hold state cannot be read"):
                 _ = merge_gate.run_suites(self.checkout, full=True)
         self.assertEqual(len(finished), 1)
         self.assertLess(finished[0].returncode, 0)
@@ -359,7 +360,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
         admits = merge_gate.BuildHoldWait.admits
         completed = False
         wait_started: list[float] = []
-        failure = merge_gate.GateRefused("fixture interrupts the hold wait")
+        failure = GateRefused("fixture interrupts the hold wait")
 
         def finish_before_hold(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
             nonlocal completed
@@ -389,7 +390,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
                 mock.patch.object(merge_gate.BuildHoldWait, "admits", autospec=True, side_effect=admit_until_finished), \
                 mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", autospec=True, side_effect=stop_current_wait), \
                 redirect_stdout(io.StringIO()):
-            with self.assertRaises(merge_gate.GateRefused) as caught:
+            with self.assertRaises(GateRefused) as caught:
                 _ = merge_gate.run_suites(self.checkout, full=True)
         self.assertIs(caught.exception, failure)
         record = self.only_record()

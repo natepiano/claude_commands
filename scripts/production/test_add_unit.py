@@ -97,7 +97,7 @@ class NativeClaudeUnitTests(StaffTestCase):
         self.assertIsInstance(outcome, herdr.PromptSubmitted)
         row = backend.before_opening.by_id(staff.StaffId(identity))
         assert row is not None
-        self.assertEqual((row.id, row.name, row.parent), (identity, "fresh", runner.id))
+        self.assertEqual((row.id, row.name, row.parent), (identity, "fresh", staff.ReportsTo(runner.id)))
         self.assertNotIn("--session-id", backend.arguments)
         self.assertNotIn("--resume", backend.arguments)
         self.assertNotIn("STAFF_ID", backend.environment)

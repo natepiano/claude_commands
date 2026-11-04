@@ -129,6 +129,12 @@ class ShellTests(unittest.TestCase):
 
 
 class CodexTests(unittest.TestCase):
+    def test_unterminated_escaped_field_has_no_ambiguous_backtracking(self) -> None:
+        source = 'await tools.exec_command({cmd: "' + '\\\\' * 10000
+        self.assertEqual(exec_cell_atoms(source), ())
+        self.assertEqual(exec_cell_atoms(source + '"});'), (WorkAtom(),))
+
+
     def test_exec_cells(self) -> None:
         cases: tuple[tuple[str, tuple[Atom, ...]], ...] = (
             ('await tools.write_stdin({session_id: 3, chars: "", yield_time_ms: 30000});',

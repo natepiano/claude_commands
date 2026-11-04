@@ -16,11 +16,9 @@ import json
 import threading
 import time
 import select
-import sys
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, TypeGuard, final, cast
 
@@ -248,10 +246,10 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
     if path.name == "mesh_roster.json":
         for name, raw in objects(record, "roster").items():
             entry = _state_object(path, raw)
-            for key in ("thread_id", "status", "role", "adopted_to", "held_design_id", "held_role", "unit_ledger"):
+            for key in ("staff_id", "status", "held_design_id", "held_role", "unit_ledger"):
                 if key in entry and not isinstance(entry[key], str):
                     raise WorkerStateUnreadable(path, f"{name}: invalid {key}")
-            for key in ("access_policy", "transferring_role", "role_redirect"):
+            for key in ("access_policy",):
                 if key in entry:
                     _ = _state_object(path, entry[key])
             revision = entry.get("revision", 0)
@@ -260,14 +258,18 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
     elif path.name.endswith(".pending.json"):
         if not record:
             return record
-        if (not isinstance(record.get("thread_id"), str) or not isinstance(record.get("messages"), list)
+        if (not isinstance(record.get("messages"), list)
                 or any(not isinstance(item, str) for item in cast(list[object], record.get("messages", [])))
-                or ("accepting_messages" in record and not isinstance(record["accepting_messages"], bool))
-                or ("adoption_id" in record and not isinstance(record["adoption_id"], str))
-                or ("reviewer_inbox_sources" in record and (not isinstance(record["reviewer_inbox_sources"], list)
-                    or any(not isinstance(item, str) for item in cast(list[object], record["reviewer_inbox_sources"]))))):
+                or ("accepting_messages" in record and not isinstance(record["accepting_messages"], bool))):
             raise WorkerStateUnreadable(path, "invalid queue fields")
     elif path.name in ("mesh_server.json", "mesh_server_start.json"):
+        previous = record.get("previous_servers", [])
+        if not isinstance(previous, list):
+            raise WorkerStateUnreadable(path, "invalid previous server list")
+        for server in cast(list[object], previous):
+            _ = validate_worker_state(path, server)
+        if path.name == "mesh_server.json" and set(record) == {"previous_servers"}:
+            return record
         if not is_process_pid(record.get("pid")):
             raise WorkerStateUnreadable(path, "invalid server pid")
         if type(record.get("port")) is not int:
@@ -277,18 +279,6 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
                 raise WorkerStateUnreadable(path, f"invalid server {key}")
         if "design_context" in record:
             _ = _state_object(path, record["design_context"])
-    elif path.name == "mesh_retired.json":
-        servers = record.get("servers")
-        if not isinstance(servers, list):
-            raise WorkerStateUnreadable(path, "invalid retired server list")
-        for server in cast(list[object], servers):
-            try:
-                _ = validate_worker_state(path.with_name("mesh_server.json"), server)
-            except WorkerStateUnreadable as error:
-                raise WorkerStateUnreadable(path, f"invalid retired server: {error}") from error
-    elif path.name == "serving_home.json":
-        if not isinstance(record.get("codex_home"), str) or not record["codex_home"]:
-            raise WorkerStateUnreadable(path, "invalid serving home")
     if path.name == "design.json":
         for key in ("placement", "binding"):
             _ = _state_object(path, record.get(key))
@@ -299,10 +289,11 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
             role = _state_object(path, raw)
             _ = _state_object(path, role.get("lifecycle"))
     if path.name.endswith(".account-move.json"):
-        for key in ("thread_id", "turn_id", "label", "move_id"):
+        identity = "staff_id"
+        for key in (identity, "turn_id", "label", "move_id"):
             if not isinstance(record.get(key), str) or not record[key]:
                 raise WorkerStateUnreadable(path, f"invalid account move {key}")
-    for key in ("workers", "adoptions", "quarantined_workers", "quarantined_adoptions", "roles"):
+    for key in ("workers", "roles"):
         if key in record:
             # Design role instances are a list; their decoder checks their tagged variants.
             if key == "roles" and isinstance(record[key], list):
@@ -313,7 +304,13 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
     if "workers" in record:
         for name, raw in _state_object(path, record["workers"]).items():
             worker = _state_object(path, raw)
-            for key in ("backend", "ownership", "access_policy"):
+            if "staff_id" in worker:
+                if not isinstance(worker["staff_id"], str) or not worker["staff_id"]:
+                    raise WorkerStateUnreadable(path, f"{name}: invalid staff_id")
+                required = ("ownership", "access_policy")
+            else:
+                required = ("ownership", "access_policy")
+            for key in required:
                 if key not in worker:
                     raise WorkerStateUnreadable(path, f"{name}: missing {key}")
                 _ = _state_object(path, worker[key])
@@ -339,22 +336,6 @@ def _read_validated_json(path: Path, validate: Callable[[Path, object], object])
         raise
     except (OSError, UnicodeError) as error:
         raise WorkerStateUnreadable(path, str(error)) from error
-    if text == "" and path.name.endswith(".pending.json"):
-        # Shared readers leave recovery to the next exclusive reader. Otherwise
-        # reread under the exclusive lock before mutating a snapshot.
-        mode = _operation.state_files.get(path.resolve(), fcntl.LOCK_UN)
-        if mode & fcntl.LOCK_SH:
-            return {}
-        if not mode & fcntl.LOCK_EX:
-            with locked_state(path) as state:
-                return state.read_object()
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        archived = path.with_name(f"{path.name}.empty-legacy-{stamp}")
-        _ = path.rename(archived)
-        print(f"worker_lifecycle: {path}: quarantined as {archived.name}: "
-              + "zero-byte legacy inbox may have lost messages during an in-place write; continuing empty",
-              file=sys.stderr)
-        return {}
     try:
         value = cast(object, json.loads(text))
     except (ValueError, UnicodeError) as error:
@@ -373,12 +354,7 @@ def read_worker_value(path: Path) -> object:
 
 
 def read_worker_state(path: Path) -> dict[str, object]:
-    """Strict lock-free atomic snapshot; absence still requires ownership reconciliation.
-
-    Complete snapshots need no lock; zero-byte legacy inbox recovery takes the
-    exclusive sidecar lock. Shared readers defer recovery and return an empty
-    queue. Writers hold locked_state through their read and replacement.
-    """
+    """Read one atomic worker snapshot."""
     return _state_object(path, read_worker_value(path))
 
 
@@ -423,5 +399,5 @@ def locked_state(path: Path, *, mode: int = fcntl.LOCK_EX,
 
 
 def empty_inbox() -> dict[str, object]:
-    """The sole empty-queue representation, before a thread has been assigned."""
-    return {"thread_id": "", "messages": [], "accepting_messages": True}
+    """An admission has no staff reference before publication."""
+    return {"messages": [], "accepting_messages": True}

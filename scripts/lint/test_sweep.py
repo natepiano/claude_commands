@@ -474,6 +474,43 @@ class SweepTests(SweepCase):
 
 
 class RebuildTests(SweepCase):
+    def test_rebuild_report_fails_when_an_enumerated_month_disappears(self) -> None:
+        path = Path(os.environ["BUILDLOG_DIR"]) / "natedev" / "2026-10.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("{}\n")
+        locked_rows = store.locked_rows
+
+        def remove_before_read(month: Path, start: int = 0) -> Generator[dict[str, object]]:
+            if month == path:
+                month.unlink()
+            yield from locked_rows(month, start)
+
+        output, errors = io.StringIO(), io.StringIO()
+        with (mock.patch.object(store, "locked_rows", side_effect=remove_before_read),
+              mock.patch.object(sweep, "read_sweep_journal", return_value=[]),
+              redirect_stdout(output), redirect_stderr(errors)):
+            status = sweep.main(["rebuilds", "--days", "7"])
+        self.assertEqual(status, 2)
+        self.assertIn("cannot read rebuild evidence", errors.getvalue())
+        self.assertEqual(output.getvalue(), "")
+
+    def test_trim_lookup_returns_false_for_an_absent_month_without_an_existence_check(self) -> None:
+        path = Path(os.environ["BUILDLOG_DIR"]) / "natedev" / "2026-10.jsonl"
+        take = sweep.TrimTake("/fixture/target", "floor take", 0)
+        with (mock.patch.object(store, "host_file", return_value=path),
+              mock.patch.object(Path, "exists", side_effect=AssertionError("trim lookup checked existence"))):
+            self.assertFalse(sweep.trim_row_recorded(take))
+
+    def test_legacy_removals_skip_invalid_rows_and_partial_tail(self) -> None:
+        path = sweep.sweep_removals_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"at": 10, "path": "/fixture/target", "cause": "floor take"}
+        complete = json.dumps(row).encode() + b"\n"
+        invalid = [b"\xff\n", b"not json\n", b"[]\n", b"{}\n",
+                   b'{"at": 10, "path": "relative", "cause": "floor take"}\n']
+        _ = path.write_bytes(complete + b"".join(invalid) + json.dumps(row).encode())
+        self.assertEqual(sweep.read_sweep_removals(), [sweep.SweepRemoval(10, "/fixture/target", "floor take")])
+
     def test_legacy_removal_file_still_explains_rebuild_without_trim_rows(self) -> None:
         folder = "/tmp/gate-check.legacy"
         self.step(folder, 2 * DAY)

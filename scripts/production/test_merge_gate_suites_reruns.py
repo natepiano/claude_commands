@@ -11,6 +11,7 @@ from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
@@ -129,7 +130,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
     def test_failed_rollback_names_merge_commit_and_blocking_files(self) -> None:
         with mock.patch.object(merge_gate, "git", return_value=subprocess.CompletedProcess([], 1, " M unit.txt", "blocked")), mock.patch.object(
                 merge_gate, "checked_git", side_effect=["merge-commit", "unit.txt\0"]):
-            with self.assertRaisesRegex(merge_gate.GateRefused, "merge NOT undone; merge commit merge-commit; blocking files: M unit.txt"):
+            with self.assertRaisesRegex(GateRefused, "merge NOT undone; merge commit merge-commit; blocking files: M unit.txt"):
                 merge_gate.rollback_merge(self.checkout, self.base)
 
 

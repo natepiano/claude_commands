@@ -296,15 +296,6 @@ def _rename_stall_watch(plan: RenamePlan) -> None:
         unit_move.move(move)
 
 
-def _rename_unit_workers(plan: RenamePlan) -> None:
-    from scripts.direct import workers
-    root = workers.ledger_path(plan.old, "unused").parent
-    units = {path.name.removesuffix(".move.json") if path.name.endswith(".move.json") else path.stem
-             for path in root.glob("*.json")}
-    for unit in sorted(units):
-        workers.move_unit(plan.old, plan.new, unit)
-
-
 def _rename_branch(plan: RenamePlan) -> None:
     """Run git branch -m on a merge branch named for the production, then commit and push the renamed documents."""
     if plan.renames_branch:
@@ -341,7 +332,7 @@ def _set_displays(plan: RenamePlan | staff.StaffRow) -> bool:
 
 
 STEPS = (_rename_doc, _rewrite_plans, _rename_timer, _rename_showrunner_state, _rename_stall_watch,
-         _rename_unit_workers, _retarget_phase_notes, _rename_branch, _set_displays)
+         _retarget_phase_notes, _rename_branch, _set_displays)
 
 
 def _pending(plan: RenamePlan) -> bool:
@@ -361,7 +352,6 @@ def _pending(plan: RenamePlan) -> bool:
 
 def apply(old: str, new: str) -> RenamePlan | staff.StaffRow:
     """Write the name, then do each step; a step that fails prints one anomaly line and the next step runs."""
-    from scripts.direct.workers import WorkerUnavailable
     with staff.operation(), design_roles.record_operation(), unit_move.production_lock():
         result: RenamePlan | staff.StaffRow
         if old == new:
@@ -375,7 +365,7 @@ def apply(old: str, new: str) -> RenamePlan | staff.StaffRow:
             try:
                 changed = _set_displays(result)
             except (OSError, ValueError, Refusal, tidy_wrapped.TidyRefused,
-                    staff.StaffRefused, herdr.HerdrFailure, WorkerUnavailable) as error:
+                    staff.StaffRefused, herdr.HerdrFailure) as error:
                 print(f"anomaly: set_displays: {error}", file=sys.stderr)
                 changed = True
             print("done" if changed else "unchanged")
@@ -385,7 +375,7 @@ def apply(old: str, new: str) -> RenamePlan | staff.StaffRow:
             try:
                 _ = step(result)
             except (OSError, ValueError, Refusal, tidy_wrapped.TidyRefused,
-                    staff.StaffRefused, herdr.HerdrFailure, WorkerUnavailable) as error:
+                    staff.StaffRefused, herdr.HerdrFailure) as error:
                 print(f"anomaly: {step.__name__.lstrip('_')}: {error}", file=sys.stderr)
         print(f"{result.old} is now {result.new}")
     return result
@@ -444,7 +434,6 @@ def main(argv: list[str]) -> int:
 
 
 def _main(argv: list[str]) -> int:
-    from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
     for name in ("plan", "apply"):
@@ -471,7 +460,7 @@ def _main(argv: list[str]) -> int:
             _ = apply(cast(str, args.old), new)
     except (staff.StaffRefused, staff.StaffNotFound, staff.StaffUnreadable):
         raise
-    except (RenameRefused, Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable,
+    except (RenameRefused, Refusal, tidy_wrapped.TidyRefused,
             herdr.HerdrFailure, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1

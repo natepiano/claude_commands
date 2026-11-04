@@ -13,6 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
+from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 import costs
@@ -33,7 +34,11 @@ class MacIdleUpperBound:
     unknown_seconds: float
 
 
-type ChartCost = MeasuredCost | MacIdleUpperBound | CostUnavailable
+class NoDataYet(StrEnum):
+    VALUE = "no data yet"
+
+
+type ChartCost = MeasuredCost | MacIdleUpperBound | CostUnavailable | NoDataYet
 
 @dataclass(frozen=True)
 class DailyBucket:
@@ -42,6 +47,7 @@ class DailyBucket:
     thin: bool
     costs: costs.BuildCosts
     observed_machines: frozenset[str]
+    first_sources: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,9 @@ def build_series(reading: costs.CostReading, start: datetime, end: datetime, zon
     observations: defaultdict[int, list[costs.SourceObservation]] = defaultdict(list)
     phases: defaultdict[int, list[moments.ProgressFinish]] = defaultdict(list)
     spans: defaultdict[int, list[costs.IdleSpan]] = defaultdict(list)
+    first_sources = dict(reading.first_sources)
+    for observation in reading.observations:
+        first_sources[observation.machine] = min(first_sources.get(observation.machine, observation.at), observation.at)
     for contribution in reading.contributions:
         position = bisect.bisect_right(stamps, contribution.at)-1
         if 0 <= position < count:
@@ -113,8 +122,9 @@ def build_series(reading: costs.CostReading, start: datetime, end: datetime, zon
                                   costs.aggregate_costs(daily, low, high),
                                   frozenset(item.machine for item in observations[position])
                                   | frozenset(item.machine for item in reading.coverage
-                                              if item.start <= low.timestamp() and item.end >= high.timestamp())))
-    machines = sorted(set(configured) | {observation.machine for observation in reading.observations})
+                                              if item.start <= low.timestamp() and item.end >= high.timestamp()),
+                                  first_sources))
+    machines = sorted(set(configured) | set(first_sources))
     if reading.idle_spans and "mac" not in machines:
         machines.append("mac")
     return ChartSet(start, end, str(zone), tuple(buckets), tuple(sorted(machines)), moments.MOMENTS)
@@ -133,11 +143,14 @@ def collect_charts(connection: sqlite3.Connection, start: datetime, end: datetim
 
 
 def cost_value(bucket: DailyBucket, machine: str, cause: costs.Cause, *, per_phase: bool = False) -> ChartCost:
+    idle = bucket.costs.mac_idle
+    idle_wait = cause == "Mac idle while natedev waits" and machine == "mac" and idle.candidate_wait_seconds > 0
+    if bucket.first_sources.get(machine, bucket.end.timestamp()) >= bucket.end.timestamp() and not idle_wait:
+        return NoDataYet.VALUE
     if per_phase and not bucket.costs.phases:
         return CostUnavailable("no finished phases")
     if cause == "Mac idle while natedev waits" and machine == "mac":
-        idle = bucket.costs.mac_idle
-        if idle.candidate_wait_seconds > 0:
+        if idle_wait:
             return MacIdleUpperBound(idle.upper_bound_seconds-idle.unknown_seconds, idle.unknown_seconds)
         if "natedev" not in bucket.observed_machines:
             return CostUnavailable("no recorded candidate coverage")
@@ -150,6 +163,8 @@ def cost_value(bucket: DailyBucket, machine: str, cause: costs.Cause, *, per_pha
 
 
 def cost_json(value: ChartCost, divisor: float, *, machine: str = "") -> dict[str, object]:
+    if isinstance(value, NoDataYet):
+        return {"state": value.value}
     if isinstance(value, CostUnavailable):
         reason = value.reason
         if machine and reason == "no recorded source coverage":
@@ -298,22 +313,28 @@ details{margin-top:14px;font-size:12px}summary{cursor:pointer;color:var(--ink)}.
 const $=id=>document.getElementById(id),ns='http://www.w3.org/2000/svg';let selected=0;
 const machineOrder=[...['natedev','mac','CI'].filter(m=>data.machines.includes(m)),...data.machines.filter(m=>!['natedev','mac','CI'].includes(m))];
 const machineGroups=machineOrder.length<=8?machineOrder.map(label=>({label,members:[label]})):[...machineOrder.slice(0,7).map(label=>({label,members:[label]})),{label:'Other',members:machineOrder.slice(7)}];
+function selectedGroup(){return machineGroups.find(group=>group.label===$('machine').value)}
+const noData=series=>series.every(s=>s.values.every(point=>point.state==='no data yet'));
 const color=slot=>'var(--series-'+(slot+1)+')';
 function node(tag,attrs={},text=''){const n=document.createElementNS(ns,tag);for(const[k,v]of Object.entries(attrs))n.setAttribute(k,v);if(text)n.textContent=text;return n}
 function element(tag,text=''){const n=document.createElement(tag);n.textContent=text;return n}
 function option(select,value,text){const n=element('option',text);n.value=value;select.append(n)}
-function sumPoints(points){if(!points.length)return{state:'unavailable',reason:'no recorded source coverage'};if(points.some(p=>p.state==='unavailable'))return{state:'unavailable',reason:[...new Set(points.filter(p=>p.state==='unavailable').map(p=>p.reason))].join('; ')};return{state:points.some(p=>p.state==='upper bound')?'upper bound':'measured',value:points.reduce((s,p)=>s+p.value,0),unknown:points.reduce((s,p)=>s+(p.unknown||0),0)}}
+function sumPoints(points){points=points.filter(point=>point.state!=='no data yet');if(!points.length)return{state:'no data yet'};if(points.some(p=>p.state==='unavailable'))return{state:'unavailable',reason:[...new Set(points.filter(p=>p.state==='unavailable').map(p=>p.reason))].join('; ')};return{state:points.some(p=>p.state==='upper bound')?'upper bound':'measured',value:points.reduce((s,p)=>s+p.value,0),unknown:points.reduce((s,p)=>s+(p.unknown||0),0)}}
 function point(bucket,machine,cause){return bucket.rows.find(r=>r.machine===machine&&r.cause===cause)?.[$('unit').value]||{state:'unavailable',reason:'no recorded source coverage'}}
-function causeSeries(){const group=machineGroups.find(g=>g.label===$('machine').value),members=group?group.members:data.machines;return data.causes.map((label,slot)=>({label,color:color(slot),values:data.buckets.map(b=>sumPoints(members.map(m=>point(b,m,label))))}))}
+function groupSeries(members){return data.causes.map((label,slot)=>({label,color:color(slot),values:data.buckets.map(b=>sumPoints(members.map(m=>point(b,m,label))))}))}
+function causeSeries(){return groupSeries(selectedGroup()?.members||data.machines)}
 function machineSeries(){return machineGroups.map((group,slot)=>({label:group.label,color:color(slot),values:data.buckets.map(b=>sumPoints(group.members.map(m=>point(b,m,$('causeSelect').value))))}))}
 function phaseSeries(){return['median','p90'].map((key,slot)=>({label:key,color:color(slot),dash:slot?'6 4':'',values:data.buckets.map(b=>b.phase.state==='measured'?{state:'measured',value:b.phase[key]/3600}:{state:'unavailable',reason:b.phase.reason})}))}
 const configs=[{id:'phase',prefix:'phase',series:phaseSeries,unit:()=> 'h/phase'},{id:'cause',prefix:'cause',series:causeSeries,unit:()=> $('unit').selectedOptions[0].text},{id:'machinePlot',prefix:'machine',series:machineSeries,unit:()=> $('unit').selectedOptions[0].text}];
-function describe(p,unit){if(p.state==='unavailable')return'unavailable ('+p.reason+')';const value=p.value.toLocaleString(undefined,{maximumFractionDigits:2})+' '+unit;return p.unknown>0?value+' known; '+p.unknown.toFixed(2)+' '+unit+' unknown; upper bound '+(p.value+p.unknown).toFixed(2)+' '+unit:value}
+function describe(p,unit){if(p.state==='no data yet')return'no data yet';if(p.state==='unavailable')return'unavailable ('+p.reason+')';const value=p.value.toLocaleString(undefined,{maximumFractionDigits:2})+' '+unit;return p.unknown>0?value+' known; '+p.unknown.toFixed(2)+' '+unit+' unknown; upper bound '+(p.value+p.unknown).toFixed(2)+' '+unit:value}
 function key(series){const n=element('i');n.className='line-key';n.style.borderColor=series.color;if(series.dash)n.style.borderTopStyle='dashed';return n}
 function table(config,series){if(config.id==='phase'){series=series.map(s=>({...s,values:s.values.map(p=>p.state==='unavailable'?p:{...p,value:p.value*3600})}));config={...config,unit:()=> 's/phase'}}const table=element('table'),caption=element('caption',config.unit()+'; unavailable values retain their reason.'),head=element('thead'),row=element('tr');row.append(element('th','Local day'));series.forEach(s=>row.append(element('th',s.label+' ('+config.unit()+')')));if(config.id==='phase')row.append(element('th','Finished / valid / missing starts'));head.append(row);table.append(caption,head);const body=element('tbody');data.buckets.forEach((b,i)=>{const tr=element('tr');tr.append(element('th',b.label+(b.thin?' · thin':'')));series.forEach(s=>tr.append(element('td',describe(s.values[i],config.unit()))));if(config.id==='phase')tr.append(element('td',b.phase.finished+' / '+b.phase.valid+' / '+b.phase.missing));body.append(tr)});table.append(body);$(config.prefix+'Table').replaceChildren(table)}
-function showTooltip(config,i){const box=$(config.prefix+'Tooltip'),b=data.buckets[i];box.replaceChildren(element('div',b.label+(b.thin?' · thin':'')));box.firstChild.className='date';config.series().forEach(s=>{const row=element('p'),value=element('strong',describe(s.values[i],config.unit()));row.append(key(s),value,document.createTextNode(' — '+s.label));box.append(row)});if(config.id==='phase')box.append(element('p',b.phase.finished+' finished; '+b.phase.valid+' valid; '+b.phase.missing+' missing starts'));box.style.display='block';const svg=$(config.id),card=svg.parentElement,width=svg.viewBox.baseVal.width,x=Number(svg.querySelector('.cursor').getAttribute('x1'))/width*svg.clientWidth;box.style.left=Math.min(Math.max(16,x+24),Math.max(16,card.clientWidth-box.offsetWidth-16))+'px';box.style.top=(svg.offsetTop+14)+'px'}
-function chart(config){const svg=$(config.id),allSeries=config.series();svg.replaceChildren();
-const width=Math.max(300,Math.min(1120,svg.clientWidth)),right=width-Math.min(150,width*.30),left=62,facets=config.id==='cause',panels=facets?allSeries.map(s=>[s]):[allSeries];
+function showTooltip(config,i){const box=$(config.prefix+'Tooltip'),b=data.buckets[i];box.replaceChildren(element('div',b.label+(b.thin?' · thin':'')));box.firstChild.className='date';config.series().forEach(s=>{const row=element('p'),value=element('strong',describe(s.values[i],config.unit()));row.append(key(s),value,document.createTextNode(' — '+s.label));box.append(row)});if(config.id==='phase')box.append(element('p',b.phase.finished+' finished; '+b.phase.valid+' valid; '+b.phase.missing+' missing starts'));box.style.display='block';const svg=$(config.id),card=svg.parentElement,width=svg.viewBox.baseVal.width,x=Number(svg.querySelector('.cursor')?.getAttribute('x1')||24)/width*svg.clientWidth;box.style.left=Math.min(Math.max(16,x+24),Math.max(16,card.clientWidth-box.offsetWidth-16))+'px';box.style.top=(svg.offsetTop+14)+'px'}
+function chart(config){const svg=$(config.id),allSeries=config.series(),width=Math.max(300,Math.min(1120,svg.clientWidth));svg.replaceChildren();
+const empty=noData(allSeries);
+if(empty){svg.setAttribute('viewBox','0 0 '+width+' 70');svg.append(node('text',{x:24,y:36,class:'no-data'},(config.id==='cause'?selectedGroup()?.label||'All machines':config.id==='machinePlot'?'Machines':'Hana phase time')+': no data yet'))}
+else{
+const right=width-Math.min(150,width*.30),left=62,facets=config.id==='cause',panels=facets?allSeries.map(s=>[s]):[allSeries];
 const x=t=>left+(t-data.start)/(data.end-data.start)*(right-left),mid=b=>(b.start+b.end)/2;
 // Reserve separate rows for moment numbers below the panel title.
 const momentRows=[],momentPositions=data.moments.map(event=>{const px=x(event.at);let row=0;while(momentRows[row]?.some(prior=>Math.abs(prior-px)<26))row++;(momentRows[row]??=[]).push(px);return{x:px,y:(facets?40:18)+row*18}});
@@ -321,14 +342,14 @@ const top=momentRows.length?(facets?40:18)+(momentRows.length-1)*18+18:(facets?4
 svg.setAttribute('viewBox','0 0 '+width+' '+panelHeight*panels.length);svg.dataset.right=right;svg.dataset.left=left;
 const defs=node('defs'),pattern=node('pattern',{id:config.id+'Hatch',width:7,height:7,patternUnits:'userSpaceOnUse'});pattern.append(node('path',{d:'M0 7 L7 0',stroke:'currentColor','stroke-width':1,opacity:.6}));defs.append(pattern);svg.append(defs);
 panels.forEach((series,panelIndex)=>{const panel=node('g',{class:'plot-panel',transform:'translate(0 '+panelIndex*panelHeight+')'});svg.append(panel);
-const direct=series.length<=4,values=series.flatMap(s=>s.values.filter(p=>p.state!=='unavailable').map(p=>p.value+(p.unknown||0))),raw=Math.max(0,...values),step=raw?Math.pow(10,Math.floor(Math.log10(raw/4))):.25,nice=raw?Math.ceil(raw/4/step)*step:.25,maximum=nice*4,y=v=>bottom-v/maximum*(bottom-top);
+const direct=series.length<=4,values=series.flatMap(s=>s.values.filter(p=>p.state==='measured'||p.state==='upper bound').map(p=>p.value+(p.unknown||0))),raw=Math.max(0,...values),step=raw?Math.pow(10,Math.floor(Math.log10(raw/4))):.25,nice=raw?Math.ceil(raw/4/step)*step:.25,maximum=nice*4,y=v=>bottom-v/maximum*(bottom-top);
 panel.dataset.maximum=maximum;
 if(facets)panel.append(node('text',{x:left,y:16,class:'panel-title'},series[0].label+' · '+config.unit()));
 for(let tick=0;tick<=4;tick++){const value=nice*tick,at=y(value);panel.append(node('line',{x1:left,x2:right,y1:at,y2:at,class:tick?'grid':'axis'}),node('text',{x:left-9,y:at+4,'text-anchor':'end'},value.toLocaleString(undefined,{maximumFractionDigits:2})))}
 if(!values.length)panel.append(node('text',{x:(left+right)/2,y:(top+bottom)/2,'text-anchor':'middle'},'Unavailable — use the table view for reasons'));
 data.buckets.forEach((b,i)=>{if(i%Math.max(1,Math.ceil(data.buckets.length/Math.max(2,Math.floor((right-left)/85))))===0)panel.append(node('text',{x:x(mid(b)),y:bottom+24,'text-anchor':'middle'},b.label.slice(4)+(b.thin?' *':'')))});
 for(const [index,event]of data.moments.entries()){const marker=node('g',{tabindex:0,role:'img','aria-label':(index+1)+'. '+event.name+' · '+event.local});marker.append(node('title',{},(index+1)+'. '+event.name+' · '+event.scope+' · '+event.local),node('line',{class:'moment-line',x1:x(event.at),x2:x(event.at),y1:top,y2:bottom,stroke:'var(--axis)','stroke-dasharray':'3 5'}),node('text',{class:'moment-number',x:x(event.at),y:momentPositions[index].y,'text-anchor':'middle'},String(index+1)));panel.append(marker)}
-const ends=[],segments=new Map();series.forEach(s=>{let previous=null,last=null;s.values.forEach((p,i)=>{if(p.state==='unavailable'){previous=null;return}const px=x(mid(data.buckets[i])),py=y(p.value);if(p.unknown>0){const b=data.buckets[i];panel.append(node('rect',{x:x(b.start)+1,y:y(p.value+p.unknown),width:Math.max(1,x(b.end)-x(b.start)-2),height:y(p.value)-y(p.value+p.unknown),fill:'url(#'+config.id+'Hatch)',color:s.color}))}if(previous){const d='M'+previous.x+' '+previous.y+' L'+px+' '+py,overlap=segments.get(d)||[];const path=node('path',{d,fill:'none',stroke:s.color,'stroke-width':2,'stroke-linecap':'round','stroke-linejoin':'round','stroke-dasharray':s.dash||''});overlap.push(path);segments.set(d,overlap);panel.append(path)}panel.append(node('circle',{class:'series-point','data-series':s.label,cx:px,cy:py,r:4,fill:s.color,stroke:'var(--card)','stroke-width':2}));previous={x:px,y:py};last={x:px,y:py,index:i,series:s}});if(last)ends.push(last)});
+const ends=[],segments=new Map();series.forEach(s=>{let previous=null,last=null;s.values.forEach((p,i)=>{if(p.state!=='measured'&&p.state!=='upper bound'){previous=null;return}const px=x(mid(data.buckets[i])),py=y(p.value);if(p.unknown>0){const b=data.buckets[i];panel.append(node('rect',{x:x(b.start)+1,y:y(p.value+p.unknown),width:Math.max(1,x(b.end)-x(b.start)-2),height:y(p.value)-y(p.value+p.unknown),fill:'url(#'+config.id+'Hatch)',color:s.color}))}if(previous){const d='M'+previous.x+' '+previous.y+' L'+px+' '+py,overlap=segments.get(d)||[];const path=node('path',{d,fill:'none',stroke:s.color,'stroke-width':2,'stroke-linecap':'round','stroke-linejoin':'round','stroke-dasharray':s.dash||''});overlap.push(path);segments.set(d,overlap);panel.append(path)}panel.append(node('circle',{class:'series-point','data-series':s.label,cx:px,cy:py,r:4,fill:s.color,stroke:'var(--card)','stroke-width':2}));previous={x:px,y:py};last={x:px,y:py,index:i,series:s}});if(last)ends.push(last)});
 // Alternate coincident strokes so each series remains visible.
 for(const paths of segments.values())if(paths.length>1)paths.forEach((path,i)=>{path.setAttribute('stroke-dasharray','6 '+6*(paths.length-1));path.setAttribute('stroke-dashoffset',String(-6*i));path.setAttribute('stroke-linecap','butt')});
 const coincident=new Map();panel.querySelectorAll('.series-point').forEach(mark=>{const key=mark.getAttribute('cx')+','+mark.getAttribute('cy'),marks=coincident.get(key)||[];marks.push(mark);coincident.set(key,marks)});
@@ -352,11 +373,12 @@ panel.append(node('line',{class:'cursor',x1:x(mid(data.buckets[selected])),x2:x(
 data.buckets.forEach((b,i)=>{const hit=node('rect',{x:x(b.start),y:top,width:Math.max(1,x(b.end)-x(b.start)),height:bottom-top,fill:'transparent',tabindex:0,role:'button','aria-label':b.label+(b.thin?' thin':'')});hit.addEventListener('pointermove',()=>choose(i,config));hit.addEventListener('focus',()=>choose(i,config));hit.addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key==='ArrowLeft'){e.preventDefault();const next=Math.max(0,Math.min(data.buckets.length-1,selected+(e.key==='ArrowRight'?1:-1)));choose(next,config);panel.querySelectorAll('rect[role=button]')[next].focus()}});panel.append(hit)});
 });
 svg.onpointerleave=()=>{$(config.prefix+'Tooltip').style.display='none'};svg.onfocusout=e=>{if(!svg.contains(e.relatedTarget))$(config.prefix+'Tooltip').style.display='none'};
-const legend=$(config.prefix+'Legend');legend.replaceChildren();if(allSeries.length>=2)allSeries.forEach(s=>{const label=element('span');label.append(key(s),document.createTextNode(s.label));legend.append(label)});table(config,allSeries)}
+}
+const legend=$(config.prefix+'Legend');legend.replaceChildren();if(!empty&&allSeries.length>=2)allSeries.forEach(s=>{const label=element('span');label.append(key(s),document.createTextNode(s.label));legend.append(label)});table(config,allSeries)}
 function details(){const b=data.buckets[selected],p=b.phase;$('phaseDetail').textContent=b.label+(b.thin?' · thin':'')+' — '+p.finished+' hana finishes; '+p.valid+' valid durations; '+p.missing+' missing starts. '+(p.state==='measured'?'Median '+(p.median/3600).toFixed(2)+' h; p90 '+(p.p90/3600).toFixed(2)+' h.':p.reason+'.');$('causeDetail').textContent=b.label+' — '+causeSeries().map(s=>s.label+': '+describe(s.values[selected],$('unit').selectedOptions[0].text)).join(' · ');const idle=b.idle;$('machineDetail').textContent=b.label+' — '+machineSeries().map(s=>s.label+': '+describe(s.values[selected],$('unit').selectedOptions[0].text)).join(' · ')+'. Mac idle seconds: candidate '+idle.candidate.toFixed(0)+', execution '+idle.execution.toFixed(0)+', complete holds '+idle.holds.toFixed(0)+', known '+idle.known.toFixed(0)+', unknown '+idle.unknown.toFixed(0)+', upper bound '+idle.upper.toFixed(0)+'.'}
 function choose(i,config){selected=i;configs.forEach(c=>{const svg=$(c.id),b=data.buckets[i],right=Number(svg.dataset.right),x=62+((b.start+b.end)/2-data.start)/(data.end-data.start)*(right-62),cursors=svg.querySelectorAll('.cursor');cursors.forEach(cursor=>{cursor.setAttribute('x1',x);cursor.setAttribute('x2',x)});$(c.prefix+'Tooltip').style.display='none'});details();if(config)showTooltip(config,i)}
 function redraw(){$('causeCaption').textContent=$('machine').selectedOptions[0].text+' · '+$('unit').selectedOptions[0].text;$('machineCaption').textContent=$('causeSelect').value+' · '+$('unit').selectedOptions[0].text;configs.forEach(chart);details()}
-option($('machine'),'all','All machines');machineGroups.forEach(g=>option($('machine'),g.label,g.label));data.causes.forEach(c=>option($('causeSelect'),c,c));
+option($('machine'),'all','All machines');machineGroups.forEach(g=>option($('machine'),g.label,g.label+(noData(groupSeries(g.members))?' · no data yet':'')));data.causes.forEach(c=>option($('causeSelect'),c,c));
 for(const id of ['machine','causeSelect','unit'])$(id).addEventListener('change',redraw);
 $('theme').addEventListener('change',()=>{if($('theme').value==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=$('theme').value;redraw()});
 const windowLabel=Math.round((data.end-data.start)/86400000)+' days';$('window').value=windowLabel;$('window').addEventListener('change',()=>{$('windowHelp').textContent='Run buildlog charts --days '+$('window').value.split(' ')[0]+' to generate that window. This page keeps its recorded window.';$('window').value=windowLabel});

@@ -16,6 +16,7 @@ from typing import cast, final, override
 from contextlib import redirect_stdout, redirect_stderr
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import only_admitted, FakeClock, wait_reply
 from scripts.lint import memory_admit
@@ -42,7 +43,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         with mock.patch.dict(os.environ, self.environment), \
              mock.patch.object(os, "access", side_effect=writable), \
              mock.patch.object(merge_gate, "gate_reservation") as admission:
-            with self.assertRaisesRegex(merge_gate.GateRefused,
+            with self.assertRaisesRegex(GateRefused,
                                         "requires writable tmpfs at /dev/shm"):
                 _ = merge_gate.run_suites(self.checkout)
             admission.assert_not_called()
@@ -56,7 +57,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(memory_admit, "memory_config", wraps=memory_admit.memory_config) as read_config, \
              mock.patch.object(client, "admit", wraps=client.admit) as checked, \
              redirect_stderr(diagnostics):
-            with self.assertRaises(merge_gate.GateRefused) as refused:
+            with self.assertRaises(GateRefused) as refused:
                 with merge_gate.gate_reservation(self.checkout, 512, self.state, merge_gate.BuildHoldWait()):
                     self.fail("gate admitted an unusable configuration")
             read_config.assert_called_once_with()

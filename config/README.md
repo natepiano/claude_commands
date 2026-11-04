@@ -62,6 +62,11 @@ context-usage hooks read it to calculate the auto-compaction trigger.
 The per-call message uses `context_usage.conf`. A new family, or a family
 whose first 1M release changes, is a row here.
 
+## codex_daemon.conf
+
+`agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
+Both callers read the value when they use it.
+
 ## context_usage.conf
 
 `message = off` disables the per-call context message for main threads and subagents.

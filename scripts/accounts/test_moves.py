@@ -9,15 +9,21 @@ import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
-from datetime import timezone
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
-from scripts.accounts import accounts, moves, worker_names
-from scripts.shutdown import inventory, stop_results
+from scripts.accounts import accounts, moves, role_map, worker_names
+from scripts.production import session_staff, staff
+from scripts.production.staff_test_support import (
+    StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id,
+)
+from scripts.shutdown import inventory, stop_results, stop_resume
+from scripts.whoami import agent_accounts, note_file
+from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
 
 
 class SingleSessionMoveNoticeTests(unittest.TestCase):
@@ -661,6 +667,133 @@ class MoveJournalTests(unittest.TestCase):
         unchanged = roles.stat().st_mtime_ns
         self.assertEqual(moves.read_moves()[0].get("from"), "codex3")
         self.assertEqual(roles.stat().st_mtime_ns, unchanged)
+
+
+class WorkerGroupPendingTests(StaffTestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.stop_requests: list[str] = []
+        self.failed_worker: str = ""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        home = Path(os.environ["HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        _ = self.enterContext(scratch_account_home(home, {}, clear=False))
+        Path(os.environ["NOTIFIER_SESSIONS_DIR"]).mkdir(parents=True, exist_ok=True)
+        _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
+        _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
+        create_claude_account("claude1", "claude@example.invalid")
+        notes = note_file.notes_dir()
+        _ = (notes / note_file.note_name("codex1")).write_text("---\nlogin: codex@example.invalid\n---\n")
+        self.assertEqual(accounts.setup("codex1"), [])
+        write_codex_auth(home / ".codex1", "codex@example.invalid")
+        report = agent_accounts.Report("Codex", email="codex@example.invalid",
+            quotas=[agent_accounts.Quota("Weekly", 80, datetime.now(timezone.utc) + timedelta(days=1))])
+        _ = self.enterContext(patch.object(accounts, "_codex_live", return_value=report))
+        self.stop_requests.clear()
+        self.failed_worker = ""
+        _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop_worker))
+        _ = self.enterContext(patch.object(accounts, "SCRIPTS", self.root / "no-launchers"))
+
+    def stop_worker(self, reference: str) -> stop_resume.Stopped | stop_resume.StopFailed:
+        self.stop_requests.append(reference)
+        if reference == self.failed_worker:
+            return stop_resume.StopFailed(reference, "source process could not stop")
+        row = staff.by_id(staff.StaffId(reference))
+        assert row is not None
+        return stop_resume.Stopped(row.current_session, 987654)
+
+    def worker(self, name: str, family: Literal["claude", "codex"]) -> tuple[staff.StaffRow, Path]:
+        owner = fixture_member("showrunner", name="history-owner")
+        unit = fixture_member("unit", name="history-unit", parent=owner.id,
+                              worktree=staff.PresentWorktree("natedev", self.root))
+        backend = staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(Path(os.environ["HOME"]) / ".codex")
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(Path.home() / ".claude")}):
+            row = fixture_worker(name, unit.id, backend=backend)
+        run = self.root / "old-runs" / name
+        run.mkdir(parents=True)
+        _ = (run / "mesh_roster.json").write_text(json.dumps({name: {"staff_id": row.id, "status": "done"}}))
+        _ = session_staff.read_worker_roster(run / "mesh_roster.json")
+        _ = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("replacement director")))
+        return row, run
+
+    def test_account_moves_stop_fixed_workers_and_keep_pending_rows_in_both_families(self) -> None:
+        for family in ("claude", "codex"):
+            for target in ("codex1", "claude1"):
+                with self.subTest(family=family, target=target):
+                    self.stop_requests.clear()
+                    row, run = self.worker("worker-" + family + target, family)
+                    before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+                    result = accounts.move_workers(target, dry_run=True)
+                    assert isinstance(result, accounts.GroupMoveDryRun)
+                    same_family = target.startswith(family)
+                    preview = (f"would stop; restart on {target} stays pending" if same_family
+                               else f"not moved: cannot restart on {target} through assign.sh")
+                    self.assertEqual(result.lines, (f"{row.name} ({row.id}): {preview}",))
+                    self.assertIn(str(row.id), "\n".join(result.lines))
+                    self.assertIn(target, "\n".join(result.lines))
+                    self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(self.stop_requests, [])
+                    inbox = session_staff.inbox_path(row.id)
+                    inbox.parent.mkdir(parents=True, exist_ok=True)
+                    _ = inbox.write_text('{"messages": ["held assignment"], "accepting_messages": true}')
+                    reference = (run / "mesh_roster.json").read_bytes(), inbox.read_bytes()
+                    saved = self.staff_file.read_bytes()
+                    with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                        code = accounts.main(["move", "workers", target])
+                    self.assertEqual(code, 1, output.getvalue() + errors.getvalue())
+                    self.assertEqual(self.stop_requests, [row.id] if same_family else [])
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(self.staff_file.read_bytes(), saved)
+                    self.assertEqual(((run / "mesh_roster.json").read_bytes(), inbox.read_bytes()), reference)
+                    self.assertEqual(session_staff.worker_directory(staff.local_snapshot(), row.id), self.root)
+                    lines = (output.getvalue() + errors.getvalue()).splitlines()
+                    self.assertEqual(len(lines), 1, lines)
+                    self.assertIn(str(row.id), lines[0])
+                    self.assertIn(target, lines[0])
+                    if same_family:
+                        self.assertIn("pending", lines[0])
+                    else:
+                        self.assertIn(f"cannot restart on {target} through assign.sh; source remains running", lines[0])
+                    _ = staff.retire(row.id)
+
+    def test_one_failed_stop_reports_the_worker_and_keeps_other_moves_pending(self) -> None:
+        for failure in ("stop", "locked"):
+            with self.subTest(failure=failure):
+                self.stop_requests.clear()
+                failed, failed_run = self.worker("first-fails-" + failure, "claude")
+                healthy, healthy_run = self.worker("second-works-" + failure, "claude")
+                saved = {path: path.read_bytes() for run in (failed_run, healthy_run) for path in run.iterdir()}
+                before = self.staff_file.read_bytes()
+                self.failed_worker = failed.id
+                lock_path = self.staff_file.parent / "rows" / f"{failed.id}.lock"
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                with lock_path.open("a") as lock:
+                    if failure == "locked":
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                        code = accounts.main(["move", "workers", "claude1"])
+                self.assertEqual(code, 1)
+                self.assertEqual(set(self.stop_requests),
+                                 {failed.id, healthy.id} if failure == "stop" else {healthy.id})
+                self.assertEqual(len(self.stop_requests), 2 if failure == "stop" else 1)
+                self.assertEqual(staff.by_id(failed.id), failed)
+                self.assertEqual(staff.by_id(healthy.id), healthy)
+                self.assertEqual(self.staff_file.read_bytes(), before)
+                self.assertEqual({path: path.read_bytes() for run in (failed_run, healthy_run) for path in run.iterdir()}, saved)
+                lines = (output.getvalue() + errors.getvalue()).splitlines()
+                self.assertEqual(len(lines), 2, lines)
+                failed_line = next(line for line in lines if str(failed.id) in line)
+                healthy_line = next(line for line in lines if str(healthy.id) in line)
+                self.assertIn("source process could not stop" if failure == "stop"
+                              else "another operation holds this row", failed_line)
+                self.assertIn("pending", healthy_line)
+                self.assertIn("claude1", healthy_line)
+                _ = staff.retire(failed.id)
+                _ = staff.retire(healthy.id)
 
 
 if __name__ == "__main__":
