@@ -28,7 +28,7 @@ from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
+    fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
 )
 from scripts.production.test_change_review import producer_rows
 from change_review import Visible
@@ -56,11 +56,6 @@ def at(day: int) -> datetime:
     return datetime(2026, 10, day, 9, 0)
 
 
-def demo_slug(doc: Path) -> str:
-    del doc
-    return "demo"
-
-
 def run(*arguments: str) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -86,9 +81,10 @@ class NextItemTests(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**source_environment(self.root / "sources"),
+                "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_source_readers())
-        _ = fixture_member("showrunner", name="fixture")
+        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc("natedev", PRODUCTION))
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
@@ -104,8 +100,9 @@ class NextItemTests(unittest.TestCase):
                                                 Entry("Q2", "demo: Newest question", since=at(5))]),
         }
 
-    def read(self, kind: str, production: Path | None, below: bool = False) -> Queue:
-        del production, below
+    def read(self, kind: str, production: Path | None, below: bool = False,
+             *, record: staff.StaffSnapshot | None = None) -> Queue:
+        del production, below, record
         if kind not in self.queues:
             raise NextError(f"{kind}: not readable")
         return self.queues[kind]
@@ -113,8 +110,78 @@ class NextItemTests(unittest.TestCase):
     def patched(self) -> contextlib.AbstractContextManager[object]:
         stack = contextlib.ExitStack()
         _ = stack.enter_context(mock.patch.object(next_item, "read_queue", self.read))
-        _ = stack.enter_context(mock.patch.object(next_item, "slug_of", demo_slug))
         return stack
+
+    def test_pin_migration_keeps_order_and_recovers_after_clear(self) -> None:
+        import json
+        from scripts.production import migrate_next_pins
+
+        owner = staff.snapshot().rows[0]
+        directory = self.root / "next"
+        directory.mkdir()
+        values: dict[str, dict[str, object]] = {
+            "next-fixture": {"source": "question-fixture", "current": "fixture: Choose", "ended": {}},
+            "question-fixture-all-below": {"current": "fixture: Choose", "ended": {"fixture: Later": 1}},
+            "proposal-fixture": {"current": "P2", "ended": {"P1": 1}},
+        }
+        for name, fields in values.items():
+            _ = (directory / f"{name}.json").write_text(json.dumps(fields))
+        self.assertEqual(migrate_next_pins.migrate(stop_after=1), 75)
+        _ = staff.update_current_session(owner.current_session,
+                                        staff.native_id(fixture_runtime_id("pins-clear")))
+        self.assertEqual(migrate_next_pins.migrate(), 0)
+        expected: dict[str, dict[str, object]] = {
+            f"next-{owner.id}.json": {"source": f"question-{owner.id}", "current": f"{owner.id}: Choose", "ended": {}},
+            f"question-{owner.id}-all-below.json": {"current": f"{owner.id}: Choose", "ended": {f"{owner.id}: Later": 1}},
+            f"proposal-{owner.id}.json": {"current": "P2", "ended": {"P1": 1}},
+        }
+        self.assertEqual({path.name: json.loads(path.read_text()) for path in directory.glob("*.json")}, expected)
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}
+        self.assertEqual(migrate_next_pins.migrate(), 0)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}, before)
+        self.assertEqual(len(staff.snapshot().rows), 1)
+
+    def test_pin_migration_refuses_missing_ownership_and_unequal_destination(self) -> None:
+        from scripts.production import migrate_next_pins
+
+        owner = staff.snapshot().rows[0]
+        directory = self.root / "next"
+        directory.mkdir()
+        contents = {"next-fixture.json": '{"current":"old"}',
+                    f"next-{owner.id}.json": '{"current":"different"}',
+                    "question-missing.json": '{"current":"keep"}'}
+        for name, text in contents.items():
+            _ = (directory / name).write_text(text)
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}
+        self.assertEqual(migrate_next_pins.migrate(), 1)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}, before)
+
+    def test_finished_pin_migration_ignores_invalid_launch_records(self) -> None:
+        import json
+        from scripts.production import migrate_next_pins, session_staff
+
+        owner = staff.snapshot().rows[0]
+        directory = self.root / "next"
+        directory.mkdir()
+        path = directory / f"question-{owner.id}.json"
+        _ = path.write_text(json.dumps({"current": f"{owner.id}: Choose", "ended": {f"{owner.id}: Later": 1}}))
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with mock.patch.object(session_staff, "member_sources",
+                               side_effect=staff.StaffUnreadable("invalid launch record")) as sources:
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+        sources.assert_not_called()
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_efficiency_show_reads_the_local_ledger_when_staff_is_unavailable(self) -> None:
+        ledger = self.root / "ledger.md"
+        _ = ledger.write_text(LEDGER)
+        document = self.root / "demo-production.md"
+        _ = document.write_text(f"# Demo\n- **Efficiency ledger:** {ledger}\n")
+        with mock.patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("staff unavailable")) as snapshot:
+            self.assertEqual(run("show", "--kind", "efficiency", "--production", str(document)),
+                             (0, f"efficiency\n{LEDGER.splitlines()[0]}\n", ""))
+        snapshot.assert_not_called()
 
     def test_bare_next_shows_the_most_urgent_item_across_the_lists_and_keeps_it(self) -> None:
         with self.patched():
