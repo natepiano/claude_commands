@@ -13,7 +13,7 @@ file replaced by its last chat reply.
 from __future__ import annotations
 
 from scripts.production import staff_sources, worker_admission
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
 
 
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -1779,20 +1779,20 @@ class MeshCommandFixture(unittest.TestCase):
 
     def held_reviewer_record(self, lifecycle: design_roles.Lifecycle) -> design_roles.HeldDesign:
         from scripts.production.staff_test_support import unit_membership
-        _ = unit_membership("demo", "design-unit")
+        parent = unit_membership("demo", "design-unit")
+        _ = fixture_worker("worker", parent.id, runtime_id=THREAD_ID)
         prompt = self.session_dir / "authorized.md"
         design = design_roles.HeldDesign(design_roles.DesignPlacement("00000000-0000-4000-8000-000000000026", "fixture-host", 3),
             "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("demo", "design-unit"), design_roles.DesignUnbound(),
+            "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
             (design_roles.RoleInstance("designer", "unused-designer", design_roles.RoleNotOpened()),
              design_roles.RoleInstance("reviewer", "worker", lifecycle, str(prompt))))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         _ = prompt.write_text("Current authorized reviewer instructions.")
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review",
             "held_design_id": design.placement.design_id, "held_role": "reviewer", "port": self.server.port,
-            "authorized_generation": 3, "authorized_holder": os.environ["CODEX_THREAD_ID"], "authorized_prompt": str(prompt),
+            "authorized_generation": 3, "authorized_prompt": str(prompt),
             "access_policy": {"kind": "ReadOnlyReviewer"}}})
-        _ = self.patches.enter_context(patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(os.environ["CODEX_THREAD_ID"])))
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": os.environ["CODEX_THREAD_ID"],
                                                                "DESIGN_ROLES_HOST": "fixture-host"})))
         return design
@@ -2199,10 +2199,9 @@ class StaffAdmissionTests(MeshCommandFixture):
                 with contextlib.redirect_stderr(io.StringIO()) as errors:
                     code = codex_mesh.command_follow(args)
                 self.assertEqual(code, 0, errors.getvalue())
-        self.assertIsInstance(held.holder, design_roles.UnitHolder)
-        assert isinstance(held.holder, design_roles.UnitHolder)
+        self.assertFalse(hasattr(held, "holder"))
         rows = staff.find(kind="worker")
-        parent = next(row for row in staff.find(kind="unit") if row.name == unit_names.name(held.holder.unit_name))
+        parent = next(row for row in staff.find(kind="unit") if row.name == unit_names.name("design-unit"))
         self.assertEqual([(row.name, row.parent) for row in rows], [("worker", parent.id)])
 
 @final
@@ -3612,7 +3611,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         context_path = self.session_dir / "design_context.json"
         context = {"design_id": design.placement.design_id, "generation": design.placement.generation,
-                   "holder_session": os.environ["CODEX_THREAD_ID"], "cwd": design.repository,
+                   "cwd": design.repository,
                    "binding": {"kind": "DesignBoundToPhase", **dataclasses.asdict(binding)}}
         _ = context_path.write_text(json.dumps(context))
         server_path = self.session_dir / codex_mesh.SERVER_FILE
@@ -3650,7 +3649,18 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_sweep_or_idle_stop_of_a_held_design_server_resumes_same_thread_with_pending_text(self) -> None:
         from scripts.production.staff_test_support import unit_membership
-        _ = unit_membership("demo", "design-unit")
+        parent = unit_membership("demo", "design-unit")
+        _ = fixture_worker("worker", parent.id, runtime_id=THREAD_ID)
+        children: set[int] = set()
+        signal_process = codex_mesh._signal_process  # pyright: ignore[reportPrivateUsage]
+
+        def signal_child(pid: object, signum: int, *, group: bool = False) -> None:
+            if signum:
+                self.assertIn(pid, children, "only this fixture's children can receive signals")
+                self.assertFalse(group)
+            signal_process(pid, signum, group=group)
+
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_signal_process", signal_child))
         fixture_root = self.session_dir
         for stop_route in ("idle-stop", "sweep"):
             with self.subTest(stop_route=stop_route):
@@ -3666,7 +3676,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                                                   str(fixture_root), ("design.md",))
                 design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 3),
                     "fixture-repo", str(fixture_root), str(fixture_root / "design.md"), "design",
-                    "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("demo", "design-unit"), binding,
+                    "2026-10-21T12:00:00+00:00", binding,
                     (design_roles.RoleInstance("designer", "worker", design_roles.RoleOpen(THREAD_ID), str(prompt)),
                      design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
                 design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
@@ -3678,9 +3688,9 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                           "launch_sandbox": "danger-full-access"}
                 self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl",
                     "held_design_id": design_id, "held_role": "designer", "access_policy": policy,
-                    "authorized_generation": 3, "authorized_holder": os.environ["CODEX_THREAD_ID"],
+                    "authorized_generation": 3,
                     "authorized_prompt": str(prompt), "port": self.server.port}})
-                context = {"design_id": design_id, "generation": 3, "holder_session": os.environ["CODEX_THREAD_ID"],
+                context = {"design_id": design_id, "generation": 3,
                            "cwd": design.repository, "binding": {"kind": "DesignBoundToPhase",
                                                                    **dataclasses.asdict(binding)}}
                 _ = (self.session_dir / "design_context.json").write_text(json.dumps(context))
@@ -3692,6 +3702,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 process = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.DEVNULL)
+                children.add(process.pid)
                 # Reap this child as soon as the real stop code signals it, so kill(0) sees it gone.
                 reaper = threading.Thread(target=process.wait, daemon=True)
                 reaper.start()
@@ -3739,7 +3750,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                         self.server.close()
                         self.server = StubAppServer(self.respond)
                         started.append(codex_mesh._server_environment(session_dir, home))  # pyright: ignore[reportPrivateUsage]
-                        _ = server_path.write_text(json.dumps({"pid": os.getpid(), "port": self.server.port,
+                        _ = server_path.write_text(json.dumps({"pid": 87654, "port": self.server.port,
                             "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
                             "design_context": context}))
                         return self.server.port
@@ -3748,10 +3759,15 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     args.to = "worker"
                     args.message_file = str(prompt)
                     args.summary_file = str(reply)
+                    pid_alive = codex_mesh._pid_alive  # pyright: ignore[reportPrivateUsage]
+
+                    def fixture_pid_alive(pid: int) -> bool:
+                        return pid == 87654 or pid_alive(pid)
+
                     with (
                         patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": os.environ["CODEX_THREAD_ID"], "DESIGN_ROLES_HOST": "fixture-host"}),
-                        patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(os.environ["CODEX_THREAD_ID"])),
                         patch.object(codex_mesh, "_start_server", start_fixture_server),
+                        patch.object(codex_mesh, "_pid_alive", side_effect=fixture_pid_alive),
                         contextlib.redirect_stderr(io.StringIO()) as errors,
                     ):
                         self.assertEqual(codex_mesh.command_follow(args), 0, errors.getvalue())
@@ -4057,12 +4073,14 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
             self.server.respond = respond
 
     def test_idle_durable_account_move_without_run_marker_parks_queue_before_server_stop(self) -> None:
+        from scripts.production import staff
+
         design = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         mesh = design_roles.mesh_directory(design.placement.design_id)
         mesh.mkdir(parents=True)
         _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps({"worker": self.worker_record()}))
         _ = (mesh / codex_mesh.SERVER_FILE).write_bytes((self.session_dir / codex_mesh.SERVER_FILE).read_bytes())
-        design_roles._mesh_context(design, design_roles.HolderReach(os.environ["CODEX_THREAD_ID"]))  # pyright: ignore[reportPrivateUsage]
+        design_roles._mesh_context(design)  # pyright: ignore[reportPrivateUsage]
         self.queued = [{"id": "queued-one", "input": [{"type": "text", "text": "Keep idle account-move text."}]}]
         stopped: list[int] = []
 
@@ -4078,11 +4096,73 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 patch.object(codex_mesh, "_start_watcher", side_effect=AssertionError("idle server should stop")):
             switches = codex_mesh.retire_workers_servers(self.session_dir / "next-account", "codex1")
         self.assertEqual([switch.folder for switch in switches], [mesh])
-        self.assertEqual(switches[0].holders, (os.environ["CODEX_THREAD_ID"],))
+        parent = design_roles.worker_parent(design, "reviewer", staff.snapshot())
+        self.assertEqual(switches[0].holders, (parent.current_session,))
         self.assertEqual(stopped, [os.getpid()])
         self.assertEqual(self.methods("turn/start"), [])
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual(cast(dict[str, dict[str, object]], json.loads((mesh / codex_mesh.ROSTER_FILE).read_text()))["worker"]["thread_id"], THREAD_ID)
+
+    def test_durable_account_moves_report_missing_parents_and_continue_all_runs(self) -> None:
+        from scripts.production import staff
+
+        original = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
+        first = dataclasses.replace(original, roles=(
+            design_roles.RoleInstance("designer", "missing-designer",
+                                      design_roles.RoleOpen(fixture_runtime_id("missing-designer"))),
+            original.roles[1]))
+        second = dataclasses.replace(original,
+            placement=dataclasses.replace(original.placement, design_id="00000000-0000-4000-8000-000000000027"),
+            roles=(design_roles.RoleInstance("designer", "missing-second-designer",
+                                            design_roles.RoleOpen(fixture_runtime_id("missing-second-designer"))),
+                   design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
+        folders: list[Path] = []
+        for index, design in enumerate((first, second)):
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            mesh = design_roles.mesh_directory(design.placement.design_id)
+            mesh.mkdir(parents=True)
+            design_roles._mesh_context(design)  # pyright: ignore[reportPrivateUsage]
+            records = {role.name: {
+                "thread_id": role.lifecycle.thread_id, "status": "done",
+                "held_design_id": design.placement.design_id, "held_role": role.role,
+            } for role in design.roles if isinstance(role.lifecycle, design_roles.RoleOpen)}
+            _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps(records))
+            _ = (mesh / codex_mesh.SERVER_FILE).write_text(json.dumps({
+                "pid": 990026 + index, "port": 4001 + index,
+                "codex_home": str(self.session_dir / "outgoing-account")}))
+            folders.append(mesh)
+        parent = design_roles.worker_parent(first, "reviewer", staff.snapshot())
+        errors = io.StringIO()
+        with (patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir / "empty-runs",)),
+              patch.object(codex_mesh, "_pid_alive", return_value=True),
+              patch.object(codex_mesh, "_collect_exited_child"),
+              patch.object(codex_mesh, "_switch_run_workers",
+                           return_value=(codex_mesh.SwitchingWorker("worker", False),)) as switch,
+              patch.object(codex_mesh, "_launcher_sessions", return_value=()) as launchers,
+              patch.object(codex_mesh, "_finish_run_moves", wraps=codex_mesh._finish_run_moves) as finish,  # pyright: ignore[reportPrivateUsage]
+              patch.object(codex_mesh, "_stop_unused", return_value=True) as stop,
+              patch.object(codex_mesh, "_notify_holder"),
+              patch.object(codex_mesh, "_log_server"),
+              contextlib.redirect_stderr(errors)):
+            switches = codex_mesh.retire_workers_servers(self.session_dir / "next-account", "codex1")
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"codex_mesh: design {design.placement.design_id}: designer: role worker parent is unavailable"
+            for design in (first, second)])
+        self.assertEqual([entry.args[0] for entry in switch.call_args_list], folders)
+        self.assertEqual([set(cast(codex_mesh.BulkWorkers, entry.kwargs["operation"]).records)
+                          for entry in switch.call_args_list],
+                         [{"missing-designer", "worker"}, {"missing-second-designer"}])
+        self.assertEqual([entry.folder for entry in switches], folders)
+        self.assertEqual([entry.holders for entry in switches], [(parent.current_session,), ()])
+        self.assertEqual([entry.workers for entry in switches],
+                         [(codex_mesh.SwitchingWorker("worker", False),)] * 2)
+        self.assertEqual(switches[1].launcher_sessions, ())
+        launchers.assert_called_once_with(folders[1])
+        finish.assert_called_once()
+        self.assertEqual(stop.call_count, 2)
+        for mesh in folders:
+            self.assertFalse((mesh / codex_mesh.SERVER_FILE).exists())
+            self.assertTrue((mesh / codex_mesh.RETIRED_FILE).exists())
 
     def test_old_launcher_normal_end_preserves_the_replacement_roster(self) -> None:
         replacement = self.replacement_record()
@@ -5875,15 +5955,13 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(set(self.roster()), {"template", "reviewer"})
 
     def test_prime_held_titles_use_the_design_holder_before_the_mesh_record_exists(self) -> None:
-        from scripts.production.staff_test_support import production_membership
+        from scripts.production.staff_test_support import production_membership, unit_membership, showrunner_relationship
         production_membership("sdlc", "roles-unit")
         private_staff = Path(os.environ["STAFF_FILE"])
         initial_staff = private_staff.read_bytes()
-        for index, (holder, prefix) in enumerate((
-                (design_roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
-                (design_roles.ShowrunnerHolder("sdlc"), "sdlc"))):
+        for index, prefix in enumerate(("sdlc · roles", "sdlc")):
             for role, job in (("designer", "designer"), ("reviewer", "design reviewer")):
-                with self.subTest(holder=holder, role=role):
+                with self.subTest(prefix=prefix, role=role):
                     _ = private_staff.write_bytes(initial_staff)
                     design_id = f"00000000-0000-4000-8000-00000000009{index}"
                     directory = design_roles.design_directory(design_id)
@@ -5891,7 +5969,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     claim.unlink(missing_ok=True)
                     design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
                         "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
-                        "2026-10-21T12:00:00+00:00", holder, design_roles.DesignUnbound(),
+                        "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
                         (design_roles.RoleInstance("designer", "template" if role == "designer" else "other-designer",
                                             design_roles.RoleNotOpened("claim")),
                          design_roles.RoleInstance("reviewer", "template" if role == "reviewer" else "other-reviewer",
@@ -5899,8 +5977,9 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
                     self.write_pool_roster({})
                     self.server.requests.clear()
-                    with patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(os.environ["CODEX_THREAD_ID"])), \
-                            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": os.environ["CODEX_THREAD_ID"]}):
+                    parent = unit_membership("sdlc", "roles-unit") if index == 0 else showrunner_relationship("sdlc")
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": parent.current_session,
+                                                 "CLAUDE_CODE_SESSION_ID": parent.current_session}):
                         result, output, errors = self.run_mesh(self.prime_cli(
                             "--held-design", design_id, "--held-role", role))
                     self.assertEqual((result, output, errors), (0, f"{THREAD_ID}\n", ""))
@@ -18374,7 +18453,7 @@ class DevShellServerTests(unittest.TestCase):
 
     def test_held_design_identity_is_also_applied_after_the_dev_shell(self) -> None:
         context: dict[str, object] = {
-            "holder_session": "design-holder", "design_id": "design-one", "generation": 7,
+            "design_id": "design-one", "generation": 7,
             "binding": {"kind": "DesignBoundToPhase", "run_directory": str(self.session_dir)},
         }
         with patch.object(codex_mesh, "_design_context", return_value=context), patch.object(design_roles, "refresh_census"):
@@ -18382,7 +18461,7 @@ class DevShellServerTests(unittest.TestCase):
         command = cast(list[str], self.launch.call_args.args[0])
         self.assertEqual(command[0], "codex")
         environment = cast(dict[str, str], self.launch.call_args.kwargs["env"])
-        self.assertEqual(environment["CLAUDE_CODE_SESSION_ID"], "design-holder")
+        self.assertNotIn("CLAUDE_CODE_SESSION_ID", environment)
         self.assertEqual(environment["HELD_DESIGN_ID"], "design-one")
         self.assertEqual(environment["DESIGN_BINDING_GENERATION"], "7")
         self.assertEqual(environment["IN_NIX_SHELL"], "impure")

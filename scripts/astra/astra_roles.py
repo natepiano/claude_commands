@@ -224,6 +224,9 @@ def _role_record(role: HeldRole) -> RoleRecord:
 
 def live_roles() -> list[LiveRole]:
     """Return readable live holds with current state; remove holds known to have ended."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.production import staff
+    staff_record: staff.StaffSnapshot | None = None
     roles: list[LiveRole] = []
     try:
         paths = sorted(state_root().glob("*.json"))
@@ -246,9 +249,9 @@ def live_roles() -> list[LiveRole]:
                     raise ValueError("durable instance thread differs from hold")
                 entry = _mesh_worker(design_roles.mesh_directory(lifetime.design_id), instance.name)
                 state: RoleState = "busy" if entry.get("status") in ("starting", "running", "waiting_capacity") else "idle"
-                reach = design_roles.resolve_holder(design.holder)
-                if isinstance(reach, design_roles.HolderReach):
-                    record["manager"] = reach.session_id
+                if staff_record is None:
+                    staff_record = staff.snapshot()
+                record["manager"] = design_roles.worker_parent(design, instance.role, staff_record).current_session
             elif isinstance(lifetime, MeshWorker):
                 session_dir = Path(lifetime.session_dir)
                 if not session_dir.exists():

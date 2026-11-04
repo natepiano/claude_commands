@@ -38,6 +38,7 @@ For DelegatedPhaseReservationContract, prepare exact phase files, baseline and
 reservation before dispatch. Bind the designer to those output paths with explicit
 `PhaseBoundDesigner` access; reviews use `ReadOnlyReviewer`. Repository edits use
 patches. Finish a turn and rebind while idle before adding a path or changing scope.
+The holder is the worker's staff parent.
 A stale binding, recovery state, adoption fence or unavailable holder blocks dispatch.
 
 For DualReview and FixDispatch, keep the same reviewer and writer. Save findings,
