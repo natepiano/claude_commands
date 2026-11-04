@@ -1208,8 +1208,6 @@ def require_stopped(identity: StaffId) -> None:
     target = record.by_id(identity)
     if target is None:
         return
-    if target.kind != "worker":
-        raise StaffRefused("retire requires a worker; retain units and showrunners with their location state")
     from scripts.message import sessions
     observed = sessions.session_liveness(target.current_session)
     if isinstance(observed, sessions.LiveSessionProcess):
@@ -1283,8 +1281,8 @@ def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
     row = _row_by_id(rows, staff_id)
     if row is None:
         return None
-    if row.kind != "worker":
-        raise StaffRefused("retire requires a worker; retain units and showrunners with their location state")
+    if row.kind not in ("worker", "agent"):
+        raise StaffRefused("retire requires a worker or agent; retain units and showrunners with their location state")
     rows.remove(row)
     return row
 
