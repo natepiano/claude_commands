@@ -6,7 +6,7 @@ from scripts.lint.memory_test_support import admission_policy_fixture
 from dataclasses import replace
 import unittest
 
-from scripts.build_queue import head_facts, queue_card, queue_view
+from scripts.build_queue import head_facts, queue_card, queue_evidence, queue_view
 from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixtureTests, queue_read_fixture
 from scripts.build_queue.queue_lines import plain
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses
@@ -16,6 +16,19 @@ from scripts.message.unit_labels import UnitLabels
 
 
 class QueueCardTests(QueueFixtureTests):
+    def test_card_uses_the_published_budget_decision_when_local_config_differs(self) -> None:
+        model = self.fixture.model()
+        decision = gate.BudgetDecision(32 * gate.GIB, 24 * gate.GIB, 48 * gate.GIB, model.reading.view.now - 60,
+            "BudgetRaised", "RaiseInterval", "largest")
+        explanation = replace(model.reading.explanation, budget_decision=decision,
+            limits=gate.AdmissionLimits(32 * gate.GIB, model.reading.view.reserve, "largest"))
+        model = replace(model, reading=replace(model.reading, explanation=explanation))
+        expected = queue_evidence.budget_decision_text(decision, model.zone)
+        text = plain(queue_card.render_card(model, [1], 400))
+        self.assertEqual(text.count(expected), 1)
+        self.assertIn("Budget 32.0 GiB; floor 24.0; ceiling 48.0", text)
+        self.assertIn("calm budget raise; hold: raise interval; free check: largest", text)
+
     def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
         model = self.fixture.model()
         for position in (1, 2, 4):

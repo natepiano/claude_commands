@@ -238,9 +238,9 @@ class PrivateReadings:
         except Exception as error:
             return gate.ReadingUnavailable(str(error))
 
-    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure:
+    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure | gate.PressureUnavailable:
         self.counts["pressure"] += 1
-        return gate.read_pressure(host, policy=policy)
+        return gate.read_pressure_reading(host, policy=policy)
 
     def compilers(self) -> list[gate.StepMemory]:
         self.counts["compilers"] += 1

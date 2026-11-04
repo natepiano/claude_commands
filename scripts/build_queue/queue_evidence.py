@@ -128,6 +128,24 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
     return text
 
 
+def budget_decision_text(decision: gate.BudgetDecision | gate.BudgetNotRecorded, zone: ZoneInfo) -> str:
+    """Use the same budget explanation in each queue display."""
+    if isinstance(decision, gate.BudgetNotRecorded):
+        return ""
+    reasons: dict[gate.BudgetReason, str] = {
+        "ServiceStarted": "service start", "BudgetRaised": "calm budget raise",
+        "PressureFloor": "pressure floor", "PressureUnavailable": "PSI unavailable",
+        "CollectingHistory": "collecting calm window", "RaiseInterval": "raise interval",
+        "NoBudgetWaiter": "no step held only by budget", "CeilingReached": "ceiling reached",
+        "OperatorFixedBudget": "operator fixed budget", "HostUnavailable": "host memory unavailable",
+        "ConfigurationChanged": "configuration changed",
+    }
+    return (f"Budget {decision.budget / gate.GIB:.1f} GiB; floor {decision.floor / gate.GIB:.1f}; "
+            f"ceiling {decision.ceiling / gate.GIB:.1f}; "
+            f"changed {head_facts.clock(decision.changed_at, zone, seconds=False)}: {reasons[decision.change_reason]}; "
+            f"hold: {reasons[decision.hold_reason]}; free check: {decision.free_check}")
+
+
 def budget_text(check: gate.BudgetCheck) -> str:
     total = check.charged + check.need
     terms = f"charged {check.charged / gate.GIB:.1f} + need {check.need / gate.GIB:.1f}"

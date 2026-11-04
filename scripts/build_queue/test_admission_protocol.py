@@ -21,6 +21,37 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NO
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_budget_decision_and_free_check_survive_a_view_reply(self) -> None:
+        with AdmissionFixture() as fixture:
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            explanation = reply.reading.explanation
+            decision = gate.BudgetDecision(32 * GIB, 24 * GIB, 48 * GIB, NOW,
+                "BudgetRaised", "RaiseInterval", "largest")
+            explanation = replace(explanation, budget_decision=decision,
+                limits=gate.AdmissionLimits(32 * GIB, 3 * GIB, "largest"))
+            published = wire.ViewReply(replace(reply.reading, explanation=explanation))
+            restored = wire.parse_reply(wire.encode_reply(published))
+            self.assertEqual(restored, published)
+            assert isinstance(restored, wire.ViewReply)
+            self.assertEqual(restored.reading.explanation.budget_decision, decision)
+            self.assertEqual(restored.reading.explanation.limits.free_check, "largest")
+
+    def test_old_snapshot_marks_budget_evidence_unavailable_and_keeps_its_fixed_limit(self) -> None:
+        with AdmissionFixture() as fixture:
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            original = reply.reading.explanation
+            record = cast(dict[str, object], gate.snapshot_value(original))
+            del record["budget_decision"]
+            limits = cast(dict[str, object], record["limits"])
+            del limits["free_check"]
+            restored = gate.parse_snapshot_value(record, gate.QueueExplanation)
+            assert isinstance(restored, gate.QueueExplanation)
+            self.assertIsInstance(restored.budget_decision, gate.BudgetNotRecorded)
+            self.assertEqual(restored.limits.budget, original.limits.budget)
+            self.assertEqual(restored.limits.free_check, "sum")
+
     def test_unowned_scope_activity_round_trips_and_old_records_remain_readable(self) -> None:
         from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun
 

@@ -610,6 +610,11 @@ class NoPressureHold:
 
 
 @dataclass(frozen=True)
+class PressureUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
 class PressureConditionNotRecorded:
     pass
 
@@ -984,10 +989,33 @@ class ReadHostAdmissionLimits:
 READ_HOST_ADMISSION_LIMITS = ReadHostAdmissionLimits()
 
 
+FreeCheckMode = Literal["sum", "largest", "half"]
+BudgetReason = Literal["ServiceStarted", "BudgetRaised", "PressureFloor", "PressureUnavailable",
+                       "CollectingHistory", "RaiseInterval", "NoBudgetWaiter", "CeilingReached",
+                       "OperatorFixedBudget", "HostUnavailable", "ConfigurationChanged"]
+
+
+@dataclass(frozen=True)
+class BudgetNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class BudgetDecision:
+    budget: int
+    floor: int
+    ceiling: int
+    changed_at: float
+    change_reason: BudgetReason
+    hold_reason: BudgetReason
+    free_check: FreeCheckMode
+
+
 @dataclass(frozen=True)
 class AdmissionLimits:
     budget: int
     reserve: int
+    free_check: FreeCheckMode = "sum"
 
 
 @dataclass(frozen=True)
@@ -1356,6 +1384,7 @@ class QueueExplanation:
     override: HeadAdmissionOverride | NoHeadAdmissionOverride = NoHeadAdmissionOverride()
     recovery: RecoverySpacing = NoRecoverySpacing()
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
+    budget_decision: BudgetDecision | BudgetNotRecorded = BudgetNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -1372,6 +1401,8 @@ class QueueInputs:
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     blockers_for: frozenset[str] = frozenset()
     waiter_orders: dict[str, PriorityUnit | NormalOrder] = field(default_factory=dict, kw_only=True)
+    budget_decision: BudgetDecision | BudgetNotRecorded = field(default=BudgetNotRecorded(), kw_only=True)
+    pressure_reading: Pressure | PressureUnavailable = field(default=NO_PRESSURE_HOLD, kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1660,6 +1691,11 @@ class MemoryConfig:
     ci_memory_margin_bytes: int
     test_phase_margin: float
     build_budget_bytes: int
+    build_budget_ceiling_bytes: int
+    build_budget_window_seconds: float
+    build_budget_raise_bytes: int
+    build_budget_raise_interval_seconds: float
+    build_free_check_calm: FreeCheckMode
     dev_size_factor: float
     dev_size_margin_bytes: int
     release_headroom: float
@@ -1690,6 +1726,12 @@ def _gib_bytes(value: float) -> int:
 def _ci_slice_name(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*\.slice", value) is None:
         raise ValueError("expected a systemd slice name")
+    return value
+
+
+def _free_check_mode(value: str) -> FreeCheckMode:
+    if value not in ("sum", "largest", "half"):
+        raise ValueError("expected sum, largest or half")
     return value
 
 
@@ -1743,6 +1785,11 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_memory_margin_bytes=int(number("ci_memory_margin_gib") * GIB),
                 test_phase_margin=number("test_phase_margin"), build_budget_bytes=gib("build_budget_gib"),
+                build_budget_ceiling_bytes=gib("build_budget_ceiling_gib"),
+                build_budget_window_seconds=number("build_budget_window_seconds"),
+                build_budget_raise_bytes=gib("build_budget_raise_gib"),
+                build_budget_raise_interval_seconds=number("build_budget_raise_interval_seconds"),
+                build_free_check_calm=value("build_free_check_calm", _free_check_mode),
                 dev_size_factor=number("dev_size_factor"),
                 dev_size_margin_bytes=value("dev_size_margin_gib", lambda raw: math.ceil(float(raw) * GIB)),
                 release_headroom=number("release_headroom"),
@@ -1757,6 +1804,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
                 peak_wave_seconds=number("peak_wave_seconds"))
+            if config.build_budget_ceiling_bytes < config.build_budget_bytes:
+                raise conf.Unusable("build_budget_ceiling_gib must be at least build_budget_gib")
         finally:
             diagnostics = configuration_diagnostics(messages)
     config = replace(config, diagnostics=diagnostics)
@@ -1787,9 +1836,19 @@ def memory_config() -> MemoryConfig:
     return read_memory_config()
 
 
+@dataclass(frozen=True)
+class NoBudgetOverride:
+    pass
+
+
+def operator_budget() -> int | NoBudgetOverride:
+    value = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
+    return NoBudgetOverride() if value is None else value
+
+
 def _configured_budget(config: MemoryConfig) -> int:
-    environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
-    return environment_budget if environment_budget is not None else config.build_budget_bytes
+    override = operator_budget()
+    return override if isinstance(override, int) else config.build_budget_bytes
 
 
 def resolve_admission_limits(total: int | UnknownHostTotal, config: MemoryConfig) -> AdmissionLimits:
@@ -1800,9 +1859,11 @@ def decide(available: int, total: int | UnknownHostTotal, need: int, running: li
            pressure: Pressure = NO_PRESSURE_HOLD, *,
            limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> AdmissionDecision:
     """Apply the build budget, free-memory floor and pressure limit together."""
-    promised = sum(growth_headroom(row) for row in running)
+    headroom = [growth_headroom(row) for row in running]
     measured = sum(row.bytes for row in running if isinstance(row, MeasuredMemory))
     resolved = limits if isinstance(limits, AdmissionLimits) else resolve_admission_limits(total, read_memory_config())
+    promised = (max(headroom, default=0) if resolved.free_check == "largest" else
+                (sum(headroom) + 1) // 2 if resolved.free_check == "half" else sum(headroom))
     charged = sum(build_charge(row) for row in running)
     budget, reserve = resolved.budget, resolved.reserve
     threshold = need + promised + reserve
@@ -2857,8 +2918,9 @@ def read_meminfo(path: Path) -> HostMemory:
 NO_HOST_SWAP = HostMemory(0, UnknownHostTotal())
 
 
-def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -> Pressure:
-    """An unreadable pressure file does not block; the memory rule still applies."""
+def read_pressure_reading(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy
+                          ) -> Pressure | PressureUnavailable:
+    """Read PSI once and retain missing evidence for the budget controller."""
     readings: dict[str, float] = {}
     path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
     check_memory_reading(path)
@@ -2873,9 +2935,25 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -
         pass
     full, some = readings.get("full", 0.0), readings.get("some", 0.0)
     swap = 100 * max(0, host.swap_total - host.swap_free) / host.swap_total if host.swap_total else 0.0
+    pressure = pressure_from_readings(full, some, swap, policy)
+    if isinstance(pressure, MemoryPressure):
+        return pressure
+    if "full" not in readings or "some" not in readings:
+        return PressureUnavailable(f"incomplete memory pressure reading: {path}")
+    return NO_PRESSURE_HOLD
+
+
+def pressure_from_readings(full: float, some: float, swap: float, policy: AdmissionPolicy) -> Pressure:
+    """Use one pressure predicate for live admission and replay estimates."""
     if swap > policy.pressure.swap_used_limit and some > policy.pressure.some_avg10_limit:
         return MemoryPressure(full, some, swap, condition="swap")
     return MemoryPressure(full, some, swap, condition="full") if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
+
+
+def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -> Pressure:
+    """Keep legacy admission available when PSI cannot be read."""
+    reading = read_pressure_reading(host, policy=policy)
+    return NO_PRESSURE_HOLD if isinstance(reading, PressureUnavailable) else reading
 
 
 def read_recovery(directory: Path) -> RecoverySpacing:
@@ -3868,6 +3946,9 @@ def decision_checks(decision: AdmissionDecision, need: int, available: int) -> t
 
 
 def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits, policy: AdmissionPolicy) -> QueueRead:
+    if isinstance(inputs.budget_decision, BudgetDecision):
+        decision = inputs.budget_decision
+        limits = AdmissionLimits(decision.budget, limits.reserve, decision.free_check)
     return queue_read_from_pass(inputs, limits, policy, admission_pass(inputs, inputs.now, limits, policy))
 
 
@@ -3940,7 +4021,7 @@ def queue_read_from_pass(inputs: QueueInputs, limits: AdmissionLimits, policy: A
                     min((item.waiter.need for item in line), default=0),
                     max((item.waiter.need for item in line), default=0),
                     min((item.waiter.since for item in line), default=now)),
-        inputs, limits, tuple(row for _, row in ordered), tuple(reservations), override, recovery, inputs.priority, policy=policy)
+        inputs, limits, tuple(row for _, row in ordered), tuple(reservations), override, recovery, inputs.priority, budget_decision=inputs.budget_decision, policy=policy)
     return QueueRead(view, explanation, ordered)
 
 

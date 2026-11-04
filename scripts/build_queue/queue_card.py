@@ -123,6 +123,9 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
     def add(text: str = "") -> None:
         lines.extend(wrap((Span(text),), columns))
 
+    budget_line = queue_evidence.budget_decision_text(explanation.budget_decision, model.zone)
+    if budget_line:
+        add(budget_line)
     host = explanation.host
     if isinstance(host, gate.HostAvailable):
         total = queue_evidence.gib(host.total) if isinstance(host.total, int) else "unknown"

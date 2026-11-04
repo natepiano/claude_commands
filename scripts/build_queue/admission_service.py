@@ -21,7 +21,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import conf, inotify
-from scripts.build_queue import admission_code
+from scripts.build_queue import admission_code, budget
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.queue_view import reason_phrase
@@ -59,7 +59,7 @@ class SystemClock:
 
 class Readings(Protocol):
     def host(self) -> gate.HostMemory | gate.ReadingUnavailable: ...
-    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure: ...
+    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure | gate.PressureUnavailable: ...
     def compilers(self) -> list[gate.StepMemory]: ...
     def reservation(self, path: Path, row: gate.Reservation, now: datetime,
                     processes: dict[int, gate.ProcessIdentity], proc: Path, policy: gate.AdmissionPolicy) -> gate.StepMemory: ...
@@ -72,8 +72,8 @@ class SystemReadings:
         except (OSError, ValueError) as error:
             return gate.ReadingUnavailable(str(error) or "memory reading unavailable")
 
-    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure:
-        return gate.read_pressure(host, policy=policy)
+    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure | gate.PressureUnavailable:
+        return gate.read_pressure_reading(host, policy=policy)
 
     def compilers(self) -> list[gate.StepMemory]:
         return gate.sccache_memory()
@@ -517,6 +517,7 @@ class AdmissionServer:
         self.configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration = gate.UnusableAdmissionConfiguration("configuration not read")
         self.last_usable_configuration: gate.MemoryConfig | NoPass = NoPass()
         self.caller_versions: dict[str, str] = {}
+        self.budget_state: budget.BudgetState | gate.BudgetNotRecorded = gate.BudgetNotRecorded()
         self.pass_stale: bool = False
         self.pending_configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration | NoPass = NoPass()
         self.priority: gate.QueuePriority | gate.NoQueuePriority = gate.NO_QUEUE_PRIORITY
@@ -902,8 +903,9 @@ class AdmissionServer:
         for waiting in (*self.waiters.values(), *self.launches.values()):
             waiting.row["build_history_current"] = not self._build_estimate_expired(waiting.request)
         host = self.readings.host()
-        pressure = self.readings.pressure(host if isinstance(host, gate.HostMemory) else
+        pressure_reading = self.readings.pressure(host if isinstance(host, gate.HostMemory) else
                                          gate.HostMemory(0, gate.UnknownHostTotal()), policy)
+        pressure = gate.NO_PRESSURE_HOLD if isinstance(pressure_reading, gate.PressureUnavailable) else pressure_reading
         readings = gate.QueueSnapshotReadings(processes, {}, host, pressure, self.recovery,
                                              self.readings.compilers(), policy=policy)
         ordered, priority = self._queue_order()
@@ -911,6 +913,7 @@ class AdmissionServer:
                                            activity_reader=activity, ci_memory_slice=config.ci_memory_slice,
                                            ci_memory_margin_bytes=config.ci_memory_margin_bytes)
         inputs = gate.build_queue_inputs(ordered, memories, readings, self.override, now, priority, unowned)
+        inputs = replace(inputs, pressure_reading=pressure_reading)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
         between: list[gate.RunningStep] = []
@@ -966,6 +969,7 @@ class AdmissionServer:
         self.configuration = configuration
         self.pass_stale = False
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
+            self.budget_state = gate.BudgetNotRecorded()
             self.next_pass = self.next_config_watch_retry
             self.next_source_check = (self.clock.monotonic() + self.last_usable_configuration.source_check_seconds
                                       if isinstance(self.last_usable_configuration, gate.MemoryConfig) else float("inf"))
@@ -1005,6 +1009,13 @@ class AdmissionServer:
         preserve_override = self._override_pending_reconnect()
         if preserve_override:
             inputs = replace(inputs, override=gate.NoHeadAdmissionOverride())
+        if isinstance(self.budget_state, gate.BudgetNotRecorded):
+            self.budget_state = budget.start_budget(config, inputs.now)
+        if isinstance(self.last_inputs, gate.QueueInputs):
+            inputs = replace(inputs, budget_decision=self.last_inputs.budget_decision)
+        self.budget_state, limits, budget_decision = budget.advance_budget(
+            self.budget_state, inputs, config, inputs.now)
+        inputs = replace(inputs, budget_decision=budget_decision)
         result = gate.admission_pass(inputs, inputs.now, limits, policy)
         self.last_inputs, self.last_limits, self.last_result, self.last_policy = inputs, limits, result, policy
         # Evidence is an effect of this completed pass, never an input to it.

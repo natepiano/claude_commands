@@ -43,6 +43,20 @@ class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
 
 
 class QueueViewTests(QueueFixtureTests):
+    def test_page_and_card_show_the_same_budget_change_and_current_hold(self) -> None:
+        model = self.fixture.model()
+        decision = gate.BudgetDecision(32 * gate.GIB, 24 * gate.GIB, 48 * gate.GIB, NOW - 60,
+            "BudgetRaised", "RaiseInterval", "largest")
+        explanation = replace(model.reading.explanation, budget_decision=decision)
+        model = replace(model, reading=replace(model.reading, explanation=explanation))
+        expected = queue_evidence.budget_decision_text(decision, model.zone)
+        card = plain(queue_card.render_card(model, [1], 400))
+        self.assertEqual(card.count(expected), 1)
+        for columns in (40, 60, 80, 140):
+            with self.subTest(columns=columns):
+                text = plain(queue_view.render_view(model, columns))
+                self.assertEqual(" ".join(text.split()).count(expected), 1)
+
     @override
     def setUp(self) -> None:
         super().setUp()

@@ -27,6 +27,7 @@ else:
 import index
 import memory
 from cargo_output import CargoOutputRoots
+from user_zone import user_zone
 from cgroup_test_support import CPU, GIB, IO_LINES, slice_reading, write_cgroup
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
@@ -114,6 +115,30 @@ class MemoryWindowTests(unittest.TestCase):
         self.fake_bin = self.base / "bin"
         self.fake_bin.mkdir()
         point_root_at(self, self.root)
+
+    def test_window_report_uses_the_recorded_budget_formatter(self) -> None:
+        from scripts.build_queue import queue_snapshot
+        from scripts.build_queue.queue_evidence import budget_decision_text
+        from scripts.lint import memory_admit as gate
+
+        self.stub_journal(early=[], kernel=[])
+        start, end = datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC)
+        decision = gate.BudgetDecision(32 * GIB, 24 * GIB, 48 * GIB, start.timestamp(),
+            "BudgetRaised", "RaiseInterval", "largest")
+        inputs = gate.QueueInputs([], (), (), gate.HostMemory(30 * GIB, 60 * GIB),
+            gate.NoPressureHold(), gate.NoRecoverySpacing(), gate.NoHeadAdmissionOverride(),
+            start.timestamp(), budget_decision=decision)
+        directory = self.root / "admission"
+        directory.mkdir(parents=True)
+        queue_snapshot.write_queue_snapshot(directory, inputs, gate.read_memory_config().policy)
+        _ = index.update()
+        with index.read_only() as connection:
+            text = memory.window_report(connection, start, end)
+        self.assertIn(budget_decision_text(decision, user_zone()), text)
+        with index.read_only() as connection:
+            older = memory.window_report(connection, start - timedelta(days=2), start - timedelta(days=1))
+        self.assertNotIn("Budget 32.0", older)
+        self.assertIn("Budget: no recorded decision in this window", older)
 
     def env(self, **extra: str) -> dict[str, str]:
         return {

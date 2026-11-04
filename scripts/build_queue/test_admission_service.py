@@ -63,6 +63,99 @@ def installed_snapshot(value: object) -> object:
             record["transition"] = {key: transition[key] for key in ("id", "action", "at")}
     return {key: installed_snapshot(item) for key, item in record.items()}
 
+class AdaptiveBudgetServiceTests(unittest.TestCase):
+    @staticmethod
+    def configure(fixture: AdmissionFixture) -> None:
+        _ = os.environ.pop("BUILDLOG_BUILD_BUDGET_GIB", None)
+        write_memory_config(fixture.root / "build_admission.conf", build_budget_gib="6",
+            build_budget_ceiling_gib="12", build_budget_window_seconds="30",
+            build_budget_raise_gib="2", build_budget_raise_interval_seconds="10",
+            build_free_check_calm="largest")
+        fixture.restart()
+
+    def test_service_starts_at_floor_and_restart_discards_the_previous_raise(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure(fixture)
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 6 * GIB)
+            granted = only_admitted(fixture.server.handle_request(fixture.request(need=6 * GIB, step="merge-gate")))
+            waiting = fixture.request(need=6 * GIB, step="merge-gate")
+            self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+            fixture.clock.advance(30)
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 8 * GIB)
+            fixture.restart()
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 6 * GIB)
+            self.assertIn(granted.reservation,
+                          [record.reservation_id for record in fixture.server.reservations.values()])
+
+    def test_pressure_resets_budget_in_the_same_pass_without_revoking_a_grant(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure(fixture)
+            granted = only_admitted(fixture.server.handle_request(fixture.request(need=6 * GIB, step="merge-gate")))
+            waiting = fixture.request(need=6 * GIB, step="merge-gate")
+            self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+            fixture.clock.advance(30)
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 8 * GIB)
+            _ = (fixture.root / "pressure").write_text("full avg10=90\nsome avg10=90\n")
+            result = fixture.run_pass()
+            self.assertEqual(result.policy.totals.budget, 6 * GIB)
+            self.assertEqual(result.rows[0].decision.state, "hold")
+            self.assertIsInstance(result.rows[0].decision.pressure, gate.MemoryPressure)
+            self.assertIn(granted.reservation,
+                          [record.reservation_id for record in fixture.server.reservations.values()])
+            self.assertIn(waiting.episode, fixture.server.waiters)
+            self.assertNotIn(waiting.episode, fixture.server.ledger)
+
+    def test_operator_environment_keeps_the_budget_fixed_across_calm_and_pressure(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure(fixture)
+            os.environ["BUILDLOG_BUILD_BUDGET_GIB"] = "9"
+            fixture.restart()
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 9 * GIB)
+            fixture.clock.advance(300)
+            _ = (fixture.root / "pressure").write_text("full avg10=90\nsome avg10=90\n")
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 9 * GIB)
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            decision = reply.reading.explanation.budget_decision
+            assert isinstance(decision, gate.BudgetDecision)
+            self.assertEqual(decision.change_reason, "OperatorFixedBudget")
+
+    def test_missing_psi_resets_the_published_budget_with_one_pressure_read_per_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure(fixture)
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=6 * GIB, step="merge-gate")))
+            self.assertIsInstance(fixture.server.handle_request(fixture.request(need=6 * GIB, step="merge-gate"))[0], wire.Wait)
+            fixture.clock.advance(30)
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 8 * GIB)
+            (fixture.root / "pressure").unlink()
+            before = fixture.readings.counts["pressure"]
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 6 * GIB)
+            self.assertEqual(fixture.readings.counts["pressure"] - before, 1)
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            explanation = reply.reading.explanation
+            decision = explanation.budget_decision
+            assert isinstance(decision, gate.BudgetDecision)
+            self.assertEqual(decision.budget, explanation.limits.budget)
+            self.assertEqual(decision.budget, 6 * GIB)
+            self.assertEqual(decision.hold_reason, "PressureUnavailable")
+            self.assertEqual(decision.free_check, "sum")
+
+    def test_edited_raise_size_applies_to_the_next_eligible_service_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure(fixture)
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=6 * GIB, step="merge-gate")))
+            self.assertIsInstance(fixture.server.handle_request(fixture.request(need=6 * GIB, step="merge-gate"))[0], wire.Wait)
+            fixture.clock.advance(30)
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 8 * GIB)
+            write_memory_config(fixture.root / "build_admission.conf", build_budget_gib="6",
+                build_budget_ceiling_gib="12", build_budget_window_seconds="30",
+                build_budget_raise_gib="1", build_budget_raise_interval_seconds="10",
+                build_free_check_calm="largest")
+            fixture.clock.advance(10)
+            self.assertEqual(fixture.run_pass().policy.totals.budget, 9 * GIB)
+
+
 class QueueLifecycleTests(unittest.TestCase):
     @staticmethod
     def interrupt_append(kind: str) -> Callable[[Path, dict[str, object], float], None]:
@@ -3759,7 +3852,8 @@ class RunPlaceTests(unittest.TestCase):
             model = queue_view.QueueModel(reading, {}, gate.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
                 queue_view.HostLoadUnavailable(), gate.smallest_head_release(reading.explanation))
             rendered = plain(queue_view.render_view(model, 100))
-            row, = [line for line in rendered.splitlines() if "check" in line]
+            row, = [line for line in rendered.splitlines()
+                    if line.split()[:1] == ["1"] and line.split()[3:4] == ["check"]]
             self.assertEqual(row.split()[4], "0", rendered)
             settings_path = fixture.root / "aws_target.conf"
             _ = write_config_fixture(settings_path, "offload=on\nkinds=check\nstart_after_wait_s=300\n"

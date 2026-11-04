@@ -807,3 +807,35 @@ It takes only the shortfall, in the existing least recently used order.
 The result line reports removed bytes, free bytes before and after, and skipped busy targets.
 `--dry-run` lists proposed takes and removes nothing. It does not run the general tmp sweep.
 The nix-darwin job is a separate deployment step.
+
+
+### Adaptive build budget
+
+The admission service owns `BudgetState(current_budget, last_breach, last_raise)` in `build_queue/budget.py`.
+A restart begins at `build_budget_gib`, the floor. A pressure breach or unavailable PSI restores the floor immediately.
+The controller uses the existing full-pressure or swap-with-some-pressure predicate.
+After `build_budget_window_seconds` without pressure, a budget-only waiter permits one increase per `build_budget_raise_interval_seconds`.
+Each increase uses `build_budget_raise_gib`. The ceiling is `build_budget_ceiling_gib`, clamped below RAM minus the safety reserve.
+The defaults are 24 GiB, 7200 seconds, 300 seconds, 2 GiB and 48 GiB, respectively.
+
+In the calm window, `build_free_check_calm` selects `largest`, `sum` or `half` for remaining promised growth.
+The default is `largest`. Each free check still includes the candidate need and the unchanged safety reserve.
+Pressure restores the full sum immediately. Existing grants keep their reservations.
+`BUILDLOG_BUILD_BUDGET_GIB` fixes the service budget and disables adaptive increases.
+The free check remains the full sum under that operator override.
+
+`BudgetDecision` records the budget, floor, ceiling, last change, reasons and free-check mode in each published snapshot.
+`queue_evidence.budget_decision_text` supplies the same explanation to the view, card and memory report.
+The memory report uses the published snapshot only when its timestamp is inside the requested window.
+Other windows show unavailable budget evidence.
+Older snapshots use `BudgetNotRecorded`. They retain the fixed-budget display.
+There is no new history store or sample writer.
+
+`budget_replay.py` estimates admission opportunities from retained queue lifetimes and existing machine samples.
+It accepts an explicit UTC window of at most two days and the historical RAM capacity.
+Frames include lifecycle boundaries and recorded CI resident memory. Unmeasured grants remain promises.
+It separates budget, free-memory, pressure and token holds. Independent holds can overlap.
+It compares checks on the observed schedule. It does not predict shifted peaks or claim an exact wait reduction.
+Sample interval pressure replaces unavailable historical avg10. Any recorded swap use assumes full swap capacity.
+The report includes kernel, earlyoom and builds/CI `oom_kill` evidence. Missing evidence, changed cgroup identities and counter resets remain incomplete.
+These checks cannot guarantee that running work never exceeds its estimates or receives an OOM kill.

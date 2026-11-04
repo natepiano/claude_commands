@@ -5674,6 +5674,20 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
             self.assertEqual(gate.read_pressure(host, policy=admission_policy_fixture()),
                              gate.MemoryPressure(8, 15, 80, condition="full"))
 
+    def test_missing_or_malformed_psi_cannot_supply_a_calm_pressure_reading(self) -> None:
+        path = self.root / "pressure"
+        policy = gate.read_memory_config().policy
+        for source in (None, "", "full avg10=broken\nsome avg10=0\n", "full avg10=0\n"):
+            with self.subTest(source=source):
+                if source is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _ = path.write_text(source)
+                self.assertIsInstance(gate.read_pressure_reading(policy=policy), gate.PressureUnavailable)
+
+        _ = path.write_text("full avg10=0\nsome avg10=0\n")
+        self.assertIsInstance(gate.read_pressure_reading(policy=policy), gate.NoPressureHold)
+
     def test_missing_kind_peak_hold_inherits_the_default_without_a_fallback(self) -> None:
         self.write_config(peak_hold_seconds="900")
         with contextlib.redirect_stderr(io.StringIO()) as errors:

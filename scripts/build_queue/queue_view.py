@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_evidence
 from scripts.build_queue.queue_evidence import step_labels as step_labels
-from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pad_left, pad_right, plain, field
+from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pad_left, pad_right, plain, field, wrap
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
@@ -393,6 +393,9 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
                 Span(column(field(step), step_width)),
                 Span(pad_left(minutes, minutes_width) + " ", "inactive"))
 
+    budget_line = queue_evidence.budget_decision_text(explanation.budget_decision, model.zone)
+    if budget_line:
+        lines.extend(wrap((Span(budget_line, "inactive"),), columns))
     lines.append(heading())
     for row, pair in zip(running, running_names):
         used = row.used / gate.GIB
