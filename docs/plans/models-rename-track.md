@@ -160,75 +160,33 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 ### Phase 3p — 3o follow-ups: live switch proofs, regression tests, test cut  · status: done
 
-**Owner:** models-unit. 3o routed these items here under the hard landing rule (repair round 11, 2026-11-04).
+#### As-built
 
-**Depends on:** 3o. Only Spec items 10-11 (live proofs) depend on assign.sh starting a Claude worker; today `assign.py:207` refuses any non-Codex worker. sdlc sent that change to devtools-unit (one-launch-path) on 2026-11-04 and tells models-unit when it lands. Spec items 1-9 start at once.
-
-#### Work Order
-
-**Goal:** Finish the 3o proofs and cuts that 3o did not land.
-
-**Spec:**
-
-Milestone 1 (starts at once):
-
-1. F010: define "already stopped" evidence for a rerun after a partial switch. Use explicit confirmed, unresolved and unknown release states. Keep the refusal for an unresolved identity or unknown server state. Test a source release followed by a failed destination creation (Astra review 20261104T173320Z, item 1).
-2. F008: regression test for healthy allocation at `scripts/direct/workers.py:484` after a failed switch. The source fix landed in 3o.
-3. F035: regression test that a caller acquires the worker row during a live Codex turn (`codex_mesh.py:4644` releases the lock before streaming). The source fix landed in 3o.
-4. F012: regression test for the done-record ownership guard in `codex_mesh.py`.
-5. F017: in the running regression in `test_codex_mesh.py`, exclude duplicate developer instructions.
-6. F016: replace `bool | None` in `worker_admission.switch_worker` (`worker_admission.py:281`) with named states: backend published, dispatch deferred, assignment accepted. Convert stored strings at the roster boundary. Keep the Claude delivery callback; remove the Codex dummy callback (`codex_mesh.py:4262`).
-7. F028: move the Python parent out of the worker turn (`worker_fill.py:92`): a Bash parent with a Python coprocess. Cover dispatch, exit status, cancellation, detach and descriptor cleanup.
-8. Simplify: F013 (one family comparison), F015 (`end_friend.sh` inline staff lookup), F019 (duplicate filter and STAFF_ID removal in `test_worker_admission.py`), F026 (one admission path), F034 (session equality in `test_implement_launcher_claude_effort.py`).
-9. Cut the 3o tests to one test per behavior, with table rows. 3o left tests net +309 lines against 5e72ab674. Give a coverage reason for each removed assertion.
-
-Milestone 2 (after devtools one-launch-path lands, and after Milestone 1 and any 5a launcher change):
-
-10. Prove one real Codex-to-Claude switch through assign.sh, with the worker using the extract (3o Acceptance gate 19).
-11. Prove the reverse direction and record both outcomes for sdlc (3o Acceptance gate 20).
+- Source release before a family switch has three outcomes: `SourceReleased`, `SourceUnresolved` and `SourceReleaseUnknown`. Unknown server state refuses the switch. A valid record with only `previous_servers` means no current server; a current server without a valid pid is `SourceReleaseUnknown`.
+- A switch records its intent before it creates the destination. The default retry request is `sha256(f"{staff id}:{destination family}")`, so a rerun after publication reuses the published destination.
+- `SwitchState` has named values (backend published, dispatch deferred, assignment accepted). The roster boundary converts stored strings; an unknown stored value refuses admission.
+- New-slot admission locks by parent and name.
+- `agent_bg.sh` is a Bash parent with a Python coprocess. The Python parent is not in the worker turn.
+- `end_friend.sh` records "ended" only after confirmed absence or a successful stop.
+- `workers.py` reports a refused candidate and continues with healthy workers.
 
 **Files:**
-- `scripts/production/worker_admission.py`
-- `scripts/production/worker_fill.py`
-- `scripts/agents/codex_mesh.py`
-- `scripts/accounts/accounts.py`
-- `scripts/direct/workers.py`
-- `scripts/direct/implement.sh`
-- `scripts/ask_a_friend/end_friend.sh`
-- `scripts/production/test_worker_admission.py`
-- `scripts/production/test_worker_fill.py`
-- `scripts/agents/test_codex_mesh.py`
-- `scripts/accounts/test_moves.py`
-- `scripts/accounts/test_accounts.py`
-- `scripts/shutdown/test_account_move.py`
-- `scripts/shutdown/test_stop_resume.py`
-- `scripts/direct/test_workers.py`
-- `scripts/direct/test_implement_launcher_claude.py`
-- `scripts/direct/test_implement_launcher_claude_effort.py`
+- `scripts/production/worker_admission.py` — admission, switch, source release, retry request key.
+- `scripts/production/worker_fill.py` — Claude coprocess admission and dispatch.
+- `scripts/agents/agent_bg.sh` — Bash parent of the worker turn.
+- `scripts/agents/codex_mesh.py` — Codex start path and source-release evidence readers.
+- `scripts/ask_a_friend/end_friend.sh` — friend stop and status.
 
-**Workers:** `1 writer + 1 tester`
+**Binds later work:** the real-path regression tests `test_default_switch_request_reuses_the_published_destination_after_fresh_admission` and `test_source_release_requires_identity_and_complete_server_evidence` stay, apart from renames. `codex_mesh.py` stops on `SourceReleaseUnknown` and continues after `SourceUnresolved`.
 
-`impl` — Own the source files above (F010, F016, F028 and the simplify items).
+**Gotchas:**
+- Gate exports need their own `.git` (`git init`, add, commit), or copy-guard, offload and inventory tests fail.
+- The fake host in tests needs its `HERDR_PROC` folder; the sdlc stop path reads it.
+- Regression tests run the real reader and function. A test that stubs the function under test passes while the defect stays.
 
-`test` — Own the test files above. Start with the regressions (items 2-5), then the test cut (item 9).
-
-**Constraints from prior phases:**
-
-1. Keep fixed staff identities: a move never changes a worker's staff id.
-2. Test fixtures write only to a fixture state folder, never the live roster or state folder (3o F040). Run tests through a guarded runner that checks the live roster before and after.
-3. `implement.sh` runs worker admission before it records a pass.
-4. The plain launcher stays removed. Start workers only through assign.sh (one-door rule, sdlc 2026-11-04).
-5. `ResumePending` stays an explicit boundary until assign.sh accepts a fixed staff id and a destination account. Output: "stopped, resume pending on <account>: <reason>".
-6. A Claude resend needs readable delivery evidence (`worker_fill.py:66`): keep the matched, absent and unknown outcomes.
-7. A `StaffRefused` row gives one refusal line for that worker; healthy workers continue (`accounts.py:2834`).
-8. Overlap with 5a: both change `codex_mesh.py`, launcher code and their tests. Serialize the overlapping launcher edits.
-
-**Acceptance gate:**
-
-1. basedpyright zero errors and warnings on changed files and callers.
-2. Affected suites green; source net negative.
-3. These assertions stay: the dry-run preview lines (`test_moves.py:678`); the `ResumePending` text (`test_moves.py:668`); the locked-worker regression (`test_moves.py:709`); the matched, absent and unknown delivery outcomes (`test_worker_fill.py`); the fresh and attach admission refusals (`test_implement_launcher_claude.py:62`); the live-roster check of the guarded runner.
-4. Pass the Delegation Context merge gate.
+**Ruled out:**
+- Merging `SourceUnresolved` and `SourceReleaseUnknown`: their consumers differ.
+- Moving launch account setup in `agent_bg.sh`: it adds work before the `unchanged` exit.
 
 ### Phase 3q — 3p follow-ups: simplify cuts and the switch-state cleanup  · status: todo
 
@@ -242,23 +200,74 @@ Milestone 2 (after devtools one-launch-path lands, and after Milestone 1 and any
 
 **Spec:**
 
-1. Apply each item in `docs/plans/models-rename-track-3q-items.md`. Each item names its change, files and reason.
-2. Settle each held-for-decision item under DecisionEconomy before dispatch. Send a design choice to sdlc.
-3. F006: remove the redundant switch-state write after publication and the `SwitchState` alternative of `dispatch` (see the F006 item).
-4. Make the phase source net negative: 3p added 265 more lines than it deleted.
+1. Apply each item in `docs/plans/models-rename-track-3q-items.md`. Each item names its change, files and reason. Find each site again; the line numbers are from the 3p review tree.
+2. Apply the held items as sdlc settled them (2026-11-04):
+   - F046 and F048 follow F058 and F059, which landed in 3p. Keep F048's enum rename: `DISPATCH_DEFERRED` says "in flight", and "no record" gets its own value. The value written before creation (`worker_admission.py:407`, today `BACKEND_PUBLISHED`) gets a name that says creation intent is recorded.
+   - F049: keep a changed refusal text only if it says what happened and what to do. Otherwise restore the old text.
+   - F050 and F051: move the code; add no copy. F051's backend lookup is the one staff read, not a second reader.
+   - F056: a new `worker_fill.py` verb stops the friend in process. Delete the old `end_friend.sh` path in this phase.
+   - F047, F052, F053 and F054: apply as the item states.
+   - F055: keep both states, as the item recommends. `codex_mesh.py:6949` stops on `SourceReleaseUnknown` and continues after `SourceUnresolved`.
+   - F057: no change, as the item recommends. The move runs account setup before the `unchanged` exit (`agent_bg.sh:102`) and on coordinator-selected attachment.
+3. F006: remove the redundant switch-state write after publication and the `SwitchState` alternative of `dispatch` (see the F006 item). Give "turn submission owns dispatch" a named value, not `None`.
+4. F021: the transcript reader gives a named torn-record result, not `None`.
+5. F011: `test_worker_admission.py:345` reads `PublishedWorker.state`. Replace that check with the same check on the stored dispatch record, then delete the field.
+6. F056: replace the `end_friend.sh` call in `commands/ask_a_friend.md:109` with the new verb.
+7. Line cut (sdlc, 2026-11-04): 3p source was net +57. 3q source must be net -58 or less against `67b2850c5`, counted at the 3q merge, so 3p and 3q together are net negative. If not, sdlc sends 3q back. The items alone come to about -3 (architect estimate; F056 about -20). Find the rest in the code 3p changed: remove code that the switch path no longer needs, and copies inside the 3p files. Report the count after each edit batch. Keep 5a work out of the 3q count.
+
+**Files:**
+- `scripts/production/worker_admission.py`
+- `scripts/production/worker_fill.py`
+- `scripts/production/staff.py`
+- `scripts/agents/codex_mesh.py`
+- `scripts/agents/agent_bg.sh`
+- `scripts/ask_a_friend/end_friend.sh`
+- `commands/ask_a_friend.md`
+- `scripts/accounts/accounts.py`
+- `scripts/direct/workers.py`
+- `scripts/shutdown/stop_resume.py`
+- `scripts/shutdown/stop_results.py`
+- `scripts/production/staff_test_support.py`
+- `scripts/direct/test_implement_launcher_claude.py`
+- `scripts/production/test_worker_admission.py`
+- `scripts/production/test_worker_fill.py`
+- `scripts/agents/test_codex_mesh.py`
+- `scripts/agents/test_agent_bg.py`
+- `scripts/ask_a_friend/test_end_friend.py`
+- `scripts/accounts/test_accounts.py`
+- `scripts/direct/test_workers.py`
+
+**Workers:** `1 writer + 1 tester`
+
+`impl` — Own the source files and `commands/ask_a_friend.md`: F006, F011-F029, F046-F056 source parts, and the line cut.
+
+`test` — Own the test files, `staff_test_support.py` included: F010 and F030-F044, then the test edits that the source changes need, and the acceptance tests for F049 and F056.
+
+**Constraints from prior phases:**
+
+1. Keep the 3p real-path regression tests. Never stub the function under test: `test_default_switch_request_reuses_the_published_destination_after_fresh_admission` and `test_source_release_requires_identity_and_complete_server_evidence` stay as they are, apart from the renames this phase makes.
+2. The default retry request is `sha256(f"{staff id}:{destination family}")` (3p F002). Keep it.
+3. A valid record with only `previous_servers` means no current server (`codex_mesh.py` `_retire_record`). A current server without a valid pid is `SourceReleaseUnknown` (3p F001).
+4. Test fixtures write only to a fixture state folder, never the live roster. The fake host needs its `HERDR_PROC` folder (sdlc stop path).
+5. `scripts/shutdown/` is shutdown-unit's. F028 and F050 edit it through cargo-berth; name both files in the checkpoint notice as `also touches`.
+6. Overlap with 5a: both change `codex_mesh.py` and `workers.py`. Serialize those edits.
+7. Run gates on an export that has its own `.git` (`git init`, add, commit in the export), with `--tests-only`.
 
 **Acceptance gate:**
 
 1. basedpyright zero errors and warnings on changed files and callers.
-2. Affected suites green; source net negative.
-3. No assertion of the 3p regression tests is weakened.
-4. Pass the Delegation Context merge gate.
+2. Affected suites green.
+3. Source net -58 lines or less against `67b2850c5`: `git diff --numstat 67b2850c5` over every changed file except `test_*.py`, `*_test_support.py` and plan docs. Count both sides of a code move into `scripts/shutdown/`.
+4. No assertion of the 3p regression tests is weakened. F006 and F048 keep the real-path retry tests green.
+5. F049: a command-output test in `test_accounts.py` shows each release refusal line with its reason and next action.
+6. F056: `test_end_friend.py` covers a successful stop for a Codex friend and a Claude friend, and the "ended" status after each.
+7. Pass the Delegation Context merge gate.
 
 ### Phase 3r — Live family-switch proofs through assign.sh  · status: todo
 
 **Owner:** models-unit. 3p Milestone 2 (Spec items 10-11) moved here so that 3p could land Milestone 1.
 
-**Depends on:** 3p, and the devtools one-launch-path change (assign.sh starts a Claude worker). sdlc tells models-unit when it lands.
+**Depends on:** 3p, 3q, 5a, and the devtools one-launch-path change (assign.sh starts a Claude worker). sdlc tells models-unit when it lands. The proofs run on the final launcher code; a later launcher edit repeats the affected proof.
 
 #### Work Order
 
@@ -266,8 +275,29 @@ Milestone 2 (after devtools one-launch-path lands, and after Milestone 1 and any
 
 **Spec:**
 
-1. Prove one real Codex-to-Claude switch through assign.sh, with the worker using the transcript extract (3o Acceptance gate 19).
-2. Prove the reverse direction and record both outcomes for sdlc (3o Acceptance gate 20).
+1. Make a throwaway fixture unit with its own state folder. Start a Codex worker in it with assign.sh.
+2. Switch that worker to Claude with assign.sh. Write the exact command at 3r start from the devtools one-launch-path interface as it landed.
+3. Switch it back to Codex with assign.sh.
+4. For each switch, save the staff row before and after, the transcript extract path, and the destination's first-turn log. Put the evidence under `${PHASE_DIR}/proofs/`.
+5. Stop the worker and remove the fixture unit after the proofs.
+6. A switch defect the proofs find is fixed at its cause, with a real-path regression test. The director assigns that repair.
+
+**Files:**
+- `scripts/production/worker_admission.py`
+- `scripts/production/worker_fill.py`
+- `scripts/agents/agent_bg.sh`
+- `scripts/agents/codex_mesh.py`
+- `scripts/production/test_worker_admission.py`
+- `scripts/agents/test_agent_bg.py`
+
+**Workers:** `1 tester`
+
+`test` — Run both live switches through assign.sh on a fixture unit, and record the evidence paths. Hand any defect to the director.
+
+**Constraints from prior phases:**
+
+1. 3q lands first; both phases edit the switch code.
+2. Live proofs use a throwaway fixture unit and never the live roster of a real unit.
 
 **Acceptance gate:**
 
@@ -279,7 +309,7 @@ Milestone 2 (after devtools one-launch-path lands, and after Milestone 1 and any
 
 **Owner:** models-unit (user via natedev and sdlc, 2026-11-03: "going forward herdr should not own changes to /default_models - it should be owned by the models unit under sdlc"). models-unit owns `commands/default_models.md`, `scripts/agents/default_models.sh`, `models_config.sh`, `sync_codex_catalog.sh`, `scripts/lib/models_registry.py` and `config/models.conf`.
 
-**Depends on:** 3o. It does not wait for 3p.
+**Depends on:** 3o and 3q. It does not wait for 3p; it waits for 3q because both edit `codex_mesh.py` and `workers.py`.
 
 **Order:** after 3o. It runs beside herdr Phase 7 when no file overlaps; it never delays 3n or 3o.
 
@@ -299,7 +329,7 @@ Milestone 2 (after devtools one-launch-path lands, and after Milestone 1 and any
 8. Preserve transformations that produce edited text through the existing publication writer.
 9. Define a `LaunchModelConfiguration` lifetime of one launch or assignment operation.
 10. Share that configuration across implementation, review, allocation, and thread creation within the same operation.
-11. Acquire a fresh configuration for the next launch, including the next launch in a long-running process. Within one running launcher, each later submission (continuation, capacity retry, resident wake) also acquires a fresh configuration; the wake test at `test_codex_mesh.py:5164` requires a changed tier there. Today `codex_mesh.py:6181` resolves settings for each submission.
+11. Acquire a fresh configuration for the next launch, including the next launch in a long-running process. Within one running launcher, each later submission (continuation, capacity retry, resident wake) also acquires a fresh configuration; the wake test at `test_codex_mesh.py:5317` requires a changed tier there. Today `codex_mesh.py:6151` resolves settings for each submission.
 12. Define a `RegistryEditBase` lifetime of one editor operation.
 13. Give editor validation and transformation the exact text and values from that same base.
 14. Preserve the existing locked delta replay against concurrent edits.
@@ -364,7 +394,7 @@ Milestone 2 (after devtools one-launch-path lands, and after Milestone 1 and any
 8. Store no persistent configuration cache.
 9. Extend existing fixtures and publication tests.
 10. Keep staff identity changes outside this phase.
-11. Overlap with 3p and devtools one-launch-path: registry and editor work starts at once. Serialize edits to `codex_mesh.py`, `assign.py` and `implement.sh` with 3p and with the devtools launcher change. 3p's live switch proofs run on the combined result.
+11. Overlap with 3q and devtools one-launch-path: 5a starts after 3q lands. Serialize edits to `codex_mesh.py`, `assign.py` and `implement.sh` with the devtools launcher change. 3r's live switch proofs run on the combined result.
 12. `implement.sh` runs worker admission before it records a pass (3o merge).
 
 **Acceptance gate:**
@@ -374,7 +404,7 @@ Milestone 2 (after devtools one-launch-path lands, and after Milestone 1 and any
 3. Prove that `direct = codex` resolves identically in Python and Bash.
 4. Prove one registry snapshot read for each complete launch operation, including allocation and thread creation.
 5. Prove that a registry edit during launch cannot mix configuration generations.
-6. Prove that the next launch reads the changed registry.
+6. Prove that the next launch reads the changed registry. Change the registry between submissions of one launcher (continuation, capacity retry, resident wake) and prove each submission uses one matching model, effort and tier.
 7. Prove that one editor read supplies matching exact text and parsed values.
 8. Preserve concurrent publication and additive catalog tests.
 9. Prove that `Use /agent.` fails the retired-name check.
