@@ -533,7 +533,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - a fixture module that raises at import gives the one stderr line, no summary, and exit 2
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 20 — The hana_shot test module stops its fixture servers at once  · status: todo
+### Phase 20 — The hana_shot test module stops its fixture servers at once  · status: done
 **Depends on:** none
 
 #### Work Order
