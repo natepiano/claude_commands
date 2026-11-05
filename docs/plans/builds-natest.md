@@ -722,7 +722,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Binds later work:**
 - A test loop that runs work in parallel reads each result inside its own `subTest`.
 
-### Phase 29 — `test_mac_run.py` runs in half its time  · status: todo
+### Phase 29 — `test_mac_run.py` runs in half its time  · status: done
 **Depends on:** none
 
 #### Work Order
