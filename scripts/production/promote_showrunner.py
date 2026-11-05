@@ -54,7 +54,7 @@ class Promotion(NamedTuple):
     unit: str
     parent: Production
     child: Production
-    marked: unit_lookup.MarkedUnit
+    marked: unit_lookup.LabeledSession
     claude: unit_lookup.LiveClaude
     worktree: Path
 
@@ -75,7 +75,7 @@ def _session_status(pid: int) -> str:
     return record.get("status", "")
 
 
-def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveClaude) -> None:
+def _quiet(unit: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude) -> None:
     """Refuse a unit mid-turn or with a form, prompt or draft on screen: `/exit` would land in it."""
     if _session_status(claude.pid) == "busy":
         raise Refusal(f"{unit} is mid-turn; promote it once its turn ends")
@@ -133,7 +133,7 @@ def checked(name: str, child_doc: Path, *,
             worktree = location.path
         child = read_production(child_doc)
         claude = unit_lookup.LiveClaude(fields["session"], fields["session_id"], fields["socket"], int(fields["pid"]))
-        marked = unit_lookup.MarkedUnit(unit, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
+        marked = unit_lookup.LabeledSession(unit, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
         return Promotion(unit, parent, child, marked, claude, worktree)
     try:
         selected = staff_sources.member(staff_sources.UnitMember(parent.slug, unit), record)
@@ -143,7 +143,7 @@ def checked(name: str, child_doc: Path, *,
         if not isinstance(location, staff.PresentWorktree):
             raise Refusal(f"{unit} is retired")
         worktree = location.path
-        marked = unit_lookup.marked_unit(parent.slug, unit)
+        marked = unit_lookup.labeled_session(parent.slug, unit)
     except (OSError, UnicodeError) as error:
         raise Refusal(str(error)) from error
     if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
@@ -312,7 +312,7 @@ def _main(argv: list[str]) -> int:
     if not was_pending:
         save_promotion(promotion, target_directory)
     try:
-        current = unit_lookup.marked_unit(promotion.parent.slug, unit) if was_pending else promotion.marked
+        current = unit_lookup.labeled_session(promotion.parent.slug, unit) if was_pending else promotion.marked
         if current is not None and isinstance(current.claude, unit_lookup.ClaudeUnknown):
             raise Refusal(f"cannot tell whether {unit} still runs: {current.claude.reason}")
         if current is not None and isinstance(current.claude, unit_lookup.LiveClaude):

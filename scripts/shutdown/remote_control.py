@@ -83,21 +83,21 @@ class RegistryUnavailable:
 
 
 def remote_control_who(session: Mapping[str, object]) -> str:
-    """Name live registry/pane data; accept the retiring restart wrapper at its boundary."""
+    """Name the staff row selected by the native runtime id."""
+    from scripts.production import staff
+
     nested = session.get("session")
     if isinstance(nested, dict):
         session = cast(Mapping[str, object], nested)
-    environment = session.get("environment", {})
-    marks: Mapping[str, object] = cast(Mapping[str, object], environment) if isinstance(environment, dict) else {}
-    host = session.get("host", {})
-    place: Mapping[str, object] = cast(Mapping[str, object], host) if isinstance(host, dict) else {}
-    unit = marks.get("SHOWRUNNER_UNIT_ID") or place.get("unit")
-    if isinstance(unit, str) and unit:
-        return unit.removesuffix("-unit") + " unit"
-    production = session.get("production") if session.get("kind") == "showrunner" else marks.get("SHOWRUNNER_UNIT")
-    if isinstance(production, str) and production:
-        return production + " showrunner"
-    name = session.get("name") or session.get("sessionId") or session.get("session_id")
+    identity = session.get("sessionId") or session.get("session_id")
+    try:
+        row = staff.initial_snapshot().by_current_session(identity) if isinstance(identity, str) else None
+    except (OSError, ValueError) as error:
+        print(f"{identity}: staff anomaly: {error}", file=sys.stderr)
+        row = None
+    if row is not None:
+        return row.name.removesuffix("-unit") + " " + row.kind
+    name = session.get("name") or identity
     return name if isinstance(name, str) else ""
 
 

@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from contextlib import redirect_stdout
+from typing import cast, override
 from unittest import mock
 
 from scripts.lib import copy_record
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+    fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.production import staff
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
@@ -40,7 +42,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root),
+            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr",
             "COPIES_CONFIG": str(Path(copies.__file__).resolve().parents[2] / "config/copies.conf"),
             "SCRATCH_ROOT": str(self.root / "scratch"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
@@ -54,12 +56,25 @@ class TidyWrappedTests(unittest.TestCase):
         return path
 
     def doc(self, slug: str, status: str) -> Path:
-        return self.write(self.root / "docs" / f"{slug}-production.md", production(status))
+        document = self.write(self.root / "docs" / f"{slug}-production.md", production(status))
+        _ = self.owner(slug)
+        return document
+
+    def owner(self, slug: str) -> staff.StaffRow:
+        document = self.root / "docs" / f"{slug}-production.md"
+        rows = [row for row in staff.initial_snapshot().rows
+                if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path == document]
+        if rows:
+            return rows[0]
+        return fixture_member("showrunner", name=slug + "-owner", runtime_id=fixture_runtime_id("tidy:" + slug),
+                              doc=staff.WrappedDoc("natedev", document))
 
     def state_files(self, slug: str) -> tuple[Path, ...]:
+        owner = self.owner(slug)
         return tuple(self.write(path, "[]\n") for path in (
-            self.state / "footers-off" / slug, self.state / "review-paused" / f"{slug}.json",
-            self.state / "outstanding" / f"{slug}.json", self.state / slug / "log-backups" / "log-1.md"))
+            self.state / "footers-off" / owner.id, self.state / "review-paused" / f"{owner.id}.json",
+            self.state / "outstanding" / f"{owner.id}.json",
+            self.state / owner.id / "log-backups" / "log-1.md"))
 
     def run_tidy(self, *docs: Path) -> subprocess.CompletedProcess[str]:
         env = {**os.environ, "SHOWRUNNER_STATE_DIR": str(self.state), "NOTIFIER_STATE_DIR": str(self.notifier)}
@@ -67,11 +82,47 @@ class TidyWrappedTests(unittest.TestCase):
                               capture_output=True, text=True, check=False,
                               timeout=TEST_HANG_GUARD_SECS)
 
+
+
+    def test_outstanding_migration_preserves_all_suffixes_after_clear_and_rerun(self) -> None:
+        from scripts.production import migrate_middle_stores
+
+        owner = fixture_member("showrunner", name="legacy-owner")
+        suffixes = (".json", ".answered.jsonl", ".history.jsonl", ".lock")
+        sources = [self.write(self.state / "outstanding" / f"legacy-owner{suffix}", suffix)
+                   for suffix in suffixes]
+        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
+            self.assertEqual(migrate_middle_stores.migrate("outstanding", stop_after=1), 75)
+            _ = staff.update_current_session(owner.current_session,
+                                            staff.native_id(fixture_runtime_id("outstanding-clear")))
+            self.assertEqual(migrate_middle_stores.migrate("outstanding"), 0)
+            targets = [source.with_name(f"{owner.id}{suffix}") for source, suffix in zip(sources, suffixes)]
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in targets}
+            self.assertEqual(migrate_middle_stores.migrate("outstanding"), 0)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in targets}, before)
+        self.assertFalse(any(path.exists() for path in sources))
+        self.assertEqual(len(staff.snapshot().rows), 1)
+
+    def test_outstanding_migration_leaves_unknown_owners_and_unequal_destinations(self) -> None:
+        from scripts.production import migrate_middle_stores
+
+        owner = fixture_member("showrunner", name="legacy-owner")
+        source = self.write(self.state / "outstanding/legacy-owner.json", "old content")
+        target = self.write(source.with_name(f"{owner.id}.json"), "different content")
+        unknown = self.write(source.with_name("unknown-owner.json"), "keep this content")
+        paths = (source, target, unknown, self.root / "staff.json")
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
+            self.assertEqual(migrate_middle_stores.migrate("outstanding"), 0)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+
+
     def test_wrap_removes_production_and_unit_checkouts_before_state(self) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
                                           "cleanup@example.invalid", {"file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
-        owner = fixture_member("showrunner", name="done", doc=staff.WrappedDoc("natedev", doc.resolve()))
+        owner = self.owner("done")
         _ = fixture_member("unit", name="alpha-unit", parent=owner.id)
         _ = fixture_member("unit", name="beta-unit", parent=owner.id,
                            worktree=staff.RemovedWorktree("natedev", self.root / "beta"))
@@ -129,16 +180,38 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assertEqual(result.stdout, "done: removed 4 state files\n")
         self.assertFalse(any(path.exists() for path in own))
-        self.assertFalse((self.state / "done").exists())
+        self.assertFalse((self.state / self.owner("done").id).exists())
         self.assertTrue(all(path.exists() for path in other))
+
+    def test_multiple_documents_share_one_question_staff_context(self) -> None:
+        import tidy_wrapped
+        from update_registration import QuestionStaff
+
+        documents = [self.doc(slug, "wrapped") for slug in ("first", "second")]
+        paths = [path for slug in ("first", "second") for path in self.state_files(slug)]
+        environment = {**source_environment(self.root / "sources"),
+                       "SHOWRUNNER_STATE_DIR": str(self.state), "NOTIFIER_STATE_DIR": str(self.notifier)}
+        with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
+              mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),
+              mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.notifier)):
+            identities = QuestionStaff.read()
+            with (mock.patch.object(QuestionStaff, "read", return_value=identities) as read_context,
+                  mock.patch.object(tidy_wrapped, "owned_paths", wraps=tidy_wrapped.owned_paths) as owned,
+                  mock.patch.object(copies, "remove_trees"), redirect_stdout(io.StringIO())):
+                self.assertEqual(tidy_wrapped.main([str(document) for document in documents]), 0)
+            read_context.assert_called_once_with()
+            self.assertEqual(owned.call_count, 2)
+            for call in owned.call_args_list:
+                self.assertIs(cast(object, call.kwargs["identities"]), identities)
+        self.assertFalse(any(path.exists() for path in paths))
 
     def test_wrap_closes_and_retains_questions_without_a_proposals_line(self) -> None:
         import tidy_wrapped
 
         doc = self.doc("done", "wrapped")
-        owner = fixture_member("showrunner", name="renamed-owner", doc=staff.WrappedDoc("natedev", doc))
-        other_doc = self.doc("live", "running")
-        other = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other_doc))
+        owner = staff.rename(self.owner("done").id, "renamed-owner")
+        _ = self.doc("live", "running")
+        other = staff.rename(self.owner("live").id, "other")
         records: list[Path] = []
         for member, title in ((owner, "Choose the layout"), (other, "Choose the release")):
             fields = {"since": "2000-01-01T08:00", "text": title,
@@ -149,9 +222,9 @@ class TidyWrappedTests(unittest.TestCase):
                 + f"registration: {json.dumps(fields)}\n---\n# {title}\n"))
         own, unrelated = records
         unrelated_before = unrelated.read_bytes(), unrelated.stat().st_mtime_ns
-        reminders = self.write(self.state / "outstanding/done.json", "[]\n")
+        reminders = self.write(self.state / "outstanding" / f"{owner.id}.json", "[]\n")
         environment = {**os.environ, **source_environment(self.root / "sources"),
-                       "HOME": str(self.root), "SHOWRUNNER_STATE_DIR": str(self.state),
+                       "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(self.state),
                        "NOTIFIER_STATE_DIR": str(self.notifier)}
         with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
               mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),
@@ -199,7 +272,7 @@ class TidyWrappedTests(unittest.TestCase):
         paths = [*state, question, document, other / relative, caller / relative, self.root / "staff.json"]
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
         environment = {**os.environ, **source_environment(self.root / "sources"),
-                       "HOME": str(self.root), "SHOWRUNNER_STATE_DIR": str(self.state),
+                       "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(self.state),
                        "NOTIFIER_STATE_DIR": str(self.notifier)}
         with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
               mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),
@@ -220,8 +293,8 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertTrue(all(path.exists() for path in own))
 
     def test_wrap_removes_its_answered_history_and_keeps_another_productions(self) -> None:
-        answered = self.write(self.state / "outstanding/done.answered.jsonl", '{"text":"answered question"}\n')
-        other = self.write(self.state / "outstanding/live.answered.jsonl", '{"text":"keep this answer"}\n')
+        answered = self.write(self.state / "outstanding" / f"{self.owner('done').id}.answered.jsonl", '{"text":"answered question"}\n')
+        other = self.write(self.state / "outstanding" / f"{self.owner('live').id}.answered.jsonl", '{"text":"keep this answer"}\n')
         before = other.read_bytes()
         result = self.run_tidy(self.doc("done", "wrapped"))
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done: removed 1 state file\n", ""))
@@ -256,6 +329,40 @@ class TidyWrappedTests(unittest.TestCase):
         result = self.run_tidy(self.doc("done", "wrapped"))
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done: no state files\n", ""))
 
+    def test_state_migration_recovers_all_files_after_clear_and_preserves_rerun(self) -> None:
+        from scripts.production import migrate_showrunner_state
+        from scripts.production.staff_test_support import fixture_runtime_id
+
+        owner = fixture_member("showrunner", name="legacy-state")
+        relative = ("session/receipt.json", "prompt.txt", "log-backups/log.md", "wrap.txt", "parent-change.json")
+        sources = [self.write(self.state / "legacy-state" / name, name) for name in relative]
+        report = self.write(self.state / "reports/legacy-state.json", "report content")
+        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
+            self.assertEqual(migrate_showrunner_state.migrate(stop_after=1), 75)
+            _ = staff.update_current_session(owner.current_session,
+                                            staff.native_id(fixture_runtime_id("state-clear")))
+            self.assertEqual(migrate_showrunner_state.migrate(), 0)
+            targets = [self.state / owner.id / name for name in relative]
+            targets.append(report.with_name(f"{owner.id}.json"))
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in targets}
+            self.assertEqual(migrate_showrunner_state.migrate(), 0)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in targets}, before)
+        self.assertFalse(any(path.exists() for path in [*sources, report]))
+        self.assertFalse((self.state / "legacy-state").exists())
+        self.assertEqual(len(staff.snapshot().rows), 1)
+
+    def test_state_migration_leaves_unknown_owner_and_unequal_destination(self) -> None:
+        from scripts.production import migrate_showrunner_state
+
+        owner = fixture_member("showrunner", name="legacy-state")
+        source = self.write(self.state / "legacy-state/prompt.txt", "old prompt")
+        target = self.write(self.state / owner.id / "prompt.txt", "different prompt")
+        unknown = self.write(self.state / "unknown-state/prompt.txt", "keep this prompt")
+        paths = (source, target, unknown, self.root / "staff.json")
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
+            self.assertEqual(migrate_showrunner_state.migrate(), 0)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
 if __name__ == "__main__":
     _ = unittest.main()

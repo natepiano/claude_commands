@@ -30,6 +30,8 @@ from scripts.hana_shot import hana_shot
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
 
 LAUNCH_RECORDING_PURPOSE = "launch recovery"
@@ -888,6 +890,9 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
             paths.append(path.relative_to(self.root).as_posix())
         diagnostics = io.StringIO()
         process = mock.Mock(pid=12345)
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        runner = fixture_member("showrunner", name="fixture")
+        unit = fixture_member("unit", name="window-unit", parent=runner.id)
 
         def start_stub(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
             self.assertEqual(command[-1], str(self.executable))
@@ -907,7 +912,7 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
 
         with (
             redirect_stderr(diagnostics),
-            mock.patch.dict(os.environ, {"SHOWRUNNER_UNIT_ID": "window-unit", "HANA_TEST_OWNER": ""}),
+            mock.patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session, "HANA_TEST_OWNER": ""}),
             mock.patch.object(hana_shot, "port_answers", return_value=False),
             mock.patch.object(hana_shot, "wait_ready"),
             mock.patch.object(hana_shot, "launch_state_path", return_value=self.root / "launch.json"),
@@ -967,11 +972,32 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
     def test_explicit_launch_owner_takes_precedence_over_the_callers_unit(self) -> None:
         self.stop_fake_listener()
-        with mock.patch.dict(os.environ, {"SHOWRUNNER_UNIT_ID": "caller-unit"}):
+        self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
+        runner = fixture_member("showrunner", name="fixture")
+        unit = fixture_member("unit", name="caller-unit", parent=runner.id)
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session}):
             _ = self.launch_without_starting_hana(owner="feature-unit")
         self.assertIn("HANA_TEST_OWNER=feature-unit", self.launch_command)
         self.assertIn(f"HANA_TEST_PURPOSE={LAUNCH_RECORDING_PURPOSE}", self.launch_command)
         self.assertNotIn("HANA_TEST_OWNER=caller-unit", self.launch_command)
+
+    def test_codex_worker_launch_uses_the_parent_unit_name(self) -> None:
+        self.stop_fake_listener()
+        self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
+        runner = fixture_member("showrunner", name="fixture")
+        unit = fixture_member("unit", name="window-unit", parent=runner.id)
+        worker = fixture_worker("impl", unit.id, backend=staff.CodexBackend(self.scratch / "codex"))
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": worker.current_session}):
+            _ = self.launch_without_starting_hana()
+        self.assertIn("HANA_TEST_OWNER=window-unit", self.launch_command)
+
+    def test_caller_without_a_staff_row_launches_with_an_empty_owner(self) -> None:
+        self.stop_fake_listener()
+        self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
+        _ = fixture_member("agent", name="another-caller")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": fixture_runtime_id("missing-caller")}):
+            _ = self.launch_without_starting_hana()
+        self.assertIn("HANA_TEST_OWNER=", self.launch_command)
 
     def stop_fake_listener(self) -> None:
         server = self.fake_listeners[-1]
