@@ -282,14 +282,16 @@ class ConversationReaderTests(StaffTestCase):
         self.assertEqual(loaded.call_args.args[0], run)
         self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
 
-    def test_astra_app_server_without_unit_run_dir_proves_its_loaded_thread_live(self) -> None:
+    def test_idle_astra_app_server_proves_its_thread_live_without_an_unknown_pid(self) -> None:
         run = unit_runs.ASTRA_RUN_ROOT / "test-review"
         run.mkdir(parents=True)
-        (run / codex_mesh.SERVER_FILE).touch()
+        _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 998071}))
         self.codex(rollout=False, arguments=["codex", "app-server"],
                    environment={"CODEX_HOME": str(self.root / "account")})
         with patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded:
-            self.assertEqual(herdr.read_conversation(self.identity, "codex"), herdr.LiveConversation("codex", ()))
+            snapshot = herdr.codex_conversations()
+        self.assertEqual(herdr.read_conversation(self.identity, "codex", codex=snapshot), herdr.LiveConversation("codex", ()))
+        self.assertEqual(snapshot.unknown, ())
         loaded.assert_called_once()
         self.assertEqual(loaded.call_args.args[0], run)
         self.assertGreater(cast(float, loaded.call_args.args[1]), 0)

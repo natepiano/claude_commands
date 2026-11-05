@@ -3327,6 +3327,14 @@ def codex_conversations() -> CodexConversations:
     runs: set[Path] = set()
     for root in (*unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")), unit_runs.ASTRA_RUN_ROOT):
         runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
+    server_pids: set[int] = set()
+    for run in runs:
+        try:
+            pid = worker_lifecycle.read_json_object(run / unit_runs.SERVER_FILE).get("pid")
+            if isinstance(pid, int):
+                server_pids.add(pid)
+        except (OSError, ValueError):
+            pass
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue
@@ -3356,7 +3364,7 @@ def codex_conversations() -> CodexConversations:
                 pass
             if environment is not None:
                 if "app-server" in arguments:
-                    if environment.get("UNIT_RUN_DIR"):
+                    if environment.get("UNIT_RUN_DIR") or pid in server_pids:
                         # The run read below resolves a server with no open rollout.
                         continue
                 elif no_rollout and "--no-daemon" not in arguments:
