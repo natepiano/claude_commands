@@ -17,8 +17,8 @@
   - Why needed: both functions scan panes; `rename._set_displays` already delegates. Two scans are a copy.
   - Completion condition: one pane scan serves both. The native-session proof and the anomaly output stay.
   - Revealed by: herdr-unit (sdlc [16a2cfa0] placed it next, after 3t).
-- [ ] **A new unit launch records its port and responsibilities**
-  - Target: `scripts/production/production_lifecycle.py`, the launch path from `produce.md`
-  - Why needed: port and responsibilities have no record between `to_production` and launch. herdr 9ae12b0be already finds plans from staff rows and `.unit.toml`.
-  - Completion condition: launch takes `--port` and `--responsibility` and records both; a test covers the record.
-  - Revealed by: herdr-unit (sdlc [16a2cfa0], [7694b0f3]).
+- [ ] **Carry the planned port and responsibilities into unit launch**
+  - Target: `commands/producer/to_production.md`, `commands/showrunner/produce.md` (`LaunchUnits`), `scripts/production/test_add_unit.py`.
+  - Why needed: `add_unit.py` already accepts and records both fields (`add_unit.py:1297`, `test_add_unit.py:216`). The documented launch command (`produce.md:420`) does not carry them from planning.
+  - Completion condition: preserve both fields through the planning handoff. Pass `--port` and repeated `--responsibility` options to `add_unit.py`. Keep saved `.unit.toml` precedence. Test the handoff and final record.
+  - Revealed by: herdr-unit (sdlc [16a2cfa0], [7694b0f3]); Phase 3y architect review.
