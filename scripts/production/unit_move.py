@@ -562,6 +562,10 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 print(f"unit_move: anomaly: {member.name}: {detail}; shutdown.py restart --only {member.id}", file=sys.stderr)
                 reported.add(member.id)
 
+        panes = client.panes() if live else []
+        retained = {member.id: (pane["pane_id"], pane.get("terminal_id", ""))
+                    for member in members if member.id in live
+                    for pane in panes if pane["session_id"] == member.current_session}
         try:
             stop_deadline = time.monotonic() + _move_timeout("RENAME_RUN_STOP_WAIT_SECONDS")
             with worker_lifecycle.operation_deadline(deadline=stop_deadline):
@@ -619,8 +623,12 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                                 continue
                             try:
                                 _check_move_deadline()
-                                _ = start_row(latest, current, client)
+                                resumed = start_row(latest, current, client)
                                 _check_move_deadline()
+                                if resumed and member.id in retained:
+                                    pane, terminal = retained[member.id]
+                                    if resumed != pane:
+                                        client.close_retained_pane(pane, terminal=terminal)
                             except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
                                 restart_notice(latest, error)
                         if not _wait_folder_rows(observe, live - reported, running=True):

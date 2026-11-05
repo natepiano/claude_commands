@@ -1199,8 +1199,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
               mock.patch.object(stop_resume, "_record_launches"),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee")),
               mock.patch.object(stop_resume, "resume", side_effect=resumed),
-              mock.patch.object(stop_resume, "_running_on_account",
-                                return_value=stop_resume.ClaudeUp("204f532d-a97a-59e7-a6a7-caf86af3f5ee", "w1:p1", "claude2")),
               mock.patch.object(stall_watch, "read_place", side_effect=resume_during_inspection)):
             self.assertEqual(self.tick(START).returncode, 0)
         prompt = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))

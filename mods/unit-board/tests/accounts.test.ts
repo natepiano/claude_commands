@@ -395,10 +395,13 @@ describe('accounts table', () => {
   }
 
   for (const columns of [140, 50, 30]) {
-    test(`${columns} cells: counts sum both machines and retain separate machine data`, async ($, on) => {
+    test(`${columns} cells: reads combined counts and retains separate machine data`, async ($, on) => {
       const fake = accountsHost(on);
       const data = statusFixture();
       data.accounts = [data.accounts[0]!, data.accounts[1]!];
+      data.accounts[0]!.role_counts = [
+        { busy: 3, shell: 2, idle: 1, total: 6 }, { busy: 1, shell: 1, idle: 3, total: 5 }];
+      data.accounts[1]!.role_counts = [{ busy: 3, shell: null, idle: 2, total: 5 }];
       data.accounts[0]!.role_counts_by_machine = {
         natedev: { 'unit directors': { busy: 1, shell: 1, idle: 1, total: 3 },
           showrunners: { busy: 1, shell: 0, idle: 1, total: 2 } },
@@ -432,6 +435,32 @@ describe('accounts table', () => {
         .toBe('total 7 3 6 16');
       else expect(normalized(lines.slice(lines.indexOf('total')))).toContain('total busy 7 · shell 3 · idle 6');
       expect(JSON.stringify(data)).toBe(before);
+      data.accounts[1]!.role_counts_by_machine = {};
+      expect(accountDisplay(data.accounts[1]!).roleCounts).toEqual([
+        { kind: 'available', value: { busy: 3, shell: null, idle: 2, total: 5 } },
+      ]);
+    });
+  }
+
+  for (const tool of ['claude', 'codex'] as const) {
+    test(`${tool}: unreported roles show zero and spare has no count`, async ($, on) => {
+      const fake = accountsHost(on);
+      const zero = { busy: 0, shell: tool === 'claude' ? 0 : null, idle: 0, total: 0 };
+      const data = statusFixture();
+      data.accounts = [{ ...data.accounts[0]!, tool, roles: ['units', 'spare'], selected_roles: ['units'],
+        role_counts: [zero, null], role_counts_by_machine: { natedev: {}, mac: {} } }];
+      fake.replace(data);
+      expect(accountDisplay(data.accounts[0]!).roleCounts).toEqual([
+        { kind: 'available', value: zero }, { kind: 'unavailable' },
+      ]);
+      await $.command.run(command());
+      const ui = await mount($);
+      const lines = rowLines(await ui.drawn());
+      const row = lines.find(line => line.includes('Low'))!;
+      expect(row.trim().replace(/\s+/g, ' ')).toContain(tool === 'claude' ? 'units ✓ 0 0 0 0' : 'units ✓ 0 0 0');
+      const shell = lines[0]!.indexOf('shell');
+      expect(row.slice(shell, shell + 5).trim()).toBe(tool === 'claude' ? '0' : '');
+      expect(lines.find(line => line.trim().startsWith('spare'))!.trim()).toBe('spare');
     });
   }
 
