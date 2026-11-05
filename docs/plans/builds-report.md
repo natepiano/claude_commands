@@ -448,27 +448,22 @@ Acceptance:
 
 
 ### Phase 22 — buildlog charts prints a tailnet link  · status: done
-**Depends on:** none (the builds showrunner, 2026-11-04: change review C1044)
 
-#### Work Order
+#### As-built
 
-**Goal:** Every `buildlog charts` run prints a bare tailnet link to the page and no file path.
-
-**Spec:**
-The user ran `buildlog charts` in an ssh terminal on natedev from the Mac (no DISPLAY). It printed the path and opened nothing, with no message. The user, 2026-11-04 (through the builds showrunner): "it should always be a tailscale link". The showrunner's rule:
-
-1. Every run publishes the page through `scripts/review_links/review_link.py` (`snapshot`), the one tailnet link tool, and prints the bare link. This holds in every session: ssh or local, natedev or the Mac.
-2. Print no file path.
-3. No open on the Mac over ssh, and no target config read. The user clicks the link. A browser opens only where a local display exists (`webbrowser.open(link)`), and it never replaces the printed link. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` skip that open.
-4. A failed publish prints one stderr line with the reason and exits non-zero.
-
-Acceptance: tests in `test_charts.py`: the printed line is the link (local display, no display, `--no-open`); no output line is a file path; a failed publish gives one stderr line and a non-zero exit; a `False` from `webbrowser.open` does not change the output. One live check on natedev from an ssh session: `buildlog charts`, then open the printed link on the Mac; the director checks it.
+- `buildlog charts` writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.snapshot`, and prints only the bare tailnet link. It prints no file path. Two runs print the same link.
+- `charts.present_page(series, path, no_open) -> int` puts the page write and the snapshot under one handler of `review_link.SNAPSHOT_ERRORS`. A failure prints one stderr line (`buildlog charts: publication failed: <reason>`) and returns 1.
+- `charts.local_display(environ, platform) -> bool`: false in any ssh session (`SSH_CONNECTION` set); otherwise true on darwin, or with `DISPLAY` or `WAYLAND_DISPLAY`. Only then does `webbrowser.open(link)` run, under `suppress(OSError, webbrowser.Error)`. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` skip the open.
+- `review_link.SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)`; `review_link.main` and charts catch it.
 
 **Files:**
-- `scripts/buildlog/charts.py` — the open paths.
-- `scripts/buildlog/test_charts.py` — the tests.
-- `scripts/review_links/review_link.py` — export `SNAPSHOT_ERRORS`; its `main` and charts catch it (natedev agreed 2026-11-04).
+- `scripts/buildlog/charts.py` — `present_page`, `local_display`.
+- `scripts/buildlog/test_charts.py` — link, display table, browser failure, cache and review-root failure, stable-link tests; `check_publication` fixes the platform.
+- `scripts/review_links/review_link.py` — `SNAPSHOT_ERRORS`.
+- `scripts/buildlog/cli.py` — the charts help line.
 
-**Workers:** 1 writer (test2): charts.py is the only code file.
+**Gotchas:**
+- `review_link.snapshot` costs about 141 ms CPU per call, mostly its `change_routing` import (natedev-efficiency owns that cost).
+- Tests that reach `present_page` must fix `charts.sys.platform`: darwin with no environment is a local display.
 
-**State:** none (the review link files belong to `review_link.py`).
+**Ruled out:** opening the page on the Mac over ssh with a target config read — the user's rule is "it should always be a tailscale link".
