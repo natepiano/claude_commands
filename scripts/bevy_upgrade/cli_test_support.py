@@ -29,7 +29,7 @@ import bevy_upgrade
 import upstream
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
-from cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -304,8 +304,7 @@ class CliFixture(unittest.TestCase):
 
     def run_cli(self, *arguments: str, explicit_production: bool = True,
                 count_saves: bool = False) -> subprocess.CompletedProcess[str]:
-        # Keep one full interpreter/wrapper boundary; the other cases prove CLI behavior.
-        if self._testMethodName == "test_start_reads_the_production_checkout_and_writes_an_open_record":
+        if process_boundary_for_case(self):
             return self.run_cli_process(*arguments, explicit_production=explicit_production,
                                         count_saves=count_saves)
         command = ["--production", str(self.doc)] if explicit_production else []

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.cli_fixture import process_boundary
+
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
 import json
@@ -352,6 +354,8 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(self.file_versions(), before)
         self.assertEqual(displays.commands, commands)
 
+    # Keep the rename CLI process boundary.
+    @process_boundary
     def test_plan_describes_the_rename_without_writes(self) -> None:
         before = self.file_versions()
         result = self.run_rename("plan")
