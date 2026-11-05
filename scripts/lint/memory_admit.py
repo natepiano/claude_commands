@@ -56,12 +56,14 @@ from test_phase import (
 if TYPE_CHECKING:
     from ..buildlog import parse
     from ..buildlog import record as record
+    from ..buildlog import repository as repository
     from ..buildlog import store as store
     from ..buildlog import index
     file_marks = index
 else:
     import parse
     import record
+    import repository
     import store
     import index as file_marks
 
@@ -3273,32 +3275,21 @@ def snapshot_head_override(override: HeadAdmissionOverride | NoHeadAdmissionOver
 GENERIC_REPO_NAMES = frozenset({"", "repo", "c", "clone", "scratch", "tmp", "repository"})
 
 
-def git_output(directory: str, *arguments: str) -> str:
-    try:
-        result = subprocess.run(["git", "-C", directory, *arguments], capture_output=True,
-                                text=True, timeout=5, check=False)
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-
-
 def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if not argv:
         return UnknownRepository(), ""
     directory = record.git_directory(argv, cwd)
     facts = record.git_facts(directory)
     worktree = Path(facts["worktree"] or cwd).name
-    remote = git_output(directory, "remote", "get-url", "origin")
-    if remote:
-        key = record.remote_identity(remote, directory)
-        name = key.rsplit("/", 1)[-1]
-        checkout_name = Path(facts["repo_path"] or cwd).name
-        legacy = name if checkout_name == name and name not in GENERIC_REPO_NAMES else ""
-        return RepositoryIdentity(key, name, legacy), worktree
-    roots = git_output(directory, "rev-list", "--max-parents=0", "--reverse", "HEAD").splitlines()
-    if roots:
-        return RepositoryIdentity("git-root:" + roots[0], Path(facts["repo_path"] or cwd).name), worktree
-    return UnknownRepository(), worktree
+    key = repository.repository_key(directory)
+    if key == store.UNKNOWN_IDENTITY:
+        return UnknownRepository(), worktree
+    checkout_name = Path(facts["repo_path"] or cwd).name
+    if key.startswith("git-root:"):
+        return RepositoryIdentity(key, checkout_name), worktree
+    name = key.rsplit("/", 1)[-1]
+    legacy = name if checkout_name == name and name not in GENERIC_REPO_NAMES else ""
+    return RepositoryIdentity(key, name, legacy), worktree
 
 
 def queue_life_identity(row: Waiter) -> QueueLifeIdentity:

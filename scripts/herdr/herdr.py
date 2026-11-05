@@ -3243,11 +3243,15 @@ def _process_display_name(pid: int) -> str:
 
 
 def codex_managed_daemon(arguments: list[str]) -> bool:
-    """Identify the shared daemon that does not hold a thread live."""
+    """Identify the shared daemon and its helpers, which hold no thread."""
     if not is_codex_process(arguments):
         return False
     index = 2 if Path(arguments[0]).name in {"node", "nodejs"} else 1
-    return arguments[index:index + 1] == ["app-server"] and "--managed-daemon" in arguments
+    commands = arguments[index:]
+    if "app-server" not in commands:
+        return False
+    server = commands.index("app-server")
+    return "--managed-daemon" in commands or commands[server + 1:server + 2] == ["daemon"]
 
 
 @dataclass(frozen=True)
@@ -3268,6 +3272,7 @@ class UnknownConversation:
     """Incomplete evidence cannot prove that the target conversation stopped."""
 
     reason: str
+    shared_codex: bool = False
 
 
 def conversation_note(observed: UnknownConversation) -> None:
@@ -3284,6 +3289,7 @@ class CodexConversations:
 
 def codex_conversations() -> CodexConversations:
     from scripts.lib import unit_runs
+    from scripts.message import codex_daemon
 
     # A static import would close the cycle codex_mesh -> session_staff -> herdr -> codex_mesh.
     loaded_threads = cast(Callable[[Path, float], set[str]], import_module("scripts.agents.codex_mesh").loaded_threads)
@@ -3311,14 +3317,23 @@ def codex_conversations() -> CodexConversations:
     except (HerdrFailure, OSError, ValueError) as error:
         unknown.append(f"Codex process list unknown: {error}")
     live: dict[str, tuple[int, ...]] = {}
+    daemon_reads = {read.owner.home: read.sessions for read in codex_daemon.read_daemons(os.environ)}
+    for home, observed in daemon_reads.items():
+        if isinstance(observed, codex_daemon.DaemonUnreadable):
+            unknown.append(f"{home} (Codex daemon unknown: {observed.reason})")
+        else:
+            for session in observed:
+                _ = live.setdefault(session.thread_id, ())
     runs: set[Path] = set()
     for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
         runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue
+        environment: dict[str, str] | None = None
         try:
-            if run := process_environment(pid).get("UNIT_RUN_DIR"):
+            environment = process_environment(pid)
+            if run := environment.get("UNIT_RUN_DIR"):
                 runs.add(Path(run))
             observed = native_process(pid, "codex")
             if isinstance(observed.identity, LaunchArgument):
@@ -3330,12 +3345,25 @@ def codex_conversations() -> CodexConversations:
             continue
         except (HerdrFailure, OSError, ValueError):
             # A server can hold several threads; each open rollout proves its thread.
+            no_rollout = False
             try:
                 for identity in codex_rollout_threads(pid):
                     live[identity] = (*live.get(identity, ()), pid)
                 continue
+            except NoOpenCodexRollout:
+                no_rollout = True
             except (HerdrFailure, OSError, ValueError):
                 pass
+            if environment is not None:
+                if "app-server" in arguments:
+                    if environment.get("UNIT_RUN_DIR"):
+                        # The run read below resolves a server with no open rollout.
+                        continue
+                elif no_rollout and "--no-daemon" not in arguments:
+                    home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+                    if home in daemon_reads:
+                        # A failed daemon read already has one note for its account.
+                        continue
             unknown.append(f"{_process_display_name(pid)} (Codex thread unknown)")
     deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
     for run in sorted(runs):
@@ -3351,6 +3379,7 @@ def read_conversation(identity: str, kind: str = "", *,
                       codex: CodexConversations | None = None) -> LiveConversation | StoppedConversation | UnknownConversation:
     """Read one current conversation across the native runtimes and hosted threads."""
     unknown: list[str] = []
+    shared_codex = False
     if kind != "codex":
         try:
             observed = runtime_sessions.session_liveness(identity)
@@ -3366,11 +3395,19 @@ def read_conversation(identity: str, kind: str = "", *,
         codex = codex_conversations() if codex is None else codex
         if identity in codex.live:
             return LiveConversation("codex", codex.live[identity])
+        shared_codex = not unknown and bool(codex.unknown)
         unknown.extend(codex.unknown)
     if unknown:
         first = " ".join(unknown[0].splitlines())
-        return UnknownConversation(f"{identity} is not proved live or stopped: {len(unknown)} processes unknown, first: {first}")
+        return UnknownConversation(f"{identity} is not proved live or stopped: {len(unknown)} processes unknown, first: {first}",
+                                   shared_codex=shared_codex)
     return StoppedConversation()
+
+
+def codex_notes(codex: CodexConversations) -> None:
+    """Print each shared reason from the snapshot once."""
+    for reason in dict.fromkeys(codex.unknown):
+        conversation_note(UnknownConversation(reason))
 
 
 def running_codex_threads(*, thread_host: Callable[[list[str]], bool],
@@ -3379,8 +3416,7 @@ def running_codex_threads(*, thread_host: Callable[[list[str]], bool],
     # Keep the keyword for external callers; host processes no longer exclude their threads.
     _ = thread_host
     codex = codex_conversations() if codex is None else codex
-    for reason in dict.fromkeys(codex.unknown):
-        conversation_note(UnknownConversation(reason))
+    codex_notes(codex)
     return set(codex.live)
 
 

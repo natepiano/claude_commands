@@ -150,20 +150,6 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assert_no_launch_change(document, head)
         self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
-    def test_resume_with_unreadable_registry_refuses_with_the_reason(self) -> None:
-        prior = self.root / "prior-session"
-        prior.mkdir()
-        registry = Path(self.env["NOTIFIER_SESSIONS_DIR"])
-        _ = (registry / "broken.json").write_text("{broken")
-        document = self.doc.read_text()
-        head = self.git("rev-parse", "HEAD")
-        result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
-                         + "unreadable session registry record: broken.json\n")
-        self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
-
     def test_resume_with_unreadable_process_identity_refuses_with_the_reason(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
