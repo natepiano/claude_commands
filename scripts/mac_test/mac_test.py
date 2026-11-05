@@ -48,10 +48,10 @@ else:
 
 
 if TYPE_CHECKING:
-    from ..buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
+    from ..buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
+    from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
 
 
 MESSAGE_TIMEOUT_S = 30.0
@@ -377,7 +377,6 @@ NO_EXPIRED_BLOCK_LIFT_FAILURE = NoExpiredBlockLiftFailure()
 class MacTestConfig:
     """Mac claim, block and CI settings."""
 
-    idle: MacIdleConfig
     ci_repo: str
     ci_variable: str
     ci_workflow: str
@@ -502,20 +501,19 @@ def read_config(target: str = "") -> MacTestConfig:
     settings = config_path(target)
     config = conf.read(settings)
     values = config.values()
-    idle = idle_config(config)
+    platform = offload.configured_ssh_target(target).platform if target else "macos"
+    if platform == "macos":
+        _ = idle_config(config)
     if "ci_repo" not in values:
         ci_repo = config.text("ci_repo")
     else:
         ci_repo = values["ci_repo"]
-    if target:
-        configured = offload.configured_ssh_target(target)
-        if configured.platform == "linux" and ci_repo:
-            raise StateReadError(f"{settings}: ci_repo must be empty for a Linux target")
+    if platform == "linux" and ci_repo:
+        raise StateReadError(f"{settings}: ci_repo must be empty for a Linux target")
     ci_fields = {key: config.text(key) if ci_repo else values.get(key, "")
                  for key in ("ci_variable", "ci_workflow", "ci_job")}
 
     return MacTestConfig(
-        idle=idle,
         ci_repo=ci_repo,
         ci_variable=ci_fields["ci_variable"],
         ci_workflow=ci_fields["ci_workflow"],
