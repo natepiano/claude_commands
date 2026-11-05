@@ -43,9 +43,10 @@ The `craft` lens remains off since 2026-10-04 (user: review trial ended).
 The `contract` reviewer also owns the phase style review under
 <ReviewPromptContract/>.
 
-The Codex lenses use the unit's own read-only reviewer. Dispatch with
-`assign.sh --role review`; it resumes `review`, or `review2` when `review` is
-busy. Keep both threads across phases and plans. Writers keep their own roles.
+The Codex lenses use the unit's read-only workers.
+Dispatch with `assign.sh --role review` under <LongLivedWorkers/>.
+The worker command selects a free reviewer and retains its native conversation across phases.
+Writers keep their assigned roles.
 
 The `simplify` lens uses the fresh reviewer path in `assign.sh`, with task `direct.simplify` and no worker address.
 It keeps `Agent` for the agents in `SIMPLIFY_AGENTS`.
@@ -275,6 +276,10 @@ final diff only.
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the selected
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
+   For `herdr`, Stage 2 uses `worker.py` with dispatch id `<dispatch id>-2`.
+   The launcher reads the transcript before input and requires `DONE <dispatch id>-2` to complete review.
+   Review Stage 2 reports through its status and summary files.
+   Only an existing mesh pin selects the retained mesh Stage 2 route.
 2. Apply <ReviewDiffContract/>. Before the broad review, save the complete phase
    diff to a file and run this read-only check in every repository, including Rust:
 
@@ -312,8 +317,8 @@ final diff only.
    For `simplify`, also pass the required `--diff <saved phase diff path>`.
 
    A closure review omits `--lens` and uses `review_prompt_${REVIEW_PASS}.md`.
-   Keep each dispatch handle. The allocator resumes `review`, then `review2`
-   when the first is busy. Read the summary path each dispatch returns.
+   Keep each dispatch handle and apply <LongLivedWorkers/> for selection and reuse.
+   Read the summary path each dispatch returns.
 4. While they run, perform the main review. Pass 1 reads changed code in risk
    order: Work Order paths, public API/traits/registration/plugin wiring, then
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and

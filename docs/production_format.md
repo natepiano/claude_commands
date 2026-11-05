@@ -35,20 +35,15 @@ must not drift from it:
   session the showrunner launches in its own herdr session. It receives messages,
   decides, writes Work Orders, dispatches workers, runs gates, checkpoints and
   reports. It writes no implementation code.
-- **Worker** — a Codex worker thread the unit director dispatches. Implementation
-  workers open once per run, continue across phases and repairs in whatever role
-  is needed, attempt compaction above `UNIT_COMPACT_ABOVE_TOKENS` but
-  continue after a failed attempt, press on after context overflow with
-  `Continue where you stopped.`, open anew only when no open worker can take the
-  work. The unit owns its reviewers too: `assign.sh --role review` resumes
-  `review`, then `review2` while the first is busy. Unit pause, move and end
-  apply to every worker.
-- **Reviewer** — a unit's read-only worker, role `review`. Its thread keeps
-  context across phases and plans; its standing instructions are in
-  `config/review/code.md`.
-- **Template** — a thread holding a type's standing prompt, forked into reviewers
-  and never leased.
-- **Lease** — one reviewer's assignment to one unit's phase, cleared at phase end.
+- **Worker** — a staff member under a unit or showrunner, with a native Claude or Codex conversation in a pane.
+  Launchers use the run's existing transport pin.
+  Pane assignments reuse an idle or resumable worker in role-number order.
+  Dispatch reads the transcript before submission and completes on the matching `DONE <dispatch id>` reply.
+  Retire, wrap, and promote stop workers and retain their rows and conversations for restore.
+  Only worker end or permanent unit removal deletes worker rows.
+- **Reviewer** — a unit's read-only worker, role `review`.
+  Its native conversation retains context across phases and plans.
+  Its standing instructions are in `config/review/code.md`.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
   named `trunk-unit`.
@@ -163,19 +158,27 @@ prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and i
 session name now. `<slug>` is this doc's file name without `-production.md`; a former
 slug from the Formerly line also works.
 
-To rename a unit, run `/showrunner:rename_unit <old> <new>` from the showrunner session,
-between phases. Never edit the staff row or `.unit.toml` by hand. The rename stops the unit,
-moves its branch, worktree and state, and commits `chore(<slug>): rename unit <old> to <new>` on
-the merge branch. Merge history follows that commit, so the unit's past merges still count under
-the new id. Then it relaunches the unit and verifies that nothing live still holds the old name.
+Run `/showrunner:rename_unit <old> <new>` from the showrunner session between phases.
+Never edit the staff row or `.unit.toml` by hand.
+The command repairs displays and completes any pending rename.
+Folder and branch targets use `unit_names.swap_stem` independently; each unmatched suffix prints one anomaly and stays unchanged.
+The move stops live members, moves the worktree and branch, and resumes those native conversations.
+Stopped members stay stopped; the output gives `shutdown.py restart --only <staff-id>` for manual restart.
+A completed rerun prints one `unchanged` line, exits 0, and sends no restart notice.
+See `commands/showrunner/rename_unit.md` for command results and timeout output.
 
-To retire a unit, run `/showrunner:retire_unit <unit>` from the showrunner session. It refuses
-while the unit has uncommitted work or a checkpoint not merged. It stops everything the unit owns
-(its sessions, Codex workers, reviewers, holds, reservations, Mac claims and processes), records a
-removed worktree in its staff row, and removes the worktree and branch. `--dry-run` lists all of it
-and changes nothing. The parked `.unit.toml` keeps the director's last session.
-`/showrunner:resume_unit <unit>` makes the worktree again at the same path from the merge branch,
-resumes that session and records the worktree as present again.
+A showrunner rename with a document move preserves staged document bytes separately from working bytes.
+Recovery restores the staged destination entry before removing the source index entry.
+It completes the pending move without staging the working edits.
+
+Run `/showrunner:retire_unit <unit>` from the showrunner session to remove its worktree and branch.
+Uncommitted work or an unmerged checkpoint prevents removal.
+Retire records a removed worktree in staff and parks `.unit.toml` under the fixed staff id.
+It releases holds, reservations, and Mac claims.
+It stops worker agents and retains their rows, native conversations, and stopped panes for restore.
+Only an existing run pinned to `mesh` uses the retained worker-end path.
+`--dry-run` lists the work without changes.
+`/showrunner:resume_unit <unit>` restores the worktree from the merge branch and resumes the director and its retained workers.
 
 A retired unit keeps its staff row. The status script, the dailies, the waits and the stall watch
 skip it. A unit's plan run ending retires nothing, because the unit's next plan keeps the same
@@ -238,7 +241,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>, simplify <N> findings, simplify minutes <S>
-   Parallel: <Phase N, Phase M could start | none — <what the next phase waits on>>
+   Parallel: <independent phase names | none — <what the next phase waits on>>
    design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
 
