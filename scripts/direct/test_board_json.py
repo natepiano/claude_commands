@@ -180,7 +180,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def attach(self, child: str, parent: str) -> None:
         self.move_parent(child, parent)
-        directory = self.showrunner_state / child
+        directory = self.showrunner_state / next(row.id for row in staff.find(kind="showrunner") if row.name == child)
         directory.mkdir(parents=True, exist_ok=True)
         _ = (directory / "parent").write_text(f"{parent}\n", encoding="utf-8")
 
@@ -405,7 +405,7 @@ class BoardJsonTests(unittest.TestCase):
                 self.assertNotIn("focus", response)
                 self.assertEqual(response["watch"], sorted(str(path.resolve()) for path in (
                     self.notifier, self.showrunner_state,
-                    self.showrunner_state / child.slug, self.showrunner_state / grandchild.slug,
+                    self.showrunner_state / fixture_runtime_id(f"showrunner::{child.slug}"), self.showrunner_state / fixture_runtime_id(f"showrunner::{grandchild.slug}"),
                 )))
                 for fixture, document in zip((root, child, grandchild), documents, strict=True):
                     unit = object_fields(array_items(document["units"])[0])
@@ -552,7 +552,7 @@ class BoardJsonTests(unittest.TestCase):
         child = self.production("child", running=False)
         sibling = self.production("sibling", running=False)
         self.move_parent(child.slug, root.slug)
-        stale_child = self.showrunner_state / child.slug
+        stale_child = self.showrunner_state / fixture_runtime_id(f"showrunner::{child.slug}")
         stale_child.mkdir(parents=True)
         _ = (stale_child / "parent").write_text(sibling.slug + "\n", encoding="utf-8")
 
@@ -624,7 +624,7 @@ class BoardJsonTests(unittest.TestCase):
     def test_attach_and_detach_change_a_watched_directory_and_refresh_the_subtree(self) -> None:
         root = self.production("root")
         child = self.production("child")
-        child_state = self.showrunner_state / child.slug
+        child_state = self.showrunner_state / fixture_runtime_id(f"showrunner::{child.slug}")
         child_state.mkdir(parents=True)
         # An unrelated directory must not become a discovery source.
         (self.showrunner_state / "unregistered").mkdir()

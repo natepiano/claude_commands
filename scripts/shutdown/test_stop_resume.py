@@ -1403,7 +1403,7 @@ class StopResumeTests(unittest.TestCase):
         self.start.assert_called_once()
         command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
         self.assertEqual(command[:4], ("pane", "run", "w1:p2", "env"))
-        self.assertIn("SHOWRUNNER_UNIT=alpha", command)
+        self.assertFalse(any(part.startswith("SHOWRUNNER_") for part in command))
         self.assertIn("HERDR_PANE_ID=w1:p2", command)
         self.assertEqual(command[4:6], ("-u", "HERDR_TAB_ID"))
         self.assertIn("HERDR_WORKSPACE_ID=w1", command)
@@ -1460,7 +1460,9 @@ class StopResumeTests(unittest.TestCase):
         from scripts.accounts import unit_watchdog
         from scripts.notify.push_texts import RenderedPush
         import quota_alert
-        self.entry["environment"]["SHOWRUNNER_UNIT_ID"] = "alpha-unit"
+        identity = staff.StaffId(self.entry["session_id"])
+        owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))))
         for probe in (False, True):
             for outcome in ("watchdog: alpha-unit restarted on claude3",
                             "watchdog: alpha-unit: folder no longer exists; restore dropped"):

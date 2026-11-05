@@ -2,7 +2,8 @@
 
 Every agent Hana launch names the feature under test in `HANA_TEST_PURPOSE`
 and its unit director in `HANA_TEST_OWNER`. The owner defaults to the caller's
-`SHOWRUNNER_UNIT_ID`. `hana_shot.py launch` and captures with `--launch` take
+unit name in the staff record: the caller's own row for a unit, its parent unit
+for a worker. No row gives an empty owner. `hana_shot.py launch` and captures with `--launch` take
 `--purpose` and `--owner`. A launch without a non-empty purpose refuses before
 starting a process. `mac_run.sh` and `smoke_launch.sh` take the same labels
 from the caller's environment. The Mac command keeps both labels when it
@@ -64,8 +65,9 @@ lifetime and stop grace. Each invocation reads those values through
 `scripts/lib/conf.py`. `CONF_DIR` selects the configuration folder.
 A Hana is a test when it has either test label.
 A non-exempt port also identifies a test.
-The environment markers `CLAUDECODE`, `SSH_CONNECTION`, and `SHOWRUNNER_UNIT_ID` also identify tests. A Hana on an exempt port with none of these markers is
-a user Hana, and neither stop nor sweep signals it. A test with neither label
+The environment markers `CLAUDECODE`, `SSH_CONNECTION`, `CLAUDE_CODE_SESSION_ID`
+and `CODEX_THREAD_ID` also identify tests. A Hana on an exempt port with none of
+these markers is a user Hana, and neither stop nor sweep signals it. A test with neither label
 uses the shorter unlabelled limit.
 
 Tests inject process files, environment reads, SSH output and signals. They

@@ -147,14 +147,17 @@ class RelaunchTests(ShutdownTestCase):
         output = self.root / "child.json"
         _ = program.write_text(f"#!{sys.executable}\nimport json,os,sys\n"
             + f"open({str(output)!r},'w').write(json.dumps({{'argv':sys.argv[1:],'marks':"
-            + "{k:v for k,v in os.environ.items() if k.startswith('SHOWRUNNER_') or k=='STAFF_ID'}}))\n")
+            + "{k:v for k,v in os.environ.items() if k.startswith('SHOWRUNNER_') or k in ('STAFF_ID','CLAUDE_CODE_SESSION_ID')}}))\n")
         program.chmod(0o700)
         environment = {"HOME": str(self.root), "PATH": os.defpath, "HERDR_ENV": "1",
-            "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2",
+            "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2", "HERDR_BIN": "/nonexistent/herdr",
             "HERDR_PANE_RECORD_DIR": str(self.root / "panes"), "SHUTDOWN_STATE_DIR": str(self.state)}
-        marks = {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}
+        native = {"CLAUDE_CODE_SESSION_ID": "2d058b83-b9da-46fd-9e87-877cd3f50a52"}
+        marks = {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", **native}
+        retained = pane_record.launch("w1:p2", "2d058b83-b9da-46fd-9e87-877cd3f50a52", str(self.root), {}, ["claude"])
+        retained["environment"] = marks
         with patch.object(pane_record, "RECORD_DIR", self.root / "panes"):
-            pane_record.write("agents", pane_record.launch("w1:p2", "2d058b83-b9da-46fd-9e87-877cd3f50a52", str(self.root), marks, ["claude"]))
+            pane_record.write("agents", retained)
         for identity, prompt in (("2d058b83-b9da-46fd-9e87-877cd3f50a52", []), ("2d058b83-b9da-46fd-9e87-877cd3f50a52", ["existing resume prompt"]),
                                  ("8b6ff791-f212-484b-828b-8970d9524043", []), ("2d058b83-b9da-46fd-9e87-877cd3f50a52", [])):
             with self.subTest(identity=identity, prompt=prompt):
@@ -167,7 +170,7 @@ class RelaunchTests(ShutdownTestCase):
                 if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" and not prompt:
                     expected = [*expected, resume_message("you were stopped and resumed")]
                 self.assertEqual(observed["argv"], expected)
-                self.assertEqual(observed["marks"], marks if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
+                self.assertEqual(observed["marks"], native if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
 
     def test_pane_delivery_does_not_add_a_second_prompt(self) -> None:
         from scripts.shutdown import pane_record

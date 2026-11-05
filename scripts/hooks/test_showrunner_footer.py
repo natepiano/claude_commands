@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -7,17 +9,88 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
+from typing import cast
 
 from scripts.hooks import showrunner_footer
 from update_registration import QuestionStaff
 from scripts.production import staff
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+    fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.statusline import counts_row
 
 
 class QuestionLibraryTests(unittest.TestCase):
+    def test_deferred_time_reports_missing_owner_and_keeps_a_known_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            environment = {**source_environment(root / "sources"), "HOME": str(root),
+                           "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(root / "showrunner")}
+            with (isolated_staff_file(root / "staff.json", environment),
+                  mock.patch.dict(os.environ, environment), isolated_source_readers()):
+                owner = fixture_member("showrunner", name="old-display-name")
+                _ = staff.rename(owner.id, "current-display-name")
+                _ = staff.update_current_session(owner.current_session,
+                    staff.native_id(fixture_runtime_id("deferred-owner-cleared")))
+                folder = root / "showrunner/outstanding"
+                folder.mkdir(parents=True)
+                _ = (folder / f"{owner.id}.json").write_text(json.dumps([
+                    {"since": "2000-01-01T08:00", "text": "Choose the layout", "after": "2099-01-02T08:00"}]))
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    self.assertIsNone(showrunner_footer.deferred_until(["missing-owner"], "UTC"))
+                self.assertIn("unavailable", errors.getvalue())
+                self.assertIn("missing-owner", errors.getvalue())
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    due = showrunner_footer.deferred_until(["missing-owner", owner.id], "UTC")
+                self.assertEqual(due, datetime(2099, 1, 2, 8, tzinfo=UTC))
+                self.assertIn("unavailable", errors.getvalue())
+                self.assertIn("missing-owner", errors.getvalue())
+
+    def test_row_reports_missing_owner_and_keeps_readable_efficiency_count(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            environment = {**source_environment(root / "sources"), "HOME": str(root),
+                           "HERDR_BIN": "/nonexistent/herdr", "USER_ZONE": "UTC"}
+            with (isolated_staff_file(root / "staff.json", environment),
+                  mock.patch.dict(os.environ, environment), isolated_source_readers()):
+                owner = fixture_member("showrunner", name="display-owner")
+                ledger = root / "ledger.md"
+                _ = ledger.write_text("- 2026-11-04 Improve the layout — proposed\n")
+                document = root / "unowned-production.md"
+                _ = document.write_text("> **Status: PRODUCTION — running.** Test\n"
+                                        + f"- **Efficiency ledger:** {ledger}\n")
+                instance = Path(environment["NOTIFIER_STATE_DIR"]) / "showrunner-unowned"
+                instance.mkdir(parents=True)
+                _ = (instance / "conf").write_text(
+                    f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {document}\n")
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    line, due, paths = counts_row.row(instance)
+                self.assertEqual(line, "For you: 1 efficiency")
+                self.assertEqual(due, "")
+                self.assertIn(document, paths)
+                self.assertIn(ledger, paths)
+                self.assertIn("unavailable", errors.getvalue())
+
+    def test_switch_and_outstanding_paths_keep_the_fixed_staff_id(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            environment = {"HOME": str(root), "HERDR_BIN": "/nonexistent/herdr",
+                           "SHOWRUNNER_STATE_DIR": str(root / "showrunner")}
+            with (isolated_staff_file(root / "staff.json", environment),
+                  mock.patch.dict(os.environ, environment)):
+                owner = fixture_member("showrunner", name="display-name", runtime_id=fixture_runtime_id("footer-owner"))
+                _ = staff.update_current_session(owner.current_session, staff.native_id(fixture_runtime_id("footer-current")))
+                self.assertEqual(showrunner_footer.review_pause_path(owner.id),
+                                 root / "showrunner/review-paused" / f"{owner.id}.json")
+                self.assertEqual(showrunner_footer.outstanding_path(owner.id),
+                                 root / "showrunner/outstanding" / f"{owner.id}.json")
+                _ = staff.rename(owner.id, "renamed-owner")
+                self.assertEqual(showrunner_footer.review_pause_path(owner.id),
+                                 root / "showrunner/review-paused" / f"{owner.id}.json")
+
     def test_read_production_skips_wrapped_doc(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -27,6 +100,41 @@ class QuestionLibraryTests(unittest.TestCase):
             _ = doc.write_text("> **Status: PRODUCTION — wrapped.** demo\n- **User zone:** America/Los_Angeles — demo\n")
             _ = (instance / "conf").write_text(f"CHECK=zsh /x/production_check.sh {doc}\n")
             self.assertIsNone(showrunner_footer.read_production(instance))
+
+    def test_hierarchy_counts_one_canonical_question_with_its_fixed_reminder_path(self) -> None:
+        from scripts.hierarchies import measure, log_records
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            state = root / "state"
+            environment = {**source_environment(root / "sources"), "HOME": str(root),
+                           "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(state / "showrunner")}
+            with (isolated_staff_file(root / "staff.json", environment),
+                  mock.patch.dict(os.environ, environment), isolated_source_readers()):
+                document = root / "legacy-production.md"
+                _ = document.write_text("# Production\n")
+                owner = fixture_member("showrunner", name="display-owner", doc=staff.LiveDoc("natedev", document))
+                _ = staff.update_current_session(owner.current_session, staff.native_id(fixture_runtime_id("hierarchy-clear")))
+                questions = state / "showrunner" / owner.id / "questions"
+                questions.mkdir(parents=True)
+                fields = {"since": "2000-01-01T08:00", "text": "Choose the layout", "question": "Keep the layout?",
+                          "asked_by": str(owner.id)}
+                _ = (questions / "question-layout.md").write_text(
+                    "---\nrecord_type: question\nstatus: open\n"
+                    + f"production_id: {owner.id}\nasked_by: {owner.id}\nregistration: {json.dumps(fields)}\n---\n")
+                reminders = state / "showrunner/outstanding"
+                reminders.mkdir()
+                _ = (reminders / f"{owner.id}.json").write_text("[]\n")
+                vault = root / "vault"
+                (vault / "change-review").mkdir(parents=True)
+                for relative in ("plan-backlog/ledger.md", "nightly-review/ledger.md"):
+                    path = state / relative
+                    path.parent.mkdir(parents=True)
+                    _ = path.write_text("")
+                problems: list[log_records.SourceProblem] = []
+                waiting = measure.read_waiting(state, vault, [], problems)
+                self.assertEqual([item.kind for item in waiting], ["questions"])
+                self.assertEqual(problems, [])
 
     def test_counts_and_deferred_time_share_one_question_staff_context(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -59,9 +167,15 @@ class QuestionLibraryTests(unittest.TestCase):
                         "---\nrecord_type: question\nstatus: open\n"
                         + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
                         + f"registration: {json.dumps(fields)}\n---\n# {title}\n", encoding="utf-8")
+                identities = QuestionStaff.read()
                 with (mock.patch.object(counts_row, "showrunner_footer", showrunner_footer),
-                      mock.patch.object(QuestionStaff, "read", wraps=QuestionStaff.read) as read_context):
+                      mock.patch.object(QuestionStaff, "read", return_value=identities) as read_context,
+                      mock.patch.object(showrunner_footer, "outstanding_path",
+                                        wraps=showrunner_footer.outstanding_path) as outstanding):
                     line, due, sources = counts_row.row(instance)
+                self.assertTrue(outstanding.call_args_list)
+                for call in outstanding.call_args_list:
+                    self.assertIs(cast(object, call.kwargs["identities"]), identities)
                 self.assertEqual(line, "For you: 1 question")
                 self.assertEqual(due, str(int(datetime(2099, 1, 2, 8, tzinfo=UTC).timestamp())))
                 self.assertIn(doc, sources)

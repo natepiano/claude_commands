@@ -15,7 +15,8 @@ from typing import IO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.production import session_staff, staff
+from scripts.production import rename_unit, session_staff, staff
+from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, fixture_showrunner_name, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
@@ -23,7 +24,6 @@ from scripts.production.update_registration_test_support import RegistrationFixt
 import dailies_input
 import footer_counts
 import next_item
-import rename_state
 import tidy_wrapped
 from scripts.hooks import showrunner_footer
 
@@ -146,7 +146,7 @@ class RegistrationTests(RegistrationFixture):
         prompt = prompts[0].read_text(encoding="utf-8")
         self.assertIn("unit_status.txt", prompt)
         self.assertIn("/showrunner:dailies gantt", prompt)
-        state_dir = self.state / "showrunner" / self.doc.name.removesuffix("-production.md") / "session"
+        state_dir = self.state / "showrunner" / self.fixture_staff_id() / "session"
         self.assertEqual(prompt.count(f"Pass `--render-state {state_dir}/dailies_state.json` to the builder"), 1)
         self.assertIn(f"unit_status.sh {state_dir}/unit_status ", prompt)
         self.assertNotIn("<STATE_DIR>", prompt)
@@ -297,9 +297,20 @@ class QuestionIdentityTests(RegistrationFixture):
         self.file_question()
         self.migrate()
         before = {path: path.read_bytes() for path in self.issues.glob("*.md")}
+        row = staff.by_id(self.asker_id)
+        assert row is not None
+        removed = self.root / "removed-asker-worktree"
+        self.assertFalse(removed.exists())
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", removed),
+                                 expected=row.worktree)
+        displays = RenameDisplays(row, live=False)
         with (self.forbid_legacy_question_access(),
-              mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner")):
-            self.assertFalse(rename_state.rename_outstanding("example", (("alpha-unit", "renamed-unit"),)))
+              displays.installed(), redirect_stdout(io.StringIO())):
+            _ = rename_unit.apply("example", "alpha", "renamed")
+            renamed = staff.by_id(self.asker_id)
+            assert renamed is not None
+            self.assertEqual((renamed.id, renamed.name), (self.asker_id, "renamed"))
+            _ = rename_unit.apply("example", "renamed", "renamed")
         self.assertEqual({path: path.read_bytes() for path in self.issues.glob("*.md")}, before)
         self.assertEqual(self.question_rows()[0]["asked_by"], self.asker_id)
 
@@ -621,6 +632,28 @@ class QuestionIdentityTests(RegistrationFixture):
         rows = self.question_rows()
         self.assertEqual(rows[0]["asked_by"], self.asker_id)
         self.assertEqual(rows[0]["review_unavailable"], "fixture timeout")
+
+    def test_open_and_answer_use_the_document_owner_without_a_timer_after_rename(self) -> None:
+        self.file_question()
+        owner = staff.snapshot().by_doc("natedev", self.doc)
+        assert owner is not None
+        timer = self.state / "notifier/showrunner-example"
+        shutil.rmtree(timer)
+        _ = staff.rename(owner.id, "different-display-name")
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            identities = registration.QuestionStaff.read()
+            self.assertNotIn("example", identities.sources.productions)
+            self.assertEqual(identities.documents()["example"], self.doc)
+            self.assertEqual(registration.outstanding_file("example", identities=identities),
+                             self.state / "showrunner/outstanding" / f"{owner.id}.json")
+        listed = self.run_command("open")
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertIn("Keep the layout?", listed.stdout)
+        answered = self.run_command("answer", "--item", "Choose the layout")
+        self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+        self.assertEqual(self.question_rows(), [])
+        self.assertFalse(timer.exists())
+        self.assertFalse((self.state / "showrunner/outstanding/example.json").exists())
 
 
 if __name__ == "__main__":

@@ -193,7 +193,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
             self.assertEqual(autocompact.recorded("62ccbd64-f22e-5647-b20e-7899aa39d766"), "200k")
 
     def test_registered_unit_autocompact_records_without_new_work_checks(self) -> None:
-        _ = self.commit_row_off_the_naming_pattern()
+        _ = self.commit_row_off_the_naming_pattern(session_id="3001165e-ca76-59c2-9490-878224585fad")
         before = self.repository_state()
         result = self.set_unit_autocompact("200k")
         self.assertEqual(result.stdout.strip(),
@@ -204,7 +204,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         self.assertEqual(self.herdr_calls(), [])
 
     def test_registered_unit_autocompact_auto_deletes_the_record(self) -> None:
-        _ = self.commit_row_off_the_naming_pattern()
+        _ = self.commit_row_off_the_naming_pattern(session_id="3001165e-ca76-59c2-9490-878224585fad")
         with patch.dict(os.environ, self.env):
             autocompact.record("3001165e-ca76-59c2-9490-878224585fad", "200k")
         result = self.set_unit_autocompact("auto")
@@ -214,7 +214,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         self.assertEqual(self.herdr_calls(), [])
 
     def test_registered_unit_autocompact_check_writes_nothing(self) -> None:
-        _ = self.commit_row_off_the_naming_pattern()
+        _ = self.commit_row_off_the_naming_pattern(session_id="3001165e-ca76-59c2-9490-878224585fad")
         before = self.repository_state()
         result = self.set_unit_autocompact("300k", "--check")
         self.assertEqual(result.stdout.strip(),

@@ -393,12 +393,11 @@ def unregistered_showrunners(
 def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, UnitMarks]:
     """Each running unit director of a registered production, by session id.
 
-    One read of every production's marks (`unit_lookup.every_marked_unit`) serves them all. A
-    production with no showrunner timer has no doc to restart its units from, so its units are not
-    counted here; a production whose marks are at fault is left out by the lookup.
+    Read the native session labels once for all productions.
+    Omit productions that have no showrunner timer or have faulty session labels.
     """
     try:
-        every = unit_lookup.every_marked_unit()
+        every = unit_lookup.every_labeled_session()
     except OSError:
         return {}
     docs = {runner.slug: runner.doc for runner in runners}
@@ -406,15 +405,15 @@ def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, Uni
     for slug, units in every.units.items():
         if slug not in docs:
             continue
-        for unit_id, marked_unit in units.items():
-            claude = marked_unit.claude
+        for unit_id, labeled_session in units.items():
+            claude = labeled_session.claude
             if not isinstance(claude, unit_lookup.LiveClaude):
                 continue
             found[claude.session_id] = UnitMarks(
                 production=slug,
                 unit=unit_id,
                 doc=docs[slug],
-                session_name=marked_unit.place.session,
+                session_name=labeled_session.place.session,
                 session_host="herdr",
             )
     return found
