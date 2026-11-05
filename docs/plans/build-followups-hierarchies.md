@@ -582,3 +582,80 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Acceptance gate:**
 - The unittest module `scripts/production/test_transfer_unit.py` passes, and basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
 - Live, from main after the merge: transfer hierarchies-unit to builds and back to sdlc. Each transfer prints `told hierarchies-unit`, the unit gets the message, its status line names the new production, and its tab is in its A-Z place.
+
+### Phase 22 — Displays read workers through observe  · status: todo
+
+**Depends on:** panes Phases 7, 8 and 9 (herdr 7+8+9 on sdlc, about 17:30 EST 2026-11-05), and style-unit's `scripts/message/roster.py` fix. This is Phase 13 of `docs/plans/herdr-worker-panes.md`, given to this unit by sdlc on 2026-11-05. It shares one gate with panes Phases 10 and 12, over the exact final batch.
+
+#### Work Order
+
+**Goal:** each display shows a pane worker through `worker_panes.observe`, the one join of worker rows and herdr panes. A mesh-pinned run displays as it does today.
+
+**Design facts (read by the unit director at herdr 10b59f7f9 and sdlc 3b42139d0):**
+- Each `observe(parent, record)` makes one full pane read: `client.panes()`, `scan_row_panes` and `client.agents()`. A display with about 30 parents must not make 30 reads.
+- `observe` sees only this machine's panes. A worker of the other machine's parent would read as `ClosedWorker`, which is wrong.
+- Every run today is mesh-pinned, and a mesh worker has no pane. `observe` on its row gives `ClosedWorker`, which is wrong.
+- `unit_runs.worker_transport(run)` writes the pin file when it is absent. A display must write nothing.
+- `scripts/hierarchies/` is deleted (Phase 19), so `measure.py` and `worker_owners.py` leave this phase. The `worker_owners.py` retained branches in the panes plan no longer exist.
+
+**Spec:**
+
+1. **Which parents use panes.** Add `unit_runs.parent_transport(session_id: str) -> Literal["mesh", "herdr"]`. It reads the pin of the session's first held run. With no held run or no pin it reads the configured `WORKER_TRANSPORT`. It writes nothing. Add `session_staff.pane_parents(record) -> list[staff.StaffRow]`: the rows with worker children, whose location is on this machine and whose `parent_transport` is `herdr`.
+2. **One read for many parents.** Add `worker_panes.observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]`. It makes one pane read and gives each parent its states. Split the read out of `_evidence`; `observe` keeps its signature and its behavior. With no parents it makes no herdr call. Import `worker_panes` inside the function that needs it, after `pane_parents` is not empty, so a run with no pane parent pays no import.
+3. **The five states.** Each converted display shows:
+   - `OpenWorker` with its pane and status.
+   - `StoppedWorker` as stopped, and `ClosedWorker` as closed.
+   - `ProcessUnknownWorker` with its known pane and reason as unknown, never as stopped or absent.
+   - `UncertainWorker` as incomplete with its reason, never as closed.
+4. **Displays to convert.**
+   - `scripts/message/roster.py`: add one entry for each worker of `pane_parents`. An `OpenWorker` is `Messageable("worker:<unit>/<short name>")` (the Phase 9 address). Other states are `CannotReceiveMessages(<state and reason>)`. Add each observed native id to `worker_threads`, so that its process does not appear a second time. The mesh loop stays for mesh-pinned runs.
+   - `scripts/production/staff_sources.py` `live`: a worker of `pane_parents` gets one new member field, `pane_state`: `open`, `stopped`, `closed`, `unknown` or `incomplete`. The schema number stays 3. `unknown` and `incomplete` set `complete` to false and add a problem with the reason. Other members do not change. Check the handler that reads this output and report if an added field breaks it.
+   - `scripts/direct/board_json.py` `workers`: a herdr-pinned run lists its workers from `observe_parents`. The mesh branch stays for mesh-pinned runs.
+   - `scripts/production/codex_winddown.py`: count each `OpenWorker` with a working status as a running agent, and name unknown and uncertain workers. A pane Codex is a plain `codex` process, which `is_codex_agent` does not count today.
+   - `scripts/lint/tmp_sweep.py`: a herdr-pinned run folder is in use while a worker of that run is `OpenWorker`, `ProcessUnknownWorker` or `UncertainWorker`. The mesh roster guards stay for mesh-pinned runs.
+5. **One snapshot per run.** Each display takes one `staff.snapshot()` per run and passes it to every `member`, `pane_parents` and `observe_parents` call.
+6. **Problems are shown, never an empty list.** When `snapshot()` raises `StaffUnreadable`, the display shows the reason as a problem line and no empty worker list: `roster.py` through `_problem`, `live` as a problem with the cause and on stderr, and each other display on stderr. A member that gives `NoSuchMember` gets its own problem line, which names the member.
+7. **No change, after a check.** `scripts/message/process_table.py`, `scripts/usage/waste_watch.py` and `scripts/shot_report/transcripts.py` read mesh text only for mesh-pinned runs, for a comment, or for history. Confirm this in the summary and change nothing. If one of them does read live pane workers, convert it under item 3.
+8. **Retained until panes Phase 18.** The mesh roster and server branches in `roster.py`, the mesh branch in `board_json.py`, the mesh start and follow recognition in `process_table.is_codex_agent`, and the mesh roster guards in `tmp_sweep.run_folder_guards`, `worker_use` and `cleanup_end_reason`. Keep no other mesh display path.
+9. Add no other check, guard or refusal. A check that a worker thinks is needed goes to the unit director, who asks the user.
+
+**Files:**
+- `scripts/lib/unit_runs.py`, `scripts/production/session_staff.py`, `scripts/herdr/worker_panes.py` and their tests — items 1 and 2.
+- `scripts/message/roster.py`, `scripts/production/staff_sources.py` and their tests — first writer.
+- `scripts/direct/board_json.py`, `scripts/production/codex_winddown.py`, `scripts/lint/tmp_sweep.py` and their tests — second writer, after items 1 and 2 are written.
+
+**Workers:** 2 writers. The first writes items 1 and 2 before the second starts.
+
+**Acceptance gate:**
+- Each converted display has a test of all five states. `ProcessUnknownWorker` is never shown as stopped or absent, and `UncertainWorker` never as closed.
+- A mesh-pinned run displays as it did: its existing tests pass with no change to their assertions.
+- A worker of the other machine's parent is not shown as closed.
+- A test counts the pane reads: `observe_parents` makes one read for many parents, and none for no parents.
+- No display writes a pin file.
+- Problem tests for each display: an unreachable owner (the fake `ssh` fails), a malformed record and a missing member each give a line that names the cause, and no empty worker list. A run makes one `snapshot()` call.
+- No display module calls `herdr agent list` outside `worker_panes`.
+- The checkpoint message records added and deleted source lines, each retained branch with its line count and its owner (panes Phase 18), and the time of one `observe_parents` read. The source count is a decrease when the retained lines count as deleted.
+- basedpyright reports 0/0/0 on changed files and every caller module. The shared full gate is green.
+
+**Known effect:** a pane with unknown evidence makes every closed worker `UncertainWorker` ("absence is unproved"). Morty's two bare `codex` panes are unknown today (pids 198033 and 294399), so every closed pane worker shows incomplete until those panes have a thread id.
+
+### Phase 23 — An unknown process does not refuse a staff write about another row  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** an unidentified process is a printed anomaly line, never a refusal (user rule, 2026-11-02). `astra_review.py` wrote its review on 2026-11-05 and then exited 1 at teardown: `staff.retire` raised `StaffUnreadable` ("Codex process 198033: native thread identity is unavailable"). Pid 198033 is one of Morty's bare `codex` panes.
+
+**Cause (found by the unit director):** `staff.retire` calls `require_stopped`, which calls `staff_sources.require_worker_stopped`, which calls `observe_workers` with its default policy `UnavailableWorkerPolicy.REFUSE`. That policy raises when any process on the machine has no thread id, whichever row the write is about.
+
+**Spec:**
+1. `scripts/production/staff_sources.py`: delete `UnavailableWorkerPolicy` and its two raises. `observe_workers` always returns its diagnostics.
+2. `require_worker_stopped`: print each diagnostic on stderr as `anomaly: <line>` and continue. It still refuses when the target's own native id is live. A `peer.problems` entry is also printed as an anomaly and is no longer a refusal; the peer's entries are still checked. `PeerNotReached` stays a refusal, because it is about the target's own machine.
+3. `scripts/production/migrate_staff_ids.py` keeps its behavior: it already adds the diagnostics to its missing list.
+4. Add no other check, guard or refusal. `live` and its `complete` field do not change in this phase.
+
+**Acceptance gate:**
+- One new test: `staff.retire` of a stopped row retires it while another Codex process has no thread id, and the anomaly line is printed.
+- The tests of the deleted policy lose their `assertRaises` blocks and the policy argument. Tests that the target's own live session refuses still pass, unchanged.
+- The unittest modules of every changed test file pass, and basedpyright on every changed file ends `0 errors, 0 warnings, 0 notes`.

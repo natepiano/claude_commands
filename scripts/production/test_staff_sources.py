@@ -236,9 +236,7 @@ class StaffSourcesTests(StaffTestCase):
         sources = MemberSources({}, (launch,))
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(record, sources)
-            evidence = staff_sources.observe_workers(record, sources, unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(record, sources)
         expected = "staff sources: Codex process 42401: native thread identity is unavailable"
         self.assertEqual(evidence.diagnostics, (expected,))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
@@ -273,10 +271,7 @@ class StaffSourcesTests(StaffTestCase):
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
-            evidence = staff_sources.observe_workers(
-                staff.snapshot(), MemberSources({}, (launch,)), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
         self.assertEqual(evidence.diagnostics, (
             "staff sources: Codex process 42401: native thread identity is unavailable",))
 
@@ -320,10 +315,7 @@ class StaffSourcesTests(StaffTestCase):
             42401, 1, "node", 'node /modules/@openai/codex/bin/codex.js --config "unfinished')}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment") as environment):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
-            evidence = staff_sources.observe_workers(
-                staff.StaffSnapshot(()), MemberSources({}, ()), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
         environment.assert_not_called()
         self.assertEqual(evidence.diagnostics,
                          ("staff sources: Codex process scan: pid 42401: No closing quotation",))
@@ -333,10 +325,7 @@ class StaffSourcesTests(StaffTestCase):
         from scripts.message import process_table
 
         with mock.patch.object(process_table, "snapshot", side_effect=OSError("process table unavailable")):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
-            evidence = staff_sources.observe_workers(
-                staff.StaffSnapshot(()), MemberSources({}, ()), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
         self.assertEqual(evidence.diagnostics, ("staff sources: Codex processes: process table unavailable",))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
 
@@ -796,3 +785,19 @@ class StaffWorkerIdentityTests(StaffTestCase):
         evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, ()), current_only=True)
         self.assertEqual(evidence.workers, ())
         staff_sources.require_worker_stopped(staff.snapshot(), worker.id)
+
+    def test_retire_stopped_worker_prints_an_anomaly_for_another_codex_process(self) -> None:
+        from scripts.message import process_table
+
+        runner, owner, worker = self.tree()
+        launch = pane_record.launch("test:pane", owner.current_session, str(self.root), {}, [])
+        table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"}),
+              mock.patch.object(session_staff, "member_sources", return_value=MemberSources({}, (launch,))),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(staff.retire(worker.id), worker)
+        self.assertIsNone(staff.by_id(worker.id))
+        self.assertEqual(staff.snapshot().rows, tuple(sorted((runner, owner), key=lambda row: row.id)))
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "anomaly: staff sources: Codex process 42401: native thread identity is unavailable"])

@@ -11,7 +11,6 @@ import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
 import sys
 from pathlib import Path
 from typing import cast, override
@@ -299,13 +298,7 @@ class WorkerEvidence:
     diagnostics: tuple[str, ...]
 
 
-class UnavailableWorkerPolicy(Enum):
-    REFUSE = "refuse"
-    LIST = "list"
-
-
 def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
-                    unavailable: UnavailableWorkerPolicy = UnavailableWorkerPolicy.REFUSE,
                     current_only: bool = False) -> WorkerEvidence:
     """Expose the shared scanner without dropping missing rows or acquiring a lock."""
     errors = io.StringIO()
@@ -313,11 +306,7 @@ def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
         scan = _WorkerSources(record, sources)
         observed = scan.collect(current_only=current_only)
     if scan.claude_registry_incomplete:
-        if unavailable is UnavailableWorkerPolicy.REFUSE:
-            raise staff.StaffUnreadable("Claude session registry is incomplete")
         _ = errors.write("Claude session registry is incomplete\n")
-    if scan.codex_scan_incomplete and unavailable is UnavailableWorkerPolicy.REFUSE:
-        raise staff.StaffUnreadable(errors.getvalue().strip())
     diagnostics = tuple(errors.getvalue().splitlines())
     return WorkerEvidence(observed, scan.identities, diagnostics)
 
@@ -593,6 +582,8 @@ def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tupl
 def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId) -> None:
     """Refuse removal while worker or peer evidence still names the native id."""
     evidence = observe_workers(record, session_staff.member_sources(), current_only=True)
+    for diagnostic in evidence.diagnostics:
+        print(f"anomaly: {diagnostic}", file=sys.stderr)
     member = record.by_id(identity)
     current_session = member.current_session if member is not None else identity
     if identity in evidence.identities or any(
@@ -610,8 +601,8 @@ def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId)
                 peer = roster.peer_snapshot(os.environ)
                 if isinstance(peer, roster.PeerNotReached):
                     raise staff.StaffRefused(f"{identity}: remote native session state is uncertain: {peer.reason}")
-                if peer.problems:
-                    raise staff.StaffRefused(f"{identity}: remote native session state is uncertain: {peer.problems[0]}")
+                for diagnostic in peer.problems:
+                    print(f"anomaly: {diagnostic}", file=sys.stderr)
                 for entry in peer.entries:
                     native = (entry.session.session_id if isinstance(entry.session, roster.ClaudeSession)
                               else entry.thread.thread_id if isinstance(entry.thread, roster.CodexThread) else "")
