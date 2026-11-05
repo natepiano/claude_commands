@@ -1,183 +1,238 @@
 #!/usr/bin/env bash
-# verify.sh — The only build/test/lint commands a worker may run.
-#
-# Work Orders list exact invocations of this script; the worker composes no
-# cargo flags and makes no scope choices. `check` pins lib and bin targets;
-# `test` selects the package's test targets; examples are never test targets.
-# `build` builds one package's binaries, or one bin or example, so a smoke run
-# or live shot can launch it, and prints each binary's path.
-# Lint checks all targets and features. Taplo checks workspace TOML files.
-# `example` checks one example. The director runs `final` with all targets.
-# `final` rejects examples with tests before nextest runs with --tests.
-# `build` prints binary paths for smoke checks.
-#
-# Package selection is always --workspace. Non-release check, test, final,
-# doc and build add workspace.metadata.dev.features to Work Order features.
-# `lint` is unchanged; its clippy always uses all features.
-# Cargo resolves features per invocation from the selected packages, so `-p <pkg>`
-# gives every member its own feature set for bevy and the rest of the
-# dependency tree, and each set is a separate compile of that tree in the
-# shared target directory: nine to eleven copies of bevy_render across the
-# members, which evict one another under the sweep budget and rebuild in
-# minutes each time a phase moves to a new package. --workspace resolves one
-# set for the whole tree, so commands with the same feature set reuse one
-# compiled copy. `lint`'s all-features clippy shares its set with the push gate.
-# The package argument still decides what runs and what is reported: nextest
-# filters to it with -E 'package(<pkg>)', and --features qualifies its list
-# with it. `test` builds the named package's test targets, plus workspace libs
-# when the package has a lib.
-#
-# `doc` documents the whole workspace with warnings denied, as the unit
-# director's last command before a Rust checkpoint. Workers may run it too.
-# Unlike lint stages, this phase check cannot be switched off in lint.conf.
-# A pass is stored in ~/.local/state/verify/doc_pass/<tree>.json, keyed by the staged index.
-# `copies.py hold` locks a standing checkout under the configured copies root and fills it from the staged index.
-# Unstaged and untracked files are excluded. The real index is unchanged. A staged tree
-# changed during the run records nothing.
-# Records outlive worker sessions and are pruned after 14 days on each write.
-#
-# Use config/lint.conf to select lint stages. Taplo always checks the workspace.
-# Check, test, and checkpoint rustdoc always run. Clippy judges before repairs.
-# Only status 101 without a kill or a hold permits Clippy repairs.
-#
-# A worker session remembers passes. With UNIT_RUN_DIR or
-# UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
-# <session>/verify_cache/, keyed by the working tree its verdict was judged on,
-# the arguments, rustc -vV, lint.conf, verify.sh, invoke.sh and the
-# RUST*/CARGO_*/NEXTEST_* environment. Lint keys also include the versions
-# of mend, nightly rustfmt, clippy and Taplo.
-# A plain `lint <package>` leaves the package out of the key:
-# every lint stage but fmt covers the workspace, and fmt covers every member
-# that differs from HEAD, so one lint record answers for each package. A
-# `test` key holds only the part of the tree its package is built from
-# (TREE_KEY_PY), so a second phase editing another member in the same worktree
-# neither drops the pass nor misses it. No key holds the files under the
-# session folder (--session-dir, UNIT_RUN_DIR) when it is inside the worktree:
-# the call writes its own log and board there while it runs. A `test --filter` key holds its names
-# sorted, each once, so one set of names finds one record whatever order a call
-# gives them in. The same call on the
-# same tree then prints that record and its log and exits 0 without the cargo
-# token: workers re-ran unchanged trees 416 times in the week to 2026-10-01. A
-# `test --filter` reuse prints one line instead, since iteration feedback needs
-# only the verdict. A failed `lint` is recorded the same way
-# and replayed with its full output and exit status, since lint on an
-# unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
-# A failed `test` is never recorded (tests flake), nor a run cut short by a
-# usage error, the sandbox or a kill. A lint failure is not recorded when the
-# last allowed clippy fix and format pass still changed the tree. The judged tree is
-# the tree when the run starts, or for `lint` the tree invoke_clippy_fix and formatting leave
-# for clippy judgment. A run that ends on any other tree (for `test`,
-# any other part of it the package is built from) records nothing: an edit
-# landed while it ran, and its verdict belongs to neither tree.
-# A test or lint run outside a worker session is never cached.
-# end_session.sh deletes the records when the run ends.
-#
-# Each record carries what a repeat would cost: the run's wall time minus
-# cargo's own "Finished … in" build times, since a repeat on the same tree
-# builds nothing. Every call, of every verb, in a worker session or not,
-# leaves one call record in the build log (~/.local/state/buildlog; `buildlog
-# schema` lists its fields): ran, failed, interrupted, cancelled (exit 77: the
-# input tree changed during test or lint judgment), reused (a pass),
-# replayed (a lint failure) or superseded (exit 76: a newer call of the same
-# verb from the same worker replaced it in the token queue), with the seconds saved and the repo, worktree,
-# branch and commit. The steps it ran carry the same call id. The build log
-# outlives the records; /verify_saved reports the time saved.
+# verify.sh runs the shared Cargo commands for people and workers.
 #
 # Usage:
-#   verify.sh check <package> [--keep-going]
-#                                          fast compile feedback (workspace
-#                                          lib + bins); --keep-going reads every
-#                                          crate's result past the first that fails
-#   verify.sh test <package>               the package's unit + integration tests
-#                                          (package targets; workspace libs if any);
-#                                          refuse examples that hold a test
-#                                          or set test = true
-#   verify.sh test <package> <int_test>    one named integration test target,
-#                                          for re-running it alone
-#   verify.sh test <package> --filter <name> [--filter <name> …]
-#                                          only the package's tests whose name
-#                                          contains any <name>, while iterating;
-#                                          never a gate: its pass is recorded
-#                                          under its own words, so it never
-#                                          answers `test <package>`. Repeat
-#                                          --filter to run a change's tests in
-#                                          one call; in a worker session the
-#                                          same names, in any order, on an
-#                                          unchanged tree print one line and
-#                                          build nothing
-#   verify.sh lint <package>               mend --fix, nightly fmt of the package
-#                                          and the members that differ from HEAD,
-#                                          workspace taplo fmt --check,
-#                                          workspace clippy judgment; on status 101
-#                                          without a kill, fix + fmt, then judgment
-#                                          on all targets with all features
-#                                          (warnings denied)
-#                                          — cargo stages gated by config/lint.conf;
-#                                          taplo always checks TOML formatting
-#   verify.sh lint --workspace [--check]   the same gate with fmt over all members;
-#                                          emits style-lint tool boundaries for records
-#                                          --check reports mend findings and checks
-#                                          formatting without applying fixes
-#   verify.sh final-pass [<tree>]          read a matching machine-wide final pass
-#   verify.sh doc [--features <list>]      workspace rustdoc, warnings denied;
-#                                          mandatory before a Rust checkpoint,
-#                                          regardless of lint.conf; workspace
-#                                          feature names pass through unchanged
-#   … [--features <list>]                  check and test accept one trailing
-#                                          `--features a,b` when the Work Order names
-#                                          it. Names without a `/` are qualified as
-#                                          <package>/<name>. check, test, final,
-#                                          doc and non-release build also add
-#                                          [workspace.metadata.dev] features,
-#                                          without duplicates; lint is unchanged
-#   … --no-cache                           test and lint: run even when this
-#                                          exact call already passed (or lint
-#                                          failed) on this tree, a flake hunt;
-#                                          the result replaces the record
-#   … --target <name>                      pin test, check, or doc to a configured SSH target;
-#                                          keep admission and version checks; never run locally
-#   verify.sh test <package> --mac "<why>" [--env NAME …] [--fetch <folder>]
-#                                          Mac only; wait when busy, never fall back;
-#                                          forward named variables and fetch one ignored folder
-#   verify.sh test <package> --local "<why>"   run on natedev; only for a test that cannot pass on macOS.
-#                                          Before CI either machine answers a test,
-#                                          merge gates included; CI is the protection
-#                                          (user, 2026-10-16). A pass the Mac ran
-#                                          does not answer --local
-#   verify.sh example <package> <name>     clippy one example (only when the
-#                                          phase changed that example)
-#   verify.sh build <package> [--bin <name> | --example <name>] [--release]
-#                                          build the package's binaries, or the
-#                                          one named bin or example, for a smoke
-#                                          run or a live shot, and print each
-#                                          binary's path (`binary: <path>`);
-#                                          an example's required features are
-#                                          turned on. Accepts --features <list>
-#   verify.sh final                        full workspace gate (unit director only);
-#                                          check all targets; nextest uses --tests
-#                                          so no example is linked; refuse examples
-#                                          that hold a test or set test = true
-#                                          so no tests are lost
-#   verify.sh --session-dir <dir> …        any of the above inside a worker
-#                                          session; same as setting
-#                                          UNIT_SESSION_DIR=<dir>
+#   verify <command> [flags]
 #
-# `final` always runs the full gate. A clean, unchanged tree that passes gets
-# ~/.local/state/verify/final_pass/<tree>.json (VERIFY_STATE_DIR sets its parent).
-# `final-pass [<tree>]` reads that proof without Cargo or build admission. It
-# requires the current rustc -vV and verify.sh hash. No tree argument means
-# the current clean HEAD tree. Writes prune records older than 14 days.
+# Commands:
+#   check <package>      check workspace libraries and binaries
+#   test <package>       run package tests; try the Mac, else natedev
+#   lint <package>       repair and format code; check TOML and run Clippy
+#   doc                  document the staged workspace; deny warnings
+#   example <pkg> <name> run Clippy on one example on natedev
+#   build <package>      build binaries on natedev and print their paths
+#   final                check all workspace targets and run all tests on natedev
+#   final-pass [<tree>]  read a saved full workspace pass
+#   help <command>       show details for one command
 #
-# Invocation policy — canonical flags, lint.conf gating, sandbox-failure
-# detection — lives in scripts/lint/invoke.sh, the
-# single bottom layer, sourced below. This file adds only worker scope rules
-# on top. Shell aliases, validate_ci and release checks use the lint CLI in that
-# directory instead of this script.
+# Flags:
+#   --filter <name>      test: select names; repeat to select more names
+#   --features <list>    check, test, doc, build: enable Cargo features
+#   --no-cache           test, lint: ignore saved results
+#   --target <name>      test, check, doc: use one configured SSH target
+#   --mac "<reason>"     test: wait for the Mac; never use natedev
+#   --local "<reason>"   test: use natedev when the test cannot pass on macOS
+#   --session-dir <dir>  use a worker session; put this before the command
+# End usage.
 #
-# Exit codes: 2 = usage error, missing tooling or a Mac-only refusal; 3 = sandbox failure, re-run
-# the same command unsandboxed; anything else is the underlying tool status.
+# Help check:
+# Usage: verify check <package> [--keep-going] [--features <list>]
+#
+# Check workspace libraries and binaries without producing executables.
+# The package must exist. Cargo resolves features for the whole workspace.
+# --keep-going continues after a crate fails.
+# Names without a slash in --features belong to the named package.
+# Add workspace.metadata.dev.features to the requested features.
+# Normally run on natedev. Eligible SSH targets can run compiling steps
+# when natedev must wait. --target selects one configured SSH target.
+# Always run this check; do not reuse a saved result.
+# End help.
+#
+# Help test:
+# Usage: verify test <package> [<integration_test>] [flags]
+#
+# Run the package's unit and integration tests with nextest.
+# Try eligible targets in config/build_targets.conf order.
+# The default order is Mac, natedev, then AWS.
+# A busy or unavailable Mac allows natedev to run the tests.
+# A test that requires Linux does not run on the Mac.
+# A waiting local test can retry on the Mac.
+#
+# Name an integration test target to run that target alone.
+# Repeat --filter <name> to select tests that contain any named text.
+# Do not combine an integration test target with --filter.
+# --features <list> enables features for the package.
+# Also add workspace.metadata.dev.features.
+# Cargo builds the package's test targets and workspace libraries as needed.
+# A full package run refuses examples that contain tests or set test = true.
+#
+# --mac "<reason>" waits for the Mac without a local fallback.
+# With --mac, repeat --env NAME to forward named environment variables.
+# --fetch <folder> retrieves one ignored folder from the Mac.
+# --local "<reason>" runs on natedev for a test that cannot pass on macOS.
+# --target <name> selects one configured SSH target without a local fallback.
+#
+# A manual run without a worker session always runs the tests.
+# UNIT_RUN_DIR, UNIT_SESSION_DIR or --session-dir enables saved results.
+# In that session, reuse a pass only when the tree and inputs still match.
+# Filtered runs have separate results. Failed tests always run again.
+# --no-cache ignores saved results. --target also ignores saved results.
+# End help.
+#
+# Help lint:
+# Usage: verify lint <package>
+#        verify lint --workspace [--check]
+#
+# Run mend repairs, nightly rustfmt, Taplo, then Clippy judgment.
+# Mend and Clippy cover the workspace. Clippy checks all targets and features.
+# Deny Clippy warnings. A clean judgment needs no Clippy repairs.
+# Status 101 permits Clippy repairs unless a kill or a hold prevents repairs.
+# Format after repairs, then judge again.
+# config/lint.conf selects mend, rustfmt and Clippy. Taplo always runs.
+#
+# Format the named package and members that differ from HEAD.
+# --workspace formats all members.
+# --workspace --check reports findings without applying fixes.
+# Tree writes stay on natedev. Eligible SSH targets can judge code
+# when natedev must wait. A natedev hold keeps formatting local.
+#
+# A manual run without a worker session always runs lint.
+# UNIT_RUN_DIR, UNIT_SESSION_DIR or --session-dir enables saved results.
+# In that session, reuse a pass or failure when the tree and inputs match.
+# A plain package lint result can answer another package in the workspace.
+# Do not save a result if edits change the tree after judgment.
+# --no-cache ignores saved results.
+# End help.
+#
+# Help doc:
+# Usage: verify doc [--features <list>] [--target <name>]
+#
+# Document the staged workspace with rustdoc. Deny warnings.
+# `copies.py hold` locks a standing checkout under the configured copies root.
+# Fill that checkout from the staged index. Exclude unstaged and untracked files.
+# Keep the real index unchanged.
+# Always run rustdoc, even with doc=off in config/lint.conf.
+# Normally run on natedev. Eligible SSH targets can run the rustdoc step
+# when natedev must wait. --target selects one configured SSH target.
+# Pass feature names unchanged. Also add workspace.metadata.dev.features.
+#
+# A Rust checkpoint requires a pass for its exact staged tree.
+# Save a pass under ~/.local/state/verify/doc_pass/<tree>.json.
+# A changed staged tree records no pass. Keep records across worker sessions.
+# Remove records older than 14 days when writing a record.
+# End help.
+#
+# Help example:
+# Usage: verify example <package> <name>
+#
+# Run Clippy on one example on natedev. Deny warnings.
+# Enable the example's required features for the named package.
+# Cargo resolves features for the whole workspace.
+# config/lint.conf can disable Clippy. Do not reuse a saved result.
+# Examples contain no tests. Use test for unit and integration tests.
+# End help.
+#
+# Help build:
+# Usage: verify build <package> [--bin <name> | --example <name>]
+#                     [--release] [--features <list>]
+#
+# Build the package's binaries on natedev.
+# --bin selects one binary. --example selects one example.
+# Enable the example's required features when building an example.
+# --release selects the release profile.
+# Names without a slash in --features belong to the named package.
+# For a debug build, also add workspace.metadata.dev.features.
+# Cargo resolves features for the whole workspace.
+# Print each executable as binary: <path> for a smoke run or a live view.
+# Always build; do not reuse a saved result.
+# End help.
+#
+# Help final:
+# Usage: verify final
+#
+# Check all workspace targets, then run workspace tests with nextest on natedev.
+# Add workspace.metadata.dev.features to both steps.
+# Check examples, but do not link them in nextest.
+# Refuse examples that contain tests or set test = true.
+# Run the full check and tests every time. Do not run lint or formatting.
+# The unit director uses this command for the final workspace gate.
+# A clean, unchanged tree gets a saved pass when both steps succeed.
+# Save it under ~/.local/state/verify/final_pass/<tree>.json.
+# VERIFY_STATE_DIR changes the state folder.
+# Remove records older than 14 days when writing a record.
+# End help.
+#
+# Help final-pass:
+# Usage: verify final-pass [<tree>]
+#
+# Read a saved full workspace pass without Cargo or build admission.
+# Without a tree argument, read the current clean HEAD tree.
+# Require the current rustc -vV and verify.sh hash to match the record.
+# Return 0 for a matching pass. Return 1 if the proof is absent or differs.
+# End help.
+#
+# Help example-test:
+# Usage: verify example-test
+#
+# This command was removed. Examples contain no tests.
+# Use verify test <package> for unit and integration tests.
+# End help.
+#
+# Help help:
+# Usage: verify help <command>
+#
+# Print details for one command without starting verification.
+# -h and --help print short usage and return 0.
+# No arguments print short usage to stderr and return 2.
+# A missing or unknown help command prints short usage to stderr and returns 2.
+# End help.
+#
+# Shared invocation policy lives in scripts/lint/invoke.sh.
+# This script adds command scope, routing, records and worker session rules.
+# Work Orders specify the command and flags for workers.
+# Workspace feature resolution avoids separate dependency builds per package.
+# Test and lint keys exclude session files because the call writes there.
+# Test keys cover package inputs. Lint keys include tool and policy versions.
+# Keys include arguments, rustc -vV, lint.conf, verify.sh and invoke.sh.
+# Keys also include the RUST*, CARGO_* and NEXTEST_* environment variables.
+# Lint keys include mend, nightly rustfmt, Clippy and Taplo versions.
+# Filter keys sort names and remove duplicate names.
+# Do not cache usage errors, sandbox failures or killed runs.
+# Do not cache lint failures if the last repair and format pass changed files.
+# Lint records use the tree left by repairs and formatting for judgment.
+# Session cleanup removes cached results. The build log keeps call records.
+# Saved time excludes Cargo build time because unchanged inputs need no build.
+# Call records include time, repository, worktree, branch, commit and call id.
+# Steps use the same call id. /verify_saved reports the saved time.
+# Status 77 means edits changed the tree during judgment.
+# Status 76 means a newer call replaced this call in the token queue.
+# Exit 2 means a usage error, missing tooling or a Mac-only refusal.
+# Exit 3 means a sandbox failure. Other statuses come from the tool.
 
 set -euo pipefail
+
+usage() {
+    sed -n '/^# Usage:$/,/^# End usage\./{
+        /^# End usage\./d
+        s/^# \{0,1\}//
+        p
+    }' "${BASH_SOURCE[0]}" >&"${1:-2}"
+}
+
+command_help() {
+    sed -n "/^# Help $1:/,/^# End help\./{
+        /^# Help /d
+        /^# End help\./d
+        s/^# \{0,1\}//
+        p
+    }" "${BASH_SOURCE[0]}"
+}
+
+# Help returns before environment setup, target queries or build records.
+case "${1:-}" in
+    -h|--help) usage 1; exit 0 ;;
+    '') usage; exit 2 ;;
+    help)
+        if [[ $# -eq 2 ]]; then
+            case "$2" in
+                check|test|lint|doc|example|build|final|final-pass|example-test|help)
+                    command_help "$2"; exit 0 ;;
+            esac
+        fi
+        usage; exit 2
+        ;;
+esac
+
 # Save exported values before script variables replace caller names.
 # The --env rule refuses the VERIFY_ prefix. env -0 works in every bash build;
 # a bash built without programmable completion has no compgen.
@@ -546,10 +601,6 @@ run_step() {
         echo "killed for memory: $*; retrying once" >&2
         : > "$step_log"
     done
-}
-
-usage() {
-    sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 }
 
 DEV_FEATURES_PY='
