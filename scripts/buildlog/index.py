@@ -42,7 +42,7 @@ else:
     from scripts.lib import conf
     from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 
 # These indexes support repeated queries over the current schema.
@@ -389,6 +389,7 @@ SAMPLE_COLUMNS: list[Column] = [
     ("slices", "TEXT", "JSON raw builds and CI slice readings; memory.current is the whole held charge"),
     ("filesystem", "TEXT", "JSON filesystem free/used/total and top-layer device identity"),
     ("jobserver", "TEXT", "JSON free pool tokens, not CPUs in use; measured or unavailable"),
+    ("zram", "TEXT", "JSON zram storage at the sample time"),
 ]
 
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [

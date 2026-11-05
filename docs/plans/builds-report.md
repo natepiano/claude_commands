@@ -406,7 +406,7 @@ Routed from resources' Phase 62 review (F021), through the builds showrunner (20
 **Workers:** 1 writer (rowcpu).
 
 
-### Phase 21 — Each memory tick writes one row  · status: todo
+### Phase 21 — Each memory tick writes one row  · status: done
 **Depends on:** none (from next items; showrunner 2026-11-04: open it now; natest P10 is on builds and the index.py freeze has ended)
 
 #### Work Order

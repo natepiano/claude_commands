@@ -552,7 +552,8 @@ The hold wait and token wait retain separate history records.
 
 ### Build log: records and schema
 
-Index `SCHEMA_VERSION = 25` (`scripts/buildlog/index.py`; `open_for_update` rebuilds on a mismatch). Memory and coordination columns:
+Index `SCHEMA_VERSION = 33` (`scripts/buildlog/index.py`). `open_for_update` rebuilds the index on a version mismatch.
+Memory and coordination columns:
 
 | Table | Column | Meaning |
 | --- | --- | --- |
@@ -562,19 +563,24 @@ Index `SCHEMA_VERSION = 25` (`scripts/buildlog/index.py`; `open_for_update` rebu
 | `calls` | `mem_kills`, `mem_kill_stopped` | memory-killed attempts; 1 when a step was killed twice |
 | `samples` | `builds_anon_bytes`, `ci_anon_bytes` | the `anon` line of each slice's `memory.stat` (process memory); NULL when absent |
 | `samples` | `sccache_in_service` | 1 when `builds.slice/sccache.service/cgroup.procs` holds a process, 0 when empty, NULL without `builds.slice` |
+| `samples` | `zram` | JSON zram storage at the sample time; NULL in older rows |
 | `memory_snapshots` | `src, host, at, slices, zram` | JSON slice counters and zram, indexed on `at` |
 | `ci_jobs` | `run_state` | `JobRunState.RAN / SKIPPED / CARRIED_OVER` |
 
 `steps.wait_s` keeps metadata and pass-record lookup time plus the ordinary build wait; `mem_wait_s` is memory admission. `calls.hold_wait_s` records held-target waiting separately, including each declined Mac retry, and `calls.target` names where the call ended. The Waiting table keeps `Held target` apart from `Memory admission`.
 
-**Slice snapshots** (`scripts/buildlog/memory.py`). Each `buildlog sample` tick writes a sample row and a `memory_snapshot` row.
-Only the sample row holds slices during the tick.
-The tick snapshot row holds `kind`, `at`, `host`, and `zram` only.
-The standalone `buildlog snapshot` row keeps slices because it has no sample row beside it.
+### Slice snapshots
+
+`scripts/buildlog/memory.py` supplies the slice snapshots.
+Each `buildlog sample` tick writes one sample row with slices and zram.
+`memory_snapshots` holds standalone snapshots and the zram-only tick rows of older logs, so the memory window reads both tables.
+The standalone `buildlog snapshot` row keeps slices and zram.
 Each slice (`builds` or `ci`) stores its events, peaks, limits, and memory pressure total.
 An absent slice has `state: absent`. An unreadable pressure total has the value `unavailable`.
 The zram reading stores the data and compressed bytes from `mm_stat`.
-A snapshot failure prints `memory snapshot unavailable` and preserves the sample.
+It takes the nearest slices value, then the nearest zram value, each from both tables.
+With no slices in range, the result is unavailable.
+Snapshot rows have priority on equal distances.
 `BUILDLOG_BUILDS_CGROUP`, `BUILDLOG_CI_CGROUP`, and `BUILDLOG_ZRAM` select fixture paths for tests.
 
 **CI jobs.** A job is `carried_over` when its attempt is above 1 and `started_at` precedes `created_at`, else `skipped` when its conclusion is `skipped`, else `ran`. Only `ran` rows store `duration_s` and `queued_s`; `queued_s` is `started_at - created_at` when both parse and the result is zero or more, else NULL. `elapsed_seconds(start, end) -> float | None` is unrounded; `seconds_between` rounds to 3 places. `ci_job_days` excludes `carried_over` and keys days by the run attempt's `started_at`.

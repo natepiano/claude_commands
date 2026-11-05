@@ -47,14 +47,11 @@ class ZramPresent(TypedDict):
     compressed_bytes: int
 
 
-class TickMemorySnapshot(TypedDict):
+class MemorySnapshot(TypedDict):
     kind: Literal["memory_snapshot"]
     at: str
     host: str
     zram: ZramPresent | ZramAbsent
-
-
-class MemorySnapshot(TickMemorySnapshot):
     slices: SliceCollection
 
 
@@ -162,31 +159,28 @@ def slice_state(path: Path) -> SlicePresent | SliceAbsent:
 
 
 def zram_state(path: Path) -> ZramPresent | ZramAbsent:
-    if not path.is_dir():
-        return {"state": "absent"}
     try:
+        if not path.is_dir():
+            return {"state": "absent"}
         data, compressed, *_ = (path / "mm_stat").read_text().split()
         return {"state": "present", "data_bytes": int(data), "compressed_bytes": int(compressed)}
     except (OSError, ValueError, UnicodeError):
         return {"state": "absent"}
 
 
-def tick_snapshot(at: float, host: str) -> TickMemorySnapshot:
-    return {
-        "kind": "memory_snapshot",
-        "at": store.utc_iso(at),
-        "host": host,
-        "zram": zram_state(Path(os.environ.get("BUILDLOG_ZRAM", "/sys/block/zram0"))),
-    }
-
-
-def write_snapshot(at: float, host: str) -> None:
-    store.append_line(store.sample_file(host, at), tick_snapshot(at, host))
+def read_zram() -> ZramPresent | ZramAbsent:
+    return zram_state(Path(os.environ.get("BUILDLOG_ZRAM", "/sys/block/zram0")))
 
 
 def snapshot() -> MemorySnapshot:
     at, host = time.time(), store.host_name()
-    record: MemorySnapshot = {**tick_snapshot(at, host), "slices": cgroup_capture.read_slices()}
+    record: MemorySnapshot = {
+        "kind": "memory_snapshot",
+        "at": store.utc_iso(at),
+        "host": host,
+        "zram": read_zram(),
+        "slices": cgroup_capture.read_slices(),
+    }
     store.append_line(store.sample_file(host, at), record)
     return record
 
@@ -323,28 +317,31 @@ def nearest_snapshot(connection: sqlite3.Connection, instant: datetime) -> Snaps
     right = stored_bound(instant + timedelta(seconds=SNAPSHOT_DISTANCE_S))
     host = store.host_name()
     bounds = (host, left, right)
-    rows = cast(list[tuple[str, str, str, int]], connection.execute(
-        "SELECT at, host, slices, 0 FROM memory_snapshots "
-        + "WHERE host = ? AND at >= ? AND at < ? AND slices IS NOT NULL "
-        + "UNION ALL SELECT at, host, slices, 1 FROM samples "
-        + "WHERE host = ? AND at >= ? AND at < ? AND slices IS NOT NULL",
-        (*bounds, *bounds),
-    ).fetchall())
-    if not rows:
-        return {"kind": "unavailable"}
-    at, host, slices, _ = min(rows, key=lambda row: (
-        abs(datetime.fromisoformat(row[0]).timestamp() - instant.timestamp()), row[3], row[0],
-    ))
-    zram_rows = cast(list[tuple[str, str]], connection.execute(
-        "SELECT at, zram FROM memory_snapshots WHERE host = ? AND at >= ? AND at < ? AND zram IS NOT NULL",
-        bounds,
-    ).fetchall())
-    zram: ZramPresent | ZramAbsent = {"state": "absent"}
-    if zram_rows:
-        _, reading = min(zram_rows, key=lambda row: (
-            abs(datetime.fromisoformat(row[0]).timestamp() - instant.timestamp()), row[0],
+    timestamp = instant.timestamp()
+
+    def nearest_value(column: Literal["slices", "zram"]) -> tuple[str, str] | None:
+        rows = cast(list[tuple[str, str, int]], connection.execute(
+            f"SELECT at, {column}, 0 FROM memory_snapshots "
+            + f"WHERE host = ? AND at >= ? AND at < ? AND {column} IS NOT NULL "
+            + f"UNION ALL SELECT at, {column}, 1 FROM samples "
+            + f"WHERE host = ? AND at >= ? AND at < ? AND {column} IS NOT NULL",
+            (*bounds, *bounds),
+        ).fetchall())
+        if not rows:
+            return None
+        nearest = min(rows, key=lambda row: (
+            abs(datetime.fromisoformat(row[0]).timestamp() - timestamp), row[2], row[0],
         ))
-        zram = cast(ZramPresent | ZramAbsent, json.loads(reading))
+        return nearest[0], nearest[1]
+
+    slices_reading = nearest_value("slices")
+    if slices_reading is None:
+        return {"kind": "unavailable"}
+    at, slices = slices_reading
+    zram_reading = nearest_value("zram")
+    zram: ZramPresent | ZramAbsent = {"state": "absent"}
+    if zram_reading is not None:
+        zram = cast(ZramPresent | ZramAbsent, json.loads(zram_reading[1]))
     return {"kind": "memory_snapshot", "at": at, "host": host,
             "slices": cast(SliceCollection, json.loads(slices)), "zram": zram}
 

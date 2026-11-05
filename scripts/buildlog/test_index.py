@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 import index
-from cgroup_test_support import CPU, GIB, slice_reading
+from cgroup_test_support import CPU, GIB, ZRAM_READING, slice_reading
 import parse
 import report
 import record as recorder
@@ -880,22 +880,29 @@ class IndexTests(unittest.TestCase):
         scope = {"cpu": CPU, "io": {"state": "unavailable"}, "identity": 42}
         path = self.root / "natedev" / "samples-2026-10.jsonl"
         self.write(path, sample(STAMP), sample("2026-10-02T12:01:00Z", slices=slices,
-                                             filesystem=filesystem, jobserver=pools))
+                                             filesystem=filesystem, jobserver=pools, zram=ZRAM_READING))
         self.write(self.host_file, step("resources", scope_resources=scope))
         original = path.read_bytes()
         self.assertEqual(index.update(), 3)
-        self.assertEqual(self.rows("SELECT slices, filesystem, jobserver FROM samples ORDER BY at")[0],
-                         (None, None, None))
-        encoded = self.rows("SELECT slices, filesystem, jobserver FROM samples ORDER BY at")[1]
-        self.assertEqual([json.loads(cast(str, value)) for value in encoded], [slices, filesystem, pools])
+        self.assertEqual(self.rows("SELECT slices, filesystem, jobserver, zram FROM samples ORDER BY at")[0],
+                         (None, None, None, None))
+        encoded = self.rows("SELECT slices, filesystem, jobserver, zram FROM samples ORDER BY at")[1]
+        self.assertEqual([json.loads(cast(str, value)) for value in encoded], [slices, filesystem, pools, ZRAM_READING])
+        self.assertEqual({row[1]: row[2] for row in self.rows("PRAGMA table_info(samples)")}["zram"], "TEXT")
         self.assertEqual(json.loads(cast(str, self.rows("SELECT scope_resources FROM steps")[0][0])), scope)
-        with closing(sqlite3.connect(index.index_path())) as connection:
-            _ = connection.execute("PRAGMA user_version = 25")
-            connection.commit()
-        self.assertEqual(index.update(), 3)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
-        self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(json.loads(cast(str, self.rows("SELECT slices FROM samples ORDER BY at")[1][0])), slices)
+        for legacy_version in (25, 32):
+            with self.subTest(legacy_version=legacy_version):
+                with closing(sqlite3.connect(index.index_path())) as connection:
+                    _ = connection.execute("ALTER TABLE samples DROP COLUMN zram")
+                    _ = connection.execute(f"PRAGMA user_version = {legacy_version}")
+                    connection.commit()
+                self.assertEqual(index.update(), 3)
+                self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
+                self.assertEqual(path.read_bytes(), original)
+                rows = self.rows("SELECT slices, filesystem, jobserver, zram FROM samples ORDER BY at")
+                self.assertEqual(rows[0], (None, None, None, None))
+                self.assertEqual([json.loads(cast(str, value)) for value in rows[1]],
+                                 [slices, filesystem, pools, ZRAM_READING])
 
     def test_cpu_io_sample_columns_preserve_old_nulls_and_new_counters(self) -> None:
         path = self.root / "natedev" / "samples-2026-10.jsonl"

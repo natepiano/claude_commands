@@ -356,17 +356,12 @@ def main(argv: list[str]) -> int:
         return 0
     if command == "sample":
         import sample
-        import memory
         import mac_idle
 
         if rest:
             print("usage: buildlog sample", file=sys.stderr)
             return 2
         taken = sample.sample()
-        try:
-            memory.write_snapshot(taken.at, taken.host)
-        except (OSError, ValueError) as error:
-            print(f"buildlog sample: memory snapshot unavailable: {error}", file=sys.stderr)
         if taken.host == "natedev":
             try:
                 mac_idle.watch_once(mac_idle.watch_paths(), taken.at, time.monotonic())

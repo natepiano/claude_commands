@@ -22,7 +22,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli
 import index
 import mac_idle
-import memory
 import sample
 if TYPE_CHECKING:
     from ..build_queue import admission_protocol as wire
@@ -421,7 +420,6 @@ done
 
     def test_minute_sample_runs_the_watch_on_natedev(self) -> None:
         with mock.patch.object(sample, "sample", return_value=sample.SampleTaken(1000, "natedev")), \
-             mock.patch.object(memory, "write_snapshot"), \
              mock.patch.object(mac_idle, "watch_once") as watch:
             self.assertEqual(cli.main(["sample"]), 0)
         watch.assert_called_once()

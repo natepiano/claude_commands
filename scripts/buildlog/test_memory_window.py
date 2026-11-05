@@ -27,7 +27,7 @@ else:
 import index
 import memory
 from cargo_output import CargoOutputRoots
-from cgroup_test_support import CPU, GIB, IO_LINES, slice_reading, write_cgroup
+from cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
 if TYPE_CHECKING:
@@ -81,7 +81,7 @@ def snapshot(at: str, high: int, peak: int, *, ci: Record | None = None) -> Reco
         "at": at,
         "host": "natedev",
         "slices": {"builds": present_slice(high, peak), "ci": ci or {"state": "absent"}},
-        "zram": {"state": "present", "data_bytes": 3 * GIB, "compressed_bytes": GIB},
+        "zram": ZRAM_READING,
     }
 
 
@@ -270,8 +270,7 @@ class MemoryWindowTests(unittest.TestCase):
         ):
             _ = (builds / name).write_text(value + "\n")
         zram = self.base / "zram0"
-        zram.mkdir()
-        _ = (zram / "mm_stat").write_text("3221225472 1073741824 0 0 0\n")
+        write_zram(zram)
 
         result = self.cli("snapshot")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -291,7 +290,7 @@ class MemoryWindowTests(unittest.TestCase):
             "stall_some_us": 1_250_000,
         })
         self.assertEqual(slices["ci"], {"state": "absent"})
-        self.assertEqual(recorded["zram"], {"state": "present", "data_bytes": 3 * GIB, "compressed_bytes": GIB})
+        self.assertEqual(recorded["zram"], ZRAM_READING)
         files = list(self.root.glob("*/*.jsonl"))
         self.assertEqual(len(files), 1)
         self.assertEqual([json.loads(line) for line in files[0].read_text().splitlines()], [recorded])
@@ -599,15 +598,16 @@ class MemoryWindowTests(unittest.TestCase):
             old_sample = sample(at, host="old", slices={"builds": {"state": "absent"}, "ci": {"state": "absent"}})
             tick_snapshot: Record = {"kind": "memory_snapshot", "host": "tick", "at": at, "zram": standalone["zram"]}
             tick_sample = sample(at, host="tick", slices=expected_slices)
+            new_sample = sample(at, host="new-log", slices=expected_slices, zram=standalone["zram"])
             standalone_snapshot = {**standalone, "host": "standalone"}
-            records.extend((old_sample, old_snapshot, tick_sample, tick_snapshot, standalone_snapshot))
+            records.extend((old_sample, old_snapshot, tick_sample, tick_snapshot, new_sample, standalone_snapshot))
         self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
         _ = index.update()
         connection = index.read_only()
         reports: list[str] = []
         try:
             with patch.object(memory, "journal_messages", return_value=memory.JournalUnavailable.VALUE):
-                for host in ("old", "tick", "standalone"):
+                for host in ("old", "tick", "new-log", "standalone"):
                     with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
                         found = memory.nearest_snapshot(connection, datetime.fromisoformat(END_UTC))
                         self.assertEqual(found["kind"], "memory_snapshot")
@@ -621,6 +621,7 @@ class MemoryWindowTests(unittest.TestCase):
             connection.close()
         self.assertEqual(reports[0], reports[1])
         self.assertEqual(reports[0], reports[2])
+        self.assertEqual(reports[0], reports[3])
         self.assertIn("builds: high +3, max +0, oom_kill +0", reports[0])
         self.assertIn("peak 12.0 GiB", reports[0])
         self.assertIn("CI: high +3", reports[0])
@@ -656,6 +657,52 @@ class MemoryWindowTests(unittest.TestCase):
                         self.assertIn("peak 12.0 GiB", report)
                         self.assertIn("CI: high +3", report)
                         self.assertIn("zram: 3.0 GiB stored in 1.0 GiB", report)
+        finally:
+            connection.close()
+
+    def test_zram_report_marks_absent_and_missing_readings_unavailable(self) -> None:
+        records: list[Record] = []
+        for at, high, peak in ((START_UTC, 2, 8 * GIB), (END_UTC, 5, 12 * GIB)):
+            reading = snapshot(at, high, peak)
+            records.extend((
+                sample(at, host="absent", slices=reading["slices"], zram={"state": "absent"}),
+                sample(at, host="missing", slices=reading["slices"]),
+            ))
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            with patch.object(memory, "journal_messages", return_value=memory.JournalUnavailable.VALUE):
+                for host in ("absent", "missing"):
+                    with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
+                        report = memory.window_report(connection, datetime.fromisoformat(START_UTC),
+                                                      datetime.fromisoformat(END_UTC))
+                        self.assertEqual([line for line in report.splitlines() if line.startswith("zram:")],
+                                         ["zram: unavailable"])
+        finally:
+            connection.close()
+
+    def test_zram_uses_nearest_reading_and_prefers_snapshot_on_equal_distance(self) -> None:
+        records: list[Record] = []
+        for host, snapshot_at in (("nearer-sample", "2026-10-05T07:29:59.000Z"),
+                                  ("equal-distance", END_UTC.replace(".000Z", "Z"))):
+            reading = snapshot(snapshot_at, 2, 8 * GIB)
+            records.extend((
+                {**reading, "host": host},
+                sample(END_UTC, host=host, slices=reading["slices"],
+                       zram={"state": "present", "data_bytes": 4 * GIB, "compressed_bytes": GIB}),
+            ))
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            for host, data in (("nearer-sample", 4 * GIB), ("equal-distance", 3 * GIB)):
+                with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
+                    found = memory.nearest_snapshot(connection, datetime.fromisoformat(END_UTC))
+                    if found["kind"] != "memory_snapshot":
+                        self.fail("The zram reading is unavailable.")
+                    self.assertEqual(found["zram"], {"state": "present", "data_bytes": data,
+                                                   "compressed_bytes": GIB})
         finally:
             connection.close()
 
