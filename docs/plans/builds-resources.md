@@ -1813,7 +1813,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - `scripts/buildlog/test_step_outputs.py` and `scripts/lint/test_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
 - Change-Review line: none — the floor finds more recorded targets; nothing the user sees changes.
 
-### Phase 67 — Importing offload or sweep loads no build coordination modules  · status: todo
+### Phase 67 — Importing offload or sweep loads no build coordination modules  · status: done
 **Depends on:** Phase 64 (on `builds-resources` at `9c2ee6eab`). It lands with or after Phases 63-64 (showrunner, 2026-11-05).
 
 #### Work Order
