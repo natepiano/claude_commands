@@ -37,6 +37,7 @@ CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")
 STAMP = "2026-10-02T12:00:00.000Z"
 FIXTURE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS fixture_index ON steps (status)"
+SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
 Record = dict[str, object]
 _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
@@ -286,6 +287,7 @@ class IndexTests(unittest.TestCase):
 
     def test_cleanup_reads_the_unused_schema_age_from_config_at_use(self) -> None:
         config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=30")
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
         active_path = index.index_path()
@@ -297,20 +299,117 @@ class IndexTests(unittest.TestCase):
             self.assertEqual(index.update(), 1)
             recent_path = index.index_path()
         now = time.time()
-        old = now - 10 * 86400
+        old = now - 2 * 86400
+        recent = now - 23 * 3600
+        sidecars = [old_path.with_name(old_path.name + suffix) for suffix in SQLITE_SIDECARS]
+        for path in sidecars:
+            _ = path.write_bytes(b"old schema sidecar")
         os.utime(old_path, (old, old))
-        os.utime(recent_path, (old, now))
+        os.utime(recent_path, (old, recent))
         self.assertEqual(index.update(), 0)
         self.assertTrue(old_path.is_file())
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=7")
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
         os.utime(active_path, (old, old))
         self.assertEqual(index.update(), 0)
         self.assertFalse(old_path.exists())
+        for path in sidecars:
+            self.assertFalse(path.exists(), path.name)
         self.assertTrue(recent_path.is_file())
-        os.utime(recent_path, (now, old))
+        os.utime(recent_path, (recent, old))
         self.assertEqual(index.update(), 0)
         self.assertTrue(recent_path.is_file())
         self.assertEqual(self.ids(), ["retained"])
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=0")
+        self.assertEqual(index.update(), 0)
+        self.assertTrue(active_path.is_file())
+
+    def test_update_removes_a_fresh_legacy_index_and_its_sidecars(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        legacy = self.root / "index.sqlite"
+        paths = [legacy, *(legacy.with_name(legacy.name + suffix) for suffix in SQLITE_SIDECARS)]
+        for path in paths:
+            _ = path.write_bytes(b"legacy index")
+        self.assertEqual(index.update(), 0)
+        for path in paths:
+            self.assertFalse(path.exists(), path.name)
+        self.assertEqual(self.ids(), ["retained"])
+
+    def test_update_finishes_interrupted_index_cleanup_and_removes_orphan_sidecars(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        old = time.time() - 2 * 86400
+        unlink = Path.unlink
+        for name in ("index.sqlite", "index-" + "a" * 64 + ".sqlite"):
+            with self.subTest(name=name):
+                obsolete = self.root / name
+                paths = [obsolete, *(obsolete.with_name(name + suffix) for suffix in SQLITE_SIDECARS)]
+                for path in paths:
+                    _ = path.write_bytes(b"obsolete index")
+                    os.utime(path, (old, old))
+                removals = 0
+
+                def interrupt_cleanup(path: Path, missing_ok: bool = False) -> None:
+                    nonlocal removals
+                    if path in paths and path.exists():
+                        if removals == 1:
+                            raise PermissionError("cleanup interrupted")
+                        removals += 1
+                    unlink(path, missing_ok=missing_ok)
+
+                with mock.patch.object(Path, "unlink", interrupt_cleanup):
+                    with self.assertRaisesRegex(PermissionError, "cleanup interrupted"):
+                        _ = index.update()
+                self.assertEqual(index.update(), 0)
+                for path in paths:
+                    self.assertFalse(path.exists(), path.name)
+        orphan = self.root / ("index-" + "b" * 64 + ".sqlite-wal")
+        _ = orphan.write_bytes(b"orphan sidecar")
+        os.utime(orphan, (old, old))
+        self.assertEqual(index.update(), 0)
+        self.assertFalse(orphan.exists())
+        self.assertEqual(self.ids(), ["retained"])
+
+    def test_reindex_removes_current_index_sidecars_before_rebuilding(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        current = index.index_path()
+        sidecars = [current.with_name(current.name + suffix) for suffix in SQLITE_SIDECARS]
+        for path in sidecars:
+            _ = path.write_bytes(b"stale sidecar")
+        open_for_update = index.open_for_update
+
+        def open_after_cleanup(path: Path) -> sqlite3.Connection:
+            for sidecar in sidecars:
+                self.assertFalse(sidecar.exists(), sidecar.name)
+            return open_for_update(path)
+
+        with mock.patch.object(index, "open_for_update", side_effect=open_after_cleanup):
+            self.assertEqual(index.reindex(), 1)
+        self.assertEqual(self.ids(), ["retained"])
+        self.assertEqual(index.update(), 0)
+
+    def test_update_reads_the_current_index_touch_interval_from_config_at_use(self) -> None:
+        config = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        current = index.index_path()
+        now = time.time()
+        for minutes, age, touches in ((120, 61, False), (60, 59, False), (60, 61, True)):
+            with self.subTest(minutes=minutes, age=age):
+                _ = write_config_fixture(config / "buildlog.conf", f"INDEX_TOUCH_MINUTES={minutes}")
+                stamp = now - age * 60
+                os.utime(current, (stamp, stamp))
+                self.assertEqual(index.update(), 0)
+                if touches:
+                    self.assertGreater(current.stat().st_mtime, stamp)
+                else:
+                    self.assertEqual(current.stat().st_mtime, stamp)
+                self.assertEqual(self.ids(), ["retained"])
 
     def test_missing_tables_rebuild_records_before_the_saved_offsets(self) -> None:
         self.write(self.host_file, step("retained"), call("retained-call"))

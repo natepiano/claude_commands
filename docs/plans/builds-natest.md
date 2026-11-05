@@ -464,3 +464,36 @@ The recording exists: `buildlog/parse.test_results` keeps each nextest test that
 - `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` green
 - in a hana worktree, `python3 ~/.claude/scripts/test_times/show.py top` lists hana nextest tests, in under 0.5 s warm
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 17 — The build log keeps only the index files that a checkout used in the last day  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `~/.local/state/buildlog` holds no `index.sqlite` and no `index-<hash>.sqlite` file that no checkout opened in the last day.
+
+**Spec:** The showrunner returned C1047 on 2026-11-04: natedev held three index files of about 1.5 GB each (`index-be554ddd…` current, `index-fdcac9b9…` from 20:28, and the old-name `index.sqlite` from 18:06). `cleanup_unused_indexes` (`scripts/buildlog/index.py:1052`) already runs at the end of each `update()`, and `INDEX_PATTERN` already matches the old name, but `INDEX_UNUSED_DAYS` is 30 and `update()` stamps the current file only when it is more than one day old.
+
+1. Old name: `update()` removes `index.sqlite` at once, whatever its age. No code opens it since Phase 10.
+2. Rule for "no live checkout uses it": a schema file is in use when a checkout opened it in the last `INDEX_UNUSED_DAYS` days. Each `update()` sets the current file's mtime when it is more than `INDEX_TOUCH_MINUTES` (new key, 60) old, in place of one day. A reader that skips `update()` counts through `st_atime`. The current file is never removed.
+3. `INDEX_UNUSED_DAYS` changes from 30 to 1 (a changed key: the showrunner takes it to the user). Until the user answers, the worker writes the code and tests with the key read at use, and the config keeps 30.
+4. A removed file also loses its `-journal`, `-wal` and `-shm` files.
+5. Removal stays under `update_lock()`. A file removed between a peer's stat and open costs that peer one rebuild.
+
+**Files:**
+- `scripts/buildlog/index.py` — `cleanup_unused_indexes` and the stamp in `update()` only
+- `config/buildlog.conf` — `INDEX_TOUCH_MINUTES`, and `INDEX_UNUSED_DAYS` after the user answers
+- `scripts/buildlog/test_index.py` — the cleanup tests only
+
+**Workers:** 1 writer + 1 tester. The work runs in a separate clone of this branch (`builds-natest-p17`), because Phase 16 also edits `index.py` and `test_index.py`; the director brings the checkpoint commit into this branch.
+- `impl` — `index.py`, `config/buildlog.conf`
+- `test` — `test_index.py`, from the Spec: an old-name `index.sqlite` goes on the next update, whatever its age; a schema file opened 2 days ago goes; a schema file stamped 23 hours ago stays; the current file stays at any age; the companion files of a removed file go; `update()` stamps the current file after `INDEX_TOUCH_MINUTES`
+
+**State:** index files on each host. A checkout that has not opened its file in a day rebuilds it on its next read.
+
+**Constraints from prior phases:**
+- Phase 10: `index-<sha256>.sqlite` per schema; `index.index_path()` and `index.index_path_in(root)` name it.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` green
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
