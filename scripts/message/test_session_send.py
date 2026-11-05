@@ -30,27 +30,33 @@ import unittest
 from unittest import mock
 from scripts.message import session_send, session_send_test_support
 
-with mock.patch.object(sys, "addaudithook", wraps=sys.addaudithook) as install:
-    session_send_test_support.forbid_real_sender()
-    session_send_test_support.forbid_real_sender()
-    assert install.call_count == 1, install.call_count
-
+session_send_test_support.forbid_real_sender()
+installed_marker = session_send_test_support.refusal_marker
+assert isinstance(installed_marker, session_send_test_support.SenderRefusalMarker)
+session_send_test_support.forbid_real_sender()
+assert session_send_test_support.refusal_marker is installed_marker
+marker = installed_marker.path
 real = Path(session_send.__file__).resolve().with_name("send.py")
-
-# This second hook stops a live process if the tested guard fails.
-def last_guard(event, arguments):
-    if event not in ("subprocess.Popen", "os.posix_spawn", "os.exec", "os.spawn", "os.system"):
-        return
-    if event in ("subprocess.Popen", "os.posix_spawn", "os.exec") and isinstance(arguments[1], (list, tuple)):
-        if str(fake) in arguments[1]:
-            return
-    raise RuntimeError("the tested guard allowed the real sender")
-sys.addaudithook(last_guard)
-
 fake = Path(sys.argv[1])
 mode = sys.argv[2]
 alias = fake.with_name("sender-link.py")
 alias.symlink_to(real)
+
+# This safety hook permits only harmless probes and blocks network delivery.
+def last_guard(event, arguments):
+    if event in ("socket.connect", "socket.sendto", "socket.bind"):
+        raise RuntimeError("the sender probe attempted network access")
+    if event in ("subprocess.Popen", "os.posix_spawn", "os.exec"):
+        command = arguments[1]
+    elif event == "os.spawn":
+        command = arguments[2]
+    elif event == "os.system":
+        command = arguments[0]
+    else:
+        return
+    if str(fake) not in str(command) and "--help" not in str(command):
+        raise RuntimeError("the sender probe attempted a live command")
+sys.addaudithook(last_guard)
 
 class SenderRequest(unittest.TestCase):
     def test_sender(self):
@@ -59,22 +65,33 @@ class SenderRequest(unittest.TestCase):
                 result = subprocess.run(session_send.session_send_argv("fixture"),
                                         capture_output=True, text=True, check=True)
             self.assertEqual(result.stdout, "fake sender ran\n")
-            self.assertIsInstance(session_send_test_support.sender_violation, session_send_test_support.NoSenderViolation)
+            self.assertFalse(marker.exists())
             return
         command = shlex.join([sys.executable, str(real), "--help"])
         if mode == "posix_spawn":
-            with self.assertRaises(session_send_test_support.RealSenderForbidden):
-                os.posix_spawn(sys.executable, [sys.executable, str(real), "--help"], os.environ)
-            return
-        if mode == "shell":
-            with self.assertRaises(session_send_test_support.RealSenderForbidden):
-                subprocess.run(command, shell=True, check=True)
-            return
-        if mode == "system":
-            with self.assertRaises(session_send_test_support.RealSenderForbidden):
-                os.system(command)
-            return
-        if mode == "real":
+            pid = os.posix_spawn(sys.executable, [sys.executable, str(real), "--help"], os.environ)
+            _, status = os.waitpid(pid, 0)
+            self.assertNotEqual(os.waitstatus_to_exitcode(status), 0)
+        elif mode == "shell":
+            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            self.check_refusal(result)
+        elif mode == "system":
+            self.assertNotEqual(os.waitstatus_to_exitcode(os.system(command)), 0)
+        elif mode == "cd":
+            result = subprocess.run(
+                f"cd {shlex.quote(str(real.parent))} && {shlex.quote(sys.executable)} send.py --help",
+                shell=True, capture_output=True, text=True)
+            self.check_refusal(result)
+        elif mode == "module":
+            result = subprocess.run([sys.executable, "-m", "scripts.message.send", "--help"],
+                                    capture_output=True, text=True)
+            self.check_refusal(result)
+        elif mode == "grandchild":
+            source = "import subprocess,sys; raise SystemExit(subprocess.call(sys.argv[1:]))"
+            result = subprocess.run([sys.executable, "-c", source, sys.executable, str(real), "--help"],
+                                    capture_output=True, text=True)
+            self.check_refusal(result)
+        elif mode == "real":
             for command, directory in (
                 ([sys.executable, str(real), "--help"], None),
                 ([sys.executable, real, "--help"], None),
@@ -83,19 +100,23 @@ class SenderRequest(unittest.TestCase):
                 ([sys.executable, str(alias), "--help"], None),
             ):
                 with self.subTest(command=command):
-                    with self.assertRaises(session_send_test_support.RealSenderForbidden):
-                        subprocess.run(command, cwd=directory, check=True)
-            return
-        with self.assertRaises(session_send_test_support.RealSenderForbidden):
-            subprocess.run([sys.executable, str(real), "--help"], check=True)
-        refused = session_send_test_support.sender_violation
-        self.assertIsInstance(refused, session_send_test_support.RealSenderRefused)
-        self.assertEqual(refused.test_id, self.id())
-        with mock.patch.object(session_send, "SEND_SCRIPT", fake):
-            result = subprocess.run(session_send.session_send_argv("fixture"),
-                                    capture_output=True, text=True, check=True)
-        self.assertEqual(result.stdout, "fake sender ran\n")
-        self.assertIs(session_send_test_support.sender_violation, refused)
+                    result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
+                    self.check_refusal(result)
+        else:
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run([sys.executable, str(real), "--help"], check=True)
+            refused = marker.read_text()
+            with mock.patch.object(session_send, "SEND_SCRIPT", fake):
+                result = subprocess.run(session_send.session_send_argv("fixture"),
+                                        capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, "fake sender ran\n")
+            self.assertEqual(marker.read_text(), refused)
+        self.assertEqual(marker.read_text(), "real sender refused\n")
+
+    def check_refusal(self, result):
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "REFUSED: real scripts/message/send.py is forbidden in tests\n")
 
 result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(SenderRequest))
 raise SystemExit(not result.wasSuccessful())
@@ -110,7 +131,8 @@ class SessionSendTests(unittest.TestCase):
             _ = sender.write_text("print('fake sender ran')\n")
             _ = (root / "lint.conf").write_text("# range: 1..\nsweep_sender_timeout_seconds=17\n")
             environment = {**os.environ, "HOME": str(root / "home"), "CONF_DIR": str(root),
-                           "BUILDLOG_DIR": str(root / "buildlog")}
+                           "BUILDLOG_DIR": str(root / "buildlog"),
+                           "TEST_SENDER_GUARD": str(root / "refused")}
             return subprocess.run(
                 [sys.executable, "-c", GUARD_PROBE, str(sender), mode],
                 cwd=Path(__file__).resolve().parents[2], env=environment,
@@ -133,11 +155,23 @@ class SessionSendTests(unittest.TestCase):
         result = self.probe("system")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_sender_from_its_own_folder_is_refused(self) -> None:
+        result = self.probe("cd")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_sender_as_a_module_is_refused(self) -> None:
+        result = self.probe("module")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_grandchild_sender_is_refused(self) -> None:
+        result = self.probe("grandchild")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_fake_sender_runs_under_unittest(self) -> None:
         result = self.probe("fake")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_caught_refusal_keeps_the_requesting_test_after_a_fake_send(self) -> None:
+    def test_caught_refusal_keeps_the_marker_after_a_fake_send(self) -> None:
         result = self.probe("caught")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

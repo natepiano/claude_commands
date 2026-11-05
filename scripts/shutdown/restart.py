@@ -1,6 +1,7 @@
 """Stop live staff rows, then resume their current sessions in their saved tabs."""
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -19,7 +20,7 @@ for dependency in ("herdr", "message", "lib", "shutdown"):
 import herdr
 import sessions
 from scripts.production import staff, session_staff
-from scripts.lib import nix_env
+from scripts.lib import nix_env, operation_deadline
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -49,48 +50,50 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
     print(f"{row.name}: restart anomaly: {reason[0] if reason else type(error).__name__}", file=sys.stderr)
 
 
-def stop_row(row: staff.StaffRow, client: herdr.Herdr) -> bool:
-    try:
-        panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
-        if len(panes) > 1:
-            _anomaly(row, "duplicate panes retained; no signal sent")
+def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf) -> bool:
+    with operation_deadline.within(deadline):
+        try:
+            panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
+            if len(panes) > 1:
+                _anomaly(row, "duplicate panes retained; no signal sent")
+                return False
+            if panes and not herdr.check_target(str(row.current_session), action="signal",
+                    place=herdr.HerdrPlace(client.session, panes[0]["pane_id"]),
+                    terminal=panes[0].get("terminal_id", ""), client=client):
+                return False
+            if panes:
+                # End the restore entry before the signal, so no restore revives the stopped session.
+                pane_record.end(client.session, panes[0]["pane_id"], str(row.current_session),
+                                record=staff.StaffSnapshot((row,)))
+        except (herdr.HerdrFailure, OSError, ValueError) as error:
+            _anomaly(row, error)
             return False
-        if panes and not herdr.check_target(str(row.current_session), action="signal",
-                place=herdr.HerdrPlace(client.session, panes[0]["pane_id"]),
-                terminal=panes[0].get("terminal_id", ""), client=client):
-            return False
-        if panes:
-            # End the restore entry before the signal, so no restore revives the stopped session.
-            pane_record.end(client.session, panes[0]["pane_id"], str(row.current_session),
-                            record=staff.StaffSnapshot((row,)))
-    except (herdr.HerdrFailure, OSError, ValueError) as error:
-        _anomaly(row, error)
+        result = stop_resume.stop(str(row.current_session))
+        if isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
+            return True
+        _anomaly(row, result.reason if isinstance(result, stop_resume.StopFailed) else "session not found")
         return False
-    result = stop_resume.stop(str(row.current_session))
-    if isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
-        return True
-    _anomaly(row, result.reason if isinstance(result, stop_resume.StopFailed) else "session not found")
-    return False
 
 
-def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     try:
         entry = pane_record.launch_for_session(identity)
     except (OSError, ValueError) as error:
         print(f"{identity}: launch record anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
         entry = None
     if entry is not None:
+        projected = entry.copy()
+        projected["session_id"] = identity
+        projected["name"] = name
+        arguments = pane_record.resume_arguments(projected)
         kind = pane_launch.agent_kind(entry)
         if kind == "codex":
             home = entry["environment"].get("CODEX_HOME", entry["config_dir"])
-            return kind, {"CODEX_HOME": home}, ["resume", identity]
-        arguments = ["--resume", identity]
-        for directory in entry.get("plugin_directories", []):
-            arguments.extend(("--plugin-dir", directory))
+            return kind, {"CODEX_HOME": home}, arguments
         return kind, named_account_environment(Path(entry["config_dir"])), arguments
     for directory in sessions.config_dirs():
         if any((directory / "projects").glob(f"*/{identity}.jsonl")):
-            return "claude", named_account_environment(directory), ["--resume", identity]
+            return "claude", named_account_environment(directory), ["--resume", identity, "--name", name]
     homes = list(Path.home().glob(".codex*"))
     if home := os.environ.get("CODEX_HOME"):
         homes.insert(0, Path(home))
@@ -101,69 +104,69 @@ def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str,
 
 
 def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
-              present: bool = False, target_account: str = "",
+              present: bool = False, target_account: str = "", deadline: float = math.inf,
               resolver: session_staff.RowResolver | None = None) -> str:
-    live = herdr.read_conversation(str(row.current_session))
-    if isinstance(live, herdr.LiveConversation):
-        print(f"{row.name}: unchanged")
-        return ""
-    if isinstance(live, herdr.UnknownConversation):
-        herdr.conversation_note(live)
-    machine, folder = shutdown_record.row_folder(row, record, resolver=resolver)
-    import remote
-    if machine != remote.local_machine():
-        raise ValueError(f"{row.name}: session is on {machine}")
-    kind, environment, arguments = session_launch(str(row.current_session))
-    if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
-        from scripts.accounts import accounts
+    with operation_deadline.within(deadline):
+        live = herdr.read_conversation(str(row.current_session))
+        if isinstance(live, herdr.LiveConversation):
+            print(f"{row.name}: unchanged")
+            return ""
+        if isinstance(live, herdr.UnknownConversation):
+            herdr.conversation_note(live)
+        machine, folder = shutdown_record.row_folder(row, record, resolver=resolver)
+        import remote
+        if machine != remote.local_machine():
+            raise ValueError(f"{row.name}: session is on {machine}")
+        kind, environment, arguments = session_launch(str(row.current_session), row.name)
+        if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
+            from scripts.accounts import accounts
 
-        target_account = accounts.role_account(row.kind).label
-    if target_account and kind == "claude":
-        from scripts.accounts import accounts
+            target_account = accounts.role_account(row.kind).label
+        if target_account and kind == "claude":
+            from scripts.accounts import accounts
 
-        target_dir = accounts.account_dir(target_account)
-        _ = stop_resume.heal_account_trust(folder, target_dir,
-            Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
-        environment = named_account_environment(target_dir)
-    destination = client.saved_row_tab(str(row.id), row.name)
-    prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
-                                                  herdr.NO_ENVIRONMENT_REMOVALS)
-    if isinstance(prepared, nix_env.Refused):
-        raise OSError(str(prepared))
-    target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
-    try:
-        panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
-        if len(panes) > 1:
-            _anomaly(row, "duplicate panes retained")
-        elif panes and not panes[0].get("terminal_id"):
-            _anomaly(row, "pane has no terminal id; pane retained")
-        elif panes:
-            target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
-        _anomaly(row, error)
-    # Read liveness again immediately before the launch.
-    current = herdr.read_conversation(str(row.current_session), kind)
-    if isinstance(current, herdr.LiveConversation):
-        print(f"{row.name}: unchanged")
-        return ""
-    if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
-        herdr.conversation_note(current)
-    if kind == "claude":
-        arguments.extend(["--name", row.name])
-    result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
-        trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),
-        int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000), agent=row.name,
-        reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
-                          live.reason if isinstance(live, herdr.UnknownConversation) else ""))
-    try:
-        client.remember_row_tab(str(row.id), result.pane)
-        if present:
-            client.focus_tab_of(result.pane)
-            client.close_startup_workspaces(result.pane.split(":", 1)[0])
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
-        _anomaly(row, error)
-    print(f"{row.name}: restarted")
-    return result.pane
+            target_dir = accounts.account_dir(target_account)
+            _ = stop_resume.heal_account_trust(folder, target_dir,
+                Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
+            environment = named_account_environment(target_dir)
+        destination = client.saved_row_tab(str(row.id), row.name)
+        prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
+                                                      herdr.NO_ENVIRONMENT_REMOVALS)
+        if isinstance(prepared, nix_env.Refused):
+            raise OSError(str(prepared))
+        target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
+        try:
+            panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
+            if len(panes) > 1:
+                _anomaly(row, "duplicate panes retained")
+            elif panes and not panes[0].get("terminal_id"):
+                _anomaly(row, "pane has no terminal id; pane retained")
+            elif panes:
+                target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            _anomaly(row, error)
+        # Read liveness again immediately before the launch.
+        current = herdr.read_conversation(str(row.current_session), kind)
+        if isinstance(current, herdr.LiveConversation):
+            print(f"{row.name}: unchanged")
+            return ""
+        if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
+            herdr.conversation_note(current)
+        operation_deadline.check()
+        result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
+            trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),
+            int(operation_deadline.remaining(herdr.PROGRAM_TIMEOUT_SECONDS) * 1000), agent=row.name,
+            reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
+                              live.reason if isinstance(live, herdr.UnknownConversation) else ""))
+        try:
+            client.remember_row_tab(str(row.id), result.pane)
+            if present:
+                client.focus_tab_of(result.pane)
+                client.close_startup_workspaces(result.pane.split(":", 1)[0])
+        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+            _anomaly(row, error)
+        print(f"{row.name}: restarted")
+        return result.pane
 
 
 def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
@@ -176,7 +179,8 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
 
 
 def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
-                 resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
+                 resolver: session_staff.RowResolver | None = None,
+                 codex: herdr.CodexConversations | None = None) -> list[staff.StaffRow]:
     """Read only the supplied rows and return their live local conversations."""
     import remote
 
@@ -187,7 +191,13 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
             machine, _folder = shutdown_record.row_folder(row, record, resolver=resolver)
             if machine != remote.local_machine():
                 continue
-            observed = herdr.read_conversation(str(row.current_session))
+            if codex is None:
+                observed = herdr.read_conversation(str(row.current_session), "claude")
+                if not isinstance(observed, herdr.LiveConversation):
+                    codex = herdr.codex_conversations()
+                    observed = herdr.read_conversation(str(row.current_session), codex=codex)
+            else:
+                observed = herdr.read_conversation(str(row.current_session), codex=codex)
             if isinstance(observed, herdr.LiveConversation):
                 selected.append(row)
             elif isinstance(observed, herdr.UnknownConversation):
@@ -207,13 +217,14 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     except (OSError, ValueError) as error:
         print(f"restart: Claude registry anomaly: {error}", file=sys.stderr)
         candidates = {}
-    for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon):
+    codex = herdr.codex_conversations()
+    for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
         _ = candidates.setdefault(identity, identity)
     owned = {row.current_session for row in record.rows}
     for identity in sorted(candidates.keys() - owned):
-        if isinstance(herdr.read_conversation(identity), herdr.LiveConversation):
+        if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
             print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
-    selected = live_members(record.rows, record, resolver=resolver)
+    selected = live_members(record.rows, record, resolver=resolver, codex=codex)
     if save_tabs:
         try:
             client.save_layout()
