@@ -567,7 +567,15 @@ Index `SCHEMA_VERSION = 25` (`scripts/buildlog/index.py`; `open_for_update` rebu
 
 `steps.wait_s` keeps metadata and pass-record lookup time plus the ordinary build wait; `mem_wait_s` is memory admission. `calls.hold_wait_s` records held-target waiting separately, including each declined Mac retry, and `calls.target` names where the call ended. The Waiting table keeps `Held target` apart from `Memory admission`.
 
-**Slice snapshots** (`scripts/buildlog/memory.py`). `buildlog snapshot`, and every `buildlog sample` (via `SampleTaken(at, host)` and `memory.write_snapshot(at, host)`), append a `memory_snapshot` record to the host's monthly samples file. Per slice (`builds`, `ci`, or `{"state": "absent"}`): `memory.events` `high`/`max`/`oom_kill`, `memory.peak`, `memory.swap.peak`, the three limits, and `memory.pressure` `some` total as `stall_some_us` (or `"unavailable"`); plus zram `mm_stat` data and compressed bytes. A snapshot failure prints `memory snapshot unavailable` and never fails the sample. `BUILDLOG_BUILDS_CGROUP`, `BUILDLOG_CI_CGROUP` and `BUILDLOG_ZRAM` point tests at fixture trees.
+**Slice snapshots** (`scripts/buildlog/memory.py`). Each `buildlog sample` tick writes a sample row and a `memory_snapshot` row.
+Only the sample row holds slices during the tick.
+The tick snapshot row holds `kind`, `at`, `host`, and `zram` only.
+The standalone `buildlog snapshot` row keeps slices because it has no sample row beside it.
+Each slice (`builds` or `ci`) stores its events, peaks, limits, and memory pressure total.
+An absent slice has `state: absent`. An unreadable pressure total has the value `unavailable`.
+The zram reading stores the data and compressed bytes from `mm_stat`.
+A snapshot failure prints `memory snapshot unavailable` and preserves the sample.
+`BUILDLOG_BUILDS_CGROUP`, `BUILDLOG_CI_CGROUP`, and `BUILDLOG_ZRAM` select fixture paths for tests.
 
 **CI jobs.** A job is `carried_over` when its attempt is above 1 and `started_at` precedes `created_at`, else `skipped` when its conclusion is `skipped`, else `ran`. Only `ran` rows store `duration_s` and `queued_s`; `queued_s` is `started_at - created_at` when both parse and the result is zero or more, else NULL. `elapsed_seconds(start, end) -> float | None` is unrounded; `seconds_between` rounds to 3 places. `ci_job_days` excludes `carried_over` and keys days by the run attempt's `started_at`.
 

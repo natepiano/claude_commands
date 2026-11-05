@@ -52,7 +52,7 @@ Launches skip memory admission by design. Their `mem_wait_s` is null and the rep
 
 The one admission sampler `buildlog_sample_anon` in `scripts/lint/invoke.sh` opens a test-phase window on the first tick when a running executable in the step's scope has a direct parent folder named `deps` (`/deps/[^/]+$`), under any target folder name. Build scripts run from `<profile>/build/<pkg>-<hash>/` and do not open it. The peak is the scope's `memory.stat` `anon`, so it counts all parallel tests. The sampler writes the anon peak, the start time and the context from `record.py test-phase-context RESERVATION ARGV...` to `$BUILDLOG_PEAK.test-phase.json` (temp + `mv`). The same loop still writes admission's `.max` and `.wave` files.
 
-`record.py step` reads `BUILDLOG_TEST_PHASE_FILE` and validates the sidecar into `PendingStep.test_phase` (`TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord`) before the save. An absent sidecar records null. An unreadable one keeps the sources and the pending record for a retry and writes one `pending record <path>` line to `errors.log`. Row fields: `test_phase_peak_bytes`, `test_phase_started_at`, and `TestPhaseContext` (`repo_identity`, `test_scope`, `package`, `filters`, `call_id`, `test_threads`). `test_threads` comes from admission's one parser `memory_admit.test_threads`. `test_phase_charge` is null until admission records a test-phase entry charge. The fields are in the JSON rows only; the index has no column for them.
+`record.py step` reads `BUILDLOG_TEST_PHASE_FILE` and validates the sidecar into `PendingStep.test_phase` (`TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord`) before the save. An absent sidecar records null. An unreadable one keeps the sources and the pending record for a retry and writes one `pending record <path>` line to `errors.log`. Row fields: `test_phase_peak_bytes`, `test_phase_started_at`, and `TestPhaseContext` (`repo_identity`, `test_scope`, `package`, `filters`, `call_id`, `test_threads`). `test_threads` comes from the one parser `parse.test_threads`; admission calls the same function as `memory_admit.test_threads`. `test_phase_charge` is null until admission records a test-phase entry charge. The fields are in the JSON rows only; the index has no column for them.
 
 ### Old field names
 
@@ -87,8 +87,9 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
 ### Raw resource readings and hourly use
 
 `cgroup_capture.read_cgroup(path)` supplies `memory.slice_state()` and the sample's
-`slices` with one reading of each file. `sample.SampleTaken.slices` is passed to
-`memory.write_snapshot()` so the sample and snapshot do not reread the slice.
+`slices` with one reading of each file. Only the sample row holds slices during each tick.
+The tick snapshot row holds `kind`, `at`, `host`, and `zram` only.
+The standalone `buildlog snapshot` row keeps slices because it has no sample row beside it.
 The builds and CI slices remain separate. An absent cgroup has `state: absent`;
 an unreadable scalar is `unavailable` and does not discard other readings.
 

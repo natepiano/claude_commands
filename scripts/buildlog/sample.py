@@ -174,7 +174,6 @@ def filesystem_reading() -> FilesystemMeasured | cgroup_capture.ReadingUnavailab
 class SampleTaken(NamedTuple):
     at: float
     host: str
-    slices: cgroup_capture.SliceCollection = {"builds": {"state": "absent"}, "ci": {"state": "absent"}}
 
 
 def sample() -> SampleTaken:
@@ -221,4 +220,4 @@ def sample() -> SampleTaken:
         "power_profile_since": store.utc_iso(profile.since_epoch) if isinstance(profile, PowerProfile) else None,
     }
     store.append_line(store.sample_file(host, at), record)
-    return SampleTaken(at, host, slices)
+    return SampleTaken(at, host)
