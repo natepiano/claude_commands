@@ -11,6 +11,7 @@ from pathlib import Path
 import socket
 import sys
 import tempfile
+import time
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -52,6 +53,10 @@ def parse_light_cli(arguments: list[str]) -> dict[str, str] | UseArgumentParser:
     index = 1
     while index < len(arguments):
         token = arguments[index]
+        if verb == "write" and token == "--clock-offset":
+            values["clock_offset"] = "1"
+            index += 1
+            continue
         if token.startswith("--"):
             name, separator, value = token.partition("=")
             if name not in flags:
@@ -109,6 +114,8 @@ def execute_cli(args: dict[str, str]) -> int:
             if args["pinned_target"]:
                 row["pinned_target"] = args["pinned_target"]
             write_fields(call_id, row)
+            if args.get("clock_offset"):
+                print((time.time_ns() - time.monotonic_ns()) // 1000)
     except (OSError, ValueError, IndexError) as error:
         print(f"step record: {error}; step refused", file=sys.stderr)
         return 2
@@ -460,6 +467,9 @@ def main() -> int:
                 _ = command.add_argument(name, required=required, default=default, choices=choices or None)
             else:
                 _ = command.add_argument(name, choices=choices or None)
+        if verb == "write":
+            _ = command.add_argument("--clock-offset", action="store_const", const="1", default="",
+                                     help="print the wall-clock offset in microseconds")
     arguments = vars(parser.parse_args())
     return execute_cli(cast(dict[str, str], arguments))
 

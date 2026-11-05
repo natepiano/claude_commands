@@ -39,9 +39,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
     from ..build_queue import admission_service
     from ..buildlog import store
+    from ..message import session_send
 else:
     from scripts.build_queue import admission_service
     from scripts.buildlog import store
+    from scripts.message import session_send
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -1422,10 +1424,9 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
 
 def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
     """Tell a recipient to start its builds; the memory gate orders them."""
-    script = Path(__file__).resolve().parent.parent / "message" / "send.py"
     notice = f"{RELEASE_NOTICE} Session {entry['session_id']}."
     try:
-        result = subprocess.run([sys.executable, str(script), "--to", f"uds:{socket}", "--text", notice], capture_output=True, text=True)
+        result = subprocess.run(session_send.send_argv("--to", f"uds:{socket}", "--text", notice), capture_output=True, text=True)
     except OSError as error:
         return ReleaseSendFailed(str(error))
     if result.returncode == 0:

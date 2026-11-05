@@ -25,6 +25,7 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
+from scripts.message import session_send
 from scripts.lib.process_failure import failure_detail
 
 STATE_ENV = "MAIN_SYNC_STATE_DIR"
@@ -32,7 +33,6 @@ DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "main-sync")
 SYNC_LOG = "sync.jsonl"
 FETCH_TIMEOUT_SECONDS = 120
 IN_PROGRESS = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply")
-SEND = Path(__file__).resolve().parents[1] / "message" / "send.py"
 # A job has no terminal: git and ssh must fail rather than ask.
 GIT_ENVIRONMENT = {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=20"}
 
@@ -117,8 +117,8 @@ def notify(name: str, outcome: Outcome) -> None:
     host = socket.gethostname()
     text = (f"main sync on {host}: {outcome.detail}. Commands there stay old until this is "
             + "cleared; the job retries every 15 minutes.")
-    _ = subprocess.run([sys.executable, str(SEND), "--to", name, "--from", "main-sync", "--text", text,
-                        "--key", f"main-sync-{host}-{outcome.state}", "--repeat-minutes", f"{minutes:g}"],
+    _ = subprocess.run(session_send.send_argv("--to", name, "--from", "main-sync", "--text", text,
+                        "--key", f"main-sync-{host}-{outcome.state}", "--repeat-minutes", f"{minutes:g}"),
                        check=False, capture_output=True)
 
 

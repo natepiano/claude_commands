@@ -14,6 +14,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
+from scripts.message import session_send
 from unittest import mock
 
 import rust_release
@@ -226,7 +227,6 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual(rust_release.release_push("1.100.0", "1.99.0", trial).id, "rust.repair_failed")
 
     def test_release_text_uses_user_send_and_only_success_returns_true(self) -> None:
-        fake_module = self.scratch / "scripts/buildlog/rust_release.py"
         sender = self.scratch / "scripts/message/send.py"
         sender.parent.mkdir(parents=True)
         _ = sender.write_text(
@@ -237,14 +237,14 @@ class RustReleaseTests(unittest.TestCase):
         command = user_send_argv(push)
         command[1] = str(sender)
         real_run = subprocess.run
-        with (mock.patch.object(rust_release, "__file__", str(fake_module)),
+        with (mock.patch.object(session_send, "SEND_SCRIPT", sender),
               mock.patch.object(review, "user_send_seconds", return_value=85),
               mock.patch.object(subprocess, "run", wraps=real_run) as run,
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "0"})):
             self.assertTrue(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))
             self.assertEqual(run.call_args.args[0], command)
             self.assertEqual(run.call_args.kwargs["timeout"], 225)
-        with (mock.patch.object(rust_release, "__file__", str(fake_module)),
+        with (mock.patch.object(session_send, "SEND_SCRIPT", sender),
               mock.patch.object(review, "user_send_seconds", return_value=85),
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "3"})):
             self.assertFalse(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))
