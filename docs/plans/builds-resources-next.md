@@ -75,6 +75,6 @@
 
 - [ ] **Measure the ANON_SHARE estimate share again after the legacy rows expire** (on or after 2026-11-12)
   - Target: rerun the Phase 19 source measurement (`count_queue_sources` over 7 days of `admission/queue_times.jsonl`, and the `expected_peak` replay) on a copy of the natedev state; update `#### Phase 19 source shares` in `docs/as-built/build-memory-admission.md`.
-  - Why needed: Phase 19 stopped at Spec 2 because `ANON_SHARE` estimates were 0% of recorded admissions and 3.4% of replayed estimates, under the 5% bar. Recorded admissions then covered only 16 hours, and the recovered legacy test rows were still inside the window.
+  - Why needed: Phase 19 stopped at Spec 2 because `ANON_SHARE` estimates were below the 5% bar. No recorded admission used `ANON_SHARE`; 10/4,267 replayed estimates used it (0.23%, excluding caps). Recorded admissions covered only 16.30 hours. The recovered legacy test rows were still inside the window.
   - Completion condition: the table shows the share by step kind after the legacy rows leave the window. If the share is above 5% of estimates, Phase 19 Specs 3-4 (remove or narrow the `ANON_SHARE` tiers, with the unknown-source boundary) come back as a phase.
   - Revealed by: Phase 19 Spec 2 (builds showrunner 2026-11-05: stop at Spec 2; "small" means under 5% of estimates)

@@ -190,7 +190,9 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Binds later work:** A new script whose owner must show in the table needs an Owns entry in its production doc. Regenerate `working_set_owners.json` from the production docs after an Owns cell changes.
 
 ### Phase 8 — Shared build state is written only by the installed copy  · status: todo
-**Depends on:** Phases 2, 10, 12 and 19. Phase 56 lands before Phase 11. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Phase 29 joins before Phase 11.
+**Depends on:** Phases 2, 10, 12 and 19. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8.
+
+**Held (2026-11-05):** the send.py freeze covers `build_hold.py`, so this phase starts after messaging's main hash. Its guards and refusals also need the user's yes (user rule 2026-11-05: a new check goes to the user first).
 
 **Approved:** showrunner 2026-10-29. The edit to `docs/plans/builds-production.md` is approved.
 
@@ -554,117 +556,17 @@ A memory promise keeps only history rows from the same side of each listed build
 **Gotchas:** after the dylib change the feature side has only 676 rows. Queue 10z removed the build budget cap; promises are uncapped.
 
 ### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: done
-**Depends on:** Phases 18, 20, 68 and 69. Phase 20 records the lifecycle events and supplies their reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Phase 29 joins before Phase 11.
-
-**Approved:** showrunner 2026-10-29, rescoped (no ETA given).
-
-**Stopped at Spec 2:** builds showrunner 2026-11-05 ruled the `ANON_SHARE` share small: 10/4,267 (0.23%) of reconstructed estimates without caps, and 0/220 recorded admissions. Specs 3-5 are not built.
-
-#### Work Order
-
-**Goal:** most admissions use measured anon peaks. The build-log peak times `ANON_SHARE` is a fallback that few admissions take.
-
-**Measured (code, at `a650d945`):**
-- `ANON_SHARE = 0.65` (`memory_admit.py` :74) scales a build-log `peak_mem_bytes` (page cache included) to process memory in three tiers. `ExpectedPeak` (:569) names its source.
-  1. `full_history_peak` (:2050), when a repository has fewer than 5 measured anon peaks: five or more indexed peaks (:2097) win; else measured anon peaks; else one to four indexed peaks (:2104).
-  2. `filtered_history_peak` (:2527): the indexed exact and package tiers (:2599) and the check/build compile index (:2603).
-  3. `fresh_test_peak` (:2732): indexed zero-compile peaks (:2784), exact and package, after the measured zero-compile peaks. With no row, it returns `NoFreshHistory` and the request takes the compile estimate.
-- Phase 60 (`e88fb841d`) already puts package anonymous history before both indexed tiers in `filtered_history_peak` (:2527), with legacy rows' package, scope and filters recovered from the indexed argv. Its test: `test_legacy_package_selection_recovers_anonymous_peaks_for_an_unseen_filter` (`test_memory_admit.py`). Rows recorded before 2026-10-29 15:05Z lack those fields; they leave the 14-day window about 2026-11-12, which also lowers the `ANON_SHARE` share.
-- Before Phase 20 Spec 0, no record keeps the source of an admitted step's estimate: reservations have no source field, and waiter rows (report Phase 3 adds `need_source`) are deleted at admission. From Spec 0's merge, each `admitted` event in `admission/queue_times.jsonl` records the need source, and Phase 20's one interval reader in `memory_admit.py` rebuilds each step from those events.
-
-**Spec:**
-
-1. **Measure first.** Read the last seven days of retained natedev evidence through `read_queue_lifetimes()`.
-   Report the actual retained coverage. The lifecycle file's size cap can retain less than fourteen days.
-   Each `QueueStepLifetime` is one logical step. Its `ReservationInterval` values describe separate admissions.
-   Count interval sources for admission shares. Count each logical step's memory wait once.
-   Report `MemoryWaitIncomplete` separately. Do not replace it with zero or a partial wait.
-   A `TokenReturn` ends one reservation interval. It does not complete the logical step.
-   `NoPositiveSample` means no measured peak. Do not count it as a zero peak.
-   Keep recorded interval sources separate from reconstructed historical estimates.
-   For earlier steps, replay `expected_peak()` with history available before each step.
-   Reconstruct build shape from recorded argv through `build_shape()` and the shared step-evidence reader.
-   Report missing shape evidence separately from ordinary fallback admissions.
-   Keep `shape` and `cap` as distinct source rows. A chosen cap counts in neither fallback nor `ANON_SHARE` shares.
-   Report source shares by step kind: full nextest, filtered nextest, clippy, check, build, doc and other.
-   Count the fresh tier (`fresh_test_peak`) in its own rows: measured, `buildlog`, and `NoFreshHistory` that took the compile estimate.
-   Report the `ANON_SHARE` share and compare those estimates with measured anonymous peaks.
-   Split recorded admissions by deployed estimator: before and after the Phase 60 merge, and before and after legacy rows leave the window (about 2026-11-12).
-   Count recovered legacy rows apart from rows with recorded selection fields. The queue card already shows source and count (`queue_evidence.py` :108); test the totals, add no user control.
-   Add a measurement test with two intervals, two sources and one logical step.
-   The test counts two admissions and one memory wait. Include token return and incomplete evidence.
-2. **Stop rule.** If the `× ANON_SHARE` share is already small, the phase is only this measurement: the table goes in the as-built doc and no code changes. The showrunner sets "small" from the table.
-3. **Otherwise, widen anon matching where the table still shows `ANON_SHARE` tiers.** Filtered estimates already use package anonymous history first (Phase 60). Work only on the measured remaining gaps, for example a full estimate where five or more indexed peaks (:2097) win over one to four anonymous peaks.
-   Keep Phase 60's package selection and the max rule.
-   Keep the scope and the compile split from Phase 11. Phase 68 removed Phase 18's history splits; add none back without a replay that shows fewer steps above their promise.
-   Replay the source shares and estimate errors. Report steps above their promise.
-   Keep modeled wait savings unavailable until queue calibration succeeds. Report observed waits separately.
-4. **Drop 0.65 once rare.** Remove the `ANON_SHARE` tiers only below the showrunner's bound.
-   A step without anonymous history then uses the pooled tier, followed by fallback.
-   The fresh tier's indexed peaks (:2784) are `ANON_SHARE` tiers too. Without them, a fresh request with no measured zero-compile peak returns `NoFreshHistory` and takes the compile estimate. Keep the `FILTERED_FLOOR` on fresh measured peaks.
-   Keep the tiers if replay shows more promises below half the measured peak.
-   Stop only the producer. Keep old `buildlog` source values readable in the basis codec, wire codec, cards and `WaitOutput`.
-   No unknown-source type exists yet: `NeedSource = str` (`memory_admit.py` :265), and `admission_client.py` :548 renders any unlisted source as "no history, so the fallback".
-   This phase defines the boundary: a known source, or an unknown source that keeps its original wire text. Do not turn a future source into a fallback value.
-   The protocol (`admission_protocol.py`), the client wait lines (`admission_client.py`), the service (`admission_service.py`) and the queue card (`queue_card.py`, `queue_evidence.py`) carry and render it.
-5. **Tests** in `scripts/lint/test_memory_admit.py`: repo + step anon rows win over the index tier when the exact filter has none; with no anon history the next tier applies; a `build` step keeps Phase 24's same-shape rule when the widened match has rows of another shape; fake both memory readings. A fresh request selects measured zero-compile peaks first; with only indexed zero-compile peaks, its source follows Spec 4 (`buildlog` kept, or `NoFreshHistory` and the compile estimate when the tier goes); the fresh floor stays. In the client and protocol tests: an unknown source keeps its wire text through a reconnect, a refreshed estimate and a historical row, and never renders as the fallback. If Spec 4 removes the tier: an old waiter row with `need_source` `buildlog` still renders in the queue card (`scripts/build_queue/test_queue_evidence.py`) and in `admission_client.WaitOutput`.
-6. **Docs.** `docs/as-built/build-memory-admission.md`: the tier share table; if changed, the `need` paragraph.
-
-**Constraints from prior phases:**
-- Phase 11: `compiling_history(history: EstimateHistory)` (`memory_admit.py` :2178) keeps a peak with no index row and selects by completion time. A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
-  Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
-- Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
-  Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
-  `NoQueuedHead` means no eligible head. A first mark uses the active window from the same pass.
-  Keep an explicit inactive window for an old head without priority. Do not derive a deadline from the current time.
-  Use `head_policy` for the deployed policy. Add no separate window rule in a reader.
-- Phase 20 found insufficient calibration evidence. Estimate replay does not establish a calibrated queue model.
-  Keep the estimate comparisons and adoption conditions. Report modeled wait savings as unavailable until calibration succeeds.
-  Report observed waits separately. Do not label an estimate comparison as a queue replay.
-- Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
-- Phases 11 and 60 set which rows match; the widened match keeps Phase 11's compile split and Phase 60's selection, adds no Phase 18 history split (Phase 68 removed them), and reads rows through the one index join in `scripts/lint/build_shape.py` and the one selection resolver `history_selection` in `memory_admit.py` (no second join or argv parser).
-- Phase 24 owns the `build` promise: `build_expected_peak` (`memory_admit.py` :2195) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and no cap: queue 10z removed the build budget cap, so `build_expected_peak` returns the full headroom result. `memory_config()` reads `release_headroom`, `dev_size_factor` and `dev_size_margin_gib` at use from `config/build_admission.conf` `[memory]`. Write no fixed factor or margin anywhere, tests included. Keep decoding of saved historical caps (`need_text` prints a saved cap and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class). In Spec 1, the `cap` source row means `ProgramMemoryCap` (`memory_admit.py` :353), not a build budget. Compare estimator cohorts across the deployment times of Phase 18, Phase 68 and queue 10z. `ShapeFallback` (the profile fallback) has neither floor nor factor. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The widened match and the drop of 0.65 change other steps' tiers only.
-- The admission service owns transitions. `admission_client.WaitOutput` writes source text and `admission_protocol.py` carries source values.
-  Preserve historical and future-source decoding. Test first, periodic and refreshed wait lines.
-  Phase 20 supplies the lifecycle recording prerequisite. This phase still owns the source-share analysis.
-  Coordinate admission files with queue-unit. Record `tested against <queue tip>` in the notice.
-- Phase 69: `read_estimate_history` (:2154) decodes the history file once per estimate into `EstimateHistory`. `compiling_history(history)` joins it through `index_step_evidence`, which reads index rows only for the window's anonymous-history call ids.
-  The indexed fallback queries in `full_history_peak`, `filtered_history_peak` and `fresh_test_peak` are separate index reads by host, repository and step; that call-id bound does not apply to them.
-  `filtered_peak` no longer exists: `expected_peak` sends a filtered request with a package to `filtered_history_peak` (steps from `filtered_steps(step)`, :2522) and others to `full_history_peak`. Do not restore the wrapper.
-  An adopted tier change reuses the single decode and the bounded evidence query. Add no second history read or evidence join.
-
+#### As-built
+The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share small on 2026-11-05: 10/4,267 (0.23%) of the reconstructed estimates, caps excluded, and 0/220 recorded admissions. Small means under 5% of estimates. Specs 3-5 were not built, and `ANON_SHARE` stays.
+- `memory_admit.count_queue_sources(lifetimes: Sequence[QueueStepLifetime]) -> QueueSourceCounts` counts each reservation interval's `need_source` as one admission and each logical step's memory wait once. `QueueSourceCounts` keeps `MemoryWaitIncomplete` (`incomplete_memory_waits`), `NoPositiveSample` (`unsampled_intervals`), open intervals and completed steps apart. A token return ends an interval, not the step.
+- `docs/as-built/build-memory-admission.md` `#### Phase 19 source shares` has the 7-day table by step kind, before and after Phase 60. The recorded admissions and the replayed estimates are separate populations, and `shape` and `cap` are their own columns. Recorded admissions covered only 16.30 hours, and the recovered legacy rows were still in the window.
 
 **Files:**
-- `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_queue_view.py` — unchanged Phase 20 regression verification.
-- `scripts/lint/memory_admit.py` — Specs 3–4 (none if Spec 2 stops the phase), including the known/unknown source type.
-- `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_client.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/queue_card.py`, `scripts/build_queue/queue_evidence.py` — Spec 4, the unknown-source boundary, only if Spec 4 runs (owner queue-unit; trial-merge against `origin/builds-queue`).
-- `scripts/lint/test_memory_admit.py` — Specs 1 and 5, including the two-interval measurement fixture.
-- `scripts/build_queue/test_queue_evidence.py` — Spec 5, the old `buildlog` row test, only if Spec 4 removes the tier (owner queue-unit; trial-merge against `origin/builds-queue`).
-- `scripts/build_queue/test_admission_client_wait.py`, `scripts/build_queue/test_admission_protocol.py` — Spec 5, the old-source wait lines and codec, only if Spec 4 removes the tier (owner queue-unit).
-- `docs/as-built/build-memory-admission.md` — Specs 1 and 6.
+- `scripts/lint/memory_admit.py` — `QueueSourceCounts` and `count_queue_sources`.
+- `scripts/lint/test_memory_admit.py` — `test_source_counts_separate_admissions_logical_waits_and_missing_evidence`: two intervals, two sources, one logical step, a token return, an incomplete wait and an unsampled peak.
+- `docs/as-built/build-memory-admission.md` — the source-share table.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the measurement, any adopted tier change in `memory_admit.py`, the unknown-source boundary in the protocol, client, service and card files, and the as-built doc.
-- `test` — `test_memory_admit.py`, the named client and codec tests, old-source and unknown-source rendering tests (reconnect, refresh, historical rows) and measurement fixtures.
-- `test` also runs the unchanged service and overview regressions named in the Acceptance gate.
-
-**Acceptance gate:**
-- A two-interval measurement test counts both admission sources and one logical step's memory wait.
-  It reports incomplete waits and unsampled peaks separately. A token return does not count as completion.
-- Preserve `test_token_return_joins_intervals_without_completing_the_step` unchanged in `scripts/lint/test_memory_admit.py`.
-- Preserve `test_unknown_source_and_failed_poll_preserve_the_real_waiting_row` in `scripts/build_queue/test_admission_client_wait.py`.
-  Only its fallback-text assertion (:147) may change, to the unknown source's wire text (Spec 4).
-  Keep its queue-place, retry and episode assertions unchanged.
-- Preserve these existing tests unchanged:
-  1. `test_first_priority_mark_agrees_in_the_card_overview_and_shell` in `scripts/build_queue/test_queue_view.py`.
-  2. `test_token_wait_preserves_backfill_and_strict_windows_until_its_next_admission` in `scripts/build_queue/test_admission_service.py`.
-  3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
-  4. `test_frozen_pass_keeps_one_window_for_admission_view_explanation_and_wait_text` in `scripts/lint/test_memory_admit.py`.
-  5. `test_recovery_release_keeps_required_endings_and_frozen_window` in `scripts/lint/test_memory_admit.py`.
-  6. The Phase 69 tests: the `assert_history_decoded_once` helper and its callers, `test_fresh_and_compile_estimates_share_the_precise_window_edge` and `test_shared_call_keeps_compile_results_and_nextest_selection_separate` in `scripts/lint/test_memory_admit.py`, and `test_evidence_query_uses_the_call_index_with_a_host_index_present` in `scripts/lint/test_build_shape.py`.
-- The tier share table is in the phase report and the checkpoint notice, with the stop decision.
-- If code changed: the memory admission tests pass; `basedpyright` over every changed module and its callers reports `0 errors, 0 warnings, 0 notes`; the merge gate is green; the before/after replay is in the notice. Post-merge check, 24 h after the merge reaches main: steps above their promise and wait minutes against the 24 h before.
-- Change-Review line: few admissions use the 0.65 fallback | on natedev while builds wait, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py 1` | the waiting rows name source `measured` and few name `buildlog`. If Spec 2 stops the phase: Change-Review: none — measurement only.
+**Next:** the remeasure on or after 2026-11-12, when the legacy rows leave the window, is in `docs/plans/builds-resources-next.md`. Specs 3-4 come back as a phase only if the share then reaches 5%.
 
 ### Phase 20 — Replay a looser head rule, and adopt it only on the replay  · status: done
 
@@ -1772,12 +1674,12 @@ One function finds the Cargo target folder that holds a path, and both parent wa
 
 **Spec:**
 1. The push keeps its title and its action line, unchanged.
-2. The push body template is `natedev has {free} free. Alerts start below {floor}. {recommendation}`. The `{cleanup}` and `{choices}` fields and the closing safety sentence leave the push.
-3. `{recommendation}` has one sentence per state:
-   - available, trash or protected: `Recommended: delete <folder> (<size>). It covers the <shortfall> shortfall.`
-   - available, scratch or other: `Recommended: review <folder> (<size>) first. It covers the <shortfall> shortfall.`
-   - insufficient: `Largest folder: <folder> (<size>). It covers only part of the <shortfall> shortfall.`
-   - unavailable: `Folder sizes are unknown, so no folder is recommended yet.`
+2. The push body template is `natedev has {free} free, below the {floor} alert line, so builds can fail. {recommendation}`. The `{cleanup}` and `{choices}` fields and the closing safety sentence leave the push.
+3. `{recommendation}` names one folder with its size and says what deleting it does. Start from these sentences; the writer may change their words until `review.py texts` passes, with no new fact added:
+   - available, trash: `Delete <folder> (recommended): this frees <size>, which covers the <shortfall> shortfall.`
+   - available, protected, scratch or other: `Review <folder> first (recommended): deleting it frees <size>, which covers the <shortfall> shortfall.`
+   - insufficient: `The largest folder is <folder> at <size>. Deleting it frees only part of the <shortfall> shortfall; the natedev session lists every folder.`
+   - unavailable: `Folder sizes are unknown. Measure (recommended): natedev lists folder sizes, then you choose. Delete nothing: free space stays low.` The action line names both choices, so the body says what each does.
 4. On a crossing, the natedev session message has, in order: the alert line, the cleanup line, each folder line with its effect, the recommendation sentence, the closing line (`Delete nothing…` or `Keep it…`), and `natedev checks your choice before it deletes anything.` These lines replace `page_paths` and `protected_folder_lines` in that message. The unavailable state keeps its measure-first lines.
 5. One function writes the recommendation sentence. The push and the session message both use it. `folder_choices` runs once per crossing, and both channels use its result.
 6. `fit_disk_floor_push` renders the push. When the text is at or over the limit, it renders the unavailable form. When that is also over the limit, it sends no push. The folder-trim loop goes.
