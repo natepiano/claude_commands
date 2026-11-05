@@ -79,7 +79,7 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
     row = record.by_current_session(session_id)
     if row is not None:
         if row.kind == "unit" and name and name != row.name:
-            print(f"herdr title: {name!r} differs from unit {row.name!r}; use /showrunner:rename_unit.", file=sys.stderr)
+            print(f"herdr title: {name!r} differs from unit {row.name!r}; use /showrunner:rename.", file=sys.stderr)
         client = herdr.Herdr(shared)
         return client.retitle(pane, row.name, tab=row.kind != "worker")
     if _clear_handoff_pending(session_id, shared, pane, record):

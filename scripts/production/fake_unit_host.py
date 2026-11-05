@@ -6,14 +6,11 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
-import time
 import unittest
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast, final
 from unittest import mock
 
@@ -361,42 +358,3 @@ class PaneShellFixture:
             parent, os_session = server, pid
         process(self.environment, pid, parent, ["visitor"], marks,
                 session=os_session, cwd=self.worktree)
-
-
-def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path, *,
-                    destination: tuple[str, str, str]) -> None:
-    """A shutdown boundary that records a clean stop and one native relaunch."""
-    import rename_unit
-    import unit_lookup
-    import herdr
-    stopped_event = threading.Event()
-    del path
-    pane.environment['RENAME_UNIT_STOP_WAIT'] = str(TEST_HANG_GUARD_SECS)
-
-    def shutdown(*arguments: str) -> None:
-        pane.stop_calls.append(' '.join(arguments))
-        if arguments[0] == 'stop':
-            pane.stopped()
-            stopped_event.set()
-        elif arguments[0] == 'restart':
-            pane.slug, pane.unit, name = destination
-            pane.place = herdr.HerdrPlace('restored', 'w2:p1')
-            write(pane.environment, [HostedUnit(pane.place.session, pane.place.pane,
-                  {"CLAUDE_CODE_SESSION_ID": pane.native_id})])
-            pane.shell = 991001
-            pane.found = unit_lookup.LabeledSession(pane.unit,
-                unit_lookup.LiveClaude(name, pane.native_id, '/fixture/socket', pane.shell), pane.place,
-                identity=unit_lookup.LiveSession(pane.native_id))
-        else:
-            raise AssertionError(f'unexpected shutdown: {arguments}')
-
-    from scripts.shutdown import stop_resume
-    def stop(identity: str) -> stop_resume.Stopped:
-        shutdown("stop", identity)
-        return stop_resume.Stopped(identity, pane.director)
-    _ = case.enterContext(mock.patch.object(stop_resume, 'stop', side_effect=stop))
-    _ = case.enterContext(mock.patch.object(rename_unit, 'run_shutdown', side_effect=shutdown))
-    def wait_for_stop(_seconds: float) -> None:
-        case.assertTrue(stopped_event.wait(TEST_HANG_GUARD_SECS), 'fake shutdown did not publish its stop')
-    _ = case.enterContext(mock.patch.object(rename_unit, 'time',
-        SimpleNamespace(monotonic=time.monotonic, sleep=wait_for_stop)))

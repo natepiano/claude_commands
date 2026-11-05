@@ -208,7 +208,7 @@ selects a private root). On first ledger binding, a production unit's run
 saves explicit production and unit fields in `progress_history_state.json`.
 Plan headers accept both Production forms and resolve former production names.
 Later reads use the saved identity, so moving a worktree does not change owners.
-`rename_unit.py` changes the unit row and repairs its session and display names.
+`rename.py` changes the unit row and repairs its session and display names.
 An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
 See `unit-rename.md`.
 
@@ -391,7 +391,7 @@ A different caller can resume the role.
 
 **Adoption.** `adopt` needs the authority's `adoption_required` source (`thread_id`, `name`, `mesh`, holder) to match. Steps: first the checks that change no authority state: the binding, the configured model, and the source entry, which must be idle on that thread (a `paused` entry counts as idle when `paused_from` is not busy). The source model and effort come from the roster entry; when it has none, from that thread's launch record (`impl_worker_<slot>.json` with the same `worker_id`, then the `phases/*/impl_agent_<slot>` file whose log names the worker and thread), and last from the source server's `thread/read` reply. Missing, conflicting or different values refuse with `AdoptionRequired:`. A refused adopt therefore leaves no `AdoptionReserved` claim. Then `adopt-reserve`; check the source entry again under its roster lock; write `transition.json` and `transfer.json` and set `transferring_role` on the source entry under its roster lock; on the source server park the queue, require `ThreadIdle` and release the writer; write the destination roster entry (same thread and name, saved prompt, access policy) and carry pending text; `confirm_adoption` resumes the same thread on the destination and requires `ThreadIdle`; set `role_redirect` on the source; write `adoption.json`; `adopt-commit`; write the hold. A retry with the same adoption ID completes from `adoption.json`. `_role_fence` and `transfer_route` make every old route refuse (`TransferringRole: use the destination holder route`), also after the source run folder is gone.
 
-**Unit rename.** `rename_unit.py` changes the staff row and repairs session, tab, and pane names.
+**Unit rename.** `rename.py` changes the staff row and repairs session, tab, and pane names.
 An explicit folder move uses `unit_move.move_folder` and the staff id.
 Role records retain their staff ids and history.
 
