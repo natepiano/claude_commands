@@ -31,7 +31,8 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **Select the next speed target after Phases 24 and 27.**
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
-  - Candidate: `direct/test_verify_lint_cache_versions.py`, gate median 116.1 s over 5 runs on 2026-11-05; it waits on the verify-unit remake like Phase 24. Confirm the rank at selection.
+  - Candidate: `direct/test_verify_lint_cache_versions.py`, gate median 116.1 s over 5 runs on 2026-11-05. The verify remake is on builds (5493dfa93). Confirm ownership and rank before dispatch.
+  - Candidate: `style/test_style_sync.py`, gate median 52.6 s; free since the verify remake landed (showrunner, 2026-11-05).
   - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
 - [ ] **Architecture proposal: the type-check job**
   - Target: `scripts/production/merge_gate.py` (owner sdlc devtools-unit)
@@ -46,7 +47,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [x] **The build log test suite finishes about 20 seconds sooner.** Taken by Phase 28 (2026-11-05): parallel starts, one process for each module.
   - Target: `scripts/buildlog/test_index.py` — `LogIsolationTests.test_each_module_uses_a_temporary_log`
   - Why needed: the test starts one Python process for each of the 33 `test_*.py` modules in `scripts/buildlog`: 24.5 s of the 34.8 s suite run at load 70 (11:24 EST, 2026-11-03). It is the slowest test in the index suite, and each new module adds one more process.
-  - Completion condition: one process imports every module and reports each module's log root; the test keeps one assertion per module and takes under 3 s on an idle natedev.
+  - Completed by Phase 28: eight workers run one process for each discovered module, and each module keeps both checks in its own subTest. Paired module medians: 26.0 s -> 5.8 s.
   - Revealed by: Phase 3
 - [ ] **The simplify-lens report validation test starts fewer processes and keeps its recorder checks.**
   - Target: `scripts/direct/test_simplify_lens.py` — `test_report_validation_trims_whitespace_and_requires_pass_or_a_numbered_item` (25 s, 8 review-launcher runs)
@@ -58,16 +59,15 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: the gate's slowdown warning compares with a rolling median, which slowly accepts a slowdown as normal (Astra plan review, 2026-11-04).
   - Completion condition: each module a speed phase improved has its after median stored as a reference; a gate median 20% over it is reported at phase start.
   - Revealed by: Astra plan review; starts after Phase 14 lands (showrunner ruling 2026-11-04).
-- [ ] **Architecture proposal: `mac_run.sh` reads its config keys in one start**
+- [x] **`mac_run.sh` uses the sourced configuration reader.**
   - Target: `scripts/production/mac_run.sh` (recent owner: builds-resources)
   - Why needed: `config_value()` starts `python3 conf.py get` once for each key. `test_mac_run.py` makes 339 such starts (23.5 s traced of a 49.5 s traced run); they set the Phase 29 floor.
-  - Completion condition: send the showrunner a proposal for one `conf.py` start that prints every key `mac_run.sh` needs, with the same validation; estimated gain 12-14 s on the module.
-  - Taken by Phase 30 (2026-11-05): `mac_run.sh` sources `conf.sh`.
+  - Completed by Phase 30 (2026-11-05): `mac_run.sh` sources `conf.sh`. Python starts per run 18 -> 1; paired module medians 34.6 s -> 20.5 s.
 - [ ] **Architecture proposal: the Mac claim and release commands import less**
   - Target: `scripts/mac_test/offload.py`, `scripts/mac_test/mac_test.py` (owner verify-unit), `scripts/build_hold/build_hold.py` (held until natedev messaging's hash)
   - Why needed: Phase 30 profile at load 10: claim 334.5 ms, release 276.6 ms; imports are about 230 ms of each. `build_hold.py:43` imports `admission_service` at once (126-132 ms cumulative); `offload.py:910` imports `memory_admit` a second time under another name (42 ms on claim); `offload` and `sweep` load at module start (about 41-53 ms, overlapping).
   - Split (showrunner, 2026-11-05): natest takes items 1 and 3 and resources' add-on F006 (offload reads its git helpers from a small module, not all of `sweep`) in one phase after Phase 24 lands; one unit changes `offload.py`. resources takes item 2 as its add-on F005 after the `build_hold.py` freeze; natest sent the measure and the light `session_owner` module design (2026-11-05).
-  - Completion condition (natest part): one `memory_admit` import name in `offload.py`, a light release path and F006, each measured after the one before it lands. Originally: send the showrunner the three proposals in order (one `memory_admit` name; admission imports out of the claim and release path through one light shared module, not a copy; a light release path), each with its measured gain after the one before it lands. Estimated 200-260 ms for each claim and release pair.
+  - Completion condition (natest part): `offload.repository_identity` (`offload.py:959`) uses `repository.repository_key` from Phase 22 and imports no `memory_admit`; report-unit's Phase 24 checkpoint 811bc2ba0 does this, so confirm it on builds and measure it. Then a light release path and F006, under one owner of `offload.py`, after Phase 24. Measure each change separately. Originally: send the showrunner the three proposals in order (one `memory_admit` name; admission imports out of the claim and release path through one light shared module, not a copy; a light release path), each with its measured gain after the one before it lands. Estimated 200-260 ms for each claim and release pair.
   - Revealed by: Phase 29 trace and Phase 30 profile, 2026-11-05.
   - Revealed by: Phase 29, 2026-11-05.
 - [ ] **Architecture proposal: one injected Git runner in fast_track.py**
@@ -83,4 +83,3 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 | --- | --- | --- | --- |
 | `direct/test_simplify_lens.py` | 118 | one real review-launcher run per test (3-6 s) | 6 |
 | `production/test_fast_track.py` | 193 | real Git work, about 3.5 s per test | 7 |
-| `production/test_mac_run.py` | 40.5 (load 40) | one `conf.py` start for each config key in `mac_run.sh` | 29 |
