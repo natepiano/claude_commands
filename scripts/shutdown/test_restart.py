@@ -133,11 +133,13 @@ class CodexSnapshotTests(ShutdownTestCase):
     def test_live_members_reports_shared_evidence_once_when_it_reads_the_snapshot(self) -> None:
         snapshot = herdr.CodexConversations({}, ("test-account (Codex daemon unknown: unreadable)",))
         with (patch.object(herdr, "codex_conversations", return_value=snapshot) as scan,
+              patch.object(herdr, "running_codex_threads") as threads,
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
               patch.dict(os.environ, {"SHUTDOWN_DETAIL": "0"}),
               redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.live_members(self.rows, staff.StaffSnapshot(self.rows)), [])
         scan.assert_called_once()
+        threads.assert_not_called()
         self.assertEqual(errors.getvalue().splitlines(), [
             "anomaly: test-account (Codex daemon unknown: unreadable); not blocking",
             "anomaly: 4 rows not proved live or stopped (shared cause above); not blocking"])

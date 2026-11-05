@@ -196,7 +196,7 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
                 observed = herdr.read_conversation(str(row.current_session), "claude")
                 if not isinstance(observed, herdr.LiveConversation):
                     codex = herdr.codex_conversations()
-                    _ = herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex)
+                    herdr.codex_notes(codex)
                     observed = herdr.read_conversation(str(row.current_session), codex=codex)
             else:
                 observed = herdr.read_conversation(str(row.current_session), codex=codex)

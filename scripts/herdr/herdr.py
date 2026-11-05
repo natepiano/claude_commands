@@ -3404,14 +3404,19 @@ def read_conversation(identity: str, kind: str = "", *,
     return StoppedConversation()
 
 
+def codex_notes(codex: CodexConversations) -> None:
+    """Print each shared reason from the snapshot once."""
+    for reason in dict.fromkeys(codex.unknown):
+        conversation_note(UnknownConversation(reason))
+
+
 def running_codex_threads(*, thread_host: Callable[[list[str]], bool],
                           codex: CodexConversations | None = None) -> set[str]:
     """Read proved current threads, including app-server threads and excluding the shared daemon."""
     # Keep the keyword for external callers; host processes no longer exclude their threads.
     _ = thread_host
     codex = codex_conversations() if codex is None else codex
-    for reason in dict.fromkeys(codex.unknown):
-        conversation_note(UnknownConversation(reason))
+    codex_notes(codex)
     return set(codex.live)
 
 
