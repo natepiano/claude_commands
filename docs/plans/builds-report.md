@@ -687,7 +687,7 @@ Director decisions:
 - `basedpyright` over each changed Python file: 0 errors, 0 warnings, 0 notes.
 - After landing: one `buildlog vault` run on natedev commits the Mac's `vault map.base` change and brings the Mac to GitHub's main.
 
-### Phase 30 — The Mac idle watch sends one alert per idle episode  · status: todo
+### Phase 30 — The Mac idle watch sends one alert per idle episode  · status: done
 **Depends on:** none (urgent, from the builds showrunner, 2026-11-05; runs beside Phase 29, no shared files)
 
 From the builds showrunner (from natedev, not the user), 2026-11-05: between 12:50 and 13:09 EST the watch sent the same text 3 times: "MAC IDLE 3 min: 3 steps wait for the Mac. Claim of port (clippy cargo-port) runs no build or test on the Mac." send-repeat-guard held the copies. "Send one alert per idle episode. A new alert goes only when the episode ends and a new one starts, or when its cause changes. Add a test."
