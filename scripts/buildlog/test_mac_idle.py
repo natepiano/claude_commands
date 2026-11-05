@@ -27,6 +27,7 @@ import index
 import mac_idle
 import sample
 if TYPE_CHECKING:
+    from ..mac_test import offload
     from ..build_queue import admission_protocol as wire
     from ..build_queue import admission_client
     from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from ..notify.push_catalog import mac_idle_reservation
     from ..message import send
 else:
+    import offload
     from scripts.build_queue import admission_protocol as wire
     from scripts.build_queue import admission_client
     from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -572,6 +574,32 @@ done
                 push.assert_called_once()
                 self.assertFalse(mac_idle.marker_path(self.paths, self.call.call_id).exists())
                 self.assertEqual(self.rows(), [])
+
+    def test_disk_alert_clears_when_the_floor_sweep_allows_the_step(self) -> None:
+        step_record.write(step_record.StepRecord(
+            self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "test",
+            self.call.package, step_record.NatedevOnly("disk"), step_record.StepState.ON_NATEDEV,
+            "2026-11-03T18:00:00Z"))
+        mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id),
+                              asdict(replace(self.call, local_reason="disk")))
+        with mock.patch.object(mac_idle, "push_outage", return_value=True) as push:
+            mac_idle.watch_once(self.paths, 1600, 100)
+        push.assert_called_once()
+        self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["cause"], "disk")
+        config = offload.read_config(self.root / "mac_test.conf")
+        with (mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")),
+              mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(config.free_floor_gib, "fake-mac"))):
+            answer = offload.ensure_mac_disk_floor(offload.ProcessController(), config,
+                offload.KnownRepository("hana"), offload.ProbeSnapshot(0, "fake-mac"))
+        self.assertEqual(answer, offload.MacDiskReady(config.free_floor_gib))
+        self.step(state=step_record.StepState.ON_MAC)
+        mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id), asdict(self.call))
+        mac_idle.watch_once(self.paths, 1601, 101)
+        saved = mac_idle.read_record(self.paths.state / "alert.json")
+        self.assertEqual(saved["waiting"], 0)
+        self.assertNotEqual(saved["cause"], "disk")
+        self.assertIsNone(mac_idle.mac_idle_alert.alert_line(
+            self.paths.state / "alert.json", 1601, ZoneInfo("UTC")))
 
     def test_admission_query_failure_reports_reason_and_preserves_independent_checks(self) -> None:
         for blocked, reason in ((False, "no socket"), (True, "connect refused")):
