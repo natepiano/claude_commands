@@ -32,7 +32,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
   - Candidate: `direct/test_verify_mac_only.py`, rank 1 at 358.7 s (CPU 339.3 s, 17 tests) in `top --repo ~/.claude` on 2026-11-05 08:15 EST. It waits until verify's load hang fix in `verify_mac_offload_test_support.py` is on builds; the showrunner sends word (2026-11-05).
-  - Taken: `direct/test_verify_lint_judgment.py`, rank 3 at 210.4 s (CPU 172.2 s), is Phase 31 (showrunner, 2026-11-05). Rank 2 is `agents/test_codex_mesh.py`, still excluded.
+  - Taken: `direct/test_verify_lint_judgment.py`, rank 3 at 210.4 s (CPU 172.2 s), was Phase 31 (floor below). `production/test_fast_track.py`, rank 4 at 216.9 s on 2026-11-05, is Phase 33 (showrunner, 2026-11-05). Rank 2 is `agents/test_codex_mesh.py`, still excluded.
   - Candidate: `direct/test_verify_lint_cache_versions.py`, rank 9 at 110.2 s. The verify remake is on builds (5493dfa93). Confirm ownership and rank before dispatch.
   - Candidate: `style/test_style_sync.py`, gate median 52.6 s; free since the verify remake landed (showrunner, 2026-11-05).
   - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
@@ -78,11 +78,16 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Completion condition: decision tests run against the runner; a few process tests keep real Git; same-load pairs show the gain (about 3 minutes on one module).
   - Risk: a recorded Git transcript is a second model of Git that can drift from real Git (showrunner, 2026-11-04).
   - Revealed by: Phase 7; showrunner ruling 2026-11-04 (next, not current).
-- [ ] **Other shell scripts read their settings with no Python start for each key.**
-  - Target: zsh scripts that start `python3 conf.py get` for each key (find the callers with grep)
-  - Why needed: `mac_run.sh` dropped from 18 Python starts per run to 1 when it sourced `scripts/lib/conf.sh` (Phase 30); other scripts still pay one start for each key.
-  - Completion condition: find the callers and measure the starts for each run first, then bring the measured cut (showrunner, 2026-11-05: next).
-  - Revealed by: Phase 30, 2026-11-05.
+- [ ] **Measure `test_verify_lint_judgment.py` again when its owners' changes land.**
+  - Target: `direct/test_verify_lint_judgment.py` (198.6 s after Phase 31)
+  - Owners (showrunner, 2026-11-05): queue-unit fixes the admission start spacing in `scripts/build_queue/admission_test_support.py` (first after 10x) and takes the lighter admission client start (`scripts/lint/memory_gate.sh:17-22`), with the `build_hold.py` import proposal. verify-unit takes step-record state reuse (`verify.sh:356-358`, `verify.sh:1925-1934`), next after its Phase 35, then a callable repair decision (`verify.sh:3711-3714`).
+  - Completion condition: same-load pairs on builds after each change lands; the Floors row moves to the new median.
+  - Revealed by: Phase 31, 2026-11-05.
+- [ ] **Every test runs from the repo root with no PYTHONPATH.**
+  - Target: `scripts/production/test_next_item.py`, two `scripts/notify` test modules, and `scripts/lib` (no package file; needs a module list)
+  - Why needed: these modules fail with an import error unless PYTHONPATH names their folder (natedev, via the showrunner, 2026-11-05; priority later).
+  - Completion condition: each module passes from the repo root with no PYTHONPATH. Fix the imports at the cause; add no new check.
+  - Revealed by: natedev, 2026-11-05.
 - [ ] **Architecture proposal: the build target commands import less**
   - Target: `scripts/build_hold/build_hold.py` (owner resources; queue-unit takes the cut), `scripts/build_targets/build_targets.py` `eligible` answer (owner verify-unit)
   - Why needed: after Phase 24, `eligible` and `reserve` set the floor of `test_verify_ssh_targets_routing.py`: they import `build_hold`, which imports `admission_service` and `memory_admit` at once (`build_hold.py:40-46`). `eligible` runs 24 times (23.4 traced s).
@@ -97,3 +102,4 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 | `direct/test_simplify_lens.py` | 118 | one real review-launcher run per test (3-6 s) | 6 |
 | `production/test_fast_track.py` | 193 | real Git work, about 3.5 s per test | 7 |
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | Python start-up of `eligible` and `reserve` (`build_hold` -> `admission_service` -> `memory_admit`) | 24 |
+| `direct/test_verify_lint_judgment.py` | 198.6 | production `verify.sh lint` route: 3.1 s per run with no repair, 5.2 s with repair (step-record and admission client Python starts) plus admission start spacing | 31 |
