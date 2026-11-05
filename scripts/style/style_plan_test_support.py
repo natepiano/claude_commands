@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
-
 import io
 import os
 import shutil
@@ -19,6 +17,8 @@ from typing import ClassVar, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from ledger_test_support import ticket_owner_id
 
 import approved_renames
 import style_footprint
@@ -39,6 +39,11 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 
 REAL_RUN = subprocess.run
+
+
+def unit_staff_id(name: str) -> str:
+    """Return the staff id for a fixture unit."""
+    return proposal_issue.staff_reference(name, "unit").id
 
 
 class StylePlanFixture(unittest.TestCase):
@@ -216,10 +221,10 @@ class StylePlanFixture(unittest.TestCase):
         showrunner_plan.parent.mkdir(parents=True)
         _ = showrunner_plan.write_text(self.plan_header() + "Showrunner copy differs.\n")
 
-    def production(self, branch: str, checkout: Path, parent: str) -> str:
+    def production(self, branch: str, checkout: Path, _parent: str) -> str:
         return "\n".join([
             "# Production", f"- **Merge branch:** {branch}", f"- **Showrunner checkout:** {checkout}",
-            "- **Log:** docs/log.md", "- **Branch point:** main", f"- **Parent production:** {parent}", "",
+            "- **Log:** docs/log.md", "- **Branch point:** main", "",
         ])
 
     def unit_plan_config(self, worktree: Path, plan_name: str) -> None:
@@ -433,8 +438,7 @@ class StylePlanFixture(unittest.TestCase):
             for path in files:
                 finding = ledger.hold(rule, path, 1, "change", kind, "Outcome::Old", "Outcome::New", blob, "outside")
                 ledger.file_held(finding.finding_id, issue)
-        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
-                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names-unit')}\nplan: approved\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
         self.proposals_field(folder)
         return issue
 
@@ -511,7 +515,7 @@ class StylePlanFixture(unittest.TestCase):
             ledger.file_held(finding.finding_id, issue)
         self.pending_judge_tickets |= {judge}
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nplan: approved\n"
-                             + f"unit: {family}-unit\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+                             + f"unit: {unit_staff_id(family)}\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
         self.proposals_field(folder)
         return issue
 
@@ -703,7 +707,7 @@ class StylePlanFixture(unittest.TestCase):
                 ledger.file_held(finding.finding_id, issue)
                 ids.append(finding.finding_id)
             ledger.ticket_drop(judging)
-            _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+            _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names-unit')}\nplan: approved\n"
                                  + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
             ledger.ticket_add(ticket, ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha",
                               [self.sources[0]], [rule], proposal=str(issue), finding_ids=tuple(ids))
@@ -738,7 +742,7 @@ class StylePlanFixture(unittest.TestCase):
             ledger.file_held(finding.finding_id, issue)
             ids.append(finding.finding_id)
         ledger.ticket_drop(judging)
-        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+        _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names-unit')}\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
         ledger.ticket_add(ticket, ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
                           proposal=str(issue), finding_ids=tuple(ids))
@@ -806,7 +810,7 @@ class StylePlanFixture(unittest.TestCase):
                             for before, after in pairs)
             for finding in findings:
                 ledger.file_held(finding.finding_id, issue)
-            _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+            _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names-unit')}\nplan: approved\n"
                                  + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
             ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [old], [rule],
                               proposal=str(issue), finding_ids=tuple(finding.finding_id for finding in findings))

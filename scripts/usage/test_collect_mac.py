@@ -5,11 +5,16 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import subprocess
+import sys
 import unittest
 from contextlib import closing
 from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import cast, final
 
+from scripts.usage.collect import REMOTE_BOOTSTRAP, reader_payload
 from scripts.usage.collect_test_support import (
     CODEX_ACTIVITIES,
     CLAUDE_ACTIVITIES,
@@ -23,6 +28,29 @@ from scripts.usage.collect_test_support import (
     MacCollectorFixture,
     READABLE_SESSION,
 )
+
+
+@final
+class RemoteReaderTests(unittest.TestCase):
+    def test_payload_calls_history_root_without_production_modules(self) -> None:
+        probe = """
+import importlib.util
+print(json.dumps({
+    'history_root': str(sys.modules['scripts.lib.unit_runs'].history_root()),
+    'production_available': importlib.util.find_spec('scripts.production') is not None,
+}))
+"""
+        with TemporaryDirectory() as folder:
+            expected = str(Path(folder) / "history")
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", REMOTE_BOOTSTRAP + probe],
+                input=reader_payload({}), capture_output=True, text=True, timeout=10,
+                cwd=folder, env={"HOME": folder, "UNIT_HISTORY_DIR": expected},
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(cast(object, json.loads(result.stdout.splitlines()[-1])), {
+            "history_root": expected, "production_available": False,
+        })
 
 
 @final

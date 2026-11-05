@@ -315,7 +315,7 @@ def report_units(doc: Path, slug: str, record: staff.StaffSnapshot) -> tuple[Uni
     except OSError as error:
         raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
     try:
-        runs = unit_lookup.read_run_states()
+        runs = unit_lookup.read_run_states(record=record)
     except OSError as error:
         raise DailiesFailure("production", f"the run records of {slug} could not be read: {error}") from error
     units: list[UnitRow] = []
@@ -888,7 +888,7 @@ def run(args: argparse.Namespace) -> int:
         )
     if isinstance(table_state, PhaseTablesUnavailable):
         report("phase tables", "unavailable", table_state.reason)
-    instance = f"showrunner-{production.slug}"
+    instance = showrunners.timer_name(production.slug, staff_record)
     blocks = status_blocks(status_path, units)
     report("status", "ok", f"{len(blocks)} units read")
     # A unit whose run is finished has nothing to report: it needs no judgment entry and is left out,

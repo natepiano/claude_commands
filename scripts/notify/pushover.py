@@ -61,8 +61,9 @@ from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefus
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 
-API_URL = "https://api.pushover.net/1/messages.json"
-CANCEL_URL = "https://api.pushover.net/1/receipts/cancel_by_tag/{tag}.json"
+API_HOST = "api.pushover.net"
+API_URL = f"https://{API_HOST}/1/messages.json"
+CANCEL_URL = f"https://{API_HOST}/1/receipts/cancel_by_tag/{{tag}}.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
 LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.jsonl"
 PRIORITIES = ("0", "1", "2")

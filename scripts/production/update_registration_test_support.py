@@ -172,7 +172,7 @@ class RegistrationFixture(unittest.TestCase):
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
             "- **Showrunner session:** first-showrunner", "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes",
-            f"- **Proposals:** `{self.root / 'issues'}`", "", "## Gates", "",
+            f"- **Proposals:** `{self.root / 'issues'}`", "",
         )), encoding="utf-8")
         runner = recorded_showrunner(fixture_showrunner_name("example", self.doc), self.doc)
         _ = fixture_member("unit", name="alpha", parent=runner.id,

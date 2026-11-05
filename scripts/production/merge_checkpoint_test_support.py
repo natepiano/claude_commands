@@ -87,8 +87,7 @@ TRIAL = ("review trial: ux 2 findings, code 3 findings, review-worker minutes 14
 SIMPLE_OWNS = ("src/alpha.txt", "crates/alpha/", "docs/plans/alpha.md", "docs/plans/alpha-next.md")
 SIMPLE_MERGE_TESTS = "- **Merge tests:** `checkpoint-test`"
 REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` "
-                    "and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 "
-                    "because pyrightconfig names a `.venv` no checkout has), run in the showrunner checkout")
+                    "and `basedpyright scripts/buildlog` (status zero and a clean summary), run in the showrunner checkout")
 DELIVERS = "Delivers checkpoint merge behavior."
 PARALLEL = "Parallel: none — no phase is waiting"
 STUB = '''#!/usr/bin/env python3
@@ -139,7 +138,7 @@ if (state / ("fail-" + name)).exists():
 if name == "basedpyright":
     print("0 errors, 0 warnings, 0 notes", flush=True)
     print("venv .venv subdirectory not found in venv path " + os.getcwd() + ".", file=sys.stderr)
-    raise SystemExit(3)
+    raise SystemExit(0)
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
 
 
@@ -244,7 +243,6 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.promotions: str = ""
         self.known_flakes: str = ""
         self.known_flaky_tests: str = ""
-        self.gate: bool = True
 
     fixture_root: ClassVar[Path]
     fixture_snapshot: ClassVar[Path]
@@ -397,21 +395,13 @@ class MergeCheckpointFixture(unittest.TestCase):
             rows.append(f"- **Known flakes:** {self.known_flakes}")
         if self.known_flaky_tests:
             rows.append(f"- **Known flaky tests:** {self.known_flaky_tests}")
-        rows.extend([
-            "", "## Gates", "",
-            "| Gate | Waiting | Waits on | Clears when |",
-            "| --- | --- | --- | --- |",
-        ])
         if hub_files:
-            hub_start = rows.index("## Gates") - 1
-            rows[hub_start:hub_start] = [
+            rows.extend([
                 "## Hub files", "",
                 "| File | Owner unit | Other units that touch it |",
                 "| --- | --- | --- |",
                 "| `shared.txt` | beta-unit | alpha-unit |", "",
-            ]
-        if self.gate:
-            rows.append("| G1 | beta-unit Phase 4 | alpha-unit Phase 2 | checkpoint merged |")
+            ])
         rows.extend(["", "## Production rules", "", "- Merge each phase and push the merge branch."])
         _ = self.doc.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
