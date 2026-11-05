@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
@@ -729,9 +729,10 @@ class LinuxShellTests(unittest.TestCase):
         real_run = subprocess.run
 
         def capture(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                    capture_output: bool = False, text: bool = False, timeout: float = 5) -> subprocess.CompletedProcess[str]:
+                    capture_output: bool = False, text: bool = False, timeout: float = 5,
+                    env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
             _ = text
-            reply = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True, timeout=timeout)
+            reply = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True, timeout=timeout, env=env)
             if not capture_output:
                 print(reply.stdout, end="")
                 print(reply.stderr, end="", file=sys.stderr)
