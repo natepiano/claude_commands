@@ -567,7 +567,15 @@ Index `SCHEMA_VERSION = 25` (`scripts/buildlog/index.py`; `open_for_update` rebu
 
 `steps.wait_s` keeps metadata and pass-record lookup time plus the ordinary build wait; `mem_wait_s` is memory admission. `calls.hold_wait_s` records held-target waiting separately, including each declined Mac retry, and `calls.target` names where the call ended. The Waiting table keeps `Held target` apart from `Memory admission`.
 
-**Slice snapshots** (`scripts/buildlog/memory.py`). `buildlog snapshot`, and every `buildlog sample` (via `SampleTaken(at, host)` and `memory.write_snapshot(at, host)`), append a `memory_snapshot` record to the host's monthly samples file. Per slice (`builds`, `ci`, or `{"state": "absent"}`): `memory.events` `high`/`max`/`oom_kill`, `memory.peak`, `memory.swap.peak`, the three limits, and `memory.pressure` `some` total as `stall_some_us` (or `"unavailable"`); plus zram `mm_stat` data and compressed bytes. A snapshot failure prints `memory snapshot unavailable` and never fails the sample. `BUILDLOG_BUILDS_CGROUP`, `BUILDLOG_CI_CGROUP` and `BUILDLOG_ZRAM` point tests at fixture trees.
+**Slice snapshots** (`scripts/buildlog/memory.py`). Each `buildlog sample` tick writes a sample row and a `memory_snapshot` row.
+Only the sample row holds slices during the tick.
+The tick snapshot row holds `kind`, `at`, `host`, and `zram` only.
+The standalone `buildlog snapshot` row keeps slices because it has no sample row beside it.
+Each slice (`builds` or `ci`) stores its events, peaks, limits, and memory pressure total.
+An absent slice has `state: absent`. An unreadable pressure total has the value `unavailable`.
+The zram reading stores the data and compressed bytes from `mm_stat`.
+A snapshot failure prints `memory snapshot unavailable` and preserves the sample.
+`BUILDLOG_BUILDS_CGROUP`, `BUILDLOG_CI_CGROUP`, and `BUILDLOG_ZRAM` select fixture paths for tests.
 
 **CI jobs.** A job is `carried_over` when its attempt is above 1 and `started_at` precedes `created_at`, else `skipped` when its conclusion is `skipped`, else `ran`. Only `ran` rows store `duration_s` and `queued_s`; `queued_s` is `started_at - created_at` when both parse and the result is zero or more, else NULL. `elapsed_seconds(start, end) -> float | None` is unrounded; `seconds_between` rounds to 3 places. `ci_job_days` excludes `carried_over` and keys days by the run attempt's `started_at`.
 
@@ -615,6 +623,14 @@ Slice lines use the snapshots nearest each edge within `SNAPSHOT_DISTANCE_S` (12
 - The Mac note starts `Mac: sync paused since <time> (<why>).` while paused.
 
 ### Mac sync pause (`scripts/buildlog/sync.py`)
+
+The hourly task exchanges records with every configured SSH peer.
+After a completed Linux offload run, natedev releases the slot claim before it calls `sync_target(target)`.
+This exchange contacts only that target and preserves its configured host paths, including `aws-build/`.
+It skips a paused sync and never waits for the sync lock.
+It uses the configured connection, reach, and rsync timeouts.
+A failed exchange prints one line and preserves the step result for the caller.
+The hourly task can retry the exchange.
 
 `buildlog sync pause <why>` writes `<root>/sync_paused.json` `{since, why}`; `resume` removes it. `sync()` holds an flock on `<root>/sync.lock` for its whole run; paused, it contacts nothing, prints `buildlog sync: paused since <time> (<why>); buildlog sync resume ends it`, returns 0 and leaves `sync.json` alone. `pause` takes the same lock (printing `buildlog sync: waiting for the running sync to finish`), so once it returns nothing contacts the Mac. `hourly` still polls CI while paused. `read_pause -> SyncPaused(since, why) | SyncRunning()`; `read_status -> SyncStatus(at, peer, ok, last_good: LastSynced | NeverSynced) | NeverSynced`. The reach check runs `mkdir -p <REMOTE_ROOT>; echo "rc=$?"` and judges the printed `rc=`; nonzero or missing (`reported rc=<n>` / `no rc= line in command output`) writes `sync.json` `ok: false` and exits 1. ssh exit 255 is a peer that did not answer (one line, exit 0). `rsync` keeps its exit-status checks.
 
@@ -768,7 +784,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 - Holder files supply current hold state. Old cycles distinguish files still in force from completed holds. A release removes its holder file at once. Historical log rows never decide whether a build can start.
 - Releases go by session id, never by name. A session that cannot be messaged is never recorded as a recipient.
 - Hold changes use `release.lock`. Release delivery uses the ended cycle after the holder file is gone. A damaged record is set aside by a changing command, never by `status` or the dailies.
-- `steps.mem_wait_s` is the memory wait and `steps.wait_s` the call's lookup and token wait; any column change bumps `SCHEMA_VERSION`.
+- `steps.mem_wait_s` is the memory wait. `steps.wait_s` is the call's lookup and token wait. The file name hashes the schema SQL. Bump `SCHEMA_VERSION` only when the way rows are derived changes.
 - Only `ran` CI jobs carry duration and queue time. CI days key on the run attempt's `started_at` everywhere.
 - The window report is host-scoped; the daily report aggregates hosts. A run's own peak comes from `ci_anon_bytes` / `builds_anon_bytes` samples, never from `memory.peak`.
 - Only the floor-out-of-reach alert reaches the phone; diagnostics go to natedev.

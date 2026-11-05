@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 if TYPE_CHECKING:
-    from ..buildlog import index, store
+    from ..buildlog import index as index, store
 else:
     import index
     import store

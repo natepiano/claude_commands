@@ -229,22 +229,22 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - The checkpoint gate is green
 
 ### Phase 7 — The fast-track module and the next live slow module run in half their time  · status: todo
-**Depends on:** Phase 6
+**Depends on:** none (its two modules share no file with Phase 6; each baseline is its own gate median and an idle-host run, so Phase 6 need not land first)
 
 #### Work Order
 
-**Goal:** `production/test_fast_track.py` (median 127 s of its last 5 gate runs, 85 s CPU in the last) and the next live module of `test_times top` each run in at most half their baseline wall time, with no CPU increase and no lost coverage.
+**Goal:** `production/test_fast_track.py` (median 296 s of its last 5 gate runs, 188 s CPU) and `style/test_crate_run.py` (median 178 s, 63 s CPU; the slowest live module of `test_times top` that no phase owns, 2026-11-04) each run in at most half their baseline wall time, with no CPU increase and no lost coverage.
 
 **Spec:** apply the speed method (Delegation Context) to each module. Each writer owns one module. `MergeCheckpointFixture.setUpClass` (`scripts/production/merge_checkpoint_test_support.py:262`) already builds one seed for each class and copies it for each test. Find the cost from the timings.
 
 **Files:**
 - `scripts/production/test_fast_track.py` — speed edits
-- The second module — speed edits. Upstream commit `322530677` deleted `scripts/direct/test_verify_lint_guard_key.py` and kept four build-key tests in `scripts/direct/test_verify_build_key.py`. At dispatch, the director takes the slowest live module of `test_times top` that no phase owns and writes its path, median and CPU here and in the Goal.
+- `scripts/style/test_crate_run.py` — speed edits (the second module)
 - `scripts/production/merge_checkpoint_test_support.py` — read; edit only under speed method step 4
 
 **Workers:** 2 writers — one module each; there is no new test to write before the code
 - `impl` — `scripts/production/test_fast_track.py`; hub: `scripts/production/merge_checkpoint_test_support.py`
-- `test` opens as impl — the second module
+- `test` opens as impl — `scripts/style/test_crate_run.py`
 
 **State:** none
 
@@ -293,45 +293,29 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Gotchas:**
 - Reading `cgroup.procs` of a cgroup the kernel is removing gives ENODEV, not `FileNotFoundError`. `reservation_lifetime` catches only `FileNotFoundError`; resources-unit owns the fix.
 
-### Phase 10 — Each schema keeps its own build log index file  · status: todo
-**Depends on:** Phase 8, Phase 9
+### Phase 10 — Each schema keeps its own build log index file  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** two trees with different index schemas never rebuild each other's build log index, and the shared row reader holds its lock only while it reads bytes.
-
-**Spec:**
-
-1. Name the index file by a hash of the schema, so each schema has its own file. The hash covers every table, column and index, including the `build_history_group` column and the `steps_build_group_history` index (report-unit P11 e15006b41). Today one file name serves every schema, so a tree with another schema rebuilds the index each time it opens it.
-2. `index.update()` rebuilds when any `TABLES` name is missing from the file, not only on a version change (Phase 8 review F012).
-3. Delete an index file of another schema only after it is unused for an age read from config (`config/` file, no constant in code).
-4. `store.locked_rows` reads the bytes under the shared lock, releases the lock, then decodes and yields the rows (Phase 9 review F014). Writers in `locked_append` then wait only for the read, not for the caller's work.
-5. One function names the index file, and every reader calls it. Remove `store.INDEX_NAME`. The readers today build `root / store.INDEX_NAME` or `"buildlog/index.sqlite"`: `scripts/lint/memory_admit.py:1854,1939,2290,2344,2459`, `scripts/buildlog/width_trial.py:449` and `scripts/hierarchies/measure.py:1839,2680`. Put the function where `memory_admit.py` can import it without loading the index build code, or state the import cost.
-6. A dropped gate table is rebuilt by `update()`, so the Phase 8 test `test_reports_name_a_missing_gate_table_without_a_traceback` (`scripts/test_times/test_show.py:305`) changes. One test proves a report succeeds after a gate table is dropped. One test keeps the one-line diagnostic for a table still missing after `update()`, with `update()` patched to do nothing.
+- The index file is `index-<sha256>.sqlite` in the store root. The hash covers `SCHEMA_VERSION` and every schema statement (tables, columns, indexes), so a tree with another schema opens its own file and rebuilds nothing of a peer's.
+- `index.index_path()` names the file in `store.root()`; `index.index_path_in(root)` names it in a given root; `index.read_only_uri(root)` gives the quoted read-only URI. Every reader calls one of these. `store.INDEX_NAME` is gone.
+- `index.update()` rebuilds when any `TABLES` name is missing, and sets the current file's mtime when it is more than one day old. `cleanup_unused_indexes` deletes another schema's file only when `max(st_atime, st_mtime)` is older than `INDEX_UNUSED_DAYS` from `config/buildlog.conf` (30).
+- `store.locked_rows` reads the bytes under the shared lock, releases it, then decodes and yields the rows.
+- A dropped gate table is rebuilt by `update()`. `show.py` keeps the one-line missing-table diagnostic for a table still missing after `update()`.
 
 **Files:**
-- `scripts/buildlog/index.py` — schema hash file name, missing-table rebuild, old-file cleanup
-- `scripts/buildlog/store.py` — `locked_rows` lock span, `INDEX_NAME` removed
-- `scripts/lint/memory_admit.py`, `scripts/buildlog/width_trial.py`, `scripts/hierarchies/measure.py` — readers of the index file
-- `scripts/buildlog/test_index.py`, `scripts/buildlog/test_gate_index.py`, `scripts/buildlog/test_store.py`, `scripts/test_times/test_show.py` — tests
-- the tests that build the index path by name: `scripts/hierarchies/test_measure.py`, `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_memory_window.py`, `scripts/buildlog/test_width_trial.py`, `scripts/lint/test_build_shape.py`, `scripts/lint/test_memory_admit.py`
-- a `config/` file for the cleanup age
+- `scripts/buildlog/index.py`, `scripts/buildlog/store.py`, `config/buildlog.conf` — file name, rebuild, cleanup, lock span
+- `scripts/lint/memory_admit.py`, `scripts/buildlog/width_trial.py`, `scripts/hierarchies/measure.py`, `scripts/test_times/show.py` — readers
+- `scripts/buildlog/test_index.py`, `test_gate_index.py`, `test_store.py`, `scripts/test_times/test_show.py` and the tests that build the index path
 
-**Workers:** 1 writer + 1 tester — the index, store and reader changes are one module group
-- `impl` — `index.py`, `store.py`, the config file, `memory_admit.py`, `width_trial.py`, `measure.py`
-- `test` — every test file above, from the Spec
+**Binds later work:**
+- No code names `index.sqlite`; a new reader calls `index.index_path()` or `index.index_path_in(root)`.
 
-**State:** none
+**Gotchas:**
+- `hashlib` and the schema statements add about 2 ms to each CLI start that imports `index`.
 
-**Constraints from prior phases:**
-- Phase 8: `index.GATE_TABLES` is the tuple of gate tables, taken from the `TABLES` keys; `show.py` probes them. `update()` skips the `meta` root write when the stored root is the same.
-- Phase 9: `memory_admit.anonymous_history_rows`, `sweep.build_log_rows`, `sweep.trim_row_recorded` and `sweep.read_sweep_removals` read through `store.locked_rows`. `sweep.build_log_rows` raises `FileNotFoundError` when an enumerated month is absent after the read.
-- Ledger routes: Phase 8 F012, F013; Phase 9 F014.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/buildlog` green
-- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_sweep.py`, `scripts/lint/test_build_shape.py`, `scripts/hierarchies/test_measure.py` and `scripts/test_times` green in the checkpoint gate run
-- `basedpyright scripts/buildlog scripts/lint/memory_admit.py scripts/hierarchies/measure.py` and every changed test file prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- Cost indexes outside the hash: a changed cost index is a schema change and gets its own file.
 
 ### Phase 11 — Shared test fixtures skip repeated setup  · status: todo
 **Depends on:** Phase 6

@@ -33,12 +33,12 @@ from scripts.direct import step_record
 
 class AwsExecutor(Protocol):
     def __call__(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
-                 timeout: float, check: bool) -> subprocess.CompletedProcess[str]: ...
+                 timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]: ...
 
 
 def execute_command(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                    timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check)
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
 
 
 class AwsUnavailable(RuntimeError):
@@ -92,7 +92,7 @@ class AwsCli:
                               timeout=self.timeout_s, check=False)
         if result.returncode:
             raise AwsUnavailable(result.stderr.strip() or f'{operation}: failed')
-        if service == 'cloudformation' and operation == 'deploy':
+        if not result.stdout.strip() or service == 'cloudformation' and operation == 'deploy':
             return {}
         raw = cast(object, json.loads(result.stdout))
         if not isinstance(raw, dict):
@@ -274,7 +274,9 @@ class Controller:
         state: dict[str, object] = {}
         with control_lock(self.directory):
             try:
-                settings = read_control_settings(configuration)
+                settings = read_control_settings(configuration, self.directory)
+                if not settings.instance_id:
+                    raise ValueError("deployment.json: no saved instance identity")
                 configured = SshTarget(self.target, 'linux', self.settings_path)
                 if not is_aws_target(configured):
                     raise ValueError('target is not an AWS target')

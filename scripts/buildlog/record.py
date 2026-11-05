@@ -49,17 +49,13 @@ exit status is 0. Records are JSON lines (store.py); index.py reads them.
 
 from __future__ import annotations
 
-import gzip
 import fcntl
-import hashlib
 import importlib
 import json
 import math
 import os
-import secrets
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -87,24 +83,16 @@ else:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
 if TYPE_CHECKING:
     from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 else:
     from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 if TYPE_CHECKING:
     from ..aws_target.config import MeasurementUnavailable
-else:
-    from scripts.aws_target.config import MeasurementUnavailable
-import conf
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
-if TYPE_CHECKING:
-    from ..build_targets.target_config import LocalTarget, SshTarget, read_targets
-else:
-    from target_config import LocalTarget, SshTarget, read_targets
 
-if TYPE_CHECKING:
-    import sample
+__all__ = ["_target_hosts"]
 
 
 class RecordedCall(Protocol):
@@ -116,8 +104,6 @@ class AdmissionMetadata(Protocol):
     CallRecord: type[RecordedCall]
 
     def parse_snapshot_value(self, value: object, schema: object) -> object: ...
-    def test_threads(self, argv: list[str]) -> int | None: ...
-    def recorded_repository_key(self, argv: list[str], cwd: str) -> str: ...
 
 
 def admission_metadata() -> AdmissionMetadata:
@@ -157,6 +143,8 @@ def transcript_target_folder(metadata: Mapping[str, object], parameters: Mapping
 
 def sync_config() -> dict[str, str]:
     """Read peer settings when a sync or report needs them."""
+    import conf
+
     path = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(Path(__file__).resolve().parents[2]
                                                          / "config/build_targets.conf"))).expanduser()
     return conf.read(path).values()
@@ -164,7 +152,10 @@ def sync_config() -> dict[str, str]:
 
 def target_hosts(target: str) -> tuple[str, ...]:
     """Map a target to host names, including explicit legacy Mac aliases."""
-    values = sync_config()
+    return _target_hosts(sync_config(), target)
+
+
+def _target_hosts(values: Mapping[str, str], target: str) -> tuple[str, ...]:
     configured = tuple(name.strip() for name in values.get(f"sync.hosts.{target}", "").split(",") if name.strip())
     if any(name in (".", "..") or Path(name).name != name for name in configured):
         raise ValueError("sync host names must be directory names")
@@ -172,15 +163,21 @@ def target_hosts(target: str) -> tuple[str, ...]:
 
 
 def mac_targets() -> tuple[str, ...]:
+    from target_config import SshTarget, read_targets
+
     return tuple(target.name for target in read_targets()
                  if isinstance(target, SshTarget) and target.platform == "macos")
 
 
 def configured_targets() -> tuple[str, ...]:
+    from target_config import read_targets
+
     return tuple(target.name for target in read_targets())
 
 
 def local_targets() -> tuple[str, ...]:
+    from target_config import LocalTarget, read_targets
+
     return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
 
 
@@ -192,7 +189,8 @@ class LocalStepIdentity:
 
 def local_step_identity(targets: tuple[str, ...] = ()) -> LocalStepIdentity:
     configured = targets or local_targets()
-    hosts = tuple(dict.fromkeys(alias for name in configured for alias in target_hosts(name)))
+    values = sync_config()
+    hosts = tuple(dict.fromkeys(alias for name in configured for alias in _target_hosts(values, name)))
     return LocalStepIdentity(configured, hosts)
 
 
@@ -229,7 +227,7 @@ def recorded_target(host: str) -> str:
     values = sync_config()
     names = [key.removeprefix("sync.hosts.") for key in values if key.startswith("sync.hosts.")]
     for name in names:
-        if host in target_hosts(name):
+        if host in _target_hosts(values, name):
             return name
     return ""
 
@@ -340,6 +338,8 @@ def hana_launch_record(fields: Mapping[str, object], directory: str) -> LaunchSt
 
 
 def _launch_row_path(record_data: Mapping[str, object]) -> Path:
+    import hashlib
+
     digest = hashlib.sha256(str(record_data["id"]).encode()).hexdigest()
     return store.root() / str(record_data["host"]) / f"launch-{digest}.jsonl"
 
@@ -359,7 +359,7 @@ def write_launch_line(record_data: Mapping[str, object]) -> bool:
         _sync_directory(path.parent)
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    temporary = path.with_name(path.name + f".{os.getpid()}.{os.urandom(6).hex()}.tmp")
     try:
         with temporary.open("w") as handle:
             _ = handle.write(json.dumps(dict(record_data), separators=(",", ":")) + "\n")
@@ -384,10 +384,10 @@ def _save_pending_record(path: Path, fields: Mapping[str, object], *, replace_ex
     if not replace_existing and path.exists():
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False)
-    temporary_path = Path(temporary.name)
+    temporary_path = path.with_name(path.name + f".{os.getpid()}.{os.urandom(6).hex()}.tmp")
+    descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with temporary:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
             json.dump(dict(fields), temporary, separators=(",", ":"))
             temporary.flush()
             os.fsync(temporary.fileno())
@@ -515,6 +515,41 @@ def git_facts(directory: str) -> GitFacts:
     return facts
 
 
+def remote_identity(remote: str, directory: str) -> str:
+    """Normalize a remote URL or path to the repository key."""
+    if "://" not in remote and ":" in remote and not remote.startswith(("/", ".")):
+        host, path = remote.split(":", 1)
+        hostname = host.rsplit("@", 1)[-1]
+        if (hostname and (host == hostname or host == f"git@{hostname}")
+                and hostname.isascii() and all(letter.isalnum() or letter in ".-" for letter in hostname)
+                and not any(letter in path for letter in "?#\r\n\t")):
+            return f"https://{hostname.lower()}{('/' + path).rstrip('/').removesuffix('.git')}"
+        remote = f"ssh://{host}/{path}"
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(remote)
+    if parsed.hostname:
+        path = parsed.path.rstrip("/").removesuffix(".git")
+        port = f":{parsed.port}" if parsed.port and parsed.port not in (22, 443) else ""
+        return urlunsplit(("https", parsed.hostname.lower() + port, path, "", ""))
+    path = Path(parsed.path if parsed.scheme == "file" else remote).expanduser()
+    if not path.is_absolute():
+        path = Path(directory) / path
+    return str(path.resolve()).rstrip("/").removesuffix(".git")
+
+
+def recorded_repository_key(argv: list[str], directory: str) -> str:
+    """Read the repository key without loading admission scheduling types."""
+    if not argv:
+        return store.UNKNOWN_IDENTITY
+    remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
+    if remote and remote.strip():
+        return remote_identity(remote.strip(), directory)
+    roots = output(["git", "-C", directory, "rev-list", "--max-parents=0", "--reverse", "HEAD"],
+                   directory, GIT_TIMEOUT_S)
+    return "git-root:" + roots.strip().splitlines()[0] if roots and roots.strip() else store.UNKNOWN_IDENTITY
+
+
 def caller(tty: bool) -> str:
     env = os.environ
     explicit = env.get("BUILDLOG_CALLER")
@@ -541,7 +576,7 @@ def who() -> dict[str, str | None]:
 
 
 def new_id(host: str, epoch: float) -> str:
-    return f"{host}-{datetime.fromtimestamp(epoch, UTC).strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
+    return f"{host}-{datetime.fromtimestamp(epoch, UTC).strftime('%Y%m%dT%H%M%S')}-{os.urandom(3).hex()}"
 
 
 def rustc_version(argv: list[str], cwd: str) -> str | None:
@@ -556,27 +591,27 @@ def rustc_version(argv: list[str], cwd: str) -> str | None:
 
 
 class StepScopeMemory(NamedTuple):
-    peak_bytes: int | sample.Unmeasured
-    stall_some_s: float | sample.Unmeasured
-    stall_full_s: float | sample.Unmeasured
+    peak_bytes: int | cgroup_capture.Unmeasured
+    stall_some_s: float | cgroup_capture.Unmeasured
+    stall_full_s: float | cgroup_capture.Unmeasured
 
 
 def peak_and_stall(path: str) -> StepScopeMemory:
-    import sample
+    unmeasured = cgroup_capture.Unmeasured.VALUE
 
     if not path:
-        return StepScopeMemory(sample.Unmeasured.VALUE, sample.Unmeasured.VALUE, sample.Unmeasured.VALUE)
+        return StepScopeMemory(unmeasured, unmeasured, unmeasured)
     try:
         lines = Path(path).read_text().splitlines()
     except OSError:
-        return StepScopeMemory(sample.Unmeasured.VALUE, sample.Unmeasured.VALUE, sample.Unmeasured.VALUE)
+        return StepScopeMemory(unmeasured, unmeasured, unmeasured)
     try:
-        peak = int(lines[0]) if lines else sample.Unmeasured.VALUE
+        peak = int(lines[0]) if lines else unmeasured
     except ValueError:
-        peak = sample.Unmeasured.VALUE
-    stalls = sample.parse_pressure("\n".join(lines[1:]), require_both=False)
-    some = stalls.some_us / 1_000_000 if isinstance(stalls.some_us, int) else sample.Unmeasured.VALUE
-    full = stalls.full_us / 1_000_000 if isinstance(stalls.full_us, int) else sample.Unmeasured.VALUE
+        peak = unmeasured
+    stalls = cgroup_capture.parse_pressure("\n".join(lines[1:]), require_both=False)
+    some = stalls.some_us / 1_000_000 if isinstance(stalls.some_us, int) else unmeasured
+    full = stalls.full_us / 1_000_000 if isinstance(stalls.full_us, int) else unmeasured
     return StepScopeMemory(peak, some, full)
 
 
@@ -608,6 +643,8 @@ def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
 
 
 def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
+    import gzip
+
     relative = _log_relative_path(host, epoch, record_id)
     target = store.root() / relative
     if target.is_file():
@@ -634,6 +671,8 @@ def pending_steps_root() -> Path:
 
 def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
+    import parse
+
     loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
         raise ValueError("test-phase sampling context is not an object")
@@ -648,7 +687,7 @@ def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, obje
     width_argv = argv
     if "NEXTEST_TEST_THREADS" in os.environ:
         width_argv = [*argv, "--test-threads", os.environ["NEXTEST_TEST_THREADS"]]
-    context = _test_phase_context({**fields, "test_threads": admission_metadata().test_threads(width_argv)})
+    context = _test_phase_context({**fields, "test_threads": parse.test_threads(width_argv)})
     return {
         **context,
         # Admission has no entry-charge record (bytes, cutoff, form, widths).
@@ -867,6 +906,7 @@ def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
 
 
 def step(args: list[str]) -> None:
+    import hashlib
     import parse
     import treekey
 
@@ -904,7 +944,7 @@ def step(args: list[str]) -> None:
             return
         tty = tty_text == "1"
         directory = git_directory(argv, cwd)
-        repository_key = admission_metadata().recorded_repository_key(argv, cwd)
+        repository_key = recorded_repository_key(argv, directory)
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_key = sent_tree_key()
@@ -1097,7 +1137,7 @@ def ssh_attempt(attempt: SshAttempt) -> None:
     store.append_line(store.host_file(host, at), {
         **attempt, "kind": "ssh_attempt", "v": RECORD_VERSION,
         "pinned": bool(os.environ.get("BUILDLOG_PINNED_TARGET")),
-        "id": f"{host}-{time.time_ns()}-{secrets.token_hex(4)}", "host": host,
+        "id": f"{host}-{time.time_ns()}-{os.urandom(4).hex()}", "host": host,
         "at": store.utc_iso(at),
     })
 
@@ -1115,6 +1155,9 @@ class AttemptResult:
 
 def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
     """Read the latest repository slot results from host month files."""
+    if not TYPE_CHECKING:
+        from scripts.aws_target.config import MeasurementUnavailable
+
     latest: dict[tuple[str, int], AttemptResult] = {}
     for path in sorted(store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')):
         for row in store.locked_rows(path):
@@ -1135,6 +1178,8 @@ def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
     return tuple(latest[key] for key in sorted(latest))
 
 def hold_event(args: list[str]) -> None:
+    from target_config import SshTarget, read_targets
+
     event, target, key, holder, reason, at = args[:6]
     if event not in ("began", "ended") or len(args) not in (6, 7):
         raise ValueError("invalid hold-event arguments")
@@ -1209,6 +1254,8 @@ def sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"
 
 
 def hold_build(args: list[str]) -> None:
+    import hashlib
+
     key, since, boot, pid, start, classification, session, command, cwd = args
     if classification not in {"other_session", "no_session"} or int(pid) <= 0 or not start.isdecimal():
         raise ValueError("invalid hold-build identity or class")
@@ -1252,6 +1299,8 @@ def backfilled_ids() -> set[str]:
 
 
 def backfill(args: list[str]) -> None:
+    import hashlib
+
     ledger = Path(args[0]) if args else LEDGER
     known = backfilled_ids()
     seen: dict[str, int] = {}
@@ -1342,4 +1391,5 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    _ = sys.modules.setdefault("record", sys.modules[__name__])
     sys.exit(main(sys.argv[1:]))
