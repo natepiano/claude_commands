@@ -634,6 +634,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Constraints from prior phases:**
 - Phase 19: the module runs under the coverage collector with a mocked `subprocess.Popen`. Keep that working.
+- The import saving depends on resources' cut at `sweep.py`: today `offload` loads `memory_admit` through `sweep.py` -> `build_hold` -> `admission_service` (report-unit finding, showrunner 2026-11-05). Profile after that cut is on builds.
 - report-unit Phase 24 (2026-11-05) edits only `offload.py` `repository_identity` (lines 898-914). It does not touch `configured_ssh_target` or the `target_config` import. The second lander resolves the one-function overlap.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `/tmp/claude`.
 
@@ -645,7 +646,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - existing tests that patch `build_targets` command dependencies stay green unchanged
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 25 — The merge gate runs the `module_run.py` of the tree it tests  · status: todo
+### Phase 25 — The merge gate runs the `module_run.py` of the tree it tests  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -664,6 +665,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/production/merge_gate.py` — the runner function and the refusal
 - `scripts/production/test_merge_gate.py`, `scripts/production/test_merge_gate_test_times.py` — the three `merge_gate.RUNNER` assertions now expect the checkout's runner; fixture checkouts get a runner file
 - `scripts/production/test_merge_gate_suites.py` — a test that a checkout whose runner differs from the installed one gets its own runner, and a test for the refusal
+- `scripts/production/merge_gate_test_support.py` — `MergeGateFixture.build_fixture` commits a runner file into each fixture checkout
 - `scripts/test_times/module_run.py` — only if step 4 finds a defect
 - `scripts/test_times/test_module_run.py` — only if step 4 finds a defect
 
@@ -682,7 +684,6 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 ### Phase 26 — The sender guard also stops `send.py` started from its own folder or as a module  · status: todo
 **Depends on:** Phase 25
-**Blocked by:** the showrunner's answer to the Pending decision below; natedev-messaging's one-path cleanup of `send.py` callers
 
 #### Work Order
 
@@ -690,18 +691,19 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Spec:** The Phase 21 architect review found two paths that the audit hook does not match: a relative `send.py` after a `cd`, and `-m scripts.message.send`. Both reach the sender with `NoSenderViolation`. This is a defect in what Phase 21 shipped.
 
-**Pending decision:** where the guard checks.
-1. Recommended: `send.py` refuses at its entry when a guard environment variable is set, and writes a marker file that `module_run.py` reads. This covers every start path, also paths that the hook cannot see. messaging owns `send.py`.
-2. The audit hook also parses `cd` and `-m` forms. It keeps the guard in test support, but each new start form needs a new rule.
-
-Option 1 uses every Files row. Option 2 uses only the support module and its test.
+**Ruling (builds showrunner, 2026-11-05):** guard at the `send.py` entry. One mechanism replaces the audit hook.
+1. `send.py` refuses at its entry when the guard environment variable is set. Before it exits, it writes a marker that `module_run.py` reads. This covers every start path, grandchildren included, which an audit hook does not see.
+2. The per-module installs in `session_send_test_support.py` set the variable for the test process and its children. Delete the audit hook.
+3. Before you delete the hook, look for a start path that the variable misses and the hook catches. If you find one, keep the hook for it and tell the showrunner which path.
+4. `module_run.py` reads the marker after `unittest.main`, and a module with a marker fails with the Phase 21 diagnostic line.
+5. `send.py` belongs to natedev messaging. The showrunner gave the go on 2026-11-05, with natedev's agreement. Put the guard at the top of `send.py` `main()` and change nothing else in the file. This unit owns the guard variable and the marker. Messaging's cleanup changes only the callers, so there is no overlap.
 
 **Files:**
-- `scripts/message/send.py` — option 1: refuse at entry under the guard variable and write the marker
-- `scripts/message/session_send_test_support.py` — the guard
+- `scripts/message/send.py` — refuse at entry under the guard variable and write the marker
+- `scripts/message/session_send_test_support.py` — set the guard variable; delete the audit hook
 - `scripts/message/test_session_send.py` — the `cd` and `-m` probes
-- `scripts/test_times/module_run.py` — option 1: read the marker
-- `scripts/test_times/test_module_run.py` — option 1: the marker fixture test
+- `scripts/test_times/module_run.py` — read the marker
+- `scripts/test_times/test_module_run.py` — the marker fixture test
 
 **Workers:** 1 writer (one guard path; the files do not split)
 - `impl` — all files above
