@@ -34,7 +34,7 @@ from sessions import SessionRecord
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership
 from scripts.production.cli_fixture import invoke_cli
 from scripts.message import sessions as runtime_sessions
-from scripts.production import staff
+from scripts.production import showrunners, staff
 
 SCRIPT = Path(__file__).with_name("session_pane.py")
 
@@ -95,7 +95,6 @@ class SessionPaneTests(unittest.TestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "responses.json"),
             "HERDR_PROC": str(self.root / "proc"), "NOTIFIER_SESSIONS_DIR": str(self.records),
-            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
@@ -119,6 +118,7 @@ class SessionPaneTests(unittest.TestCase):
             _ = self.enterContext(mock.patch.object(module, "running_session", side_effect=running))
         _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", side_effect=live))
         _ = self.enterContext(mock.patch.object(session_pane, "live_session", side_effect=live))
+        _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")))
         self.responses()
 
