@@ -52,10 +52,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
-| `scripts/hierarchies/measure.py` | read | active, snapshot |
-| `scripts/hierarchies/push_audit.py` | read | active, snapshot |
 | `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation, ReportsTo, StaffId |
-| `scripts/hierarchies/worker_owners.py` | read | local_snapshot |
 | `scripts/hooks/conversation_pause.py` | read | LiveDoc, WrappedDoc (types only) |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
