@@ -27,6 +27,7 @@ from scripts.lint import sweep
 from scripts.lib import conf
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_group import send_process_group
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import offload
 from scripts.mac_test import mac_test
@@ -465,7 +466,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                 _ = copies.mirror_action(self.action(mirror, "mirror-remove"))
             self.assertTrue((self.mirror / ".copy-record.json").exists())
         finally:
-            os.killpg(owner.pid, signal.SIGKILL)
+            send_process_group(owner.pid, signal.SIGKILL)
             _ = owner.communicate(timeout=5)
 
     def test_standing_checkout_repairs_a_stale_lock_and_a_damaged_index(self) -> None:

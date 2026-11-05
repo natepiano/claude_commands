@@ -30,8 +30,8 @@
 # `doc` documents the whole workspace with warnings denied, as the unit
 # director's last command before a Rust checkpoint. Workers may run it too.
 # Unlike lint stages, this phase check cannot be switched off in lint.conf.
-# A pass is stored in ~/.local/state/verify/doc_pass/<tree>.json, keyed by a
-# staged index in a stable checkout that copies.py owns.
+# A pass is stored in ~/.local/state/verify/doc_pass/<tree>.json, keyed by the staged index.
+# `copies.py hold` locks a standing checkout under the configured copies root and fills it from the staged index.
 # Unstaged and untracked files are excluded. The real index is unchanged. A staged tree
 # changed during the run records nothing.
 # Records outlive worker sessions and are pruned after 14 days on each write.

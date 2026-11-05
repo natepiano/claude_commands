@@ -30,6 +30,7 @@ if __package__ in (None, ""):
 
 from scripts.lib import conf, copy_record, file_lock, scratch
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
 from scripts.lib.atomic_file import remove_dead_temporary_files, write_text_atomic
 
@@ -1251,7 +1252,7 @@ def remove_remote_mirror(mirror: RemoteMirror) -> None:
     answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
                             capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
     if answer.returncode:
-        raise CopyError(f"{mirror.host}:{mirror.path}: {answer.stderr.strip() or answer.stdout.strip() or 'removal failed'}")
+        raise CopyError(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
     remote_record_path(mirror).unlink(missing_ok=True)
 
 
