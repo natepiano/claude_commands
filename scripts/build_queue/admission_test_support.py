@@ -7,6 +7,7 @@ from collections import Counter
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
 else:
     import store
 
-from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment
+from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment, write_pressure_reading
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_service as service
 from scripts.build_queue.queue_fixture import write_process
@@ -139,12 +140,6 @@ class ObservedAdmissionServer(service.AdmissionServer):
             self.proc.register(request.owner)
         return super().handle_request(request, connection)
 
-    def resolve_estimates(self, count: int = 1) -> None:
-        """Use worker completion as the barrier before the loop accepts its results."""
-        completed = [self.estimate_results.get(timeout=5) for _ in range(count)]
-        for result in completed:
-            self.estimate_results.put(result)
-        self._accept_estimates()
 
     @contextmanager
     def silent_replies(self) -> Generator[None]:
@@ -306,10 +301,14 @@ class AdmissionFixture(ExitStack):
         self.state_dir: Path = (log_dir if log_dir is not None else self.root / "log") / "admission"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.socket_path: Path = self.socket_dir / "admission.sock"
+        self.scenery_reservations: set[str] = set()
         self.clock: FakeClock = FakeClock()
         self.fault: Faults = Faults()
         self.proc: TestProcesses = TestProcesses(self.root / "proc")
         _ = self.callback(self.proc.close)
+        pressure = self.root / "pressure"
+        if not pressure.exists():
+            write_pressure_reading(pressure)
         memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
                    "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
                   if (self.root / "meminfo").exists() else fake_memory_readings(
@@ -321,7 +320,7 @@ class AdmissionFixture(ExitStack):
             "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.state_dir.parent),
             "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
             "BUILDLOG_RUN": "",
-            "BUILDLOG_BUILD_BUDGET_GIB": "21", "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
+            "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
             "HOME": str(self.root)}
         self.enter_context(mock.patch.dict(os.environ, environment))
@@ -450,6 +449,7 @@ class AdmissionFixture(ExitStack):
 
     def finish_step(self, request: wire.AdmitRequest, *, end_owner: bool = False) -> wire.Admitted:
         """Admit and release a step without retaining its memory charge."""
+        self.allow_next_start()
         granted = only_admitted(self.server.handle_request(request))
         replies = self.server.handle_request(wire.ReleaseRequest(f"finish-{request.episode}", granted.reservation, 0))
         if replies != [wire.Ok()]:
@@ -506,6 +506,37 @@ class AdmissionFixture(ExitStack):
         peer = SocketPeer(self, request)
         _ = self.callback(peer.close)
         return peer
+
+    def occupy_host(self) -> wire.Admitted:
+        """Keep one measured run active without another memory keep-aside."""
+        with self.loop_turn():
+            request = self.request(need=GIB, run=self.run_owner())
+            request = replace(request, sidecar=str(self.scope(request.owner)))
+            grant = only_admitted(self.server.handle_request(request))
+            self.scenery_reservations.add(grant.reservation)
+            self.allow_next_start()
+            return grant
+
+    def caller_reservations(self) -> dict[str, service.ReservationRecord]:
+        """Return caller reservations without the occupied-host scenery."""
+        with self.loop_turn():
+            return {episode: record for episode, record in self.server.reservations.items()
+                    if record.reservation_id not in self.scenery_reservations}
+
+    def callers_released(self) -> bool:
+        """Check that every caller released its wait and reservation."""
+        with self.loop_turn():
+            return not self.server.waiters and not self.caller_reservations()
+
+    def hold_starts(self) -> None:
+        """Hold new starts without creating a running reservation."""
+        _ = (self.root / "pressure").write_text("full avg10=99\nsome avg10=0\n")
+
+    def allow_next_start(self) -> None:
+        """Move the fake clock to the next permitted new start."""
+        spacing = self.server.recovery
+        if isinstance(spacing, gate.NextStartAt) and spacing.at > self.clock.now():
+            self.clock.advance(spacing.at - self.clock.now())
 
     def free(self, available: int) -> None:
         _ = fake_memory_readings(self.root, available_kib=available // 1024,
@@ -585,7 +616,7 @@ class AdmissionFixture(ExitStack):
         directory = self.root / f"scope-{owner.pid}"
         directory.mkdir(exist_ok=True)
         for name, text in {"cgroup.procs": str(owner.pid), "cgroup.events": "populated 1\n",
-                           "memory.current": str(GIB), "memory.stat": "inactive_file 0\n", "memory.swap.current": "0"}.items():
+                           "memory.current": str(GIB), "memory.stat": f"anon {GIB}\ninactive_file 0\n", "memory.swap.current": "0"}.items():
             _ = (directory / name).write_text(text)
         sidecar = self.root / f"sample-{owner.pid}.cgroup"
         _ = sidecar.write_text(str(directory))
@@ -683,10 +714,18 @@ def wait_reply(reason: gate.WaitReason, position: int = 1, head: str = "head",
                text: str = "free memory") -> wire.Wait:
     """Build a held reply with the same decision fields as a real pass."""
     peak = gate.ExpectedPeak(8 * GIB, "fallback", 0)
-    decision = gate.decide(0, 60 * GIB, peak.bytes, [], limits=gate.AdmissionLimits(21 * GIB, 3 * GIB))
+    decision = gate.decide(0, 60 * GIB, peak.bytes, [], limits=gate.AdmissionLimits(3 * GIB))
     snapshot = gate.AdmissionWaitSnapshot(decision, peak, (), 0, "repo", "nextest",
                                          admission_policy_fixture(), ())
     return wire.Wait(reason, position, head, text, snapshot)
+
+
+def snapshot_with_head_cause(snapshot: gate.AdmissionWaitSnapshot,
+                             cause: gate.HeadCause) -> gate.AdmissionWaitSnapshot:
+    """Supply the cause that a real admission pass captures."""
+    status = gate.HeadAdmissionStatus(snapshot.decision, snapshot.peak.bytes,
+                                      snapshot.available, cause=cause)
+    return replace(snapshot, head_reason=status)
 
 
 def admitted_reply(reservation: str = "stem", need: int = GIB, source: str = "new-source",
@@ -708,9 +747,6 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
     fixture = test.enterContext(AdmissionFixture(root=root, log_dir=Path(environment["BUILDLOG_DIR"])))
     _caller_services[str(fixture.socket_path)] = fixture
     test.addCleanup(_caller_services.pop, str(fixture.socket_path))
-    fixture.enter_context(mock.patch.dict(os.environ, {
-        "BUILDLOG_BUILD_BUDGET_GIB": environment.get("BUILDLOG_BUILD_BUDGET_GIB", "21"),
-    }))
     fixture.clock.epoch = time.time()
     launcher = Path.home() / ".claude/scripts/lib/py"
     launcher.parent.mkdir(parents=True, exist_ok=True)

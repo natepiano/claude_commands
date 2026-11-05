@@ -68,9 +68,9 @@ class WrappingTests(unittest.TestCase):
 
     def test_word_wrap_uses_the_requested_hanging_indent_and_retains_styles(self) -> None:
         line = (Span("Waits on ", "default", True), Span("memory pressure", "error"),
-                Span(" and budget", "warning"))
+                Span(" and room", "warning"))
         lines = wrap(line, 20, indent=4)
-        self.assertEqual(plain(lines), "Waits on memory\n    pressure and\n    budget")
+        self.assertEqual(plain(lines), "Waits on memory\n    pressure and\n    room")
         self.assertEqual(styled_letters(lines), styled_letters([line]))
         self.assertTrue(all(terminal_width(plain([row])) <= 20 for row in lines))
 

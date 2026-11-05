@@ -10,9 +10,10 @@ from typing import TYPE_CHECKING
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
     from ..build_hold.override_guard import require_checkout
-    from .memory_admit import AdmissionPolicy, MemoryConfig
+    from .memory_admit import AdmissionPolicy, MemoryConfig, read_memory_config as read_fixture_config
 else:
     from scripts.build_hold.override_guard import require_checkout
+    from scripts.lint.memory_admit import read_memory_config as read_fixture_config
 
 require_checkout(Path(__file__))
 
@@ -22,12 +23,11 @@ ADMISSION_CONFIG_FIXTURE = Path(__file__).with_name("fixtures") / "build_admissi
 
 @cache
 def admission_configuration_fixture() -> MemoryConfig:
-    """Read the fixed test settings without the caller's live configuration."""
+    """Read the fixed test settings with the original configuration reader."""
     from unittest.mock import patch
-    from scripts.lint import memory_admit
 
     with patch.dict(os.environ, {"CONF_DIR": str(ADMISSION_CONFIG_FIXTURE.parent)}):
-        return memory_admit.read_memory_config(report=False)
+        return read_fixture_config(report=False)
 
 
 def admission_policy_fixture() -> AdmissionPolicy:
@@ -138,6 +138,14 @@ def private_ci_environment(root: Path) -> dict[str, str]:
     return {"BUILDLOG_CI_CGROUP": str(ci)}
 
 
+def write_pressure_reading(path: Path, *, full_avg10: float = 0.0, some_avg10: float = 0.0) -> None:
+    """Write both pressure classes for the real admission reader."""
+    _ = path.write_text(
+        f"some avg10={some_avg10} avg60=0.00 avg300=0.00 total=0\n"
+        + f"full avg10={full_avg10} avg60=0.00 avg300=0.00 total=0\n"
+    )
+
+
 def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
                          total_kib: int = 67108864, full_avg10: float = 0.0,
                          swap_total_kib: int = 0, swap_free_kib: int = 0, some_avg10: float = 0.0) -> dict[str, str]:
@@ -145,10 +153,7 @@ def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
     pressure = root / "pressure"
     _ = meminfo.write_text(f"MemTotal: {total_kib} kB\nMemAvailable: {available_kib} kB\n"
                           + f"SwapTotal: {swap_total_kib} kB\nSwapFree: {swap_free_kib} kB\n")
-    _ = pressure.write_text(
-        f"some avg10={some_avg10} avg60=0.00 avg300=0.00 total=0\n"
-        + f"full avg10={full_avg10} avg60=0.00 avg300=0.00 total=0\n"
-    )
+    write_pressure_reading(pressure, full_avg10=full_avg10, some_avg10=some_avg10)
     return {
         **config_environment(root),
         **private_ci_environment(root),

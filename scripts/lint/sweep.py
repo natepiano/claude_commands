@@ -181,6 +181,7 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget, send_result
+from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 import conf
@@ -3101,16 +3102,6 @@ class NoPhoneAlert:
 
 
 NO_PHONE_ALERT = NoPhoneAlert()
-
-
-def session_send_argv(to: str, *,
-    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> list[str]:
-    """send.py's argv for a disk floor message to the session named to; the text goes on stdin."""
-    if isinstance(lint_settings, UseConfiguredValue):
-        lint_settings = conf.read("lint")
-    return [sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
-            "--to", to, "--from", "disk_floor", "--timeout", f"{lint_settings.number("sweep_sender_timeout_seconds"):g}"]
 
 
 def send_holder_message(session: str, message: str, *,

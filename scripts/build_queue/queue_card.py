@@ -26,12 +26,10 @@ def order_check(model: QueueModel, position: int) -> Line:
     reason = model.reading.view.waiting[position - 1].reason
     if isinstance(reason, gate.TokenWaitingWaiter):
         return check_line(False, reason_phrase(reason, model.reading.view.waiting))
-    if isinstance(reason, gate.BehindOlderFit):
-        return check_line(False, "queue order      " + reason_phrase(reason, model.reading.view.waiting))
     if isinstance(reason, gate.BehindHead):
         text = f"#{eligible_head_position(model.reading.view.waiting)}'s turn"
         if isinstance(model.facts, head_facts.HeadFacts):
-            text += "      " + head_facts.order_rule(model.facts, model.zone)
+            text += "      " + head_facts.order_rule(model.facts)
         return check_line(False, text)
     return check_line(True, "queue order")
 
@@ -47,7 +45,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
         step = waiting[position - 1]
         if card:
             add()
-        add((Span(f"#{position} of {len(waiting)} · ", bold=True), *name_spans(step, model.labels),
+        add((Span(f"#{position} of {len(waiting)} · {queue_evidence.pid_text(queue_evidence.step_pid(step))} · ", bold=True), *name_spans(step, model.labels),
              Span(f" · {step.step} · {step.need / gate.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Queue arrival {clock(model, step.since)}; waiting {age(step.since, model.reading.explanation.now)} min. "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
@@ -87,7 +85,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
                     detail = f"joined {clock(model, order_since)}, {minutes} min {'after' if later else 'before'} it"
                 if isinstance(priority_order, gate.PriorityUnit):
                     detail += f"; {priority_order.unit} (queue priority)"
-                add((Span(f"  #{place} "), Span("↑  " if is_moved(model, place) else "   "),
+                add((Span(f"  #{place} {queue_evidence.pid_text(queue_evidence.step_pid(ahead))} · "), Span("↑  " if is_moved(model, place) else "   "),
                      *name_spans(ahead, model.labels), Span(f" {ahead.step}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))
@@ -123,16 +121,14 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
     def add(text: str = "") -> None:
         lines.extend(wrap((Span(text),), columns))
 
-    budget_line = queue_evidence.budget_decision_text(explanation.budget_decision, model.zone)
-    if budget_line:
-        add(budget_line)
+    add(queue_evidence.room_text(explanation.room))
     host = explanation.host
     if isinstance(host, gate.HostAvailable):
         total = queue_evidence.gib(host.total) if isinstance(host.total, int) else "unknown"
         add(f"Host: available RAM {queue_evidence.gib(host.available)}; total RAM {total}")
         lines.extend(wrap(check_line(*pressure_check(host.pressure, model)), columns))
     else:
-        add("Host memory: unavailable")
+        add("Host memory: " + host.reason)
     if isinstance(model.load, HostLoad):
         cpus = model.load.cpus if isinstance(model.load.cpus, int) else "unknown"
         add(f"Host load: {model.load.load:.2f} (1 min); CPU count: {cpus}")
@@ -163,7 +159,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         return lines
     add()
     if not head_card:
-        add(f"First in line: {name_text(head.waiter, model)} {head.waiter.step}; "
+        add(f"First in line: {queue_evidence.pid_text(queue_evidence.step_pid(head.waiter))} · {name_text(head.waiter, model)} {head.waiter.step}; "
             + f"queue arrival {clock(model, head.waiter.since)}; "
             + f"waiting {age(head.waiter.since, explanation.now)} min; "
             + f"need {queue_evidence.gib(head.waiter.need)}")
@@ -174,7 +170,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         add(head_facts.bump_text(facts, model.zone))
         for text in head_facts.bump_lines(facts, model.zone, model.labels):
             add(text)
-        add("Order rule: " + head_facts.order_rule(facts, model.zone))
+        add("Order rule: " + head_facts.order_rule(facts))
         for text in head_facts.cargo_token_lines(facts, model.zone, model.labels):
             add(text)
     else:
@@ -187,7 +183,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
             lines.extend(wrap(check, columns))
     followers = explanation.line
     if followers.count:
-        add(f"Followers: {followers.count} waiting; {followers.fitting} fit now under both checks; "
+        add(f"Followers: {followers.count} waiting; {followers.fitting} fit now with head protection; "
             + f"needs from {queue_evidence.gib(followers.smallest_need)} to {queue_evidence.gib(followers.largest_need)}; "
             + f"oldest waiting {age(followers.oldest_since, explanation.now)} min")
     else:

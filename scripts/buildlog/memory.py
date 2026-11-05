@@ -26,7 +26,8 @@ from user_zone import user_zone  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import queue_snapshot
-from scripts.build_queue.queue_evidence import budget_decision_text
+from scripts.build_queue.queue_evidence import room_text
+from scripts.lint import memory_admit as gate
 
 import conf
 from cargo_output import CargoOutputRoots, read_cargo_output_roots
@@ -399,10 +400,11 @@ def slice_line(name: Literal["builds", "ci"], start: SnapshotNearInstant, end: S
 def window_report(connection: sqlite3.Connection, start: datetime, end: datetime) -> str:
     lines = [f"Memory, {local_time(start, with_date=True)} to {local_time(end, with_date=True)}"]
     recorded = queue_snapshot.read_queue_snapshot(store.root() / "admission")
-    budget_line = ""
+    cap_line = ""
     if isinstance(recorded, queue_snapshot.QueueSnapshot) and start.timestamp() <= recorded.written_at < end.timestamp():
-        budget_line = budget_decision_text(recorded.inputs.budget_decision, user_zone())
-    lines.append(budget_line or "Budget: no recorded decision in this window")
+        cap_line = room_text(gate.head_policy(recorded.inputs, recorded.written_at,
+                            gate.AdmissionLimits(recorded.policy.safety_bytes), recorded.policy).room)
+    lines.append(cap_line or "Cap: no recorded admission pass in this window")
     early = earlyoom_kills(start, end)
     if early is JournalUnavailable.VALUE:
         lines.append("earlyoom kills: journal unavailable")
