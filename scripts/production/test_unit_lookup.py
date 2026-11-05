@@ -759,6 +759,24 @@ print(observed.row.id)
 
 
 
+    def test_registered_claude_with_a_headless_claude_child_of_the_same_id_stays_live(self) -> None:
+        row = unit_membership("show", "trunk")
+        place = herdr.HerdrPlace("native", "w1:p1")
+        running = [SessionRecord(pid=991099, name="director", sessionId=row.current_session,
+                                 updatedAt=1, messagingSocketPath="/fixture.sock", tmux="", formerNames=[])]
+        self.process(991099, 991000, ["claude"], CLAUDE_CODE_SESSION_ID=row.current_session)
+        self.process(991200, 991099, ["claude", "--print"], CLAUDE_CODE_SESSION_ID=row.current_session)
+        processes = [herdr.HerdrProcess(991099, place, {}, "claude", ""),
+                     herdr.HerdrProcess(991200, place, {"CLAUDE_CODE_SESSION_ID": row.current_session}, "claude", "")]
+        with (mock.patch.object(herdr, "herdr_processes", return_value=processes),
+              mock.patch.object(herdr, "live_sessions", return_value=[{"name": "native"}]),
+              mock.patch.object(unit_lookup, "live_session", return_value=True)):
+            observed = unit_lookup.observed_session_labels(record=staff.snapshot(), running=running)
+        self.assertEqual([pane.process.pid for pane in observed
+                          if isinstance(pane.process, session_staff.ObservedProcess)], [991099])
+        grouped = unit_lookup.group_labeled_sessions(observed)
+        self.assertIsInstance(grouped.units["show"]["trunk"].claude, LiveClaude)
+
     def test_stopped_shell_does_not_read_the_darwin_process_snapshot(self) -> None:
         from scripts.message import process_table
 
