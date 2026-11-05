@@ -173,12 +173,15 @@ def claim(ledger: ledger_api.Ledger, selected: Selection, family: str, branch: s
     for finding in selected.findings:
         if isinstance(finding.state, ledger_api.Filed):
             groups[str(finding.state.proposal)].append(finding)
+    if not groups:
+        intent.begin(())
+        return {}
+    holder = str(ledger.bulk_holder().id)
     owned: dict[str, str] = {}
     planned: list[tuple[str, str, str, list[ledger_api.HeldFinding]]] = []
     for proposal, findings in groups.items():
-        unit = "bulk-" + hashlib.sha256((findings[0].rule + proposal).encode()).hexdigest()[:16] + f"-{family}-unit"
-        ticket = ledger.next_ticket_id(unit)
-        planned.append((ticket, unit, proposal, findings))
+        ticket = ledger.next_ticket_id()
+        planned.append((ticket, holder, proposal, findings))
         owned.update((finding.finding_id, ticket) for finding in findings)
     # ticket_add commits independently: persist every planned claim before the first one.
     intent.begin((), sorted(set(owned.values())), sorted(owned))

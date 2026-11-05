@@ -99,7 +99,20 @@ An interruption marker reports the instance generation.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
-- `deploy.py price` reads the current Spot price through the deployment profile.
+- `deploy.py up --approve-resources` runs price, bootstrap, stacks, scaler-key, Tailscale policy, box join, box configuration, checks, idle stop, activation, and routing proof.
+  Each stage checks live state and records its last result and times in `up.json`.
+  A retry continues from incomplete stages. The price stage always refreshes the public price.
+  The stacks stage preserves the guard, ledger, and retained-volume checks.
+  A completed foundation wait renews preparation for unchanged inputs.
+  `REVIEW_IN_PROGRESS` counts as absent because that stack has no resources.
+- `deployment.json` holds the stack, instance, and data volume IDs outside the repository.
+  The controller reads its instance ID from that record.
+  Replacement reads the saved retained volume from the same record.
+- The scaler-key stage verifies the configured profile through STS.
+  It writes a new key atomically to the private credential file with mode `0600`.
+  It keeps other profiles. It verifies the new key before it deletes old keys.
+  A failed new key is deleted. The secret appears only in the private credential file.
+- `deploy.py price` reads the current Spot price with the encrypted administrator key.
   It writes the price and its read time to the state file named by `deployment_price_file`.
   The default path is `~/.config/aws-build/deployment-price`. The file stays outside the repository and has mode `0600`.
   `prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
@@ -112,12 +125,73 @@ An interruption marker reports the instance generation.
 - `cloudformation.json` defines the Spot instance, the root volume and the retained data volume. Shutdown behavior is `stop`, IMDSv2 is required and inbound is UDP 41641 only. The scaler IAM policy allows start and stop on the one instance, the needed describe calls and `ce:GetCostAndUsage`.
 - `nixos.patch` adds host `aws-build` and the natedev `aws-target` user unit, stopped by default. It is on `/etc/nixos` main as commit 78746da. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03): `aws-target.service` is installed and disabled. `/etc/nixos` main 25966d8 adds sccache (one shared module with natedev), mold, natedev's cargo config and cargo-tile to `hosts/aws-build.nix`. The box is not built.
 
+### Box setup stages
+
+1. `tailscale-policy` reads `config/aws-build-tailscale.json` and the live policy.
+   It resolves the natedev and Mac addresses from local Tailscale status.
+   It changes only `tag:build-aws` owners and destination rules.
+   It prints each proposed change and uses the policy ETag to prevent concurrent overwrites.
+   It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
+2. `box-join` checks SSM and the instance's Tailscale identity.
+   It starts a stopped instance through the existing guarded setup path.
+   It creates a single-use, pre-approved key and revokes it after the join attempt.
+   SSM disables terminal echo before the helper sends the key through stdin.
+   The command reads the key from stdin and writes no key file.
+3. `box-configuration` reads the clean `main` checkout named by `nixos_configuration_directory`.
+   It compares `/run/current-system` with the `aws-build` output.
+   It builds the output locally and copies the closure with destination substitutes.
+   It holds the controller lock and stops the remote idle service during the copy.
+   A bounded poweroff timer protects a failed reconnect.
+   A transient systemd unit runs the switch independently of SSH.
+   The helper resets the old idle timestamp before it restarts the remote service.
+   It waits for the expected system and an active `aws-build-remote` service.
+4. `checks` confirms SSM, the EBS serial under `/home`, ext4, and the remote service.
+   It compares `rustc -V`, `cargo nextest --version`, and `cargo mend --version` in the plain environment on both hosts.
+   Non-interactive SSH uses the box tools from `environment.systemPackages` in `/etc/nixos/hosts/aws-build.nix`.
+   The stage reads no other source repository and copies no shell inputs.
+   It uses `normalize_tool_version` for both results.
+   `box-tools.json` records the instance ID and normalized tool versions.
+   Each build still checks the tools inside its own repository shell.
+
+`admin_secret_file` names `~/.config/aws-build/admin.gpg` outside the repository, with mode `0600`.
+The encrypted JSON holds `aws_access_key_id`, `aws_secret_access_key`, `tailscale_client_id`, and `tailscale_client_secret`.
+`deploy.py secrets` uses symmetric AES256 encryption and hidden terminal input.
+It can import the administrator profile and the old OAuth file.
+It removes those plain credentials only after the encrypted write succeeds.
+It preserves the scaler profile and all unrelated sections.
+Enter retains a stored value during replacement.
+
+`price`, `apply`, `setup-start`, and `up` decrypt at the first administrator request.
+`prepare` decrypts only when it must reconcile existing AWS resources.
+`bootstrap` needs no administrator credentials.
+`up` shares one decryption across all eleven stages.
+The price stage refresh and the live checks require credentials even when every stage reports `present`.
+The policy check uses the same decrypted OAuth client for its token request.
+AWS subprocesses receive the administrator key through their environment without an administrator profile argument.
+The SSM subprocess uses that same environment.
+Inherited AWS session tokens cause a refusal.
+The unattended controller continues to use the plain scaler profile without a prompt.
+
+The helper reads the passphrase from `/dev/tty` without echo.
+A process without a terminal cannot decrypt through the helper.
+GPG receives the passphrase through a private descriptor with `--no-symkey-cache` and loopback pinentry.
+The helper never uses public-key encryption.
+Decrypted values remain in process memory until the run ends.
+AWS subprocesses contain the AWS key in their environment during their lifetime.
+A process with sufficient access can inspect that memory or environment.
+Administrator subprocesses ignore the AWS configuration file to prevent CLI history from storing secret responses.
+The helper redacts administrator values from reported AWS errors.
+Administrator commands refuse a remaining plain administrator profile or legacy OAuth file and name `deploy.py secrets`.
+`deploy.py down --approve-destroy` uses the same encrypted administrator session.
+No deployment stage edits or pushes the NixOS checkout.
+The controller activation and routing proof remain separate plan stages.
+
 ## Invariants
 
 1. No AWS resource and no AWS call exist before the user's go-live gate.
 2. Read every tunable at use from `config/aws_target.conf` or `config/build_targets.conf`, through `scripts/lib/conf.py`.
 3. The guard runs before every AWS start, admission, deployment and first boot. Derive the Budget amount from `monthly_limit_usd`.
-4. No password, AWS key or Tailscale auth key passes through a session. The scaler key is not on the box. `build-scaler` credentials are never read or printed.
+4. No password, AWS key or Tailscale auth key passes through a session. The scaler key is not on the box. `build-scaler` credentials remain in the private credential file. The helper never prints them.
 5. Use Tailscale SSH. Store no GitHub credential on the box; `ci_repo=` stays empty.
 6. An empty `OffloadRequest.target` selects the legacy Mac default. Mac paths and output do not change.
 7. Unresolved process ownership never adds an unattributed PID to the kill list. Missing completion stays `LostMacRun`.
@@ -145,3 +219,128 @@ An interruption marker reports the instance generation.
 - An unconfirmed compute request is charged at the Spot maximum price. A historical price is not an upper bound, and the fallback rate under-counts.
 - A stateless per-day floor was ruled out: it over-counts the common uneven case, a $10 bill becoming $17.92 across two days.
 - Refusal cleanup reuses `take_over_kept_claim` and `check_leftovers`, so no second cleanup path exists.
+
+### Activation and proof
+
+1. `idle-stop` observes EC2 until the box stops within `idle_stop_minutes` plus `idle_stop_margin_s`.
+   Without a saved proof, the stage waits for pending or stopping instances to reach a stable state.
+   It starts a stopped instance through the existing spending checks and waits for health.
+   It holds the controller lock so the controller cannot satisfy the proof.
+   Active AWS claims prevent the proof.
+   A deadline failure requests an EC2 stop, confirms the stop, and refuses the stage.
+2. `activation` writes `routing.json` under `~/.local/state/build-targets/aws`.
+   This record enables routing for the configured AWS settings file.
+   The controller and the sender read the same record before the legacy `offload` value.
+   The stage enables and starts `aws-target.service` with `systemctl --user`.
+   It requires the reviewed AWS registry rows and edits no tracked file.
+3. `routing-proof` runs `verify.sh test aws-routing-proof --target aws --no-cache` in `scripts/aws_target/proof_crate`.
+   The crate has its own workspace, no Rust dependencies, and one test that runs the compiler.
+   The runner requires `flake.nix` and `flake.lock`, so the crate supplies a small locked shell.
+   The `default` shell retains the host tools on PATH.
+   The stage uses the existing `DOC_REPO_TOP` source override to copy only the crate.
+   The crate needs no other source repository.
+   The normal queue retains admission, spending, and version checks.
+   The stage requires a new successful pinned buildlog step with `target=aws` and `host=aws-build`.
+
+Both proofs record the current instance ID and completion time in `up.json`.
+A replacement instance invalidates both proofs.
+A later run skips completed proofs without another idle wait or test.
+A stopped instance retains its completed setup evidence for the same instance ID.
+The price stage still refreshes the public price.
+
+### Target removal
+
+`deploy.py down` prints the removal plan without reading credentials or changing state.
+`deploy.py down --approve-destroy` removes the target in this order.
+
+1. Write disabled `routing.json` and disable `aws-target.service` with `systemctl --user`.
+2. Refuse while an AWS claim remains live.
+3. Save public resource identities in `down.json` before removing any resource.
+4. Delete the tagged `aws-build` Tailscale device and keep the policy rules.
+5. Delete every scaler access key and remove only its credential profile.
+6. Update the existing stack with `EnableCompute=false` and wait for compute removal.
+7. Delete the foundation stack and wait for its removal.
+8. Delete the retained data volume and Budget.
+9. Remove deployment records, setup proofs, and the prepared bundle files.
+
+The template implements compute and foundation as two phases of one stack.
+The helper uses the previous template and parameter values during compute removal.
+It does not read the private notification address file.
+The helper excludes new claims and controller actions throughout resource removal.
+The helper reports the removed resource kinds.
+Deleting the data volume loses the `/home` build cache.
+The helper preserves `admin.gpg`, disabled routing, claims, the spend ledger, and charge history.
+It records confirmed termination without removing past spending evidence.
+It retains the conservative fixed cost inventory.
+The existing spending caps remain unchanged.
+
+A repeated command checks live state and skips each completed removal.
+`down.json` preserves identities after an interruption and prevents `up` until removal completes.
+A successful removal deletes this temporary record.
+The next `up` creates a new target and uses the existing monthly spending history.
+The helper shares one administrator decryption across AWS and Tailscale requests.
+The Tailscale OAuth client needs device deletion access for `tag:build-aws`.
+
+
+### Deployment ownership and changed setup inputs
+
+Preparation saves a deployment ID in deployment.json.
+The helper records the caller account and region before creating resources.
+A CREATE change set reserves the StackId before the foundation deploy creates resources.
+The helper saves that StackId before resource creation.
+The helper records the scaler resource's IAM name, ARN, and UserId from the verified stack.
+The confirmed Tailscale node ID stays with its instance ID in the deployment record.
+The data volume has a DeploymentId tag.
+A new Budget name includes the deployment ID.
+Migration preserves the existing Budget name.
+The deployment record saves the actual volume ID and Budget name.
+
+Removal checks the saved account, region, and StackId before changing routing or deleting resources.
+Missing or mismatched ownership evidence causes a refusal.
+Removal uses the StackId for every stack mutation.
+Removal deletes only the saved Tailscale node after checking tag:build-aws.
+Removal checks all required saved identities before changing routing or writing `down.json`.
+A missing identity causes a refusal that names `deploy.py up` as the recovery command.
+This refusal leaves `up` available to record the missing identity.
+One exception applies when the box never joined Tailscale.
+The record must have no node ID, and `up.json` must have no successful box-join stage.
+The Tailscale API must list no device with hostname `aws-build` and tag `tag:build-aws`.
+Then removal reports `tailscale-device: no device` and deletes no device.
+Any matching device without a saved node ID causes a refusal before routing changes.
+Removal resolves ScalerUser through the verified stack and checks its saved ARN and UserId before deleting keys.
+Removal requires the saved volume ID and a matching DeploymentId tag.
+Removal uses the saved Budget name after a live check confirms that name.
+Removal never selects a device or resource through a name or tag alone.
+Removal refuses a stale down.json with another deployment ID.
+A completed removal keeps a public down-complete.json receipt for repeated commands.
+The next up creates a new deployment identity.
+A reused volume requires its previous DeploymentId receipt, or no DeploymentId tag.
+The helper verifies the volume and sets its new DeploymentId before attachment.
+
+An interrupted removal can leave a retained volume that continues to incur charges.
+AWS status shows down incomplete, the retained resource IDs, and their daily storage cost.
+It shows the action deploy.py down --approve-destroy.
+The spend ledger keeps counting retained storage during the interruption.
+The helper does not create a background removal job.
+
+The box-configuration proof includes the evaluated desired system path from /etc/nixos.
+The helper evaluates that path once during each up run.
+The box-tools proof includes natedev's normalized tool versions.
+Changed inputs invalidate that stage and every later proof.
+A stopped instance must complete the changed checks before the helper accepts its old proofs.
+
+### Legacy identity migration and reservation recovery
+
+An existing deployment without StackId can migrate through up.
+The helper checks the configured region and the caller account against the live StackId.
+The helper requires a complete stack and the saved physical InstanceId.
+The helper checks the volume, Budget, and scaler identities before it changes state.
+The helper saves these identities and tags the verified volume with DeploymentId.
+The existing Budget name and ExistingDataVolumeId parameter stay the same during the update.
+The box-join stage records the confirmed Tailscale node ID.
+A failed migration check changes no resource or deployment record.
+A missing deletion identity requires deploy.py up before deploy.py down.
+
+Before CREATE, the helper checks identity-<deployment_id> for a previous reservation.
+It verifies the saved DeploymentId and the StackId account before it saves the StackId.
+It resumes the change-set waiter without a second CREATE request.
