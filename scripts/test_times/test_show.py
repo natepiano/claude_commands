@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
-    from ..buildlog import parse, record, store
+    from ..buildlog import parse, record, repository, store
     from ..buildlog.index import index_path_in
     from ..buildlog.test_index import call, configure_cleanup, encode, step
     from ..lib.rerun_test_support import initialize_repository
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 else:
     # Import show first because it adds the build log folder to the import path.
     from scripts.test_times import gate_record, show
-    from scripts.buildlog import parse, record, store
+    from scripts.buildlog import parse, record, repository, store
     from index import index_path_in
     from test_index import call, configure_cleanup, encode, step
     from scripts.lib.rerun_test_support import initialize_repository
@@ -110,14 +110,14 @@ class TestTimesTests(unittest.TestCase):
             _ = path.write_text("# A live fixture module.\n", encoding="utf-8")
         initialize_repository(self.repo, self.root / "claude-origin.git", os.environ)
         _ = self.enterContext(mock.patch.object(show, "TOOL_REPOSITORY", self.repo))
-        self.tool_identity = record.recorded_repository_key(["git"], str(self.repo))
+        self.tool_identity = repository.repository_key(str(self.repo))
         _ = self.enterContext(chdir(self.repo))
 
     def repository(self, name: str) -> tuple[Path, str]:
         path = self.root / name
         path.mkdir()
         initialize_repository(path, self.root / f"{name}-origin.git", os.environ)
-        return path, record.recorded_repository_key(["git"], str(path))
+        return path, repository.repository_key(str(path))
 
     def write_nextest(self, repository: tuple[Path, str], text: str, *, epoch: float = EPOCH,
                       host: str = HOST, call_id: str = "", caller: str = "test") -> None:

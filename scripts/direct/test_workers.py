@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -61,6 +62,19 @@ def json_object(path: Path) -> dict[str, object]:
     if path.name == codex_mesh.ROSTER_FILE:
         return fixture_worker_records(fields, staff.local_snapshot())
     return fields
+
+
+class WorkerScriptTests(unittest.TestCase):
+    def test_worker_script_starts_outside_the_repository(self) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        with tempfile.TemporaryDirectory(prefix="workers-script-") as directory:
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--help"], cwd=directory,
+                env=environment, capture_output=True, text=True,
+                timeout=TEST_HANG_GUARD_SECS, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
 
 
 class DirectorResolutionTests(StaffTestCase):

@@ -106,6 +106,86 @@ class DiscoveryBoundaries(unittest.TestCase):
 '''
 
 
+SENDER_REQUEST = '''\
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import unittest
+from unittest import mock
+
+sys.path.insert(0, __REPOSITORY__)
+from scripts.message import session_send
+from scripts.message import session_send_test_support
+
+def setUpModule():
+    session_send_test_support.forbid_real_sender()
+    sys.addaudithook(last_guard)
+
+real_sender = Path(session_send.__file__).resolve().with_name("send.py")
+
+# This safety hook permits only harmless probes and blocks network delivery.
+def last_guard(event, arguments):
+    if event in ("socket.connect", "socket.sendto", "socket.bind"):
+        raise RuntimeError("the sender probe attempted network access")
+    if event in ("subprocess.Popen", "os.posix_spawn", "os.exec"):
+        command = arguments[1]
+    elif event == "os.spawn":
+        command = arguments[2]
+    elif event == "os.system":
+        command = arguments[0]
+    else:
+        return
+    if str(Path(__file__).with_name("fake_sender.py")) not in str(command) and "--help" not in str(command):
+        raise RuntimeError("the sender probe attempted a live command")
+
+
+MODE = __MODE__
+
+class SenderRequest(unittest.TestCase):
+    def test_sender(self):
+        if MODE == "fake":
+            fake = Path(__file__).with_name("fake_sender.py")
+            fake.write_text("print('fake sender ran')\\n")
+            with mock.patch.object(session_send, "SEND_SCRIPT", fake):
+                result = subprocess.run(session_send.session_send_argv("fixture"),
+                                        capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, "fake sender ran\\n")
+        elif MODE == "cleared_environment":
+            child_environment = os.environ.copy()
+            marker = session_send_test_support.refusal_marker
+            # This isolated process keeps its environment empty through runner completion.
+            mock.patch.dict(os.environ, {}, clear=True).start()
+            session_send_test_support.forbid_real_sender()
+            self.assertIs(session_send_test_support.refusal_marker, marker)
+            result = subprocess.run([sys.executable, str(real_sender), "--help"],
+                                    env=child_environment, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(os.environ, {})
+            self.assertIsInstance(marker, session_send_test_support.SenderRefusalMarker)
+            self.assertEqual(marker.path.read_text(), "real sender refused\\n")
+        elif MODE == "caught":
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run([sys.executable, str(real_sender), "--help"], check=True)
+        else:
+            if MODE == "cd":
+                command = f"cd {shlex.quote(str(real_sender.parent))} && {shlex.quote(sys.executable)} send.py --help"
+                directory = None
+            elif MODE == "module":
+                command = [sys.executable, "-m", "scripts.message.send", "--help"]
+                directory = real_sender.parents[2]
+            else:
+                command = [sys.executable, str(real_sender), "--help"]
+                directory = None
+            result = subprocess.run(command, cwd=directory, shell=MODE == "cd", capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+if MODE == "expected_failure":
+    SenderRequest.test_sender = unittest.expectedFailure(SenderRequest.test_sender)
+'''
+
+
 @dataclass(frozen=True)
 class FixtureRun:
     timed: subprocess.CompletedProcess[str]
@@ -176,6 +256,72 @@ class ModuleRunnerTests(unittest.TestCase):
             [sys.executable, str(RUNNER), str(folder), "test_boundaries.py"], cwd=root, env=env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def sender_fixture(self, mode: str) -> FixtureRun:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config"
+            config.mkdir()
+            _ = (config / "lint.conf").write_text("# range: 1..\nsweep_sender_timeout_seconds=17\n")
+            source = SENDER_REQUEST.replace("__REPOSITORY__", repr(str(RUNNER.parents[2])))
+            return run_fixture(root, "sender", source.replace("__MODE__", repr(mode)))
+
+    def test_real_sender_request_fails_the_module_with_one_diagnostic(self) -> None:
+        fixture = self.sender_fixture("uncaught")
+
+        self.assertNotEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        diagnostic = "test_fixture.py: started the real scripts/message/send.py"
+        self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
+        self.assertNotIn("the tested guard allowed the real sender", fixture.timed.stderr)
+        self.assertEqual(fixture.times["tests_run"], 1)
+        self.assertEqual(fixture.times["failures"], 1)
+
+    def test_sender_from_its_folder_or_as_a_module_fails_with_one_diagnostic(self) -> None:
+        for mode in ("cd", "module"):
+            with self.subTest(mode=mode):
+                fixture = self.sender_fixture(mode)
+                self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                diagnostic = "test_fixture.py: started the real scripts/message/send.py"
+                self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
+                self.assertIn("REFUSED: real scripts/message/send.py is forbidden in tests", fixture.timed.stderr)
+                self.assertNotIn("the sender probe attempted", fixture.timed.stderr)
+
+    def test_caught_sender_refusal_still_fails_the_module(self) -> None:
+        for mode in ("caught", "expected_failure"):
+            with self.subTest(mode=mode):
+                fixture = self.sender_fixture(mode)
+
+                self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+                self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                diagnostic = "test_fixture.py: started the real scripts/message/send.py"
+                self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
+                self.assertNotIn("the tested guard allowed the real sender", fixture.timed.stderr)
+                self.assertEqual(fixture.times["tests_run"], 1)
+                self.assertEqual(fixture.times["failures"], 0)
+                self.assertEqual(fixture.times["errors"], 0)
+                expected_status = "expected_failure" if mode == "expected_failure" else "pass"
+                self.assertEqual(fixture.times["tests"][0]["status"], expected_status)
+
+    def test_cleared_environment_keeps_the_refusal_marker_and_fails_the_module(self) -> None:
+        fixture = self.sender_fixture("cleared_environment")
+
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.times["tests_run"], 1)
+        self.assertEqual(fixture.times["tests"][0]["status"], "pass")
+        self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        diagnostic = "test_fixture.py: started the real scripts/message/send.py"
+        self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
+        self.assertNotIn("the sender probe attempted", fixture.timed.stderr)
+
+    def test_fake_sender_module_passes_without_a_refusal_diagnostic(self) -> None:
+        fixture = self.sender_fixture("fake")
+
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        self.assertNotIn("started the real scripts/message/send.py", fixture.timed.stderr)
+        self.assertEqual(fixture.times["tests_run"], 1)
+        self.assertEqual(fixture.times["tests"][0]["status"], "pass")
 
     def test_normal_test_case_attribute_keeps_the_failure_entry(self) -> None:
         self.assertEqual(self.discovery_result.returncode, 1, self.discovery_result.stderr)

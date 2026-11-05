@@ -3128,6 +3128,10 @@ def attempt_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.
 
 
 def main(argv: list[str]) -> int:
+    if marker := os.environ.get("TEST_SENDER_GUARD"):
+        _ = Path(marker).write_text("real sender refused\n")
+        print("REFUSED: real scripts/message/send.py is forbidden in tests", file=sys.stderr)
+        return 1
     user_target = "--to=user" in argv or any(left == "--to" and right == USER for left, right in zip(argv, argv[1:]))
     has_template = "--text-id" in argv or any(value.startswith("--text-id=") and value != "--text-id=" for value in argv)
     if user_target and not has_template and argv[:1] != ["retire"]:

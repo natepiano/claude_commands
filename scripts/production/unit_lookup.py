@@ -463,26 +463,25 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
                   processes: list[herdr.HerdrProcess]) -> Iterable[LabeledSession]:
     """Join live Claude by PID, retaining stopped panes and unknown evidence."""
     running = {session["name"] for session in herdr.live_sessions()}
-    shells = {process.pid: (process.place, process.marks.get("CODEX_THREAD_ID", "")
-                           or process.marks.get("CLAUDE_CODE_SESSION_ID", ""))
-              for process in processes
-              if process.pid not in claudes and process.command in ("sh", "bash", "zsh", "dash", "fish", "ksh")}
+    holders = {process.pid: (process.place, claudes[process.pid].session_id if process.pid in claudes else
+                            process.marks.get("CODEX_THREAD_ID", "") or process.marks.get("CLAUDE_CODE_SESSION_ID", ""))
+               for process in processes}
     process_counts = Counter(process.place for process in processes)
     inherited: set[int] = set()
-    if shells and claudes:
+    agents = [process for process in processes if holders[process.pid][1]
+              and (process.pid in claudes or process.command in ("claude", "codex"))]
+    if agents:
         from scripts.message import process_table
 
+        darwin = os.environ.get("HERDR_PLATFORM", sys.platform) == "darwin"
         try:
-            darwin = os.environ.get("HERDR_PLATFORM", sys.platform) == "darwin"
             parents = process_table.snapshot() if darwin else {}
-            for process in processes:
-                if process.pid not in claudes:
-                    continue
-                identity = claudes[process.pid].session_id
-                if (process.place, identity) not in shells.values():
-                    continue
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            parents = {}
+        for process in agents:
+            try:
                 current = process.pid
-                seen = {current}
+                seen: set[int] = {current}
                 while current > 1:
                     if darwin:
                         parent = parents.get(current)
@@ -494,18 +493,17 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
                     if current in seen:
                         break
                     seen.add(current)
-                    if shells.get(current) == (process.place, identity):
+                    if holders.get(current) == holders[process.pid]:
                         inherited.add(current)
-        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-            # Unavailable ancestry keeps the shell evidence unknown.
-            pass
+            except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+                # Keep this process evidence when its ancestry is unavailable.
+                pass
     for process in processes:
         if process.pid in inherited:
             continue
         if process.place.session not in running:
             continue
-        native = (claudes[process.pid].session_id if process.pid in claudes else
-                  process.marks.get("CODEX_THREAD_ID", "") or process.marks.get("CLAUDE_CODE_SESSION_ID", ""))
+        native = holders[process.pid][1]
         if not native:
             if process.place in unread.places or process.command in ("claude", "codex"):
                 yield LabeledSession("", ClaudeUnknown("native runtime identity is unavailable"), process.place,
@@ -518,7 +516,7 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
             claude = ClaudeUnknown(unread.places[process.place])
         elif isinstance(unread.unplaced, RecordsPartlyUnread):
             claude = ClaudeUnknown(unread.unplaced.reason)
-        elif (process.pid in shells and process_counts[process.place] == 1
+        elif (process.command in ("sh", "bash", "zsh", "dash", "fish", "ksh") and process_counts[process.place] == 1
               and process.marks.get("CLAUDE_CODE_SESSION_ID") == native
               and not process.marks.get("CODEX_THREAD_ID")):
             claude = ClaudeNotRunning()
