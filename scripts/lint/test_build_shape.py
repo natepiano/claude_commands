@@ -77,7 +77,7 @@ class IndexStepEvidenceTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.directory = tempfile.TemporaryDirectory()
-        self.index = Path(self.directory.name) / "index.sqlite"
+        self.index = Path(self.directory.name) / "steps.sqlite"
         self.before = datetime(2026, 10, 30, 9, tzinfo=UTC)
         self.cutoff = self.before - timedelta(days=14)
 

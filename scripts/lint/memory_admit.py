@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Prot
 from functools import lru_cache
 from itertools import chain
 from types import UnionType, MappingProxyType
-from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
@@ -1974,23 +1973,7 @@ def percentile(values: list[int]) -> int:
     return values[(90 * len(values) + 99) // 100 - 1]
 
 
-def test_threads(argv: list[str]) -> int | None:
-    """Return nextest's explicitly requested test width, when it is numeric."""
-    for index, argument in enumerate(argv):
-        value: str | None = None
-        if argument in ("--test-threads", "-j"):
-            if index + 1 < len(argv):
-                value = argv[index + 1]
-        elif argument.startswith("--test-threads="):
-            value = argument.removeprefix("--test-threads=")
-        elif argument.startswith("-j") and len(argument) > 2:
-            value = argument[2:]
-        if value is not None:
-            try:
-                return int(value)
-            except ValueError:
-                return None
-    return None
+test_threads = parse.test_threads
 
 
 def expected_peak(repository: Repository, step: str, host: str, now: datetime, root: Path,
@@ -2039,7 +2022,7 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
         return ExpectedPeak(percentile(measured), "measured", len(measured))
     peaks: list[int] = []
     try:
-        with closing(sqlite3.connect((root / store.INDEX_NAME).resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
             if repository.legacy_name:
                 columns = {row[1] for row in cast(list[tuple[object, ...]],
                            connection.execute("PRAGMA table_info(steps)").fetchall())}
@@ -2110,7 +2093,7 @@ def compiling_history(root: Path, host: str, step: str,
                       now: datetime, *, include_current_end: bool = False) -> list[tuple[dict[str, object], StepEvidence]]:
     """Exclude only peaks whose known attempts compiled no crates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
-    evidence = index_step_evidence(root / store.INDEX_NAME, host, step,
+    evidence = index_step_evidence(file_marks.index_path_in(root), host, step,
                                    datetime.min.replace(tzinfo=now.tzinfo), now)
     peaks: list[tuple[dict[str, object], StepEvidence]] = []
     try:
@@ -2515,7 +2498,7 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
     indexed_exact: list[int] = []
     if repository.legacy_name:
         try:
-            connection = sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)
+            connection = sqlite3.connect(file_marks.read_only_uri(root), uri=True)
             try:
                 columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
                            connection.execute("PRAGMA table_info(steps)").fetchall())}
@@ -2567,7 +2550,7 @@ def current_worktree_steps(root: Path, host: str, worktree: str,
     prefixes: dict[str, tuple[int, str]] = {}
     indexed: dict[str, list[dict[str, object]]] = {}
     try:
-        with closing(sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
             _ = connection.execute("BEGIN")
             prefixes = {path: (offset, marks) for path, offset, marks in cast(
                 list[tuple[str, int, str]], connection.execute("SELECT path, offset, marks FROM files").fetchall())}
@@ -2682,7 +2665,7 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     try:
-        with closing(sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
             rows = cast(list[tuple[str | None, str, int | None, str]], connection.execute(
                 "SELECT call_id, argv, peak_mem_bytes, repo FROM steps WHERE host = ? "
                 + "AND step = ? AND started_at >= ? AND started_at < ? AND ended_at < ? "
@@ -3290,22 +3273,6 @@ def git_output(directory: str, *arguments: str) -> str:
         return ""
 
 
-def remote_identity(remote: str, directory: str) -> str:
-    if "://" not in remote and ":" in remote and not remote.startswith(("/", ".")):
-        host, path = remote.split(":", 1)
-        remote = f"ssh://{host}/{path}"
-    parsed = urlsplit(remote)
-    if parsed.hostname:
-        path = parsed.path.rstrip("/").removesuffix(".git")
-        # SSH and HTTPS name the same repository; credentials are not identity.
-        port = f":{parsed.port}" if parsed.port and parsed.port not in (22, 443) else ""
-        return urlunsplit(("https", parsed.hostname.lower() + port, path, "", ""))
-    path = Path(parsed.path if parsed.scheme == "file" else remote).expanduser()
-    if not path.is_absolute():
-        path = Path(directory) / path
-    return str(path.resolve()).rstrip("/").removesuffix(".git")
-
-
 def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if not argv:
         return UnknownRepository(), ""
@@ -3314,7 +3281,7 @@ def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     worktree = Path(facts["worktree"] or cwd).name
     remote = git_output(directory, "remote", "get-url", "origin")
     if remote:
-        key = remote_identity(remote, directory)
+        key = record.remote_identity(remote, directory)
         name = key.rsplit("/", 1)[-1]
         checkout_name = Path(facts["repo_path"] or cwd).name
         legacy = name if checkout_name == name and name not in GENERIC_REPO_NAMES else ""
@@ -3323,12 +3290,6 @@ def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if roots:
         return RepositoryIdentity("git-root:" + roots[0], Path(facts["repo_path"] or cwd).name), worktree
     return UnknownRepository(), worktree
-
-
-def recorded_repository_key(argv: list[str], cwd: str) -> str:
-    """Encode admission's repository identity at the build-log boundary."""
-    repository, _ = git_identity(argv, cwd)
-    return repository.key if isinstance(repository, RepositoryIdentity) else store.UNKNOWN_IDENTITY
 
 
 def queue_life_identity(row: Waiter) -> QueueLifeIdentity:

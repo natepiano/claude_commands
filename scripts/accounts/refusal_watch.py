@@ -16,7 +16,7 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
@@ -38,7 +38,8 @@ from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blo
                          TargetReadingUnavailable as TargetReadingUnavailable,
                          TargetLoginRenewalFailed as TargetLoginRenewalFailed,
                          TargetAtOrBelowThreshold as TargetAtOrBelowThreshold,
-                         TargetUnresolvedRefusal as TargetUnresolvedRefusal)
+                         TargetUnresolvedRefusal as TargetUnresolvedRefusal,
+                         TargetAccountUnavailable as TargetAccountUnavailable)
 
 if TYPE_CHECKING:
     from scripts.shutdown import inventory as inventory_module
@@ -176,6 +177,7 @@ class AutoMoveRule:
     group: accounts.ClaudeGroup
     to: str
     when: LeftAtMost
+    fallback_targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -186,7 +188,7 @@ class UnreadableNextMoveLog:
 def read_auto_move_rules() -> tuple[AutoMoveRule | UnreadableNextMoveLog, ...]:
     try:
         return tuple(AutoMoveRule(entry.id, entry.group, entry.to,
-                                  LeftAtMost(entry.at_percent, entry.hold_mode))
+                                  LeftAtMost(entry.at_percent, entry.hold_mode), entry.fallback_targets)
                      for entry in next_moves.read_next_moves() if isinstance(entry, next_moves.ClaudeGroupMove))
     except next_moves.NextMoveError as error:
         return (UnreadableNextMoveLog(str(error)),)
@@ -643,15 +645,18 @@ def _notify_blocked_head(rule: AutoMoveRule, reason: BlockedHeadReason, now: dat
 
 
 def _record_blocked_head(state: WatchState, rule: AutoMoveRule, reason: BlockedHeadReason,
-                         now: datetime, dry_run: bool) -> str:
+                         now: datetime, dry_run: bool, *,
+                         other_targets: tuple[tuple[AutoMoveRule, BlockedHeadReason], ...] = ()) -> str:
+    blocked = ((rule, reason), *other_targets)
+    line = "; ".join(_blocked_head_line(candidate, cause) for candidate, cause in blocked)
     if not dry_run:
         notices = state.setdefault("auto_move_notices", {})
-        fingerprint = blocked_next_move_reason_key(reason)
+        fingerprint = "|".join(candidate.to + blocked_next_move_reason_key(cause) for candidate, cause in blocked) if other_targets else blocked_next_move_reason_key(reason)
         if notices.get(rule.entry_id) != fingerprint:
             _ = notices.pop(rule.entry_id, None)
-            if _notify_blocked_head(rule, reason, now):
+            if (_notify_no_room(line, now) if other_targets else _notify_blocked_head(rule, reason, now)):
                 notices[rule.entry_id] = fingerprint
-    return _blocked_head_line(rule, reason)
+    return line
 
 
 def _first_refusal(held: FirstRefusalObservation) -> refusals.AccountRefusal:
@@ -1058,6 +1063,49 @@ def recorded_auto_moves() -> RecordedAutoMoves | UnreadableAutoMoveHistory:
     return role_map.recorded_auto_moves(accounts.roles_history_file())
 
 
+@dataclass(frozen=True)
+class BlockedAutoMoveTargets:
+    reasons: tuple[tuple[AutoMoveRule, BlockedHeadReason], ...]
+
+
+def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: datetime,
+                             account_config: conf.ConfigRead) -> AutoMoveRule | BlockedAutoMoveTargets:
+    held_refusals = refusals.load()
+    stale_after = timedelta(minutes=account_config.whole("usage_stale_minutes"))
+    blocked: list[tuple[AutoMoveRule, BlockedHeadReason]] = []
+    for label in (rule.to, *rule.fallback_targets):
+        candidate = replace(rule, to=label)
+        if current_account == label:
+            return candidate
+        try:
+            target_login = accounts.claude_login(accounts.claude_account_dir(label))
+        except accounts.AccountsError as error:
+            blocked.append((candidate, TargetAccountUnavailable(str(error).splitlines()[0])))
+            continue
+        target = refusals.stored_reading_with_age("claude", target_login, now, stale_after)
+        last_read = (target.weekly.at if isinstance(target, (refusals.FreshReading, refusals.StaleReading))
+                     and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
+        target_usage = usage_store.load().get(usage_store.key("Claude", target_login), {})
+        reason: BlockedHeadReason
+        if usage_store.latest_read_outcome(target_usage) in (agent_accounts.UsageReadOutcome.STALE_TOKEN,
+                                                          agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN):
+            attempt = accounts.login_renewal_attempts().get(label)
+            reason = (TargetLoginRenewalFailed(attempt.result.detail)
+                      if attempt is not None and isinstance(attempt.result, accounts.LoginRenewalFailed)
+                      else TargetReadingUnavailable(last_read))
+        elif not isinstance(target, refusals.FreshReading):
+            reason = TargetReadingUnavailable(last_read)
+        elif target.weekly.left <= rule.when.percent:
+            reason = TargetAtOrBelowThreshold(target.weekly.left, rule.when.percent)
+        else:
+            held = held_refusals.get(refusals.key("claude", target_login))
+            if held is None or refusals.resolved(held, target, now):
+                return candidate
+            reason = TargetUnresolvedRefusal()
+        blocked.append((candidate, reason))
+    return BlockedAutoMoveTargets(tuple(blocked))
+
+
 def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
                    moved_groups: frozenset[accounts.ClaudeGroup] = NO_MOVED_GROUPS, account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> list[str]:
     """Apply log entries after the refusal pass while holding the log lock."""
@@ -1079,8 +1127,8 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         del holds[entry_id]
     for entry_id in set(notices) - head_ids:
         del notices[entry_id]
-    recorded = role_map.repair_selected_auto_moves(tuple(role_map.AutoMoveTarget(rule.entry_id, rule.group, rule.to)
-        for rule in rules), now, dry_run=dry_run)
+    recorded = role_map.repair_selected_auto_moves(tuple(role_map.AutoMoveTarget(rule.entry_id, rule.group, target)
+        for rule in rules for target in (rule.to, *rule.fallback_targets)), now, dry_run=dry_run)
     consumed: frozenset[str] = (recorded.entry_ids & {rule.entry_id for rule in rules}
                 if isinstance(recorded, RecordedAutoMoves) else frozenset())
     if consumed:
@@ -1098,7 +1146,6 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         return lines
     selected = accounts.group_accounts()
     moved = set(moved_groups)
-    held_refusals = refusals.load()
     stale_after = timedelta(minutes=account_config.whole("usage_stale_minutes"))
     for rule in rules:
         selection = _group_selection(selected, rule.group)
@@ -1129,6 +1176,16 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             if (isinstance(started.duration, next_moves.ResolvedHold)
                     and (now - started.at).total_seconds() / 60 < started.duration.minutes):
                 continue
+        chosen = _choose_auto_move_target(rule, selection.account, now, account_config)
+        if isinstance(chosen, BlockedAutoMoveTargets):
+            blocked_rule, reason = chosen.reasons[0]
+            if not rule.fallback_targets and isinstance(reason, TargetAccountUnavailable):
+                lines.append(reason.reason)
+            else:
+                lines.append(_record_blocked_head(state, blocked_rule, reason, now, dry_run,
+                                                  other_targets=chosen.reasons[1:]))
+            continue
+        rule = chosen
         if selection.account == rule.to:
             lines.append(f"{rule.group}: unchanged")
             if not dry_run:
@@ -1136,34 +1193,6 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
                                                   if entry.id != rule.entry_id))
                 _ = holds.pop(rule.entry_id, None)
                 _ = notices.pop(rule.entry_id, None)
-            continue
-        try:
-            target_login = accounts.claude_login(accounts.claude_account_dir(rule.to))
-        except accounts.AccountsError as error:
-            lines.append(str(error).splitlines()[0])
-            continue
-        target = refusals.stored_reading_with_age("claude", target_login, now, stale_after)
-        last_read = (target.weekly.at if isinstance(target, (refusals.FreshReading, refusals.StaleReading))
-                     and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
-        target_usage = usage_store.load().get(usage_store.key("Claude", target_login), {})
-        if usage_store.latest_read_outcome(target_usage) in (agent_accounts.UsageReadOutcome.STALE_TOKEN,
-                                                          agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN):
-            attempt = accounts.login_renewal_attempts().get(rule.to)
-            reason = (TargetLoginRenewalFailed(attempt.result.detail)
-                      if attempt is not None and isinstance(attempt.result, accounts.LoginRenewalFailed)
-                      else TargetReadingUnavailable(last_read))
-            lines.append(_record_blocked_head(state, rule, reason, now, dry_run))
-            continue
-        if not isinstance(target, refusals.FreshReading):
-            lines.append(_record_blocked_head(state, rule, TargetReadingUnavailable(last_read), now, dry_run))
-            continue
-        if target.weekly.left <= rule.when.percent:
-            lines.append(_record_blocked_head(state, rule,
-                TargetAtOrBelowThreshold(target.weekly.left, rule.when.percent), now, dry_run))
-            continue
-        held = held_refusals.get(refusals.key("claude", target_login))
-        if held is not None and not refusals.resolved(held, target, now):
-            lines.append(_record_blocked_head(state, rule, TargetUnresolvedRefusal(), now, dry_run))
             continue
         _ = notices.pop(rule.entry_id, None)
         why = f"auto: {rule.entry_id}"

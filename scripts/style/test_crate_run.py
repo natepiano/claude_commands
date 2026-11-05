@@ -1,6 +1,8 @@
 """Serial crate lifecycle tests: temporary Git and ledger, fake planner and verification."""
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import json
 import io
 import sqlite3
@@ -142,17 +144,17 @@ class CrateRunTests(CargoProjectTests):
 
     def file_findings(self, *, shared_proposal: bool = False,
                       paths: tuple[str, ...] = ("src/lib.rs", "beta/src/lib.rs")) -> None:
-        self.authority.ticket_add("read-1", "read", "read", "names", ".", list(paths), [self.definition.rule_id])
-        self.authority.ticket_assign("read-1", "main")
-        _ = self.authority.ticket_base("read-1")
+        self.authority.ticket_add("1001", ticket_owner_id("read"), "read", "names", ".", list(paths), [self.definition.rule_id])
+        self.authority.ticket_assign("1001", "main")
+        _ = self.authority.ticket_base("1001")
         for index, path in enumerate(paths):
             proposal = self.root / ("decision.md" if shared_proposal else f"decision-{index}.md")
             _ = proposal.write_text("---\nunit: approved-unit\nplan: approved-plan\n---\nApproved rename\n")
             source = (self.repo / path).read_text()
             finding = self.authority.hold(self.definition.rule_id, path, 2, source.splitlines()[1],
-                                          "rename", "old", "number", self.definition.blob, "read-1")
+                                          "rename", "old", "number", self.definition.blob, "1001")
             self.authority.file_held(finding.finding_id, proposal)
-        self.authority.ticket_drop("read-1")
+        self.authority.ticket_drop("1001")
 
     def freeze(self, *, shared_proposal: bool = False, paths: tuple[str, ...] = ("src/lib.rs", "beta/src/lib.rs")) -> None:
         self.file_findings(shared_proposal=shared_proposal, paths=paths)
@@ -550,21 +552,21 @@ class CrateRunTests(CargoProjectTests):
             "---\ntier: B\nfamily: values\ninput_scope: file\npre_filter: magic-values\n" +
             "approval: always\n---\n# Values\n")
         definition = next(rule for rule in rules.load_rules(self.repo) if rule.name == "no-magic-values")
-        self.authority.ticket_add("values-read-1", "values-read", "read", "values", ".",
+        self.authority.ticket_add("11001", ticket_owner_id("values-read"), "read", "values", ".",
                                   ["src/lib.rs"], [definition.rule_id])
-        self.authority.ticket_assign("values-read-1", "main")
-        _ = self.authority.ticket_base("values-read-1")
+        self.authority.ticket_assign("11001", "main")
+        _ = self.authority.ticket_base("11001")
         identities: list[str] = []
         for line, after in ((2, "Add `const FIRST: usize = 42;` in constants.rs."),
                             (3, "Compute a better value instead.")):
-            issue = self.root / f"values-{line}.md"
+            issue = self.root / f"{44000 + line}.md"
             _ = issue.write_text("---\nstatus: open\n---\nValues decision\n")
             finding = self.authority.hold(definition.rule_id, "src/lib.rs", line,
                 source.splitlines()[line - 1], "restructure", str(40 + line), after,
-                definition.blob, "values-read-1")
+                definition.blob, "11001")
             self.authority.file_held(finding.finding_id, issue)
             identities.append(finding.finding_id)
-        self.authority.ticket_drop("values-read-1")
+        self.authority.ticket_drop("11001")
         before = self.dry_run_snapshot()
         denying_writes = False
         def deny_writes(event: str, arguments: tuple[object, ...]) -> None:
@@ -991,23 +993,23 @@ class CrateRunTests(CargoProjectTests):
         findings = self.authority.held_findings(ledger_api.AllHeldFindings())
         primary = next(finding for finding in findings if finding.path == "src/lib.rs")
         assert isinstance(primary.state, ledger_api.Filed)
-        self.authority.ticket_add("read-2", "read", "read", "names", ".", [primary.path],
+        self.authority.ticket_add("1002", ticket_owner_id("read"), "read", "names", ".", [primary.path],
                                   [self.definition.rule_id])
-        self.authority.ticket_assign("read-2", "main")
-        _ = self.authority.ticket_base("read-2")
+        self.authority.ticket_assign("1002", "main")
+        _ = self.authority.ticket_base("1002")
         source = (self.repo / primary.path).read_text().splitlines()
         second = self.authority.hold(self.definition.rule_id, primary.path, 3, source[2],
-                                     "rename", "old", "value", self.definition.blob, "read-2")
+                                     "rename", "old", "value", self.definition.blob, "1002")
         file_blocked = self.authority.hold(self.definition.rule_id, primary.path, 1, source[0],
-                                           "rename", "run", "execute", self.definition.blob, "read-2")
+                                           "rename", "run", "execute", self.definition.blob, "1002")
         for finding in (second, file_blocked):
             self.authority.file_held(finding.finding_id, primary.state.proposal)
-        self.authority.ticket_drop("read-2")
+        self.authority.ticket_drop("1002")
         other = next(finding for finding in findings if finding.path == "beta/src/lib.rs")
-        for ticket, finding in (("holder-a-1", primary), ("holder-b-1", second), ("other-crate-1", other)):
+        for ticket, unit, finding in (("42001", "holder-a", primary), ("43001", "holder-b", second), ("23001", "other-crate", other)):
             filed = self.authority.named_held((finding.finding_id,))[0]
             assert isinstance(filed.state, ledger_api.Filed)
-            self.authority.ticket_add(ticket, ticket.rsplit("-", 1)[0], "proposal", "names", ".",
+            self.authority.ticket_add(ticket, ticket_owner_id(unit), "proposal", "names", ".",
                                       [filed.path], [filed.rule], proposal=str(filed.state.proposal),
                                       finding_ids=(filed.finding_id,))
         batch = crates.CrateRun(self.authority, "held")
@@ -1020,9 +1022,9 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(record["selected"], [])
         self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
         self.assertEqual(record.get("error"),
-                         "no selected findings: 3 findings held by open tickets: holder-a-1, holder-b-1")
+                         "no selected findings: 3 findings held by open tickets: 42001, 43001")
         self.assertEqual(other_result["crates"]["beta"].get("error"),
-                         "no selected findings: 1 finding held by open tickets: other-crate-1")
+                         "no selected findings: 1 finding held by open tickets: 23001")
 
     def test_queue_refusal_keeps_the_claimed_run_and_its_tickets(self) -> None:
         self.freeze()
