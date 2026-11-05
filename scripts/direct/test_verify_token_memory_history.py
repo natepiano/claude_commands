@@ -105,11 +105,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         os.kill(process.pid, signal.SIGTERM)
         self.assertNotEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
 
-        def released() -> bool:
-            with admission.loop_turn():
-                return not admission.server.waiters and not admission.server.reservations
-
-        wait_until(released, admission.state_dir)
+        wait_until(admission.callers_released, admission.state_dir)
         self.assertFalse((board / "locks/cargo.d").exists())
         self.assertEqual(self.live_group_processes(process.pid), [])
         self.assertFalse((self.root / "cargo-calls").exists())
@@ -219,11 +215,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             self.assertEqual(list((board / "token_waiters").glob(f"*.{process.pid}*")), [])
             self.assertFalse((self.root / "cargo-calls").exists())
 
-            def released() -> bool:
-                with admission.loop_turn():
-                    return not admission.server.waiters and not admission.server.reservations
-
-            wait_until(released, admission.state_dir)
+            wait_until(admission.callers_released, admission.state_dir)
         finally:
             if hidden.exists():
                 _ = hidden.rename(admission.socket_path)
@@ -250,7 +242,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         self.assertFalse((self.root / "cargo-calls").exists())
         self.assertEqual((lock / "holder_pid").read_text(), str(os.getpid()))
         with admission.loop_turn():
-            self.assertEqual(admission.server.reservations, {})
+            self.assertEqual(admission.caller_reservations(), {})
 
     def test_two_boards_share_memory_without_a_resource_cycle(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
@@ -273,7 +265,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         self.assertEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
         self.assertEqual(second.wait(timeout=TEST_HANG_GUARD_SECS), 0, second_errors.read_text())
         self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
-        self.assertEqual(admission.server.reservations, {})
+        self.assertEqual(admission.caller_reservations(), {})
 
 
 

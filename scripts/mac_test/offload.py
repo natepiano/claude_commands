@@ -1467,6 +1467,7 @@ def remote_test_command(
             remote_mirror(repository, request.target, request.slot), runner_values(config, request.target),
             repository.policy_name, request.verb, words, request.call_id,
             sent_tree_key.value if isinstance(sent_tree_key, KnownTreeKey) else "",
+            repository.key,
         )
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
@@ -1479,6 +1480,7 @@ def remote_test_command(
         f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
+    repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(repository.key)} " if repository.key else ""
     if any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
         cleanup_command = "echo mac_cleanup=skipped"
     else:
@@ -1499,6 +1501,7 @@ def remote_test_command(
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
+        f"{repo_identity}"
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
         f"{sent_tree}"
         "BUILDLOG_SYNC=1 "

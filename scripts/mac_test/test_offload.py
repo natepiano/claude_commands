@@ -168,6 +168,17 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch("subprocess.run", side_effect=AssertionError("No external command expected")))
         _ = self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("No external command expected")))
 
+    def test_mac_command_sends_repository_identity_only_when_nonempty(self) -> None:
+        config = offload.read_config(self.settings)
+        request = offload.OffloadRequest(self.root, "hana", "fixture-call", offload.NO_RESULT_FILE, ())
+        for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
+            with self.subTest(key=key):
+                words = shlex.split(offload.remote_test_command(
+                    config, request, offload.KnownRepository("hana", key),
+                ))
+                assignments = [word for word in words if word.startswith("BUILDLOG_REPO_IDENTITY=")]
+                self.assertEqual(assignments, [f"BUILDLOG_REPO_IDENTITY={key}"] if key else [])
+
     def test_ssh_target_state_path_needs_no_registry(self) -> None:
         with mock.patch.object(target_config, "read_targets", side_effect=AssertionError("No registry read expected")):
             self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / ".local/state/build-targets/aws")
