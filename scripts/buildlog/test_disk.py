@@ -25,6 +25,7 @@ import report
 import store
 import sweep
 import test_index
+from scripts.message.session_send_test_support import forbid_real_sender
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..lib.cargo_output import CargoOutputRoots
@@ -34,6 +35,10 @@ else:
     from scripts.lib.cargo_output import CargoOutputRoots
     from scripts.lint.memory_test_support import config_environment
     from scripts.mac_test import linux_runner
+
+
+def setUpModule() -> None:
+    forbid_real_sender()
 
 
 class DiskTests(unittest.TestCase):

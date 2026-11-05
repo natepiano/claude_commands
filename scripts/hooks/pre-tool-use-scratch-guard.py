@@ -25,14 +25,16 @@ from a PreToolUse hook, so an allow is an exit 0 with no output.
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import os
 import re
 import shlex
 import sys
+from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import Protocol, TypedDict, cast, override
 
 
 class SessionTempPaths(Protocol):
@@ -155,16 +157,61 @@ def without_heredoc_bodies(text: str) -> str:
     return "\n".join(kept)
 
 
+def without_line_continuations(text: str) -> str:
+    """Delete backslash-newline pairs outside single quotes before splitting words."""
+    if "\\\n" not in text:
+        return text
+    kept: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and quote != "'" and index + 1 < len(text):
+            if text[index + 1] != "\n":
+                kept.append(text[index:index + 2])
+            index += 2
+            continue
+        if char == quote:
+            quote = ""
+        elif not quote and char in "'\"":
+            quote = char
+        kept.append(char)
+        index += 1
+    return "".join(kept)
+
+
+class CommandLexer(shlex.shlex):
+    """Keep the source spelling that distinguishes an operator from a word."""
+
+    operator: bool = False
+
+    def __init__(self, text: str) -> None:
+        self.text: str = text
+        self.stream: io.StringIO = io.StringIO(text)
+        super().__init__(self.stream, posix=True, punctuation_chars=PUNCTUATION)
+        self._pushback_chars: deque[str] = deque()
+
+    @override
+    def read_token(self) -> str | None:
+        # shlex can read one character ahead and keep it for the next token.
+        start = self.stream.tell() - len(self._pushback_chars)
+        token = super().read_token()
+        end = self.stream.tell() - len(self._pushback_chars)
+        self.operator = (token is not None and bool(token) and set(token) <= set(PUNCTUATION)
+                         and self.text[start:end].strip(self.whitespace) == token)
+        return token
+
+
 def commands(text: str) -> Iterator[list[str]]:
     """Each simple command of `text` as words; nothing when the text cannot be split."""
-    lexer = shlex.shlex(without_heredoc_bodies(text), posix=True, punctuation_chars=PUNCTUATION)
+    lexer = CommandLexer(without_line_continuations(without_heredoc_bodies(text)))
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     lexer.commenters = ""  # a comment's words start with `#`, which is no command
     words: list[str] = []
     try:
         for token in lexer:
-            if set(token) <= set(PUNCTUATION):
+            if lexer.operator:
                 if words:
                     yield words
                 words = []

@@ -12,22 +12,27 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
-from unittest.mock import patch
+from unittest.mock import MagicMock, call as mock_call, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment
+    from ..lint.memory_test_support import config_environment, write_config_fixture
+    from ..lint.test_build_shape import create_step_index, record_root_attempt
 else:
-    from memory_test_support import config_environment
+    from memory_test_support import config_environment, write_config_fixture
+    from test_build_shape import create_step_index, record_root_attempt
 
 import index
 import memory
-from cargo_output import CargoOutputRoots
-from cgroup_test_support import CPU, GIB, IO_LINES, slice_reading, write_cgroup
+from cargo_output import CargoOutputRoots, CargoOutputUnavailable
+from cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
 if TYPE_CHECKING:
@@ -81,7 +86,7 @@ def snapshot(at: str, high: int, peak: int, *, ci: Record | None = None) -> Reco
         "at": at,
         "host": "natedev",
         "slices": {"builds": present_slice(high, peak), "ci": ci or {"state": "absent"}},
-        "zram": {"state": "present", "data_bytes": 3 * GIB, "compressed_bytes": GIB},
+        "zram": ZRAM_READING,
     }
 
 
@@ -114,6 +119,30 @@ class MemoryWindowTests(unittest.TestCase):
         self.fake_bin = self.base / "bin"
         self.fake_bin.mkdir()
         point_root_at(self, self.root)
+
+    def test_window_report_uses_the_recorded_cap_and_room_formatter(self) -> None:
+        from scripts.build_queue import queue_snapshot
+        from scripts.build_queue.queue_evidence import room_text
+        from scripts.lint import memory_admit as gate
+
+        self.stub_journal(early=[], kernel=[])
+        start, end = datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC)
+        configuration = gate.read_memory_config()
+        inputs = gate.QueueInputs([], (), (), gate.HostMemory(30 * GIB, 60 * GIB),
+            gate.NoPressureHold(), gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), start.timestamp())
+        directory = self.root / "admission"
+        directory.mkdir(parents=True)
+        queue_snapshot.write_queue_snapshot(directory, inputs, configuration.policy)
+        _ = index.update()
+        with index.read_only() as connection:
+            text = memory.window_report(connection, start, end)
+        room = gate.memory_room(inputs.host, (), start.timestamp(), configuration.policy)
+        self.assertIn(room_text(room), text)
+        self.assertIn("Cap 27.0 GiB", text)
+        with index.read_only() as connection:
+            older = memory.window_report(connection, start - timedelta(days=2), start - timedelta(days=1))
+        self.assertNotIn("Cap 27.0 GiB", older)
+        self.assertIn("Cap: no recorded admission pass in this window", older)
 
     def env(self, **extra: str) -> dict[str, str]:
         return {
@@ -270,8 +299,7 @@ class MemoryWindowTests(unittest.TestCase):
         ):
             _ = (builds / name).write_text(value + "\n")
         zram = self.base / "zram0"
-        zram.mkdir()
-        _ = (zram / "mm_stat").write_text("3221225472 1073741824 0 0 0\n")
+        write_zram(zram)
 
         result = self.cli("snapshot")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -291,7 +319,7 @@ class MemoryWindowTests(unittest.TestCase):
             "stall_some_us": 1_250_000,
         })
         self.assertEqual(slices["ci"], {"state": "absent"})
-        self.assertEqual(recorded["zram"], {"state": "present", "data_bytes": 3 * GIB, "compressed_bytes": GIB})
+        self.assertEqual(recorded["zram"], ZRAM_READING)
         files = list(self.root.glob("*/*.jsonl"))
         self.assertEqual(len(files), 1)
         self.assertEqual([json.loads(line) for line in files[0].read_text().splitlines()], [recorded])
@@ -599,15 +627,16 @@ class MemoryWindowTests(unittest.TestCase):
             old_sample = sample(at, host="old", slices={"builds": {"state": "absent"}, "ci": {"state": "absent"}})
             tick_snapshot: Record = {"kind": "memory_snapshot", "host": "tick", "at": at, "zram": standalone["zram"]}
             tick_sample = sample(at, host="tick", slices=expected_slices)
+            new_sample = sample(at, host="new-log", slices=expected_slices, zram=standalone["zram"])
             standalone_snapshot = {**standalone, "host": "standalone"}
-            records.extend((old_sample, old_snapshot, tick_sample, tick_snapshot, standalone_snapshot))
+            records.extend((old_sample, old_snapshot, tick_sample, tick_snapshot, new_sample, standalone_snapshot))
         self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
         _ = index.update()
         connection = index.read_only()
         reports: list[str] = []
         try:
             with patch.object(memory, "journal_messages", return_value=memory.JournalUnavailable.VALUE):
-                for host in ("old", "tick", "standalone"):
+                for host in ("old", "tick", "new-log", "standalone"):
                     with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
                         found = memory.nearest_snapshot(connection, datetime.fromisoformat(END_UTC))
                         self.assertEqual(found["kind"], "memory_snapshot")
@@ -621,6 +650,7 @@ class MemoryWindowTests(unittest.TestCase):
             connection.close()
         self.assertEqual(reports[0], reports[1])
         self.assertEqual(reports[0], reports[2])
+        self.assertEqual(reports[0], reports[3])
         self.assertIn("builds: high +3, max +0, oom_kill +0", reports[0])
         self.assertIn("peak 12.0 GiB", reports[0])
         self.assertIn("CI: high +3", reports[0])
@@ -656,6 +686,52 @@ class MemoryWindowTests(unittest.TestCase):
                         self.assertIn("peak 12.0 GiB", report)
                         self.assertIn("CI: high +3", report)
                         self.assertIn("zram: 3.0 GiB stored in 1.0 GiB", report)
+        finally:
+            connection.close()
+
+    def test_zram_report_marks_absent_and_missing_readings_unavailable(self) -> None:
+        records: list[Record] = []
+        for at, high, peak in ((START_UTC, 2, 8 * GIB), (END_UTC, 5, 12 * GIB)):
+            reading = snapshot(at, high, peak)
+            records.extend((
+                sample(at, host="absent", slices=reading["slices"], zram={"state": "absent"}),
+                sample(at, host="missing", slices=reading["slices"]),
+            ))
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            with patch.object(memory, "journal_messages", return_value=memory.JournalUnavailable.VALUE):
+                for host in ("absent", "missing"):
+                    with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
+                        report = memory.window_report(connection, datetime.fromisoformat(START_UTC),
+                                                      datetime.fromisoformat(END_UTC))
+                        self.assertEqual([line for line in report.splitlines() if line.startswith("zram:")],
+                                         ["zram: unavailable"])
+        finally:
+            connection.close()
+
+    def test_zram_uses_nearest_reading_and_prefers_snapshot_on_equal_distance(self) -> None:
+        records: list[Record] = []
+        for host, snapshot_at in (("nearer-sample", "2026-10-05T07:29:59.000Z"),
+                                  ("equal-distance", END_UTC.replace(".000Z", "Z"))):
+            reading = snapshot(snapshot_at, 2, 8 * GIB)
+            records.extend((
+                {**reading, "host": host},
+                sample(END_UTC, host=host, slices=reading["slices"],
+                       zram={"state": "present", "data_bytes": 4 * GIB, "compressed_bytes": GIB}),
+            ))
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            for host, data in (("nearer-sample", 4 * GIB), ("equal-distance", 3 * GIB)):
+                with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
+                    found = memory.nearest_snapshot(connection, datetime.fromisoformat(END_UTC))
+                    if found["kind"] != "memory_snapshot":
+                        self.fail("The zram reading is unavailable.")
+                    self.assertEqual(found["zram"], {"state": "present", "data_bytes": data,
+                                                   "compressed_bytes": GIB})
         finally:
             connection.close()
 
@@ -702,6 +778,145 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertIn("builds: reset in the window; since the reset high 2, max 0, oom_kill 0; stall 0.0 s; peak 4.0", result.stdout)
         self.assertIn("CI: reset in the window; since the reset high 1, max 1, oom_kill 0; stall 0.0 s; peak 6.0", result.stdout)
         self.assertNotIn("no new high in the window", result.stdout)
+
+
+class BuildOutputRootsTests(unittest.TestCase):
+    base: Path = Path()
+    current: Path = Path()
+    index_file: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.current = self.checkout("current")
+        self.index_file = self.base / "steps.sqlite"
+        memory.build_output_roots.cache_clear()
+        self.addCleanup(memory.build_output_roots.cache_clear)
+        create_step_index(self.index_file)
+
+    def checkout(self, name: str) -> Path:
+        path = self.base / name
+        path.mkdir()
+        _ = (path / "Cargo.toml").write_text("[workspace]\n")
+        return path
+
+    def recorded_step(self, target: str, build: str, *, worktree: str = "", cwd: str = "",
+                      host: str = "natedev", argv: tuple[str, ...] = ("cargo", "check")) -> None:
+        record_root_attempt(self.index_file, worktree, target, build, cwd=cwd, host=host, argv=argv)
+
+    def probe(self, side_effect: Callable[[Path], CargoOutputRoots | CargoOutputUnavailable] | Exception,
+              index_file: Path | None = None) -> tuple[frozenset[Path], MagicMock]:
+        with patch.object(memory, "read_cargo_output_roots", side_effect=side_effect) as metadata:
+            roots = memory.build_output_roots(index_file if index_file is not None else self.index_file,
+                                             self.current, "natedev")
+        return roots, metadata
+
+    def build_roots(self, outputs: Mapping[Path, CargoOutputRoots],
+                    index_file: Path | None = None) -> tuple[frozenset[Path], MagicMock]:
+        def read(checkout: Path) -> CargoOutputRoots | CargoOutputUnavailable:
+            return outputs.get(checkout, CargoOutputUnavailable("fixture"))
+
+        return self.probe(read, index_file)
+
+    def configure_workers(self, workers: int) -> None:
+        environment = config_environment(self.base / "config")
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "buildlog.conf",
+                                 f"METADATA_PROBE_WORKERS={workers}\n")
+        _ = cast(Mapping[str, str], self.enterContext(patch.dict(os.environ, environment)))
+
+    def probes_meet(self, workers: int, *, timeout: float) -> frozenset[Path]:
+        recorded = self.checkout("recorded")
+        self.recorded_step("", "", worktree=str(recorded))
+        self.configure_workers(workers)
+        together = threading.Barrier(2, timeout=timeout)
+
+        def read(checkout: Path) -> CargoOutputRoots:
+            _ = together.wait()
+            return CargoOutputRoots(checkout, checkout / "target", checkout / "build")
+
+        return self.probe(read)[0]
+
+    def test_recorded_pair_resolves_paths_and_uses_one_workspace(self) -> None:
+        workspace = self.checkout("recorded")
+        outside = self.checkout("outside")
+        target = self.base / "target"
+        alias = self.base / "target-alias"
+        alias.symlink_to(target)
+        build = self.base / "build"
+        self.recorded_step(str(alias), str(build), worktree=str(workspace), cwd=str(outside))
+        roots, metadata = self.build_roots({})
+        self.assertEqual(roots, frozenset((target, build)))
+        self.assertCountEqual(metadata.call_args_list, [mock_call(self.current), mock_call(workspace)])
+
+    def test_incomplete_pairs_keep_absolute_sides_without_a_workspace(self) -> None:
+        target = self.base / "target"
+        build = self.base / "build"
+        orphan = self.base / "orphan"
+        self.recorded_step(str(target), store.UNKNOWN_IDENTITY)
+        self.recorded_step("relative-target", str(build))
+        self.recorded_step("", "relative-build")
+        self.recorded_step(store.UNKNOWN_IDENTITY, str(orphan), worktree="relative-workspace", cwd="")
+        roots, metadata = self.build_roots({})
+        self.assertEqual(roots, frozenset((target, build, orphan)))
+        metadata.assert_called_once_with(self.current)
+
+    def test_unavailable_index_keeps_current_checkout_metadata(self) -> None:
+        empty_index = self.base / "empty.sqlite"
+        sqlite3.connect(empty_index).close()
+        missing_index = self.base / "missing.sqlite"
+        outputs = CargoOutputRoots(self.current, self.current / "target", self.current / "build")
+        for index_file in (missing_index, empty_index):
+            with self.subTest(index_file=index_file):
+                roots, metadata = self.build_roots({self.current: outputs}, index_file)
+                self.assertEqual(roots, frozenset((outputs.target_directory, outputs.build_directory)))
+                metadata.assert_called_once_with(self.current)
+
+    def test_other_host_adds_neither_outputs_nor_checkout(self) -> None:
+        foreign = self.checkout("foreign")
+        target = self.base / "local-target"
+        self.recorded_step(str(target), "")
+        self.recorded_step(str(foreign / "target"), str(foreign / "build"), worktree=str(foreign), host="mac")
+        roots, metadata = self.build_roots({})
+        self.assertEqual(roots, frozenset((target,)))
+        metadata.assert_called_once_with(self.current)
+
+    def test_metadata_probes_manifests_and_keeps_only_successful_outputs(self) -> None:
+        recorded = self.checkout("recorded")
+        unavailable = self.checkout("unavailable")
+        no_manifest = self.base / "no-manifest"
+        no_manifest.mkdir()
+        self.recorded_step("", "", cwd=str(recorded))
+        self.recorded_step("", "", worktree=str(unavailable))
+        self.recorded_step("", "", worktree=str(no_manifest))
+        current_outputs = CargoOutputRoots(self.current, self.current / "target", self.current / "build")
+        recorded_outputs = CargoOutputRoots(recorded, recorded / "target", recorded / "build")
+
+        roots, metadata = self.build_roots({self.current: current_outputs, recorded: recorded_outputs})
+        self.assertEqual(roots, frozenset((current_outputs.target_directory, current_outputs.build_directory,
+                                          recorded_outputs.target_directory, recorded_outputs.build_directory)))
+        self.assertCountEqual(metadata.call_args_list, [mock_call(self.current), mock_call(recorded), mock_call(unavailable)])
+
+    def test_target_override_adds_neither_pair_nor_checkout(self) -> None:
+        overridden = self.checkout("overridden")
+        self.recorded_step(str(overridden / "target"), str(overridden / "build"), worktree=str(overridden),
+                           argv=("cargo", "check", "--target-dir", str(overridden / "target")))
+        roots, metadata = self.build_roots({})
+        self.assertEqual(roots, frozenset())
+        metadata.assert_called_once_with(self.current)
+
+    def test_metadata_probes_run_at_the_same_time(self) -> None:
+        recorded = self.base / "recorded"
+        roots = self.probes_meet(2, timeout=2)
+        self.assertEqual(roots, frozenset((self.current / "target", self.current / "build",
+                                          recorded / "target", recorded / "build")))
+
+    def test_one_configured_worker_runs_metadata_probes_in_sequence(self) -> None:
+        with self.assertRaises(threading.BrokenBarrierError):
+            _ = self.probes_meet(1, timeout=0.1)
+
+    def test_metadata_probe_exception_reaches_the_caller(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "probe failed"):
+            _ = self.probe(RuntimeError("probe failed"))
 
 
 if __name__ == "__main__":

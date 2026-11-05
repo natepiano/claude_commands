@@ -22,7 +22,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli
 import index
 import mac_idle
-import memory
 import sample
 if TYPE_CHECKING:
     from ..build_queue import admission_protocol as wire
@@ -85,10 +84,12 @@ class MacIdleTests(unittest.TestCase):
                      {"BUILDLOG_CALL_ID": self.call.call_id, "LINT_QUEUE_LEAVE_HOOK": "check Mac"})
         mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id), asdict(self.call))
         self.admission = caller_admission(self, self.root, dict(os.environ))
-        self.admission.free(0)
-        owner = self.admission.fixture_owner(124, "457")
-        request = self.admission.request(owner=owner, since=100)
-        _ = self.admission.server.handle_request(request)
+        _ = self.admission.occupy_host()
+        with self.admission.loop_turn():
+            self.admission.free(0)
+            owner = self.admission.fixture_owner(124, "457")
+            request = self.admission.request(owner=owner, since=100)
+            _ = self.admission.server.handle_request(request)
         mac_idle.write_record(self.paths.state / "idle.json", {"since": 1000})
         self.step()
 
@@ -421,7 +422,6 @@ done
 
     def test_minute_sample_runs_the_watch_on_natedev(self) -> None:
         with mock.patch.object(sample, "sample", return_value=sample.SampleTaken(1000, "natedev")), \
-             mock.patch.object(memory, "write_snapshot"), \
              mock.patch.object(mac_idle, "watch_once") as watch:
             self.assertEqual(cli.main(["sample"]), 0)
         watch.assert_called_once()

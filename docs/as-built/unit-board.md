@@ -6,7 +6,7 @@ The mod in `mods/unit-board/` draws three panes on demand.
 `/showrunner:unit_board` shows the production, its child productions, or one unit.
 It shows phases, ETAs, gates, finish times, and workers.
 `/showrunner:accounts` shows stored account readings without login addresses.
-`/build:queue` shows the memory budget and waiting steps.
+`/build:queue` shows the memory cap, room, running steps, and waiting steps.
 The recorder keeps each phase's stated ETA and predicts later phases from it.
 `/unit:report` prints a short report; `tables` adds the recorder's round table.
 
@@ -119,8 +119,26 @@ Run `scripts/lib/py scripts/direct/board_json.py --migrate-cache` to migrate the
   It replies `Accounts opened.`; `close` replies `Accounts closed.`.
 - `/build:queue [<position|session|folder>]` is intercepted by `command.run` without a model turn. It opens `build-queue` (title `Build queue`, Escape closes), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/build_queue/build_queue.py, "--json", "--columns", <last bodyColumns>, "--you", <session id>, <optional selector>]` and replies `Build queue opened.`. The width starts at 100. A pane-width change requests one forced refresh; the shared busy guard joins repeated requests. A selector shows the full queue, one blank line, and the matching cards on one page. `mine` uses the same layout. The selection survives the 10 s refresh and reload. `close` replies `Build queue closed.`. Bump retains its existing refusal handling and refreshes an open pane. Bump is off; nothing can move a waiting step.
 - `queue_lines.py` defines `Span {text, tone, bold, background, until?}`, terminal-cell widths, padding, clipping, hanging-indent wrap, text output and `QueueLines {columns, as_of, lines}` JSON. Tone names include blue `suggestion`. JSON omits fields at their `Span` defaults: `tone` and `background` `default`, `bold` false, and no `until`. The pane accepts missing fields as those defaults; older explicit fields remain valid. An `until` span contains only the countdown text and its epoch deadline; the pane computes `max(0, until − now)` on every draw. One `$.clock.every(1000, …)` timer invalidates the drawing while a countdown is active, without a script run; it stops on expiry, a page without a countdown, or close. The 10 s script refresh stays.
-- `build_queue.py` reads admission with the lock-free, bounded `queue_read()`, then resolves labels through one file-only `unit_labels_for` lookup. The no-selector view skips bump/token history and pace reads. It draws a budget bar from admission’s charged total and budget, then aligned waiting rows with showrunner, unit (without its showrunner prefix), step, minutes and need bars at one cell per GiB. Plain output uses `░` for free budget and `█` for taken; colour uses green and blue with an eighth-block boundary. Name columns grow above 60 cells, shrink together when needed, then clip at the edge. `--you` carries `$.session.id()`; inline falls back to the calling session environment. Matching rows have a blue `▸`. Row 1 ends with `↑` for backfill, `↑ ≤N.N` for positive strict-window room or `⊘` when no room remains, a recorded window countdown when known, and red host-hold words. The view has no running rows, moves or start estimates.
-- Selector cards retain their order, checks and history behavior. An older fitting step fails the queue-order check with `behind #<k>, an older step that fits`, or `behind an older step that fits` when it is absent from the reading. `queue_view.render_view` and `queue_card.render_card` share a model and admission check formatter. Every waiting step's card shows its recorded budget and free checks from admission. A failed refresh or malformed reply keeps the last successful page. A failed first query shows only `Build queue could not be read.`. Times use the user’s zone; `as_of` is the admission reading’s epoch.
+- `build_queue.py` reads one captured admission pass through the bounded `queue_read()` query.
+  `unit_labels_for` supplies the labels through one file read.
+  The memory bar shows the cap, anonymous use, keep-aside, room, safety, and other programs.
+  Running rows show each run and its held slot.
+  Waiting rows show the showrunner, unit, step, waiting minutes, pid, and need.
+  Every process row shows its captured `pid N`, or `pid —` when no pid was recorded.
+  The pid column takes space from the row bar while names keep their allocated widths.
+  The first eligible row has an `↑` marker and a recorded hold cause.
+  Head protection keeps its full need available before a younger run starts.
+  Held slots give the same run priority for its next step.
+  New starts use the recorded start-spacing deadline.
+  Service rows retain RAM and swap amounts through marked continuation lines.
+  `--you` selects the session through `$.session.id()`.
+  A blue `▸` marks matching rows.
+- Selector cards share the queue model and the admission check formatter.
+  Each card shows the captured room check, start basis, head cause, and run keep-aside.
+  The evidence uses the same pass as the queue view.
+  A failed refresh retains the last successful view.
+  A failed first query shows only `Build queue could not be read.`.
+  Times use the user’s zone; `as_of` is the admission reading’s epoch.
 - `session.start` restores refresh timers for open panes. Command files supply the colon names; mod hooks open the panes without a model turn. Without the mod, `/showrunner:accounts` names the required plugin. `/build:queue` runs its script. Run `/reload-plugins` in sessions that need the updated hooks.
 
 **State.** Plugin state `unit-board` holds the board and accounts records, each keyed by pane id; a missing entry is a closed pane.

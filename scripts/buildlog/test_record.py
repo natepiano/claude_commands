@@ -204,6 +204,45 @@ class RecordTests(unittest.TestCase):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
 
+    def test_reserved_test_phase_row_keeps_the_sampler_reservation_with_or_without_charge(self) -> None:
+        reservation = "sampled-reservation"
+        charge: recorder.TestPhaseChargeUse = {
+            "bytes": 8192, "selected_at": START, "reservation_id": reservation, "need": {},
+        }
+        history = self.root / "admission/anon_peaks.jsonl"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        for has_charge in (False, True):
+            with self.subTest(has_charge=has_charge):
+                _ = history.write_text(json.dumps({
+                    "reservation_id": reservation,
+                    "test_phase_charge_use": charge if has_charge else None,
+                }) + "\n")
+                result = self.record("test-phase-context", json.dumps({"reservation_id": reservation}), *NEXTEST)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                context = cast(Record, json.loads(result.stdout))
+                phase = self.base / f"reserved-phase-{has_charge}.json"
+                _ = phase.write_text(json.dumps({
+                    **context, "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+                }))
+                row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TEST_PHASE_FILE": str(phase)})
+                self.assertEqual(row["test_phase_charge"], charge if has_charge else None)
+                self.assertEqual(row["reservation_id"], reservation)
+
+    def test_test_phase_without_a_text_reservation_omits_the_sidecar_and_row_key(self) -> None:
+        contexts: tuple[Record, ...] = ({}, {"reservation_id": ""}, {"reservation_id": None}, {"reservation_id": 7})
+        for case, sampling_context in enumerate(contexts):
+            with self.subTest(sampling_context=sampling_context):
+                result = self.record("test-phase-context", json.dumps(sampling_context), *NEXTEST)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                context = cast(Record, json.loads(result.stdout))
+                phase = self.base / f"unreserved-phase-{case}.json"
+                _ = phase.write_text(json.dumps({
+                    **context, "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+                }))
+                row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TEST_PHASE_FILE": str(phase)})
+                self.assertNotIn("reservation_id", row)
+                self.assertNotIn("reservation_id", context)
+
     def test_step_records_resolved_target_and_build_directories(self) -> None:
         cargo = self.base / "tools" / "cargo"
         target, build = self.repo / "artifacts", self.base / "intermediates"
@@ -211,18 +250,15 @@ class RecordTests(unittest.TestCase):
                               "build_directory": str(build)})
         _ = cargo.write_text("#!/bin/sh\nif [ \"$1\" = metadata ]; then\n  printf '%s\\n' '" + payload + "'\nelse\n  exit 99\nfi\n")
         cargo.chmod(0o755)
-        captured = str(self.repo / "captured-output")
-        row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TARGET_FOLDER": captured})
-        self.assertEqual(row["target_directory"], str(target))
+        row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TARGET_FOLDER": str(target)})
+        self.assertTrue(row["target_dir"] == row["target_directory"] == str(target))
         self.assertEqual(row["build_directory"], str(build))
-        self.assertIn("target_dir", row)
-        self.assertEqual(row["target_dir"], captured)
         _ = index.update()
         with closing(index.read_only()) as connection:
             indexed = connection.execute(
                 "SELECT target_folder, build_history_group, target_directory, build_directory FROM steps"
             ).fetchall()
-        self.assertEqual(indexed, [(captured, "folder:" + captured, str(target), str(build))])
+        self.assertEqual(indexed, [(str(target), "folder:" + str(target), str(target), str(build))])
 
     def test_floor_scan_records_filesystem_identity_without_changing_old_rows(self) -> None:
         recorder.floor_scan(1, 2, [], START, filesystem="8-1:/outputs")
@@ -416,6 +452,25 @@ class RecordTests(unittest.TestCase):
         _ = (config / "config.toml").write_text('[build\n')
         _ = self.assert_folder_record(NEXTEST, "unresolved")
         self.assertIn("target folder:", (self.root / "errors.log").read_text())
+
+    def test_invalid_cli_config_records_unresolved_and_an_error(self) -> None:
+        _ = (self.repo / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
+        malformed = self.base / "malformed.toml"
+        _ = malformed.write_text('[build\n')
+        unreadable = self.base / "config-directory"
+        unreadable.mkdir()
+        for setting in ('build.target-dir="broken', str(malformed), str(unreadable), str(self.base / "missing.toml")):
+            with self.subTest(setting=setting):
+                self.assertEqual(self.resolved_folder(["cargo", "check", "--config", setting]), "unresolved")
+                self.assertIn("target folder:", (self.root / "errors.log").read_text())
+
+    def test_target_environment_overrides_cli_config_in_capture(self) -> None:
+        argv = ["cargo", "check", "--config", 'build.target-dir="configured-output"']
+        for variable, expected in (("CARGO_TARGET_DIR", "environment-output"),
+                                   ("CARGO_BUILD_TARGET_DIR", "configured-output")):
+            with self.subTest(variable=variable):
+                self.assertEqual(self.resolved_folder(argv, extra={variable: "environment-output"}),
+                                 str(self.repo / expected))
 
     def test_captured_folder_survives_config_change_and_pending_retry(self) -> None:
         config = self.repo / ".cargo"
@@ -684,6 +739,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(record["duration_s"], 12.5)
 
     def test_piped_run_records_memory_wait_outside_step_duration(self) -> None:
+        self.admission.configure(**{"program_first_peak_gib.cargo": 9})
+        _ = self.admission.occupy_host()
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
         runtime = Path(self.enterContext(short_socket_directory())) / "systemd"
@@ -745,6 +802,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(duration, 7)
 
     def test_launch_memory_wait_limit_refuses_once(self) -> None:
+        self.admission.configure(**{"program_first_peak_gib.cargo": 9})
+        _ = self.admission.occupy_host()
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11010048 kB\n")
         command = ('source "$1"; sleep() { SECONDS=$((SECONDS + 1)); }; '
@@ -780,6 +839,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         _ = cases["above floor"].write_text("MemAvailable: 13631488 kB\n")
         for name, meminfo in cases.items():
             with self.subTest(name=name):
+                self.admission.allow_next_start()
                 result = subprocess.run(
                     ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
                     env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),
@@ -883,6 +943,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(self.records()[-1]["mem_wait_s"], 0)
 
     def test_unscoped_step_waits_for_memory(self) -> None:
+        self.admission.configure(**{"program_first_peak_gib.cargo": 9})
+        _ = self.admission.occupy_host()
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
         marker = self.base / "step-started"

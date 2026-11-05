@@ -30,9 +30,9 @@ class EditorScopeTests(unittest.TestCase):
             self.assertEqual(idle.bytes, 0)
             self.assertEqual(sum(step.bytes for step in measured), 4 * gate.GIB)
             decision = gate.decide(60 * gate.GIB, 60 * gate.GIB, 18 * gate.GIB, [row.measured for row in inputs.running],
-                                   limits=gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB))
-            self.assertEqual(decision.charged, 4 * gate.GIB)
-            self.assertFalse(decision.budget_passes)
+                                   limits=gate.AdmissionLimits(3 * gate.GIB))
+            self.assertEqual(decision.charged, 0)
+            self.assertEqual(decision.room, gate.RoomCheck(18 * gate.GIB, 57 * gate.GIB, True, basis=gate.Fits()))
             self.assertFalse(fixture.server.waiters)
             self.assertFalse(fixture.server.reservations)
             self.assertEqual(fixture.history(), [])
@@ -50,8 +50,8 @@ class EditorScopeTests(unittest.TestCase):
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
             decision = gate.decide(60 * gate.GIB, 60 * gate.GIB, 18 * gate.GIB, [row.measured for row in inputs.running],
-                                   limits=gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB))
-            self.assertTrue(decision.budget_passes)
+                                   limits=gate.AdmissionLimits(3 * gate.GIB))
+            self.assertEqual(decision.room, gate.RoomCheck(18 * gate.GIB, 57 * gate.GIB, True, basis=gate.Fits()))
 
 
 if __name__ == "__main__":
