@@ -227,7 +227,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 #### As-built
 
 - `test_fast_track.py` calls the CLI in-process where a test does not check the process boundary, and starts Git directly where no interruption fixture is needed. Same-load pairs (load 40-73): 304 s to 193 s wall, 202 s to 110 s CPU. Half was not reached; the floor is 55 tests at about 3.5 s each of real Git work. The architecture proposal (one injected Git runner in `fast_track.py`) went to the showrunner.
-- The Git hang guard script forks a watcher that moves to its own process group and stops the Git group through `send_process_group`, loaded by path (the script runs with `-S`).
+- The Git hang guard (`GIT_HANG_GUARD`) runs Git under `timeout -s KILL`, which moves Git to its own process group and kills that group at the deadline. Since Phase 33 only `test_git_wrappers_stop_a_blocked_hook` installs it; the other wrappers start Git directly in the module's process group.
 - `cli_fixture.py` adds the `@process_boundary` mark and `process_boundary_for_case()`. The fixtures that kept one named test as a process now read the mark from the test method.
 
 **Files:**
@@ -769,7 +769,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - Starting `scripts/build_hold/cargo`, the BRP launch hook and `scripts/lint/lint` through `py` in this phase: outside its scope; a next item after the PYTHONPATH item.
 
-### Phase 33 — `test_fast_track.py` runs in half its time  · status: todo
+### Phase 33 — `test_fast_track.py` runs in half its time  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -784,7 +784,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
    - 4,627 Git calls take 118.6 s in the test process. 22 fast-track CLI runs take 105.5 s, with their own Git work.
    - What grew since Phase 7: the Phase 7 repair added 5 tests and a Python watchdog for each Git call. 3,612 watchdog starts take a median of 38.3 ms each; a shell watchdog takes 13.8 ms.
    - Sleeps take 15.2 s, mostly subprocess deadline polls. The blocked-hook test waits for two 5 s deadlines by design.
-   - Change: `GIT_HANG_GUARD` in `test_fast_track.py` becomes a bash job-control guard with the same deadline and the same process-group kill. `merge_checkpoint_test_support.py` does not change.
+   - Change (as shipped): `GIT_HANG_GUARD` runs Git under `timeout -s KILL`, and only `test_git_wrappers_stop_a_blocked_hook` installs it. The other wrappers start Git directly. `merge_checkpoint_test_support.py` does not change.
    - Production proposals (Spec step 3): repeated `rev-parse` (898), `update-ref` (777) and `cat-file` (283) calls around `fast_track.reconcile`; 403 fetches through `copies.py` remote refresh; the Phase 7 injected Git runner.
 2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
 3. A cut in `fast_track.py` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase. The Phase 7 proposal (one injected Git runner in `fast_track.py`) is already with the showrunner.
@@ -799,7 +799,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `impl` — all files above
 
 **Constraints from prior phases:**
-- Phase 7: `test_fast_track.py` calls the CLI in-process where a test does not check the process boundary. `cli_fixture.py` `@process_boundary` keeps a named test as a process. The Git hang guard script forks a watcher in its own process group.
+- Phase 7: `test_fast_track.py` calls the CLI in-process where a test does not check the process boundary. `cli_fixture.py` `@process_boundary` keeps a named test as a process. The Git hang guard runs Git under `timeout -s KILL` and is installed only by `test_git_wrappers_stop_a_blocked_hook` (Phase 33).
 - Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
 - Phase 31: the manual admission clock advance is a workaround (showrunner ruling); queue-unit fixes the start spacing in the shared admission fixture. Do not advance the admission clock by hand.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
