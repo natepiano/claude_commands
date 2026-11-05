@@ -1678,7 +1678,7 @@ The Darwin process snapshot runs only when an agent process is present.
 **Gotchas:** An inherited environment id does not prove the current conversation; an unregistered Codex descendant remains unknown.
 **Ruled out:** A second ancestry walk in `session_staff.py`.
 
-### Phase 5b — The saved layout binds rows from the native process scan  · status: todo
+### Phase 5b — The saved layout binds rows from the native process scan  · status: done
 
 **Depends on:** 4e (native runtime ids select rows).
 
@@ -1697,6 +1697,7 @@ The Darwin process snapshot runs only when an agent process is present.
 **Files:**
 - `scripts/herdr/herdr.py` — `record_layout` uses `_row_panes`.
 - `scripts/herdr/test_herdr.py` — the regression tests; update fakes that set only `agent_session` to give native process info.
+- `scripts/herdr/test_herdr_sessions.py` — its fake herdr answers `pane process-info`, so a launch that saves the layout prints no unknown-evidence line.
 
 **Workers:** `1 writer` — one slot owns both files.
 
