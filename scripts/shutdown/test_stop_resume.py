@@ -26,6 +26,7 @@ from scripts.shutdown import restart, stop_resume
 from scripts.shutdown.stop_results import ClaudeStartState
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.shutdown.inventory import PausedSeat
 import herdr
 import pane_record
@@ -392,11 +393,12 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr, "repository_root", return_value=self.root))
         _ = self.enterContext(patch.object(herdr, "repository_trust_key", return_value=self.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
+            "HOME": str(self.root),
             "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
         })))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="agents"))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
