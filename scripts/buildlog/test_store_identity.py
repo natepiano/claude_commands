@@ -78,6 +78,8 @@ check.assertIs(packaged, bare)
 check.assertNotIn("scripts.buildlog", sys.modules)
 import sweep
 check.assertIs(sweep.store, sys.modules["store"])
+check.assertNotIn("scripts.buildlog.store", sys.modules)
+import scripts.buildlog.store
 ''')
 
     def test_index_import_outside_the_repository_preserves_store_identity(self) -> None:

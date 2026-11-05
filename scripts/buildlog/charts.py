@@ -10,10 +10,13 @@ import sqlite3
 import sys
 import webbrowser
 from collections import defaultdict
+from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from enum import StrEnum
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import costs
@@ -21,6 +24,12 @@ import index
 import moments
 from user_zone import user_zone
 from costs import CostUnavailable as CostUnavailable
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..review_links import review_link
+else:
+    from scripts.review_links import review_link
 
 
 @dataclass(frozen=True)
@@ -233,6 +242,27 @@ def publish(series: ChartSet, path: Path) -> None:
     _ = temporary.replace(path)
 
 
+def local_display(environ: Mapping[str, str], platform: str) -> bool:
+    if "SSH_CONNECTION" in environ:
+        return False
+    return platform == "darwin" or bool(environ.get("DISPLAY") or environ.get("WAYLAND_DISPLAY"))
+
+
+def present_page(series: ChartSet, path: Path, no_open: bool) -> int:
+    try:
+        publish(series, path)
+        url = review_link.snapshot([path])[0]
+    except review_link.SNAPSHOT_ERRORS as error:
+        reason = " ".join(str(error).splitlines())
+        print(f"buildlog charts: publication failed: {reason}", file=sys.stderr)
+        return 1
+    print(url)
+    if not no_open and local_display(os.environ, sys.platform):
+        with suppress(OSError, webbrowser.Error):
+            _ = webbrowser.open(url)
+    return 0
+
+
 def main(args: list[str]) -> int:
     from number_option import positive_window
 
@@ -254,14 +284,7 @@ def main(args: list[str]) -> int:
     finally:
         connection.close()
     path = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home()/".cache")))/"buildlog/charts/latest.html"
-    publish(series, path)
-    print(path)
-    if not no_open:
-        try:
-            _ = webbrowser.open(path.resolve().as_uri())
-        except webbrowser.Error:
-            pass
-    return 0
+    return present_page(series, path, no_open)
 
 
 PAGE = r'''<!doctype html>

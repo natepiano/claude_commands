@@ -52,10 +52,11 @@ def cargo_home_folder(cwd: str, environment: Mapping[str, str]) -> str:
 
 def cargo_folder_settings(argv: list[str], cwd: str, environment: Mapping[str, str], *,
                           policy: CargoConfigPolicy = CargoConfigPolicy.COMPATIBLE) -> dict[str, CargoFolderSetting]:
-    """Apply config, environment, and CLI precedence to Cargo folder settings.
+    """Apply Cargo precedence to folder settings under both policies.
 
-    Sweep keeps its existing legacy and override support. The recorder uses
-    current config files and records invalid config as unresolved.
+    Read config files, then CARGO_BUILD_TARGET_DIR and CARGO_BUILD_BUILD_DIR, then CLI config.
+    Apply CARGO_TARGET_DIR next, then the first --target-dir argument.
+    Strict mode reads current config files and raises for invalid or unreadable CLI config.
     """
     strict = policy is CargoConfigPolicy.CURRENT_STRICT
     settings: dict[str, CargoFolderSetting] = {}
@@ -89,17 +90,19 @@ def cargo_folder_settings(argv: list[str], cwd: str, environment: Mapping[str, s
     for config in configs:
         legacy = config / "config"
         read_config(legacy if not strict and legacy.is_file() else config / "config.toml")
-    for key, variables in (("target-dir", ("CARGO_BUILD_TARGET_DIR", "CARGO_TARGET_DIR")),
-                           ("build-dir", ("CARGO_BUILD_BUILD_DIR",))):
-        for variable in variables:
-            if environment.get(variable):
-                settings[key] = CargoFolderSetting(environment[variable], directory)
-    if not strict:
-        for setting in cargo_config_values(argv):
-            if "=" in setting:
-                read_settings(setting, directory)
-            else:
-                read_config(directory / setting)
+    for key, variable in (("target-dir", "CARGO_BUILD_TARGET_DIR"), ("build-dir", "CARGO_BUILD_BUILD_DIR")):
+        if environment.get(variable):
+            settings[key] = CargoFolderSetting(environment[variable], directory)
+    for setting in cargo_config_values(argv):
+        if "=" in setting:
+            read_settings(setting, directory)
+        elif strict:
+            path = directory / setting
+            read_settings(path.read_text(), path.parent.parent)
+        else:
+            read_config(directory / setting)
+    if environment.get("CARGO_TARGET_DIR"):
+        settings["target-dir"] = CargoFolderSetting(environment["CARGO_TARGET_DIR"], directory)
     named = cargo_path_argument(argv, "--target-dir")
     if named:
         settings["target-dir"] = CargoFolderSetting(named, directory)
