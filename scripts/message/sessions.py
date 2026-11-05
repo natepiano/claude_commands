@@ -302,8 +302,6 @@ def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | Sess
             observed = process_liveness(registered["pid"], registered.get("procStart", ""))
             if not isinstance(observed, SessionNotLive):
                 yield observed
-    if registry.unreadable:
-        yield SessionLivenessUnknown("unreadable session registry record: " + registry.unreadable[0].name)
 
 
 def session_liveness(session_id: str) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:

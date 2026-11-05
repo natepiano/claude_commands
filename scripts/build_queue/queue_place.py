@@ -216,20 +216,9 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
     raise QueuePlaceRefused("the program did not enter its memory scope")
 
 
-def scope_members(scope: Path) -> set[int]:
-    """Read current scope members, including members of nested scopes."""
-    members: set[int] = set()
-    for path in scope.rglob("cgroup.procs"):
-        try:
-            members.update(int(pid) for pid in path.read_text().split())
-        except FileNotFoundError:
-            continue
-    return members
-
-
 def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
     """Stop scope members until the scope is empty."""
-    while members := scope_members(scope):
+    while members := memory_admit.scope_members(scope):
         number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
         killed_scope = False
         if number == signal.SIGKILL:
@@ -254,7 +243,7 @@ def program_members(tree: ProgramTree, sidecar: Path) -> dict[int, str]:
     try:
         scope = sidecar.read_text().strip()
         if scope:
-            members = scope_members(Path(scope))
+            members = memory_admit.scope_members(Path(scope))
     except FileNotFoundError:
         pass
     return tree.live_members(members)
@@ -336,11 +325,9 @@ class QueuePlace:
             try:
                 scope = self.sidecar.read_text().strip()
                 if scope:
-                    stat = Path(scope) / "memory.stat"
-                    memory_admit.check_memory_reading(stat)
-                    anon = next(int(line.split()[1]) for line in stat.read_text().splitlines()
-                                if line.startswith("anon "))
-                    self.observe(anon, anon)
+                    reading = memory_admit.slice_working_set(Path(scope))
+                    if isinstance(reading.anonymous, memory_admit.AnonymousRunUse):
+                        self.observe(reading.anonymous.bytes, reading.anonymous.bytes)
                 elif isinstance(tracking, ProgramTree):
                     members = program_members(tracking, self.sidecar)
                     proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
