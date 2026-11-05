@@ -220,36 +220,24 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - A per-class recorder seed for the assign launcher tests (F025): it gained about 4%, so simple wins (showrunner ruling).
 
 ### Phase 7 — The fast-track module and the next live slow module run in half their time  · status: done
-**Depends on:** none (its two modules share no file with Phase 6; each baseline is its own gate median and an idle-host run, so Phase 6 need not land first)
+**Depends on:** none
 
-**Result:** half was not reached. Same-load pairs (3 rounds, load 40-73): `test_fast_track.py` 304 to 193 s wall, 202 to 110 s CPU. Its floor is 55 tests at about 3.5 s each, from real Git work; the architecture proposal went to the showrunner. `test_crate_run.py`: a per-class seed gave no gain under the same load (128 to 126 s) and was removed.
+#### As-built
 
-#### Work Order
-
-**Goal:** `production/test_fast_track.py` (median 296 s of its last 5 gate runs, 188 s CPU) and `style/test_crate_run.py` (median 178 s, 63 s CPU; the slowest live module of `test_times top` that no phase owns, 2026-11-04) each run in at most half their baseline wall time, with no CPU increase and no lost coverage.
-
-**Spec:** apply the speed method (Delegation Context) to each module. Each writer owns one module. `MergeCheckpointFixture.setUpClass` (`scripts/production/merge_checkpoint_test_support.py:262`) already builds one seed for each class and copies it for each test. Find the cost from the timings.
+- `test_fast_track.py` calls the CLI in-process where a test does not check the process boundary, and starts Git directly where no interruption fixture is needed. Same-load pairs (load 40-73): 304 s to 193 s wall, 202 s to 110 s CPU. Half was not reached; the floor is 55 tests at about 3.5 s each of real Git work. The architecture proposal (one injected Git runner in `fast_track.py`) went to the showrunner.
+- The Git hang guard script forks a watcher that moves to its own process group and stops the Git group through `send_process_group`, loaded by path (the script runs with `-S`).
+- `cli_fixture.py` adds the `@process_boundary` mark and `process_boundary_for_case()`. The fixtures that kept one named test as a process now read the mark from the test method.
 
 **Files:**
-- `scripts/production/test_fast_track.py` — speed edits
-- `scripts/style/test_crate_run.py` — speed edits (the second module)
-- `scripts/production/merge_checkpoint_test_support.py` — read; edit only under speed method step 4
+- `scripts/production/test_fast_track.py` — speed edits and the hang guard
+- `scripts/production/cli_fixture.py` — the process-boundary mark
+- `scripts/production/merge_checkpoint_test_support.py`, `rename_test_support.py`, `scripts/direct/findings_test_support.py`, `scripts/bevy_upgrade/cli_test_support.py`, `scripts/style/style_plan_test_support.py` — read the mark; one importer test of each marks its process case
 
-**Workers:** 2 writers — one module each; there is no new test to write before the code
-- `impl` — `scripts/production/test_fast_track.py`; hub: `scripts/production/merge_checkpoint_test_support.py`
-- `test` opens as impl — `scripts/style/test_crate_run.py`
+**Gotchas:**
+- `lib/test_process_group.py` also scans script text held in strings: a group signal there goes through `send_process_group`, from a process outside the target group.
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 5: the speed phases run one after another, so each baseline is measured on the tree the last one left.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_fast_track.py'` and the second module green
-- `python3 -m unittest discover -s scripts/lib` green
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
-- Each module's (or group's) after median `wall_s` is at most half its before median, or the phase report names the measured floor and the proposal sent; its `cpu_s` median is not higher
-- The checkpoint gate is green, with the importers of each changed support file in it
+**Ruled out:**
+- A per-class seed for `test_crate_run.py`: no gain under the same load (128 s to 126 s).
 
 ### Phase 8 — The test history tool starts without the merge gate module  · status: done
 
