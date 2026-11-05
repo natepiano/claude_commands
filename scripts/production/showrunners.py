@@ -9,7 +9,6 @@ from time import monotonic
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping
@@ -21,6 +20,7 @@ from typing import NamedTuple, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.lib.atomic_file import write_bytes_atomic
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -52,7 +52,7 @@ class Showrunner(TypedDict):
     slug: str
     # The user's zone setting. A production doc's own User zone line is no longer read.
     zone: str
-    # The production doc, whose Units table says which units the showrunner has.
+    # The production doc. The staff rows whose parent is this showrunner are its units.
     doc: str
 
 
@@ -411,9 +411,9 @@ def production_slug(doc: str) -> str:
     return slug
 
 
-def session_state_dir(slug: str) -> Path:
+def session_state_dir(staff_id: str) -> Path:
     """The showrunner's own state, which a new session id, a restart and a reboot keep; a wrap deletes it."""
-    return SHOWRUNNER_STATE_DIR / slug / "session"
+    return SHOWRUNNER_STATE_DIR / staff_id / "session"
 
 
 # The showrunner state a scratchpad held before session_state_dir.
@@ -421,26 +421,25 @@ SESSION_STATE = ("dailies_input_state", "unit_status", "showrunner_state.json", 
                  "dailies_state.json")
 
 
-def copy_session_state(slug: str, scratch: Path) -> list[str]:
-    """Copy each state file the scratchpad holds and the state directory does not; a copy never replaces one."""
-    target = session_state_dir(slug)
-    target.mkdir(parents=True, exist_ok=True)
+def copy_session_state(staff_id: str, scratch: Path) -> list[str]:
+    """Copy missing scratchpad files to the fixed owner's session folder."""
+    target = session_state_dir(staff_id)
     copied: list[str] = []
     for name in SESSION_STATE:
         source, destination = scratch / name, target / name
-        if destination.exists() or not source.exists():
+        if not source.exists():
             continue
-        complete = target / f".{name}.copying"
-        if complete.is_dir():
-            shutil.rmtree(complete)
-        else:
-            complete.unlink(missing_ok=True)
-        if source.is_dir():
-            _ = shutil.copytree(source, complete)
-        else:
-            _ = shutil.copy2(source, complete)
-        os.replace(complete, destination)
-        copied.append(name)
+        files = sorted(source.rglob("*")) if source.is_dir() else [source]
+        changed = False
+        for file in files:
+            if not file.is_file():
+                continue
+            path = destination / file.relative_to(source) if source.is_dir() else destination
+            if not path.exists():
+                write_bytes_atomic(path, file.read_bytes())
+                changed = True
+        if changed:
+            copied.append(name)
     return copied
 
 
@@ -457,17 +456,13 @@ def timer_scratch(slug: str) -> Path | None:
                  if path.is_dir()), None)
 
 
-def adopt_session_state(slug: str) -> list[str]:
-    """Bring a showrunner's scratchpad state into its state directory once, with no step by anyone.
-
-    Only the state files the directory lacks are looked for, so a showrunner that has moved costs one
-    stat per file.
-    """
-    target = session_state_dir(slug)
+def adopt_session_state(slug: str, staff_id: str) -> list[str]:
+    """Copy missing scratchpad state to the fixed owner's folder."""
+    target = session_state_dir(staff_id)
     if all((target / name).exists() for name in SESSION_STATE):
         return []
     scratch = timer_scratch(slug)
-    return copy_session_state(slug, scratch) if scratch is not None else []
+    return copy_session_state(staff_id, scratch) if scratch is not None else []
 
 
 def former_slugs(text: str) -> tuple[str, ...]:

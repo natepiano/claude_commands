@@ -26,8 +26,11 @@ import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import CodexHomeSource, Quota, Report
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
+from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib import models_registry
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import fixture_member, fixture_worker
+from scripts.shutdown import stop_resume
 from scripts.whoami import usage_store
 from push_texts import RenderedPush, catalog, render_entry
 from user_action import ActionRequired
@@ -67,8 +70,10 @@ class CodexAccountAlertTests(unittest.TestCase):
             "CODEX_CONFIG_FILE": str(self.root / "absent"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "absent"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "synced"),
+            "STAFF_FILE": str(self.root / "staff.json"),
         })))
         (self.root / "synced").touch()
+        _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         config = self.root / "showrunners.json"
@@ -82,7 +87,6 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = self.enterContext(patch.object(quota_alert, "recipients", return_value=["director"]))
         _ = self.enterContext(patch.object(quota_alert, "relay", side_effect=self.relay))
         _ = self.enterContext(patch.object(quota_alert, "tell_user", side_effect=self.push))
-        _ = self.enterContext(patch.object(accounts, "_retire_workers_servers", return_value=[]))
         _ = self.enterContext(patch.object(accounts, "_codex_live", side_effect=self.live_for_swap))
 
     def live_for_swap(self, home: Path) -> Report:
@@ -99,6 +103,23 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.pushes.append(push)
         self.sent.append(push.body)
         return quota_alert.PushSent()
+
+    def test_selected_codex_reading_uses_the_account_usage_age(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        original = config.read_text()
+        identity = agent_accounts.KnownCodexAccount(self.root / ".codex2", "fixture", "codex2")
+        report = Report("Codex", email=identity.login)
+        readings = quota_alert.CodexAlertPassReadings(
+            accounts.CodexWorkersAccount(identity.label, identity.home), identity,
+            (quota_alert.CodexHomeReading(identity.home, report, self.now - timedelta(minutes=6)),))
+        for age in (5, 7):
+            _ = config.write_text(original.replace("usage_stale_minutes=10", f"usage_stale_minutes={age}"))
+            with self.subTest(age=age):
+                selected = quota_alert.selected_codex_report(readings, self.now)
+                if age == 5:
+                    self.assertEqual(selected.problem, "the selected account's current reading is unknown")
+                else:
+                    self.assertIs(selected, report)
 
     def test_fresh_room_after_a_weekly_refusal_is_picked_without_a_later_reset(self) -> None:
         target, source = self.account(1), self.account(2)
@@ -374,6 +395,16 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertEqual(swap.call_count, 1)
         self.assertEqual(agent_accounts.workers_home(), target.home)
         self.assertIn("direct=codex", registry_view())
+
+    def test_unreadable_next_list_reports_an_anomaly_without_losing_its_entry(self) -> None:
+        entry = next_moves.add_next_move("workers", 1, "codex2")
+        output = io.StringIO()
+        with (patch.object(next_moves, "read_next_moves", side_effect=OSError("fixture unreadable")),
+              redirect_stdout(output)):
+            self.assertFalse(quota_alert.workers_entry_pending())
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        self.assertEqual(output.getvalue().splitlines(),
+            ["account moves: anomaly: cannot read workers entries: fixture unreadable"])
 
     def test_unreadable_workers_journal_preserves_queue_and_roles_and_blocks_fallback_reminders(self) -> None:
         source, target = self.account(1), self.account(2)
@@ -1053,17 +1084,21 @@ class CodexAccountAlertTests(unittest.TestCase):
 
     def test_live_paid_only_destination_keeps_workers_on_source_credits_and_alerts_once(self) -> None:
         source, target = self.account(1), self.account(2)
+        owner = fixture_member("showrunner", name="alert-owner")
+        unit = fixture_member("unit", name="alert-unit", parent=owner.id,
+            worktree=staff.PresentWorktree("natedev", self.root))
+        _ = fixture_worker("alert-review", unit.id, backend=staff.CodexBackend(source.home))
         for number in (1, 2):
             note = self.note(number, "active" if number == 1 else "inactive", 0, "6370")
             _ = note.path.write_text(note.path.read_text().replace("credit_balance:",
                 "use_credits: on\ncredit_balance:"))
         readings = self.readings(source, self.report(source, 0, "6370"), self.report(target, 1, "6370"))
         with (patch.object(accounts, "_codex_live", return_value=self.report(target, 0, "6370")) as live,
-              patch.object(accounts, "_retire_workers_servers") as retire):
+              patch.object(stop_resume, "stop") as stop):
             for minute in (0, 2):
                 _ = quota_alert.alert([], self.now + timedelta(minutes=minute), codex_readings=readings)
             self.assertGreater(live.call_count, 0)
-            retire.assert_not_called()
+            stop.assert_not_called()
         self.assertEqual(agent_accounts.workers_home(), source.home)
         self.assertEqual(len(self.pushes), 1)
         self.assertEqual(self.pushes[0].id, "quota.paid_credits")

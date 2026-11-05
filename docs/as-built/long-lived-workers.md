@@ -119,7 +119,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 - Without `--to`, it opens a new worker named by `worker_name.sh`. After the turn it writes the worker's identity file.
 - With `--to`, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
-  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, worker_id}` for this launch, with `worker_id` the thread id. The saved `model` is retained for compatibility with old identity files; it does not select a turn's model or effort. Each turn uses an explicit override or the current role default. A mismatch fails with `has no matching durable worker identity`. A missing file with a roster thread for the name is not a mismatch: the claim writes the identity from the roster and continues. That resumes a reopened worker, and a fix worker of a run from before 2026-10-17, whose record the impl worker's replaced. A worker recorded under another slot is still refused.
+  1. Finds the saved identity through its `staff_id`. A new identity uses `impl_worker_<slot>.json`. The compatibility launcher uses `impl_worker_fix.json` for a repair in the `impl` slot. Named `assign.sh` workers use their names as new slots. The saved model does not select the next turn's model. Each turn uses an explicit override or the current role default. A missing identity is created from the roster. A worker recorded under another slot is refused.
   2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
   3. If the roster's `context_tokens` is an integer greater than `UNIT_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On exit 4 (the roster changed during compaction) it refuses the follow-up and advises inspection and same-thread `reopen` when idle. On other failures it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
@@ -130,7 +130,15 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 **Code review dispatch.** Use `assign.sh --role review --session-dir <run>
 --phase <phase> --prompt <file> --cwd <worktree>`. Each broad-review lens has
-its own dispatch; closure review omits the lens. The returned handle names its
+its own dispatch; closure review omits the lens.
+Each artifact uses the worker name: `<worker>_status`, `<worker>_summary.txt`,
+`<worker>_agent.log`, and `<worker>_reply.txt`.
+Reviews add `_<lens>_<pass>`, or `_<pass>` without a lens.
+The launcher claims the worker before it writes these artifacts.
+A refused claim leaves the artifacts unchanged.
+Use `arm-review --worker <worker>` for an early named reviewer.
+Its marker reads `<worker>_status_<lens>` and `<worker>_pid_<lens>`.
+Legacy `review.sh` markers retain their `review` prefix. The returned handle names its
 status, log and summary. The allocator uses `review`, then `review2` when the
 first worker is busy. Both threads stay read-only.
 
@@ -200,11 +208,9 @@ selects a private root). On first ledger binding, a production unit's run
 saves explicit production and unit fields in `progress_history_state.json`.
 Plan headers accept both Production forms and resolve former production names.
 Later reads use the saved identity, so moving a worktree does not change owners.
-`rename.py unit` also repoints run worktree and plan paths and worker roster
-launch paths, while keeping paused threads and Codex homes. For older moves,
-use `rename.py repair-workers <production> [--dry-run]`. It matches current
-Units rows with saved run or worker paths even without journaled moves, and
-skips ambiguous unit matches; see `production-rename.md`.
+`rename_unit.py` changes the unit row and repairs its session and display names.
+An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
+See `unit-rename.md`.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 
@@ -339,14 +345,19 @@ Role IDs are `<design_id>/designer` and `<design_id>/reviewer`. Instance names a
 | `end <instance>` | `end` | End one role. When no role of the design stays open, it also stops the design mesh server and writes `end-server-release.json`; a failed stop leaves the role `RoleNeedsRecovery`. |
 | `unbind-run <run>` | `unbind_run` | Unbind every design bound to that run. |
 | `list [--json]` | `list_roles` | Default: one plain line per role with instance ID, role, lifecycle state, holder, holder session or unavailable reason, thread ID when present, and document; `no held roles` when empty, then one line per problem. `--json`: the full local roles and problems dict, with `transition.json`, move marker and failed status mapped to recovery/paused states; no network calls. |
-| `register --repository --host --checkout [--inventory-complete]` | `register_repository` | Register a repository with the authority. |
+| `register --repository --host --checkout` | `register_repository` | Register a repository with the authority. |
 | `authority <operation>` | `_authority_local` | Run one authority operation from JSON on stdin; refuses on a host that is not the authority. |
 
 Other public functions: `queue_message`, `pending_messages`, `held_document`, `end_holder`, `check_patch`, `rename_holder`, `rename_failures`, `move_holder`, `holder_failures`, `transfer_route`, `durable_meshes`, `resolve_holder`, `resolve_model`, `access_policy`, `refresh_census`, `authority_request`.
 
-**Ownership authority.** `config/design_roles.conf` pins `[ownership] host=natedev` (override file: `DESIGN_ROLES_CONFIG`; local host: `DESIGN_ROLES_HOST`, else the short hostname). `authority_request` runs locally on that host, else over `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> … design_roles.py authority <op>` with a 30 s limit; failure is `RoleRefused('ownership authority unavailable: …')`. Only the authority writes `DESIGN_OWNERSHIP_STATE`, else `~/.local/state/astra/design-ownership/`: `repositories.json` (ID to per-host absolute checkouts and `inventory_complete`) and `placements/<sha256(repository_id \0 relative document)>.json`. Operations: `register`, `reserve`, `lookup`, `advance` (generation +1 on the placement and its aliases), `checkout` (move a host's checkout mapping), `alias`, `legacy` (record `adoption_required`), `adopt-reserve`, `adopt-commit`. Every operation except `register` refuses until `inventory_complete` is true, and refuses a host with no explicit checkout mapping or a document outside it. A placement on another host refuses: the pair always lives on its holder's host. `[roles] new_open=false` makes `open_role` and `adopt` refuse and keeps every existing identity.
+**Ownership authority.** `config/design_roles.conf` pins `[ownership] host=natedev`. `DESIGN_ROLES_CONFIG` overrides the configuration file. `DESIGN_ROLES_HOST` overrides the local host; otherwise, the short hostname applies. `authority_request` runs locally on the authority host. Other hosts use `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> … design_roles.py authority <op>` with a 30 s limit. Failure raises `RoleRefused('ownership authority unavailable: …')`. Only the authority writes `DESIGN_OWNERSHIP_STATE`, which defaults to `~/.local/state/astra/design-ownership/`. `repositories.json` maps repository IDs to absolute checkout paths for each host. `placements/<sha256(repository_id \0 relative document)>.json` stores placements. Operations are `register`, `reserve`, `lookup`, `advance`, `checkout`, `alias`, `legacy`, `adopt-reserve`, and `adopt-commit`. `advance` increases the generation for the placement and its aliases. `checkout` changes a host's checkout mapping. `legacy` records `adoption_required`. Operations except `register` refuse a host without an explicit checkout mapping or a document outside that checkout. A placement on another host refuses. Both roles remain on the holder's host. `[roles] new_open=false` makes `open_role` and `adopt` refuse and keeps every existing identity.
 
-**Authorization.** `_authorize` requires placement host = local host, a live holder from `resolve_holder` (unit holder: `unit_lookup.every_marked_unit` with a `LiveClaude`; showrunner holder: `production_tree.showrunner_sessions` and `sessions.running_sessions`), and `CLAUDE_CODE_SESSION_ID` equal to that session. A missing or ambiguous holder blocks dispatch but does not change the holder.
+**Authorization.** `_check_host` requires the design host to equal the local host.
+`worker_parent` reads the helper's worker row from the staff record.
+The worker row's `parent` identifies the current holder.
+`worker_parent` refuses if the worker or its parent is unavailable.
+The design record stores no holder identity.
+A different caller can resume the role.
 
 **Models.** `resolve_model(role)` sources `scripts/agents/models_config.sh` and runs `agents_resolve "design_roles.<role>"`; the family must be `codex`. `config/models.conf` has `[assignments] design_roles=codex` and `[design_roles.codex] designer=astra:xhigh`, `reviewer=astra:xhigh` (the `astra` word resolves to `gpt-6-astra`). A missing or invalid row refuses; there is no fallback model.
 
@@ -366,7 +377,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 | Account move | `retire_workers_servers` adds `design_roles.durable_meshes()` and takes the holder from `design_context.json`. A running role gets the move marker before interruption (`_interrupt_worker_for_account_move`); an idle one has its queue parked and its thread released. `command_resume_account_move` reads the saved header and writes to its `reply_path`. `list` shows `RolePausedForMove` while the marker exists. `accounts.py` `_swap_workers` needs no held-role code. |
 | Crash or uncertainty | `recover` refuses while the launcher pid lives, resumes the recorded thread on the mesh server, requires the same thread ID and `ThreadIdle`, then sets `RoleOpen` and clears the claim. A resume that cannot keep the same thread gives `RoleNeedsRecovery`; no replacement thread starts. |
 | End | Holder only, idle, not during an adoption. Write `transition.json`, run `codex_mesh.py end`, then require `held_thread_end_confirmed(session_dir, thread_id)`: every recorded live server shows the thread idle or unloaded. Unconfirmed gives `RoleNeedsRecovery` with the roster end marker kept. Confirmed sets `RoleEnded` and releases the census hold. Evidence stays. |
-| Retire | `retire_unit.py` `retire` calls `design_roles.end_holder(production, unit)` after the unit's sessions stop; only the production showrunner's session may run it; each open role must be idle. A failure leaves the unit not retired. |
+| Retire | `retire_unit.py` stops the unit and its staff worker rows through each row's `current_session`. It does not scan held-role records. |
 
 **Pending messages.** `codex_mesh.py send` to a held entry calls `design_roles.queue_message` and prints `queued for <name>; holder adds it to the next authorized assignment`. `mesh_runs.py` queues a held role's detached result with a stable `uuid5` ID and source `mesh_runs:<run_id>`, following a `transfer_route` to the adoption destination. Nothing wakes the role. `commands/message.md` and `codex/AGENTS-messaging.md` `<HeldRoleMessages>` state the same rules for senders.
 
@@ -380,9 +391,13 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 
 **Adoption.** `adopt` needs the authority's `adoption_required` source (`thread_id`, `name`, `mesh`, holder) to match. Steps: first the checks that change no authority state: the binding, the configured model, and the source entry, which must be idle on that thread (a `paused` entry counts as idle when `paused_from` is not busy). The source model and effort come from the roster entry; when it has none, from that thread's launch record (`impl_worker_<slot>.json` with the same `worker_id`, then the `phases/*/impl_agent_<slot>` file whose log names the worker and thread), and last from the source server's `thread/read` reply. Missing, conflicting or different values refuse with `AdoptionRequired:`. A refused adopt therefore leaves no `AdoptionReserved` claim. Then `adopt-reserve`; check the source entry again under its roster lock; write `transition.json` and `transfer.json` and set `transferring_role` on the source entry under its roster lock; on the source server park the queue, require `ThreadIdle` and release the writer; write the destination roster entry (same thread and name, saved prompt, access policy) and carry pending text; `confirm_adoption` resumes the same thread on the destination and requires `ThreadIdle`; set `role_redirect` on the source; write `adoption.json`; `adopt-commit`; write the hold. A retry with the same adoption ID completes from `adoption.json`. `_role_fence` and `transfer_route` make every old route refuse (`TransferringRole: use the destination holder route`), also after the source run folder is gone.
 
-**Unit rename.** `rename_unit.py` `_move_state` calls `design_roles.rename_holder(slug, old, new, old_worktree, new_worktree)` before relaunch: idle required, authority `checkout` then `advance`, holder, checkout, document and binding paths moved, generation +1, `design_context.json` rewritten, roster `cwd` set and `authorized_*` cleared. A failure raises `RenameRefused`; the rename journal retries it. `_state_failures` adds `design_roles.rename_failures`, which flags an old holder, old checkout in live fields or roster `cwd`, or a stale context. `unit_rename_sweep.py` `_history` treats `prompts/`, `replies/`, `adoption.json` and `transfer.json` as history, and `sweep` ignores role `name` and `aliases` in `design.json` and `aliases` in the roster as identity.
+**Unit rename.** `rename_unit.py` changes the staff row and repairs session, tab, and pane names.
+An explicit folder move uses `unit_move.move_folder` and the staff id.
+Role records retain their staff ids and history.
 
-**Unit transfer and production rename.** `rename_holder` is `move_holder(old_holder, new_holder, old_checkout, new_checkout, reason=...)` for one unit. `move_holder` moves every design held by `old_holder` to `new_holder`; when the checkout does not change, it keeps the repository, document, binding paths and roster `cwd`, and skips the `checkout` request. It writes `transition.json`, releases the servers, bumps the generation and clears `authorized_*`; a second call changes nothing. `holder_failures(old_holder, old_checkout='')` flags an old holder, a stale context and, with a checkout, the old checkout. `transfer_unit.py` `_move_state` moves `UnitHolder(from, unit)` to `UnitHolder(to, unit)` and `verify_failures` adds `holder_failures`. Production `rename.py` moves `ShowrunnerHolder(old)` to `ShowrunnerHolder(new)` in apply step 4, and each `UnitHolder(old, unit)` with its worktree paths in unit step 3. Role names keep the old slug: they are thread aliases, kept as history. A failure raises `RenameRefused`.
+**Unit transfer and production rename.** Staff ids keep design ownership stable across row renames and unit transfers.
+The rename commands change no design holder records.
+Role names remain thread aliases.
 
 ### Astra work header
 
@@ -400,7 +415,8 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - `hold(role, thread_id, codex_home, *, session_dir, worker, pid, manager, design_id, role_id) -> HeldRole`, `release(thread_id)`, `live_roles() -> list[LiveRole]`; CLI `hold`, `release`, `list [--json]`, exit 2 on a refusal.
 - `live_roles` removes a mesh hold whose run folder, roster worker or thread is gone or whose status is `ended`/`failed`, and an exec hold whose pid is gone. A `HeldDesignRole` hold ends only when the durable role is `RoleEnded`; a missing run folder cannot end it. Its `manager` is refreshed to the current holder session. `busy` means status `starting`, `running` or `waiting_capacity` (or a live exec pid). A bad record is one stderr line; other records still return.
 - `astra_review.py` `run_review` holds an `ExecProcess` reviewer during its one-turn `codex exec` when `CLAUDE_CODE_SESSION_ID` is set, after reading `session id:` from `codex.log` (30 s), with `codex_home` from `accounts.py env workers`, and releases in `finally`. For a document with a held design (`design_roles.held_document`), `held_review` sends it to the sole reviewer through `design_roles.resume`; busy or unavailable exits 1 and starts no other reviewer.
-- `scripts/production/production_tree.py --json` keeps schema 1 and adds one `AstraEdge` (`manager`, `member` = thread ID, `role` `astra-designer` | `astra-reviewer`, `codex_home`, `state`) per live hold, and drops the Codex worker edge for that thread.
+- Cargo-handler reads manager relationships and staff names directly from `~/.local/state/staff/staff.json` through `[census] staff_file`.
+- Staff schema 2 supplies the member IDs, parent IDs, kinds, names, and current sessions. The handler reads the file again when it changes.
 - `scripts/message/roster.py` `_durable_roles` adds one Codex entry per open held role (role `astra-designer` / `astra-reviewer`, reach `CannotReceiveMessages`, director or showrunner from the holder), skipping fenced threads. `scripts/agents/mesh_runs.py` `_roster_folders` lists durable meshes.
 - Colors: `config/statusline.conf` `role.astra-designer=mauve`, `role.astra-reviewer=bright-green`.
 
@@ -414,8 +430,8 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - Access comes from the roster `access_policy`, never from the instructions text. Reviews stay `ReadOnlyReviewer`.
 - The berth check covers `apply_patch` only. Designers edit by patch; shell or Python writes are outside the check. Do not copy reservation state into the role store.
 - Role records outlive run folders. Ordinary run cleanup unbinds; it never ends a held role or stops a durable mesh.
-- A census hold is a projection of the durable role, repeatable on the next lifecycle action. Removing it cannot delete a design. `AstraEdge` fields and `production_tree.py` schema 1 stay; cargo-handler reads them.
-- `production_tree.py --json` reads only local records, never prompts, answers well under a second, and drops only the edge it cannot read, with a stderr line.
+- A census hold represents the durable role. The next lifecycle action can restore the hold. Removing the hold cannot delete a design.
+- Cargo-handler reads the staff file directly. It runs no command for the manager tree.
 - A showrunner may hold a read-only role but cannot launch an unbound writer, because no production-design phase exists yet. A writer needs an authorized phase with exact output paths, baseline and reservation.
 - Tests use fixtures and environment overrides (`DESIGN_ROLES_STATE`, `DESIGN_OWNERSHIP_STATE`, `DESIGN_ROLES_CONFIG`, `DESIGN_ROLES_HOST`, `ASTRA_ROLES_STATE`, `ASTRA_REVIEW_DIR`), never real state or a live Codex.
 - Stored stamps are UTC; user-facing times use `scripts/lib/user_zone.py`.

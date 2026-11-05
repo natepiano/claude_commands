@@ -32,11 +32,10 @@ import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
-from scripts.message import send_result
-from scripts.message import send_budget
+from scripts.message import send_result, send_budget, session_send
 from scripts.whoami import note_file
 
-from scripts.lib import models_registry  # noqa: E402
+from scripts.lib import conf, models_registry  # noqa: E402
 
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
@@ -78,7 +77,6 @@ class ReadCurrentCodexReadings:
 
 
 READ_CURRENT_CODEX_READINGS = ReadCurrentCodexReadings()
-CODEX_READING_MAX_AGE = timedelta(minutes=10)
 UNKNOWN_REFUSAL_WINDOW = refusals.UnknownWindow()
 
 
@@ -109,10 +107,11 @@ def resolve_codex_readings(value: CodexAlertPassReadings | ReadCurrentCodexReadi
 def selected_codex_report(readings: CodexAlertPassReadings, now: datetime) -> Report:
     identity = readings.selected_account
     if isinstance(identity, agent_accounts.KnownCodexAccount) and not isinstance(readings.workers, NoWorkersHome):
+        max_age = timedelta(minutes=conf.read("accounts").whole("usage_stale_minutes"))
         for checked in readings.checked_homes:
             if (checked.home == readings.workers.home and checked.home == identity.home
                     and checked.report.email and checked.report.email.casefold() == identity.login.casefold()
-                    and timedelta(0) <= now - checked.observed_at <= CODEX_READING_MAX_AGE):
+                    and timedelta(0) <= now - checked.observed_at <= max_age):
                 return checked.report
     return Report("Codex", problem="the selected account's current reading is unknown")
 
@@ -137,13 +136,14 @@ def reset_display(reset: refusals.KnownReset | refusals.NoResetKnown | accounts.
 
 
 def _save_codex_readings(readings: CodexAlertPassReadings, now: datetime) -> None:
+    max_age = timedelta(minutes=conf.read("accounts").whole("usage_stale_minutes"))
     try:
         with usage_store.read_lock():
             held = usage_store.load()
             changed = False
             for checked in readings.checked_homes:
                 if (not checked.report.problem and not checked.report.quota_problem
-                        and timedelta(0) <= now - checked.observed_at <= CODEX_READING_MAX_AGE):
+                        and timedelta(0) <= now - checked.observed_at <= max_age):
                     if checked.report.email:
                         previous = held.get(usage_store.key("Codex", checked.report.email), {})
                         if "weekly" in previous:
@@ -163,11 +163,12 @@ def _reading_for_account(readings: CodexAlertPassReadings, identity: agent_accou
                          now: datetime) -> refusals.FreshReading | refusals.StaleReading | refusals.NoReading:
     reading = refusals.stored_reading("codex", identity.login, now)
     if isinstance(reading, refusals.FreshReading):
+        max_age = timedelta(minutes=conf.read("accounts").whole("usage_stale_minutes"))
         for checked in readings.checked_homes:
             if (checked.home == identity.home and checked.report.email
                     and checked.report.email.casefold() == identity.login.casefold()
                     and not checked.report.problem and not checked.report.quota_problem
-                    and timedelta(0) <= now - checked.observed_at <= CODEX_READING_MAX_AGE
+                    and timedelta(0) <= now - checked.observed_at <= max_age
                     # The store drops fractions of a second; recover this pass's exact observation time.
                     and reading.weekly.at == checked.observed_at.replace(microsecond=0)):
                 return replace(reading, weekly=replace(reading.weekly, at=checked.observed_at),
@@ -248,7 +249,7 @@ from scripts.production.showrunners import (
 
 Config = ShowrunnerSettings
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
-SEND = Path(__file__).resolve().parent.parent / "message" / "send.py"
+SEND = session_send.SEND_SCRIPT
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
 AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
@@ -256,13 +257,7 @@ AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
 REGISTRY = models_registry.registry_path()
 # The session whose user is shown a switch on their next prompt.
 OWNER = "natedev"
-# These values keep the existing 30-second relay delivery limit.
-# The outer budget uses the configured cleanup grace through send_budget.
-RELAY_TIMEOUT = 40
 KILL_GRACE = 10
-# The whole switch took 2 s of wall time when measured idle and 8 s at load average 87; each entry
-# switched back, 0.4 s idle.
-EDIT_TIMEOUT = 30
 
 
 class Episode(TypedDict):
@@ -737,11 +732,12 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
             return False
         if note is None:
             return False
+        max_age = timedelta(minutes=conf.read("accounts").whole("usage_stale_minutes"))
         for checked in codex_readings.checked_homes:
             report = checked.report
             if (report.email and report.email.casefold() == (note.get("login") or "").casefold()
                     and not report.problem
-                    and timedelta(0) <= now - checked.observed_at <= CODEX_READING_MAX_AGE):
+                    and timedelta(0) <= now - checked.observed_at <= max_age):
                 value, reset = report.weekly_remaining, report.weekly_reset
                 if value is not None and reset is not None and reset > now and value > threshold:
                     return True
@@ -799,6 +795,7 @@ def edit_registry(editor: str, *args: str) -> str | None:
     A timeout stops the process group before the caller reads the result.
     """
     command = ["bash", "-c", f'source "$0" && {editor} "$@"', str(AGENTS), *args]
+    timeout = conf.read("accounts").whole("quota_edit_timeout_seconds")
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY)}, start_new_session=True)
@@ -806,11 +803,11 @@ def edit_registry(editor: str, *args: str) -> str | None:
         return str(error)
     with process:
         try:
-            out, err = process.communicate(timeout=EDIT_TIMEOUT)
+            out, err = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             process_group.send_process_group(process.pid, signal.SIGKILL)
             _ = process.communicate()
-            return f"{editor} took longer than {EDIT_TIMEOUT} s and was stopped"
+            return f"{editor} took longer than {timeout} s and was stopped"
     if process.returncode == 0:
         return None
     return " ".join((err.strip() or out.strip() or f"exit {process.returncode}").split())
@@ -1280,11 +1277,12 @@ def notify_blocked_next_move(group: str, target: str, entry_id: str, reason: Blo
 
 
 def workers_entry_pending() -> bool:
-    """An unreadable next list cannot prove workers have no account move."""
+    """Read the queued workers entries for this pass."""
     try:
         return any(isinstance(entry, next_moves.WorkersMove) for entry in next_moves.read_next_moves())
-    except (OSError, next_moves.NextMoveError):
-        return True
+    except (OSError, next_moves.NextMoveError) as error:
+        print(f"account moves: anomaly: cannot read workers entries: {error}")
+        return False
 
 
 def _workers_head_blocked(entry: next_moves.WorkersMove, reason: BlockedHeadReason,
@@ -1498,10 +1496,11 @@ def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None
 
 def relay(recipient: str, text: str, key: str | None) -> str | None:
     """Deliver text to one session; None when it arrived, otherwise why not."""
-    command = [sys.executable, str(SEND), "--to", recipient, "--from", "quota_alert",
-               "--timeout", str(RELAY_TIMEOUT - KILL_GRACE), *(["--key", key] if key else [])]
+    timeout = conf.read("accounts").whole("quota_relay_timeout_seconds") - KILL_GRACE
+    command = session_send.send_argv("--to", recipient, "--from", "quota_alert",
+                                     "--timeout", str(timeout), *(["--key", key] if key else []))
     try:
-        done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=send_budget.seconds(RELAY_TIMEOUT - KILL_GRACE),
+        done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=send_budget.seconds(timeout),
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)
@@ -1513,6 +1512,8 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
             case "queued":
                 # refusal_watch accepts a queued copy through this header.
                 return " ".join(f"QUEUED: {outcome.header.detail}".split())
+            case "retry":
+                return " ".join(f"RETRY: {outcome.header.detail}".split())
             case "failed" | "refused" | "held" | "pending":
                 pass
     return " ".join(failure_detail(done).split())
@@ -1537,7 +1538,6 @@ def tell_user(push: RenderedPush) -> PushDelivery:
 
     user_send_timeout = review.user_send_seconds()
     command = user_send_argv(push, timeout=user_send_timeout)
-    command[1] = str(SEND)
     try:
         done = subprocess.run(command, capture_output=True, text=True,
                               timeout=send_budget.user_seconds(user_send_timeout),
@@ -1549,6 +1549,8 @@ def tell_user(push: RenderedPush) -> PushDelivery:
         match outcome.header.outcome:
             case "sent" | "skipped" | "kept" | "replaced":
                 return PushSent()
+            case "retry":
+                return PushFailed(" ".join(f"RETRY: {outcome.header.detail}".split()))
             case "queued" | "failed" | "refused" | "held" | "pending":
                 pass
     return PushFailed(" ".join(failure_detail(done).split()))

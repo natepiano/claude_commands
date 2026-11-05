@@ -7,30 +7,49 @@ import json
 import os
 import signal
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
+import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast, override
+from typing import NoReturn, cast, override
 from unittest.mock import patch
 
 from scripts.whoami.account_test_support import write_claude_account
+from scripts.direct import assign
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.git_test_support import commit_repository
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_member, isolated_staff_file
+from scripts.production.cli_fixture import invoke_cli
 
 
 class SimplifyDispatchTests(NixFixture):
+    git_seed: Path = Path()
     session_dir: Path = Path()
     diff: Path = Path()
     prompt: Path = Path()
     calls: Path = Path()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.git_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "repository"
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        _ = subprocess.run(["git", "init", "--template=", "-b", "simplify-fixture", str(cls.git_seed)],
+                           env=environment, capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = commit_repository(cls.git_seed, "Empty fixture", allow_empty=True, env=environment)
 
     @override
     def setUp(self) -> None:
@@ -53,11 +72,13 @@ class SimplifyDispatchTests(NixFixture):
                          "CODEX_THREAD_ID": fixture_runtime_id("simplify-director"),
                          "TZ": "UTC", "USER_ZONE": "UTC"})
         self.env["AGENT_NOTES_DIR"] = str(self.root / "notes")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
+        owner = fixture_member("showrunner", name="simplify-owner")
+        _ = fixture_member("unit", name="simplify-unit", parent=owner.id,
+                       runtime_id=self.env["CODEX_THREAD_ID"],
+                       worktree=staff.PresentWorktree("natedev", self.work))
         self.claude_quota("claude1", 100)
-        _ = subprocess.run(["git", "init", "-b", "simplify-fixture", str(self.work)],
-                           env=self.env, capture_output=True, text=True,
-                           check=True, timeout=TEST_HANG_GUARD_SECS)
-        _ = commit_repository(self.work, "Empty fixture", allow_empty=True)
+        _ = shutil.copytree(self.git_seed / ".git", self.work / ".git")
         standing = self.root / "review/simplify.md"
         standing.parent.mkdir()
         _ = standing.write_text("Report only. Edit no file.\nReport each item with its file, line, change, and reason.\nStanding user words.\n")
@@ -68,6 +89,13 @@ class SimplifyDispatchTests(NixFixture):
              "--main-session-id", self.env["CODEX_THREAD_ID"]], self.env, self.work,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        # The ad hoc test lets assign open the phase itself.
+        if self._testMethodName != "test_an_ad_hoc_review_uses_the_shared_phase_directory":
+            result = invoke_recorder(
+                ["start-phase", "--session-dir", str(self.session_dir), "--phase-id", "simplify",
+                 "--phase-title", "Simplify"], self.env, self.work,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
         self.diff = self.root / "phase.diff"
         _ = self.diff.write_text("diff --git a/worker.py b/worker.py\n-old\n+new\n")
         self.prompt = self.root / "source.md"
@@ -101,14 +129,26 @@ raise SystemExit(int(os.environ.get("SIMPLIFY_TEST_EXIT", "0")))
         with patch.dict(os.environ, self.env):
             write_claude_account(label, f"{label}@example.invalid", left, reset)
 
-    def command(self, *options: str) -> list[str]:
-        return ["bash", str(ROOT / "scripts/direct/assign.sh"), "--role", "review", "--lens", "simplify",
+    def arguments(self, *options: str) -> list[str]:
+        return ["--role", "review", "--lens", "simplify",
                 "--session-dir", str(self.session_dir), "--phase", "simplify", "--cwd", str(self.work),
                 "--prompt", str(self.prompt), "--diff", str(self.diff), *options]
 
+    def command(self, *options: str) -> list[str]:
+        return ["bash", str(ROOT / "scripts/direct/assign.sh"), *self.arguments(*options)]
+
     def launch(self, *options: str) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(self.command(*options), env=self.env, capture_output=True, text=True,
-                                check=False, timeout=TEST_HANG_GUARD_SECS)
+        def run_review(executable: str, arguments: list[str], environment: dict[str, str]) -> NoReturn:
+            result = subprocess.run(arguments, executable=executable, env=environment,
+                                    capture_output=True, text=True, check=False,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            print(result.stdout, end="")
+            print(result.stderr, file=sys.stderr, end="")
+            raise SystemExit(result.returncode)
+
+        # assign.main ends in os.execvpe; run review.sh as a child so this test process continues.
+        with patch.object(os, "execvpe", run_review):
+            result = invoke_cli(assign, assign.main, self.arguments(*options), self.env, self.work)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
@@ -516,6 +556,8 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
     def test_an_ad_hoc_review_uses_the_shared_phase_directory(self) -> None:
         _ = self.launch("--phase", "ad hoc")
 
+        state = cast(dict[str, object], json.loads((self.session_dir / "progress_history_state.json").read_text()))
+        self.assertEqual(cast(dict[str, object], state["phase"])["id"], "ad hoc")
         directory = self.session_dir / "phases/adhoc"
         self.assertEqual((directory / "review_status_simplify").read_text().splitlines()[0], "reviewed")
         self.assertEqual((directory / "review_prompt_1_simplify.md").read_text().splitlines()[0],
@@ -557,6 +599,11 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         self.assertIn("busy", retry.stderr)
         self.assertEqual(len(self.claude_calls()), 1)
         _ = gate.write_text("finish")
+        # Stop the orphan heartbeat without stopping the separate Claude session.
+        try:
+            send_process_group(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         _ = communicate_launcher(process)
 
         _ = self.launch()
@@ -589,3 +636,26 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         self.assertEqual(record["status"], "error")
         self.assertIn("simplify reviewer changed the working tree", result.stderr)
         self.assertNotIn("review worker  changed", result.stderr)
+
+
+class SimplifySeedTests(unittest.TestCase):
+    def test_class_setup_keeps_the_callers_git_index_unchanged(self) -> None:
+        class SeedFixture(SimplifyDispatchTests):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            caller_index = Path(directory) / "caller.index"
+            original = b"The caller index must stay unchanged.\n"
+            _ = caller_index.write_bytes(original)
+            try:
+                with patch.dict(os.environ, {"GIT_INDEX_FILE": str(caller_index)}):
+                    SeedFixture.setUpClass()
+                self.assertEqual(caller_index.read_bytes(), original)
+                environment = {"PATH": os.environ.get("PATH", os.defpath),
+                               "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+                result = subprocess.run(["git", "-C", str(SeedFixture.git_seed), "log", "-1", "--format=%s"],
+                                        env=environment, capture_output=True, text=True, check=True,
+                                        timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.stdout.strip(), "Empty fixture")
+            finally:
+                SeedFixture.doClassCleanups()

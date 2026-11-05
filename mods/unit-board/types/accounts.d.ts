@@ -9,6 +9,8 @@ export interface StoredAccount {
   label: string;
   tool: 'claude' | 'codex';
   roles: string[];
+  selected_roles?: string[];
+  /** Combined counts in roles order; spare has no count. Codex shell counts are null. */
   role_counts: (RoleSessionCounts | null)[];
   /** Local and fresh peer counts, keyed by machine and role. */
   role_counts_by_machine?: Record<string, Record<string, RoleSessionCounts>>;
@@ -24,4 +26,5 @@ export interface StoredAccountsStatus {
   accounts: StoredAccount[];
   problems: string[];
   session_inputs?: string[];
+  upcoming_moves?: string[];
 }

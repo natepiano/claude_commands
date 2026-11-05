@@ -86,6 +86,14 @@
     "ExistingDataVolumeId": {
       "Type": "String",
       "Default": ""
+    },
+    "DeploymentId": {
+      "Type": "String",
+      "AllowedPattern": "[a-f0-9]{32}"
+    },
+    "BudgetName": {
+      "Type": "String",
+      "Default": ""
     }
   },
   "Conditions": {
@@ -119,6 +127,18 @@
             {
               "Condition": "ReuseData"
             }
+          ]
+        }
+      ]
+    },
+    "PreserveBudgetName": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "BudgetName"
+            },
+            ""
           ]
         }
       ]
@@ -237,7 +257,15 @@
       "Properties": {
         "Budget": {
           "BudgetName": {
-            "Fn::Sub": "${AWS::StackName}-monthly"
+            "Fn::If": [
+              "PreserveBudgetName",
+              {
+                "Ref": "BudgetName"
+              },
+              {
+                "Fn::Sub": "${AWS::StackName}-monthly-${DeploymentId}"
+              }
+            ]
           },
           "BudgetType": "COST",
           "TimeUnit": "MONTHLY",
@@ -641,6 +669,12 @@
             "Value": {
               "Ref": "CostTagValue"
             }
+          },
+          {
+            "Key": "DeploymentId",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
           }
         ]
       }
@@ -771,7 +805,7 @@
         },
         "Definition": {
           "SsmActionDefinition": {
-            "ActionSubType": "STOP_EC2_INSTANCES",
+            "Subtype": "STOP_EC2_INSTANCES",
             "Region": {
               "Ref": "AWS::Region"
             },

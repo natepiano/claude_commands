@@ -1,16 +1,16 @@
 """Read module times and append gate runs to the build log."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
 import sys
 import time
-from typing import Literal, TypedDict, cast, get_args
+from typing import Final, Literal, TypedDict, cast, get_args
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.buildlog import record, store
 from scripts.lib import conf
 
 
@@ -33,6 +33,10 @@ class ModuleTimes(TypedDict):
     errors: int
     skipped: int
     tests: list[TestTime]
+
+
+# The (suite, module) of the merge gate's type-check job, which runs no tests.
+TYPE_CHECK_JOB: Final = ("types", "basedpyright")
 
 
 class ModuleRun(TypedDict):
@@ -79,6 +83,7 @@ class GateRun(TypedDict):
     dirty: bool
     suites: list[SuiteRun]
     modules: list[ModuleRun]
+    slow_test_s: float
 
 
 class GateRunRecord(GateRun):
@@ -86,11 +91,30 @@ class GateRunRecord(GateRun):
     v: int
     id: str
     host: str
+    tests_run: int
 
 
 @dataclass(frozen=True)
 class NoModuleTimes:
     reason: str
+
+
+@dataclass(frozen=True)
+class TimingNotApplicable:
+    """The type-check job runs no tests and writes no timing file."""
+
+
+@dataclass(frozen=True)
+class Execution:
+    """One finished gate job, including each hold restart and retry."""
+    suite: str
+    module: str
+    wall_s: float
+    cpu_s: float
+    peak_mib: float
+    status: int
+    restart: Literal["", "hold"]
+    times: ModuleTimes | NoModuleTimes | TimingNotApplicable
 
 
 def _fields(value: object) -> dict[str, object]:
@@ -160,14 +184,46 @@ def slow_test_s() -> float:
     return conf.read("test_times").number("SLOW_TEST_S")
 
 
+def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[ModuleRun]:
+    """Keep each attempt and select its test times with one threshold."""
+    attempts: dict[tuple[str, str], int] = {}
+    modules: list[ModuleRun] = []
+    for job in executions:
+        key = (job.suite, job.module)
+        attempts[key] = attempts.get(key, 0) + 1
+        module: ModuleRun = {
+            "suite": job.suite, "module": job.module, "attempt": attempts[key],
+            "wall_s": job.wall_s, "cpu_s": job.cpu_s, "peak_mib": job.peak_mib,
+            "status": job.status, "tests_run": 0, "failures": 0, "errors": 0,
+            "skipped": 0, "tests_s": 0.0, "tests": [], "restart": job.restart,
+            "times_missing": job.times.reason if isinstance(job.times, NoModuleTimes) else "",
+        }
+        if not isinstance(job.times, (NoModuleTimes, TimingNotApplicable)):
+            times = job.times
+            module.update(tests_run=times["tests_run"], failures=times["failures"],
+                          errors=times["errors"], skipped=times["skipped"], tests_s=times["tests_s"],
+                          tests=kept_tests(times, slow_test_s))
+        modules.append(module)
+    return modules
+
+
+def report_not_written(error: BaseException) -> None:
+    """Report a failed record on one line."""
+    detail = " ".join(str(error).splitlines())
+    print(f"gate run not written: {detail}", file=sys.stderr)
+
+
 def write_gate_run(run: GateRun) -> None:
     """Append one gate record without failing the caller."""
     try:
+        # This import keeps gate_record free of an import cycle with index.py.
+        from scripts.buildlog import record, store
+
         epoch = time.time()
         host = store.host_name()
         entry: GateRunRecord = {"kind": "gate_run", "v": record.RECORD_VERSION,
-                                "id": record.new_id(host, epoch), "host": host, **run}
+                                "id": record.new_id(host, epoch), "host": host, **run,
+                                "tests_run": sum(module["tests_run"] for module in run["modules"])}
         store.append_line(store.host_file(host, epoch), entry)
     except Exception as error:
-        detail = str(error).replace("\n", " ")
-        print(f"gate run not written: {detail}", file=sys.stderr)
+        report_not_written(error)

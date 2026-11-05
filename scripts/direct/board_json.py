@@ -22,12 +22,11 @@ if not __package__:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts" / "production"))
 
-import unit_table_cells
+import display_cells
 
 from scripts.direct import phase_table, plan_history
 from scripts.lib import unit_runs
 from scripts.production import session_staff, showrunners, staff, unit_run, unit_config, unit_names
-from scripts.production.unit_table import cell_value
 from scripts.shutdown import remote
 
 
@@ -262,8 +261,8 @@ def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.Do
             repairing = False
     if repairing:
         return f"Repair round {dispatched}"
-    step = unit_table_cells.open_step(events)
-    if isinstance(step, unit_table_cells.OpenStep):
+    step = display_cells.open_step(events)
+    if isinstance(step, display_cells.OpenStep):
         return step.label
     if isinstance(current, phase_table.OpenPhase):
         return f"Ticket {ticket.id} running" if isinstance(ticket, TicketInProgress) else f"Phase {current.phase} running"
@@ -284,7 +283,7 @@ def is_standing_plan(plan: Path) -> bool:
         return False
 
 
-def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> UnitTicketProgress:
+def unit_ticket_progress(worktree: Path, unit_id: staff.StaffId, sources: set[Path]) -> UnitTicketProgress:
     try:
         common = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -303,38 +302,37 @@ def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> 
                 """SELECT
                     (SELECT count(*) FROM tickets WHERE unit = ? AND state = 'merged'),
                     (SELECT id FROM tickets WHERE unit = ? AND state IN ('assigned', 'checkpointed')
-                     ORDER BY created_at DESC LIMIT 1)""", (unit_name, unit_name),
+                     ORDER BY created_at DESC LIMIT 1)""", (unit_id, unit_id),
             ).fetchone())
             return UnitTicketProgress(row[0], TicketInProgress(row[1]) if row[1] else NoTicketInProgress())
     except (OSError, UnicodeError, subprocess.TimeoutExpired, sqlite3.Error):
         return UnitTicketProgress()
 
 
-def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path],
+def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str, clock: BoardClock, sources: set[Path],
          *, resolver: session_staff.RowResolver | None = None) -> dict[str, object]:
-    value = cell_value
-    worktree = Path(value(cells.get("Worktree", ""))).expanduser().resolve()
-    plan_cell = value(cells.get("Plan", ""))
-    plan = plan_history.resolve_plan_path(worktree, plan_cell.split(" ", 1)[0])
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    worktree = worktree.expanduser().resolve()
+    plan = plan_history.resolve_plan_path(worktree, plan_text)
     sources.add(plan)
     sources.add(plan_history.history_root() / "runs")
     if not (plan_history.history_root() / "runs").exists():
         sources.add(plan_history.history_root())
     sources.update(unit_runs.run_roots())
-    found = unit_run.local_run(plan_history.history_root(), str(worktree))
+    found = unit_run.local_run(plan_history.history_root(), str(worktree), record=resolver.record)
     events: list[dict[str, object]] = []
     worker_rows: list[dict[str, object]] = []
     if isinstance(found, unit_run.RunFound):
         path = plan_history.history_root() / "runs" / f"{found.run_id}.jsonl"
         sources.add(path)
-        events = unit_table_cells.run_events(path)
+        events = display_cells.run_events(path)
         worker_rows = workers(session_directory(found.run_id), sources,
                               re.sub(r"[^a-zA-Z0-9._-]", "-", worktree.name)[:40])
     header = events[0] if events else {}
     run_plan = text(header.get("project_plan_doc")) or text(header.get("plan_doc"))
     record_plan = plan_history.resolve_plan_path(worktree, run_plan) if run_plan else plan
     sources.add(record_plan)
-    sources.update(plan_history.plan_runs(record_plan))
+    sources.update(plan_history.plan_runs(record_plan, record=resolver.record))
     try:
         record = phase_table.build_plan(record_plan, resolver=resolver)
     except phase_table.NoPlan:
@@ -345,10 +343,9 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path],
     if isinstance(found, unit_run.RunFound):
         state = "run-finished" if events and events[-1].get("event_type") == "run_finished" else "running"
     current = record.current
-    unit_name = value(cells.get("Unit", ""))
     ledger_unit = unit_names.unit_id(unit_name)
     standing = is_standing_plan(record.plan)
-    tickets = unit_ticket_progress(worktree, ledger_unit, sources) if standing else UnitTicketProgress()
+    tickets = unit_ticket_progress(worktree, unit_id, sources) if standing else UnitTicketProgress()
     ticket = tickets.open_ticket
     if isinstance(ticket, TicketInProgress) and isinstance(current, phase_table.OpenPhase):
         current = next((row for row in phase_table.build_run(record.plan, events, resolver=resolver).phases if isinstance(row, phase_table.OpenPhase)
@@ -365,7 +362,7 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path],
         else:
             current_phase = {"kind": "plan", "id": current.phase, "of": len(record.phases), "title": current.title}
     summary = next((text(event.get("activity")) for event in reversed(events) if event.get("event_type") == "progress_reported"), "")
-    return {"key": unit_name.removesuffix("-unit"), "plan": plan_cell if plan.is_file() else "", "state": state,
+    return {"key": unit_name.removesuffix("-unit"), "plan": plan_text if plan.is_file() else "", "state": state,
             "phase": current_phase,
             "phases": [clock.phase(row) for row in record.phases], "finish": clock.finish(record.plan_finish),
             "stage": stage(events, state, record.phases, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
@@ -400,7 +397,7 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
         else:
             root = record.by_current_session(session)
             while root is not None and root.kind != "showrunner":
-                root = record.by_id(root.parent) if root.parent is not None else None
+                root = record.by_id(root.parent.id) if isinstance(root.parent, staff.ReportsTo) else None
     except staff.StaffUnreadable as error:
         print(f"board_json: {error}", file=sys.stderr)
         return NoBoardSubtree()
@@ -415,7 +412,7 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
             if slug in by_slug:
                 boards.append(by_slug[slug])
         level = sorted((child for row in level for child in staff.active(record, "showrunner")
-                        if child.parent == row.id and child.id in slugs),
+                        if child.parent == staff.ReportsTo(row.id) and child.id in slugs),
                        key=lambda row: slugs.get(row.id, row.name))
     return BoardSubtree(record, tuple(boards))
 
@@ -431,7 +428,7 @@ def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
     if owner is None:
         print(f"board_json: {runner['slug']}: the production document is not recorded", file=sys.stderr)
     for row in staff.active(record, "unit"):
-        if owner is None or row.parent != owner.id:
+        if owner is None or row.parent != staff.ReportsTo(owner.id):
             continue
         tree = resolver.unit_worktree(row)
         try:
@@ -452,7 +449,7 @@ def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
             units.append({"key": row.name, "state": "unavailable", "problem": reason})
         elif isinstance(config, unit_config.UnitConfig) and isinstance(tree, staff.PresentWorktree):
             plan = str(tree.path / config.plan.path) if isinstance(config.plan, unit_config.PlanFile) else "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
-            units.append(unit({"Unit": row.name, "Worktree": str(tree.path), "Plan": plan}, clock, sources, resolver=resolver))
+            units.append(unit(row.name, row.id, tree.path, plan, clock, sources, resolver=resolver))
     offset = datetime.fromtimestamp(clock.now, clock.zone).utcoffset()
     return {"production": runner["slug"], "as_of": clock.time(clock.now), "zone": runner["zone"],
             "utc_offset_minutes": int(offset.total_seconds() / 60) if offset else 0,
@@ -494,7 +491,7 @@ def main(arguments: list[str]) -> int:
         for row in staff.active(subtree.record, "showrunner"):
             timer = showrunners.timer_for(row, subtree.record)
             if isinstance(timer, showrunners.Timer):
-                watch_sources.add(showrunners.SHOWRUNNER_STATE_DIR / timer.slug)
+                watch_sources.add(showrunners.SHOWRUNNER_STATE_DIR / row.id)
     watch = existing_sources(watch_sources)
     print(json.dumps({"files": files, "watch": watch}))
     return 0

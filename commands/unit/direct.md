@@ -38,6 +38,7 @@ For DelegatedPhaseReservationContract, prepare exact phase files, baseline and
 reservation before dispatch. Bind the designer to those output paths with explicit
 `PhaseBoundDesigner` access; reviews use `ReadOnlyReviewer`. Repository edits use
 patches. Finish a turn and rebind while idle before adding a path or changing scope.
+The holder is the worker's staff parent.
 A stale binding, recovery state, adoption fence or unavailable holder blocks dispatch.
 
 For DualReview and FixDispatch, keep the same reviewer and writer. Save findings,
@@ -539,7 +540,8 @@ Rules:
   worker got the phase-wide run, its 13 warnings were in the test worker's
   files, and the test worker had to be launched again.
 - Prove any claimed pre-existing failure on the pre-phase tree before mentioning
-  it. Do not stash; use the existing clean tree or a scratch checkout.
+  it. Do not stash; use the existing clean tree.
+  Use `build_folders.py run --owner O --name N -- CMD...` for a build experiment.
 - Re-run suspected environment failures unsandboxed before classifying them.
   Nested Swift `sandbox-exec` failures and missing GPU adapters are environment
   failures, not dependency or code defects.
@@ -1076,7 +1078,7 @@ At an eligible point, in that same turn:
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
+   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
 
    Pass the same lens and phase the launch carries, and no lens where the
    launch carries none: the marker names the status and pid files it will watch for, and a
@@ -1600,10 +1602,10 @@ overtake an unconfirmed release. An unsuccessful recovery stops refill.
 Then run:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/<Plan cell> --repo <unit-worktree>
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/<plan> --repo <unit-worktree>
 ```
 
-Read the Plan cell from the unit's Units row, relative to its worktree; a rename
+Read `<plan>` from `plan` in the unit's `.unit.toml`, relative to its worktree; a rename
 keeps that path. `add_unit.py` copies the showrunner template
 only at first launch. Exit 0 continues with the todo phase; a todo repair
 always runs first. The ledger resumes assigned work, rebuilds a missing phase,

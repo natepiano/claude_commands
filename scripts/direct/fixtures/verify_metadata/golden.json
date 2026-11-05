@@ -1,0 +1,594 @@
+{
+  "baseline_commit": "a171c9e0c0159f10f230e7cba072f07522d54d07",
+  "baseline_source": "git show HEAD:scripts/direct/verify.sh",
+  "cases": [
+    {
+      "fixture": "workspace.json",
+      "constant": "WORKSPACE_ROOT",
+      "arguments": [],
+      "stdout": "/tmp/verify workspace's $root; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "--workspace"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "MEMBER_PY",
+      "arguments": [
+        "alpha"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "TEST_TARGETS_PY",
+      "arguments": [
+        "alpha",
+        ""
+      ],
+      "stdout": "--lib\n--bins\n--tests\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "alpha",
+        "",
+        ""
+      ],
+      "stdout": "select --bin\nselect alpha-cli\nbinary alpha-cli\ntarget /tmp/verify target's $dir; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "alpha"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "EXAMPLE_FEATURES_PY",
+      "arguments": [
+        "alpha",
+        "demo"
+      ],
+      "stdout": "\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "alpha",
+        "example",
+        "demo"
+      ],
+      "stdout": "select --example\nselect demo\nbinary examples/demo\ntarget /tmp/verify target's $dir; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "EXAMPLE_FEATURES_PY",
+      "arguments": [
+        "alpha",
+        "gated"
+      ],
+      "stdout": "graphics,dep/window\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "alpha",
+        "example",
+        "gated"
+      ],
+      "stdout": "select --example\nselect gated\nfeatures graphics,dep/window\nbinary examples/gated\ntarget /tmp/verify target's $dir; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "MEMBER_PY",
+      "arguments": [
+        "beta"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "TEST_TARGETS_PY",
+      "arguments": [
+        "beta",
+        ""
+      ],
+      "stdout": "--lib\n--bins\n--tests\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "beta",
+        "",
+        ""
+      ],
+      "stdout": "select --bin\nselect beta-cli\nbinary beta-cli\ntarget /tmp/verify target's $dir; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "beta"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "MEMBER_PY",
+      "arguments": [
+        "solo"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "TEST_TARGETS_PY",
+      "arguments": [
+        "solo",
+        ""
+      ],
+      "stdout": "--lib\n--bin\nsolo-cli\n--test\nsolo-test\n--bench\nsolo-bench\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "solo",
+        "",
+        ""
+      ],
+      "stdout": "select --bin\nselect solo-cli\nbinary solo-cli\ntarget /tmp/verify target's $dir; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "solo"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "MEMBER_PY",
+      "arguments": [
+        "unknown"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package unknown not found in workspace\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "EXAMPLE_FEATURES_PY",
+      "arguments": [
+        "unknown",
+        "missing"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package unknown not found in workspace\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "unknown"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package unknown not found in workspace\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "WORKSPACE_ROOT",
+      "arguments": [],
+      "stdout": "/tmp/verify workspace's $root; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "--workspace"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "MEMBER_PY",
+      "arguments": [
+        "empty"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "TEST_TARGETS_PY",
+      "arguments": [
+        "empty",
+        ""
+      ],
+      "stdout": "--bins\n--tests\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "empty",
+        "",
+        ""
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package empty has no binary; name an example with --example <name>\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "empty"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "MEMBER_PY",
+      "arguments": [
+        "unknown"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package unknown not found in workspace\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "EXAMPLE_FEATURES_PY",
+      "arguments": [
+        "unknown",
+        "missing"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package unknown not found in workspace\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "unknown"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package unknown not found in workspace\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "WORKSPACE_ROOT",
+      "arguments": [],
+      "stdout": "/tmp/verify workspace's $root; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "--workspace"
+      ],
+      "stdout": "",
+      "stderr": "example bad holds a test: scripts/direct/fixtures/verify_metadata/sources/bad.rs:2 has #[cfg(test)], and examples carry no tests.\nmove it into bad-app's src/ or tests/, or delete it.\n\nexample bad sets test = true in /tmp/verify fixture/bad-app/Cargo.toml, and examples carry no tests.\nremove test = true from its [[example]] entry.\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "MEMBER_PY",
+      "arguments": [
+        "gated-app"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "TEST_TARGETS_PY",
+      "arguments": [
+        "gated-app",
+        ""
+      ],
+      "stdout": "--lib\n--bins\n--tests\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "gated-app",
+        "",
+        ""
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package gated-app has no binary; name an example with --example <name>\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "gated-app"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "EXAMPLE_FEATURES_PY",
+      "arguments": [
+        "gated-app",
+        "gated"
+      ],
+      "stdout": "extra\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "gated-app",
+        "example",
+        "gated"
+      ],
+      "stdout": "select --example\nselect gated\nfeatures extra\nbinary examples/gated\ntarget /tmp/verify target's $dir; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "MEMBER_PY",
+      "arguments": [
+        "bad-app"
+      ],
+      "stdout": "",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "TEST_TARGETS_PY",
+      "arguments": [
+        "bad-app",
+        ""
+      ],
+      "stdout": "--bins\n--tests\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "bad-app",
+        "",
+        ""
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package bad-app has no binary; name an example with --example <name>\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "bad-app"
+      ],
+      "stdout": "",
+      "stderr": "example bad holds a test: scripts/direct/fixtures/verify_metadata/sources/bad.rs:2 has #[cfg(test)], and examples carry no tests.\nmove it into bad-app's src/ or tests/, or delete it.\n\nexample bad sets test = true in /tmp/verify fixture/bad-app/Cargo.toml, and examples carry no tests.\nremove test = true from its [[example]] entry.\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "EXAMPLE_FEATURES_PY",
+      "arguments": [
+        "bad-app",
+        "bad"
+      ],
+      "stdout": "\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "bad-app",
+        "example",
+        "bad"
+      ],
+      "stdout": "select --example\nselect bad\nbinary examples/bad\ntarget /tmp/verify target's $dir; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "MEMBER_PY",
+      "arguments": [
+        "unknown"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package unknown not found in workspace\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "EXAMPLE_FEATURES_PY",
+      "arguments": [
+        "unknown",
+        "missing"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package unknown not found in workspace\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "UNTESTED_EXAMPLES_PY",
+      "arguments": [
+        "unknown"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package unknown not found in workspace\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "TEST_TARGETS_PY",
+      "arguments": [
+        "gated-app",
+        "gated-app/extra"
+      ],
+      "stdout": "--lib\n--test\nready\n--test\noptional\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "TEST_TARGETS_PY",
+      "arguments": [
+        "gated-app",
+        "other/extra"
+      ],
+      "stdout": "--lib\n--bins\n--tests\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "gated_examples.json",
+      "constant": "TEST_TARGETS_PY",
+      "arguments": [
+        "gated-app",
+        "gated-app/cycle-a,gated-app/extra"
+      ],
+      "stdout": "--lib\n--test\nready\n--test\noptional\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "alpha",
+        "bin",
+        "alpha-cli"
+      ],
+      "stdout": "select --bin\nselect alpha-cli\nbinary alpha-cli\ntarget /tmp/verify target's $dir; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "alpha",
+        "bin",
+        "missing"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: package alpha has no bin missing\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "workspace.json",
+      "constant": "EXAMPLE_FEATURES_PY",
+      "arguments": [
+        "alpha",
+        "missing"
+      ],
+      "stdout": "",
+      "stderr": "verify.sh: example missing not found in package alpha\n",
+      "exit_code": 2
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "EXAMPLE_FEATURES_PY",
+      "arguments": [
+        "empty",
+        "only-example"
+      ],
+      "stdout": "\n",
+      "stderr": "",
+      "exit_code": 0
+    },
+    {
+      "fixture": "no_tests.json",
+      "constant": "BUILD_TARGETS_PY",
+      "arguments": [
+        "empty",
+        "example",
+        "only-example"
+      ],
+      "stdout": "select --example\nselect only-example\nbinary examples/only-example\ntarget /tmp/verify target's $dir; literal\n",
+      "stderr": "",
+      "exit_code": 0
+    }
+  ]
+}

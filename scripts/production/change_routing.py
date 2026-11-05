@@ -13,7 +13,7 @@ from pathlib import Path
 
 from scripts.lib import conf
 from scripts.production import delivery_state, staff, unrouted_alert
-from scripts.production.production_units import Refusal, production_field
+from scripts.production.production_doc import Refusal, production_field
 from scripts.production.proposals_folder import slug_of
 
 PREFIX = "change-review - "
@@ -155,6 +155,11 @@ class StaffRouting:
         return review_root()
 
     @cached_property
+    def _root(self) -> staff.StaffRow | None:
+        name = conf.read("review_links").text("unrouted_alert_recipient")
+        return self.runners_by_name.get(name)
+
+    @cached_property
     def list_paths(self) -> dict[str, Path]:
         paths: dict[str, Path] = {}
         for doc in dict.fromkeys(self.documents.values()):
@@ -177,6 +182,9 @@ class StaffRouting:
                      if path == review_list and name in self.runners_by_name), name)
 
     def owner(self, row: dict[str, str], review_list: Path) -> ChangeOwner:
+        return self.owner_and_production(review_list, row).owner
+
+    def _staff_owner(self, row: dict[str, str], review_list: Path) -> ChangeOwner:
         list_owner = self.list_owner(review_list)
         identity = row.get(PRODUCER, "").strip()
         if not identity:
@@ -193,9 +201,9 @@ class StaffRouting:
             return self.unrouted(review_list, row, f"Producer {identity} is not a staff unit or showrunner", identity)
         parent = producer
         seen: set[staff.StaffId] = set()
-        while parent.kind != "showrunner" and parent.parent is not None and parent.id not in seen:
+        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:
             seen.add(parent.id)
-            ancestor = self.record.by_id(parent.parent)
+            ancestor = self.record.by_id(parent.parent.id)
             if ancestor is None:
                 break
             parent = ancestor
@@ -206,18 +214,26 @@ class StaffRouting:
     def owner_and_production(self, review_list: Path, row: dict[str, str]) -> ChangeAssignment:
         """Read the producer and its showrunner's current production document."""
         name = self.list_owner(review_list)
-        owner = self.owner(row, review_list)
+        owner = self._staff_owner(row, review_list)
         if isinstance(owner, UnroutedChange) or isinstance(owner.showrunner_id, MissingShowrunner):
             runner = self.runners_by_name.get(name)
             document = self.production_by_runner.get(runner.id) if runner is not None else self.production_by_name.get(name)
         else:
             document = self.production_by_runner.get(owner.showrunner_id)
+        missing_owner = isinstance(owner, ShowrunnerOwnChange) and isinstance(owner.showrunner_id, MissingShowrunner)
+        if missing_owner or document is None:
+            root = self._root
+            if root is not None:
+                root_document = document if document is not None else self.production_by_runner.get(root.id)
+                if root_document is not None:
+                    return ChangeAssignment(owner if isinstance(owner, UnroutedChange)
+                                            else ShowrunnerOwnChange(root.id, root.name), root_document)
         return ChangeAssignment(owner, document if document is not None else UnavailableProduction(review_list))
 
     def unrouted(self, review_list: Path, row: dict[str, str], note: str, producer: str) -> UnroutedChange:
         list_owner = self.list_owner(review_list)
         print(f"staff: {note[0].lower() + note[1:]} (change {list_owner}/{row['#']})", file=sys.stderr)
-        if not row.get("Verdict") and _is_real_list(review_list, self._configured_folder):
+        if not row.get("Verdict") and _is_real_list(review_list, self._configured_folder) and self.record.production:
             root = self._review_root
             if not waits_for_user(review_list, row, root):
                 return UnroutedChange(note + "; no message goes out")

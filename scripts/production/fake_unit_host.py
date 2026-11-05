@@ -9,7 +9,8 @@ import sys
 import threading
 import time
 import unittest
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,10 +29,43 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 PANE_RESULT = herdr.Herdr.result
 
 
-def native_claude(environment: Mapping[str, str], pid: int) -> None:
+@contextmanager
+def private_process_registry() -> Generator[None]:
+    """Read private process generations and retain normal reads for other processes."""
+    import sessions
+    from scripts.message import sessions as runtime_sessions
+
+    original_start = runtime_sessions.process_start
+    original_running = runtime_sessions.running_session
+
+    def started(pid: int) -> str | None:
+        root = os.environ.get("HERDR_PROC", "")
+        path = Path(root) / str(pid) / "stat"
+        if root and path.is_file() and not (path.parent / "kernel-process").exists():
+            fields = path.read_text().rsplit(")", 1)[1].split()
+            return fields[19] if len(fields) > 19 else None
+        return original_start(pid)
+
+    def running(record: runtime_sessions.SessionRecord) -> bool:
+        root = os.environ.get("HERDR_PROC", "")
+        directory = Path(root) / str(record["pid"])
+        if root and (directory / "stat").is_file() and not (directory / "kernel-process").exists():
+            return record.get("procStart", started(record["pid"])) == started(record["pid"])
+        return original_running(record)
+
+    with (mock.patch.object(sessions, "process_start", side_effect=started),
+          mock.patch.object(runtime_sessions, "process_start", side_effect=started),
+          mock.patch.object(sessions, "running_session", side_effect=running),
+          mock.patch.object(runtime_sessions, "running_session", side_effect=running)):
+        yield
+
+
+def native_claude(environment: Mapping[str, str], pid: int, *, kernel_process: bool = False) -> None:
     """Publish the private process files needed for registry and liveness reads."""
     directory = Path(environment["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
+    if kernel_process:
+        (directory / "kernel-process").touch()
     for name, content in (("environ", b""), ("cmdline", b"claude\0")):
         if not (directory / name).exists():
             _ = (directory / name).write_bytes(content)
@@ -64,6 +98,16 @@ class HostedUnit:
     label: str = ""
 
 
+def labeled(session: str, pane: str, unit: str, slug: str = "show", *,
+            screen: str = "", agent_status: str = "idle", label: str = "", **environment: str) -> HostedUnit:
+    """Publish a fixture member with its current native session identity."""
+    from scripts.production import showrunners
+    from scripts.production.staff_test_support import unit_membership
+
+    row = unit_membership(showrunners.canonical_slug(slug), unit)
+    return HostedUnit(session, pane, {"CODEX_THREAD_ID": row.current_session, **environment}, screen, agent_status, label)
+
+
 def environment(root: Path) -> dict[str, str]:
     """An isolated empty host; the caller may add units before invoking a CLI."""
     responses = root / "herdr-responses.json"
@@ -78,21 +122,35 @@ def environment(root: Path) -> dict[str, str]:
     }
 
 
+def _write_children(root: Path) -> None:
+    """Update thread child lists from the private process parent facts."""
+    parents = {
+        int(path.parent.name): int(path.read_text().rsplit(")", 1)[1].split()[1])
+        for path in root.glob("[0-9]*/stat")
+    }
+    for pid in parents:
+        task = root / str(pid) / "task" / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        children = sorted(child for child, parent in parents.items() if parent == pid)
+        _ = (task / "children").write_text(" ".join(str(child) for child in children))
+
+
 def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], marks: Mapping[str, str], *, started: str = "1",
             session: int | None = None, cwd: Path | None = None) -> None:
     directory = Path(env["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
-    _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} {pid} {session or pid} {session or pid} 0 " + "0 " * 13 + started)
+    _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} {pid} {session or pid} 0 {session or pid} " + "0 " * 13 + started)
     _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
     _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in marks.items()).encode())
     link = directory / "cwd"
     link.unlink(missing_ok=True)
     link.symlink_to(cwd or directory.parent.parent)
     _ = (directory / "cgroup").write_text("")
+    _write_children(directory.parent)
 
 
 def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
-    """Publish marked shells and session list/read responses using the real reader boundaries."""
+    """Publish fixture shells and session list/read responses using the real reader boundaries."""
     responses_file = Path(env["FAKE_HERDR_RESPONSES"])
     responses = cast(dict[str, CommandResponse], json.loads(responses_file.read_text()))
     sockets = Path(env["HERDR_PROC"]) / "net/unix"
@@ -119,7 +177,7 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
             responses[f"--session {name} pane process-info --pane {unit.pane}"] = {
                 "code": 0, "stdout": json.dumps({"result": {"process_info": {
                     "shell_pid": shell, "foreground_process_group_id": shell,
-                    "foreground_processes": [{"name": "zsh"}]}}})}
+                    "foreground_processes": [{"name": "zsh", "argv": ["zsh"], "pid": shell}]}}})}
             responses[f"--session {name} pane close {unit.pane}"] = {
                 "code": 0, "stdout": "", "remove_paths": [str(Path(env["HERDR_PROC"]) / str(shell))]}
             for source in ("recent", "recent-unwrapped"):
@@ -139,6 +197,17 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
     _ = responses_file.write_text(json.dumps(responses))
 
 
+def pane_foreground(env: Mapping[str, str], session: str, pane: str, shell: int, pid: int, command: str) -> None:
+    """Update only the selected pane's foreground reply."""
+    responses_file = Path(env["FAKE_HERDR_RESPONSES"])
+    responses = cast(dict[str, CommandResponse], json.loads(responses_file.read_text()))
+    responses[f"--session {session} pane process-info --pane {pane}"] = {
+        "code": 0, "stdout": json.dumps({"result": {"process_info": {
+            "shell_pid": shell, "foreground_process_group_id": pid,
+            "foreground_processes": [{"name": command, "argv": [command], "pid": pid}]}}})}
+    _ = responses_file.write_text(json.dumps(responses))
+
+
 def place_process(env: Mapping[str, str], pid: int, pane: str, *, session: str = "", exec_shell: bool = False) -> None:
     """Put a registry process below the fixture shell owning this pane."""
     matches: list[tuple[Path, dict[str, str]]] = []
@@ -154,16 +223,13 @@ def place_process(env: Mapping[str, str], pid: int, pane: str, *, session: str =
     if len(matches) != 1:
         raise AssertionError(f"expected one hosted pane {session}:{pane}, found {len(matches)}")
     directory, marks = matches[0]
-    parent = int((directory / "stat").read_text().split()[3])
+    parent = int((directory / "stat").read_text().split()[3]) if exec_shell else int(directory.name)
     process(env, pid, parent, ["claude"], marks)
+    pane_foreground(env, marks["HERDR_SESSION"], pane, pid if exec_shell else int(directory.name), pid, "claude")
     if exec_shell:
         # Generic launch fixtures use exec; pane-shell scenarios keep both processes.
-        responses_file = Path(env["FAKE_HERDR_RESPONSES"])
-        responses = cast(dict[str, CommandResponse], json.loads(responses_file.read_text()))
-        responses[f"--session {marks['HERDR_SESSION']} pane process-info --pane {pane}"] = {
-            "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": pid}}})}
-        _ = responses_file.write_text(json.dumps(responses))
         shutil.rmtree(directory)
+        _write_children(directory.parent)
 
 
 def calls(env: Mapping[str, str]) -> list[list[str]]:
@@ -210,32 +276,41 @@ class PaneShellFixture:
         self.native_id: str = owner.current_session
         self.stop_calls: list[str] = []
         self.lifecycle: list[str] = []
-        self._found: unit_lookup.MarkedUnit | None = unit_lookup.MarkedUnit(unit,
+        self._found: unit_lookup.LabeledSession | None = unit_lookup.LabeledSession(unit,
             unit_lookup.LiveClaude("alpha", self.native_id, "/fixture/socket", self.director)
-            if live else unit_lookup.ClaudeNotRunning(), self.place)
+            if live else unit_lookup.ClaudeNotRunning(), self.place,
+            identity=unit_lookup.LiveSession(self.native_id))
         write(self.environment, [HostedUnit(self.place.session, self.place.pane,
-              {unit_lookup.PRODUCTION_MARK: slug, unit_lookup.UNIT_MARK: unit})])
+              {"CLAUDE_CODE_SESSION_ID": self.native_id})])
+        _ = case.enterContext(private_process_registry())
+        if live:
+            from scripts.production.staff_test_support import record_fixture_claude_start
+            place_process(self.environment, self.director, self.place.pane)
+            with mock.patch.dict(os.environ, {**self.environment, "FAKE_CLAUDE_PID": str(self.director),
+                                             "FAKE_CLAUDE_SESSION_ID": self.native_id}):
+                record_fixture_claude_start([])
         process(self.environment, self.shell, 991000, ["arbitrary-shell-name"],
                 self.marks(), session=self.shell, cwd=worktree)
         self.parent(self.shell)
         if not live:
             shutil.rmtree(process_root / str(self.director))
+            _write_children(process_root)
         case.enterContext(mock.patch.dict(os.environ, self.environment))
         _ = case.enterContext(mock.patch.object(herdr.Herdr, "result", PANE_RESULT))
         _ = case.enterContext(mock.patch.object(unit_move, "processes_inside", side_effect=self.inside_pids))
-        _ = case.enterContext(mock.patch.object(unit_lookup, "marked_unit", side_effect=self.marked_unit))
-        _ = case.enterContext(mock.patch.object(unit_lookup, "marked_units", side_effect=self.marked_units))
+        _ = case.enterContext(mock.patch.object(unit_lookup, "labeled_session", side_effect=self.labeled_session))
+        _ = case.enterContext(mock.patch.object(unit_lookup, "labeled_sessions", side_effect=self.labeled_sessions))
 
     def marks(self) -> dict[str, str]:
-        return {"SHOWRUNNER_UNIT": self.slug, "SHOWRUNNER_UNIT_ID": self.unit,
+        return {"CLAUDE_CODE_SESSION_ID": self.native_id,
                 "HERDR_PANE_ID": self.place.pane, "HERDR_SESSION": self.place.session}
 
     @property
-    def found(self) -> unit_lookup.MarkedUnit | None:
+    def found(self) -> unit_lookup.LabeledSession | None:
         return self._found if (Path(self.environment["HERDR_PROC"]) / str(self.shell)).exists() else None
 
     @found.setter
-    def found(self, value: unit_lookup.MarkedUnit | None) -> None:
+    def found(self, value: unit_lookup.LabeledSession | None) -> None:
         self._found = value
 
     def parent(self, pid: int) -> None:
@@ -246,12 +321,15 @@ class PaneShellFixture:
         import unit_lookup
         self.lifecycle.append("director exited")
         shutil.rmtree(Path(self.environment["HERDR_PROC"]) / str(self.director), ignore_errors=True)
-        self._found = unit_lookup.MarkedUnit(self.unit, unit_lookup.ClaudeNotRunning(), self.place)
+        _write_children(Path(self.environment["HERDR_PROC"]))
+        pane_foreground(self.environment, self.place.session, self.place.pane, self.shell, self.shell, "arbitrary-shell-name")
+        self._found = unit_lookup.LabeledSession(self.unit, unit_lookup.ClaudeNotRunning(), self.place,
+            identity=unit_lookup.LiveSession(self.native_id))
 
-    def marked_unit(self, slug: str, unit: str) -> unit_lookup.MarkedUnit | None:
+    def labeled_session(self, slug: str, unit: str) -> unit_lookup.LabeledSession | None:
         return self.found if (slug, unit) == (self.slug, self.unit) else None
 
-    def marked_units(self, slug: str) -> dict[str, unit_lookup.MarkedUnit]:
+    def labeled_sessions(self, slug: str) -> dict[str, unit_lookup.LabeledSession]:
         found = self.found
         return {self.unit: found} if slug == self.slug and found else {}
 
@@ -266,7 +344,9 @@ class PaneShellFixture:
     def add_occupant(self, pid: int, *, unit: str = "", session: str = "agents",
                      marked: bool = True) -> None:
         """A visitor may reuse the pane id in another herdr session."""
-        marks = {**self.marks(), "SHOWRUNNER_UNIT_ID": unit} if marked else {
+        from scripts.production.staff_test_support import fixture_runtime_id
+        identity = self.native_id if unit == self.unit else fixture_runtime_id("visitor:" + unit)
+        marks = {**self.marks(), "CLAUDE_CODE_SESSION_ID": identity} if marked else {
             "HERDR_PANE_ID": self.place.pane, "HERDR_SESSION": session}
         parent = self.shell
         os_session = self.shell
@@ -285,7 +365,7 @@ class PaneShellFixture:
 
 def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path, *,
                     destination: tuple[str, str, str]) -> None:
-    """A shutdown boundary that records a clean stop and one marked relaunch."""
+    """A shutdown boundary that records a clean stop and one native relaunch."""
     import rename_unit
     import unit_lookup
     import herdr
@@ -302,10 +382,11 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
             pane.slug, pane.unit, name = destination
             pane.place = herdr.HerdrPlace('restored', 'w2:p1')
             write(pane.environment, [HostedUnit(pane.place.session, pane.place.pane,
-                  {'SHOWRUNNER_UNIT':pane.slug, 'SHOWRUNNER_UNIT_ID':pane.unit})])
+                  {"CLAUDE_CODE_SESSION_ID": pane.native_id})])
             pane.shell = 991001
-            pane.found = unit_lookup.MarkedUnit(pane.unit,
-                unit_lookup.LiveClaude(name, pane.native_id, '/fixture/socket', pane.shell), pane.place)
+            pane.found = unit_lookup.LabeledSession(pane.unit,
+                unit_lookup.LiveClaude(name, pane.native_id, '/fixture/socket', pane.shell), pane.place,
+                identity=unit_lookup.LiveSession(pane.native_id))
         else:
             raise AssertionError(f'unexpected shutdown: {arguments}')
 

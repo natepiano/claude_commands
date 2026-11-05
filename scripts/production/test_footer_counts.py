@@ -27,7 +27,8 @@ from scripts.production.test_change_review import producer_rows
 from scripts.statusline import counts_row
 from footer_counts import FooterCounts
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+    fixture_member, isolated_source_readers, isolated_staff_file, production_staff_record,
+    recorded_showrunner, source_environment, unit_membership,
 )
 
 LIST = """# Change review
@@ -71,11 +72,12 @@ def issue(folder: Path, name: str, status: str, tags: str, proposed_by: str = "p
 
 
 def production_doc(folder: Path, slug: str, proposals: Path, *units: str) -> Path:
-    """A production doc that names the shared proposals folder and its units."""
-    rows = "".join(f"| {unit} | `docs/plans/{unit}.md` |\n" for unit in units)
+    """A production doc that names the shared proposals folder, with staff rows for its units."""
     path = folder / f"{slug}-production.md"
-    _ = path.write_text(f"# {slug}\n\n- **Proposals:** {proposals}\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n{rows}",
-                        encoding="utf-8")
+    _ = path.write_text(f"# {slug}\n\n- **Proposals:** {proposals}\n", encoding="utf-8")
+    _ = recorded_showrunner(slug, path)
+    for unit in units:
+        _ = unit_membership(slug, unit)
     return path
 
 
@@ -88,6 +90,8 @@ class FooterCountsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
         _ = self.enterContext(isolated_source_readers())
@@ -121,6 +125,7 @@ class FooterCountsTests(unittest.TestCase):
     def doc(self, *fields: str) -> Path:
         path = self.root / "production.md"
         _ = path.write_text("# Production\n\n" + "".join(f"{field}\n" for field in fields), encoding="utf-8")
+        _ = recorded_showrunner("production", path)
         return path
 
     def test_a_footer_count_uses_one_staff_snapshot_for_scope_and_routing(self) -> None:
@@ -286,7 +291,11 @@ class FooterCountsTests(unittest.TestCase):
         doc = self.doc(f"- **Change review:** `{listing}`", f"- **Proposals:** {folder}",
                        f"- **Improvement queue:** {ledger}")
         self.assertEqual(footer_counts.sources(doc), [doc, listing, folder, ledger, folder / "wanted.md"])
-        self.assertEqual(footer_counts.sources(self.doc()), [self.root / "production.md"])
+        empty_doc = self.doc()
+        owner = staff.snapshot().by_doc("natedev", empty_doc)
+        assert owner is not None
+        question_folder = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / owner.id / "questions"
+        self.assertEqual(footer_counts.sources(empty_doc), [empty_doc, question_folder])
 
     def test_a_shared_folder_counts_only_the_productions_own_proposals(self) -> None:
         folder = self.root / "issues"
@@ -336,9 +345,12 @@ class FooterCountsTests(unittest.TestCase):
         configuration.mkdir()
         source = configuration / "change_review.conf"
         _ = source.write_text(f"lists_directory={self.root}\nreview_links_directory={self.root / 'links'}\n")
+        root_configuration = configuration / "review_links.conf"
+        _ = root_configuration.write_text("unrouted_alert_recipient=top\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)}):
             paths = footer_counts.routing_sources(staff.snapshot())
         self.assertIn(source, paths)
+        self.assertIn(root_configuration, paths)
         self.assertIn(self.root, paths)
         self.assertIn(self.root / "links", paths)
 
@@ -366,7 +378,7 @@ class FooterCountsTests(unittest.TestCase):
         from dataclasses import replace
         broken = replace(snapshot, rows=tuple(replace(row, parent=None) if row.id == one.id else row
                                                for row in snapshot.rows))
-        with (mock.patch.object(staff, "snapshot", return_value=broken),
+        with (mock.patch.object(staff, "snapshot", return_value=broken), production_staff_record(),
               mock.patch.object(unrouted_alert, "send_message") as send, contextlib.redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(footer_counts.changes(doc), 0)
             self.assertEqual(footer_counts.unrouted_changes(doc), 2)
@@ -395,6 +407,33 @@ class FooterCountsTests(unittest.TestCase):
         counts = [footer_counts.changes(doc) for doc in self.tree.values()]
         self.assertEqual(counts, [4, 0, 0])
         self.assertEqual(counts, [forms.counts[name] for name in self.tree])
+
+    def test_orphan_rows_count_under_the_root_tab_before_and_after_a_document_is_stamped(self) -> None:
+        from scripts.review_links import change_browser, change_page
+        from scripts.production import change_review as page_review
+
+        listing = self.root / "change-review - orphan.md"
+        doc = self.root / "top-production.md"
+        own_list = self.root / "change-review - top.md"
+        _ = doc.write_text(f"# Top\n- **Change review:** `{own_list}`\n")
+        _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", doc))
+        self.tree = {"top": doc}
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
+        _ = (config / "change_review.conf").write_text(
+            f"lists_directory={self.root}\nreview_links_directory={self.root / 'links'}\n")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              mock.patch.object(page_review, "lists_directory", return_value=self.root)):
+            for document in (self.root / "missing-production.md", doc):
+                with self.subTest(document=document):
+                    _ = listing.write_text(f'---\nproductions:\n  - "{document}"\n---\n' + LIST)
+                    prepared = change_browser.prepare(change_page.ReviewBrowser("token"),
+                        change_page.DeliveryStatus(self.root / "links"))
+                    waiting = [item for item in prepared.changes if item.waiting]
+                    self.assertEqual([item.key for item in waiting], ["orphan/C1", "orphan/C2"])
+                    self.assertEqual([item.tab for item in waiting], ["top", "top"])
+                    self.assertEqual(footer_counts.change_counts(doc, staff.snapshot()), (2, 0))
 
     def test_rows_without_producers_in_independent_lists_stay_with_their_showrunners(self) -> None:
         from scripts.review_links import change_browser, change_page

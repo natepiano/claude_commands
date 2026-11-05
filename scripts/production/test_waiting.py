@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.fake_unit_host import labeled as labeled_host
+
 import fcntl
 import io
 import json
@@ -27,7 +29,6 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.lib.atomic_file import write_text_atomic
 import add_unit
-import production_units
 import dailies_render
 import merge_checkpoint
 from scripts.production import production_doc, staff
@@ -158,7 +159,7 @@ class WaitingTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
         self.host_pids = {}
         fake_unit_host.write(os.environ, [
-            fake_unit_host.HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit})
+            labeled_host(unit, f"w{index}:p1", unit, slug="showrunner-example")
             for index, unit in enumerate((ALPHA, BETA), start=1)])
         for index, unit in enumerate((ALPHA, BETA), start=1):
             self.claude(unit, f"w{index}:p1")
@@ -245,7 +246,9 @@ class WaitingTests(unittest.TestCase):
         if pane not in self.host_pids:
             self.host_pids[pane] = fake_unit_host.live_pid(self)
         pid = self.host_pids[pane]
-        fake_unit_host.place_process(os.environ, pid, pane)
+        process = Path(os.environ["HERDR_PROC"]) / str(pid) / "environ"
+        if not process.exists():
+            fake_unit_host.place_process(os.environ, pid, pane, exec_shell=True)
         self.write(self.root / "sessions" / f"{pane.removeprefix("w").split(":")[0]}.json", json.dumps({
             "pid": pid, "sessionId": unit_membership("showrunner-example", (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]).id, "name": name, "messagingSocketPath": str(path),
             "updatedAt": 1, "tmux": ""}))
@@ -256,12 +259,7 @@ class WaitingTests(unittest.TestCase):
             "", "## Production Context", "", "- **Merge branch:** `production`",
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Showrunner session:** showrunner-example",
             "- **Log:** `production.log`", "- **User zone:** America/Los_Angeles",
-            "- **Updates:** every 15 minutes", "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |",
-            f"| `{ALPHA}` | `docs/alpha.md` | `{self.alpha}` | `alpha-branch` | — | `shared.txt` |",
-            f"| `{BETA}` | `docs/beta.md` | `{self.beta}` | `beta-branch` | — | `src/beta.py` |",
-            "", "## Gates", "", "| Gate | Waiting | Waits on | Clears when |",
+            "- **Updates:** every 15 minutes", "", "## Gates", "", "| Gate | Waiting | Waits on | Clears when |",
             "| --- | --- | --- | --- |",
             f"| G1 | {ALPHA} phase 2 | {BETA} phase 1 | beta code merged |",
             "", "## Production rules", "", "- Merge each phase and push the merge branch.", "",
@@ -275,12 +273,6 @@ class WaitingTests(unittest.TestCase):
             _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder), expected=row.worktree)
             if folder.exists():
                 write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
-
-    def add_gamma(self) -> None:
-        _ = unit_membership("showrunner-example", GAMMA)
-        content = self.doc.read_text(encoding="utf-8")
-        row = f"| `{GAMMA}` | `docs/gamma.md` | `{self.root / 'gamma'}` | `gamma-branch` | — | — |\n"
-        self.write(self.doc, content.replace("\n\n## Gates", f"\n{row}\n## Gates"))
 
     def alpha_session(self, session: str) -> None:
         """The user renamed alpha's session: only the live session record says so."""
@@ -319,9 +311,7 @@ class WaitingTests(unittest.TestCase):
     def test_named_unit_refuses_retired_row(self) -> None:
         _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
                                staff.RemovedWorktree(local_machine(), self.alpha), expected=unit_membership("showrunner-example", ALPHA).worktree)
-        content = self.doc.read_text(encoding="utf-8")
-        self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
-        production = production_units.read_production(self.doc)
+        production = production_doc.read_production(self.doc)
         with self.assertRaisesRegex(waiting.WaitingFailure, f"unknown unit {ALPHA}"):
             _ = waiting.named_unit(production, ALPHA)
 
@@ -338,7 +328,7 @@ class WaitingTests(unittest.TestCase):
         return path
 
     def producer_launch_line(self, moment: datetime, *, session: str = ALPHA) -> str:
-        production = production_units.read_production(self.doc)
+        production = production_doc.read_production(self.doc)
         producer_log = self.root / "launch-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         request = add_unit.UnitLaunch(
@@ -348,9 +338,7 @@ class WaitingTests(unittest.TestCase):
             worktree=self.alpha,
             plan=add_unit.PlanGiven(self.root / "alpha-plan.md"),
             port=add_unit.OmittedCell(),
-            owns=add_unit.OmittedCell(),
             session=add_unit.NewSession(),
-            launch_kind=add_unit.NewWorkLaunch(),
             timeout=1.0,
         )
         with redirect_stdout(io.StringIO()):
@@ -360,7 +348,7 @@ class WaitingTests(unittest.TestCase):
 
     def producer_merge_line(self, moment: datetime, unit_tip: str, merge_tip: str,
                             phase: str = "1") -> str:
-        production = production_units.read_production(self.doc)
+        production = production_doc.read_production(self.doc)
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
@@ -377,8 +365,9 @@ class WaitingTests(unittest.TestCase):
         return f"- {moment:%H:%M %Z}: {produced}"
 
     def producer_state_block(self, moment: datetime, phases: dict[str, str]) -> str:
-        production = production_units.read_production(self.doc)
-        judgments = tuple(update_registration.UnitJudgment(session, phase, "none")
+        production = production_doc.read_production(self.doc)
+        judgments = tuple(update_registration.UnitJudgment(
+                              unit_membership("showrunner-example", session).id, phase, "none")
                           for session, phase in phases.items())
         state = update_registration.ShowrunnerState(judgments, (), update_registration.KeepOutstanding())
         return update_registration.state_block(production, state, moment.strftime("%H:%M %Z"))
@@ -541,7 +530,7 @@ class WaitingTests(unittest.TestCase):
         self.assertLess(verdict.index("stdout first"), verdict.index("stderr second"))
         self.assertLess(verdict.index("stderr second"), verdict.index("stdout third"))
 
-    def test_scratch_cleanup_failure_prints_verdict_before_cleanup_failure(self) -> None:
+    def test_scratch_uses_no_worktree_cleanup_and_reuses_the_checkout(self) -> None:
         _ = self.commit(self.alpha, "alpha.txt", "unit work\n")
         _ = self.commit(self.checkout, "merged.txt", "merge branch work\n")
         self.push_scratch_branches()
@@ -560,13 +549,50 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
 '''.replace("__PYTHON__", sys.executable))
         wrapper.chmod(0o755)
         self.env["WAITING_TEST_REAL_GIT"] = real_git or "git"
-        result = self.run_waiting("scratch-test", ALPHA, "--tests", "printf 'green marker\\n'",
+        observed = self.state / "checkout-paths"
+        command = f"pwd -P >> {shlex.quote(str(observed))}; printf 'green marker\\n'"
+        result = self.run_waiting("scratch-test", ALPHA, "--tests", command,
                                   "--state-dir", str(self.state))
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = [line for line in result.stdout.splitlines() if line.startswith("scratch-test:")]
-        self.assertEqual(len(lines), 2, result.stdout)
+        self.assertEqual(len(lines), 1, result.stdout)
         self.assertIn("ok — green", lines[0])
-        self.assertIn("failed — temporary worktree cleanup: stderr: cleanup refused by test wrapper", lines[1])
+        result = self.run_waiting("scratch-test", ALPHA, "--tests", command,
+                                  "--state-dir", str(self.state))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        paths = observed.read_text().splitlines()
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(paths[0], paths[1])
+
+    def test_scratch_post_use_failure_preserves_green_and_red_verdicts(self) -> None:
+        from scripts.copies import copies
+
+        _ = self.commit(self.alpha, "alpha.txt", "unit work\n")
+        _ = self.commit(self.checkout, "merged.txt", "merge branch work\n")
+        self.push_scratch_branches()
+        mark = copies.mark_target
+        for code, verdict in ((0, "ok — green"), (7, "failed — red")):
+            with self.subTest(code=code):
+                calls = 0
+
+                def fail_after_use(tree: Path) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise OSError("cache marking refused")
+                    mark(tree)
+
+                with mock.patch.object(copies, "mark_target", side_effect=fail_after_use):
+                    result = self.run_waiting("scratch-test", ALPHA, "--tests",
+                                              f"printf 'tests ran\\n'; exit {code}",
+                                              "--state-dir", str(self.state))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(len(lines), 2, result.stdout)
+                self.assertIn(verdict, lines[0])
+                self.assertTrue(lines[1].startswith("scratch-test: failed — post-use step:"), result.stdout)
+                self.assertIn("cache marking refused", lines[1])
+                self.assertEqual(self.scratch_log(lines[0]).read_text(), "tests ran\n")
 
     def test_search_reports_other_unit_branch_and_uncommitted_worktree_sites(self) -> None:
         _ = self.commit(self.beta, "src/beta.py", "old_public_name()\n")
@@ -624,7 +650,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
     def test_eta_request_records_requested_alone_once_per_phase(self) -> None:
         seen_path = self.state / "eta_seen.json"
         original = json.dumps({
-            f"{ALPHA}|{PHASE}": {
+            f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {
                 "text": "ETA 14:00",
                 "first_seen": "2026-10-07T01:00",
                 "requested": False,
@@ -636,7 +662,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", first.stdout)
         seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text()))
-        self.assertEqual(seen, {f"{ALPHA}|{PHASE}": {"requested": True}})
+        self.assertEqual(seen, {f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {"requested": True}})
         requested_bytes = seen_path.read_bytes()
         repeated = self.run_waiting("eta-request", ALPHA, "--phase", PHASE,
                                     "--state-dir", str(self.state))
@@ -662,7 +688,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
-        self.assertEqual(set(seen), {f"{ALPHA}|{phase}" for phase in phases})
+        self.assertEqual(set(seen), {f"{unit_membership('showrunner-example', ALPHA).id}|{phase}" for phase in phases})
         self.assertFalse([path for path in self.state.iterdir() if path.suffix == ".tmp"])
 
     def test_parallel_eta_requests_for_one_phase_print_once(self) -> None:
@@ -673,7 +699,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(sum(stdout.count(f"request /unit:eta: {ALPHA}")
                              for stdout, _ in outputs), 1)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
-        self.assertEqual(seen, {f"{ALPHA}|{PHASE}": {"requested": True}})
+        self.assertEqual(seen, {f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {"requested": True}})
 
     def test_eta_request_waits_for_its_state_lock(self) -> None:
         # The child proves it reached the held lock, rather than racing startup
@@ -756,8 +782,6 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
         _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
                                staff.RemovedWorktree(local_machine(), self.alpha), expected=unit_membership("showrunner-example", ALPHA).worktree)
-        content = self.doc.read_text(encoding="utf-8")
-        self.write(self.doc, content.replace("`docs/alpha.md`", "retired after completion", 1))
         now = datetime.now(ZoneInfo("America/Los_Angeles"))
         opened = now - timedelta(minutes=10)
         self.write(self.log, "\n".join((
@@ -946,7 +970,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
         output = io.StringIO()
         with mock.patch.object(waiting, "datetime", AgendaClock), redirect_stdout(output):
-            waiting.agenda(production_units.read_production(self.doc), self.state)
+            waiting.agenda(production_doc.read_production(self.doc), self.state)
         self.assertIn("agenda: ok — 0 new items", output.getvalue())
         self.assertFalse((self.state / "agenda_seen.json").exists())
 
@@ -977,7 +1001,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         output = io.StringIO()
         clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
         with mock.patch.dict(os.environ, self.env), mock.patch.object(waiting, "datetime", clock), redirect_stdout(output):
-            waiting.waits(production_units.read_production(self.doc))
+            waiting.waits(production_doc.read_production(self.doc))
         found = re.search(r"open (\d+) minutes", output.getvalue())
         self.assertIsNotNone(found, output.getvalue())
         age = int(found.group(1)) if found else 0

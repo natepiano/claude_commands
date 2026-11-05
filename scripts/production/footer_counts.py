@@ -11,7 +11,7 @@ from scripts.lib import conf
 from scripts.production import change_routing, staff
 import proposals_folder
 import proposals_table
-from production_units import Refusal, production_field
+from scripts.production.production_doc import Refusal, production_field
 
 if TYPE_CHECKING:
     from update_registration import QuestionStaff
@@ -97,11 +97,11 @@ def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | 
 
 
 def routing_sources(record: staff.StaffSnapshot | None = None) -> list[Path]:
-    """Watch staff, all review lists, and delivery records for tab count changes."""
+    """Watch configuration, staff, review lists, and delivery records for count changes."""
     root = change_routing.review_root()
     record = record if record is not None else staff.snapshot()
     lists = change_review.lists_directory()
-    return [conf.path("change_review"), lists, *lists.glob(change_review.PREFIX + "*.md"),
+    return [conf.path("change_review"), conf.path("review_links"), lists, *lists.glob(change_review.PREFIX + "*.md"),
             *(Path(path) for path in record.inputs), root, *root.glob(".review-link-delivery-*")]
 
 
@@ -127,7 +127,8 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
             found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
         except OSError:
             pass
-    from update_registration import QuestionFolder, QuestionStaff, question_folder, question_records_for_document
+    from update_registration import (QuestionFolder, QuestionStaff, RegistrationFailure,
+                                     question_folder, question_records_for_document)
 
     try:
         if identities is None:
@@ -138,11 +139,8 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
                 found.append(questions.path)
             found.extend(record.path for record in question_records_for_document(doc, identities)
                          if record.status == "open")
-    except staff.StaffRefused as error:
-        print(f"questions: refused — {error}", file=sys.stderr)
-        raise SystemExit(2) from error
-    except OSError:
-        pass
+    except (staff.StaffRefused, RegistrationFailure, OSError) as error:
+        print(f"questions: unavailable — {error}", file=sys.stderr)
     return found
 
 

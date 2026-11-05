@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.cli_fixture import process_boundary
+
 import json
 import shutil
 import subprocess
@@ -26,6 +28,8 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    # Keep the child CLI process boundary.
+    @process_boundary
     def test_attached_child_handoff_merges_without_a_units_row_and_acknowledges_after_push(self) -> None:
         _ = self.child_production()
         checkpoint = self.checkpoint()
@@ -284,11 +288,11 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.events("send.py"), [])
     def test_style_unit_none_owns_needs_explicit_ticket_file_allowance(self) -> None:
-        self.production_doc(owns_cell="none — takes what the board leaves free")
+        self.production_doc(owns=("none",))
         checkpoint = self.checkpoint(relative="src/lib.rs", content="fn fixed() {}\n")
         refused = self.run_checkpoint(checkpoint)
         self.assertNotEqual(refused.process.returncode, 0)
-        self.assertIn("outside Owns: src/lib.rs", refused.process.stdout)
+        self.assertIn("outside responsibilities: src/lib.rs", refused.process.stdout)
         permitted = self.run_checkpoint(checkpoint, "--also", "src/lib.rs")
         self.assertEqual(permitted.process.returncode, 0, permitted.process.stdout + permitted.process.stderr)
         self.assertIn("scope: ok", permitted.process.stdout)

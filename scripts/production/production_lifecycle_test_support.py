@@ -110,12 +110,12 @@ class LifecycleFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         socket_for = showrunners.socket_for
-        marked_units = unit_lookup.marked_units
+        labeled_sessions = unit_lookup.labeled_sessions
         self.staff = StaffTestCase()
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         _ = self.enterContext(mock.patch.object(showrunners, "socket_for", socket_for))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", marked_units))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_sessions", labeled_sessions))
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.root = self.fixture_root
@@ -213,14 +213,7 @@ class LifecycleFixture(unittest.TestCase):
         ]
         if promote:
             lines.append(f"- **Promote:** {promote}")
-        lines.extend([
-            "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| alpha-unit | docs/plans/alpha.md | `{self.alpha}` | alpha-branch | alpha | — | `alpha.txt` |",
-            f"| beta-unit | docs/plans/beta.md | `{self.beta}` | beta-branch | beta | — | `beta.txt` |",
-            "", "## Close-out", "",
-        ])
+        lines.extend(["", "## Close-out", ""])
         if close_out:
             lines.append(close_out)
         lines.extend(["", "## Production rules", "", "- No CI, smoke launch, Mac run, or validate_and_push.sh."])
@@ -254,8 +247,7 @@ class LifecycleFixture(unittest.TestCase):
     def park_fixture_unit(self, name: str, worktree: Path, branch: str) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == name)
         with mock.patch.dict(os.environ, self.env):
-            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id,
-                unit_config.RecordedStartFolder(worktree), unit_config.Branch(branch)))
+            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id, unit_config.Branch(branch)))
 
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         # Restore import-time state just as a fresh CLI would compute it.
@@ -306,20 +298,26 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "lifecycle@example.invalid", cwd=destination)
         return destination
 
+    def owner_id(self, slug: str = "example") -> staff.StaffId:
+        name = "old-showrunner" if slug == "example" else slug
+        return next(row.id for row in staff.find(kind="showrunner") if row.name == name)
+
     def showrunner(self, slug: str, *, live: bool = False) -> None:
-        """An update timer for `slug`'s showrunner, and with `live` a running session it is addressed to."""
+        """Publish the private owner and its update timer."""
         doc = self.root / f"{slug}-production.md"
         self.write(doc, f"# {slug}\n")
+        owners = [row for row in staff.find(kind="showrunner") if row.name == slug]
+        owner = (staff.set_doc(owners[0].id, staff.LiveDoc("natedev", doc)) if owners
+                 else fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", doc)))
         self.write(self.state / "notifier" / f"showrunner-{slug}" / "conf",
-                   f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {doc}\n")
+                   f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {doc}\n")
         if live:
-            # This test's own process stands in for the session's: it is alive while the lifecycle runs.
             self.write(self.state / "sessions" / f"{os.getpid()}.json",
-                       json.dumps({"pid": os.getpid(), "name": f"{slug}-name", "sessionId": f"{slug}-session",
+                       json.dumps({"pid": os.getpid(), "name": f"{slug}-name", "sessionId": owner.current_session,
                                    "messagingSocketPath": str(self.root / f"{slug}.sock")}))
 
     def reports_to(self, child: str, parent: str) -> Path:
-        path = self.state / "showrunner" / child / "parent"
+        path = self.state / "showrunner" / self.owner_id(child) / "parent"
         self.write(path, parent + "\n")
         return path
 

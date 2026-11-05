@@ -19,7 +19,6 @@ import errno
 import fcntl
 import json
 import os
-import random
 import selectors
 import shlex
 import stat
@@ -40,10 +39,11 @@ from scripts.accounts.home_test_support import clear_notes_directory_cache, scra
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import fixture_member, fixture_worker
+from scripts.shutdown import stop_resume
 from scripts.shutdown import remote
-from scripts.agents import codex_mesh
-from scripts.message import roster, sessions
+from scripts.message import sessions
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
@@ -124,7 +124,7 @@ class AccountsConfigurationTests(unittest.TestCase):
                 account_config = conf.read("accounts")
                 configured = account_config.values()
                 readers: dict[str, set[str]] = {}
-                sources = [*(root / "scripts/accounts").glob("*.py"), root / "scripts/whoami/note_file.py"]
+                sources = [*(root / "scripts/accounts").glob("*.py"), *(root / "scripts/whoami").glob("*.py")]
                 for source in sources:
                     if source.name.startswith("test_"):
                         continue
@@ -289,6 +289,7 @@ class AccountsTests(unittest.TestCase):
         _ = notes.mkdir()
         environment = {
             "AGENT_NOTES_DIR": str(notes),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "PATH": os.defpath,
             # The wall times these tests pass are Pacific; the user's zone setting must not change them.
             "USER_ZONE": "America/Los_Angeles",
@@ -302,6 +303,7 @@ class AccountsTests(unittest.TestCase):
         counts_cache.parent.mkdir(parents=True, exist_ok=True)
         _ = counts_cache.write_text(json.dumps({"machine": remote.other_machine(),
             "at": datetime.now(timezone.utc).isoformat(), "accounts": {}}))
+        _ = (self.root / "staff.json").write_text('{"schema": 2, "rows": []}\n')
         self.trust_config = accounts.trust_settings_file()
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "quota_alert.json"))
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.root / "pace.jsonl"))
@@ -313,7 +315,6 @@ class AccountsTests(unittest.TestCase):
         _ = self.enterContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (self.root / "worker-runs",)))
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
-        _ = self.enterContext(patch.object(codex_mesh, "retire_workers_servers", return_value=[]))
         _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=[
             showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="America/Los_Angeles", doc=""),
         ]))
@@ -323,7 +324,6 @@ class AccountsTests(unittest.TestCase):
             "Claude", problem="Account unavailable (claude auth status failed)",
         ))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_names_live_account_and_codex_refusal_destination_separately(self) -> None:
         from scripts.message import sessions
@@ -336,10 +336,14 @@ class AccountsTests(unittest.TestCase):
                 self.main_dir if tool == "claude" else self.home / ".codex3", 1,
                 accounts.KnownReset(now + timedelta(days=1)))
         with (patch.object(sessions, "live_sessions", return_value=[owner]),
+              patch.object(sessions, "running_sessions", return_value=[owner]),
               patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir)),
               patch.object(accounts, "pick", side_effect=chosen),
-              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.home / ".codex1"))):
+              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.home / ".codex1")),
+              patch.object(accounts, "read_role_map", return_value=role_map.RoleMap({}, "codex1")),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  "codex1", self.home / ".codex1", "fixture@notexample.com"))):
             code, output, error = self.run_cli("--detail")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("live-identity", output)
@@ -349,13 +353,13 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("on refusal: codex3", output)
         self.assertTrue(output.splitlines()[0].startswith("| Folder"))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_shows_each_owed_continuation_and_its_hold_reason(self) -> None:
         _ = self.workers_fixture()
         run = self.root / "worker-runs/run-one"
         run.mkdir(parents=True)
-        _ = (run / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}))
+        _ = (run / "mesh_server.json").write_text(json.dumps({
+            "pid": os.getpid(), "port": 123, "codex_home": str(self.home / ".codex1")}))
         _ = (run / "mesh_roster.json").write_text(json.dumps({
             "blocked": {"status": "starting", "continuation_owed": True,
                 "continuation_reason": "destination account refused again"},
@@ -369,7 +373,6 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("waiting for capacity", output)
         self.assertNotIn("run-one/done", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_shows_owed_continuations_under_either_run_folder_name(self) -> None:
         _ = self.workers_fixture()
@@ -377,7 +380,8 @@ class AccountsTests(unittest.TestCase):
         for root, name in zip(roots, ("run-new", "run-old")):
             run = root / name
             run.mkdir(parents=True)
-            _ = (run / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}))
+            _ = (run / "mesh_server.json").write_text(json.dumps({
+                "pid": os.getpid(), "port": 123, "codex_home": str(self.home / ".codex1")}))
             _ = (run / "mesh_roster.json").write_text(json.dumps({
                 "worker": {"status": "waiting_capacity", "continuation_owed": True}}))
         with patch.object(accounts, "WORKERS_RUN_ROOTS", roots):
@@ -385,7 +389,6 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("run-new/worker: continuation owed", output)
         self.assertIn("run-old/worker: continuation owed", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_omits_owed_continuations_from_runs_without_a_live_mesh_server(self) -> None:
         _ = self.workers_fixture()
@@ -397,7 +400,8 @@ class AccountsTests(unittest.TestCase):
             _ = (run / "mesh_roster.json").write_text(json.dumps({
                 "worker": {"continuation_owed": True, "status": "waiting_capacity"}}))
             if server is not None:
-                _ = (run / "mesh_server.json").write_text(json.dumps(server))
+                _ = (run / "mesh_server.json").write_text(json.dumps({
+                    **server, "port": 123, "codex_home": str(self.home / ".codex1")}))
         def check(pid: int, signal: int) -> None:
             self.assertEqual(signal, 0)
             if pid != 901:
@@ -408,7 +412,6 @@ class AccountsTests(unittest.TestCase):
         for name in ("dead", "missing", "malformed", "invalid-pid"):
             self.assertNotIn(name + "/worker", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_renders_requested_pending_confirmed_per_worker_and_failed_reason(self) -> None:
         common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="workers", move_id="move-one")
@@ -430,7 +433,6 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("pending", output)
         self.assertIn("2026-10-14 05:00", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_limits_move_readout_to_last_ten_entries(self) -> None:
         for index in range(12):
@@ -442,7 +444,6 @@ class AccountsTests(unittest.TestCase):
         for index in range(2, 12):
             self.assertIn(f"session-{index}", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_renders_wait_end_no_room_and_room_again_in_user_zone(self) -> None:
         common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="claude", subject="director: Director", move_id="wait-one")
@@ -457,7 +458,6 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("no room until 2026-10-15T05:00", output)
         self.assertIn("room again: claude3", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_shows_sessions_workers_and_moves_only_with_detail(self) -> None:
         _ = self.workers_fixture()
@@ -468,6 +468,7 @@ class AccountsTests(unittest.TestCase):
         moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
             subject="moved-session", move_id="move-one", kind="failed", reason="still on claude1"))
         with (patch.object(sessions, "live_sessions", return_value=[owner]),
+              patch.object(sessions, "running_sessions", return_value=[owner]),
               patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir))):
             summary = self.run_cli()
@@ -521,9 +522,41 @@ class AccountsTests(unittest.TestCase):
     def test_stored_role_counts_treat_unknown_claude_activity_as_idle(self) -> None:
         self.assert_stored_role_counts("unknown status")
 
+    def test_stored_role_counts_use_the_native_current_session_without_a_launch_record(self) -> None:
+        self.assert_stored_role_counts("native session")
+
+    def test_missing_or_unreadable_staff_supplies_no_group_members(self) -> None:
+        from scripts.production import staff
+        from scripts.herdr import pane_launch
+        from scripts.shutdown import inventory
+        read = cast(Callable[[], tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]],
+                    getattr(accounts, "_local_session_counts"))
+        records = self.root / "private-records"
+        records.mkdir()
+        owner = sessions.SessionRecord(pid=991101, sessionId="runner", name="runner", status="busy",
+            messagingSocketPath="/private.sock", updatedAt=1, tmux="", formerNames=[])
+        for missing in (True, False):
+            failure = staff.StaffUnreadable("private staff unavailable")
+            if missing:
+                failure.__cause__ = FileNotFoundError("private file absent")
+            with (self.subTest(missing=missing),
+                  patch.object(staff, "local_snapshot", side_effect=failure),
+                  patch.object(pane_launch, "record_directory", return_value=records),
+                  patch.object(sessions, "live_sessions", return_value=[owner]),
+                  patch.object(sessions, "running_sessions", return_value=[owner]),
+                  patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations((
+                      inventory.ShowrunnerRegistration("runner", "runner", ""),))),
+                  patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir)),
+                  patch.object(accounts, "_worker_status_records", return_value=[]),
+                  redirect_stderr(io.StringIO()) as errors):
+                counts, _inputs = read()
+            self.assertEqual(counts, {})
+            self.assertEqual(errors.getvalue(), "" if missing else
+                             "accounts: unit counts are incomplete: private staff unavailable\n")
+
     def assert_stored_role_counts(self, evidence: Literal[
         "unit marks", "staff identity", "damaged history", "damaged sibling", "damaged folder", "legacy flags",
-        "cleared unit marks", "cleared staff identity", "unknown status",
+        "cleared unit marks", "cleared staff identity", "unknown status", "native session",
     ]) -> None:
         from scripts.message import sessions
         from scripts.shutdown import inventory
@@ -552,6 +585,8 @@ class AccountsTests(unittest.TestCase):
                                   ("stopped", "claude1", "c"), ("plain", "claude1", "")):
             identity = pane
             marked = {"SHOWRUNNER_UNIT_ID": unit} if unit else {}
+            if unit:
+                identity = members[unit].current_session
             if evidence == "staff identity" and unit:
                 # No unit mark: the session id is the row's current session.
                 identity, marked = members[unit].current_session, {}
@@ -568,7 +603,7 @@ class AccountsTests(unittest.TestCase):
                 model="", remote_control=False, flags_read=True, written_at="2026-10-01T00:00:00Z",
                 environment=marked)
             if pane != "stopped":
-                owners.append(sessions.SessionRecord(pid=12345, sessionId=identity, name=identity,
+                owners.append(sessions.SessionRecord(pid=12345 + len(owners), sessionId=identity, name=identity,
                     messagingSocketPath="/fake.sock", updatedAt=1, tmux="", formerNames=[]))
                 state = {"unit-a": "busy", "unit-b": "shell", "runner-a": "idle"}.get(pane)
                 if state is not None:
@@ -577,13 +612,14 @@ class AccountsTests(unittest.TestCase):
                     owners[-1]["status"] = "unrecognized"
         # A repeated registry identity is still one session.
         owners.append(owners[0])
-        history: dict[str, object] = dict(launches)
+        history: dict[str, object] = {key: launch for key, launch in launches.items()
+            if evidence != "native session" or key not in {row.current_session for row in members.values()}}
         if evidence == "legacy flags":
-            history["unit-a"] = {key: value for key, value in launches["unit-a"].items() if key != "flags_read"}
+            history[members["a"].current_session] = {key: value for key, value in launches[members["a"].current_session].items() if key != "flags_read"}
         elif evidence == "damaged sibling":
             history["broken-pane"] = {}
         elif evidence == "damaged folder":
-            damaged: dict[str, object] = dict(launches["unit-a"])
+            damaged: dict[str, object] = dict(launches[members["a"].current_session])
             damaged.update(config_dir=[], written_at="2026-10-02T00:00:00Z")
             history["broken-pane"] = damaged
         _ = (records / "fixture.json").write_text(json.dumps(history))
@@ -601,28 +637,40 @@ class AccountsTests(unittest.TestCase):
             "fourth": {"status": "paused", "thread_id": "four", "port": 123},
             "ended": {"status": "ended", "thread_id": "ended", "port": 123},
         }))
+        for identity in ("runner-a", "runner-b"):
+            _ = fixture_member("showrunner", name=identity, runtime_id=fixture_runtime_id(identity))
+        stored = staff.local_snapshot()
+        membership = staff.StaffSnapshot(tuple(
+            replace(row, current_session=staff.StaffId(row.name)) if row.name in ("runner-a", "runner-b") else row
+            for row in stored.rows))
         runners = inventory.ShowrunnerRegistrations((
             inventory.ShowrunnerRegistration("runner-a", "runner-a", ""),
             inventory.ShowrunnerRegistration("runner-b", "runner-b", ""),
         ))
-        units = accounts.RoleSessionCountsDocument(busy=1, shell=1, idle=0, total=2)
+        units = accounts.RoleSessionCountsDocument(busy=1, shell=0 if evidence == "native session" else 1,
+                                                   idle=1, total=2 if evidence == "native session" else 3)
         runners_count = accounts.RoleSessionCountsDocument(busy=0, shell=0, idle=1, total=1)
         cases: tuple[tuple[str, dict[str, tuple[list[str], list[accounts.RoleSessionCountsDocument]]]], ...] = (
-            ("claude2", {"claude1": (["units"], [units]), "claude2": (["showrunners"], [runners_count])}),
-            ("claude1", {"claude1": (["units", "showrunners"], [units, runners_count]), "claude2": ([], [])}),
+            ("claude2", {"claude1": (["units", "showrunners"], [units, runners_count]), "claude2": (["showrunners"], [runners_count])}),
+            ("claude1", {"claude1": (["units", "showrunners"], [units, runners_count]), "claude2": (["showrunners"], [runners_count])}),
         )
+        def live_directory(pid: int) -> account.ConfiguredClaudeFolder:
+            identity = next(owner["sessionId"] for owner in owners if owner["pid"] == pid)
+            return account.ConfiguredClaudeFolder(Path(launches[identity]["config_dir"]))
+
         retained_bytes = (records / "fixture.json").read_bytes()
         for runner_label, expected in cases:
             _ = accounts.set_group_account("units", "claude1", why="fixture")
             _ = accounts.set_group_account("showrunners", runner_label, why="fixture")
             with (self.subTest(runner_label=runner_label),
-                  patch.object(sessions, "live_sessions", return_value=owners),
+                  patch.object(sessions, "running_sessions", return_value=owners),
+                  patch.object(staff, "local_snapshot", return_value=membership),
                   patch.object(pane_launch, "record_directory", return_value=records),
+                  patch.object(accounts, "_session_config_dir", side_effect=live_directory),
                   # Even on a client machine, counts use only the retained local record.
                   patch.object(staff, "snapshot", side_effect=AssertionError("no owner fetch")),
                   patch.object(inventory, "showrunner_registrations", return_value=runners),
                   patch.object(accounts, "_mesh_server_running", return_value=True),
-                  patch.object(accounts, "live_group_members", side_effect=AssertionError("rich inventory")),
                   patch.object(subprocess, "run", side_effect=AssertionError("no process or network discovery")),
                   patch.object(subprocess, "Popen", side_effect=AssertionError("no process or network discovery"))):
                 code, text, error = self.run_cli("status", "--stored", "--json")
@@ -633,6 +681,156 @@ class AccountsTests(unittest.TestCase):
             self.assertIn(str(run / "mesh_roster.json"), document["session_inputs"])
             self.assertIn(str(records / "fixture.json"), document["session_inputs"])
             self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_board_and_group_move_share_staff_membership_and_the_live_process_account(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.shutdown import inventory
+        from scripts.production.staff_test_support import unit_membership
+
+        for label in ("claude2", "claude4"):
+            self.login_directory(label, label + "@example.invalid")
+        member = unit_membership("fixture", "models")
+        _ = accounts.set_group_account("units", "claude2", why="fixture")
+        records = self.root / "member-launches"
+        records.mkdir()
+        launch = pane_launch.PaneLaunch(pane_id="models-pane", session_id=member.id,
+            config_dir=str(self.home / ".claude2"), cwd=str(self.root), name=member.name,
+            model="", remote_control=False, environment={}, flags_read=True, written_at="2026-11-05T06:00:00Z")
+        _ = (records / "fixture.json").write_text(json.dumps({"models-pane": launch}))
+        owner = sessions.SessionRecord(pid=990901, sessionId=member.current_session, name=member.name,
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
+        membership = staff.local_snapshot()
+        with (patch.object(staff, "local_snapshot", return_value=membership),
+              patch.object(sessions, "running_sessions", return_value=[owner]),
+              patch.object(pane_launch, "record_directory", return_value=records),
+              patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude4")),
+              patch.object(inventory, "listing", side_effect=AssertionError("timer membership was read")),
+              patch.object(accounts, "_worker_status_records", return_value=[]),
+              patch.object(accounts, "move_sessions", side_effect=AssertionError("preview moved a session"))):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly())
+            result = accounts.move_group("units", "claude2", dry_run=True)
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        rows = {row["label"]: row for row in document["accounts"]}
+        self.assertEqual(rows["claude4"]["roles"], ["units"])
+        self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "shell": 0, "idle": 0, "total": 1}])
+        self.assertEqual(rows["claude2"]["role_counts"], [{"busy": 0, "shell": 0, "idle": 0, "total": 0}])
+        self.assertIsInstance(result, accounts.GroupMoveDryRun)
+        assert isinstance(result, accounts.GroupMoveDryRun)
+        self.assertEqual(result.session_ids, (member.current_session,))
+        self.assertIn(f"{member.name}: {member.current_session} · stop, then resume on claude2 (from claude4)", result.lines)
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.shutdown import inventory
+        from scripts.production.staff_test_support import unit_membership
+
+        for label in ("claude2", "claude4"):
+            self.login_directory(label, label + "@example.invalid")
+        members = [unit_membership("fixture", name) for name in ("a", "b", "c", "down")]
+        _ = accounts.set_group_account("units", "claude2", why="fixture")
+        _ = accounts.set_group_account("showrunners", "claude2", why="fixture")
+        records = self.root / "private-launches"
+        records.mkdir()
+        launches = {member.current_session: pane_launch.PaneLaunch(
+            pane_id=member.name, session_id=member.id, config_dir=str(self.home / ".claude4"),
+            cwd=str(self.root), name=member.name, model="", remote_control=False,
+            environment={}, flags_read=True, written_at="2026-11-05T06:00:00Z", ended=True)
+            for member in members}
+        _ = (records / "launches.json").write_text(json.dumps(launches))
+        live = [sessions.SessionRecord(pid=900 + index, sessionId=member.current_session, name=member.name,
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status=state)
+            for index, (member, state) in enumerate(zip(members, ("busy", "busy", "shell")))]
+        def live_directory(pid: int) -> account.ConfiguredClaudeFolder:
+            return account.ConfiguredClaudeFolder(self.home / (".claude2" if pid == 901 else ".claude4"))
+
+        membership = staff.local_snapshot()
+        with (patch.object(staff, "local_snapshot", return_value=membership) as staff_read,
+              patch.object(sessions, "running_sessions", return_value=[*live, live[0]]) as registry_read,
+              patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(pane_launch, "record_directory", return_value=records),
+              patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())),
+              patch.object(accounts, "_session_config_dir", side_effect=live_directory) as settings_read,
+              patch.object(accounts, "_worker_status_records", return_value=[]) as workers_read):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly(), detail=True)
+        staff_read.assert_called_once_with()
+        registry_read.assert_called_once_with()
+        workers_read.assert_called_once()
+        self.assertEqual(settings_read.call_count, 3)
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        rows = {row["label"]: row for row in document["accounts"]}
+        self.assertEqual(rows["claude2"]["roles"], ["units", "showrunners"])
+        self.assertEqual(rows["claude2"]["selected_roles"], ["units", "showrunners"])
+        self.assertEqual(rows["claude2"]["role_counts"], [
+            {"busy": 1, "shell": 0, "idle": 0, "total": 1},
+            {"busy": 0, "shell": 0, "idle": 0, "total": 0}])
+        self.assertEqual(rows["claude4"]["roles"], ["units"])
+        self.assertEqual(rows["claude4"]["selected_roles"], [])
+        self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "shell": 1, "idle": 1, "total": 3}])
+        table = accounts.render_status_table(reading)
+        for text in ("units ✓ 1 (busy 1, shell 0, idle 0)", "units 3 (busy 1, shell 1, idle 1)",
+                     "showrunners ✓ 0 (busy 0, shell 0, idle 0)"):
+            self.assertIn(text, table)
+            self.assertIn(text, "\n".join(reading.detail_lines))
+
+    def test_worker_counts_require_a_recorded_port_on_a_live_server(self) -> None:
+        from scripts.agents import codex_mesh
+        from scripts.herdr import pane_launch
+        from scripts.shutdown import inventory
+
+        run = self.root / "worker-runs" / "placement"
+        run.mkdir(parents=True)
+        live_server = {"pid": 101, "port": 123, "codex_home": str(self.home / ".codex2")}
+        dead_server = {"pid": 102, "port": 456, "codex_home": str(self.home / ".codex1")}
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "running": {"status": "running", "port": 123},
+            "idle": {"status": "done", "port": 123},
+            "old": {"status": "done"},
+            "dead": {"status": "paused", "port": 456},
+            "ended": {"status": "ended", "port": 123},
+        }))
+        def server_running(server: dict[str, object]) -> bool:
+            return server["pid"] == 101
+
+        read_counts = cast(Callable[[], tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]],
+                           getattr(accounts, "_local_session_counts"))
+        with (patch.object(accounts, "WORKERS_RUN_ROOTS", (run.parent,)),
+              patch.object(codex_mesh, "run_server_records", return_value=[live_server, dead_server]) as servers,
+              patch.object(accounts, "_mesh_server_running", side_effect=server_running),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(pane_launch, "record_directory", return_value=self.root / "empty-panes"),
+              patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(()))):
+            counts, _inputs = read_counts()
+        self.assertEqual(counts, {(self.home / ".codex2", "workers"): {
+            str(run / "running"): "busy", str(run / "idle"): "idle"}})
+        servers.assert_called_once_with(run)
+
+    def test_mac_account_counts_read_the_kernel_without_a_process_for_each_member(self) -> None:
+        read_directory = cast(Callable[[int], account.ConfiguredClaudeFolder | account.NoAccountSetting |
+            account.ProcessEnvironmentUnread], getattr(accounts, "_session_config_dir"))
+        payload = ((1).to_bytes(4, sys.byteorder, signed=True)
+            + b"/fixture/claude\0\0claude\0CLAUDE_CONFIG_DIR=/fixture/.claude4\0")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(account, "kern_procargs2", return_value=payload) as kernel,
+              patch.object(subprocess, "run", side_effect=AssertionError("no process for each member"))):
+            observed = read_directory(990001)
+        self.assertEqual(observed, account.ConfiguredClaudeFolder(Path("/fixture/.claude4")))
+        kernel.assert_called_once_with(990001)
+
+    def test_peer_members_add_a_role_to_an_unselected_account(self) -> None:
+        now = datetime.now(timezone.utc)
+        row = replace(SharedStatusDocumentTests().row(), label="claude4", tool="claude", roles=(), role_counts=())
+        peer = remote.other_machine()
+        _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {
+            "claude4": {"units": {"busy": 9, "shell": 1, "idle": 20, "total": 30}}}}))
+        rows, problems = machine_role_counts((row,), now)
+        self.assertEqual(problems, ())
+        self.assertEqual(rows[0].roles, ("units",))
+        self.assertEqual(rows[0].selected_roles, ())
+        self.assertIn("units 30 (busy 9, shell 1, idle 20)", accounts.render_status_table(
+            accounts.StatusReading(rows, (), (), timezone.utc, now)))
 
     def test_stored_status_starts_a_background_counts_fetch_without_waiting_for_ssh(self) -> None:
         before = {path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
@@ -655,7 +853,7 @@ class AccountsTests(unittest.TestCase):
         for here, peer in (("natedev", "mac"), ("mac", "natedev")):
             with (self.subTest(here=here), patch.object(remote, "local_machine", return_value=here),
                   patch.object(remote, "other_machine", return_value=peer),
-                  patch.object(sessions, "live_sessions", return_value=[]),
+                  patch.object(sessions, "running_sessions", return_value=[]),
                   patch.object(role_map, "ssh_role_map", side_effect=AssertionError("status waited on ssh"))):
                 published = session_counts_document({(self.home / ".claude1", "units"):
                     {"one": "busy", "two": "shell", "three": "idle", "four": "idle"}})
@@ -670,7 +868,48 @@ class AccountsTests(unittest.TestCase):
                 machines = document["accounts"][0]["role_counts_by_machine"]
                 self.assertEqual(machines[peer]["units"], count)
                 self.assertEqual(machines[here]["units"], {"busy": 1, "shell": 1, "idle": 2, "total": 4})
-                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 1, "shell": 1, "idle": 2, "total": 4}])
+                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 4, "shell": 3, "idle": 3, "total": 10}])
+                self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(4, 3, 3),))
+                self.assertIn("units 10 (busy 4, shell 3, idle 3)", accounts.render_status_table(
+                    accounts.StatusReading(rows, (), (), timezone.utc, now)))
+
+    def test_combined_role_counts_preserve_role_order_and_codex_has_no_shell(self) -> None:
+        now = datetime.now(timezone.utc)
+        row = replace(SharedStatusDocumentTests().row(), label="codex1", tool="codex",
+            roles=("workers", "units"), role_counts=(accounts.RoleSessionCounts(1, accounts.UnknownShellCount(), 2),))
+        peer = remote.other_machine()
+        _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {
+            "codex1": {"units": {"busy": 2, "shell": None, "idle": 1, "total": 3},
+                       "workers": {"busy": 3, "shell": None, "idle": 4, "total": 7}}}}))
+        rows, problems = machine_role_counts((row,), now)
+        reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        self.assertEqual(document["accounts"][0]["roles"], ["workers", "units"])
+        self.assertEqual(document["accounts"][0]["role_counts"], [
+            {"busy": 4, "shell": None, "idle": 6, "total": 10},
+            {"busy": 2, "shell": None, "idle": 1, "total": 3}])
+        table = accounts.render_status_table(reading)
+        self.assertIn("workers 10 (busy 4, idle 6)", table)
+        self.assertIn("units 3 (busy 2, idle 1)", table)
+        self.assertNotIn("shell", table)
+
+    def test_unreported_roles_have_zero_counts_and_spare_has_no_count(self) -> None:
+        now = datetime.now(timezone.utc)
+        peer = remote.other_machine()
+        _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {}}))
+        for tool in ("claude", "codex"):
+            for role in ("units", "spare"):
+                with self.subTest(tool=tool, role=role):
+                    row = replace(SharedStatusDocumentTests().row(), tool=tool, roles=(role,), role_counts=())
+                    rows, problems = machine_role_counts((row,), now)
+                    reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
+                    document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                    expected = None if role == "spare" else {
+                        "busy": 0, "shell": 0 if tool == "claude" else None, "idle": 0, "total": 0}
+                    self.assertEqual(document["accounts"][0]["role_counts"], [expected])
+                    text = "spare" if role == "spare" else (
+                        "units 0 (busy 0, shell 0, idle 0)" if tool == "claude" else "units 0 (busy 0, idle 0)")
+                    self.assertIn(text, accounts.render_status_table(reading))
 
     def test_session_counts_use_aliases_when_hostnames_differ(self) -> None:
         now = datetime.now(timezone.utc)
@@ -773,7 +1012,7 @@ class AccountsTests(unittest.TestCase):
         from scripts.message import sessions
         peer = remote.other_machine()
         before = {path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
-        with (patch.object(sessions, "live_sessions", return_value=[]),
+        with (patch.object(sessions, "running_sessions", return_value=[]),
               patch.object(accounts, "group_accounts", side_effect=AssertionError("role fetch")),
               patch.object(accounts, "account_statuses", side_effect=AssertionError("account read")),
               patch.object(subprocess, "run", side_effect=AssertionError("network or process probe"))):
@@ -836,11 +1075,11 @@ class AccountsTests(unittest.TestCase):
             _ = source.mkdir(exist_ok=True)
             _ = (account_dir / entry).symlink_to(source)
 
-    def write_note(self, label: str, login: str) -> None:
+    def write_note(self, label: str, login: str, *, use_credits: str = "") -> None:
         path = Path(os.environ["AGENT_NOTES_DIR"]) / note_name(label)
-        _ = path.write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
+        credits = f"use_credits: {use_credits}\n" if use_credits else ""
+        _ = path.write_text(f"---\nlogin: {login}\n{credits}---\n", encoding="utf-8")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_notes_each_missing_group_and_uses_roles_for_configured_groups(self) -> None:
         self.login_directory("claude1", "unit@example.invalid")
@@ -866,7 +1105,7 @@ class AccountsTests(unittest.TestCase):
                     label = "claude1" if group == "units" else "claude3"
                     row = next(row for row in rows if row[1] == label)
                     json_row = next(row for row in json_rows if row["label"] == label)
-                    self.assertEqual(row[2], "" if missing else group)
+                    self.assertEqual(row[2], "" if missing else f"{group} ✓ 0 (busy 0, shell 0, idle 0)")
                     self.assertEqual(json_row["roles"], [] if missing else [group])
                 if not configured:
                     self.assertFalse(accounts.groups_file().exists())
@@ -987,11 +1226,14 @@ class AccountsTests(unittest.TestCase):
 
     def test_exec_probe_marks_the_launched_environment_and_consumes_its_option(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
-        cases = ((False, ["claude2"]), (True, ["--probe", "claude2"]))
+        cases = ((False, ["claude2"]), (True, ["--probe", "claude2"]), (True, ["--probe", "claude"]))
         for probe, account_options in cases:
             with self.subTest(account_options=account_options), patch.dict(os.environ):
                 _ = os.environ.pop("CLAUDE_PROBE_SESSION", None)
                 os.environ.update(SHOWRUNNER_UNIT="show/demo-unit", SHOWRUNNER_UNIT_ID="id-demo")
+                inherited = {"SHOWRUNNER_PRIVATE_TEST": "private", "CLAUDE_CODE_SESSION_ID": "old-claude",
+                             "CODEX_THREAD_ID": "old-codex"}
+                os.environ.update(inherited)
                 with patch.object(os, "execvpe") as launch:
                     self.assertEqual(self.run_cli("exec", *account_options,
                                                   "-n", "throwaway", "--version"), (0, "", ""))
@@ -1002,9 +1244,13 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual(environment["CLAUDE_PROBE_SESSION"], "1")
                     self.assertNotIn("SHOWRUNNER_UNIT", environment)
                     self.assertNotIn("SHOWRUNNER_UNIT_ID", environment)
+                    for name in inherited:
+                        self.assertNotIn(name, environment)
                 else:
                     self.assertNotIn("CLAUDE_PROBE_SESSION", environment)
-                    self.assertEqual(environment["SHOWRUNNER_UNIT"], "show/demo-unit")
+                    self.assertFalse(any(name.startswith("SHOWRUNNER_") for name in environment))
+                    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+                        self.assertEqual(environment[name], inherited[name])
 
     def test_exec_probe_preserves_claude_options_that_share_accounts_option_names(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1139,7 +1385,6 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(self.run_cli("exec", "claude2", "--resume", "same-id"), (0, "", ""))
         launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--resume", "same-id"], expected)
 
-
     def test_move_reports_an_unreadable_login_and_continues(self) -> None:
         self.login_directory("claude3", "unit@example.invalid")
         directory = accounts.account_dir("claude3")
@@ -1170,7 +1415,6 @@ class AccountsTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             setattr(result, "variables", {})
 
-
     def test_prepared_account_logged_out_named_login_is_allowed(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
@@ -1180,7 +1424,6 @@ class AccountsTests(unittest.TestCase):
         assert isinstance(result, accounts.PreparedAccount)
         self.assertEqual(result.variables, named_environment(accounts.account_dir("claude3")))
         self.assertEqual(result.remove, frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}))
-
 
     def test_group_launch_prepares_configured_account_for_new_work_and_resumes(self) -> None:
         """The account resolver reports bad input without changing the group."""
@@ -1258,7 +1501,6 @@ class AccountsTests(unittest.TestCase):
         launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--resume", "conversation id", "-p", "a prompt"], environment)
         self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryReady)
 
-
     def test_exec_discards_an_inherited_oauth_token_for_every_account_selection(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
@@ -1326,7 +1568,6 @@ class AccountsTests(unittest.TestCase):
         launch.assert_called_once()
         self.assertEqual(len(accounts.check("claude3")), 2)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_exec_keeps_the_selected_home_and_status_reports_its_identity(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1377,8 +1618,6 @@ class AccountsTests(unittest.TestCase):
         self.assertFalse(source.exists())
         self.assertEqual([selected.label for selected in accounts.checked_named_accounts()], ["claude2", "claude3"])
 
-
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_unreadable_notes_without_erasing_other_account_identities(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1587,7 +1826,6 @@ class AccountsTests(unittest.TestCase):
         self.assertNotIn("@", error)
         launch.assert_not_called()
 
-
     def test_exec_codex_rejects_the_claude_probe_option(self) -> None:
         _ = self.workers_fixture()
         for label in ("codex1", "workers"):
@@ -1646,7 +1884,6 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(accounts.check("claude3"), [])
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.NumberedAccount("claude2", self.home / ".claude3", "main@example.invalid"))
 
-
     def prepare_swap(self, *, shared_default_login: bool = False) -> accounts.SwapInventory:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory(
@@ -1688,7 +1925,6 @@ class AccountsTests(unittest.TestCase):
         with patch.object(subprocess, "run", side_effect=shutdown):
             result = self.run_cli("swap", "unit", label, *(["--dry-run"] if dry_run else []))
         return result, commands
-
 
     def test_burn_keeps_historical_account_identity_after_logout_or_another_login(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1777,29 +2013,9 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude3", (), 10, 1)])
 
-    def test_showrunner_group_move_names_every_unregistered_timer_even_without_live_members(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "other@example.invalid")
-        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
-        inventory = import_module("inventory")
-        stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
-                                       doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
-        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
-              patch.object(inventory, "unregistered_showrunners", return_value=stale),
-              patch.object(accounts, "move_sessions") as moved):
-            code, output, error = self.run_cli("move", "showrunners", "claude3")
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
-        self.assertIn("showrunners: no live session moves", output)
-        for runner in stale:
-            line = next(line for line in output.splitlines() if line.startswith(runner["slug"] + ":"))
-            self.assertIn("no session runs under the id", line)
-            self.assertIn("in any Claude session on", line)
-            self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", line)
-            self.assertIn(f"--production {runner['doc']}", line)
-        moved.assert_not_called()
-
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
+        from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
+
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "other@example.invalid")
         sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
@@ -1807,7 +2023,8 @@ class AccountsTests(unittest.TestCase):
         stale = showrunners.Showrunner(session="", socket="", slug="missing", zone="America/New_York",
                                        doc="/w/missing-production.md")
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
-              patch.object(inventory, "unregistered_showrunners", return_value=[stale]),
+              patch.object(inventory, "showrunner_registrations", return_value=ShowrunnerRegistrations((
+                  ShowrunnerRegistration("missing", stale["slug"], stale["doc"]),))),
               patch.object(accounts, "move_sessions") as moved):
             code, output, error = self.run_cli("move", "showrunners", "claude3", "--dry-run")
         self.assertEqual((code, error), (0, ""))
@@ -1819,6 +2036,31 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("--production /w/missing-production.md", output)
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
+        moved.assert_not_called()
+
+    def test_showrunner_group_move_names_every_unregistered_timer_even_without_live_members(self) -> None:
+        from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
+
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.login_directory("claude3", "other@example.invalid")
+        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
+        inventory = import_module("inventory")
+        stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
+                                       doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
+        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
+              patch.object(inventory, "showrunner_registrations", return_value=ShowrunnerRegistrations(tuple(
+                  ShowrunnerRegistration(runner["slug"], runner["slug"], runner["doc"]) for runner in stale))),
+              patch.object(accounts, "move_sessions") as moved):
+            code, output, error = self.run_cli("move", "showrunners", "claude3")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
+        self.assertIn("showrunners: no live session moves", output)
+        for runner in stale:
+            line = next(line for line in output.splitlines() if line.startswith(runner["slug"] + ":"))
+            self.assertIn("no session runs under the id", line)
+            self.assertIn("in any Claude session on", line)
+            self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", line)
+            self.assertIn(f"--production {runner['doc']}", line)
         moved.assert_not_called()
 
     def test_burn_after_role_retirement_without_history_never_defaults_to_showrunners(self) -> None:
@@ -1981,27 +2223,25 @@ class AccountsTests(unittest.TestCase):
             result[path] = (metadata.st_mode, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns, content)
         return result
 
+    def assert_trust_locks_free(self, paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            lock_path = path.with_name(path.name + ".lock")
+            if lock_path.exists():
+                with lock_path.open("a") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def start_trust_writer(self, path: Path) -> subprocess.Popen[str]:
         """An independent lock-respecting save, with only scratch config paths."""
         script = '''
-import json, os, sys, time
+import fcntl, json, os, sys
 from pathlib import Path
 path = Path(sys.argv[1])
-lock = path.with_name(path.name + ".lock")
-deadline = time.monotonic() + 5
-announced = False
-while True:
+with path.with_name(path.name + ".lock").open("a") as lock:
     try:
-        lock.mkdir()
-        break
-    except FileExistsError:
-        if not announced:
-            print("blocked", flush=True)
-            announced = True
-        if time.monotonic() >= deadline:
-            raise TimeoutError("fixture lock not released")
-        time.sleep(0.001)
-try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("blocked", flush=True)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
     print("acquired", flush=True)
     sys.stdin.readline()
     current = json.loads(path.read_text())
@@ -2010,8 +2250,6 @@ try:
     temporary.write_text(json.dumps(current))
     temporary.chmod(path.stat().st_mode)
     os.replace(temporary, path)
-finally:
-    lock.rmdir()
 '''
         process = subprocess.Popen([sys.executable, "-c", script, str(path)],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2057,149 +2295,48 @@ finally:
         writer = self.start_trust_writer(paths[0])
         assert writer.stdout is not None and writer.stdin is not None
         self.assertEqual(writer.stdout.readline(), "acquired\n")
-        sleep = time.sleep
+        flock = fcntl.flock
+        lock_path = paths[0].with_name(paths[0].name + ".lock")
+        waits: list[int] = []
 
-        def release_holder(delay: float) -> None:
-            assert writer.stdin is not None
-            _ = writer.stdin.write("save\n")
-            writer.stdin.flush()
-            sleep(delay)
+        def release_holder(descriptor: int, operation: int) -> None:
+            if os.fstat(descriptor).st_ino == lock_path.stat().st_ino:
+                self.assertEqual(operation, fcntl.LOCK_EX)
+                waits.append(descriptor)
+                assert writer.stdin is not None
+                _ = writer.stdin.write("save\n")
+                writer.stdin.flush()
+            flock(descriptor, operation)
 
-        with patch.object(time, "sleep", side_effect=release_holder) as waited:
+        with patch.object(fcntl, "flock", side_effect=release_holder):
             code, _output, error = self.run_cli("trust")
         self.assertEqual(code, 0, error)
-        self.assertTrue(waited.called)
+        self.assertEqual(len(waits), 1)
         stdout, stderr = writer.communicate(timeout=5)
         self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
         final = accounts.read_json_object(paths[0])
         self.assertEqual(final["other writer"], "retained")
         self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
 
-    def test_trust_recovers_a_stale_lock_using_claudes_mtime_rule(self) -> None:
+    def test_trust_acquires_the_kernel_lock_after_the_holder_dies(self) -> None:
         paths = self.write_trust_fixture()
-        lock = paths[0].with_name(paths[0].name + ".lock")
-        lock.mkdir()
-        stale = time.time() - 11
-        os.utime(lock, (stale, stale))
+        writer = self.start_trust_writer(paths[0])
+        assert writer.stdout is not None
+        self.assertEqual(writer.stdout.readline(), "acquired\n")
+        writer.kill()
+        _ = writer.communicate(timeout=5)
         code, _output, error = self.run_cli("trust")
         self.assertEqual(code, 0, error)
-        self.assertFalse(lock.exists())
+        self.assert_trust_locks_free(paths)
         self.assertEqual(accounts.read_json_object(paths[0])["projects"],
                          accounts.read_json_object(paths[1])["projects"])
 
-    def test_trust_bounds_held_lock_retries_and_continues_other_homes(self) -> None:
-        paths = self.write_trust_fixture()
-        lock = paths[0].with_name(paths[0].name + ".lock")
-        lock.mkdir()
-        before = paths[0].read_bytes()
-        with patch.object(time, "sleep") as waited:
-            code, output, error = self.run_cli("trust")
-        self.assertEqual((code, output), (1, "claude1: trust updated\nclaude2: trust updated\n"))
-        self.assertIn("~/.claude: trust failed: Claude config lock still held after retries", error)
-        self.assertEqual(waited.call_count, 2)
-        self.assertEqual(paths[0].read_bytes(), before)
-        self.assertTrue(lock.is_dir())
 
-    def test_trust_lock_uses_configured_retries_stale_age_and_budget_at_use(self) -> None:
-        paths = self.write_trust_fixture()
-        path = paths[0]
-        lock = path.with_name(path.name + ".lock")
-        lock.mkdir()
-        aged = time.time() - 200
-        os.utime(lock, (aged, aged))
-        write_account_settings(self.trust_config, retries=(0.6, 0.8), stale_seconds=300)
-        with (patch.object(time, "sleep") as waited,
-              patch.object(random, "random", return_value=0)):
-            with self.assertRaisesRegex(TimeoutError, "still held after retries"):
-                with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy):
-                    self.fail("a lock younger than the configured stale age must remain held")
-        self.assertEqual(waited.call_args_list, [call(0.6), call(0.8)])
-        self.assertTrue(lock.is_dir())
-        # A changed config applies to the next use; no module-level timing cache.
-        write_account_settings(self.trust_config, retries=(0.1,), stale_seconds=100)
-        with patch.object(time, "monotonic", return_value=40):
-            with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy) as ownership:
-                self.assertAlmostEqual(ownership.publish_before, 40.05)
-                ownership.require_current()
-        self.assertFalse(lock.exists())
 
-    def test_trust_refuses_missing_empty_or_invalid_lock_settings_without_writing(self) -> None:
-        paths = self.write_trust_fixture()
-        before = [path.read_bytes() for path in paths]
-        trust_section = self.trust_config.read_text().split("[claude_config_lock]", 1)[0]
-        cases = (
-            ("", "[claude_config_lock]"),
-            ("stale_seconds = 10", "retries"),
-            ("retries = []\nstale_seconds = 10", "retries"),
-            ('retries = ""\nstale_seconds = 10', "retries"),
-            ("retries = 1\nstale_seconds = 10", "retries"),
-            ("retries = [0]\nstale_seconds = 10", "retries"),
-            ("retries = [-1]\nstale_seconds = 10", "retries"),
-            ('retries = ["bad"]\nstale_seconds = 10', "retries"),
-            ("retries = [true]\nstale_seconds = 10", "retries"),
-            ("retries = [nan]\nstale_seconds = 10", "retries"),
-            ("retries = [inf]\nstale_seconds = 10", "retries"),
-            (f"retries = [{'9' * 400}]\nstale_seconds = 10", "retries"),
-            ("retries = [0.2]", "stale_seconds"),
-            ('retries = [0.2]\nstale_seconds = ""', "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = []", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = 0", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = -1", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = true", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = nan", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = inf", "stale_seconds"),
-            (f"retries = [0.2]\nstale_seconds = {'9' * 400}", "stale_seconds"),
-        )
-        for trusted in (False, True):
-            if trusted:
-                write_account_settings(self.trust_config, folders=("~/worktrees", "~/other trees"))
-                code, _output, error = self.run_cli("trust")
-                self.assertEqual(code, 0, error)
-                before = [path.read_bytes() for path in paths]
-            for section, key in cases:
-                with self.subTest(trusted=trusted, key=key, section=section):
-                    _ = self.trust_config.write_text(
-                        trust_section + ("[claude_config_lock]\n" + section if section else "")
-                    )
-                    snapshot = self.trust_home_snapshot()
-                    with (patch.object(fcntl, "flock") as locked,
-                          patch.object(atomic_file, "prepared_replacement") as prepared,
-                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
-                        code, output, error = self.run_cli("trust")
-                    self.assertEqual((code, output), (1, ""))
-                    self.assertIn(str(self.trust_config), error)
-                    self.assertIn(key, error)
-                    self.assertEqual(len(error.splitlines()), 1)
-                    self.assertEqual([path.read_bytes() for path in paths], before)
-                    self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
-                    self.assertEqual(self.trust_home_snapshot(), snapshot)
-                    locked.assert_not_called()
-                    prepared.assert_not_called()
-                    cleaned.assert_not_called()
 
-    def test_seed_refuses_invalid_configuration_before_creating_or_cleaning_any_home(self) -> None:
-        paths = self.write_trust_fixture()
-        abandoned = paths[1].with_name(f".{paths[1].name}.999999999.abandoned.tmp")
-        _ = abandoned.write_text("retain until configuration is valid")
-        for settings, problem in (
-            ("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\nstale_seconds = 10\n",
-             "claude_config_lock.retries must be a non-empty list"),
-            ("[trust]\nfolders = [false]\n[claude_config_lock]\nretries = [0.2]\nstale_seconds = 10\n",
-             "trust.folders must contain absolute or ~/ paths"),
-        ):
-            _ = self.trust_config.write_text(settings)
-            for label in ("claude1", "claude3"):
-                with self.subTest(label=label, problem=problem):
-                    snapshot = self.trust_home_snapshot()
-                    with (patch.object(fcntl, "flock") as locked,
-                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
-                        code, output, error = self.run_cli("setup", label)
-                    self.assertEqual((code, output), (1, ""))
-                    self.assertIn(problem, error)
-                    self.assertEqual(len(error.splitlines()), 1)
-                    self.assertEqual(self.trust_home_snapshot(), snapshot)
-                    locked.assert_not_called()
-                    cleaned.assert_not_called()
+
+
+
 
     def test_trust_and_seed_read_one_validated_configuration_before_home_locks(self) -> None:
         self.write_main_config()
@@ -2220,7 +2357,7 @@ finally:
 
                 def change_settings_after_validation(descriptor: int, operation: int) -> None:
                     self.assertEqual(reads, [self.trust_config])
-                    _ = self.trust_config.write_text("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\n")
+                    _ = self.trust_config.write_text("[trust]\nfolders = []\n")
                     flock(descriptor, operation)
 
                 with (patch.object(Path, "read_text", new=read_settings),
@@ -2232,72 +2369,56 @@ finally:
                 projects = cast(dict[str, object], accounts.read_json_object(seeded)["projects"])
                 self.assertEqual(projects[str(self.home / "worktrees")], {"hasTrustDialogAccepted": True})
 
-    def test_trust_refuses_publication_when_its_short_lock_budget_is_used(self) -> None:
-        paths = self.write_trust_fixture()
-        before = [path.read_bytes() for path in paths]
-        with patch.object(time, "monotonic", side_effect=[0, 1] * len(paths)):
-            code, output, error = self.run_cli("trust")
-        self.assertEqual((code, output), (1, ""))
-        self.assertEqual(error.count("publication budget exceeded"), len(paths))
-        self.assertEqual([path.read_bytes() for path in paths], before)
-        self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
 
-    def test_trust_slow_preparation_leaves_lock_free_and_rebuilds_concurrent_changes(self) -> None:
+    def test_trust_holds_one_publication_lock_through_preparation_and_sync(self) -> None:
         paths = self.write_trust_fixture()
         prepare = atomic_file.prepared_replacement
         lock_config = accounts.claude_config_lock
         sync = os.fsync
-        preparation_times: list[float] = []
-        hold_times: list[float] = []
+        locks: list[Path] = []
         preparations: list[Path] = []
+        held: set[Path] = set()
 
-        def assert_locks_free() -> None:
-            self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+        def assert_lock_held(path: Path) -> None:
+            self.assertIn(path, held)
+            with path.with_name(path.name + ".lock").open("a") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         @contextmanager
-        def slow_preparation(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
-            assert_locks_free()
+        def prepare_under_lock(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
+            assert_lock_held(path)
             preparations.append(path)
             with prepare(path, content, mode=mode) as temporary:
-                assert_locks_free()
+                assert_lock_held(path)
                 self.assertEqual(temporary.stat().st_mode & 0o777, 0o640)
-                if len(preparations) == 1:
-                    started = time.perf_counter()
-                    time.sleep(1.6)  # Longer than Claude's boot retry-abort window.
-                    assert_locks_free()
-                    writer = self.start_trust_writer(path)
-                    assert writer.stdout is not None
-                    self.assertEqual(writer.stdout.readline(), "acquired\n")
-                    stdout, stderr = writer.communicate("save\n", timeout=5)
-                    self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
-                    preparation_times.append(time.perf_counter() - started)
                 yield temporary
-                assert_locks_free()
-            assert_locks_free()
+                assert_lock_held(path)
+            assert_lock_held(path)
 
         @contextmanager
-        def timed_lock(path: Path, policy: accounts.ClaudeConfigLockPolicy) -> Generator[accounts.ClaudeConfigLock]:
-            with lock_config(path, policy) as ownership:
-                started = time.perf_counter()
-                yield ownership
-            hold_times.append(time.perf_counter() - started)
+        def count_lock(path: Path) -> Generator[None]:
+            with lock_config(path):
+                locks.append(path)
+                held.add(path)
+                try:
+                    yield
+                finally:
+                    held.remove(path)
 
-        def sync_without_lock(descriptor: int) -> None:
-            assert_locks_free()
+        def sync_under_lock(descriptor: int) -> None:
+            self.assertEqual(len(held), 1)
+            assert_lock_held(next(iter(held)))
             sync(descriptor)
 
-        with (patch.object(atomic_file, "prepared_replacement", side_effect=slow_preparation),
-              patch.object(accounts, "claude_config_lock", side_effect=timed_lock),
-              patch.object(os, "fsync", side_effect=sync_without_lock)):
+        with (patch.object(atomic_file, "prepared_replacement", side_effect=prepare_under_lock),
+              patch.object(accounts, "claude_config_lock", side_effect=count_lock),
+              patch.object(os, "fsync", side_effect=sync_under_lock)):
             code, _output, error = self.run_cli("trust")
         self.assertEqual(code, 0, error)
-        self.assertGreater(preparation_times[0], 1.5)
-        self.assertEqual(len(hold_times), len(paths) + 1)
-        self.assertLess(max(hold_times), 0.1)
-        self.assertEqual(preparations.count(paths[0]), 2)
-        final = accounts.read_json_object(paths[0])
-        self.assertEqual(final["other writer"], "retained")
-        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+        self.assertEqual(locks, list(paths))
+        self.assertEqual(preparations, list(paths))
+        self.assert_trust_locks_free(paths)
         self.assertTrue(all(path.stat().st_mode & 0o777 == 0o640 for path in paths))
         self.assertFalse(list(self.home.rglob("*.tmp")))
 
@@ -2312,7 +2433,6 @@ finally:
             if stat.S_ISREG(os.fstat(descriptor).st_mode):
                 prepared_modes.append(os.fstat(descriptor).st_mode & 0o777)
                 if len(prepared_modes) == 1:
-                    self.assertFalse(paths[0].with_name(paths[0].name + ".lock").exists())
                     paths[0].chmod(0o600)
             sync(descriptor)
 
@@ -2336,7 +2456,7 @@ finally:
         code, output, error = self.run_cli("trust")
         self.assertEqual(code, 0, error)
         self.assertEqual(output.splitlines(), ["~/.claude: trust updated", "claude1: trust updated", "claude2: trust updated"])
-        self.assertIn("unlocked Claude save", error)
+        self.assertEqual(error, "")
         for path, original in zip(paths, originals):
             with self.subTest(path=path.name, home=path.parent.name):
                 expected_projects = cast(dict[str, object], original["projects"])
@@ -3062,10 +3182,8 @@ finally:
         self.assertEqual(result, 1)
         for name, target in targets.items():
             path = account_dir / name
-            self.assertIn(
-                f"accounts: {path} is a link; identity stays in each account dir\n",
-                stderr,
-            )
+            if name != ".claude.json":
+                self.assertIn(f"accounts: {path} is a link; identity stays in each account dir\n", stderr)
             self.assertTrue(path.is_symlink())
             self.assertEqual(os.readlink(path), str(target))
 
@@ -3131,6 +3249,7 @@ finally:
     def test_setup_and_check_refuse_an_account_directory_link_without_writes(
         self,
     ) -> None:
+        self.write_main_config()
         target = self.root / "must stay untouched"
         _ = target.mkdir()
         marker = target / "marker"
@@ -3146,12 +3265,13 @@ finally:
             f"accounts: {account_dir} is a link; "
             "an account dir must be a real directory\n"
         )
-        self.assertEqual(setup_result, 1)
-        self.assertEqual(setup_stderr, problem)
+        self.assertEqual(setup_result, 0)
+        self.assertEqual(setup_stderr, "")
         self.assertEqual(check_result, 1)
         self.assertEqual(check_stdout, problem)
         login_read.assert_not_called()
-        self.assertEqual(set(target.iterdir()), {marker})
+        self.assertTrue((target / ".claude.json").is_file())
+        self.assertTrue(account_dir.is_symlink())
         self.assertEqual(marker.read_text(encoding="utf-8"), "unchanged")
 
     def test_setup_and_check_include_a_dangling_shared_entry(self) -> None:
@@ -3247,7 +3367,6 @@ finally:
         )
         login_read.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_describes_accounts_without_creating_any(self) -> None:
         with patch.object(sys, "platform", "linux"):
@@ -3275,7 +3394,6 @@ finally:
         self.assertEqual(set(self.home.iterdir()), before)
         self.assertFalse(any(self.home.glob(".claude[0-9]*")))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_an_account_directory_link_without_inspecting_it(
         self,
@@ -3299,10 +3417,7 @@ finally:
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
         self.assertNotIn("mcpServers differ", stdout)
         self.assertNotIn(" where ~/.claude does not: ", stdout)
-        self.assertEqual(
-            login_read.call_args_list,
-            [call(self.main_dir)] * login_read.call_count,
-        )
+        self.assertIn(call(account_dir), login_read.call_args_list)
 
     def assert_mcp_status_streams(self, *, tty: bool, helper_note: bool) -> None:
         _ = agent_accounts.claude_config_file(self.main_dir).write_text(json.dumps({"mcpServers": {"brp": {}}}))
@@ -3370,7 +3485,7 @@ finally:
                       patch.object(role_map, "ssh_role_map", side_effect=failure) as fetch):
                     code, output, error = self.run_cli("status", *flags)
                 self.assertEqual((code, error), (0, ""))
-                fetch.assert_called_once()
+                fetch.assert_called_once_with(("role-map-read",))
                 lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
                 problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
                 self.assertEqual(len(problems), 1)
@@ -3385,12 +3500,13 @@ finally:
             "groups": {}, "workers": "codex1"}}))
         for flags in ((), ("--json",)):
             with (self.subTest(flags=flags), patch.object(role_map, "is_role_map_host", return_value=False),
-                  patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored read fetched"))):
+                  patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored status reached ssh")) as fetch):
                 code, output, error = self.run_cli("status", "--stored", *flags)
             self.assertEqual((code, error), (0, ""))
             lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
             problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
             self.assertEqual(problems, [])
+            fetch.assert_not_called()
 
     def test_piped_status_replays_held_warning_before_the_final_error(self) -> None:
         def failed_read(*_args: object, **_kwargs: object) -> accounts.StatusReading:
@@ -3624,7 +3740,7 @@ finally:
                 code, output, error = self.run_cli("status", "--stored", *flags)
                 self.assertEqual((code, error), (0, ""))
                 expected = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
-                            else output.split("\n\n", 1)[1].strip().splitlines())
+                            else output.split("\n\n", 2)[2].strip().splitlines())
                 self.assertEqual(len(expected), 2)
                 self.assertTrue(any("test wrote" in line for line in expected))
                 for later in ("read", "render"):
@@ -3811,16 +3927,21 @@ finally:
 
     def test_mcp_repair_refuses_a_linked_configuration_without_touching_its_target(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
+        _ = self.write_mcp_configuration(self.main_dir, ("brp",), {})
         config = self.home / ".claude2/.claude.json"
         target = self.root / "untouched.json"
         _ = config.rename(target)
         config.symlink_to(target)
         before = target.read_bytes()
         code, output, error = self.run_cli("mcp-repair", "claude2", "brp")
-        self.assertEqual((code, output), (1, ""))
-        self.assertIn("linked", error)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output, "")
         self.assertEqual(target.read_bytes(), before)
-        self.assertEqual(list(config.parent.glob(".claude.json.mcp-backup-*")), [])
+        self.assertFalse(config.is_symlink())
+        self.assertIn("brp", cast(dict[str, object], accounts.read_json_object(config)["mcpServers"]))
+        backups = list(config.parent.glob(".claude.json.mcp-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), before)
 
     def test_mcp_project_in_one_file_compares_against_the_other_global_servers(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
@@ -3960,7 +4081,7 @@ finally:
                     code, output, error = self.run_cli("status", "--stored", *flags)
                     self.assertEqual((code, error), (0, ""))
                     lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
-                             else output.split("\n\n", 1)[1].strip().splitlines())
+                             else output.split("\n\n", 2)[2].strip().splitlines())
                     expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>"]
                     for label in ("claude2", "claude3"):
                         roles = "units" if label == "claude2" and different else "showrunners" if different else "units, showrunners" if label == "claude2" else ""
@@ -3998,7 +4119,7 @@ finally:
                     code, output, error = self.run_cli("status", "--stored", *flags)
                 self.assertEqual((code, error), (0, ""))
                 lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
-                         else output.split("\n\n", 1)[1].strip().splitlines())
+                         else output.split("\n\n", 2)[2].strip().splitlines())
                 self.assertCountEqual(lines, expected)
 
     def test_failed_codex_save_and_render_keep_the_good_reading_diagnostic(self) -> None:
@@ -4066,7 +4187,6 @@ finally:
         self.assertEqual(stdout, "")
         self.assertIn("fixture read failed", stderr)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_shows_unclassified_entries_and_mcp_difference(
         self,
@@ -4125,7 +4245,6 @@ finally:
             self.assertFalse((directory / name).is_symlink())
         self.assertEqual(temporary.read_text(encoding="utf-8"), "unfinished config")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unknown_claude_and_codex_entries_show_only_with_detail(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -4264,7 +4383,6 @@ finally:
         self.assertTrue(folder.is_symlink())
         self.assertEqual(temporary.read_text(encoding="utf-8"), "outside the sweep")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_codex_unknown_entry_does_not_block_check_and_is_only_shown_in_detail(self) -> None:
         self.write_main_config()
@@ -4312,7 +4430,7 @@ finally:
             ("~/.claude1", "claude1", "", *("—",) * 5),
             ("~/.claude2", "claude2", "",
              "71%", weekly_cell, "—", "—", read_cell),
-            ("~/.claude3", "claude3", "units",
+            ("~/.claude3", "claude3", "units ✓ 0 (busy 0, shell 0, idle 0)",
              "12%", weekly_cell, "—", "—", read_cell),
             ("~/.claude4", "claude4", "", *("—",) * 5),
         ])
@@ -4322,7 +4440,6 @@ finally:
         self.assertFalse(accounts.account_dir("claude1").exists())
         self.assertTrue(accounts.account_dir("claude2").exists())
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_hides_five_hour_cells_and_keeps_weekly_and_read(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -4349,7 +4466,6 @@ finally:
             "—", "—", read.astimezone(zone).strftime("%H:%M %Z"),
         ))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_no_action_means_status(self) -> None:
         self.write_main_config()
@@ -4361,7 +4477,6 @@ finally:
         self.assertEqual(stdout, self.run_cli("status")[1])
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_table_is_padded_markdown_and_a_folder_in_order_adds_no_line(self) -> None:
         self.write_main_config()
@@ -4425,7 +4540,7 @@ finally:
 
                 rows = self.status_rows()
 
-                self.assertEqual(rows[-2][:3], ("~/.codex", "codex2", "workers"))
+                self.assertEqual(rows[-2][:3], ("~/.codex", "codex2", "workers ✓ 0 (busy 0, idle 0)"))
                 self.assertEqual(rows[-2][3:], (
                     f"{100 - weekly_used:.0f}%", later.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
                     *credit_cells, read.astimezone(zone).strftime("%H:%M %Z"),
@@ -4588,14 +4703,16 @@ finally:
             next_moves.ResolvedHold(34, next_moves.PaceEstimate(0.9)))
         refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
             auto_move_holds={head.id: held}))
-        notice = "started holds not shown: watch state unreadable"
+        anomaly = "accounts: anomaly: cannot read started holds:"
         requests: list[tuple[str, ...]] = []
 
         def remote(arguments: tuple[str, ...]) -> str:
             requests.append(arguments)
             with patch.object(role_map, "is_role_map_host", return_value=True):
                 code, output, error = self.run_cli(*arguments)
-            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(code, 0)
+            self.assertTrue(error.startswith(anomaly))
+            self.assertEqual(len(error.splitlines()), 1)
             return output
 
         with (patch.object(next_moves, "render_time", return_value=at + timedelta(minutes=22)),
@@ -4608,15 +4725,18 @@ finally:
             _ = state_path.write_text("{")
             before_log = next_moves.next_moves_file().read_bytes()
             expected = ("units 1: at 1% → claude2, hold half a point (≈5 min)\n"
-                        + "units 2: at 2% → claude3, hold half a point (≈5 min)\n"
-                        + notice + "\n")
+                        + "units 2: at 2% → claude3, hold half a point (≈5 min)\n")
             for mac_client in (False, True):
                 with (self.subTest(mac_client=mac_client),
                       patch.object(role_map, "is_role_map_host", return_value=not mac_client),
                       patch.object(role_map, "ssh_role_map", side_effect=remote)):
                     code, listed, error = self.run_cli("next", "list")
-                    self.assertEqual((code, listed, error), (0, expected, ""))
-                    self.assertEqual(listed.count(notice), 1)
+                    self.assertEqual((code, listed), (0, expected))
+                    if mac_client:
+                        self.assertEqual(error, "")
+                    else:
+                        self.assertTrue(error.startswith(anomaly))
+                        self.assertEqual(len(error.splitlines()), 1)
                     self.assertEqual(state_path.read_text(), "{")
                     self.assertEqual(next_moves.next_moves_file().read_bytes(), before_log)
         self.assertEqual(requests, [("next", "list")])
@@ -5048,7 +5168,6 @@ finally:
             self.assertEqual(self.run_cli("next", "remove", "workers", "1")[0], 0)
         self.assertEqual(next_moves.read_next_moves(), ())
 
-
     def test_workers_next_cli_rejects_hold_unknown_account_and_remote_invalid_entry(self) -> None:
         for arguments in (("workers", "1", "claude", "--hold-minutes", "5"),
                           ("workers", "1", "codex99"), ("workers", "1", "claude2")):
@@ -5066,7 +5185,6 @@ finally:
         self.assertTrue(error)
         self.assertEqual(next_moves.read_next_moves(), ())
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_table_displays_both_groups_on_the_same_account_in_group_order(self) -> None:
         self.login_directory("claude2", "shared@example.invalid")
@@ -5077,9 +5195,59 @@ finally:
         self.assertEqual((code, error), (0, ""))
         lines = output.splitlines()
         index = next(index for index, line in enumerate(lines) if "| claude2 " in line)
-        self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units")
+        self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units ✓ 0 (busy 0, shell 0, idle 0)")
         self.assertEqual([cell.strip() for cell in lines[index + 1].strip("|").split("|")],
-                         ["", "", "showrunners", "", "", "", "", ""])
+                         ["", "", "showrunners ✓ 0 (busy 0, shell 0, idle 0)", "", "", "", "", ""])
+
+    def test_board_shows_upcoming_moves_between_the_table_and_problems(self) -> None:
+        _ = next_moves.add_next_move("units", 1, "claude4")
+        _ = next_moves.add_next_move("showrunners", 1, "claude3", fallback_targets=("claude2",))
+        _ = next_moves.add_next_move("workers", 1, "codex2")
+        expected = next_moves.list_next_moves()
+        before = next_moves.next_moves_file().read_bytes()
+        reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
+        with patch.object(accounts, "_read_status", return_value=reading):
+            code, output, error = self.run_cli()
+        self.assertEqual((code, error), (0, ""))
+        table, upcoming, problems = output.rstrip().split("\n\n", 2)
+        self.assertTrue(table.startswith("| Folder"))
+        self.assertEqual(upcoming + "\n\n" + problems,
+                         "Upcoming moves:\n" + expected + "\n\nFixture problem.")
+        with patch.object(accounts, "_read_status", return_value=reading):
+            code, document, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(document)["upcoming_moves"], ["Upcoming moves:", *expected.splitlines()])
+        self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+
+    def test_board_shows_none_when_no_upcoming_moves_exist(self) -> None:
+        reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
+        with patch.object(accounts, "_read_status", return_value=reading):
+            code, output, error = self.run_cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(output.endswith("\n\nUpcoming moves: none\n\nFixture problem.\n"))
+        with patch.object(accounts, "_read_status", return_value=reading):
+            code, document, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(document)["upcoming_moves"], ["Upcoming moves: none"])
+        self.assertFalse(next_moves.next_moves_file().exists())
+
+    def test_board_uses_upcoming_moves_from_the_role_map_without_another_fetch(self) -> None:
+        reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
+        for lines in (("Upcoming moves:", "showrunners 1: at 1% → claude3, else claude2"),
+                      ("Upcoming moves: none",), ()):
+            for arguments in ((), ("status", "--stored", "--json")):
+                with (self.subTest(lines=lines, arguments=arguments),
+                      patch.object(accounts, "_read_status", return_value=reading),
+                      patch.object(role_map, "is_role_map_host", return_value=False),
+                      patch.object(role_map, "read_role_map", return_value=role_map.RoleMap({}, "codex1", upcoming_moves=lines)),
+                      patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected second fetch")) as fetch):
+                    code, output, error = self.run_cli(*arguments)
+                self.assertEqual((code, error), (0, ""))
+                fetch.assert_not_called()
+                if arguments:
+                    output = "\n".join(cast(accounts.StatusDocument, json.loads(output))["upcoming_moves"])
+                expected = lines or ("Upcoming moves: unavailable; natedev unreachable",)
+                self.assertIn("\n".join(expected), output)
 
     def json_status_fixture(self) -> tuple[datetime, datetime]:
         self.login_directory("claude2", "main@example.invalid")
@@ -5091,8 +5259,7 @@ finally:
                              ("codex3", "unlimited@example.invalid")):
             self.write_note(label, login)
             self.codex_login(login, self.home / f".{label}")
-        note = Path(os.environ["AGENT_NOTES_DIR"]) / note_name("codex1")
-        _ = note.write_text("---\nlogin: workers@example.invalid\nuse_credits: off\n---\n")
+        self.write_note("codex1", "workers@example.invalid", use_credits="off")
         groups = accounts.groups_file()
         groups.parent.mkdir(parents=True, exist_ok=True)
         _ = groups.write_text('{"units": "claude2", "showrunners": "claude3"}')
@@ -5114,7 +5281,6 @@ finally:
             codex_startup=agent_accounts.CodexStartupFailure(failed_home, "accounts.py setup codex2"))
         return read, reset
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_explains_empty_account_rows_in_the_table_and_json_without_login_addresses(self) -> None:
         self.write_note("claude1", "absent@example.invalid")
@@ -5128,11 +5294,10 @@ finally:
         expected = [
             "claude1: not set up; no folder holds this account; run accounts.py setup claude1",
             f"claude2: not logged in; no readable sign-in is stored; run CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude2'))} claude and /login",
-            "claude3: folder unavailable; its folder could not be read; run accounts.py setup claude3",
+            f"claude3: not logged in; no readable sign-in is stored; run CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude3'))} claude and /login",
             "codex1: not set up; no folder holds this account; run accounts.py setup codex1",
         ]
-        # Some inventory callers have no check diagnostics. Status must still
-        # explain each empty row, without reading the linked account folder.
+        # Status must explain each empty row when the inventory has no diagnostics.
         readiness = accounts.account_directory_readiness
         def without_diagnostics(label: str) -> accounts.AccountDirectoryReadiness:
             return replace(readiness(label), problems=(), state_source=accounts.NoObservedStateCause())
@@ -5168,12 +5333,11 @@ finally:
                 code, output, error = self.run_cli(*arguments)
                 self.assertEqual((code, error), (0, ""))
                 notes = (cast(list[str], json.loads(output)["problems"]) if "--json" in arguments
-                         else output.split("\n\n", 1)[1].strip().splitlines())
+                         else output.split("\n\n", 2)[2].strip().splitlines())
                 for line in expected:
                     self.assertEqual(notes.count(line), 1)
                 self.assertFalse(any(note.startswith(("* claude2:", "* claude3:", "* codex1:")) for note in notes))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_json_preserves_row_order_numeric_readings_roles_and_table_problems(self) -> None:
         read, reset = self.json_status_fixture()
@@ -5182,9 +5346,9 @@ finally:
         code, output, error = self.run_cli("status", "--json")
         self.assertEqual((code, error), (0, ""))
         document = cast(dict[str, object], json.loads(output))
-        self.assertEqual(set(document), {"accounts", "problems", "session_inputs"})
+        self.assertEqual(set(document), {"accounts", "problems", "session_inputs", "upcoming_moves"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "role_counts", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+        keys = {"label", "tool", "roles", "selected_roles", "role_counts", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
@@ -5200,7 +5364,7 @@ finally:
         self.assertEqual([tuple(row[field] for field in fields) for row in rows], expected)
         self.assertEqual([row["read_ok"] for row in rows], [False, True, True, False, True, False, True])
         self.assertEqual([row["credits_in_use"] for row in rows], [False, False, False, False, True, False, False])
-        notes = table.split("\n\n", 1)[1].strip().splitlines()
+        notes = table.split("\n\n", 2)[2].strip().splitlines()
         self.assertIn("accounts.py setup codex2", "\n".join(notes))
         self.assertEqual(document["problems"], [note.removeprefix("* ") for note in notes])
         self.assertTrue(any(note.startswith("* ") for note in notes))
@@ -5216,7 +5380,6 @@ finally:
         changed = cast(list[dict[str, object]], json.loads(output)["accounts"])
         self.assertEqual([row["roles"] for row in changed[:4]], [[], [], ["units", "showrunners"], []])
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_json_and_table_refresh_the_same_stale_logins_once_each(self) -> None:
         self.login_directory("claude2", "stale@example.invalid")
@@ -5244,7 +5407,6 @@ finally:
                 self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
                 self.codex_reads.assert_awaited_once_with(codex_home)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_stored_status_shows_old_readings_without_live_reads_subprocesses_or_network(self) -> None:
         self.login_directory("claude2", "old@example.invalid")
@@ -5514,14 +5676,13 @@ finally:
         rows = self.status_rows()[1:]
 
         self.assertEqual([row[:3] for row in rows], [
-            ("~/.codex", "codex1", "workers"),
+            ("~/.codex", "codex1", "workers ✓ 0 (busy 0, idle 0)"),
             ("~/.codex2", "codex2", "spare"),
             ("~/.codex4", "~/.codex4", "spare"),
             ("~/.codex10", "~/.codex10", "spare"),
             ("~/.codex3", "codex3", "—"),
         ])
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_a_not_set_up_codex_account_when_its_home_is_a_file(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
@@ -5537,7 +5698,6 @@ finally:
         self.assertEqual(home.read_text(), "obstruction")
         self.codex_reads.assert_not_awaited()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_a_not_set_up_codex_account_when_its_home_is_a_dangling_link(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
@@ -5555,7 +5715,6 @@ finally:
         self.assertFalse(target.exists())
         self.codex_reads.assert_not_awaited()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_logged_out_numbered_home_names_the_account_to_sign_in(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
@@ -5577,7 +5736,7 @@ finally:
         self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         with patch.dict(os.environ, {"CODEX_HOME": str(selected)}):
             rows = self.status_rows()[1:]
-        self.assertEqual([row[2] for row in rows], ["spare", "workers"])
+        self.assertEqual([row[2] for row in rows], ["spare", "workers ✓ 0 (busy 0, idle 0)"])
         self.assertEqual([row[0] for row in rows], ["~/.codex", "~/.codex1"])
 
     def test_status_reads_each_stale_codex_home_and_saves_both_readings(self) -> None:
@@ -5670,7 +5829,6 @@ finally:
         self.assertEqual(cast(accounts.StatusDocument, json.loads(output))["accounts"][0]["credits"], 9)
         self.codex_reads.assert_awaited_once_with(home)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_prints_codex_check_problems_below_the_table(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -5727,7 +5885,6 @@ finally:
         self.assertEqual(selection.live_logins, frozenset())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_a_refresh_without_session_credentials_keeps_a_good_reading_but_marks_its_age(self) -> None:
         self.login_directory("claude2", "desktop@example.invalid")
@@ -5826,7 +5983,6 @@ finally:
             self.assertEqual(accounts.renew_login("claude2"),
                              accounts.LoginRenewalFailed("usage still shows no login token"))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_missing_login_token_has_an_actionable_cause_in_table_and_json_on_both_machines(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -5851,7 +6007,6 @@ finally:
                         self.assertNotIn("next notes pass", output)
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_damaged_login_renewal_state_reads_empty_and_status_renders(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -5871,7 +6026,6 @@ finally:
                     self.assertIn("login token expired; start a session on it", output)
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_expired_login_note_names_the_failed_probe_in_table_and_json(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -5890,7 +6044,6 @@ finally:
         self.assertIn(note, cast(list[str], cast(dict[str, object], json.loads(output))["problems"]))
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failed_read_causes_show_old_date_star_and_one_footnote_until_a_good_read(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -5901,9 +6054,9 @@ finally:
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
-             "the usage service is busy; this shows the reading from 01-02 05:29; no usage read has been attempted"),
+             "the usage service is busy; this shows the reading from 01-02 05:29; the attempt time is not recorded"),
             (agent_accounts.UsageReadOutcome.ERROR,
-             "the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"),
+             "the usage read failed; this shows the reading from 01-02 05:29; the attempt time is not recorded"),
         )
         for outcome, reason in cases:
             with self.subTest(outcome=outcome):
@@ -5929,7 +6082,6 @@ finally:
         self.live_reads.assert_not_called()
         self.codex_reads.assert_not_awaited()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_usage_failure_notes_name_the_service_and_retry_time_in_table_and_json(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -5972,7 +6124,6 @@ finally:
                     self.assertNotIn("refused", note)
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_a_held_refresh_keeps_the_stored_reading_and_failure_note(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -5987,10 +6138,9 @@ finally:
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("01-02 05:29 PST*", output)
-        self.assertIn("the usage service is busy; this shows the reading from 01-02 05:29; no usage read has been attempted", output)
+        self.assertIn("the usage service is busy; this shows the reading from 01-02 05:29; the attempt time is not recorded", output)
         self.assertEqual(usage_store.store_file().read_bytes(), before)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_first_identity_failure_after_upgrade_marks_the_old_reading(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6006,11 +6156,10 @@ finally:
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; the attempt time is not recorded"])
         self.assertEqual(usage_store.load()["idle@example.invalid"].get("weekly"), window)
         self.live_reads.assert_called_once_with(directory)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failure_from_the_first_of_two_directories_marks_their_shared_login(self) -> None:
         login = "shared@example.invalid"
@@ -6030,10 +6179,9 @@ finally:
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; the attempt time is not recorded"])
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failed_read_today_keeps_the_short_time_and_marks_a_never_read_account(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6051,7 +6199,6 @@ finally:
             [now.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z") + "*", "—*"])
         self.assertEqual(len([line for line in output.splitlines() if line.startswith("* ")]), 2)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failed_codex_start_keeps_its_last_good_read_time_and_shows_a_footnote(self) -> None:
         _, target = self.workers_fixture()
@@ -6061,15 +6208,14 @@ finally:
             quotas=[agent_accounts.Quota("Weekly", 25, old + timedelta(days=1))])], old)
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem="Startup request timed out",
             source=agent_accounts.CodexHomeSource(target),
-            codex_startup=agent_accounts.CodexStartupFailure(target, "/showrunner:accounts setup codex1"))
+            codex_startup=agent_accounts.CodexStartupFailure(target, "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1"))
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| codex1 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
-        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run /showrunner:accounts setup codex1 and try again; no usage read has been attempted", output)
-        self.assertIn("/showrunner:accounts setup codex1", row)
+        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1 and try again; the attempt time is not recorded", output)
+        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1", row)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_after_weekly_reset_explains_a_stale_login_without_reading_it_again(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6193,7 +6339,6 @@ finally:
             self.assertEqual(self.status_rows()[0][4], resets.astimezone(zone).strftime("%a %m-%d %H:%M %Z"))
         resolve.assert_called_once_with()
 
-
     def test_account_prefix_keeps_the_selection_after_the_role_changes(self) -> None:
         """Rendering a selected account never resolves the role again."""
         self.write_main_config()
@@ -6231,7 +6376,6 @@ finally:
 
         self.assertFalse(hasattr(accounts, "HOME"))
 
-
     def test_unknown_role_is_refused_by_every_role_command(self) -> None:
         for arguments in (
             ("role", "unknown"),
@@ -6247,7 +6391,6 @@ finally:
                     stderr,
                     "accounts: unknown is not a role; only unit, showrunner and workers are supported\n",
                 )
-
 
     def workers_fixture(self) -> tuple[Path, Path]:
         default = self.home / ".codex"
@@ -6265,10 +6408,15 @@ finally:
         _ = config.write_text('{"workers": "codex2"}\n')
         return default, target
 
+    def workers_member(self, name: str = "project-review") -> staff.StaffRow:
+        owner = fixture_member("showrunner", name="worker-owner")
+        unit = fixture_member("unit", name="worker-unit", parent=owner.id,
+                              worktree=staff.PresentWorktree("natedev", self.root))
+        return fixture_worker(name, unit.id, backend=staff.CodexBackend(self.home / ".codex"))
+
     def test_workers_swap_records_the_callers_auto_reason_and_cause(self) -> None:
         _ = self.workers_fixture()
-        with patch.object(accounts, "_retire_workers_servers", return_value=[]):
-            _ = accounts.swap("workers", "codex1", why="auto: workers-entry", cause="auto")
+        _ = accounts.swap("workers", "codex1", why="auto: workers-entry", cause="auto")
         rows = [cast(dict[str, object], json.loads(line))
                 for line in accounts.roles_history_file().read_text().splitlines()]
         self.assertEqual((rows[-1]["role"], rows[-1]["cause"], rows[-1]["why"]),
@@ -6387,14 +6535,12 @@ finally:
         self.assertIn("codex1 has no account note", stderr)
         self.assertEqual(stderr.count("accounts: "), 1, stderr)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unrelated_io_and_value_errors_propagate_from_the_command(self) -> None:
         for error in (OSError("table write failed"), ValueError("invalid table data")):
             with self.subTest(error=error), patch.object(accounts, "status_report", side_effect=error):
                 with self.assertRaises(type(error)):
                     _ = self.run_cli("status")
-
 
     def test_workers_only_configuration_preserves_claude_selection(self) -> None:
         _ = self.workers_fixture()
@@ -6405,7 +6551,6 @@ finally:
                 self.assertEqual(self.run_cli("set-role", "workers", label), (0, "", ""))
                 self.assertEqual(accounts.claude_account_selection(), before)
                 self.assertTrue(accounts.multiple_accounts_configured())
-
 
     def test_failed_workers_history_write_restores_both_roles(self) -> None:
         _ = self.workers_fixture()
@@ -6452,370 +6597,133 @@ finally:
         self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)),
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
-    def test_workers_swap_dry_run_names_target_and_preserves_roles_and_history(self) -> None:
+    def test_workers_swap_selects_the_target_before_stops_and_keeps_pending_and_refused_workers(self) -> None:
         _, target = self.workers_fixture()
-        before = self.role_files()
-        with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
-            result, stdout, stderr = self.run_cli("swap", "workers", "codex1", "--dry-run")
-        self.assertEqual((result, stderr), (0, ""))
-        self.assertIn("codex1", stdout)
-        self.assertEqual(stdout, "Workers would move codex2 → codex1:\n")
-        self.assertEqual(self.role_files(), before)
-        retire.assert_called_once_with(target, "codex1", dry_run=True)
+        failed = self.workers_member("project-review")
+        pending = self.workers_member("project-test")
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
 
-    def test_workers_swap_names_each_switching_worker_and_its_production_for_both_modes(self) -> None:
-        def holder(session: str, machine: str, unit: str, name: str) -> roster.RosterEntry:
-            return roster.RosterEntry(
-                machine=machine, kind="claude", role="unit director", name=name, status="running",
-                reach=roster.Messageable(f"session:{session}"), cwd="",
-                showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
-                director=roster.DirectsUnit(unit) if unit else roster.NoDirector(),
-                assignment=roster.NotAWorker(), session=roster.ClaudeSession(session))
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                switches = (
-                    codex_mesh.WorkersRunSwitch(self.root / "private-run-a", ("director-a",), (
-                        codex_mesh.SwitchingWorker("claude-build-two-accounts-impl", False),)),
-                    codex_mesh.WorkersRunSwitch(self.root / "private-run-b", ("director-b",), (
-                        codex_mesh.SwitchingWorker("claude-build-herdr-trial-review", True),)),
-                    codex_mesh.WorkersRunSwitch(self.root / "private-run-c", ("freestanding",), (
-                        codex_mesh.SwitchingWorker("project-test-worker", False),)),
-                    codex_mesh.WorkersRunSwitch(self.root / "orphan-run", ("missing",), (
-                        codex_mesh.SwitchingWorker("project-fix", False),)),
-                )
-                snapshot = roster.Roster([
-                    holder("director-a", "here", "two-accounts", "director-a"),
-                    holder("director-b", "macbook", "herdr-trial", "director-b"),
-                    holder("freestanding", "here", "", "scratch session"),
-                ], [])
-                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-                      patch.object(roster, "roster", return_value=snapshot),
-                      patch.object(roster, "machine_name", return_value="here")):
-                    code, stdout, stderr = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, stderr), (0, ""))
-                header = "Workers would move" if dry_run else "Workers moving"
-                self.assertEqual(stdout, f"{header} codex2 → codex1:\n" +
-                    "  natedev · two-accounts · impl-worker → codex1\n" +
-                    "  macbook · natedev · herdr-trial · review-worker → codex1, interrupted and resumed\n" +
-                    "  natedev · scratch session · test-worker → codex1\n" +
-                    "  unknown session (orphan-run) · fix-worker → codex1\n")
-                self.assertNotIn("private-run", stdout)
-
-    def test_workers_swap_reports_each_failed_worker_with_manual_resume_and_keeps_new_role(self) -> None:
-        _, target = self.workers_fixture()
-        run = self.root / "run with spaces"
-        interrupt_command = f"python3 mesh.py resume-account-move --session-dir '{run}' --to project-impl"
-        resume_command = f"python3 mesh.py resume-account-move --session-dir '{run}' --to project-review"
-        switches = (codex_mesh.WorkersRunSwitch(run, (), (
-            codex_mesh.SwitchingWorker("project-impl", True,
-                codex_mesh.WorkerMoveFailed("interrupt failed: access denied", interrupt_command)),
-            codex_mesh.SwitchingWorker("project-review", True,
-                codex_mesh.WorkerMoveFailed("resume failed: server unavailable", resume_command)),
-            codex_mesh.SwitchingWorker("project-test", False),
-        )),)
-        with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-              patch.object(roster, "roster", return_value=roster.Roster([], []))):
-            code, output, errors = self.run_cli("swap", "workers", "codex1")
-        self.assertEqual((code, errors), (0, ""))
-        self.assertEqual(agent_accounts.workers_home(), target)
-        lines = output.splitlines()
-        self.assertEqual(len(lines), 4)
-        for worker, reason, command in (("impl-worker", "interrupt failed: access denied", interrupt_command),
-                                         ("review-worker", "resume failed: server unavailable", resume_command)):
-            line = next(line for line in lines if f" · {worker} → codex1" in line)
-            self.assertIn(reason, line)
-            self.assertIn(command, line)
-            self.assertNotIn("interrupted and resumed", line)
-        idle = next(line for line in lines if " · test-worker → codex1" in line)
-        self.assertNotIn("failed", idle)
-        self.assertNotIn("interrupted", idle)
-
-    def test_workers_swap_role_write_failure_exits_one_before_interrupting_workers(self) -> None:
-        _ = self.workers_fixture()
-        before = self.role_files()
-        with (patch.object(accounts, "_write_role", side_effect=accounts.AccountsError("role write refused")),
-              patch.object(codex_mesh, "retire_workers_servers") as retire):
-            code, output, errors = self.run_cli("swap", "workers", "codex1")
-        self.assertEqual((code, output), (1, ""))
-        self.assertIn("role write refused", errors)
-        self.assertEqual(self.role_files(), before)
-        retire.assert_not_called()
-
-    def test_workers_swap_folds_same_holder_slot_across_runs_without_hiding_failures_or_other_holders(self) -> None:
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                commands = ("mesh resume-account-move --to plan-c-review", "mesh resume-account-move --to plan-d-review")
-                switches = (
-                    codex_mesh.WorkersRunSwitch(self.root / "plan-a", ("holder-a",), (
-                        codex_mesh.SwitchingWorker("plan-a-review", False),
-                        codex_mesh.SwitchingWorker("plan-a-impl", False))),
-                    codex_mesh.WorkersRunSwitch(self.root / "plan-b", ("holder-a",), (
-                        codex_mesh.SwitchingWorker("plan-b-review-worker", True, codex_mesh.WorkerMoveResumed()),
-                        codex_mesh.SwitchingWorker("plan-b-impl", False))),
-                    codex_mesh.WorkersRunSwitch(self.root / "failures", ("holder-a",), (
-                        codex_mesh.SwitchingWorker("plan-c-review", True,
-                            codex_mesh.WorkerMoveFailed("interrupt failed: denied", commands[0])),
-                        codex_mesh.SwitchingWorker("plan-d-review", True,
-                            codex_mesh.WorkerMoveFailed("resume failed: refused", commands[1])))),
-                    codex_mesh.WorkersRunSwitch(self.root / "different-holder", ("holder-b",), (
-                        codex_mesh.SwitchingWorker("plan-e-review", False),)),
-                )
-                # Identical display names still describe two distinct holder identities.
-                listing = roster.Roster([roster.RosterEntry(
-                    machine="here", kind="claude", role="unit director", name="director", status="running",
-                    reach=roster.Messageable(f"session:{holder}"), cwd="",
-                    showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
-                    director=roster.DirectsUnit("two-accounts"), assignment=roster.NotAWorker(),
-                    session=roster.ClaudeSession(holder)) for holder in ("holder-a", "holder-b")], [])
-                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-                      patch.object(roster, "roster", return_value=listing),
-                      patch.object(roster, "machine_name", return_value="here")):
-                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, errors), (0, ""))
-                rows = output.splitlines()[1:]
-                self.assertEqual(len(rows), 5)
-                self.assertIn("  natedev · two-accounts · review-worker → codex1 ×2, 1 interrupted and resumed", rows)
-                self.assertIn("  natedev · two-accounts · impl-worker → codex1 ×2", rows)
-                self.assertIn("  natedev · two-accounts · review-worker → codex1", rows)
-                for reason, command in zip(("interrupt failed: denied", "resume failed: refused"), commands, strict=True):
-                    failed = next(row for row in rows if reason in row)
-                    self.assertIn(command, failed)
-                    self.assertNotIn("×", failed)
-
-    def test_workers_swap_fold_counts_mid_turn_entries_and_preserves_single_rows_in_both_modes(self) -> None:
-        previous, _ = self.workers_fixture()
-        holder = roster.RosterEntry(
-            machine="here", kind="claude", role="unit director", name="director", status="running",
-            reach=roster.Messageable("session:holder"), cwd="",
-            showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
-            director=roster.DirectsUnit("two-accounts"), assignment=roster.NotAWorker(),
-            session=roster.ClaudeSession("holder"))
-        cases = (
-            ((False,) * 11 + (True,), " ×12, 1 interrupted and resumed"),
-            ((False, True, True, False), " ×4, 2 interrupted and resumed"),
-            ((True, True, True), " ×3, 3 interrupted and resumed"),
-            ((False, False, False), " ×3"),
-            ((True,), ", interrupted and resumed"),
-            ((False,), ""),
-        )
-        for dry_run in (True, False):
-            for mid_turns, suffix in cases:
-                with self.subTest(dry_run=dry_run, mid_turns=mid_turns):
-                    switches = tuple(codex_mesh.WorkersRunSwitch(
-                        self.root / f"plan-{index}", ("holder",), (
-                            codex_mesh.SwitchingWorker(f"plan-{index}-test", mid_turn),))
-                        for index, mid_turn in enumerate(mid_turns))
-                    with (patch.object(roster, "roster", return_value=roster.Roster([holder], [])),
-                          patch.object(roster, "machine_name", return_value="here")):
-                        lines = accounts._workers_swap_lines(  # pyright: ignore[reportPrivateUsage]
-                            switches, previous, "codex2", dry_run=dry_run)
-                    self.assertEqual(lines[1:], (
-                        f"  natedev · two-accounts · test-worker → codex2{suffix}",))
-
-    def test_workers_swap_names_launcher_session_and_folds_with_that_sessions_holder_rows(self) -> None:
-        holder = roster.RosterEntry(
-            machine="here", kind="claude", role="unit director", name="director", status="running",
-            reach=roster.Messageable("session:launching-director"), cwd="",
-            showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
-            director=roster.DirectsUnit("two-accounts"), assignment=roster.NotAWorker(),
-            session=roster.ClaudeSession("launching-director"))
-        switches = (
-            codex_mesh.WorkersRunSwitch(self.root / "holderless-run", (), (
-                codex_mesh.SwitchingWorker("plan-a-test", False),),
-                launcher_sessions=("launching-director",)),
-            codex_mesh.WorkersRunSwitch(self.root / "marked-run", ("launching-director",), (
-                codex_mesh.SwitchingWorker("plan-b-test", True, codex_mesh.WorkerMoveResumed()),)),
-            codex_mesh.WorkersRunSwitch(self.root / "unresolved-run", (), (
-                codex_mesh.SwitchingWorker("plan-c-impl", False),)),
-        )
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-                      patch.object(roster, "roster", return_value=roster.Roster([holder], [])),
-                      patch.object(roster, "machine_name", return_value="here")):
-                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, errors), (0, ""))
-                self.assertEqual(output.splitlines()[1:], [
-                    "  natedev · two-accounts · test-worker → codex1 ×2, 1 interrupted and resumed",
-                    "  unknown session (unresolved-run) · impl-worker → codex1",
-                ])
-
-    def test_workers_swap_uses_saved_launcher_session_name_when_roster_cannot_name_it(self) -> None:
-        records = sessions.sessions_dir()
-        records.mkdir(parents=True, exist_ok=True)
-        _ = (records / "321.json").write_text(json.dumps({
-            "pid": 321, "sessionId": "launching-director", "name": "saved launching director",
-            "messagingSocketPath": "", "updatedAt": 10}))
-        switches = (codex_mesh.WorkersRunSwitch(self.root / "holderless-run", (), (
-            codex_mesh.SwitchingWorker("project-impl", False),), launcher_sessions=("launching-director",)),)
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                previous, _ = self.workers_fixture()
-                with patch.object(roster, "roster", return_value=roster.Roster([], [])):
-                    lines = accounts._workers_swap_lines(  # pyright: ignore[reportPrivateUsage]
-                        switches, previous, "codex1", dry_run=dry_run)
-                self.assertEqual(lines[1:], ("  saved launching director · impl-worker → codex1",))
-
-    def test_workers_swap_prints_ended_server_totals_and_each_busy_reason_in_both_modes(self) -> None:
-        run = self.root / "ended-run"
-        reason = "a conversation is not idle: unread-worker: ThreadLive"
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                before = self.role_files()
-                switches = (codex_mesh.WorkersRunSwitch(run, (), (), leftover_servers=3,
-                    stopped_servers=0 if dry_run else 1, kept_servers=(
-                        codex_mesh.KeptWorkersServer(101, 4001, reason),
-                        codex_mesh.KeptWorkersServer(102, 4002, "1 client connection(s) on its port"))),)
-                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
-                      patch.object(roster, "roster", side_effect=AssertionError("ended runs need no worker roster"))):
-                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, errors), (0, ""))
-                summary = ("3 leftover servers from ended sessions: 1 can be stopped, 2 would stay" if dry_run
-                           else "3 leftover servers from ended sessions, 1 stopped")
-                prefix = "would stay" if dry_run else "left running"
-                self.assertEqual(output.splitlines()[1:], [summary,
-                    f"{prefix}: 101 on port 4001 ({run}): {reason}",
-                    f"{prefix}: 102 on port 4002 ({run}): 1 client connection(s) on its port"])
-                self.assertNotIn("unknown session", output)
-                if dry_run:
-                    self.assertEqual(self.role_files(), before)
-
-    def test_workers_swap_uses_saved_holder_name_when_roster_cannot_list_it(self) -> None:
-        records = sessions.sessions_dir()
-        records.mkdir(parents=True, exist_ok=True)
-        _ = (records / "321.json").write_text(json.dumps({
-            "pid": 321, "sessionId": "missing-holder", "name": "saved director",
-            "messagingSocketPath": "", "updatedAt": 10}))
-        switches = (codex_mesh.WorkersRunSwitch(self.root / "private-run", ("missing-holder",), (
-            codex_mesh.SwitchingWorker("project-impl", False),)),)
-        for dry_run in (True, False):
-            with self.subTest(dry_run=dry_run):
-                _ = self.workers_fixture()
-                with (patch.object(roster, "roster", return_value=roster.Roster([], [])),
-                      patch.object(codex_mesh, "retire_workers_servers", return_value=switches)):
-                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
-                self.assertEqual((code, errors), (0, ""))
-                self.assertEqual(output.splitlines()[1:], ["  saved director · impl-worker → codex1"])
-                self.assertNotIn("private-run", output)
-
-    def test_numbered_workers_target_selects_the_login_in_the_home_directory(self) -> None:
-        default, _ = self.workers_fixture()
-        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
-        report = cast(agent_accounts.Report, self.codex_reads.return_value)
-        report.email = "default@example.invalid"
-        report.source = agent_accounts.CodexHomeSource(default)
-        before = self.role_files()
-        with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
-            code, stdout, stderr = self.run_cli("swap", "workers", "codex2", "--dry-run")
-        self.assertEqual((code, stderr), (0, ""))
-        self.assertEqual(stdout, "Workers would move codex1 → codex2:\n")
-        self.assertEqual(self.role_files(), before)
-        retire.assert_called_once_with(default, "codex2", dry_run=True)
-        self.assertEqual(self.run_cli("set-role", "workers", "codex2"), (0, "", ""))
-        self.assertEqual(agent_accounts.workers_home(), default)
-        self.assertEqual(self.run_cli("role", "workers"), (0, "codex2\n", ""))
-        self.assertEqual(accounts.role_account("workers").home, default)
-        self.assertEqual(json.loads(accounts.accounts_config_file().read_text())["workers"], "codex2")
-
-    def test_workers_swap_refuses_paid_credits_when_the_target_setting_is_off(self) -> None:
-        _, target = self.workers_fixture()
-        note = Path(os.environ["AGENT_NOTES_DIR"]) / "codex1.md"
-        _ = note.write_text("---\nlogin: target@example.invalid\nuse_credits: off\n---\n")
-        report = cast(agent_accounts.Report, self.codex_reads.return_value)
-        report.quotas = [agent_accounts.Quota("Weekly", 100, datetime.now(timezone.utc) + timedelta(days=1))]
-        report.credit_balance = "6370"
-        before = self.role_files()
-        with patch.object(codex_mesh, "retire_workers_servers") as retire:
-            code, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-        self.assertNotEqual(code, 0)
-        self.assertIn("is used up and set not to use credits; choose another account or wait for reset", stdout + stderr)
-        self.assertIn("codex1 (~/.codex1)", stdout + stderr)
-        self.assertEqual(self.role_files(), before)
-        self.assertEqual(target, self.home / ".codex1")
-        retire.assert_not_called()
-
-    def test_workers_swap_writes_role_before_retiring_servers(self) -> None:
-        _, target = self.workers_fixture()
         observed: list[Path] = []
-        def retire(home: Path, label: str, dry_run: bool = False) -> tuple[codex_mesh.WorkersRunSwitch, ...]:
-            self.assertFalse(dry_run)
-            self.assertEqual((home, label), (target, "codex1"))
+        def stop(reference: str) -> stop_resume.StopFailed | stop_resume.Stopped:
             observed.append(agent_accounts.workers_home())
-            return ()
-        with patch.object(codex_mesh, "retire_workers_servers", side_effect=retire):
-            result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-        self.assertEqual((result, stderr), (0, ""))
-        self.assertEqual(observed, [target])
-        self.assertEqual(stdout, "Workers moving codex2 → codex1:\n")
+            return (stop_resume.StopFailed(reference, "source process could not stop") if reference == failed.id
+                    else stop_resume.Stopped(pending.current_session, 987654))
+
+        with patch.object(stop_resume, "stop", side_effect=stop) as stopped:
+            code, output, errors = self.run_cli("swap", "workers", "codex1")
+        self.assertEqual((code, errors), (1, ""))
+        self.assertEqual(agent_accounts.workers_home(), target)
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertEqual({entry.args[0] for entry in stopped.call_args_list}, {failed.id, pending.id})
+        self.assertEqual(stopped.call_count, 2)
+        self.assertEqual(observed, [target, target])
         self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
+        lines = output.splitlines()
+        self.assertEqual(len(lines), 2)
+        failed_line = next(line for line in lines if failed.id in line)
+        self.assertIn("source process could not stop", failed_line)
+        self.assertNotIn("resumed", failed_line)
+        pending_line = next(line for line in lines if pending.id in line)
+        self.assertIn("pending", pending_line)
+        self.assertIn("codex1", pending_line)
+        self.assertNotIn("failed", pending_line)
 
-
-    def test_workers_swap_accepts_default_real_shared_entries(self) -> None:
-        default, _ = self.workers_fixture()
-        _ = (default / "config.toml").write_text("own config")
-        (default / "sessions").mkdir()
-        for name in ("config.toml", "sessions"):
-            _ = (self.home / ".codex1" / name).symlink_to(default / name)
-        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
-        report = cast(agent_accounts.Report, self.codex_reads.return_value)
-        report.email = "default@example.invalid"
-        report.source = agent_accounts.CodexHomeSource(default)
-        with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
-            result, _, stderr = self.run_cli("swap", "workers", "codex2")
-        self.assertEqual((result, stderr), (0, ""))
-        retire.assert_called_once_with(default, "codex2", dry_run=False)
-        self.assertEqual(self.run_cli("role", "workers"), (0, "codex2\n", ""))
-
-
-    def test_workers_swap_refuses_exhausted_usage(self) -> None:
-        _, target = self.workers_fixture()
-        before = self.role_files()
-        now = datetime.now(timezone.utc)
-        for report in (
-            agent_accounts.Report("Codex", email="target@example.invalid", five_hour=agent_accounts.Quota("5-hour", 100, now + timedelta(hours=1)),
-                quotas=[agent_accounts.Quota("Weekly", 20, now + timedelta(days=1))], credit_balance="0"),
+    def test_worker_release_refusals_name_the_reason_and_next_action(self) -> None:
+        _ = self.workers_fixture()
+        worker = self.workers_member()
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        for result, reason, action in (
+            (stop_resume.SessionNotFound(worker.id), "could not resolve the staff reference", "check the staff row and retry"),
+            (stop_resume.StopFailed(worker.id, "fixture stop failed"), "fixture stop failed", "inspect the source session and retry"),
+            (stop_resume.NotRunning(worker.current_session), "source thread stop is unresolved", "inspect the source session and retry"),
         ):
-            with self.subTest(report=report), patch.object(codex_mesh, "retire_workers_servers") as retire:
+            with self.subTest(reason=reason), patch.object(stop_resume, "stop", return_value=result) as stopped:
+                code, output, errors = self.run_cli("move", "workers", "codex1")
+                self.assertEqual((code, output), (1, ""))
+                self.assertEqual(len(errors.splitlines()), 1)
+                self.assertIn(worker.id, errors)
+                self.assertIn(reason, errors)
+                self.assertIn(action, errors)
+                stopped.assert_called_once_with(worker.id)
+                self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+
+    def test_numbered_workers_targets_keep_the_selected_home_with_real_or_shared_entries(self) -> None:
+        target = "codex2"
+        for shared in (False, True):
+            with self.subTest(shared=shared, target=target):
+                default, _ = self.workers_fixture()
+                if shared:
+                    _ = (default / "config.toml").write_text("own config")
+                    (default / "sessions").mkdir(exist_ok=True)
+                    for name in ("config.toml", "sessions"):
+                        _ = (self.home / ".codex1" / name).symlink_to(default / name)
+                self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
+                report = cast(agent_accounts.Report, self.codex_reads.return_value)
+                report.email = "default@example.invalid"
+                report.source = agent_accounts.CodexHomeSource(default)
+                worker = self.workers_member()
+                before = self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()
+                with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(worker.current_session, 987654)) as stop:
+                    code, stdout, stderr = self.run_cli("swap", "workers", target, *([] if shared else ["--dry-run"]))
+                self.assertEqual((code, stderr), (1 if shared else 0, ""))
+                if shared:
+                    self.assertIn("pending", stdout)
+                    stop.assert_called_once_with(worker.id)
+                else:
+                    self.assertEqual(stdout, f"{worker.name} ({worker.id}): would stop; restart on {target} stays pending\n")
+                    self.assertEqual((self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()), before)
+                    stop.assert_not_called()
+                    self.assertEqual(self.run_cli("set-role", "workers", target), (0, "", ""))
+                self.assertEqual(agent_accounts.workers_home(), default)
+                self.assertEqual(self.run_cli("role", "workers"), (0, target + "\n", ""))
+                self.assertEqual(accounts.role_account("workers").home, default)
+                self.assertEqual(json.loads(accounts.accounts_config_file().read_text())["workers"], target)
+
+    def test_workers_swap_checks_usage_and_credit_policy_before_changing_roles(self) -> None:
+        _, target = self.workers_fixture()
+        now = datetime.now(timezone.utc)
+        cases = (
+            ("role-write-refused", "on", accounts.AccountsError("role write refused"), False, False,
+                agent_accounts.Report("Codex", email="target@example.invalid")),
+            ("credits-disabled", "off", None, True, False, agent_accounts.Report("Codex", email="target@example.invalid",
+                quotas=[agent_accounts.Quota("Weekly", 100, now + timedelta(days=1))], credit_balance="6370")),
+            ("exhausted", "on", None, True, False, agent_accounts.Report("Codex", email="target@example.invalid",
+                five_hour=agent_accounts.Quota("5-hour", 100, now + timedelta(hours=1)),
+                quotas=[agent_accounts.Quota("Weekly", 20, now + timedelta(days=1))], credit_balance="0")),
+            ("credits", "on", None, False, False, agent_accounts.Report("Codex", email="target@example.invalid",
+                five_hour=agent_accounts.Quota("5-hour", 100, now + timedelta(hours=1)), credit_balance="5")),
+            ("unknown", "on", None, False, True, agent_accounts.Report("Codex", problem="read failed")),
+            ("stale", "on", None, False, True, agent_accounts.Report("Codex", five_hour=agent_accounts.Quota("5-hour", 0, now - timedelta(seconds=1)),
+                quotas=[agent_accounts.Quota("Weekly", 0, now + timedelta(days=1))], credit_balance="0")),
+        )
+        for case, credits, write_error, refusal, anomalies, report in cases:
+            with (self.subTest(case=case), patch.object(stop_resume, "stop") as stop,
+                  patch.object(accounts, "_write_role", wraps=getattr(accounts, "_write_role"), side_effect=write_error)):
+                self.write_note("codex1", "target@example.invalid", use_credits=credits)
                 report.source = agent_accounts.CodexHomeSource(target)
                 self.codex_reads.return_value = report
-                result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-                self.assertNotEqual(result, 0)
-                self.assertIn("codex1", stdout + stderr)
-                self.assertIn("~/.codex1", stdout + stderr)
-                self.assertEqual(self.role_files(), before)
-                retire.assert_not_called()
-
-    def test_workers_swap_accepts_credits_when_a_window_is_used_up(self) -> None:
-        _ = self.workers_fixture()
-        report = cast(agent_accounts.Report, self.codex_reads.return_value)
-        report.five_hour = agent_accounts.Quota("5-hour", 100, datetime.now(timezone.utc) + timedelta(hours=1))
-        report.credit_balance = "5"
-        self.assertEqual(self.run_cli("swap", "workers", "codex1")[0], 0)
-
-    def test_workers_swap_reports_one_usage_anomaly_and_continues(self) -> None:
-        _, target = self.workers_fixture()
-        now = datetime.now(timezone.utc)
-        reports = (
-            agent_accounts.Report("Codex", problem="read failed"),
-            agent_accounts.Report("Codex", five_hour=agent_accounts.Quota("5-hour", 0, now - timedelta(seconds=1)),
-                quotas=[agent_accounts.Quota("Weekly", 0, now + timedelta(days=1))], credit_balance="0"),
-        )
-        for report in reports:
-            report.source = agent_accounts.CodexHomeSource(target)
-            self.codex_reads.return_value = report
-            with self.subTest(report=report), patch.object(codex_mesh, "retire_workers_servers", return_value=()) as retire:
-                result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-            self.assertEqual(result, 0)
-            self.assertEqual(len(stderr.splitlines()), 1)
-            self.assertIn("accounts: anomaly: codex1 (~/.codex1):", stderr)
-            self.assertIn("Workers moving", stdout)
-            self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
-            retire.assert_called_once_with(target, "codex1", dry_run=False)
-
+                before = self.role_files()
+                code, stdout, stderr = self.run_cli("swap", "workers", "codex1")
+                stop.assert_not_called()
+                if write_error:
+                    self.assertEqual((code, stdout), (1, ""))
+                    self.assertIn("role write refused", stderr)
+                    self.assertEqual(self.role_files(), before)
+                elif refusal:
+                    self.assertNotEqual(code, 0)
+                    self.assertIn("codex1", stdout + stderr)
+                    self.assertIn("~/.codex1", stdout + stderr)
+                    self.assertEqual(self.role_files(), before)
+                    if credits == "off":
+                        self.assertIn("is used up and set not to use credits; choose another account or wait for reset", stdout + stderr)
+                        self.assertIn("codex1 (~/.codex1)", stdout + stderr)
+                else:
+                    self.assertEqual(code, 0)
+                    self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
+                    if anomalies:
+                        self.assertEqual(len(stderr.splitlines()), 1)
+                        self.assertIn("accounts: anomaly: codex1 (~/.codex1):", stderr)
+                        self.assertEqual(stdout, "\n")
 
     def test_codex_log_directory_is_own_state(self) -> None:
         _, target = self.workers_fixture()
@@ -6898,7 +6806,7 @@ _ = sys.stdin.read()
         self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         with patch.dict(os.environ, {"CODEX_HOME": str(default)}):
             rows = self.status_rows()[1:]
-        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers")])
+        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers ✓ 0 (busy 0, idle 0)")])
         self.assertEqual(agent_accounts.workers_home(), target)
 
     def test_table_keeps_workers_selection_when_a_live_read_changes_the_role(self) -> None:
@@ -6912,25 +6820,25 @@ _ = sys.stdin.read()
                 source=agent_accounts.CodexHomeSource(home))
         self.codex_reads.side_effect = read
         rows = self.status_rows()[1:]
-        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers")])
+        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers ✓ 0 (busy 0, idle 0)")])
         self.assertEqual(agent_accounts.workers_home(), default)
         self.assertNotEqual(target, default)
 
     def test_numbered_home_start_failure_row_names_setup(self) -> None:
         _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        problem = 'Codex did not start at ~/.codex1; run /showrunner:accounts setup "codex1" and try again'
-        startup = agent_accounts.CodexStartupFailure(target, '/showrunner:accounts setup "codex1"')
+        problem = 'Codex did not start at ~/.codex1; run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1" and try again'
+        startup = agent_accounts.CodexStartupFailure(target, '~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1"')
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem=problem,
             source=agent_accounts.CodexHomeSource(target), codex_startup=startup)
         rows = self.status_rows()[1:]
         target_row = next(row for row in rows if row[0] == "~/.codex1")
-        self.assertIn('/showrunner:accounts setup "codex1"', " ".join(target_row))
+        self.assertIn('~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1"', " ".join(target_row))
 
     def test_table_uses_the_startup_result_command_independently_of_problem_text(self) -> None:
         _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        command = '/showrunner:accounts setup "codex1"'
+        command = '~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1"'
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem="Startup request timed out",
             codex_startup=agent_accounts.CodexStartupFailure(target, command))
         row = next(row for row in self.status_rows() if row[0] == "~/.codex1")
@@ -6969,6 +6877,31 @@ _ = sys.stdin.read()
         with self.assertRaises(ValueError) as refused:
             _ = agent_accounts.workers_home()
         self.assertEqual(str(refused.exception), message)
+
+    def test_trust_skips_a_relative_folder_and_continues_with_the_other_folders(self) -> None:
+        paths = self.write_trust_fixture()
+        write_account_settings(self.trust_config, folders=("relative", "~/worktrees"))
+        code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertIn("anomaly", error)
+        for path in paths:
+            saved = cast(dict[str, object], json.loads(path.read_text()))
+            projects = cast(dict[str, dict[str, object]], saved["projects"])
+            self.assertTrue(projects[str(self.home / "worktrees")]["hasTrustDialogAccepted"])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @final
@@ -7168,7 +7101,6 @@ class PickerTests(unittest.TestCase):
                 self.assertEqual(rows[0]["move_id"], selection["move_id"])
                 self.assertEqual(rows[0]["cause"], selection["cause"])
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_lists_work_routing_separately_from_account_moves(self) -> None:
         self.codex("default", "worker@example.invalid")
@@ -7205,7 +7137,6 @@ class PickerTests(unittest.TestCase):
         self.assertIn("owner unknown", routing)
         self.assertNotIn("— open", routing)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_shows_scheduled_claude_routing_as_auto(self) -> None:
         self.codex("default", "worker@example.invalid")
@@ -7367,7 +7298,6 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(config.read_bytes(), original)
         self.assertFalse(accounts.roles_history_file().exists())
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unnoted_claude_home_is_displayed_but_never_selected_or_a_destination(self) -> None:
         (self.home / "notes/claude2.md").unlink()
@@ -7392,7 +7322,6 @@ class PickerTests(unittest.TestCase):
         self.assertEqual((code, stderr), (0, ""), stdout)
         self.assertEqual(accounts.role_account("unit").dir, self.home / ".claude1")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_legacy_group_for_an_unnoted_home_is_display_only_and_cannot_launch(self) -> None:
         path = self.groups(units="default")
@@ -7407,7 +7336,6 @@ class PickerTests(unittest.TestCase):
             _ = accounts.role_account("unit")
         self.assertEqual(path.read_bytes(), original)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unnoted_codex_home_is_displayed_but_never_picked_or_assigned_to_workers(self) -> None:
         self.codex("default", "unnoted@example.invalid")
@@ -7606,7 +7534,6 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(stored_group_labels(accounts.groups_file()), {"units": "claude1"})
         self.assertFalse(moved.called)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_starts_with_the_table_and_keeps_groups_in_role_cells(self) -> None:
         _ = self.groups()
@@ -7958,8 +7885,8 @@ class PickerTests(unittest.TestCase):
                 self.assertEqual(accounts.main(["status"]), 0)
         rows = [[cell.strip() for cell in line.strip("|").split("|")]
                 for line in output.getvalue().splitlines() if line.startswith("| ~/.claude")]
-        self.assertEqual([row[1] for row in rows if row[2] == "units"], ["claude3"])
-        self.assertEqual([row[1] for row in rows if row[2] == "showrunners"], ["claude1"])
+        self.assertEqual([row[1] for row in rows if row[2].startswith("units ✓")], ["claude3"])
+        self.assertEqual([row[1] for row in rows if row[2].startswith("showrunners ✓")], ["claude1"])
 
     def test_unit_role_reads_group_and_ignores_legacy_saved_unit_key(self) -> None:
         _ = self.groups(units="claude3")
@@ -8019,6 +7946,7 @@ class PickerTests(unittest.TestCase):
                 process.assert_not_called()
 
 
+
 class SharedStatusDocumentTests(unittest.TestCase):
     """The stored JSON adds access and spending signals without changing its text view."""
 
@@ -8051,7 +7979,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
         first_role = replace(row, roles=("units",), role_counts=row.role_counts[:1])
         single = accounts.render_status_table(self.reading(first_role))
         self.assertEqual(cells[0], tuple(cell.strip() for cell in single.splitlines()[2].strip("|").split("|")))
-        self.assertEqual(cells[1], ("", "", "showrunners", "", "", "", "", ""))
+        self.assertEqual(cells[1], ("", "", "showrunners 2 (busy 1, shell 0, idle 1)", "", "", "", "", ""))
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         self.assertEqual(len(document["accounts"]), 1)
         self.assertEqual(document["accounts"][0]["roles"], ["units", "showrunners"])
@@ -8069,7 +7997,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
                 (now - timedelta(minutes=3), "last read attempted at 11:57"),
                 (now - timedelta(minutes=3, seconds=1), "last read attempted at 11:56"),
                 (read, "last read attempted at 10-16 10:58"),
-                (accounts.StatusUnavailable(), "no usage read has been attempted"),
+                (accounts.StatusUnavailable(), "the attempt time is not recorded"),
                 (now + timedelta(minutes=1), "last read attempted at 12:01"),
             )
             for attempted, step in cases:
@@ -8143,17 +8071,17 @@ class SharedStatusDocumentTests(unittest.TestCase):
                     self.assertIs(document["use_credits"], enabled)
                     self.assertIsNone(document["credits"])
 
-    def test_new_json_signals_leave_the_existing_text_table_exactly_unchanged(self) -> None:
+    def test_json_signals_and_text_table_show_the_same_zero_worker_counts(self) -> None:
         reading = self.reading(self.row())
         self.assertEqual(accounts.render_status_table(reading), (
-            '| Folder    | Label   | Role    | Weekly left | Weekly resets       | On credits | Credits left | Read      |\n'
-            '| --------- | ------- | ------- | ----------- | ------------------- | ---------- | ------------ | --------- |\n'
-            '| ~/.codex1 | fixture | workers | 60%         | Sat 10-17 14:00 EDT | no         | 13,446       | 14:00 EDT |\n'
+            '| Folder    | Label   | Role                       | Weekly left | Weekly resets       | On credits | Credits left | Read      |\n'
+            '| --------- | ------- | -------------------------- | ----------- | ------------------- | ---------- | ------------ | --------- |\n'
+            '| ~/.codex1 | fixture | workers 0 (busy 0, idle 0) | 60%         | Sat 10-17 14:00 EDT | no         | 13,446       | 14:00 EDT |\n'
             '\n'
             '* Fixture problem.'
         ))
         self.assertEqual(self.document(self.row()), {
-            "label": "fixture", "tool": "codex", "roles": ["workers"], "role_counts": [{"busy": 0, "shell": None, "idle": 0, "total": 0}],
+            "label": "fixture", "tool": "codex", "roles": ["workers"], "selected_roles": [], "role_counts": [{"busy": 0, "shell": None, "idle": 0, "total": 0}],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
             "read_ok": True, "credits_in_use": False, "role_counts_by_machine": {},
@@ -8195,6 +8123,9 @@ class StatusProblemCauseTests(unittest.TestCase):
         with (patch.object(accounts, "account_statuses", return_value=[]),
               patch.object(accounts, "codex_statuses", return_value=[status]),
               patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", home)),
+              patch.object(accounts, "read_role_map", return_value=role_map.RoleMap({}, "codex1")),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  "codex1", home, login)),
               patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
               patch.object(accounts, "_stored_usage", return_value=usage),
               patch.object(accounts, "_codex_home_login", return_value=login),
@@ -8209,6 +8140,9 @@ class StatusProblemCauseTests(unittest.TestCase):
               patch.object(accounts, "codex_statuses", return_value=codex),
               patch.object(accounts, "role_account", side_effect=accounts.AccountsError(role_error) if role_error else None,
                            return_value=workers),
+              patch.object(accounts, "read_role_map", return_value=role_map.RoleMap({}, "codex1")),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  workers.label, workers.home, "fixture@notexample.com")),
               patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
               patch.object(accounts, "_stored_usage", return_value={
                   usage_store.key("Claude", status.login): usage for status in statuses} | {
@@ -8300,7 +8234,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         ))
         self.assertCountEqual(reading.notes, expected)
         terminal = accounts.render_status_table(reading).splitlines()
-        self.assertCountEqual(terminal[terminal.index("") + 1:], expected)
+        self.assertCountEqual(terminal[terminal.index("") + 1:], [*reading.upcoming_moves, "", *expected])
         self.assertCountEqual(cast(list[str], json.loads(accounts.render_status_json(reading))["problems"]),
             [line.removeprefix("* ") for line in expected])
 
@@ -8429,7 +8363,8 @@ class StatusProblemCauseTests(unittest.TestCase):
             lines = list(reading.notes)
             observed.append(sorted(lines))
             self.assertCountEqual(lines, expected)
-            self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].splitlines(), expected)
+            self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].splitlines(),
+                                  [*reading.upcoming_moves, "", *expected])
             self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
         self.assertEqual(observed[0], observed[1])
 
@@ -8453,6 +8388,9 @@ class StatusProblemCauseTests(unittest.TestCase):
                       patch.object(accounts, "codex_statuses", return_value=list(statuses)),
                       patch.object(accounts, "_codex_live", side_effect=reports),
                       patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", failed.home)),
+                      patch.object(accounts, "read_role_map", return_value=role_map.RoleMap({}, "codex1")),
+                      patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                          "codex1", failed.home, failed.login)),
                       patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
                       patch.object(accounts, "_codex_home_login", return_value=""),
                       patch.object(account, "claude_account", return_value=None)):
@@ -8467,17 +8405,17 @@ class StatusProblemCauseTests(unittest.TestCase):
                     "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
                     "* codex1: usage unavailable; Codex did not start at ~/.codex1; " + previous
                         + "; run accounts.py setup codex1 and try again"
-                        + ("; no usage read has been attempted" if outcome == agent_accounts.UsageReadOutcome.ERROR else
+                        + ("; the attempt time is not recorded" if outcome == agent_accounts.UsageReadOutcome.ERROR else
                            "; start a session on it to check it" if outcome == agent_accounts.UsageReadOutcome.REFUSED_401 else ""),
                     "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 store codex1's login; two homes on one login break token refresh; keep each login in one home",
                 ]
                 if outcome != agent_accounts.UsageReadOutcome.OK:
                     expected.append("* codex1: usage unavailable; " + (
-                        "the usage read failed; " + previous + "; no usage read has been attempted"
+                        "the usage read failed; " + previous + "; the attempt time is not recorded"
                         if outcome == agent_accounts.UsageReadOutcome.ERROR else
                         "the usage service did not accept this login; start a session on it to check it"))
                 terminal = accounts.render_status_table(reading).splitlines()
-                self.assertCountEqual(terminal[terminal.index("") + 1:], expected)
+                self.assertCountEqual(terminal[terminal.index("") + 1:], [*reading.upcoming_moves, "", *expected])
                 document = cast(dict[str, object], json.loads(accounts.render_status_json(reading)))
                 self.assertCountEqual(cast(list[str], document["problems"]),
                     [line.removeprefix("* ") for line in expected])
@@ -8520,7 +8458,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         reading = self.status_with(statuses, [], usage_store.StoredUsage(
             read_outcome=agent_accounts.UsageReadOutcome.ERROR,
             attempt_outcome=agent_accounts.UsageReadOutcome.ERROR))
-        line = "* claude2: usage unavailable; the usage read failed; no reading is stored yet; no usage read has been attempted"
+        line = "* claude2: usage unavailable; the usage read failed; no reading is stored yet; the attempt time is not recorded"
         self.assertIn(line, reading.notes)
         self.assertIn(line, accounts.render_status_table(reading).splitlines())
         self.assertIn(line.removeprefix("* "), cast(accounts.StatusDocument,
@@ -8567,7 +8505,8 @@ class StatusProblemCauseTests(unittest.TestCase):
                                      for line in lines))
                 expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
                             "claude2: test sign-in is stored; a test wrote ~/.claude2/.claude.json at 2026-10-29 01:14 UTC; delete ~/.claude2/.claude.json"]
-                self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+                self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(),
+                                      [*reading.upcoming_moves, "", *expected])
                 self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
 
     def test_startup_failure_stays_visible_when_another_home_reads_the_same_login(self) -> None:
@@ -8653,7 +8592,8 @@ class StatusProblemCauseTests(unittest.TestCase):
         self.assertFalse(any("account note" in line for line in lines))
         expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
                     "claude2: test sign-in is stored; a test wrote ~/.claude2/.claude.json at 2026-10-29 01:14 UTC; delete ~/.claude2/.claude.json"]
-        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(),
+                              [*reading.upcoming_moves, "", *expected])
         self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
 
     def test_codex_startup_cause_keeps_reading_and_setup_in_one_line(self) -> None:
@@ -8707,7 +8647,8 @@ class StatusProblemCauseTests(unittest.TestCase):
             "codex1: test sign-in is stored; a test wrote ~/.codex1/auth.json at 2026-10-29 01:15 UTC; delete ~/.codex1/auth.json",
             "codex1: login is stored in two homes; ~/.codex and ~/.codex1 store codex1's login; two homes on one login break token refresh; keep each login in one home",
         ]
-        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(),
+                              [*reading.upcoming_moves, "", *expected])
         self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
 
     def test_real_domains_keep_account_repairs_through_status(self) -> None:

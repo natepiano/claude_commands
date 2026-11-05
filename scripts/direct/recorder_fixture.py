@@ -25,6 +25,23 @@ from scripts.direct import progress_history
 from scripts.lib import models_registry, user_zone
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
+
+
+def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
+                        workers: Mapping[str, str]) -> None:
+    """Publish private staff references before the recorder attributes a wait."""
+    import json
+    with isolated_staff_file(root / "staff.json", environment):
+        owner = fixture_member("showrunner", name="wait-owner")
+        parent = fixture_member("unit", name="wait-unit", parent=owner.id,
+                                runtime_id=fixture_runtime_id("fixture-director"),
+                                worktree=staff.PresentWorktree("natedev", root))
+        roster = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
+                  for name, identity in workers.items()}
+    session.mkdir(parents=True, exist_ok=True)
+    _ = (session / "mesh_roster.json").write_text(json.dumps(roster))
 
 
 
@@ -152,13 +169,12 @@ class LauncherFixture(unittest.TestCase):
         return session_dir
 
 
-def launcher_registry(implementation_roles: tuple[str, ...], *, mesh: bool = False) -> str:
+def launcher_registry(implementation_roles: tuple[str, ...]) -> str:
     """Build both launcher registries from the same catalog and role settings."""
     return registry_text({
         "assignments": ExactRows({"direct": "codex"}),
         "direct.codex": {**dict.fromkeys(implementation_roles, "gpt-called:xhigh"), "review": "gpt-blind:max"},
         "codex.agents": {"gpt-called": "low,medium,high,xhigh,max", "gpt-blind": "low,medium,high,xhigh,max"},
-        "direct.options": {"codex_mesh": "1" if mesh else "0"},
     })
 
 
@@ -197,7 +213,7 @@ def configure_launcher_fixture(launcher: Path) -> None:
 
 def launcher_environment(root: Path) -> dict[str, str]:
     """Isolate registry writes, Python discovery and worker identity for launchers."""
-    environment = os.environ.copy()
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("HERDR_")}
     environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
                        UNIT_WORKER_POLL_SECS="0.01", UNIT_WORKER_WAIT_ATTEMPTS="30000", UNIT_SYNC_WRITES="0",
                        TEST_LEGACY_LAUNCH="1", MODELS_CONFIG_FILE=str(root / ".claude/config/models.conf"),

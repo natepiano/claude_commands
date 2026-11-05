@@ -1,6 +1,8 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
 
+from scripts.production.fake_unit_host import labeled as labeled_host
+
 import json
 import os
 import io
@@ -524,20 +526,16 @@ class MessageTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name in ("notifier", "sessions"):
             (self.root / name).mkdir()
-        # hana's one unit: a row of its production doc, and a herdr pane marked as that unit.
+        # hana's one unit: a staff row, and a herdr pane marked as that unit.
         doc = self.root / "show-production.md"
-        _ = doc.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                                      "| --- | --- | --- | --- | --- | --- |",
-                                      "| trunk-unit | docs/plan.md | /tmp/no-worktree-of-trunk | trunk | — | — |")),
-                           encoding="utf-8")
+        _ = doc.write_text("# Show\n", encoding="utf-8")
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana",
             "always": [],
         }), encoding="utf-8")
         # A second showrunner whose production has no units.
         other = self.root / "other-production.md"
-        _ = other.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                                        "| --- | --- | --- | --- | --- | --- |")), encoding="utf-8")
+        _ = other.write_text("# Other\n", encoding="utf-8")
         # A showrunner is recorded by its update timer; the one of `zz-gone` has no running session.
         _ = fake_showrunner.write_timer(self.root / "notifier", "show", "b861068b-66ee-573d-b3be-ec6d4a321e71", "America/Los_Angeles", doc)
         _ = fake_showrunner.write_timer(self.root / "notifier", "zz-gone", "id-gone", "America/Los_Angeles", other)
@@ -583,7 +581,7 @@ class MessageTests(unittest.TestCase):
         _ = unit_membership("show", "trunk-unit")
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
         fake_unit_host.write({**os.environ, **self.environment}, [
-            fake_unit_host.HostedUnit("trunk", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "trunk-unit"})])
+            labeled_host("trunk", "w1:p1", "trunk-unit", slug="show")])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")
         self.set_processes()
 

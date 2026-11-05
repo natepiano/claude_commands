@@ -79,6 +79,7 @@ own push (stall_watch.py, escalate.py); sessions that send by hand give `--clear
 (user, 2026-10-05) Outcomes have a header followed by any payload lines and are logged with the full
 message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
+  RETRY: why     keyed delivery in progress; retry later        exit 6
   SKIPPED: why   acknowledged, inside the repeat window, or       exit 0
                  an emergency push with the key is still live
   PENDING: why   an earlier send has not confirmed acceptance     exit 5
@@ -154,6 +155,7 @@ if TYPE_CHECKING:
     from ..accounts import accounts
     from ..whoami.account import named_account_environment
 import push_texts  # noqa: E402
+import push_reference
 import rca  # noqa: E402
 import repeat_guard  # noqa: E402
 import review  # noqa: E402
@@ -684,6 +686,17 @@ class MeshWorker:
 RecipientSelection = RosterLookup | MeshWorker
 
 
+@dataclass(frozen=True)
+class TransportRecipientIdentity:
+    """Keep the established per-address key identity."""
+
+
+@dataclass(frozen=True)
+class LogicalRecipientIdentity:
+    """A stable recipient whose transport address may change."""
+    name: str
+
+
 class Options(NamedTuple):
     selection: RecipientSelection
     sender: str | None
@@ -711,6 +724,9 @@ class Options(NamedTuple):
     report_recipient: bool = False
     sender_origin: RuntimeSender | ForwardedSender = RuntimeSender()
     due: str = ""
+    reference: push_reference.PushReference = push_reference.NO_REFERENCE
+
+    recipient_identity: TransportRecipientIdentity | LogicalRecipientIdentity = TransportRecipientIdentity()
 
     @property
     def to(self) -> str:
@@ -1173,6 +1189,53 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def delivery_turn(message: Message) -> Generator[bool]:
+    """Exclude only this key and recipient; never hold the global state lock during transport."""
+    if message.key is None:
+        yield True
+        return
+    directory = STATE / "delivery-locks"
+    directory.mkdir(parents=True, exist_ok=True)
+    identity = json.dumps([message.key, message.to])
+    path = directory / (hashlib.sha256(identity.encode()).hexdigest() + ".lock")
+    with path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def confirmed_skip(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False) -> str | None:
+    """Read prior acceptance under a delivery turn; a lock alone never means sent."""
+    if message.key is None:
+        return None
+    with key_states() as states:
+        state = states.get(message.key, {"last": {}})
+        if "acknowledged" in state:
+            return acknowledged_skip_reason(message.key, state["acknowledged"])
+        last = state["last"].get(message.to)
+        if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
+            if live:
+                return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
+            minutes = repeat.total_seconds() / 60
+            return f"key {message.key!r} last sent to {message.to} at {last}, inside its {minutes:g}-minute window"
+    return None
+
+
+def record_acceptance(message: Message, at: datetime) -> None:
+    """Only a confirmed transport or recoverable queue/kept handoff enters the repeat window."""
+    if message.key is not None:
+        with key_states() as states:
+            state = states.setdefault(message.key, {"last": {}})
+            state["last"][message.to] = at.isoformat()
+
+
 @dataclass(frozen=True)
 class ClaimGranted:
     """This attempt can deliver the message."""
@@ -1598,9 +1661,45 @@ def pending(to: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _print_roster_problems(problems: list[str]) -> None:
+def _recipient_roster_problems(
+    to: str, problems: list[str], observed: roster.Roster, membership: staff.StaffSnapshot,
+) -> list[str]:
+    """Use staff identities for anomalies and text for diagnostics without typed owners."""
+    member = resolve_staff_recipient(to, membership, observed=observed.entries)
+    references = {to, to.split(":", 1)[-1]}
+    if isinstance(member, staff.StaffRow):
+        references.update((member.name, str(member.id), str(member.current_session)))
+    typed: dict[str, bool] = {}
+    for anomaly in observed.row_anomalies:
+        owner = anomaly.row
+        matches = (owner.id == member.id if isinstance(member, staff.StaffRow)
+                   else to.casefold() in (owner.name.casefold(), owner.id, owner.current_session,
+                                          f"session:{owner.current_session}", f"codex:{owner.current_session}"))
+        for text in (anomaly.diagnostic, f"warning: {anomaly.diagnostic}"):
+            typed[text] = typed.get(text, False) or matches
+    related: list[str] = []
     for problem in problems:
+        if problem in typed:
+            matches = typed[problem]
+        else:
+            matches = any(reference and re.search(
+                rf"(?<![\w-]){re.escape(reference)}(?![\w-])", problem, re.IGNORECASE)
+                for reference in references)
+        if matches:
+            related.append(problem)
+    return related
+
+
+def _print_roster_problems(
+    to: str, problems: list[str], observed: roster.Roster, membership: staff.StaffSnapshot,
+) -> None:
+    related = _recipient_roster_problems(to, problems, observed, membership)
+    for problem in related:
         print(f"send.py: roster: {problem}", file=sys.stderr)
+    omitted = len(problems) - len(related)
+    if omitted:
+        print(f"send.py: roster problems omitted: {omitted}; "
+              + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py", file=sys.stderr)
 
 
 def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
@@ -1685,8 +1784,8 @@ def resolve_staff_recipient(
         chain = [candidate.name]
         parent = candidate
         visited = {candidate.id}
-        while parent.kind != "showrunner" and parent.parent is not None:
-            ancestor = membership.by_id(parent.parent)
+        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo):
+            ancestor = membership.by_id(parent.parent.id)
             if ancestor is None or ancestor.id in visited:
                 break
             visited.add(ancestor.id)
@@ -1755,6 +1854,10 @@ def matching_recipients(
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [member.reason])
+    if isinstance(member, staff.StaffRow):
+        for anomaly in observed.row_anomalies:
+            if anomaly.row.id == member.id:
+                return RecipientSearchFailed(anomaly.diagnostic, observed.diagnostics)
     matches = (_staff_transport_matches(member, observed.entries) if isinstance(member, staff.StaffRow)
                else _sender_label_matches(to, observed.entries))
     if matches or isinstance(scope, LocalOnly):
@@ -1785,40 +1888,61 @@ def resolve_recipient(
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
     membership = staff.snapshot() if membership is None else membership
-    if to.startswith("uds:"):
-        return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
-    member = resolve_staff_recipient(to, membership, observed=observed.entries)
-    if isinstance(member, RecipientLookupFailed):
-        usage_error(member.reason)
-    if isinstance(scope, NamedMachine):
-        return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
-                                          else to if to.startswith("worker:") else f"session:{member.current_session}")
-                              if isinstance(member, staff.StaffRow) else to)
-    if to.startswith("codex:"):
-        thread_id = to.removeprefix("codex:")
-        if not thread_id:
-            usage_error("codex: needs a thread id")
-    result = matching_recipients(to, scope, observed, membership=membership)
-    _print_roster_problems(result.problems)
-    if isinstance(result, LocalRosterIncomplete):
-        usage_error(f"absence of {to} here is not proven; use an address or --machine")
-    if isinstance(result, RecipientSearchFailed):
-        return RecipientLookupFailed(result.reason)
-    if result.entries:
-        return _matched_recipient(to, result.entries, result.destination)
-    if to.startswith("worker:"):
-        usage_error(f"no roster session has address {to}")
-    if to.startswith("codex:"):
-        from scripts.whoami.agent_accounts import codex_home_display
+    problems = observed.diagnostics
 
-        checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
-        return RecipientLookupFailed(
-            f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
-    if isinstance(member, staff.StaffRow):
-        return ClaudeRecipient(f"session:{member.current_session}")
-    if to.startswith("session:"):
-        return ClaudeRecipient(to)
-    usage_error(f"no staff row or live session for {to!r}")
+    def lookup() -> DeliveryRoute:
+        nonlocal problems
+        if to.startswith("uds:"):
+            return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
+        member = resolve_staff_recipient(to, membership, observed=observed.entries)
+        if isinstance(member, RecipientLookupFailed):
+            usage_error(member.reason)
+        if isinstance(member, staff.StaffRow):
+            for anomaly in observed.row_anomalies:
+                if anomaly.row.id == member.id:
+                    usage_error(anomaly.diagnostic)
+        if isinstance(scope, NamedMachine):
+            return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
+                                              else to if to.startswith("worker:") else f"session:{member.current_session}")
+                                  if isinstance(member, staff.StaffRow) else to)
+        if to.startswith("codex:"):
+            thread_id = to.removeprefix("codex:")
+            if not thread_id:
+                usage_error("codex: needs a thread id")
+        result = matching_recipients(to, scope, observed, membership=membership)
+        problems = result.problems
+        if isinstance(result, LocalRosterIncomplete):
+            usage_error(f"absence of {to} here is not proven; use an address or --machine")
+        if isinstance(result, RecipientSearchFailed):
+            related = _recipient_roster_problems(to, problems, observed, membership)
+            reason = (f"recipient lookup failed for {to!r}"
+                      if any(problem in result.reason for problem in problems if problem not in related)
+                      else result.reason)
+            return RecipientLookupFailed(reason)
+        if result.entries:
+            return _matched_recipient(to, result.entries, result.destination)
+        if to.startswith("worker:"):
+            usage_error(f"no roster session has address {to}")
+        if to.startswith("codex:"):
+            from scripts.whoami.agent_accounts import codex_home_display
+
+            checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
+            return RecipientLookupFailed(
+                f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
+        if isinstance(member, staff.StaffRow):
+            return ClaudeRecipient(f"session:{member.current_session}")
+        if to.startswith("session:"):
+            return ClaudeRecipient(to)
+        usage_error(f"no staff row or live session for {to!r}")
+
+    failed = True
+    try:
+        route = lookup()
+        failed = isinstance(route, RecipientLookupFailed)
+        return route
+    finally:
+        if failed:
+            _print_roster_problems(to, problems, observed, membership)
 
 
 def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | None = None,
@@ -2056,7 +2180,7 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
     return original
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "") -> Result:
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
     key = ["--key", message.key] if message.key else []
     selected_priority = decision_priority.priority(need, due)
@@ -2069,6 +2193,10 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
             command.extend(["--value", value])
     if due:
         command[2:2] = ["--due", due]
+    if reference["kind"] != "none":
+        command[2:2] = ["--push-reference", json.dumps(reference)]
+    if remote_forward:
+        command[2:2] = ["--ssh-forwarded-reference"]
     code, out, err = run(command, "", timeout)
     if code == 6:
         failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True, text_id=text_id, sender=message.sender))
@@ -2189,8 +2317,12 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--human"]
     if message.key is not None:
         forwarded += ["--key", message.key]
+        if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+            forwarded += ["--recipient-key", options.recipient_identity.name]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if options.reference["kind"] != "none":
+            forwarded += ["--push-reference", json.dumps(options.reference)]
         if options.due:
             forwarded += ["--due", options.due]
         if options.need == "blocked":
@@ -2435,6 +2567,8 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--priority", choices=("0", "1", "2"), help=argparse.SUPPRESS)
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
                             help="to `user`: what they must do (default note: nothing)")
+    _ = parser.add_argument("--question", default="", help="the open question record for decision.choices")
+    _ = parser.add_argument("--push-reference", default="", help=argparse.SUPPRESS)
     _ = parser.add_argument("--due", default="", help="decision deadline in ISO 8601 with an explicit offset")
     _ = parser.add_argument("--action", help="to `user`: what the user does")
     _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
@@ -2445,6 +2579,7 @@ def parse(argv: list[str]) -> Options:
     _ = clears.add_argument("--self-clearing", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
                                            + " the user replaces an older kept one with this key from the same sender"))
+    _ = parser.add_argument("--recipient-key", help="stable logical recipient for keyed deduplication across address changes")
     _ = parser.add_argument("--repeat-minutes", type=float,
                            help="skip a delivered or kept send with --key inside this window; failed sends do not count")
     location = parser.add_mutually_exclusive_group()
@@ -2457,8 +2592,26 @@ def parse(argv: list[str]) -> Options:
     _ = body.add_argument("--text")
     _ = body.add_argument("--file")
     args = parser.parse_args(argv)
+    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
+    origin: RuntimeSender | ForwardedSender = RuntimeSender()
+    if forwarded_stamp is not None:
+        if attr(args, "here") is not True:
+            parser.error("--forwarded-sender-stamp needs --here")
+        if "SSH_CONNECTION" not in os.environ:
+            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
+        try:
+            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
+        except ValueError as error:
+            parser.error(str(error))
     to = as_str(attr(args, "to"))
     text_id = as_str(attr(args, "text_id"))
+    try:
+        reference = push_reference.admission_reference(text_id, as_str(attr(args, "question")), as_str(attr(args, "push_reference")),
+            remote_forward=isinstance(origin, ForwardedSender))
+    except (OSError, ValueError) as error:
+        usage_error(str(error).replace("\n", " "))
+    if reference["kind"] == "question" and attr(args, "key") is None:
+        args.key = "question:" + reference["path"]
     raw_values = cast(list[str], attr(args, "value"))
     # Only auto_mode.refused repeats a key: one command value for each refused command.
     commands: list[str] = []
@@ -2540,23 +2693,13 @@ def parse(argv: list[str]) -> Options:
     forwarded_sender = optional_str(attr(args, "forwarded_shown_sender"))
     if forwarded_sender is not None and (attr(args, "here") is not True or not forwarded_sender):
         parser.error("--forwarded-shown-sender needs --here and nonempty sending-machine display text")
-    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
-    origin: RuntimeSender | ForwardedSender = RuntimeSender()
-    if forwarded_stamp is not None:
-        if attr(args, "here") is not True:
-            parser.error("--forwarded-sender-stamp needs --here")
-        if "SSH_CONNECTION" not in os.environ:
-            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
-        try:
-            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
-        except ValueError as error:
-            parser.error(str(error))
     scope: RecipientResolutionScope = (
         NamedMachine(host) if host is not None else
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
     get = {name: attr(args, name) for name in Options._fields
-           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin"}}
+           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin", "reference", "recipient_identity"}}
+    recipient_key = optional_str(attr(args, "recipient_key"))
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       scope=scope, timeout=optional_float(get["timeout"]) or delivery_timeout(),
@@ -2567,13 +2710,16 @@ def parse(argv: list[str]) -> Options:
                       human=get["human"] is True, no_accounting=get["no_accounting"] is True,
                       report_recipient=get["report_recipient"] is True,
                       shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
-                      sender_origin=origin, due=due)
+                      sender_origin=origin, due=due, reference=reference,
+                      recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity())
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
         parser.error("--need goes with --to user")
     if options.to == USER and options.need != "note" and not isinstance(options.action, ActionRequired):
         parser.error(f"--need {options.need} requires --action. {FIX}")
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and options.key is None:
+        parser.error("--recipient-key needs --key")
     if options.repeat_minutes is not None and options.key is None:
         parser.error("--repeat-minutes needs --key")
     if get["clears_when"] is not None and not options.clears_when.strip():
@@ -2620,11 +2766,13 @@ def body_text(options: Options) -> str:
     return sys.stdin.read()
 
 
-def sender_shown_name(sender: str, observed: roster.Roster) -> str:
-    """Resolve display text without changing sender keys or reply addresses."""
+def sender_shown_name(sender: str, stamp: SenderStamp, observed: roster.Roster) -> str:
+    """Resolve the display from the native id without changing reply addresses."""
     import roster
 
-    matches = _sender_label_matches(sender, observed.entries)
+    if isinstance(stamp, UnavailableSender):
+        return sender
+    matches = _sender_label_matches(sender_native_id(stamp), observed.entries)
     if len(matches) == 1:
         return roster.shown_name(matches[0]).render()
     return sender
@@ -2718,6 +2866,17 @@ def delivered_text(message: Message, entry_id: str) -> str:
 
 
 def send(options: Options) -> Result:
+    if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
+        return _send(options)
+    identity = Message(options.recipient_identity.name, options.sender or default_sender(),
+                       options.summary or "", "", options.key)
+    with delivery_turn(identity) as acquired:
+        if not acquired:
+            return Result("retry", f"key {options.key!r} has a delivery in progress; retry")
+        return _send(options)
+
+
+def _send(options: Options) -> Result:
     import roster
 
     if options.to == USER and not options.text_id:
@@ -2761,7 +2920,8 @@ def send(options: Options) -> Result:
         usage_error(member.reason)
     if isinstance(member, NoStaffRecipient) and destination != options.to:
         member = resolve_staff_recipient(destination, membership, records=records, observed=observed.entries)
-    stable = StableRecipient(f"staff:{member.id}" if isinstance(member, staff.StaffRow) else options.to)
+    stable = StableRecipient(options.recipient_identity.name if isinstance(options.recipient_identity, LogicalRecipientIdentity)
+                             else f"staff:{member.id}" if isinstance(member, staff.StaffRow) else options.to)
     registered = sessions.addressed(destination, records)
     legacy_aliases = (destination,)
     if registered is not None:
@@ -2771,9 +2931,9 @@ def send(options: Options) -> Result:
         options = options._replace(answerable=True)
     emergency = options.to == USER and options.need == "blocked"
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
-    display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
-               else sender_shown_name(sender, observed) if options.to != USER else sender)
     stamp = (options.sender_origin.stamp if isinstance(options.sender_origin, ForwardedSender) else sender_stamp())
+    display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
+               else sender_shown_name(sender, stamp, observed) if options.to != USER else sender)
     if sender.casefold() == "morty" and not morty_stamp(stamp):
         print("send.py: sender 'morty' does not match MORTY_NATIVE_ID", file=sys.stderr)
     message = Message(destination, sender, summary, text, key, display, options.human, stamp)
@@ -2790,10 +2950,15 @@ def send(options: Options) -> Result:
     refused = emergency and not options.clears_when and not options.self_clearing
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
     cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
-    claim_result = ClaimGranted() if refused or held is not None else claim(
-        message, stable, window, started, delivery_limit=options.timeout,
-        legacy_aliases=legacy_aliases, live=live, clears_when=cold_check,
-        posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
+    identity = replace(message, to=stable.value)
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+        skip = None if refused or held is not None else confirmed_skip(identity, window, started, live=live)
+        claim_result = RepeatAccepted(skip) if skip is not None else ClaimGranted()
+    else:
+        claim_result = ClaimGranted() if refused or held is not None else claim(
+            message, stable, window, started, delivery_limit=options.timeout,
+            legacy_aliases=legacy_aliases, live=live, clears_when=cold_check,
+            posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
     guarded = repeat_guard.Decision()
     if not refused and held is None and isinstance(claim_result, ClaimGranted) and not isinstance(route, (RecipientLookupFailed, CodexWorkerRecipient, RemoteDelivery)):
@@ -2817,7 +2982,7 @@ def send(options: Options) -> Result:
     elif isinstance(route, UserDelivery):
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due)
+        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender))
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
             _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexWorkerRecipient):
@@ -2882,13 +3047,18 @@ def send(options: Options) -> Result:
         _ = remove_queued_key(message.to, message.key, recipient=stable, order=order)
         if options.to != message.to:
             _ = remove_queued_key(options.to, message.key, recipient=stable, order=order)
-    # A failed send can retry. A queue or kept push owns its copy until delivery.
-    if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
-            and result.outcome in {"failed", "refused", "held", "pending"}):
-        forget_sent(key, stable.value, started)
-    elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
-          and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
-        accept_sent(key, stable.value, started)
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+        if (not refused and held is None and isinstance(claim_result, ClaimGranted)
+                and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
+            record_acceptance(identity, started)
+    else:
+        # A failed send can retry. A queue or kept push owns its copy until delivery.
+        if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+                and result.outcome in {"failed", "refused", "held", "pending"}):
+            forget_sent(key, stable.value, started)
+        elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+              and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
+            accept_sent(key, stable.value, started)
     if emergency and options.clears_when and key is not None and not cold_check and result.outcome == "sent":
         posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
         record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
@@ -2912,10 +3082,10 @@ def repeat_notice_owner(sender: str) -> str:
         usage_error(member.reason)
     visited: set[staff.StaffId] = set()
     while member.kind != "showrunner":
-        if member.parent is None or member.id in visited:
+        if isinstance(member.parent, staff.StaffRoot) or member.id in visited:
             usage_error(f"missing showrunner staff row for {sender!r}")
         visited.add(member.id)
-        parent = membership.by_id(member.parent)
+        parent = membership.by_id(member.parent.id)
         if parent is None:
             usage_error(f"missing showrunner staff row for {sender!r}")
         member = parent
@@ -2960,6 +3130,10 @@ def attempt_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.
 
 
 def main(argv: list[str]) -> int:
+    if marker := os.environ.get("TEST_SENDER_GUARD"):
+        _ = Path(marker).write_text("real sender refused\n")
+        print("REFUSED: real scripts/message/send.py is forbidden in tests", file=sys.stderr)
+        return 1
     user_target = "--to=user" in argv or any(left == "--to" and right == USER for left, right in zip(argv, argv[1:]))
     has_template = "--text-id" in argv or any(value.startswith("--text-id=") and value != "--text-id=" for value in argv)
     if user_target and not has_template and argv[:1] != ["retire"]:

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
@@ -18,8 +19,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production.staff_test_support import unit_membership
+from scripts.production.staff_test_support import unit_membership, StaffTestCase, fixture_worker, fixture_runtime_id, fixture_session, fixture_roster
 from scripts.production import staff
+from scripts.usage import agents_log
 from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import top_level, worker_session
 import inventory
@@ -137,15 +139,68 @@ class InventoryTests(ShutdownTestCase):
         cls.seed_head = fixture.head
         fixture.live_socket.close()
 
+    def test_paused_worker_reads_its_current_thread_from_the_staff_backend_record(self) -> None:
+        fixture = StaffTestCase()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        _, unit, _ = fixture.tree()
+        worker = fixture_worker("impl2", unit.id,
+                                backend=staff.CodexBackend(self.root / "codex-home"))
+        current = staff.native_id(fixture_runtime_id("shutdown-replaced-thread"))
+        fixture_session(current, staff.CodexBackend(self.root / "codex-home"))
+        worker = staff.update_current_session(worker.current_session, current)
+        agents_log.append(current, "review", None, datetime.now(timezone.utc))
+        run = self.root / "paused-staff-worker"
+        run.mkdir()
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            worker.name: {"staff_id": worker.id, "status": "paused", "role": "review"},
+        }))
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        seats = inventory.codex_seats([run])
+        self.assertEqual(len(seats), 1)
+        self.assertEqual(seats[0]["staff_id"], worker.id)
+        recorded = staff.by_id(staff.StaffId(seats[0]["staff_id"]))
+        assert recorded is not None
+        self.assertEqual(recorded.current_session, current)
+        self.assertEqual(seats[0]["role"], "review")
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertNotIn("thread_id", (run / "mesh_roster.json").read_text())
+
+    def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
+        run = self.root / "paused run"
+        run.mkdir()
+        command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
+        outer = ["bash", "/config/scripts/direct/implement.sh", "outer arguments"]
+        self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
+        self.herdr_process(811, 812, command, {})
+        self.herdr_process(812, 1, outer, {})
+        _ = (run / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], {
+            "busy": {"role": "review", "thread_id": "75863a97-cb41-5754-bb95-d7e89deccf43", "turn_id": "turn", "status": "running", "launcher_pid": 810},
+            "idle": {"role": "impl", "thread_id": "fe371221-a140-5ddf-8753-e906f9ce3519", "status": "done"},
+            "orphan": {"role": "impl", "thread_id": "ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "status": "starting", "launcher_pid": 99999999},
+            "ended": {"role": "impl", "thread_id": "cbf7634e-e57a-51ad-99e2-5cfbeabec92b", "status": "ended"},
+        }), unit_membership("fixture", run.name.replace(" ", "-")).id, self.root / "codex-home")))
+        agents_log.append("75863a97-cb41-5754-bb95-d7e89deccf43", "review", None, datetime.now(timezone.utc))
+        agents_log.append("fe371221-a140-5ddf-8753-e906f9ce3519", "impl", None, datetime.now(timezone.utc))
+        def launcher_alive(pid: int) -> bool:
+            return pid in {810, 811, 812}
+
+        with patch.object(inventory, "_pid_alive", side_effect=launcher_alive):
+            found = inventory.codex_seats([run])
+        seats = {seat["seat"]: seat for seat in found}
+        self.assertEqual(set(seats), {"busy", "idle", "orphan"})
+        self.assertEqual(seats["busy"], inventory.PausedSeat(run_dir=str(run), seat="busy", role="review", staff_id="75863a97-cb41-5754-bb95-d7e89deccf43", turn_live=True, launcher_command=command))
+        self.assertEqual(seats["idle"], inventory.PausedSeat(run_dir=str(run), seat="idle", role="impl", staff_id="fe371221-a140-5ddf-8753-e906f9ce3519", turn_live=False, launcher_command=[]))
+        self.assertEqual(seats["orphan"]["launcher_command"], [])
 
     def test_codex_seats_leaves_out_a_run_its_director_left_after_an_earlier_stop_offered_it(self) -> None:
         def run_with(name: str, statuses: dict[str, str], *, board_at: int, offered_at: int | None) -> Path:
             run = self.root / name
             run.mkdir()
-            _ = (run / "mesh_roster.json").write_text(json.dumps({
-                seat: {"role": "test", "thread_id": f"{seat}-thread", "status": status}
+            _ = (run / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], {
+                seat: {"role": "test", "thread_id": fixture_runtime_id(f"{seat}-thread"), "status": status}
                 for seat, status in statuses.items()
-            }))
+            }), unit_membership("fixture", run.name.replace(" ", "-")).id, self.root / "codex-home")))
             board = run / "board.log"
             _ = board.write_text("[director] dispatch\n")
             os.utime(board, (board_at, board_at))
@@ -412,6 +467,7 @@ class InventoryTests(ShutdownTestCase):
         environment = {
             **os.environ,
             "HOME": str(self.home),
+            "USAGE_STATE_DIR": str(self.root / "usage"),
             "AGENT_NOTES_DIR": str(self.notes),
             "NOTIFIER_SESSIONS_DIR": str(self.records),
             "NOTIFIER_STATE_DIR": str(self.notifier),
@@ -719,8 +775,9 @@ elif "comm=" in joined:
 
     def make_production_state(self) -> None:
         member = unit_membership("build-followups", "shutdown-unit")
-        assert member.parent is not None
-        parent = staff.by_id(member.parent)
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", self.checkout), expected=member.worktree)
+        assert isinstance(member.parent, staff.ReportsTo)
+        parent = staff.by_id(member.parent.id)
         assert parent is not None
         _ = staff.update_current_session(parent.current_session, staff.StaffId(DIRECTOR_ID))
         _ = staff.update_current_session(member.current_session, staff.StaffId(UNIT_ID))
@@ -768,6 +825,9 @@ elif "comm=" in joined:
             )
 
     def make_worker_state(self) -> None:
+        parent = staff.local_snapshot().by_current_session(DIRECTOR_ID)
+        assert parent is not None
+        _ = fixture_worker("review-worker", parent.id, runtime_id=WORKER_ID)
         run_dir = self.runs / "phase-two"
         run_dir.mkdir()
         _ = (self.runs / "active" / DIRECTOR_ID).write_text(
@@ -779,24 +839,24 @@ elif "comm=" in joined:
         )
         _ = (run_dir / "mesh_roster.json").write_text(
             json.dumps(
-                {
+                fixture_roster(cast(dict[str, object], {
                     "busy-codex": {
-                        "thread_id": "thread-busy",
+                        "thread_id": "fe0c4217-2bac-5469-b661-2b4d94550a98",
                         "turn_id": "turn-busy",
                         "status": "running",
                         "launcher_pid": os.getpid(),
                     },
                     "busy-without-launcher": {
-                        "thread_id": "thread-without-launcher",
+                        "thread_id": "afeb2efd-6f41-5075-857b-c1f97cad78ab",
                         "status": "running",
                     },
                     "orphaned-start": {
-                        "thread_id": "thread-orphaned",
+                        "thread_id": "2b572040-6864-5d68-932f-e25da01f0cb7",
                         "status": "starting",
                         "launcher_pid": 999_999_999,
                     },
-                    "finished-codex": {"thread_id": "thread-done", "status": "done"},
-                }
+                    "finished-codex": {"thread_id": "4efc4edc-6d50-52e3-a71b-736c5dbfae93", "status": "done"},
+                }), unit_membership("fixture", run_dir.name).id, self.root / "codex-home")
             ),
             encoding="utf-8",
         )
@@ -863,7 +923,7 @@ elif "comm=" in joined:
             unit["host"],
             {
                 "kind": "unit",
-                "unit": "shutdown-unit",
+                "unit": "shutdown",
                 "plan": {"kind": "plan", "path": "docs/shutdown-plan.md"},
                 "session_name": "unit-renamed",
                 "session_host": "herdr",
@@ -957,7 +1017,7 @@ elif "comm=" in joined:
         self.assertEqual(unit["host"].get("session_name"), "unit-herdr")
         self.assertEqual(unit["host"].get("session_host"), "herdr")
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
-        self.assertEqual(shutdown._host_text(unit["host"]), "unit shutdown-unit (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(shutdown._host_text(unit["host"]), "unit shutdown (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(unit["host"].get("plan"), {"kind": "plan", "path": "docs/shutdown-plan.md"})
 
 
@@ -1026,7 +1086,7 @@ elif "comm=" in joined:
         run_dir = self.runs / "phase-two"
         roster = cast(dict[str, dict[str, object]], json.loads((run_dir / "mesh_roster.json").read_text()))
         roster["orphaned-start"]["status"] = "running"
-        _ = (run_dir / "mesh_roster.json").write_text(json.dumps(roster))
+        _ = (run_dir / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], roster), unit_membership("fixture", run_dir.name).id, self.root / "codex-home")))
         found = inventory.inventory(TARGET_LOGIN)
         director = next(session for session in found["sessions"] if session["session_id"] == DIRECTOR_ID)
         self.assertEqual(director["codex_servers"][0]["busy_workers"], ["busy-codex"])
@@ -1081,6 +1141,7 @@ elif "comm=" in joined:
         previous = current.with_name("seats")
         modified = current.stat().st_mtime_ns
         _ = current.replace(previous)
+        contents = previous.read_bytes()
         found = inventory.inventory(TARGET_LOGIN)
         worker = next(session for session in found["sessions"] if session["session_id"] == WORKER_ID)
         self.assertEqual(worker["kind"], "worker")
@@ -1088,21 +1149,29 @@ elif "comm=" in joined:
                          {"kind": "director", "session_id": DIRECTOR_ID})
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
         self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"], {"kind": "no director"})
-        self.assertTrue(previous.samefile(current))
-        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self.assertFalse(current.exists())
+        self.assertEqual(previous.read_bytes(), contents)
+        self.assertEqual(previous.stat().st_mtime_ns, modified)
         _ = inventory.inventory(TARGET_LOGIN)
-        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self.assertFalse(current.exists())
+        self.assertEqual(previous.read_bytes(), contents)
+        self.assertEqual(previous.stat().st_mtime_ns, modified)
         with previous.open("a", encoding="utf-8") as ledger:
             _ = ledger.write(f"{DESKTOP_ID[:8]}\tlate-worker\n")
-        self.assertIn("late-worker", current.read_text(encoding="utf-8"))
-        modified = current.stat().st_mtime_ns
+        self.assertIn("late-worker", previous.read_text(encoding="utf-8"))
+        contents = previous.read_bytes()
+        modified = previous.stat().st_mtime_ns
+        parent = staff.local_snapshot().by_current_session(DIRECTOR_ID)
+        assert parent is not None
+        _ = fixture_worker("late-worker", parent.id, runtime_id=DESKTOP_ID)
         found = inventory.inventory(TARGET_LOGIN)
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
         self.assertEqual(late_worker["kind"], "worker")
         self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"],
                          {"kind": "director", "session_id": DIRECTOR_ID})
-        self.assertTrue(previous.samefile(current))
-        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self.assertFalse(current.exists())
+        self.assertEqual(previous.read_bytes(), contents)
+        self.assertEqual(previous.stat().st_mtime_ns, modified)
 
     def test_live_worker_keeps_owner_after_director_exits(self) -> None:
         (self.records / f"{self.director_pid}.json").unlink()
@@ -1131,6 +1200,12 @@ elif "comm=" in joined:
         for path in (self.history / "runs").glob("*.jsonl"):
             path.unlink()
         (self.runs / "phase-two" / "workers").unlink()
+        path = Path(os.environ["STAFF_FILE"])
+        membership = cast(dict[str, object], json.loads(path.read_text()))
+        membership["rows"] = [row for row in cast(list[dict[str, object]], membership["rows"])
+                              if row["current_session"] != WORKER_ID]
+        _ = cast(dict[str, object], membership.get("backends", {})).pop(WORKER_ID, None)
+        _ = path.write_text(json.dumps(membership))
         transcript = (
             self.home / ".claude" / "projects" / "fixture" / f"{DESKTOP_ID}.jsonl"
         )

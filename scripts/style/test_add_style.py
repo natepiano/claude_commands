@@ -23,11 +23,11 @@ import rules
 import style_ledger
 import unit_plans
 import style_rules
-from production_units import read_production
-from production_units import production_field
+from scripts.production.production_doc import production_field, read_production
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
-from scripts.production.staff_test_support import fixture_showrunner_name, isolated_staff_file, showrunner_relationship
+from scripts.production import change_review, staff
+from scripts.production.staff_test_support import fixture_showrunner_name, isolated_staff_file, recorded_showrunner
 
 SCRIPT = Path(add_style.__file__)
 STUB = '''import json
@@ -37,7 +37,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.environ["STYLE_TEST_CHECKOUT"])
-from scripts.production.staff_test_support import fixture_showrunner_name, showrunner_relationship
+from scripts.production.staff_test_support import fixture_showrunner_name, recorded_showrunner, showrunner_relationship
 
 arguments = sys.argv[1:]
 name = Path(sys.argv[0]).name
@@ -53,7 +53,7 @@ elif name == "launch.py":
             "production": doc.read_text(),
             "plans": {path.name: path.read_text() for path in (doc.parent / "style-production/units").glob("*.md")},
         }))
-    destination = next(line for line in doc.read_text().splitlines() if line.startswith("- **Parent production:**"))
+    destination = next(line for line in doc.read_text().splitlines() if line.startswith("- **Proposals:**"))
     with Path(os.environ["TEST_LAUNCH_DESTINATIONS"]).open("a") as destinations:
         destinations.write(destination + "\\n")
     if os.environ.get("TEST_FAIL_LAUNCH") == "1":
@@ -65,10 +65,7 @@ elif name == "launch.py":
     timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / ("showrunner-" + slug) / "conf"
     timer.parent.mkdir(parents=True, exist_ok=True)
     timer.write_text("TARGET=session:stub\\nCHECK=zsh /x/production_check.sh " + shlex.quote(str(doc)) + "\\n")
-    parent = state / slug / "parent"
-    parent.parent.mkdir(parents=True, exist_ok=True)
-    parent.write_text(os.environ["TEST_PARENT_SLUG"] + "\\n")
-    showrunner_relationship(fixture_showrunner_name(slug, doc), os.environ["TEST_PARENT_SLUG"])
+    recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
 elif arguments[0] == "detach":
     (state / arguments[1] / "parent").unlink()
     showrunner_relationship(arguments[1])
@@ -187,12 +184,20 @@ class AddStyleTests(unittest.TestCase):
         ]
         if proposals:
             fields.append(f"- **Proposals:** `{self.root / (slug + '-issues')}`")
-        _ = path.write_text("\n".join([*fields, "", "## Units", "", "| Unit | Plan |", "| --- | --- |", ""]))
+        _ = path.write_text("\n".join([*fields, ""]))
         timer = self.root / "notifier" / f"showrunner-{slug}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
         _ = timer.write_text(f"TARGET=session:{slug}\nCHECK=zsh /x/production_check.sh {shlex.quote(str(path))}\n")
-        _ = showrunner_relationship(fixture_showrunner_name(slug, path))
+        _ = recorded_showrunner(fixture_showrunner_name(slug, path), path)
         return path
+
+    def parent_document(self) -> Path:
+        record = staff.snapshot()
+        child = next(row for row in record.rows if row.name == "sample-style")
+        assert isinstance(child.parent, staff.ReportsTo)
+        parent = record.parent_of(child)
+        assert parent is not None and isinstance(parent.doc, staff.LiveDoc)
+        return parent.doc.path
 
     def run_bootstrap(self, *arguments: str, parent: Path | None = None, success: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -250,7 +255,6 @@ atomic_file.os.replace = interrupted_replace
         self.assertEqual(finished.returncode, 0, finished.stderr)
         self.assertEqual(read_production(self.doc).merge_branch, "style/main")
         self.assertEqual(len(list((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
-        self.assertIn("## Units", self.doc.read_text())
         self.assertIn("## Phases", (self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md").read_text())
         self.assertEqual(sum(call["command"] == "launch.py" for call in self.calls()), 1)
 
@@ -260,7 +264,7 @@ atomic_file.os.replace = interrupted_replace
     def test_interrupted_first_unit_plan_publish_reruns_bootstrap(self) -> None:
         self.interrupted_bootstrap_publish(self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md")
 
-    def test_pilot_rows_and_package_scopes_are_ready_before_the_showrunner_launches(self) -> None:
+    def test_pilot_units_and_package_scopes_are_ready_before_the_showrunner_launches(self) -> None:
         self.add_workspace_packages()
         snapshot = self.root / "bootstrap-at-launch.json"
         self.env["TEST_BOOTSTRAP_AT_LAUNCH"] = str(snapshot)
@@ -270,9 +274,8 @@ atomic_file.os.replace = interrupted_replace
 
         launched = cast(BootstrapAtLaunch, json.loads(snapshot.read_text()))
         self.assertEqual(launched["production"], self.doc.read_text())
-        self.assertEqual([line.split("|")[1].strip() for line in launched["production"].splitlines()
-                          if line.startswith("| ") and "-unit |" in line],
-                         ["sample-style-names-unit", "sample-style-types-unit", "sample-style-modules-unit"])
+        self.assertEqual(production_field(launched["production"].splitlines(), "Pilot units"),
+                         "sample-style-names-unit, sample-style-types-unit, sample-style-modules-unit")
         self.assertEqual(set(launched["plans"]), {f"sample-style-{family}-unit.md" for family in add_style.FAMILIES})
         for unit, scope in (("names", "cargo-handler, cargo-port"), ("types", "cargo-port")):
             lines = launched["plans"][f"sample-style-{unit}-unit.md"].splitlines()
@@ -317,7 +320,7 @@ atomic_file.os.replace = interrupted_replace
                     self.assertFalse((self.root / "ledger").exists())
                     self.assertEqual(self.calls(), [])
 
-    def test_interrupted_pilot_changes_only_unlaunched_rows_and_plan_scopes(self) -> None:
+    def test_interrupted_pilot_changes_only_unlaunched_units_and_plan_scopes(self) -> None:
         self.add_workspace_packages()
         self.env["TEST_FAIL_LAUNCH"] = "1"
         self.assertEqual(self.run_bootstrap("--pilot", "names-unit=cargo-handler", "--pilot", "types-unit=cargo-handler",
@@ -326,8 +329,6 @@ atomic_file.os.replace = interrupted_replace
         launched.mkdir()
         names_plan = self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md"
         _ = names_plan.write_text(names_plan.read_text() + "\n### Phase 1 — launched record\n")
-        _ = self.doc.write_text(self.doc.read_text().replace("| sample-style-names | — |", "| sample-style-names | 7777 |"))
-        names_row = next(line for line in self.doc.read_bytes().splitlines(keepends=True) if line.startswith(b"| sample-style-names-unit |"))
         names_before = names_plan.read_bytes(), names_plan.stat().st_mtime_ns
         types_plan = self.checkout / add_style.PLAN_DIRECTORY / "sample-style-types-unit.md"
         _ = types_plan.write_text(types_plan.read_text() + "\nUnlaunched notes retained.\n")
@@ -338,10 +339,9 @@ atomic_file.os.replace = interrupted_replace
 
         _ = self.run_bootstrap("--pilot", "types-unit=cargo-port", "--pilot", "modules-unit")
 
-        self.assertIn(names_row, self.doc.read_bytes().splitlines(keepends=True))
         self.assertEqual((names_plan.read_bytes(), names_plan.stat().st_mtime_ns), names_before)
-        self.assertIn("| sample-style-modules-unit |", self.doc.read_text())
-        self.assertNotIn("| sample-style-values-unit |", self.doc.read_text())
+        self.assertEqual(production_field(self.doc.read_text().splitlines(), "Pilot units"),
+                         "sample-style-names-unit, sample-style-types-unit, sample-style-modules-unit")
         self.assertIn("- **Pilot scope:** cargo-port\n", types_plan.read_text())
         self.assertNotIn("**Pilot scope:** cargo-handler", types_plan.read_text())
         self.assertIn("Unlaunched notes retained.", types_plan.read_text())
@@ -416,7 +416,6 @@ atomic_file.os.replace = interrupted_replace
         for family in add_style.FAMILIES:
             plan = self.checkout / f"docs/style-production/units/sample-style-{family}-unit.md"
             text = plan.read_text()
-            self.assertIn(f"| sample-style-{family}-unit | docs/style-production/units/sample-style-{family}-unit.md | {self.root / ('sample-style-' + family)} | sample-style-{family} |", self.doc.read_text())
             self.assertIn(f"> **Production: sample-style** — unit `sample-style-{family}-unit`", text)
             self.assertIn("> **Standing:** style_plan.py", text)
             self.assertNotIn("**Pilot scope:**", text)
@@ -435,10 +434,11 @@ atomic_file.os.replace = interrupted_replace
         self.assertEqual(self.git("status", "--porcelain", "--untracked-files=all"), "")
         self.assertEqual(self.git("-C", str(self.checkout), "status", "--porcelain", "--untracked-files=all"), "")
         self.assertEqual(self.sync()[:2], (self.initial_tip, "refs/heads/style/main"))
+        self.assertEqual(self.parent_document(), self.parent)
         self.assertEqual(self.calls(), [{
             "command": "launch.py",
             "arguments": ["--production", str(self.doc), "--model", "test-model", "--effort", "high"],
-        }])
+        }, {"command": "showrunners.py", "arguments": ["attach", "sample-style", "parent"]}])
 
     def test_standing_plans_do_not_become_local_rules_or_hide_real_rules(self) -> None:
         _ = self.run_bootstrap()
@@ -523,9 +523,9 @@ atomic_file.os.replace = interrupted_replace
             self.assertEqual({row["checkpoint"]: row["state"] for row in ledger.pending_handoffs()},
                              {self.initial_tip: "pending", second: "sent"})
         fields = self.doc.read_text().splitlines()
-        self.assertEqual(production_field(fields, "Parent production"), str(caller))
+        self.assertEqual(self.parent_document(), caller)
         self.assertEqual(production_field(fields, "Proposals"), str(self.root / "next-issues"))
-        self.assertEqual(self.calls()[1:], [
+        self.assertEqual(self.calls()[2:], [
             {"command": "showrunners.py", "arguments": ["detach", "sample-style"]},
             {"command": "showrunners.py", "arguments": ["attach", "sample-style", "next"]},
             self.resume_call(),
@@ -533,6 +533,18 @@ atomic_file.os.replace = interrupted_replace
         self.assertEqual((self.root / "showrunners/sample-style/parent").read_text().strip(), "next")
         self.assertEqual(self.sync(), original_sync)
         self.assertEqual({path: path.read_text() for path in original_plans}, original_plans)
+
+    def test_change_review_credits_the_parent_after_creation_and_reattach(self) -> None:
+        _ = self.run_bootstrap()
+        with self.subTest(destination="new production"):
+            self.assertEqual(change_review.credited(self.doc), self.parent)
+        lines = [line for line in self.doc.read_text().splitlines()
+                 if not line.startswith("- **Parent production:**")]
+        _ = self.doc.write_text("\n".join([*lines, f"- **Parent production:** {self.parent}", ""]))
+        caller = self.parent_doc("next")
+        _ = self.run_bootstrap(parent=caller)
+        with self.subTest(destination="new parent"):
+            self.assertEqual(change_review.credited(self.doc), caller)
 
     def test_missing_proposals_refuses_before_writes_in_check_and_apply(self) -> None:
         parent = self.parent_doc("missing", proposals=False)
@@ -624,8 +636,7 @@ atomic_file.os.replace = interrupted_replace
         request = add_unit.RequestedUnitLaunch(
             production=read_production(self.doc), requested_name="sample-style-names", unit="sample-style-names-unit",
             branch="sample-style-names", worktree=self.root / "sample-style-names",
-            plan=add_unit.PlanGiven(plan), port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
-            session=add_unit.NewSession(), launch_kind=add_unit.NewWorkLaunch(), timeout=1.0,
+            plan=add_unit.PlanGiven(plan), port=add_unit.OmittedCell(), session=add_unit.NewSession(), timeout=1.0,
         )
         before = self.git("status", "--porcelain", "--untracked-files=all"), self.git("show-ref"), self.doc.read_text()
         agent_config = self.root / "models.conf"
@@ -646,7 +657,6 @@ atomic_file.os.replace = interrupted_replace
 
         self.assertEqual(ready.launch.plan_path, plan)
         self.assertEqual(ready.launch.identity.unit, "sample-style-names-unit")
-        self.assertIsInstance(ready.row, add_unit.ExistingUnitRow)
         self.assertEqual((self.git("status", "--porcelain", "--untracked-files=all"), self.git("show-ref"), self.doc.read_text()), before)
         self.assertFalse(request.worktree.exists())
 
@@ -699,7 +709,7 @@ atomic_file.os.replace = interrupted_replace
         self.assertEqual(self.sync()[:2], (style_tip, "refs/heads/style/main"))
         with style_ledger.open_ledger(self.checkout) as ledger:
             self.assertNotIn("src/new.rs", {cell.path for cell in ledger.cells()})
-        self.assertEqual([call["command"] for call in self.calls()], ["launch.py", "launch.py"])
+        self.assertEqual([call["command"] for call in self.calls()], ["launch.py", "launch.py", "showrunners.py"])
         self.assertEqual(self.git("worktree", "list", "--porcelain").count(f"worktree {self.checkout}"), 1)
 
     def test_retry_completes_worktree_left_before_production_doc_was_written(self) -> None:
@@ -710,7 +720,7 @@ atomic_file.os.replace = interrupted_replace
         self.assertTrue(self.doc.exists())
         self.assertEqual(len(tuple((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
         self.assertEqual(self.sync()[:2], (self.initial_tip, "refs/heads/style/main"))
-        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(len(self.calls()), 2)
 
     def test_interrupted_bootstrap_rewrites_destination_for_the_next_parent_only(self) -> None:
         self.env["TEST_FAIL_LAUNCH"] = "1"
@@ -723,7 +733,7 @@ atomic_file.os.replace = interrupted_replace
         self.env["TEST_PARENT_SLUG"] = "next"
         _ = self.run_bootstrap(parent=caller)
         fields = self.doc.read_text().splitlines()
-        self.assertEqual(production_field(fields, "Parent production"), str(caller))
+        self.assertEqual(self.parent_document(), caller)
         self.assertEqual(production_field(fields, "Proposals"), str(self.root / "next-issues"))
         self.assertEqual({path: path.read_bytes() for path in plans}, plans)
         self.assertEqual((self.sync(), (self.repo / ".git/info/exclude").read_bytes()), (sync, excludes))
@@ -732,8 +742,8 @@ atomic_file.os.replace = interrupted_replace
         self.assertIn(str(self.doc), launches[-1]["arguments"])
         destinations = (self.root / "launch-destinations.txt").read_text().splitlines()
         self.assertEqual(len(destinations), 2)
-        self.assertEqual(production_field([destinations[0]], "Parent production"), str(self.parent))
-        self.assertEqual(production_field([destinations[1]], "Parent production"), str(caller))
+        self.assertEqual(production_field([destinations[0]], "Proposals"), str(self.root / "parent-issues"))
+        self.assertEqual(production_field([destinations[1]], "Proposals"), str(self.root / "next-issues"))
         self.assertNotIn(self.resume_call(), self.calls())
 
     def test_check_interrupted_bootstrap_describes_destination_repair_without_writes(self) -> None:
@@ -748,7 +758,7 @@ atomic_file.os.replace = interrupted_replace
                          f"4. set Parent production and Proposals in existing production doc {self.doc}")
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
         self.assertEqual((self.calls(), self.sync()), (calls, sync))
-        self.assertEqual(production_field(self.doc.read_text().splitlines(), "Parent production"), str(self.parent))
+        self.assertEqual(production_field(self.doc.read_text().splitlines(), "Proposals"), str(self.root / "parent-issues"))
 
 
 if __name__ == "__main__":

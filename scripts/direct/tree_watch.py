@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Shared verify cache key and conservative workspace-input watcher.
 
---key [--watch-start FILE] [tree_key args] prints the existing cache key.
+--key [--with-tree-content] [--watch-start FILE] [tree_key args] prints the cache key.
+--with-tree-content also prints the key without script files.
 --watch-key [tree_key args] prints only the watched input key.
 START FIRED PARENT [--signal-parent] [tree_key args] watches until changed (0)
 or the parent exits (3). Cargo metadata is supplied once on stdin.
@@ -19,6 +20,9 @@ import subprocess
 import sys
 import time
 from typing import NotRequired, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
 
 
 class Dependency(TypedDict, total=False):
@@ -41,6 +45,42 @@ class Metadata(TypedDict):
 
 def run(*args: str | bytes) -> bytes:
     return subprocess.check_output(list(args), stderr=subprocess.DEVNULL)
+
+
+def lint_tool_versions() -> bytes:
+    """Identify each lint tool through the command that runs it."""
+    saved = os.environ.get("VERIFY_LINT_VERSIONS_FILE", "")
+    if saved and Path(saved).exists():
+        versions = Path(saved).read_bytes()
+        if not versions:
+            raise ValueError("lint tool versions are unavailable")
+        return versions
+    versions = bytearray()
+    try:
+        for command in (("taplo", "--version"), ("cargo", "mend", "--version"),
+                        ("cargo", "+nightly", "fmt", "--version"), ("cargo", "clippy", "--version")):
+            formatter = os.environ.get("VERIFY_LINT_RUSTFMT_VERSION_FILE", "") if command[1:2] == ("+nightly",) else ""
+            if formatter and Path(formatter).exists():
+                version = Path(formatter).read_bytes().strip()
+            else:
+                try:
+                    version = subprocess.check_output(command, stderr=subprocess.DEVNULL, timeout=10).strip()
+                except (OSError, subprocess.SubprocessError):
+                    if formatter:
+                        _ = Path(formatter).write_bytes(b"")
+                    raise
+                if formatter:
+                    _ = Path(formatter).write_bytes(version)
+            if not version:
+                raise ValueError("lint tool returned no version: " + " ".join(command))
+            versions.extend("\0".join(command).encode() + b"\0" + version + b"\0")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        if saved:
+            _ = Path(saved).write_bytes(b"")
+        raise
+    if saved:
+        _ = Path(saved).write_bytes(versions)
+    return bytes(versions)
 
 
 def content(path: bytes) -> bytes:
@@ -70,6 +110,7 @@ class TreeInputs:
 
     def __init__(self, args: list[str], metadata: str) -> None:
         split = args.index("--")
+        self.tree_content_key: str = ""
         self.files: list[str] = args[:split]
         self.words: list[str] = args[split + 1:]
         self.package: str = self.files[1] if self.files[:1] == ["--package"] else ""
@@ -84,10 +125,9 @@ class TreeInputs:
             ) if not folder.startswith(b"..") and folder != b"."
         )
         self.workspace_root: bytes = b""
-        self.test_target_directory: str = ""
+        self.watch_entries: dict[str, str] = {}
         try:
             meta: Metadata = cast(Metadata, json.loads(metadata)) if metadata.strip() else {"workspace_root": "", "packages": [], "workspace_members": []}
-            self.test_target_directory = meta.get("target_directory", "")
             workspace_root = meta.get("workspace_root", "")
             if workspace_root:
                 self.workspace_root = os.fsencode(os.path.realpath(workspace_root))
@@ -129,7 +169,8 @@ class TreeInputs:
         cargo_root = cargo_path in (b"Cargo.toml", b"Cargo.lock", b"rust-toolchain", b"rust-toolchain.toml") or cargo_path.startswith(b".cargo/")
         return self.counts(path) and (cargo_root or any(full.startswith(root + b"/") for root in self.members))
 
-    def keys(self, *, cache: bool = True, watch: bool = True) -> tuple[str, str]:
+    def keys(self, *, cache: bool = True, watch: bool = True, lint_versions: bool = True) -> tuple[str, str]:
+        self.tree_content_key = ""
         # status never refreshes the index; diff does, even with no-optional-locks.
         status = run("git", "--no-optional-locks", "-C", self.top, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
         changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3 and not entry[3:].startswith(self.own)})
@@ -154,7 +195,9 @@ class TreeInputs:
                     _ = entries.pop(path, None)
         watched = hashlib.sha256(self.top + b"\0")
         if watch:
+            self.watch_entries = {}
             for path in sorted(filter(self.watched, entries)):
+                self.watch_entries[os.fsdecode(path)] = entries[path].decode()
                 watched.update(path + b"\0" + entries[path] + b"\0")
         watch_key = watched.hexdigest() if watch else ""
         if not cache:
@@ -168,6 +211,14 @@ class TreeInputs:
             for path in changed:
                 key.update(path + b"\0" + content(os.path.join(self.top, path)))
         key.update(run("rustc", "-vV"))
+        if lint_versions and self.words[:1] == ["lint"]:
+            try:
+                versions = lint_tool_versions()
+            except (OSError, ValueError, subprocess.SubprocessError):
+                # Unknown tool versions prevent cache reuse and publication.
+                return "", watch_key
+            key.update(versions)
+        tree_content = key.copy()
         for name in self.files:
             key.update(content(os.fsencode(name)))
         build_key = key.copy()
@@ -179,18 +230,25 @@ class TreeInputs:
                 build_key.update(b"\0" + word.encode())
         for word in self.words:
             key.update(b"\0" + word.encode())
+            tree_content.update(b"\0" + word.encode())
         for name, value in sorted(os.environ.items()):
             if name.startswith(("RUST", "CARGO_", "NEXTEST_")) and name != "CARGO_MAKEFLAGS":
                 key.update(("\0" + name + "=" + value).encode())
+                tree_content.update(("\0" + name + "=" + value).encode())
                 if not name.startswith("NEXTEST_") or name == "NEXTEST_CARGO_PROFILE":
                     build_key.update(("\0" + name + "=" + value).encode())
         if self.package and os.environ.get("VERIFY_COMPUTE_TEST_BUILD") == "1":
             # Cargo resolves config, environment and workspace target paths.
             # An unknown destination proves no fresh build.
             output = os.environ.get("VERIFY_TEST_BUILD_INPUTS_FILE", "")
-            if output and os.path.isabs(self.test_target_directory):
-                build_key.update(b"\0target=" + os.fsencode(self.test_target_directory))
-                _ = Path(output).write_text(build_key.hexdigest() + "\n" + self.test_target_directory + "\n")
+            if output and self.workspace_root:
+                roots = read_cargo_output_roots(Path(os.fsdecode(self.workspace_root)))
+                if isinstance(roots, CargoOutputRoots):
+                    build_key.update(b"\0target=" + os.fsencode(roots.target_directory))
+                    build_key.update(b"\0build=" + os.fsencode(roots.build_directory))
+                    _ = Path(output).write_text("\n".join((build_key.hexdigest(),
+                        str(roots.target_directory), str(roots.build_directory), "")))
+        self.tree_content_key = tree_content.hexdigest()
         return key.hexdigest(), watch_key
 
 
@@ -209,13 +267,24 @@ def main(args: list[str]) -> int:
     metadata = sys.stdin.read()
     if args[0] in ("--key", "--watch-key"):
         mode, args = args[0], args[1:]
+        paired = mode == "--key" and args[:1] == ["--with-tree-content"]
+        if paired:
+            args = args[1:]
         start = ""
         if args[:1] == ["--watch-start"]:
             start, args = args[1], args[2:]
-        cache, watched = TreeInputs(args, metadata).keys(cache=mode == "--key", watch=bool(start) or mode == "--watch-key")
+        lint_versions = args[:1] != ["--without-lint-versions"]
+        if not lint_versions:
+            args = args[1:]
+        inputs = TreeInputs(args, metadata)
+        cache, watched = inputs.keys(
+            cache=mode == "--key", watch=bool(start) or mode == "--watch-key", lint_versions=lint_versions)
         if start:
+            _ = Path(start + ".paths").write_text(json.dumps(inputs.watch_entries))
             _ = Path(start).write_text(watched + "\n")
         print(cache if mode == "--key" else watched)
+        if paired:
+            print(inputs.tree_content_key)
         return 0
     start_file, fired_file, parent = args[:3]
     args = args[3:]
@@ -226,6 +295,7 @@ def main(args: list[str]) -> int:
     start_key = Path(start_file).read_text().strip()
     if not start_key:
         return 3
+    start_entries = cast(dict[str, str], json.loads(Path(start_file + ".paths").read_text()))
     try:
         interval = float(os.environ.get("VERIFY_TREE_WATCH_S", "5"))
         if not math.isfinite(interval) or interval <= 0:
@@ -236,6 +306,9 @@ def main(args: list[str]) -> int:
         try:
             _, key = inputs.keys(cache=False)
             if key and key != start_key:
+                changed = next(path for path in sorted(start_entries.keys() | inputs.watch_entries.keys())
+                               if start_entries.get(path) != inputs.watch_entries.get(path))
+                _ = Path(fired_file + ".path").write_text(changed + "\n")
                 _ = Path(fired_file).write_text(key + "\n")
                 if notify:
                     os.kill(int(parent), signal.SIGUSR2)

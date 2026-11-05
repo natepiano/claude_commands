@@ -26,12 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.message.process_test_support import OwnedTestProcesses
 import push_texts  # noqa: E402
 import rca  # noqa: E402
 import review  # noqa: E402
 import send  # noqa: E402
 import sessions  # noqa: E402
-import session_staff  # noqa: E402
+from scripts.production import session_staff  # noqa: E402
 from scripts.production import showrunners, staff, fake_showrunner  # noqa: E402
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, fixture_member  # noqa: E402
 from test_showrunners import stalled_session_reader  # noqa: E402
@@ -99,6 +100,10 @@ class RcaTests(unittest.TestCase):
                         self.assertEqual(rca.send(["--text", "body"]), (True, "SENT: fixture"))
                     self.assertEqual(run.call_args.kwargs["timeout"], seconds)
 
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.owned: OwnedTestProcesses = OwnedTestProcesses()
+
     root: Path = Path()
     log: Path = Path()
     owner_processes: list[bool] = []
@@ -118,8 +123,8 @@ class RcaTests(unittest.TestCase):
         # A fixed clock: a case id carries the day, so a call with no time of its own opens 261023-<n> on any day.
         _ = self.enterContext(mock.patch.object(rca, "now", return_value=OPENED))
         (self.root / "sessions").mkdir()
-        removed = (session_staff.PRODUCTION_MARK, "CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
-        environment = {key: value for key, value in os.environ.items() if key not in removed}
+        removed = ("CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
+        environment = {key: value for key, value in os.environ.items() if key not in removed and not key.startswith("SHOWRUNNER_")}
         self.enterContext(mock.patch.dict(os.environ, environment | {
             "RCA_TEST_LOG": str(self.log), "USER_ZONE": "America/Puerto_Rico",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "NOTIFY_STATE_DIR": str(self.root / "notify")},
@@ -142,6 +147,8 @@ class RcaTests(unittest.TestCase):
             return SHOWRUNNER.removeprefix("uds:") if target.removeprefix("session:") == owner.current_session else None
 
         _ = self.enterContext(mock.patch.object(showrunners, "socket_for", side_effect=live_socket))
+        self.owned = OwnedTestProcesses()
+        self.addCleanup(self.owned.finish)
         self.owner_processes = []
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", self.popen))
 
@@ -149,8 +156,10 @@ class RcaTests(unittest.TestCase):
               text: bool = False, start_new_session: bool = False) -> subprocess.Popen[str]:
         """Record whether send.py was detached, while running the real isolated sender."""
         self.owner_processes.append(start_new_session)
-        return REAL_POPEN(argv, stdin=stdin, stdout=stdout, stderr=stderr, text=text,
-                          start_new_session=start_new_session)
+        child = REAL_POPEN(argv, stdin=stdin, stdout=stdout, stderr=stderr, text=text,
+                           start_new_session=start_new_session, env=self.owned.environment())
+        self.owned.track(child, group=start_new_session)
+        return child
 
     def review(self, draft: review.Draft, revision: bool, *, limit: float = 0) -> review.ReviewOutcome:
         del revision, limit
@@ -225,6 +234,8 @@ class RcaTests(unittest.TestCase):
         socket_root = Path(self.enterContext(short_socket_directory()))
         sender = self.root / "socket-send.py"
         _ = sender.write_text("""import json, os, pathlib, socket, sys
+with pathlib.Path(os.environ['OWNER_TEST_PIDS']).open('a') as marker:
+    marker.write(str(os.getpid()) + '\\n')
 with socket.socket(socket.AF_UNIX) as client:
     client.settimeout(10)
     client.connect(os.environ['OWNER_TEST_SOCKET'])
@@ -233,6 +244,7 @@ with socket.socket(socket.AF_UNIX) as client:
 pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).write_text('delivered')
 print('SENT: fake owner socket')
 """)
+        descendants = self.root / "owner-pids"
         caller = """import json, math, os, pathlib, subprocess, sys
 from scripts.production import stall_watch
 rca = stall_watch.rca
@@ -275,10 +287,13 @@ subprocess.run([sys.executable, '-c',
                     "XDG_STATE_HOME": str(self.root / "state"), "RCA_SEND": str(sender),
                     "STALL_WATCH_SEND": str(sender), "STALL_WATCH_STATE_DIR": str(self.root / "stall"),
                     "OWNER_TEST_SOCKET": str(address), "OWNER_TEST_RECEIPT": str(receipt),
-                    "OWNER_TEST_RETURN": str(returned), "OWNER_TEST_CASE_DIR": str(rca.STATE)}
+                    "OWNER_TEST_RETURN": str(returned), "OWNER_TEST_CASE_DIR": str(rca.STATE),
+                    "OWNER_TEST_PIDS": str(descendants)}
+                self.owned.markers.append(descendants)
                 with REAL_POPEN([sys.executable, "-c", caller, mode], cwd=Path(__file__).resolve().parents[2],
-                                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=self.owned.environment(environment), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True) as process:
+                    self.owned.track(process, group=True)
                     try:
                         with receiver.accept()[0] as connection:
                             connection.settimeout(10)
@@ -287,8 +302,7 @@ subprocess.run([sys.executable, '-c',
                             connection.sendall(b"delivered")
                         out, err = process.communicate(timeout=10)
                     finally:
-                        if process.poll() is None:
-                            process.kill()
+                        self.owned.finish()
                 self.assertEqual(process.returncode, -signal.SIGTERM, out + err)
                 self.assertEqual(json.loads(returned.read_text()), {"failure": "", "delivered": True})
                 self.assertEqual(receipt.read_text(), "delivered")
@@ -321,16 +335,16 @@ subprocess.run([sys.executable, '-c',
         self.live_session("marked", member.current_session)
         timers = self.root / "notifiers"
         _ = fake_showrunner.write_timer(timers, "cargo-liner", owner.current_session, "UTC", doc)
-        with (mock.patch.dict(os.environ, {session_staff.PRODUCTION_MARK: "cargo-liner"}),
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_" + "UNIT": "cargo-liner"}),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", timers)):
             _ = rca.open_case(HANDLER._replace(session="marked", production=""), OPENED)
         self.assertEqual([flags(argv)["--to"] for argv in self.sends()], ["natedev", "natedev", SHOWRUNNER])
         self.assertEqual(self.case("261023-3")["production"], "cargo-liner")
 
-    def test_the_mark_is_the_one_unit_lookup_reads(self) -> None:
+    def test_native_identity_uses_the_shared_member_resolver(self) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
         import unit_lookup
-        self.assertEqual(session_staff.PRODUCTION_MARK, unit_lookup.PRODUCTION_MARK)
+        self.assertIs(session_staff.member_sources, unit_lookup.member_sources)
 
     def test_a_by_hand_open_takes_the_newest_transcript_of_the_session_it_names(self) -> None:
         _ = self.transcript("-home-handler-old", "sid-handler", 1000)

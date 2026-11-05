@@ -18,10 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment
-else:
-    from scripts.lint.memory_test_support import config_environment
+from mac_natedev_test_support import mac_natedev_environment
 
 import disk
 import ci
@@ -147,6 +144,7 @@ class ReportSpeedTests(unittest.TestCase):
         _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(temporary / "config"))))
 
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
@@ -273,7 +271,7 @@ class ReportTests(unittest.TestCase):
         point_root_at(self, self.root)
         for host in ("natedev", "Mac"):
             _ = refresh_machine_health(self, host, self.root, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, **config_environment(Path(temporary))}))
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, **mac_natedev_environment(Path(temporary))}))
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))
         self.records = []
@@ -3052,6 +3050,22 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| free | 1.0 GiB |", lines)
         self.assertNotIn("free (floor", "\n".join(lines))
 
+    def test_disk_section_names_each_filesystem_once(self) -> None:
+        snapshot: disk.DiskSnapshot = {
+            "measured_at": "2026-10-04T16:14:00+00:00", "host": "natedev", "rows": [],
+            "used": 10 * (2**30), "free": (2**30), "floor": None,
+            "filesystems": [
+                {"path": "/", "device": "1:1", "device_name": "root", "used": 10 * (2**30), "free": (2**30)},
+                {"path": "/build", "device": "2:1", "device_name": "build", "used": 20 * (2**30), "free": 3 * (2**30)},
+                {"path": "/alias", "device": "2:1", "device_name": "build", "used": 20 * (2**30), "free": 3 * (2**30)},
+            ],
+        }
+        with mock.patch("report.disk.read_snapshot", return_value=snapshot):
+            text = "\n".join(report.disk_section())
+        self.assertIn("/build (2:1, build) free | 3.0 GiB", text)
+        self.assertIn("/ (1:1, root) free | 1.0 GiB", text)
+        self.assertNotIn("/alias", text)
+
     def test_disk_section_clamps_other_when_rows_exceed_used(self) -> None:
         unit = 2**30
         snapshot: disk.DiskSnapshot = {
@@ -3110,10 +3124,10 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(sync.sync_time("2026-10-02T16:14:00+00:00", now), "2026-10-02 12:14 EDT")
 
     def test_nearest_rank_matches_p95_boundaries_and_single_value(self) -> None:
-        self.assertEqual(report.nearest_rank(list(range(1, 21)), 95), 19)
-        self.assertEqual(report.nearest_rank(list(range(1, 22)), 95), 20)
-        self.assertEqual(report.nearest_rank([37], 95), 37)
-        self.assertEqual(report.nearest_rank([360, 720, 1080, 1440], 75), 1080)
+        self.assertEqual(moments.nearest_rank(list(range(1, 21)), 95), 19)
+        self.assertEqual(moments.nearest_rank(list(range(1, 22)), 95), 20)
+        self.assertEqual(moments.nearest_rank([37], 95), 37)
+        self.assertEqual(moments.nearest_rank([360, 720, 1080, 1440], 75), 1080)
 
     def test_ci_freshness_for_today_and_a_past_day(self) -> None:
         now = datetime.now(UTC)

@@ -45,7 +45,7 @@ SESSION = "nightly-review"
 DOC = Path("/work/docs/plans/build-followups-production.md")
 UNIT = LiveClaude("nightly-review", "aaaaaaaa-0000-0000-0000-000000000001", "/run/cc-socks/42.sock", 42)
 PRODUCTION = nightly_review.NightlyProduction(DOC, "build-followups", nightly_review.NightlyUnit(
-    staff.StaffRow(staff.StaffId(UNIT.session_id), "unit", SESSION, None,
+    staff.StaffRow(staff.StaffId(UNIT.session_id), "unit", SESSION, staff.StaffRoot(),
                    current_session=staff.StaffId(UNIT.session_id),
                    worktree=staff.PresentWorktree("natedev", DOC.parents[1])),
     unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ("nightly-review",)),
@@ -198,6 +198,25 @@ class NightlyReviewTests(unittest.TestCase):
             self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
         directory.assert_called_once_with(42)
 
+    def test_transcript_lookup_uses_session_id_after_the_folder_changes(self) -> None:
+        records = self.root / "sessions"
+        records.mkdir()
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        identity = self.transcript_owner("natedev")
+        config = self.root / "account"
+        path = config / "projects/-previous-folder" / f"{identity}.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(nightly_review.DatedTranscriptRecord(
+            type="assistant", timestamp=since.isoformat())) + "\n")
+        _ = (records / "probe.json").write_text(json.dumps(nightly_review.TranscriptSessionRecord(
+            name="natedev", sessionId=identity, cwd="/current/folder", config_dir=str(config))))
+        unrelated = path.with_name(f"{fixture_runtime_id('unrelated-transcript')}.jsonl")
+        _ = unrelated.write_text(path.read_text())
+        with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              mock.patch.object(nightly_review, "sessions_directory", return_value=records),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
+            self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
+
     def test_live_counts_exclude_dry_runs_and_keep_unreviewed_apart_from_failures(self) -> None:
         since = datetime(2026, 10, 13, tzinfo=timezone.utc)
         records = [nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict=verdict,
@@ -298,14 +317,12 @@ class TonightTests(NightlyReviewTests):
 class NightlyProductionTests(NightlyReviewTests):
     def doc(self, name: str, plan: str) -> str:
         path = self.root / f"{name}.md"
-        _ = path.write_text("\n".join(["# production", "", "## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                                       "| --- | --- | --- | --- | --- | --- |",
-                                       f"| nightly-review-unit | {plan} | `/w/{name}` | `{name}` | 0 | nightly |", ""]))
+        _ = path.write_text("# production\n")
         tree = self.root / (name + "-unit")
         unit = recorded_unit(name + "-owner", "nightly-review", tree, path, plan=plan)
         responsibilities = '["nightly-review"]' if plan == "permanent" else "[]"
         _ = (tree / ".unit.toml").write_text(f'plan = "{plan}"\nresponsibilities = {responsibilities}\n')
-        parent = staff.snapshot().by_id(unit.parent) if unit.parent is not None else None
+        parent = staff.snapshot().parent_of(unit)
         if parent is None:
             self.fail("the nightly fixture unit lost its parent")
         _ = fake_showrunner.write_timer(Path(os.environ["NOTIFIER_STATE_DIR"]), name,
@@ -315,7 +332,7 @@ class NightlyProductionTests(NightlyReviewTests):
     def runners(self, *docs: tuple[str, str]) -> list[showrunners.Showrunner]:
         return [showrunners.Showrunner(session="", socket="", slug=slug, zone="", doc=doc) for slug, doc in docs]
 
-    def test_configuration_responsibility_wins_over_the_permanent_table_row(self) -> None:
+    def test_configuration_responsibility_wins_over_the_permanent_plan(self) -> None:
         _ = self.doc("old-alias", "permanent")
         destination = Path(self.doc("new-alias", "standby"))
         _ = (self.root / "old-alias-unit/.unit.toml").write_text('plan = "permanent"\nresponsibilities = []\n')

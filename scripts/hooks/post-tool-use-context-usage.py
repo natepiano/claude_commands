@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: report context-window usage to the agent (model-only).
+"""PostToolUse hook: read context usage and optionally report it to the agent.
+
+The message is off in config/context_usage.conf. Only message = off disables it.
+The hook reads the switch on each call and always keeps the reading and debug log.
 
 Reads the live token count from the session transcript and injects a short
 line into the agent's context via `hookSpecificOutput.additionalContext`.
@@ -38,7 +41,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import cast
 
-from context_usage import (
+from scripts.lib import conf
+
+from scripts.hooks.context_usage import (
     OUTPUT_RESERVE_TOKENS,
     PRECOMPUTE_RESERVE_TOKENS,
     HookInput,
@@ -54,6 +59,15 @@ from context_usage import (
 )
 
 DEBUG_LOG = Path("/tmp/claude/context-hook-debug.jsonl")
+
+
+def message_enabled() -> bool:
+    """Only a live off value disables the context message."""
+    settings = conf.read("context_usage").settings
+    if not isinstance(settings, dict):
+        return True
+    setting = settings.get("message")
+    return setting is None or setting.value != "off"
 
 
 def build_context(tokens: int, window: int | None, is_subagent: bool, showrunner: Path | None = None) -> str | None:
@@ -131,7 +145,9 @@ def showrunner_state(session_id: str) -> Path | None:
     doc = showrunners.production_of(session_id) if session_id else None
     if doc is None:
         return None
-    return showrunners.session_state_dir(showrunners.production_slug(str(doc))) / "showrunner_state.json"
+    from scripts.production.store_owner import document_id
+
+    return showrunners.session_state_dir(document_id(doc)) / "showrunner_state.json"
 
 
 def log_debug(
@@ -174,7 +190,7 @@ def main() -> None:
     window = auto_compact_window(None if reading is None else reading["model"])
     response = response_bytes(payload)
     log_debug(payload, transcript, reading, window, response)
-    if reading is None:
+    if reading is None or not message_enabled():
         return
     tokens = estimate_tokens(reading, response)
     is_subagent = bool(payload.get("agent_id"))

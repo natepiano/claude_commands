@@ -96,14 +96,17 @@ def main() -> int:
     config = conf.read(registry)
     values = config.values()
     memory = int(linux_runner.positive_setting(values, 'loopback.memory_gib') * memory_admit.GIB)
-    budget = int(linux_runner.positive_setting(values, 'loopback.build_budget_gib') * memory_admit.GIB)
     # The isolated fixture has no history for nextest, check or doc.
-    need = memory_admit.FALLBACK
-    required_free = need + memory_admit.resolve_admission_limits(memory).reserve
-    if memory < required_free or budget < need:
+    try:
+        configuration = memory_admit.read_memory_config()
+        need = configuration.program_first_peaks["cargo"]
+        required_free = need + memory_admit.resolve_admission_limits(configuration).reserve
+    except conf.Unusable as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if memory < required_free:
         print(f'loopback: cannot admit the fixture; loopback.memory_gib must provide '
-              + f'{required_free / memory_admit.GIB:g} GiB including the gate reserve; '
-              + f'loopback.build_budget_gib must be at least {need / memory_admit.GIB:g} GiB', file=sys.stderr)
+              + f'{required_free / memory_admit.GIB:g} GiB including the safety reserve', file=sys.stderr)
         return 2
     host = values['loopback.host']
     connect = config.number('loopback.connect_timeout_s')

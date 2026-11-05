@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
-import production_units
+from scripts.production.production_doc import Production, read_production
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.whoami import usage_store
@@ -39,6 +39,7 @@ from scripts.production.add_showrunner_test_support import AddShowrunnerFixture,
 
 from scripts.production import staff
 from scripts.production import completion_receipt
+from scripts.production.fake_unit_host import process as write_process
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -55,7 +56,7 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         _ = fixture_member("showrunner", name="demo", runtime_id=fixture_runtime_id("decoy-showrunner"))
         with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", return_value=
               runtime.AgentLaunched("w1:p1", runtime.PromptSubmitted(datetime.now(timezone.utc)))) as launch):
-            _ = add_showrunner.launch(production_units.read_production(document), "fixture", "high", current,
+            _ = add_showrunner.launch(read_production(document), "fixture", "high", current,
                                       self.root, accounts.NamedAccount("claude1", self.root))
         arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
         self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
@@ -67,7 +68,7 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         document = self.production("demo")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
                                 + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
-        child = production_units.read_production(document)
+        child = read_production(document)
         identity = fixture_runtime_id("fresh-Claude-showrunner")
         backend = ClaudeBackendFixture(identity, self.root / "claude-account")
         with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", side_effect=backend.launch)):
@@ -76,7 +77,7 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         self.assertIsInstance(outcome, runtime.PromptSubmitted)
         row = backend.before_opening.by_id(staff.StaffId(identity))
         assert row is not None
-        self.assertEqual((row.id, row.name, row.parent), (identity, "demo", None))
+        self.assertEqual((row.id, row.name, row.parent), (identity, "demo", staff.StaffRoot()))
         self.assertNotIn("--session-id", backend.arguments)
         self.assertNotIn("--resume", backend.arguments)
         self.assertNotIn("STAFF_ID", backend.environment)
@@ -92,7 +93,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         assert child is not None and parent is not None
         self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
         self.assertEqual(parent.doc, staff.LiveDoc("natedev", self.doc("top")))
-        self.assertEqual(child.parent, parent.id)
+        self.assertEqual(child.parent, staff.ReportsTo(parent.id))
 
     @override
     def setUp(self) -> None:
@@ -130,11 +131,11 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             self.assertGreater(showrunner_admit.call_count, 0)
             with (patch.dict(os.environ, self.env),
                   patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
-                unit = add_unit.ensure_staff_unit(production_units.read_production(self.doc("kid")), "probe-unit",
+                unit = add_unit.ensure_staff_unit(read_production(self.doc("kid")), "probe-unit",
                     worktree=staff.PresentWorktree("natedev", self.root / "probe"),
                     runtime_id=fixture_runtime_id("probe-unit-backend"))
             unit_admit.assert_called_once()
-        self.assertEqual(unit.parent, child.id)
+        self.assertEqual(unit.parent, staff.ReportsTo(child.id))
         self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
         self.assertEqual(len([row for row in staff.find(kind="showrunner") if row.id == child.id]), 1)
@@ -144,13 +145,13 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         parent = fixture_member("showrunner", name="other")
         child = fixture_member("showrunner", name="kid", parent=parent.id,
                              doc=staff.LiveDoc("natedev", self.doc("kid")))
-        path = self.root / "showrunner/kid/parent"
+        path = self.root / "showrunner" / child.id / "parent"
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, "top\n")
         before = self.staff.staff_file.read_bytes(), path.read_bytes()
         with (patch.dict(os.environ, self.env),
               patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
-            ensured = add_showrunner.ensure_staff_showrunner(production_units.read_production(self.doc("kid")), "top")
+            ensured = add_showrunner.ensure_staff_showrunner(read_production(self.doc("kid")), "top")
         self.assertEqual(ensured, child)
         self.assertEqual((self.staff.staff_file.read_bytes(), path.read_bytes()), before)
 
@@ -159,7 +160,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         class NativeCallbackInterrupted(BaseException):
             """The backend was observed before this launcher process ended."""
 
-        def interrupted(child: production_units.Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
+        def interrupted(child: Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
             self.assertEqual((child.slug, caller), ("kid", "top"))
             self.assertEqual(runtime_id, "cfc4564d-fed3-5803-9a4c-e3119733bb53")
             raise NativeCallbackInterrupted("stopped after saving launch")
@@ -168,7 +169,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         with patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted):
             with self.assertRaisesRegex(NativeCallbackInterrupted, "stopped after saving launch"):
                 _ = self.run_command("kid")
-        receipt = completion_receipt.read_launch_receipt(self.root / "showrunner/kid/add_showrunner.json", staff.initial_snapshot())
+        receipt = completion_receipt.read_launch_receipt(self.root / "showrunner/cfc4564d-fed3-5803-9a4c-e3119733bb53/add_showrunner.json", staff.initial_snapshot())
         assert isinstance(receipt, completion_receipt.UnpublishedReceipt)
         identity = add_showrunner.ShowrunnerLaunch.from_receipt(receipt.fields)
         self.assertEqual(receipt.identity, identity.session_id)
@@ -201,7 +202,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         assert child is not None
         self.assertEqual((child.id, child.current_session), (returned_native, returned_native))
         recovered_receipt = completion_receipt.read_launch_receipt(
-            self.root / "showrunner/kid/add_showrunner.json", staff.snapshot())
+            self.root / "showrunner" / child.id / "add_showrunner.json", staff.snapshot())
         assert isinstance(recovered_receipt, completion_receipt.OwnedReceipt)
         self.assertEqual(recovered_receipt.fields["session_id"], returned_native)
 
@@ -243,7 +244,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         child = staff.by_path("kid")
         parent = staff.by_path("top")
         assert child is not None and parent is not None
-        self.assertEqual(child.parent, parent.id)
+        self.assertEqual(child.parent, staff.ReportsTo(parent.id))
 
     def test_open_showrunner_recovers_before_its_timer_registers_without_second_launch(self) -> None:
         self.assert_open_launch_recovers(True)
@@ -260,7 +261,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         class NativeCallbackInterrupted(BaseException):
             """Process loss after native observation leaves the launch available for recovery."""
 
-        def interrupted(child: production_units.Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
+        def interrupted(child: Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
             self.assertEqual(runtime_id, native)
             if after_publication:
                 _ = original(child, caller, runtime_id=runtime_id)
@@ -269,7 +270,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         with patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted):
             with self.assertRaisesRegex(NativeCallbackInterrupted, "interrupted after native observation"):
                 _ = self.run_command("kid")
-        receipt_path = self.root / "showrunner/kid/add_showrunner.json"
+        receipt_path = self.root / "showrunner/cfc4564d-fed3-5803-9a4c-e3119733bb53/add_showrunner.json"
         receipt = completion_receipt.read_launch_receipt(receipt_path, staff.initial_snapshot())
         if after_publication:
             self.assertIsInstance(receipt, completion_receipt.OwnedReceipt)
@@ -308,7 +309,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual([row.id for row in staff.find(kind="showrunner") if row.name == "kid"], [native])
         child, parent = staff.by_path("kid"), staff.by_path("top")
         assert child is not None and parent is not None
-        self.assertEqual(child.parent, parent.id)
+        self.assertEqual(child.parent, staff.ReportsTo(parent.id))
 
     def test_observed_native_launch_recovers_before_staff_publication_without_a_second_backend(self) -> None:
         self.assert_observed_callback_recovers(False)
@@ -333,7 +334,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         rows = staff.snapshot().rows
         child = next(row for row in rows if row.name == "kid")
         parent = next(row for row in rows if row.name == "top")
-        self.assertEqual(child.parent, parent.id)
+        self.assertEqual(child.parent, staff.ReportsTo(parent.id))
         data, edge = self.staff.staff_file.read_bytes(), self.parent_of("kid")
         calls = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         with patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1")):
@@ -386,11 +387,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertIn("--resume and --cwd go together", alone.stderr)
 
     def test_showrunner_shared_tab_retries_enter_with_the_selected_session_transcript(self) -> None:
-        child = production_units.read_production(self.doc("kid"))
+        child = read_production(self.doc("kid"))
         selected = accounts.NamedAccount("claude3", self.root / "selected")
         native = fixture_runtime_id("shared-tab-resumed-showrunner")
         path, record = self.record(native, "kid")
-        _ = Path(path).write_text(record)
         pid = cast(dict[str, object], json.loads(record))["pid"]
         transcript = selected.dir / "projects/fixture" / f"{native}.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -402,9 +402,17 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             nonlocal elapsed
             elapsed += seconds
 
-        def visible(*_args: str, deadline: float = math.inf) -> str:
+        def visible(*args: str, deadline: float = math.inf) -> str:
             del deadline
+            if args[:2] == ("pane", "process-info"):
+                return json.dumps({"result": {"process_info": {
+                    "shell_pid": 998040, "foreground_process_group_id": pid,
+                    "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}})
             return screen
+
+        def started(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            _ = Path(path).write_text(record)
+            return subprocess.CompletedProcess([], 0, "", "")
 
         def turn(*, meta: bool) -> None:
             with transcript.open("a") as output:
@@ -436,12 +444,12 @@ class AddShowrunnerTests(AddShowrunnerFixture):
               patch.object(runtime, "start_server"),
               patch.object(runtime, "open_tab", return_value="destination:p1") as tab,
               patch.object(runtime, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
-              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "label": "kid"}]),
-              patch.object(runtime.Herdr, "start_command", return_value=subprocess.CompletedProcess([], 0, "", "")),
+              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "terminal_id": "destination-terminal", "workspace_id": "destination", "label": "kid"}]),
+              patch.object(runtime.Herdr, "start_command", side_effect=started),
               patch.object(runtime.Herdr, "readiness", return_value={"agent_status": "idle", "interactive_ready": True}) as readiness,
-              patch.object(runtime.Herdr, "prompt", autospec=True, side_effect=typed) as prompt,
+              patch.object(runtime.Herdr, "_prompt", autospec=True, side_effect=typed) as prompt,
               patch.object(runtime.Herdr, "run", side_effect=visible),
-              patch.object(runtime.Herdr, "send_keys", autospec=True, side_effect=enter) as keys):
+              patch.object(runtime.Herdr, "_send_keys", autospec=True, side_effect=enter) as keys):
             outcome = add_showrunner.launch(child, "opus", "high", native, self.root, selected)
         self.assertIsInstance(outcome, runtime.PromptSubmitted)
         self.assertEqual(prompt.call_count, 1)
@@ -627,7 +635,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
 
     def test_resume_uses_the_configured_showrunners_account(self) -> None:
         directory = self.named_account()
-        child = production_units.read_production(self.doc("kid"))
+        child = read_production(self.doc("kid"))
         self.resume_record()
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
@@ -636,7 +644,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         role.assert_called_once_with("showrunner")
 
     def test_check_validates_the_destination_without_returning_a_binary(self) -> None:
-        child = production_units.read_production(self.doc("kid"))
+        child = read_production(self.doc("kid"))
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(add_showrunner, "running", return_value=False), \
                 patch.object(showrunner_tree, "descendants_of", return_value=[]), \
@@ -651,13 +659,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             (991000, 0, ["herdr", "--session", "kid", "server"], {}),
             (991001, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1"}),
         ):
-            process = Path(self.env["HERDR_PROC"]) / str(pid)
-            process.mkdir(parents=True)
-            _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
-            _ = (process / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
-            _ = (process / "environ").write_bytes(
-                ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
-            )
+            write_process(self.env, pid, parent, argv, environment)
         result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--check")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("check: ok", result.stdout)
@@ -854,7 +856,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         grand = fixture_member("showrunner", name="grand")
         middle = fixture_member("showrunner", name="middle", parent=grand.id)
         top = next(row for row in staff.find(kind="showrunner") if row.name == "top")
-        _ = staff.move(top.id, middle.id)
+        _ = staff.move(top.id, staff.ReportsTo(middle.id))
         for child, parent in (("top", "middle"), ("middle", "grand")):
             edge = self.root / "showrunner" / child / "parent"
             edge.parent.mkdir(parents=True)

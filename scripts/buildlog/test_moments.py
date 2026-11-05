@@ -44,6 +44,25 @@ def build(record_id: str, seconds: float, **fields: object) -> Record:
     })
 
 
+def moment_fixture(test: unittest.TestCase) -> MomentTests:
+    fixture = MomentTests(methodName="runTest")
+    test.addCleanup(fixture.doCleanups)
+    fixture.setUp()
+    return fixture
+
+
+def read_only_cli(test: unittest.TestCase, args: list[str]) -> subprocess.CompletedProcess[str]:
+    database = index.index_path()
+    before = database.read_bytes()
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("cli.py")), *args],
+        env=dict(os.environ), capture_output=True, text=True, check=False, timeout=60,
+    )
+    test.assertEqual(result.returncode, 0, result.stderr)
+    test.assertEqual(database.read_bytes(), before)
+    return result
+
+
 class MomentTests(unittest.TestCase):
     fixture: report_fixtures.PowerProfileTests  # pyright: ignore[reportUninitializedInstanceVariable]
     journal: memory_fixtures.MemoryWindowTests  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -67,7 +86,7 @@ class MomentTests(unittest.TestCase):
         # These cases exercise the indexed Hana predicate, including each
         # evidence column in isolation. The index derives these three columns
         # from other source fields, so bind their fixture values after indexing.
-        with closing(sqlite3.connect(self.fixture.root / "index.sqlite")) as fixture_index:
+        with closing(sqlite3.connect(index.index_path_in(self.fixture.root))) as fixture_index:
             with fixture_index:
                 for record in records:
                     if record.get("kind") == "step":
@@ -78,8 +97,8 @@ class MomentTests(unittest.TestCase):
                         )
         return index.read_only()
 
-    def progress(self, events: list[Record], *, root: Path | None = None) -> None:
-        path = (root if root is not None else self.fixture.root / "progress") / "fixture.jsonl"
+    def progress(self, events: list[Record], *, root: Path | None = None, filename: str = "fixture.jsonl") -> None:
+        path = (root if root is not None else self.fixture.root / "progress") / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events))
 
@@ -485,16 +504,9 @@ class MomentTests(unittest.TestCase):
             closing(self.connection(build("measured", 3600, repo="hana"))) as connection,
         ):
             expected = report.moments_section(connection, "2026-10-30")
-        database = self.fixture.root / "index.sqlite"
-        before = database.read_bytes()
-        result = subprocess.run(
-            [sys.executable, str(Path(report.__file__).with_name("cli.py")), "moments", "2026-10-30"],
-            env={**os.environ, "BUILDLOG_PROGRESS_DIR": str(self.fixture.root / "progress")},
-            capture_output=True, text=True, check=False, timeout=60,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        result = read_only_cli(self, ["moments", "2026-10-30"])
         self.assertEqual(result.stdout.splitlines(), expected)
-        self.assertEqual(database.read_bytes(), before)
+
 
 
 class MemoryMomentTests(unittest.TestCase):
@@ -503,9 +515,7 @@ class MemoryMomentTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = MomentTests(methodName="runTest")
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = moment_fixture(self)
         self.journal = self.fixture.journal
         _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", return_value="natedev")))
 
@@ -544,6 +554,7 @@ class MemoryMomentTests(unittest.TestCase):
         return records
 
     def test_configured_kill_level_changes_the_python_split_and_definition(self) -> None:
+        target = memory_fixtures.cargo_output(self.journal.base / "cargo-output")
         at = START + timedelta(days=1)
         self.journal.stub_journal(early=[
             memory_fixtures.journal_entry(at + timedelta(minutes=1),
@@ -551,7 +562,7 @@ class MemoryMomentTests(unittest.TestCase):
             memory_fixtures.journal_entry(at + timedelta(minutes=2),
                 memory_fixtures.earlyoom_message(107, adj=500, cmdline="/usr/bin/editor")),
             memory_fixtures.journal_entry(at + timedelta(minutes=3),
-                memory_fixtures.earlyoom_message(108, adj=200, cmdline="/work/target/debug/test")),
+                memory_fixtures.earlyoom_message(108, adj=200, cmdline=f"{target}/debug/test")),
         ], kernel=[])
         config = write_lint_config(self.journal.base, 650)
         with closing(self.fixture.connection()):
@@ -607,15 +618,16 @@ with index.read_only() as connection:
         self.assertEqual(sum("A window shorter than 2 day is thin" in line for line in section), 1)
 
     def test_memory_table_counts_kills_stalls_zero_waits_and_stopped_retries(self) -> None:
+        target = memory_fixtures.cargo_output(self.journal.base / "cargo-output")
         at = START + timedelta(days=1)
         moment = moments.MemoryMoment(at, "fixture budget raise")
         before_messages = [memory_fixtures.earlyoom_message(number) for number in range(6)]
-        before_messages.append(memory_fixtures.earlyoom_message(10, adj=200, cmdline="/work/target/debug/test"))
+        before_messages.append(memory_fixtures.earlyoom_message(10, adj=200, cmdline=f"{target}/debug/test"))
         before_messages.extend((memory_fixtures.earlyoom_message(11, adj=200, cmdline="/usr/bin/editor"),
                                 memory_fixtures.earlyoom_message(12, adj=None)))
         after_messages = [memory_fixtures.earlyoom_message(20),
-                          memory_fixtures.earlyoom_message(21, adj=200, cmdline="/work/target/debug/test"),
-                          memory_fixtures.earlyoom_message(22, adj=100, cmdline="/work/target/release/test"),
+                          memory_fixtures.earlyoom_message(21, adj=200, cmdline=f"{target}/debug/test"),
+                          memory_fixtures.earlyoom_message(22, adj=100, cmdline=f"{target}/release/test"),
                           memory_fixtures.earlyoom_message(23, adj=None)]
         self.journal.stub_journal(early=[
             *(memory_fixtures.journal_entry(at - timedelta(minutes=10), message) for message in before_messages),

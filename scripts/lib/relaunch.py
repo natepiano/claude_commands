@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.herdr import herdr
@@ -48,7 +48,7 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
 
 class RelaunchRequest(TypedDict):
     argv: list[str]
-    cwd: str
+    cwd: NotRequired[str]
     environment: dict[str, str]
     unset: list[str]
     written_at: str
@@ -103,9 +103,11 @@ def _request(value: object) -> RelaunchRequest:
         for key, item in cast(dict[object, object], environment).items()
     ):
         raise ValueError("relaunch request environment must contain strings")
-    for key in ("cwd", "written_at", "note"):
+    for key in ("written_at", "note"):
         if not isinstance(values.get(key), str):
             raise ValueError(f"relaunch request {key} must be a string")
+    if "cwd" in values and not isinstance(values["cwd"], str):
+        raise ValueError("relaunch request cwd must be a string")
     return cast(RelaunchRequest, cast(object, values))
 
 
@@ -117,7 +119,8 @@ def _execute_request(path: Path) -> None:
     for key in request["unset"]:
         _ = environment.pop(key, None)
     environment.update(request["environment"])
-    os.chdir(request["cwd"])
+    if "cwd" in request:
+        os.chdir(request["cwd"])
     print(" ".join(request["note"].splitlines()), flush=True)
     script = str(Path(__file__).resolve())
     os.execvpe(sys.executable, [sys.executable, script, "run", "--", *request["argv"]], environment)

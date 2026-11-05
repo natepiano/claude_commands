@@ -14,11 +14,10 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import build_folders
 
+from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
-from production_units import Production, read_production
-from production_units import Refusal, cell_value
+from scripts.production.production_doc import Production, Refusal, cell_value, read_production
 from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history, merge_lock
 
 
@@ -150,27 +149,26 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         return
     script = Path(os.environ.get("CI_POINTS_VALIDATE_SCRIPT", str(Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh")))
     tip = branch_tip(production)
-    origin = required(git(production.checkout, "remote", "get-url", "origin"), "ci start")
     push_origin = required(git(production.checkout, "remote", "get-url", "--push", "origin"), "ci start")
     history = merge_branch_history(production.checkout, tip)
     last_code = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and isinstance(entry.kind, CodeCheckpoint)), None)
     checkpoint = (f"{last_code.unit} phase {last_code.phase}" if isinstance(last_code, MergeEntry)
                   else "production wrap")
     state_dir.mkdir(parents=True, exist_ok=True)
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            build_folders.FOLDER_PREFIXES["ci-point"], build_folders.ExplicitBuildParent(state_dir.resolve()))) as temporary:
-        checkout = temporary / "checkout"
-        _ = required(command("ci start", "git", "clone", "--shared", "--no-checkout", "--",
-                             str(production.checkout.resolve()), str(checkout)), "ci start")
-        _ = required(git(checkout, "remote", "set-url", "origin", origin), "ci start")
-        _ = required(git(checkout, "remote", "set-url", "--push", "origin", push_origin), "ci start")
-        _ = required(git(checkout, "checkout", "--detach", tip), "ci start")
-        # A checkout can set its commit identity locally instead of globally.
+    with copies.standing(production.slug, production.checkout, tip) as checkout:
+        source_url = required(git(checkout, "config", "--local", "--get", "remote.origin.url"), "ci start")
+        settings = [(f"url.{push_origin}.pushInsteadOf", source_url)]
         for key in ("user.name", "user.email"):
             identity = git(production.checkout, "config", "--get", key)
             if identity.returncode == 0:
-                _ = required(git(checkout, "config", key, identity.stdout.strip()), "ci start")
-        argv = ("env", f"CARGO_TARGET_DIR={checkout / 'target'}", "bash", str(script.resolve()),
+                settings.append((key, identity.stdout.strip()))
+        # Git's command environment reaches validation's child commands without
+        # changing the standing checkout's persistent configuration.
+        inherited = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
+        configuration = [f"GIT_CONFIG_COUNT={inherited + len(settings)}"]
+        for index, (key, value) in enumerate(settings, inherited):
+            configuration.extend((f"GIT_CONFIG_KEY_{index}={key}", f"GIT_CONFIG_VALUE_{index}={value}"))
+        argv = ("env", *configuration, f"CARGO_TARGET_DIR={checkout / 'target'}", "bash", str(script.resolve()),
                 "--validate-only", "--fix-commit",
                 f"ci({production.slug}): validation fixes after {checkpoint}")
         validation_log = state_dir.resolve() / "ci_validation.log"
@@ -380,7 +378,7 @@ def main() -> int:
             notice(production, cast(str, args.gate_id), cast(str, args.notice_action),
                    cast(Path | None, getattr(args, "log", None)))
         return 0
-    except (PointFailure, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
+    except (copies.CopyError, PointFailure, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         report(error.step if isinstance(error, PointFailure) else step, "failed", str(error))
         return 2
 

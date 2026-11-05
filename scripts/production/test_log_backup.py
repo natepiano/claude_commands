@@ -7,12 +7,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from zoneinfo import ZoneInfo
 
 import log_backup
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -38,9 +41,16 @@ class LogBackupTests(unittest.TestCase):
         self.log = checkout / "docs/plans/demo-log.md"
         self.log.parent.mkdir(parents=True)
         self.state = self.root / "state"
-        self.backups = self.state / "demo" / "log-backups"
         self.doc = self.root / "demo-production.md"
         self.write_doc("running")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr",
+            "SHOWRUNNER_STATE_DIR": str(self.state),
+        })))
+        owner = fixture_member("showrunner", name="backup-owner", doc=staff.LiveDoc("natedev", self.doc))
+        _ = staff.update_current_session(owner.id, staff.native_id("2798657c-063d-4dcb-9c0a-b20bb56cfa53"))
+        self.backups = self.state / owner.id / "log-backups"
 
     def write_doc(self, status: str, *, log_field: bool = True) -> None:
         fields = [
@@ -48,7 +58,6 @@ class LogBackupTests(unittest.TestCase):
             "- **Merge branch:** `demo`",
             f"- **Showrunner checkout:** `{self.root / 'checkout'}`",
             "- **User zone:** America/Los_Angeles — demo",
-            "## Units",
         ]
         if log_field:
             fields.insert(2, "- **Log:** `docs/plans/demo-log.md`")

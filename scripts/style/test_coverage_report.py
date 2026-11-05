@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import json
 import os
 import sqlite3
@@ -20,6 +22,7 @@ import coverage_report
 import rules
 import style_ledger
 import style_rules
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, unit_membership
 
 
 @dataclass(frozen=True)
@@ -123,7 +126,7 @@ class CoverageReportTests(unittest.TestCase):
         definition = next(row for row in rules.load_rules(self.repo)
                           if row.rule_id == rule.removesuffix("#uncovered"))
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.record(rule, path, self.tip, definition.blob, verdict, ticket="report-1", worker="test",
+            ledger.record(rule, path, self.tip, definition.blob, verdict, ticket="40001", worker="test",
                           input_scope=style_ledger.DeclaredInputScope.RULE)
 
     def report(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
@@ -154,59 +157,60 @@ class CoverageReportTests(unittest.TestCase):
         definition = next(row for row in rules.load_rules(self.repo) if row.rule_id == rule)
         with style_ledger.open_ledger(self.repo) as ledger:
             return ledger.hold(rule, self.sources[0], line, "pub fn value() {}", "rename",
-                               "value", "count", definition.blob, "report-1").finding_id
+                               "value", "count", definition.blob, "40001").finding_id
 
-    def production_units(self, *units: str) -> None:
+    def staff_units(self, *units: str) -> None:
         doc = self.root / "sample-style/docs/sample-style-production.md"
         doc.parent.mkdir(parents=True, exist_ok=True)
-        _ = doc.write_text("\n".join([
-            "# Style production", "- **Kind:** style", "- **Branch point:** main", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch |",
-            "| --- | --- | --- | --- |",
-            *(f"| {unit} | docs/{unit}.md | {self.root / unit} | main |" for unit in units), "",
-        ]))
+        _ = doc.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = recorded_showrunner("sample-style", doc)
+        for unit in units:
+            _ = unit_membership("sample-style", unit)
 
 
-    def test_production_units_use_full_ids_without_a_document_and_mixed_ids_with_one(self) -> None:
+    def test_staff_units_use_full_ids_without_a_document_and_mixed_ids_with_one(self) -> None:
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:
             self.assertEqual(set(coverage_report.production(ledger, self.tip).units), {
                 "sample-style-names-unit", "sample-style-types-unit",
                 "sample-style-values-unit", "sample-style-modules-unit",
             })
-            self.production_units("names-unit", "sample-style-types-unit", "feature-unit")
+            self.staff_units("names-unit", "sample-style-types-unit", "feature-unit")
             self.assertEqual(coverage_report.production(ledger, self.tip).units,
                              ("names-unit", "sample-style-types-unit"))
 
     def test_report_finds_a_moved_ticket_by_the_declared_full_unit_id(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.production_units("sample-style-names-unit")
+        self.staff_units("names-unit")
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
-            ledger.ticket_assign("names-unit-1", "main")
-            _ = ledger.rename_unit("names-unit", "sample-style-names-unit")
+            ledger.ticket_assign("1", "main")
+            from scripts.production import staff
+            owner = staff.initial_snapshot().find(kind="unit")[0]
+            _ = staff.rename(owner.id, "sample-style-names")
         output = self.report("--rule", "read").stdout
-        self.assertIn("names-unit-1", output)
+        self.assertIn("1", output)
         self.assertNotIn("Open tickets: none", output)
 
     def test_report_shows_each_widened_path_of_an_open_ticket_under_its_line(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.production_units("names-unit")
+        self.staff_units("names-unit")
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
-            ledger.ticket_assign("names-unit-1", "main")
+            ledger.ticket_assign("1", "main")
             database = ledger.database
         # Only a proposal ticket widens; the report shows the rows of any open ticket.
         with closing(sqlite3.connect(database)) as connection, connection:
             _ = connection.execute("INSERT INTO ticket_widened_paths VALUES (?,?,?,?,?)",
-                                   ("names-unit-1", "crates/alpha/src/extra.rs", "the move needs a new file",
+                                   ("1", "crates/alpha/src/extra.rs", "the move needs a new file",
                                     "showrunner", "2026-10-25T23:06:34+00:00"))
         lines = self.report("--rule", "read").stdout.splitlines()
-        opened = next(index for index, line in enumerate(lines) if line.startswith("names-unit-1 · assigned"))
+        opened = next(index for index, line in enumerate(lines) if line.startswith("1 · assigned"))
         self.assertEqual(lines[opened + 1], "widened: crates/alpha/src/extra.rs — the move needs a new file "
                          + "(showrunner, 2026-10-25T23:06:34+00:00)")
 
@@ -418,12 +422,12 @@ class CoverageReportTests(unittest.TestCase):
         other = self.rule("other")
         self.sync()
         units = ("names-unit", "sample-style-names-unit", "other-style-names-unit", "types-unit")
-        self.production_units(*units)
+        self.staff_units(*units)
         with style_ledger.open_ledger(self.repo) as ledger:
             for number, rule in enumerate((selected, selected, selected, other), start=1):
                 unit = units[number - 1]
-                ticket = unit + "-1"
-                ledger.ticket_add(ticket, unit, "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+                ticket = str(number)
+                ledger.ticket_add(ticket, ticket_owner_id(unit), "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
                 if number != 3:
                     ledger.ticket_assign(ticket, "main")
                 if number == 2:
@@ -433,31 +437,31 @@ class CoverageReportTests(unittest.TestCase):
                     ledger.ticket_checkpoint(ticket, self.tip)
         output = self.report("--rule", "selected").stdout
         self.assertEqual(set(self.rows(output)), {"selected"})
-        self.assertIn("names-unit-1", output)
-        self.assertIn("sample-style-names-unit-1", output)
-        self.assertNotIn("other-style-names-unit-1", output)
-        self.assertNotIn("types-unit-1", output)
+        self.assertIn("1 · assigned ·", output)
+        self.assertIn("2 · checkpointed ·", output)
+        self.assertNotIn("3 · queued ·", output)
+        self.assertNotIn("2001", output)
 
     def test_crate_filter_limits_cells_and_prints_the_oldest_open_ticket(self) -> None:
         read = self.rule("read")
         self.sync()
-        self.production_units("names-unit", "sample-style-names-unit", "types-unit")
+        self.staff_units("names-unit", "sample-style-names-unit", "types-unit")
         for path in self.sources[:2]:
             self.record(read, path)
         with style_ledger.open_ledger(self.repo) as ledger:
-            for unit, crate in (("names-unit", "alpha"), ("sample-style-names-unit", "alpha"), ("types-unit", "beta")):
+            for identity, unit, crate in (("1", "names-unit", "alpha"), ("2", "sample-style-names-unit", "alpha"), ("2001", "types-unit", "beta")):
                 with mock.patch.object(style_ledger, "_now", return_value=(
                     "2026-10-01T12:00:00+00:00" if unit == "names-unit" else "2026-10-02T12:00:00+00:00"
                 )):
-                    ledger.ticket_add(unit + "-1", unit, "read", "names", "crates/" + crate,
+                    ledger.ticket_add(identity, ticket_owner_id(unit), "read", "names", "crates/" + crate,
                                       [f"crates/{crate}/src/lib.rs"], [read])
-                ledger.ticket_assign(unit + "-1", "main")
+                ledger.ticket_assign(identity, "main")
         output = self.report("--crate", "crates/alpha").stdout
         row = self.rows(output)["read"]
         self.assertEqual((row.current, row.open, row.done), ("2 (100%)", "0", "yes"))
         oldest_line = next(line for line in output.splitlines() if "oldest" in line.lower())
-        self.assertIn("names-unit-1", oldest_line)
-        self.assertNotIn("types-unit-1", output)
+        self.assertIn("1", oldest_line)
+        self.assertNotIn("2001", output)
 
     def test_report_counts_coverage_once_and_adds_one_pass_only_for_a_crate(self) -> None:
         read = self.rule("read")

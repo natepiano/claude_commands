@@ -7,10 +7,13 @@ from typing import cast
 from pathlib import Path
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.build_queue.admission_test_support import caller_admission
 
 
 class VerifyTokenHistoryTests(VerifyTokenWaitFixture):
     def test_waiting_for_peer_call_records_token_seconds(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
         board = self.root / "board"
         self.record_phase(board)
         waiting = self.root / "waiting-for-token"
@@ -19,20 +22,17 @@ class VerifyTokenHistoryTests(VerifyTokenWaitFixture):
         second_clock = self.root / "second-clock"
         _ = first_clock.write_text("1000\n")
         _ = second_clock.write_text("1000\n")
-        sleep = self.root / "stubs" / "sleep"
-        _ = sleep.write_text('''#!/bin/sh
-if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then
+        self.write_wait_sleep('''if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then
     : > "$TEST_WAITING"
     exec python3 "$TEST_WAIT_HELPER" "$TEST_WAIT_GATE"
 fi
 exit 0
 ''')
-        sleep.chmod(0o755)
         first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                             "UNIT_TEAM_ROLE": "first", "CODEX_THREAD_ID": "thread-first", "TEST_BLOCK": "1",
+                             "UNIT_TEAM_ROLE": "first", "CODEX_THREAD_ID": fixture_runtime_id("thread-first"), "TEST_BLOCK": "1",
                              "UNIT_TOKEN_CLOCK_FILE": str(first_clock)}
         second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                              "UNIT_TEAM_ROLE": "second", "CODEX_THREAD_ID": "thread-second", "TEST_WAITING": str(waiting),
+                              "UNIT_TEAM_ROLE": "second", "CODEX_THREAD_ID": fixture_runtime_id("thread-second"), "TEST_WAITING": str(waiting),
                               "TEST_WAIT_GATE": str(resume),
                               "UNIT_TOKEN_CLOCK_FILE": str(second_clock)}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
@@ -53,6 +53,8 @@ exit 0
                 _ = (self.root / "release").touch()
                 first_output = first.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(first.returncode, 0, first_output)
+                with admission.loop_turn():
+                    admission.allow_next_start()
                 resume.touch()
                 second_output = second.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(first.returncode, 0, first_output)

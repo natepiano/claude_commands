@@ -19,9 +19,11 @@ from typing import TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "lib"))
+sys.path.insert(0, str(SCRIPTS.parent))
 
 import rules
 import style_ledger
+from scripts.production import staff, unit_lookup, unit_names
 from user_zone import user_zone
 
 
@@ -72,9 +74,8 @@ def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
         branch = re.search(r"^\s*-?\s*\*\*Branch point:\*\*\s*(.+)$", text, re.MULTILINE)
         if branch is None:
             raise style_ledger.LedgerError(f"{doc}: missing Branch point")
-        rows = text.split("## Units", 1)[-1].split("\n## ", 1)[0]
-        declared = tuple(match[1].strip(" `") for match in re.finditer(r"^\|\s*([^|]+)\|", rows, re.MULTILINE)
-                         if not isinstance(rules.style_family(match[1].strip(" `")), rules.NotStyleUnit))
+        declared = tuple(unit for unit in (unit_names.unit_id(row.name) for row in unit_lookup.doc_units(doc, staff.snapshot()))
+                         if not isinstance(rules.style_family(unit), rules.NotStyleUnit))
         return StyleProduction(slug, branch[1].strip().removeprefix("refs/heads/"), declared or units)
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()
     branch_point = next((branch for branch in branches if not branch.startswith("style/")), tip[:7])
@@ -164,9 +165,9 @@ def workspace(ledger: style_ledger.Ledger, tip: str) -> tuple[rules.WorkspaceMem
     return rules.workspace_members(manifests)
 
 
-def ticket_line(ticket: style_ledger.TicketRecord) -> str:
+def ticket_line(ticket: style_ledger.TicketRecord, unit_name: str) -> str:
     at = datetime.fromisoformat(ticket["created_at"]).astimezone(user_zone())
-    line = f"{ticket['id']} · {ticket['state']} · {ticket['unit']} · {ticket['crate']} · opened {at:%a %H:%M %Z}"
+    line = f"{ticket['id']} · {ticket['state']} · {unit_name} · {ticket['crate']} · opened {at:%a %H:%M %Z}"
     return "\n".join([line, *(style_ledger.widened_line(widened) for widened in ticket["widened"]),
                       *(style_ledger.yielded_line(yielded) for yielded in ticket["yielded"]),
                       *(style_ledger.removed_line(removed) for removed in ticket["removed"])])
@@ -228,14 +229,22 @@ def prepare_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "")
         stem = PurePosixPath(row.rule_id).stem
         lines.append(table_row(row.rule_id if stems[stem] > 1 else stem, row, shown_counts[row.rule_id]))
     if selected_rule or crate:
-        tickets = sorted((ticket for unit in style.units for ticket in ledger.ticket_open(unit)
+        tickets = sorted((ticket for ticket in ledger.open_tickets()
                           if (not selected_rule or selected_rule in {value.removesuffix("#uncovered")
                                                                    for value in (ticket["rule"], *ticket["rules"])})
                           and (not crate or ticket["crate"] == crate)), key=lambda ticket: (ticket["created_at"], ticket["id"]))
+        descriptions: list[str] = []
+        for ticket in tickets:
+            try:
+                owner = ledger.unit_name(ticket["unit"])
+            except style_ledger.LedgerError as error:
+                print(f"anomaly: ticket {ticket['id']}: " + " ".join(str(error).splitlines()))
+                owner = ticket["unit"]
+            descriptions.append(ticket_line(ticket, owner))
         if selected_rule:
-            lines.extend(["", "Open tickets:", *(ticket_line(ticket) for ticket in tickets)] if tickets else ["", "Open tickets: none"])
+            lines.extend(["", "Open tickets:", *descriptions] if descriptions else ["", "Open tickets: none"])
         else:
-            lines.extend(["", "Oldest open ticket: " + (ticket_line(tickets[0]) if tickets else "none")])
+            lines.extend(["", "Oldest open ticket: " + (descriptions[0] if descriptions else "none")])
     gained = lost = lost_to_new_files = 0
     current_proposals = {str(finding.state.proposal) for finding in ledger.held_findings(style_ledger.HeldFindingsInState("filed"))
                          if isinstance(finding.state, style_ledger.Filed)}

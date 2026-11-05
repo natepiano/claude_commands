@@ -23,55 +23,9 @@ from types import FrameType
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-
-from targets import (
-    ANY_ELIGIBLE_TARGET,
-    AwsStatusRow,
-    read_aws_status as read_aws_status,
-    ConfigError,
-    EligibleTarget,
-    ExcludedTarget,
-    ExpiresAt,
-    Free,
-    Held,
-    HolderSession,
-    IdleSince,
-    LocalTarget,
-    LocalRequired,
-    ReleaseEstimated,
-    Running,
-    RunningJob,
-    Routing,
-    SshTarget,
-    StateUnreadable,
-    TargetState,
-    Unreachable,
-    read_targets,
-    target_state,
-    target_eligibility,
-)
-from target_config import is_aws_target
-import offload
-import mac_test
-import conf
-from atomic_file import write_text_atomic
-import build_hold
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import override_guard
-from user_zone import user_zone
-if TYPE_CHECKING:
-    from ..message import roster
-    from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
-else:
-    from scripts.message import roster
-    from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
-
-
-
-class ActiveWaitProcess(TypedDict):
-    call_id: str
-    pid: int
-    proc_start: str
+import target_config
 
 
 class CliArguments(argparse.Namespace):
@@ -95,12 +49,122 @@ class CliArguments(argparse.Namespace):
         self.recover_only: bool = False
 
 
+def positive_pid(value: str) -> int:
+    pid = int(value)
+    if pid <= 0:
+        raise argparse.ArgumentTypeError("must be a positive PID")
+    return pid
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    commands = root.add_subparsers(dest="command", required=True)
+    platform = commands.add_parser("platform")
+    _ = platform.add_argument("--target", required=True)
+    reserve = commands.add_parser("reserve")
+    _ = reserve.add_argument("--repo-root", required=True)
+    _ = reserve.add_argument("--package", default="")
+    _ = reserve.add_argument("--kind", required=True)
+    _ = reserve.add_argument("--pid", type=positive_pid, required=True)
+    _ = reserve.add_argument("--reservation-file", required=True)
+    _ = reserve.add_argument("--target", default="")
+    _ = reserve.add_argument("--recover-only", action="store_true")
+    release = commands.add_parser("release-wait")
+    _ = release.add_argument("--pid", type=positive_pid, required=True)
+    status = commands.add_parser("status")
+    _ = status.add_argument("--probe", action="store_true")
+    eligible = commands.add_parser("eligible")
+    _ = eligible.add_argument("--repo-root", required=True)
+    _ = eligible.add_argument("--package", default="")
+    _ = eligible.add_argument("--kind", choices=("check", "lint", "doc", "test", "build", "example", "final"), default="")
+    _ = eligible.add_argument("--local", dest="local_reason", default="")
+    _ = eligible.add_argument("--target", default="")
+    register = commands.add_parser("register-local")
+    _ = register.add_argument("--call-id", required=True)
+    _ = register.add_argument("--pid", type=positive_pid, required=True)
+    waiter = commands.add_parser("wait-local")
+    _ = waiter.add_argument("--call-id", required=True)
+    _ = waiter.add_argument("--pid", type=positive_pid, default=0)
+    _ = waiter.add_argument("--leave-hook", default="")
+    _ = waiter.add_argument("--caller", default="")
+    check = commands.add_parser("check-local")
+    _ = check.add_argument("--caller", default="")
+    interrupt = commands.add_parser("interrupt-local")
+    _ = interrupt.add_argument("--call-id", required=True)
+    _ = interrupt.add_argument("--signal", dest="signal_name", choices=("INT", "TERM"), default="TERM")
+    return root
+
+
+def command_platform(target: str) -> int:
+    print(target_config.configured_ssh_target(target).platform)
+    return 0
+
+
+# A platform query needs configuration before any coordination imports.
+if __name__ == "__main__" and sys.argv[1:2] == ["platform"]:
+    override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
+    platform_arguments = parser().parse_args(namespace=CliArguments())
+    raise SystemExit(command_platform(platform_arguments.target))
+
+
+from targets import (
+    ANY_ELIGIBLE_TARGET,
+    AwsStatusRow,
+    RemovalPending,
+    read_aws_status as read_aws_status,
+    ConfigError,
+    EligibleTarget,
+    ExcludedTarget,
+    ExpiresAt,
+    Free,
+    Held,
+    HolderSession,
+    IdleSince,
+    LocalTarget,
+    LocalRequired,
+    ReleaseEstimated,
+    Running,
+    RunningJob,
+    Routing,
+    SshTarget,
+    StateUnreadable,
+    TargetState,
+    Unreachable,
+    read_targets,
+    target_state,
+    target_eligibility,
+)
+import offload
+import mac_test
+import conf
+from atomic_file import write_text_atomic
+import build_hold
+from user_zone import user_zone
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+    from ..direct.step_record import Pinned, ROUTED, TargetSelection
+    from ..buildlog import mac_idle_alert
+    from ..message import roster
+    from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
+else:
+    from scripts.lib import process_start as process_identity
+    from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
+    from scripts.buildlog import mac_idle_alert
+    from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
+
+
+
+class ActiveWaitProcess(TypedDict):
+    call_id: str
+    pid: int
+    proc_start: str
+
+
 def local_time(instant: datetime) -> str:
     return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def display_field(value: str) -> str:
-    return " ".join(value.split())
+display_field = mac_idle_alert.display_field
 
 
 def unit_label_suffix(state: RunningJob | Held, labels: Mapping[RunningJob | Held, roster.UnitLabels]) -> str:
@@ -146,7 +210,7 @@ def format_state(name: str, state: TargetState,
 
 
 def probe_target(target: SshTarget) -> TargetState:
-    if is_aws_target(target):
+    if target_config.is_aws_target(target):
         return target_state(target)
     config = offload.read_config(target.settings)
     result = offload.probe_reachability(offload.ProcessController(), config)
@@ -164,6 +228,9 @@ def format_aws_status(row: AwsStatusRow) -> str:
     state = f'starting since {at(row.starting_at)}' if row.state == 'starting' else row.state
     lines = [f'{row.target}: {state}; evidence {at(row.evidence_at)}; month {monthly} / {cap}',
              f'  spending {row.spending}; decision {at(row.decision_at)}; {display_field(row.reason)}']
+    if isinstance(row.removal, RemovalPending):
+        lines.append('  down incomplete: ' + ', '.join(row.removal.resources)
+                     + f'; storage ${row.removal.storage_usd_per_day:.2f}/day; run deploy.py down --approve-destroy')
     for slots in row.slots:
         lines.append(f'  {slots.repository}: {slots.occupied}/{slots.capacity} slots; '
                      + f'{slots.active} active, {slots.retained} retained pending cleanup')
@@ -187,6 +254,8 @@ def format_aws_status(row: AwsStatusRow) -> str:
 
 
 def command_status(probe: bool = False) -> int:
+    from scripts.message import roster
+
     try:
         targets = read_targets()
     except ConfigError as error:
@@ -210,6 +279,9 @@ def command_status(probe: bool = False) -> int:
     except Exception:
         identities = {}
     labels = {state: identities[session_id] for state, session_id in holders.items() if session_id in identities}
+    alert = mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone())
+    if alert is not None:
+        print(f"\033[1;31m{alert}\033[0m" if sys.stdout.isatty() else alert)
     for name, state in states:
         print(format_state(name, state, labels))
     return 0
@@ -249,6 +321,14 @@ class NatedevOnly:
     reason: str
 
 
+def target_can_retry(result: EligibleTarget | ExcludedTarget) -> bool:
+    """Keep temporary refusals available for a later reservation."""
+    return (isinstance(result, EligibleTarget)
+            or result.reason in {"busy", "blocked", "disk", "backoff", "unreachable", "state", "copy", "mac_busy",
+                                 "spending_limit", "spending_unavailable"}
+            or result.reason.startswith("state unreadable: "))
+
+
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing
                            ) -> EligibleTarget | ExcludedTarget:
@@ -265,22 +345,30 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         eligibility = offload.mac_step_eligibility(config, repo_root, package, verb, name)
         if isinstance(eligibility, offload.IneligibleMacStep):
             return ExcludedTarget(target, eligibility.reason)
-        probe = offload.probe_mac(offload.ProcessController(), config, eligibility, name)
+        controller = offload.ProcessController()
+        probe = offload.probe_mac(controller, config, eligibility, name)
         if isinstance(probe, offload.UnresolvedSlotStartup):
             return ExcludedTarget(target, "busy")
         if isinstance(probe, offload.UnavailableProbe):
             return ExcludedTarget(target, "unreachable")
         if isinstance(probe, offload.InterruptedTargetStatus):
             return ExcludedTarget(target, "busy")
-        if probe.free_gib < config.free_floor_gib:
+        with offload.interrupt_handlers(controller):
+            disk = offload.ensure_mac_disk_floor(controller, config, eligibility, probe, name)
+        if isinstance(disk, offload.SweepFailed):
+            print(f"build targets: Mac disk exclusion: {disk.cause}", file=sys.stderr)
+        if not isinstance(disk, offload.MacDiskReady):
             return ExcludedTarget(target, "disk")
+    except offload.OffloadInterrupted as interrupted:
+        raise SystemExit(128 + interrupted.signal_number) from None
     except (OSError, UnicodeError, ValueError) as error:
         return ExcludedTarget(target, f"state unreadable: {error}")
     return EligibleTarget(target)
 
 
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
-                           kind: StepKind, routing: Routing) -> EligibleTarget | ExcludedTarget:
+                           kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED
+                           ) -> EligibleTarget | ExcludedTarget:
     """Read Linux policy and capacity without evaluating a development shell."""
     if target.platform == "macos":
         return mac_target_eligibility(target, repo_root, package, kind, routing)
@@ -296,6 +384,12 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     if isinstance(policy, offload.IneligibleMacStep):
         return ExcludedTarget(target, policy.reason)
     paths = mac_test.state_paths(target.name)
+    if isinstance(selection, Pinned) and target_config.is_aws_target(target):
+        control = mac_test.read_json_object(paths.directory / "controller.json") or {}
+        if control.get("state") in ("stopped", "starting", "pending", "stopping"):
+            return ExcludedTarget(target, "starting")
+        if control.get("state") == "refused":
+            return ExcludedTarget(target, str(control.get("reason", "controller refused")))
     answer = mac_test.free_now(paths, target.settings, repo_root)
     if answer != "free":
         return ExcludedTarget(target, answer)
@@ -306,7 +400,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
 
 def aws_spending_exclusion(target: SshTarget) -> str:
     """Check AWS spending before reading the execution settings."""
-    if not is_aws_target(target):
+    if not target_config.is_aws_target(target):
         return ""
     if not aws_config.offload_enabled(conf.read(target.settings)):
         return "off"
@@ -325,22 +419,43 @@ def ssh_target_config(target: SshTarget) -> offload.OffloadConfig | ExcludedTarg
             return ExcludedTarget(target, reason)
         return offload.read_config(target.settings)
     except conf.Unusable as error:
-        if not is_aws_target(target):
+        if not target_config.is_aws_target(target):
             raise
         print(f"build targets: {target.name}: spending refused: {error}", file=sys.stderr)
         return ExcludedTarget(target, "spending_unavailable")
 
 
+def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:
+    """Use normal eligibility, but wait for stopped AWS capacity before its reachability check."""
+    try:
+        target = target_config.configured_ssh_target(args.target)
+        if args.kind not in ("test", "check", "doc"):
+            raise ValueError("--target supports test, check, and doc only")
+        kind = cast(StepKind, args.kind)
+        result = ssh_target_eligibility(target, Path(args.repo_root), args.package, kind, routing,
+                                        selection=Pinned(target.name))
+        if isinstance(result, ExcludedTarget) and result.reason not in ("busy", "blocked", "starting"):
+            raise ValueError(f"target {target.name} refused: {result.reason}")
+        print("ssh_allowed")
+        print_eligible_target(result)
+        return 0
+    except (ConfigError, OSError, UnicodeError, ValueError) as error:
+        print(f"build targets: {error}", file=sys.stderr)
+        return 2
+
+
 def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> bool:
     """Find the same process's reservation, including retained cleanup ownership."""
-    start = mac_test.process_start_time(pid)
-    if start is None:
+    start = process_identity.process_start(pid)
+    if not isinstance(start, process_identity.Started):
         return False
     scope = mac_test.target_claim_scope(paths, repo_root)
     with mac_test.locked(paths.lock):
+        block = mac_test.blocking_claim_block(paths)
         return any(mac_test.scopes_overlap(claim.scope, scope)
-                   and claim.record["pid"] == pid and claim.record["proc_start"] == start
+                   and claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                    and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+                   and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)
                    for claim in mac_test.read_claims(paths))
 
 
@@ -350,15 +465,15 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
     scope = mac_test.target_claim_scope(paths, args.repo_root)
     if not isinstance(scope, mac_test.RepositoryScope):
         return
-    start = mac_test.process_start_time(args.pid)
-    if start is None:
+    start = process_identity.process_start(args.pid)
+    if not isinstance(start, process_identity.Started):
         return
     with mac_test.locked(paths.lock):
         claims = tuple(claim for claim in mac_test.read_claims(paths)
                        if mac_test.scopes_overlap(claim.scope, scope) and "remote_host" in claim.record
                        and (mac_test.run_is_kept(claim.record)
                             or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
-                                and claim.record["proc_start"] == start)))
+                                and claim.record["proc_start"] == start.start)))
     if not claims:
         return
     try:
@@ -395,7 +510,7 @@ def command_reserve(args: CliArguments) -> int:
     if destination.exists():
         name, separator, settings = destination.read_text().strip().partition("\t")
         if separator:
-            target = offload.configured_ssh_target(name)
+            target = target_config.configured_ssh_target(name)
             if settings != str(target.settings):
                 destination.unlink()
                 return 1
@@ -459,8 +574,8 @@ def command_reserve(args: CliArguments) -> int:
 
 def command_release_wait(pid: int) -> int:
     """Release only process-bound reservations; remote claims retain ownership."""
-    start = mac_test.process_start_time(pid)
-    if start is None:
+    start = process_identity.process_start(pid)
+    if not isinstance(start, process_identity.Started):
         return 0
     for target in read_targets():
         if not isinstance(target, SshTarget):
@@ -470,7 +585,7 @@ def command_release_wait(pid: int) -> int:
             continue
         with mac_test.locked(paths.lock):
             for claim in mac_test.read_claims(paths):
-                if (claim.record["pid"] == pid and claim.record["proc_start"] == start
+                if (claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                         and "remote_host" not in claim.record):
                     claim.path.unlink(missing_ok=True)
     return 0
@@ -493,16 +608,22 @@ def command_kind_eligible(repo_root: Path, package: str, kind: StepKind, routing
         decision = NatedevOnly("full gate runs on natedev")
     elif isinstance(routing, LocalRequired):
         decision = NatedevOnly(routing.reason)
-    for result in eligibility:
-        if not isinstance(result.target, SshTarget):
-            continue
-        if isinstance(result, EligibleTarget):
+    retry_allowed = kind in ("test", "check", "lint", "doc") and not isinstance(routing, LocalRequired)
+    remote_results = tuple(result for result in eligibility if isinstance(result.target, SshTarget))
+    disk_declined = any(isinstance(result, ExcludedTarget) and result.reason == "disk" for result in remote_results)
+    linux_allowed = False
+    if retry_allowed:
+        if disk_declined:
+            # Keep disk evidence independent of target order and retry permission.
+            decision = NatedevOnly("disk")
+        elif any(target_can_retry(result) for result in remote_results):
             decision = MacAllowed()
-            break
-        decision = NatedevOnly(result.reason)
-    linux_allowed = any(isinstance(result.target, SshTarget) and result.target.platform == "linux"
-                        and (isinstance(result, EligibleTarget) or result.reason in ("busy", "blocked"))
-                        for result in eligibility)
+            linux_allowed = any(isinstance(result.target, SshTarget) and result.target.platform == "linux"
+                                and target_can_retry(result) for result in remote_results)
+        else:
+            reasons = sorted(result.reason for result in remote_results if isinstance(result, ExcludedTarget))
+            if reasons:
+                decision = NatedevOnly(reasons[0])
     print("ssh_allowed" if linux_allowed else "mac_allowed" if isinstance(decision, MacAllowed)
           else f"natedev_only {display_field(decision.reason)}")
     for result in eligibility:
@@ -769,63 +890,19 @@ def command_check_local(caller: str = "") -> int:
         return 12
 
 
-def positive_pid(value: str) -> int:
-    pid = int(value)
-    if pid <= 0:
-        raise argparse.ArgumentTypeError("must be a positive PID")
-    return pid
-
-
-def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description=__doc__)
-    commands = root.add_subparsers(dest="command", required=True)
-    platform = commands.add_parser("platform")
-    _ = platform.add_argument("--target", required=True)
-    reserve = commands.add_parser("reserve")
-    _ = reserve.add_argument("--repo-root", required=True)
-    _ = reserve.add_argument("--package", default="")
-    _ = reserve.add_argument("--kind", required=True)
-    _ = reserve.add_argument("--pid", type=positive_pid, required=True)
-    _ = reserve.add_argument("--reservation-file", required=True)
-    _ = reserve.add_argument("--target", default="")
-    _ = reserve.add_argument("--recover-only", action="store_true")
-    release = commands.add_parser("release-wait")
-    _ = release.add_argument("--pid", type=positive_pid, required=True)
-    status = commands.add_parser("status")
-    _ = status.add_argument("--probe", action="store_true")
-    eligible = commands.add_parser("eligible")
-    _ = eligible.add_argument("--repo-root", required=True)
-    _ = eligible.add_argument("--package", default="")
-    _ = eligible.add_argument("--kind", choices=("check", "lint", "doc", "test", "build", "example", "final"), default="")
-    _ = eligible.add_argument("--local", dest="local_reason", default="")
-    register = commands.add_parser("register-local")
-    _ = register.add_argument("--call-id", required=True)
-    _ = register.add_argument("--pid", type=positive_pid, required=True)
-    waiter = commands.add_parser("wait-local")
-    _ = waiter.add_argument("--call-id", required=True)
-    _ = waiter.add_argument("--pid", type=positive_pid, default=0)
-    _ = waiter.add_argument("--leave-hook", default="")
-    _ = waiter.add_argument("--caller", default="")
-    check = commands.add_parser("check-local")
-    _ = check.add_argument("--caller", default="")
-    interrupt = commands.add_parser("interrupt-local")
-    _ = interrupt.add_argument("--call-id", required=True)
-    _ = interrupt.add_argument("--signal", dest="signal_name", choices=("INT", "TERM"), default="TERM")
-    return root
-
-
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
     args = parser().parse_args(namespace=CliArguments())
     if args.command == "platform":
-        print(offload.configured_ssh_target(args.target).platform)
-        return 0
+        return command_platform(args.target)
     if args.command == "reserve":
         return command_reserve(args)
     if args.command == "release-wait":
         return command_release_wait(args.pid)
     if args.command == "eligible":
         routing = LocalRequired(args.local_reason) if args.local_reason else ANY_ELIGIBLE_TARGET
+        if args.target:
+            return command_pinned_eligible(args, routing)
         if args.kind:
             return command_kind_eligible(Path(args.repo_root).resolve(), args.package, cast(StepKind, args.kind), routing)
         return command_eligible(Path(args.repo_root).resolve(), args.package, routing)

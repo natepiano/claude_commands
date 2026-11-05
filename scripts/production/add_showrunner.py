@@ -32,13 +32,13 @@ from typing import TYPE_CHECKING, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.shutdown.remote import local_machine
 from scripts.production import completion_receipt, staff
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
 
 from scripts.production import showrunners
 import showrunner_tree
-from production_units import Production, read_production
-from production_units import Refusal
+from scripts.production.production_doc import Production, Refusal, read_production
 import herdr
 
 if TYPE_CHECKING:
@@ -263,14 +263,24 @@ def _main(argv: list[str]) -> int:
         selected = account_for_launch(child, resume, cast(str, args.account), cast(str, args.config_dir))
         identity = ShowrunnerLaunch(resume or "", selected.dir, datetime.now(UTC))
         place: herdr.HerdrPlace | herdr.NotInHerdr = herdr.NotInHerdr()
-        receipt = showrunners.SHOWRUNNER_STATE_DIR / child.slug / "add_showrunner.json"
-        saved = completion_receipt.read_launch_receipt(receipt, staff.initial_snapshot())
+        record = staff.initial_snapshot()
+        owner = record.by_doc(local_machine(), child.doc)
+        saved: completion_receipt.OwnedReceipt | completion_receipt.UnpublishedReceipt | completion_receipt.NoReceipt = completion_receipt.NoReceipt()
+        if owner is not None:
+            receipt = showrunners.SHOWRUNNER_STATE_DIR / owner.id / "add_showrunner.json"
+            saved = completion_receipt.read_launch_receipt(receipt, record)
+        else:
+            for receipt in sorted(showrunners.SHOWRUNNER_STATE_DIR.glob("*/add_showrunner.json")):
+                candidate = completion_receipt.read_launch_receipt(receipt, record)
+                if isinstance(candidate, completion_receipt.UnpublishedReceipt) and candidate.fields.get("doc") == str(child.doc):
+                    if not isinstance(saved, completion_receipt.NoReceipt):
+                        raise Refusal(f"{child.doc}: several unpublished launches")
+                    saved = candidate
         if isinstance(saved, (completion_receipt.OwnedReceipt, completion_receipt.UnpublishedReceipt)) and not cast(bool, args.check):
             fields = saved.fields
             if ((isinstance(saved, completion_receipt.UnpublishedReceipt) or saved.owner.kind == "showrunner")
                     and fields.get("doc") == str(child.doc)
-                    and fields.get("caller") == caller and fields.get("resume") == resume
-                    and fields.get("cwd") == str(where)):
+                    and fields.get("caller") == caller and fields.get("resume") == resume):
                 identity = ShowrunnerLaunch.from_receipt(fields)
                 if identity.config_dir != selected.dir:
                     raise Refusal(f"{child.slug}: unfinished launch belongs to {identity.config_dir}")
@@ -310,7 +320,7 @@ def _main(argv: list[str]) -> int:
                     raise Refusal(f"{child.slug}: unfinished launch owner changed")
                 existing = staff.update_current_session(retained.current_session, native)
         owner = existing.id if existing is not None else native
-        completion_receipt.write_receipt(receipt, owner, {"doc": str(child.doc), "caller": caller, "resume": resume, "cwd": str(where),
+        completion_receipt.write_receipt(showrunners.SHOWRUNNER_STATE_DIR / owner / "add_showrunner.json", owner, {"doc": str(child.doc), "caller": caller, "resume": resume,
                                   "session_id": transcript.session_id, "config_dir": str(identity.config_dir),
                                   "started_at": identity.started_at.isoformat()})
         _ = ensure_staff_showrunner(child, caller, runtime_id=native)

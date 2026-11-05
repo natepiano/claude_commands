@@ -13,6 +13,7 @@ import unittest
 from typing import cast, override
 
 from scripts.direct import verify_lint_scope_test_support as support
+from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -58,13 +59,14 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
              "--package", "sample", str(support.VERIFY),
              str(support.SCRIPTS / "lint/invoke.sh"), str(self.config), "--", "test", "sample", *arguments],
             input=json.dumps(metadata), cwd=self.root,
-            env={**self.environment, "VERIFY_COMPUTE_TEST_BUILD": "1",
+            env={**self.environment, "TEST_METADATA": json.dumps(metadata), "VERIFY_COMPUTE_TEST_BUILD": "1",
                  "VERIFY_TEST_BUILD_INPUTS_FILE": str(output), **(extra_environment or {})},
             capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         lines = output.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)
         self.assertRegex(lines[0], r"^[0-9a-f]{64}$")
+        self.assertEqual(lines[2], lines[1])
         return result.stdout.strip(), lines[0], lines[1]
 
     def test_build_input_key_changes_with_features_profile_flags_and_toolchain(self) -> None:
@@ -132,9 +134,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 sys.path.insert(0, {str(support.SCRIPTS / 'lint')!r})
 import memory_admit as gate
+from scripts.lib.cargo_output import CargoOutputRoots
+output_roots = CargoOutputRoots(Path.cwd(), Path(os.environ['BUILDLOG_TEST_TARGET_DIR']),
+    Path(os.environ['BUILDLOG_TEST_BUILD_DIR']))
 fresh = gate.is_fresh_test(Path(os.environ['BUILDLOG_DIR']), gate.store.host_name(),
     os.getcwd(), 'sample', 'filtered', os.environ['BUILDLOG_TEST_BUILD_KEY'],
-    datetime.now(UTC), os.environ['BUILDLOG_TEST_TARGET_DIR'])
+    datetime.now(UTC), output_roots)
 Path('admission.json').write_text(json.dumps({{'fresh': fresh,
     'key': os.environ['BUILDLOG_TEST_BUILD_KEY']}}))
 """, encoding="utf-8")
@@ -148,7 +153,7 @@ Path('admission.json').write_text(json.dumps({{'fresh': fresh,
             r'''CMD=test
 HOLD_WAIT_DIR="$PWD/tmp"
 tree_key() {
-  VERIFY_TEST_BUILD_INPUTS_FILE="$HOLD_WAIT_DIR/test-build-inputs" "$PY" "$TREE_WATCH_SCRIPT" --key --package sample "$VERIFY" "$HOME/.claude/scripts/lint/invoke.sh" "$LINT_CONFIG_FILE" -- test sample --filter native_rate <<< "$TEST_METADATA"
+  VERIFY_TEST_BUILD_INPUTS_FILE="$HOLD_WAIT_DIR/test-build-inputs" "$PY" "$TREE_WATCH_SCRIPT" --key "$@" --package sample "$VERIFY" "$HOME/.claude/scripts/lint/invoke.sh" "$LINT_CONFIG_FILE" -- test sample --filter native_rate <<< "$TEST_METADATA"
 }
 build_hold_wait_local() {
   printf "// edited during hold\n" >> src/lib.rs
@@ -158,7 +163,7 @@ build_hold_applies() { return 0; }
 build_hold_nothing_held() { test -f "$PWD/hold-released"; }
 step_state() { :; }
 ''',
-            hold_wrapper, key_setup,
+            shell_function(source, "set_verdict_keys"), hold_wrapper, key_setup,
             # Seed a finished build of A before the hold changes it to B.
             r'''printf "%s\n" "$BUILDLOG_TEST_BUILD_KEY" > old-build-key
 buildlog_begin cargo nextest run -E "package(sample) & test(native_rate)"

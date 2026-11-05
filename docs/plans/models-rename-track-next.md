@@ -10,12 +10,16 @@
 
 **Acceptance:** the add_unit test suites pass, and a test shows that an unnamed command raises.
 
-## The fill reports problems and never blocks on them
+## The fill reports anomalies and healthy changes
 
 **Status:** next (sdlc, 2026-11-02; user rule of 2026-11-02: tools report anomalies and never block on them).
 
-**Problem:** `staff_sources.py fill` exits 1 and prints no `changed` or `unchanged` line when any unit has a recovery error. Healthy units get no report.
+**Problem:** `_fill_live` suppresses its result line and returns 1 when recovery anomalies exist, also after healthy writes.
 
-**Change:** the fill prints each problem as one line, prints `changed` or `unchanged` for the healthy units, and exits 0 on a rerun.
+**Change:** print each recovery anomaly on one line. Continue with the healthy units. Always print the aggregate `changed` or `unchanged` line. Return 0 for reported recovery anomalies.
 
-**Acceptance:** with one unit in error, a fill prints that unit's problem line and `changed`; a rerun prints the same problem line and `unchanged`, and exits 0.
+**Acceptance:** one malformed unit and one repairable unit give the anomaly line, `changed` and exit 0. The rerun gives the anomaly line, `unchanged` and exit 0. The malformed unit stays unchanged. Errors for unreadable staff storage and the spec's safety refusals stay.
+
+**Files:** `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py`.
+
+**Constraint:** keep the incomplete-observation output and exit status of `staff.py show --json --live`.

@@ -29,11 +29,8 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
                 else:
                     self.assertNotIn("--effort", arguments)
                 self.assertEqual(
-                    (session_dir / "impl_bg_id_impl").read_text(encoding="utf-8"),
-                    "abc12345\n",
-                )
-                self.assertIn(
-                    "abc12345\t", (session_dir / "workers").read_text(encoding="utf-8")
+                    self.recorded_worker(session_dir).current_session,
+                    json.loads(next((self.root / "sessions").glob("*.json")).read_text())["sessionId"],
                 )
 
 

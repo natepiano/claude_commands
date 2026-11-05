@@ -302,8 +302,6 @@ def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | Sess
             observed = process_liveness(registered["pid"], registered.get("procStart", ""))
             if not isinstance(observed, SessionNotLive):
                 yield observed
-    if registry.unreadable:
-        yield SessionLivenessUnknown("unreadable session registry record: " + registry.unreadable[0].name)
 
 
 def session_liveness(session_id: str) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
@@ -376,6 +374,20 @@ def named(name: str, records: list[SessionRecord]) -> SessionRecord | None:
     bare = name.removesuffix("-unit")
     return next((found for candidate in dict.fromkeys((name, bare, f"{bare}-unit"))
                  if (found := addressed(candidate, records)) is not None), None)
+
+
+def config_dirs() -> list[Path]:
+    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        directories.add(Path(override).expanduser())
+    return sorted(directories)
+
+
+def transcript_locations(session_id: str) -> list[Path]:
+    """Return distinct transcript paths across the Claude accounts."""
+    return sorted({path.resolve() for directory in config_dirs()
+                   for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
 
 
 def latest_transcript(session_id: str, projects: Path) -> Path | None:

@@ -33,11 +33,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import change_review
 import scratch  # on the path once change_review has put scripts/lib there
 from scripts.production.showrunners import canonical_slug
-from production_units import Production, read_production
-from production_units import Refusal, cell_value, production_field, unit_table
+from scripts.production.production_doc import Production, Refusal, cell_value, production_field, read_production
 
 from scripts.direct import progress_history  # noqa: E402
-from scripts.production import production_doc, staff, staff_sources, unit_lookup  # noqa: E402
+from scripts.production import merge_gate, production_doc, session_staff, staff, unit_config, unit_lookup, unit_names  # noqa: E402
+from scripts.shutdown import remote  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
@@ -188,17 +188,14 @@ class Unit(NamedTuple):
     owns: tuple[str, ...]
 
 
-class UnitRow(NamedTuple):
+class UnitUnavailable(NamedTuple):
     name: str
-    plan: Path
-    branch: str
-    owns: tuple[str, ...]
-    cells: dict[str, str]
+    reason: str
 
 
 class MergeRequest(NamedTuple):
     production: Production
-    unit: Unit | UnitRow
+    unit: Unit
     phase: str
     commit: str
     also: tuple[str, ...]
@@ -208,7 +205,7 @@ class MergeRequest(NamedTuple):
     merge_tests: tuple[tuple[str, ...], ...]
     flakes: frozenset[str]
     flaky_tests: frozenset[str]
-    units: tuple[Unit | UnitRow, ...]
+    units: tuple[Unit | UnitUnavailable, ...]
     lines: tuple[str, ...]
     scratch: Path
     trailer: tuple[str, ...]
@@ -293,32 +290,26 @@ def listed_names(lines: list[str], field: str) -> frozenset[str]:
     return frozenset(name.strip() for name in names if name.strip())
 
 
-def parse_units(lines: list[str]) -> tuple[UnitRow, ...]:
-    result: list[UnitRow] = []
-    for cells in unit_table(lines):
-        if not all(heading in cells for heading in ("Unit", "Branch", "Owns")):
-            continue
-        plan = Path(cell_value(cells.get("Plan", "")).split(" ", 1)[0])
-        owns_cell = cells["Owns"]
-        quoted = cast(list[str], re.findall(r"`([^`]+)`", owns_cell))
-        plain = owns_cell.split(" — ", 1)[0]
-        if quoted:
-            owned: list[str] = []
-            sibling_directory = ""
-            for path in quoted:
-                owned.append(path)
-                if "/" in path:
-                    sibling_directory = path.rstrip("/") if path.endswith("/") else str(Path(path).parent)
-                elif sibling_directory:
-                    # A bare name is a root file (`settings.json`) or a sibling of the path before it.
-                    owned.append((Path(sibling_directory) / path).as_posix())
-            owns = tuple(owned)
-        else:
-            owns = tuple(part.strip() for part in plain.split(",") if part.strip())
-        name = cell_value(cells["Unit"])
-        branch = cell_value(cells["Branch"])
-        result.append(UnitRow(name, plan, branch, owns, cells))
-    return tuple(result)
+def unit_from_row(row: staff.StaffRow, resolver: session_staff.RowResolver) -> Unit | UnitUnavailable:
+    """A local unit from its staff row, its branch and its `.unit.toml`."""
+    name = unit_names.unit_id(row.name)
+    location = row.worktree
+    if not isinstance(location, staff.PresentWorktree) or location.machine != remote.local_machine():
+        return UnitUnavailable(name, "the worktree is not on this machine")
+    branch = resolver.unit_branch(row)
+    if not isinstance(branch, session_staff.Branch):
+        return UnitUnavailable(name, branch.reason)
+    try:
+        config = resolver.unit_config(row)
+    except unit_config.ConfigRefused as error:
+        return UnitUnavailable(name, str(error))
+    if isinstance(config, session_staff.NoUnitConfig):
+        return UnitUnavailable(name, "no unit configuration")
+    if not isinstance(config, unit_config.UnitConfig):
+        return UnitUnavailable(name, config.reason)
+    plan = (config.plan.path if isinstance(config.plan, unit_config.PlanFile)
+            else Path("standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"))
+    return Unit(name, plan, location.path, branch.name, config.responsibilities)
 
 
 def parse_merge_tests(lines: list[str], checkout: Path) -> tuple[tuple[str, ...], ...]:
@@ -373,10 +364,15 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     production = read_production(Path(cast(str, args.production)))
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     name = cast(str, args.unit)
-    units = parse_units(lines)
+    record = staff.snapshot()
+    resolver = session_staff.RowResolver(record)
+    units = tuple(unit_from_row(row, resolver) for row in unit_lookup.doc_units(production.doc, record)
+                  if not isinstance(row.worktree, staff.RemovedWorktree))
     unit = next((candidate for candidate in units if candidate.name == name), None)
     if unit is None:
-        raise Refusal(f"unit {name} not in production doc")
+        raise Refusal(f"unit {name} is not a staff unit of this production")
+    if isinstance(unit, UnitUnavailable):
+        raise Refusal(f"unit {name}: {unit.reason}")
     push_field = production_doc.optional_field(lines, "Push")
     push_raw = cell_value(push_field.text) if isinstance(push_field, production_doc.FieldPresent) else "validate_and_push"
     if push_raw not in ("git", "validate_and_push"):
@@ -469,10 +465,10 @@ def code_merged(request: MergeRequest) -> bool:
 
 
 def on_origin(request: MergeRequest) -> str | None:
-    """Find an origin branch holding the checkpoint, trying the Units row first."""
+    """Find an origin branch holding the checkpoint, trying the unit branch first."""
     checkout = request.production.checkout
     fetched = git(checkout, "fetch", "origin", request.unit.branch)
-    # A missing Units-row branch is not a failure: another head may hold this phase.
+    # A missing unit branch is not a failure: another head may hold this phase.
     missing = fetched.returncode and git(checkout, "ls-remote", "--exit-code", "origin",
                                         f"refs/heads/{request.unit.branch}").returncode == 2
     if not missing:
@@ -653,7 +649,7 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
         permitted = (*request.unit.owns, *request.also, *hubs)
         unexpected = [path for path in paths if not allowed(path, permitted)]
         if unexpected:
-            raise Stop("scope", "held", f"outside Owns: {', '.join(unexpected)}",
+            raise Stop("scope", "held", f"outside responsibilities: {', '.join(unexpected)}",
                        f"explain why these paths changed: {', '.join(unexpected)}")
     report("scope", "ok", f"{len(paths)} changed paths are allowed"
            + (f"; {imported} came from origin merge branches" if imported else ""))
@@ -687,36 +683,21 @@ def conflicts(request: MergeRequest) -> None:
     report("conflicts", "ok", "merge tree is clean")
 
 
-def unit_worktree(production: Production, unit: Unit | UnitRow, record: staff.StaffSnapshot) -> Path:
-    if isinstance(unit, Unit):
-        return unit.worktree
-    member = staff_sources.member(staff_sources.UnitMember(production.slug, unit.name), record)
-    return unit_lookup.plan_worktree(unit.cells, member)
-
-
 def other_units(request: MergeRequest, paths: tuple[str, ...]) -> None:
     if len(request.units) == 1:
         report("other units", "ok", "no other units")
         return
-    try:
-        record = staff.snapshot()
-    except staff.StaffUnreadable as error:
-        record = error
     for unit in request.units:
         if unit.name == request.unit.name:
+            continue
+        if isinstance(unit, UnitUnavailable):
+            report("other units", "unavailable", f"{unit.name}: {unit.reason}")
             continue
         diff = git(request.production.checkout, "diff", "--name-only",
                    f"{request.production.merge_branch}...{unit.branch}")
         branch_paths: set[str] = set(diff.stdout.splitlines()) if diff.returncode == 0 else set()
-        worktree_paths: set[str] = set()
-        try:
-            if isinstance(record, staff.StaffUnreadable):
-                raise record
-            worktree = unit_worktree(request.production, unit, record)
-            status = git(worktree, "status", "--short")
-            worktree_paths = {line[3:] for line in status.stdout.splitlines() if len(line) >= 4}
-        except (staff.StaffUnreadable, staff.StaffRefused) as error:
-            report("other units", "unavailable", f"{unit.name}: {error}")
+        status = git(unit.worktree, "status", "--short")
+        worktree_paths = {line[3:] for line in status.stdout.splitlines() if len(line) >= 4}
         overlap = sorted(set(paths) & (branch_paths | worktree_paths))
         report("other units", "ok", f"{unit.name}: {', '.join(overlap) if overlap else 'no overlap'}")
 
@@ -786,10 +767,33 @@ def tool(name: str, fallback: Path, override: str) -> str:
     return os.environ.get(override) or shutil.which(name) or str(fallback)
 
 
+class CheckpointTestStep(NamedTuple):
+    label: str
+    command: list[str]
+    folder: Path
+
+
+class CargoPackage(NamedTuple):
+    folder: Path
+    name: str
+
+
+class CargoWorkspace(NamedTuple):
+    pass
+
+
+def read_cargo_package(folder: Path) -> CargoPackage | CargoWorkspace:
+    manifest = tomllib.loads((folder / "Cargo.toml").read_text(encoding="utf-8"))
+    if "package" not in manifest:
+        # A workspace root's manifest names no package, so paths under it have no package tests.
+        return CargoWorkspace()
+    return CargoPackage(folder, cast(str, manifest["package"]["name"]))
+
+
 def test_steps(production: Production, paths: tuple[str, ...],
-               merge_tests: tuple[tuple[str, ...], ...]) -> list[tuple[str, list[str]]]:
+               merge_tests: tuple[tuple[str, ...], ...]) -> list[CheckpointTestStep]:
     checkout = production.checkout
-    packages: set[str] = set()
+    packages: set[CargoPackage] = set()
     examples: set[tuple[str, str]] = set()
     for raw in paths:
         path = checkout / raw
@@ -798,25 +802,31 @@ def test_steps(production: Production, paths: tuple[str, ...],
                 break
             manifest = parent / "Cargo.toml"
             if manifest.exists():
-                # A workspace root's manifest names no package: a path under it, such as docs, has no tests.
-                if "package" in tomllib.loads(manifest.read_text(encoding="utf-8")):
-                    packages.add(parent.name)
+                package = read_cargo_package(parent)
+                if isinstance(package, CargoPackage):
+                    packages.add(package)
                 break
         match = re.search(r"(?:^|/)crates/([^/]+)/examples/([^/.]+)", raw)
         if match:
-            examples.add((match.group(1), match.group(2)))
+            folder = checkout / "crates" / match.group(1)
+            if (folder / "Cargo.toml").exists():
+                package = read_cargo_package(folder)
+                if isinstance(package, CargoPackage):
+                    examples.add((package.name, match.group(2)))
     verify = tool("verify.sh", Path.home() / ".claude/scripts/direct/verify.sh", "MERGE_CHECKPOINT_VERIFY")
     verify_command = [verify] if os.access(verify, os.X_OK) else ["bash", verify]
-    steps = [(f"package {package}", [*verify_command, "test", package]) for package in sorted(packages)]
-    steps.extend((f"example {package}/{name}", [*verify_command, "example", package, name])
+    steps = [CheckpointTestStep(f"package {package.name}", [*verify_command, "test", package.name], package.folder)
+             for package in sorted(packages)]
+    steps.extend(CheckpointTestStep(f"example {package}/{name}", [*verify_command, "example", package, name], checkout)
                  for package, name in sorted(examples))
-    steps.extend((f"merge test {index}", list(command)) for index, command in enumerate(merge_tests, 1))
+    steps.extend(CheckpointTestStep(f"merge test {index}", list(command), checkout)
+                 for index, command in enumerate(merge_tests, 1))
     return steps
 
 
-def run_test_command(command: list[str], checkout: Path) -> subprocess.CompletedProcess[str]:
+def run_test_command(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(command, cwd=checkout, capture_output=True, text=True, check=False)
+        return subprocess.run(command, cwd=folder, capture_output=True, text=True, check=False)
     except OSError as error:
         return subprocess.CompletedProcess(command, 127, "", f"{error}\n")
 
@@ -884,22 +894,23 @@ def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
     """Run checkpoint commands and their retries; the caller owns merge rollback."""
     steps = test_steps(production, paths, merge_tests)
     log.parent.mkdir(parents=True, exist_ok=True)
-    failed: list[tuple[str, list[str], frozenset[str]]] = []
+    failed: list[tuple[CheckpointTestStep, frozenset[str]]] = []
     with log.open("a", encoding="utf-8") as output:
-        for name, command in steps:
-            result = run_test_command(command, production.checkout)
+        for step in steps:
+            result = run_test_command(step.command, step.folder)
             _ = output.write(result.stdout + result.stderr)
-            _ = output.write(f"{name.replace(' ', '_')}_EXIT={result.returncode}\n")
+            _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
-            stop_cancelled_test(name, result, log)
-            if not test_passed(command, result):
-                failed.append((name, command, failed_tests(result.stdout + result.stderr)))
+            stop_cancelled_test(step.label, result, log)
+            if not test_passed(step.command, result):
+                failed.append((step, failed_tests(result.stdout + result.stderr)))
     unresolved: list[str] = []
-    for name, command, tests in failed:
+    for step, tests in failed:
+        name, command, folder = step
         # Only known flaky tests failed: rerun those alone, not the whole command.
         alone = bool(tests) and tests <= flaky_tests
         with log.open("a", encoding="utf-8") as output:
-            result = run_test_command(only_tests(command, tests) if alone else command, production.checkout)
+            result = run_test_command(only_tests(command, tests) if alone else command, folder)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
         stop_cancelled_test(name, result, log)
@@ -918,7 +929,7 @@ def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
         raise Stop("red", "failed", f"{', '.join(unresolved)} failed; log {log}",
                    f"repair {', '.join(unresolved)} and send a new checkpoint; test log: {log}")
     report("red", "ok", "all commands green or known flakes green alone")
-    return ", ".join(name for name, _ in steps) if steps else "no tests"
+    return ", ".join(step.label for step in steps) if steps else "no tests"
 
 
 def test_passed(command: list[str], result: subprocess.CompletedProcess[str]) -> bool:
@@ -1024,6 +1035,9 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
             _ = good(git(checkout, "push", "origin", "main"), "promote")
             return PromotionOriginPushed(tip)
         return PromotionAlreadyAtTip(tip)
+    if conflict := merge_gate.promotion_edit_conflict(checkout, tip):
+        raise Stop("promote", "failed", conflict,
+                   "clear the listed checkout paths and rerun this checkpoint")
     result = git(checkout, "merge", "--ff-only", tip)
     if result.returncode:
         status = git(checkout, "status", "--short").stdout.strip()
@@ -1480,7 +1494,7 @@ def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
     unit_address = ""
     showrunner_address = ""
     try:
-        found = unit_lookup.marked_unit(slug, unit)
+        found = unit_lookup.labeled_session(slug, unit)
         if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
             unit_address = f"session:{found.claude.session_id}"
     except OSError as error:
@@ -1496,8 +1510,7 @@ def run(request: MergeRequest) -> int:
     try:
         checkpoint = git(request.production.checkout, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
         if checkpoint.returncode:
-            checkpoint = git(unit_worktree(request.production, request.unit, staff.snapshot()),
-                             "rev-parse", "--verify", f"{request.commit}^{{commit}}")
+            checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
         if checkpoint.returncode:
             raise Stop("ancestry", "failed", f"commit {request.commit} is absent",
                        "push the checkpoint and send its hash again")
@@ -1538,13 +1551,7 @@ def run(request: MergeRequest) -> int:
         elif isinstance(pushed, NotYetPushed):
             try:
                 if isinstance(request.kind, CodeCheckpoint):
-                    with ExitStack() as wait:
-                        try:
-                            worktree = unit_worktree(request.production, request.unit, staff.snapshot())
-                        except (staff.StaffUnreadable, staff.StaffRefused) as error:
-                            report("wait", "NotRecorded", str(error))
-                        else:
-                            _ = wait.enter_context(merge_gate_wait(worktree, request.phase, request.unit.name, request.commit))
+                    with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit):
                         tests_green = tests(request, paths, merge_head)
                 else:
                     tests_green = tests(request, paths, merge_head)

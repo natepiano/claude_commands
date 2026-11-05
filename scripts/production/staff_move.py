@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -15,30 +15,15 @@ import herdr  # noqa: E402
 
 
 @dataclass(frozen=True)
-class TabMoved:
-    workspace: str
-
-
-@dataclass(frozen=True)
-class TabAlreadyPlaced:
-    workspace: str
-
-
-@dataclass(frozen=True)
-class NoLiveTab:
-    workspace: str
-
-
-@dataclass(frozen=True)
 class UnitMoveResult:
     row: staff.StaffRow
-    membership_changed: bool
-    tab: TabMoved | TabAlreadyPlaced | NoLiveTab
+    changed: bool
+    workspace: str
 
 
 @dataclass(frozen=True)
 class PinnedUnit:
-    """A transfer journal fixed the unit and destination before changing sources."""
+    """The caller selects fixed unit and destination IDs."""
 
     staff_id: staff.StaffId
     parent_staff_id: staff.StaffId
@@ -53,36 +38,8 @@ UnitIdentity = PinnedUnit | LocateUnit
 _LOCATE_UNIT = LocateUnit()
 
 
-def _place_tab(slug: str, unit: str, row: staff.StaffRow, workspace: str,
-               record: staff.StaffSnapshot) -> TabMoved | TabAlreadyPlaced | NoLiveTab:
-    client = herdr.Herdr(herdr.shared_session())
-    found = client.lookup(row.name)
-    if isinstance(found, herdr.NoPane):
-        return NoLiveTab(workspace)
-    if isinstance(found, herdr.SeveralPanes):
-        raise herdr.HerdrFailure(f"{slug}/{unit}: several panes ({found.count}) for label {row.name!r}")
-    panes = [herdr.json_object(item, "herdr pane") for item in herdr.json_items(
-        client.result("pane", "list").get("panes"), "herdr pane list")]
-    current = next((item for item in panes if item.get("pane_id") == found.pane_id), None)
-    if current is None:
-        return NoLiveTab(workspace)
-    spaces = [herdr.json_object(item, "herdr workspace") for item in herdr.json_items(
-        client.result("workspace", "list").get("workspaces"), "herdr workspace list")]
-    if any(space.get("label") == workspace and space.get("workspace_id") == current.get("workspace_id")
-           for space in spaces):
-        # A previous move may have finished just before its tab rename failed.
-        tab = herdr.json_text(current.get("tab_id"), "herdr pane tab id")
-        workspace_id = herdr.json_text(current.get("workspace_id"), "herdr pane workspace id")
-        tabs = [herdr.json_object(item, "herdr tab") for item in herdr.json_items(
-            client.result("tab", "list", "--workspace", workspace_id).get("tabs"), "herdr tab list")]
-        if not any(item.get("tab_id") == tab and item.get("label") == row.name for item in tabs):
-            _ = client.run("tab", "rename", tab, row.name)
-        placed = TabAlreadyPlaced(workspace)
-    else:
-        _ = client.move_pane_to_workspace(found.pane_id, workspace, row.name, record=record)
-        placed = TabMoved(workspace)
-    _ = client.sort_tabs(workspace_names={workspace}, record=record)
-    return placed
+def _place_tab(row: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
+    return herdr.Herdr(herdr.shared_session()).move_row_tabs(row.id, record=record)
 
 
 def move_unit(slug: str, unit: str, new_showrunner: str, *, identity: UnitIdentity = _LOCATE_UNIT) -> UnitMoveResult:
@@ -107,25 +64,20 @@ def move_unit(slug: str, unit: str, new_showrunner: str, *, identity: UnitIdenti
             raise staff.StaffRefused(f"{slug}/{unit}: no matching unit staff row")
         if isinstance(parent, staff_sources.NoSuchMember) or parent.row.kind != "showrunner":
             raise staff.StaffRefused(f"{new_showrunner}: no matching showrunner staff row")
-        row = found.row if found.row.parent == parent.row.id else staff.move(found.row.id, parent.row.id)
+        row = found.row if found.row.parent == staff.ReportsTo(parent.row.id) else staff.move(found.row.id, staff.ReportsTo(parent.row.id))
         try:
-            current = replace(record, rows=tuple(row if member.id == row.id else member for member in record.rows))
-            tab = _place_tab(slug, unit, row, parent.row.name, current)
+            current = staff.StaffSnapshot(tuple(row if member.id == row.id else member for member in record.rows))
+            changed = _place_tab(row, current)
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             raise staff.StaffUnreadable(f"{slug}/{unit}: tab was not moved: {error}") from error
-        return UnitMoveResult(row, found.row.parent != row.parent, tab)
+        return UnitMoveResult(row, found.row.parent != row.parent or changed, parent.row.name)
 
 
 def report(result: UnitMoveResult, *, json_output: bool = False) -> int:
-    """Use the same done/no-live-tab output in the staff and transfer commands."""
-    if isinstance(result.tab, NoLiveTab):
-        message = f"done: {result.row.name}: tab was not moved (no live pane); staff parent is {result.tab.workspace}"
-        print(message, file=sys.stderr if json_output else sys.stdout)
-    elif not json_output and not result.membership_changed and isinstance(result.tab, TabAlreadyPlaced):
-        print(f"unchanged: {result.row.name} under {result.tab.workspace}")
-    elif not json_output:
-        print(f"done: {result.row.name} under {result.tab.workspace}")
-    if json_output:
+    """Report whether the parent or the tab placement changed."""
+    if not json_output:
+        print(f"{'done' if result.changed else 'unchanged'}: {result.row.name} under {result.workspace}")
+    else:
         print(json.dumps(result.row.to_json(), sort_keys=True))
     return 0
 

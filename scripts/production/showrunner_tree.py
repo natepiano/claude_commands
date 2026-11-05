@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff, staff_sources
 from scripts.production import showrunners
+from scripts.production.store_owner import showrunner_id
 
 
 def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
@@ -18,8 +19,8 @@ def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]
     members = staff_sources.showrunner_members(record)
     names = {row.id: row.name for row in staff.active(record, "showrunner")}
     names.update({row.id: slug for slug, row in members.items() if row.id in names})
-    return {names[row.id]: names[row.parent] for row in staff.active(record, "showrunner")
-            if row.parent is not None and row.parent in names}
+    return {names[row.id]: names[row.parent.id] for row in staff.active(record, "showrunner")
+            if isinstance(row.parent, staff.ReportsTo) and row.parent.id in names}
 
 
 def edges(slugs: set[str] | None = None, *, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
@@ -169,16 +170,20 @@ def edges_to_release(slug: str, *, record: staff.StaffSnapshot | None = None) ->
 
 def release_edges(slug: str, released: WrapRelease, *, record: staff.StaffSnapshot | None = None) -> None:
     """Remove captured legacy files unless the record has a subsequent attachment."""
+    record = record if record is not None else staff.snapshot()
     tree = edges(record=record)
     captured = [(child, slug) for child in released.former_children]
     if isinstance(released.former_parent, ReportedTo):
         captured.insert(0, (slug, released.former_parent.parent))
     for child, parent in captured:
+        identity = showrunner_id(child, record=record)
+        row = record.by_id(identity)
+        assert row is not None
         current = tree.get(child, "")
         if not current or current == parent:
-            (showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE).unlink(missing_ok=True)
+            (showrunners.SHOWRUNNER_STATE_DIR / identity / showrunners.PARENT_FILE).unlink(missing_ok=True)
         else:
-            print(f"showrunners: keep {child} -> {current}; captured parent was {parent}", file=sys.stderr)
+            print(f"showrunners: keep {row.name} -> {current}; captured parent was {parent}", file=sys.stderr)
 
 
 def main(action: str, slug: str) -> int:

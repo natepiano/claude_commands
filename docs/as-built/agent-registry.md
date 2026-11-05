@@ -330,7 +330,7 @@ A thin dispatcher over the resolver:
 | `scripts/direct/test_progress_history.py`, `test_findings.py` | `python3 -m unittest scripts.direct.test_progress_history scripts.direct.test_findings` from `~/.claude`. Both drive the real CLIs in a temp session dir with `UNIT_NOW_EPOCH` / `UNIT_HISTORY_DIR` pinning time and storage; `test_progress_history` runs the recorder's `main()` in-process through `recorder_fixture.invoke_recorder` and keeps one subprocess case for the CLI contract. |
 | `scripts/cli_agent/cli_agent.sh` | zshrc-alias dispatcher (`commit_no`, `commit_yes`, `merge`, `code`). `cli_agent_print_status` prints the four `cli.*` rows via `agents_resolve_print`; `cli_agent_run` maps no args → `cli.interactive` REPL and a skill name → `cli.<skill>` (unknown skill errors with the known list), then `exec`s codex on the signed-in workers account home with `agents_codex_args` (the registry tier included), overriding a caller's `CODEX_HOME`, or claude with `-- "/$invocation"`. An unavailable workers account refuses before Codex starts. It has no assignment editor — assignment changes go through `/default_models`. |
 | `scripts/production/add_unit.py` | `production.director`, resolved directly (not through `agent_exec`) because a unit director is a long-lived herdr session: `director_agent` runs `bash -c` sourcing `models_config.sh` and `agents_resolve production.director`, refuses any family but `claude`, and launches it through `herdr.start_agent(kind="claude", agent_arguments=[--model <agent>, [--effort <effort>], --remote-control …])`. `produce.md`'s Resume runs `add_unit.py ... --resume <session-id> --cwd <cwd>`, which resolves the same row and keeps the transcript's last model unless `--model` is given. |
-| `scripts/ask_a_friend/prepare_session.sh` / `launch_friend.sh` / `end_friend.sh` | `ask_a_friend.consultation`, resolved directly (not through `agent_exec`) because the friend is a live peer, not a one-shot: claude → `agent_bg.sh` with `AGENT_BG_DETACH=1` (the one `claude --bg --name <friend>` recipe; answers by `SendMessage`; `friend_id` for `claude stop`), codex → `codex_mesh.py start --resident --service-tier "$AGENT_SERVICE_TIER"` (a thread that outlives its turns; replies print between `=== reply from <friend> (N) ===` / `=== end reply ===`; `end` releases it). Protocol files: `friend_name`, `question.md`, `message_<N>.md`, `answer.txt` (codex), `status` `running\|ended\|error`, `agent.log`, provenance `consult_agent`. One friend carries consultation and implementation, so there is one row per family. |
+| `scripts/ask_a_friend/prepare_session.sh`, `launch_friend.sh`, `worker_fill.py end-friend` | The friend uses `ask_a_friend.consultation`. The launcher starts a Claude friend through `agent_bg.sh` and a Codex friend through `codex_mesh.py start`. The friend keeps its staff identity between turns. The `end-friend` verb stops the worker and its Codex server before recording `ended`. |
 | `commands/unit/direct.md`, `commands/ask_a_friend.md` | Consumer docs: call sites, log/provenance names, and `/default_models` as the switch surface. |
 
 All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK" 2>"$LOG_FILE"`) so an "on error read the log" instruction is true even on the resolution-failure path.
@@ -404,7 +404,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   `find` per wake, and one short Python run about twice an hour while the server
   is in use. The connection count needs `ss` and the run folder needs `/proc`,
   so on the Mac automatic reclamation keeps a server when it cannot establish
-  that the server is unused. Explicit `stop` and `end_friend.sh` can stop it;
+  that the server is unused. Explicit `stop` and `worker_fill.py end-friend` can stop it;
   run end uses `stop --pause` and preserves a live director's servers. The
   watcher is what reaps a server whose run folder no end step covers, such as
   work that went on in a run folder after its run had closed.
@@ -521,3 +521,9 @@ Accepted Codex turns record `turn_model` and `turn_effort` in the roster for dis
 The simplify launch lock owner alone writes its report, status, and summary.
 The `review_status_simplify` file contains one atomic status line: `preparing`, `reviewing`, `reviewed`, or `error`.
 A rejected launch writes its reason to stderr and preserves the shared files.
+
+Named `assign.sh` workers use separate phase artifacts for each worker name.
+The files are `<worker>_status`, `<worker>_summary.txt`, `<worker>_agent.log`, and `<worker>_reply.txt`.
+Review files also include the lens and pass suffix.
+The launcher writes these files only after its claim succeeds.
+The compatibility launchers retain their existing filenames.

@@ -27,7 +27,7 @@ from scripts.production.delivery_state import (
     ValidationRequested as ValidationRequested,
 )
 from scripts.lib import atomic_file, conf, file_lock, urgency
-from scripts.production.production_units import Refusal as Refusal, production_field
+from scripts.production.production_doc import Refusal as Refusal, production_field
 from scripts.production.proposals_folder import owner_docs, slug_of
 from scripts.feature_log import feature_log
 from scripts.review_links import review_link
@@ -314,9 +314,10 @@ def document(content: str) -> bytes:
 body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
 .id,h2{opacity:.7;font-size:14px}.kind{font-weight:600}
 h1{font-size:26px;line-height:1.25}h2{margin:28px 0 6px}p{white-space:pre-wrap}
+ul,ol{margin:8px 0;padding-left:28px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
 section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
-form{margin-top:28px}label,input{display:block}input[type=text]{box-sizing:border-box;width:100%;font:inherit;margin:6px 0 12px}
+form{margin-top:28px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:6px 0 12px;resize:vertical}
 button{font:inherit;margin:0 8px 8px 0;padding:6px 12px}button[aria-pressed=true]{outline:2px solid currentColor}
 </style></head><body><main>''' + content + "</main></body></html>").encode("utf-8")
 
@@ -332,7 +333,7 @@ def answer_notice(page: ReviewPage, body: str, reason: str) -> AnswerNotice:
     return AnswerNotice(row, reason, outcome, fields.get("feedback", [""])[0])
 
 
-def answer_form(page: ReviewPage, notice: AnswerNotice) -> str:
+def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> str:
     """Render an answer without reading rows or queue state."""
     row = notice.row if notice.row in page.rows else page.rows[0]
     row_id = html.escape(row)
@@ -347,20 +348,53 @@ def answer_form(page: ReviewPage, notice: AnswerNotice) -> str:
 <input type="hidden" name="row" value="{row_id}">
 <input type="hidden" name="token" value="{html.escape(page.token)}">
 <label for="feedback-{row_id}">Feedback or question</label>
-<input id="feedback-{row_id}" name="feedback" type="text" value="{html.escape(notice.feedback, quote=True)}">
+<textarea id="feedback-{row_id}" name="feedback" rows="{feedback_rows}">
+{html.escape(notice.feedback)}</textarea>
 <div>{"".join(buttons)}</div></form>'''
 
 
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
-    return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice))
+    feedback_rows = conf.read("review_links").whole("feedback_rows")
+    return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
+
+
+def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
+    """Render review text as escaped text blocks and consecutive list runs."""
+    lines = text.splitlines()
+    if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
+        return f"<{block}>{html.escape(text)}</{block}>"
+    content: list[str] = []
+    current = ""
+    for line in lines:
+        line = line.lstrip()
+        numbered = re.match(r"([0-9]+)\. (.*)", line)
+        tag = "ul" if line.startswith("- ") else "ol" if numbered else block if line else ""
+        if tag != current:
+            if current:
+                content.append(f"</{current}>")
+            if tag:
+                start = (numbered[1].lstrip("0") or "0") if numbered else "1"
+                attribute = f' start="{start}"' if tag == "ol" and start != "1" else ""
+                content.append(f"<{tag}{attribute}>")
+        elif tag == block:
+            content.append("\n")
+        if tag in ("ul", "ol"):
+            item = numbered[2] if numbered else line[2:]
+            content.append(f"<li>{html.escape(item)}</li>")
+        elif tag:
+            content.append(html.escape(line))
+        current = tag
+    if current:
+        content.append(f"</{current}>")
+    return "".join(content)
 
 
 def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str:
     if isinstance(question, NoQuestion):
         return ""
-    content = f'<h2>Question</h2><p>{html.escape(question.text)}</p>'
+    content = '<h2>Question</h2>' + review_text_html(question.text)
     if isinstance(question, AnsweredQuestion):
-        content += f'<h2>Answer</h2><p>{html.escape(question.answer)}</p>'
+        content += '<h2>Answer</h2>' + review_text_html(question.answer)
     else:
         content += '<p>The showrunner will answer this</p>'
     return content
@@ -428,6 +462,7 @@ def list_routing(snapshots: dict[Path, change_review.ReviewListSnapshot]) -> cha
 
 
 def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO_ANSWER_NOTICE) -> bytes:
+    feedback_rows = conf.read("review_links").whole("feedback_rows")
     sections: list[str] = []
     saved = False
     for row in shown_rows(page):
@@ -441,14 +476,14 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         form_notice = notice if notice.row == row["#"] else AnswerNotice(row["#"])
         status_text = answer_status(verdict, slots)
         answer = (f'<p role="status">{html.escape(status_text)}</p>' if status_text and (verdict or not warning) else
-                  "" if isinstance(question, OpenQuestion) else answer_form(page, form_notice))
+                  "" if isinstance(question, OpenQuestion) else answer_form(page, form_notice, feedback_rows))
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         sections.append(f'''<section id="{row_id}">
 {alert}
 <p class="kind">{html.escape(row[change_review.KIND])}</p>
 <div class="id">{row_id} · {html.escape(row.get("Merged", ""))}</div>
 <h1>{html.escape(row["Change"])}</h1>
-<h2>{proof_title}</h2><pre>{html.escape(row[change_review.CHECK])}</pre>
+<h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
 {question_html(question)}{answer}</section>''')
     if notice.reason and not notice.row:
         sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')
@@ -605,16 +640,17 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(values) != 1 for values in fields.values()):
         raise AnswerRefused("expected only row, token, outcome and feedback")
     row_id, token, outcome, feedback = (fields[key][0] for key in ("row", "token", "outcome", "feedback"))
+    feedback = "\n".join(feedback.splitlines())
     if row_id not in page.rows or not secrets.compare_digest(token.encode("utf-8"), page.token.encode("utf-8")):
         raise AnswerRefused("row or page token does not match this page")
-    if (outcome not in ("works", "not works", "validate", "feedback", "question")
-            or feedback.splitlines() not in ([], [feedback])):
-        raise AnswerRefused("choose an answer and use one line of feedback")
+    if outcome not in ("works", "not works", "validate", "feedback", "question"):
+        raise AnswerRefused("choose an answer")
     if outcome in ("feedback", "question") and not feedback.strip():
         raise AnswerRefused("enter a question" if outcome == "question" else "enter feedback")
-    verdict = feedback.strip() if feedback.strip() else outcome
-    if outcome in ("works", "not works") and feedback.strip():
-        verdict = f"{outcome}: {feedback.strip()}"
+    one_line = " ".join(line.strip() for line in feedback.split("\n") if line.strip())
+    verdict = one_line or outcome
+    if outcome in ("works", "not works") and one_line:
+        verdict = f"{outcome}: {one_line}"
     rows = answer_rows(page) if isinstance(page, AssignedReviewPage) else shown_rows(page)
     row = next(row for row in rows if row["#"] == row_id)
     if isinstance(page, AssignedReviewPage):
@@ -633,7 +669,7 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         if row.get("Verdict"):
             raise AnswerRefused("this row already has a saved answer")
         _ = row_production(page, row)
-        intent = status.ask(page, row_id, feedback.strip(), recipients=recipients)
+        intent = status.ask(page, row_id, feedback, recipients=recipients)
         if isinstance(intent, NoDelivery):
             return NoMessageDelivery()
         message = review_message(message_page, row, "the user asks a question",

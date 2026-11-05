@@ -6,8 +6,7 @@ Usage: promote_showrunner.py <unit> --production <child production doc> --model 
 The parent showrunner runs it, once the unit has written the child's production doc and committed it.
 The unit gets `/exit`; once its Claude is gone its herdr tab is closed, and add_showrunner.py resumes
 the same conversation as the child's showrunner: in a tab of the shared herdr session, with no unit mark, on the configured showrunners account,
-attached to this showrunner's production. The unit's Units row is then retired and committed in this
-showrunner's checkout, also when the session opened but its opening prompt is not proven to have run.
+attached to this showrunner's production. Its staff row becomes the child's showrunner row.
 --check runs every refusal and stops nothing.
 
 Exit 0 when the promoted session runs as the child's showrunner and is attached; 1 when the unit was
@@ -24,13 +23,12 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
-from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import completion_receipt, staff, staff_sources, session_staff
+from scripts.production import completion_receipt, staff, staff_sources, unit_config
 from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
@@ -45,8 +43,7 @@ import sessions
 import unit_runs
 import herdr
 from session_pane import HerdrFailure, read_place, type_place, where_place
-from add_unit import commit_paths
-from production_units import Production, Refusal, cell_value, plan_cell_is_retired, read_production, unit_headings, unit_rows, unit_table
+from scripts.production.production_doc import Production, Refusal, read_production
 
 STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)
 POLL_S = 0.5
@@ -57,11 +54,9 @@ class Promotion(NamedTuple):
     unit: str
     parent: Production
     child: Production
-    marked: unit_lookup.MarkedUnit
+    marked: unit_lookup.LabeledSession
     claude: unit_lookup.LiveClaude
     worktree: Path
-    # The unit's Plan cell value: the line that brings it back as a unit names it.
-    plan: str
 
 
 def _git(where: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -72,15 +67,6 @@ def run_marker(session_id: str) -> Path:
     return unit_runs.marker(session_id, unit_runs.environ("ACTIVE_DIR") or None)
 
 
-def _unit_row(lines: list[str], unit: str) -> dict[str, str]:
-    for cells in unit_table(lines):
-        if cell_value(cells.get("Unit", "")) == unit:
-            if plan_cell_is_retired(cells.get("Plan", "")):
-                raise Refusal(f"{unit} is retired")
-            return cells
-    raise Refusal(f"{unit} has no row in the Units table")
-
-
 def _session_status(pid: int) -> str:
     """The session record's `status`: `busy` while a turn runs."""
     record = sessions.read_session(unit_lookup.sessions_dir() / f"{pid}.json")
@@ -89,7 +75,7 @@ def _session_status(pid: int) -> str:
     return record.get("status", "")
 
 
-def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveClaude) -> None:
+def _quiet(unit: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude) -> None:
     """Refuse a unit mid-turn or with a form, prompt or draft on screen: `/exit` would land in it."""
     if _session_status(claude.pid) == "busy":
         raise Refusal(f"{unit} is mid-turn; promote it once its turn ends")
@@ -120,7 +106,7 @@ def _committed(doc: Path) -> None:
 
 
 def checked(name: str, child_doc: Path, *,
-            record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Promotion:
+            record: staff.StaffSnapshot | None = None) -> Promotion:
     """Everything the promotion needs. Raises Refusal naming what is in the way."""
     parent_doc = showrunners.production_of(staff.runtime_id())
     if parent_doc is None:
@@ -128,7 +114,7 @@ def checked(name: str, child_doc: Path, *,
     parent = read_production(parent_doc)
     unit = name if name.replace("_", "-").endswith("-unit") else f"{name}-unit"
     pending = promotion_record(parent, unit)
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    record = staff.snapshot() if record is None else record
     if pending.exists():
         fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
         if Path(fields["child_doc"]).resolve() != child_doc.expanduser().resolve():
@@ -147,16 +133,17 @@ def checked(name: str, child_doc: Path, *,
             worktree = location.path
         child = read_production(child_doc)
         claude = unit_lookup.LiveClaude(fields["session"], fields["session_id"], fields["socket"], int(fields["pid"]))
-        marked = unit_lookup.MarkedUnit(unit, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
-        return Promotion(unit, parent, child, marked, claude, worktree, fields["plan"])
+        marked = unit_lookup.LabeledSession(unit, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
+        return Promotion(unit, parent, child, marked, claude, worktree)
     try:
-        cells = _unit_row(parent.doc.read_text(encoding="utf-8").splitlines(), unit)
         selected = staff_sources.member(staff_sources.UnitMember(parent.slug, unit), record)
+        if isinstance(selected, staff_sources.NoSuchMember):
+            raise Refusal(f"{unit} has no staff row under {parent.slug}")
         location = unit_lookup.local_worktree(selected)
         if not isinstance(location, staff.PresentWorktree):
-            raise Refusal(f"{unit}: staff worktree is removed")
+            raise Refusal(f"{unit} is retired")
         worktree = location.path
-        marked = unit_lookup.marked_unit(parent.slug, unit)
+        marked = unit_lookup.labeled_session(parent.slug, unit)
     except (OSError, UnicodeError) as error:
         raise Refusal(str(error)) from error
     if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
@@ -170,7 +157,7 @@ def checked(name: str, child_doc: Path, *,
     directory = showrunner_account_directory()
     ending = add_showrunner.EndingUnitTab(marked.place.pane)
     _ = add_showrunner.checked(child, parent.slug, ending=ending, start_in=worktree, config_dir=directory)
-    return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
+    return Promotion(unit, parent, child, marked, claude, worktree)
 
 
 def promotion_record(parent: Production, unit: str) -> Path:
@@ -189,7 +176,7 @@ def save_promotion(promotion: Promotion, target: Path) -> None:
         "unit": promotion.unit, "child_doc": str(promotion.child.doc), "target": str(target),
         "session_id": promotion.claude.session_id, "session": promotion.marked.place.session,
         "pane": promotion.marked.place.pane, "socket": promotion.claude.socket, "pid": str(promotion.claude.pid),
-        "worktree": str(promotion.worktree), "plan": promotion.plan,
+        "worktree": str(promotion.worktree),
         "launched_at": datetime.now(UTC).isoformat(),
     }) + "\n")
 
@@ -234,7 +221,7 @@ def stop(promotion: Promotion) -> bool:
     """
     place = promotion.marked.place
     try:
-        type_place(place, "/exit")
+        type_place(place, "/exit", target=promotion.claude.session_id)
     except (OSError, HerdrFailure) as error:
         raise Refusal(f"cannot type /exit into {promotion.unit}'s pane: {error}") from error
     deadline = time.monotonic() + STOP_WAIT_S
@@ -262,35 +249,14 @@ def account_line() -> str:
     return "showrunners account"
 
 
-def retire(promotion: Promotion) -> None:
-    """Mark the unit's Units row retired, promoted to the child's showrunner, and commit the doc."""
-    doc = promotion.parent.doc
-    lines = doc.read_text(encoding="utf-8").split("\n")
-    headings = unit_headings(lines)
-    _, rows = unit_rows(lines)
-    plan_at = headings.index("Plan") + 1
-    for index, line in enumerate(lines):
-        if line not in rows:
-            continue
-        parts = line.split("|")
-        if cell_value(parts[headings.index("Unit") + 1].strip()) != promotion.unit:
-            continue
-        if plan_cell_is_retired(parts[plan_at]):
-            break
-        date = datetime.now(promotion.parent.zone).strftime("%Y-%m-%d")
-        note = f"(retired {date}: promoted to showrunner of {promotion.child.slug})"
-        parts[plan_at] = f" {note} {parts[plan_at].strip()} "
-        lines[index] = "|".join(parts)
-        break
-    write_text_atomic(doc, "\n".join(lines))
-    _ = commit_paths(promotion.parent, [doc], f"production({promotion.parent.slug}): retire {promotion.unit}, "
-                 + f"promoted to showrunner of {promotion.child.slug}")
-
-
 def restore_line(promotion: Promotion) -> str:
-    """The command that resumes the stopped session as the unit it was."""
+    """The command that resumes the stopped session as the unit it was, with the plan its .unit.toml names."""
+    config = unit_config.read(promotion.worktree, cleanup=False)
+    if isinstance(config, unit_config.ConfigMissing):
+        return f"add_unit.py with --resume {promotion.claude.session_id}; {config.reason}"
     return "~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py " + shlex.join([
-        "--production", str(promotion.parent.doc), promotion.unit.removesuffix("-unit"), "--plan", promotion.plan,
+        "--production", str(promotion.parent.doc), promotion.unit.removesuffix("-unit"),
+        *unit_config.plan_arguments(config.plan),
         "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
 
 
@@ -346,7 +312,7 @@ def _main(argv: list[str]) -> int:
     if not was_pending:
         save_promotion(promotion, target_directory)
     try:
-        current = unit_lookup.marked_unit(promotion.parent.slug, unit) if was_pending else promotion.marked
+        current = unit_lookup.labeled_session(promotion.parent.slug, unit) if was_pending else promotion.marked
         if current is not None and isinstance(current.claude, unit_lookup.ClaudeUnknown):
             raise Refusal(f"cannot tell whether {unit} still runs: {current.claude.reason}")
         if current is not None and isinstance(current.claude, unit_lookup.LiveClaude):
@@ -370,7 +336,8 @@ def _main(argv: list[str]) -> int:
     document = staff.LiveDoc(remote.local_machine(), promotion.child.doc.resolve())
     retained = record.by_current_session(native)
     if (retained is not None and retained.kind == "showrunner"
-            and (retained.name, retained.parent, retained.doc) == (name, parent_row.id, document)):
+            and (retained.name, retained.parent, retained.doc) == (name, staff.ReportsTo(parent_row.id), document)):
+        print("unchanged", file=sys.stderr)
         new_member = staff_sources.MemberFound(retained)
     else:
         new_member = staff_sources.MemberFound(staff.promote_unit(
@@ -394,50 +361,33 @@ def _main(argv: list[str]) -> int:
         print(f"promote_showrunner: {error}", file=sys.stderr)
         return 1
     if started == 2:
-        print(f"{unit} is stopped and did not start as a showrunner; its Units row is unchanged. "
+        print(f"{unit} is stopped and did not start as a showrunner. "
               + f"Bring it back as the unit it was with: {restore_line(promotion)}")
         return 1
-    result = finish(promotion, started, moved)
+    code = finish(promotion, started, moved)
     if isinstance(old_member, staff_sources.MemberFound):
         workers = staff.find(kind="worker", parent=old_member.row.id)
         for worker in workers:
             print(f"kept worker {worker.id} {worker.name} under {old_member.row.name}")
         if workers:
             return 1
-    if result.exit_code == 0:
+    if code == 0:
         fields = cast(dict[str, object], json.loads(pending.read_text(encoding="utf-8")))
         completion_receipt.write_receipt(pending.with_suffix(".done.json"), new_member.row.id, fields)
         pending.unlink(missing_ok=True)
-    return result.exit_code
+    return code
 
 
-@dataclass(frozen=True)
-class PromotionProgress:
-    unit_retired: bool
-    exit_code: int
-
-
-def finish(promotion: Promotion, started: int, moved: str) -> PromotionProgress:
-    """Retire the Units row of a unit that now runs as the child's session, and say what is still owed.
-
-    A session open without a proven prompt is no longer the unit either, so its row is retired too.
-    """
+def finish(promotion: Promotion, started: int, moved: str) -> int:
+    """Say what is still owed by a unit that now runs as the child's session."""
     unit, slug = promotion.unit, promotion.child.slug
-    retired, row = True, "its Units row is retired"
-    try:
-        retire(promotion)
-    except (OSError, subprocess.CalledProcessError, Refusal) as error:
-        retired, row = False, f"its Units row was not retired and is owed: {error}"
     if started == add_showrunner.SESSION_NOT_READY:
-        print(f"{unit} is open as the session {slug}, but its showrunner prompt is not proven to have run; {row}. "
+        print(f"{unit} is open as the session {slug}, but its showrunner prompt is not proven to have run. "
               + f"Look at it with `{herdr.attach_hint(showrunners.herdr_space(slug, str(promotion.child.doc)), slug)}`; unless it runs the production, type: "
               + f"/showrunner:produce {promotion.child.doc} resume")
-        return PromotionProgress(retired, 1)
-    if not retired:
-        print(f"{unit} now runs as the showrunner of {slug}, but {row}")
-        return PromotionProgress(False, 1)
+        return 1
     print(f"{unit} is now the showrunner of {slug}; {moved}")
-    return PromotionProgress(True, started)
+    return started
 
 
 def main(argv: list[str]) -> int:

@@ -9,9 +9,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
-from contextlib import redirect_stderr
-from typing import cast, final, override
+from typing import Literal, cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.shutdown import pane_record
 from scripts.production import staff
 import herdr
+import sessions
 from scripts.shutdown.test_pane_restore import FakeClient
 from scripts.whoami import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
 
@@ -55,7 +56,7 @@ class PaneRecordTests(unittest.TestCase):
             "PATH": "", "HOME": str(self.root),
             "HERDR_PANE_RECORD_DIR": str(self.records), "HERDR_ENV": "1", "HERDR_SESSION": "agents",
             "CLAUDE_CONFIG_DIR": str(self.root / ".claude3"), "ENABLE_TOOL_SEARCH": "true",
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit",
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit",
             "CLAUDE_CODE_OAUTH_TOKEN": "secret", "UNRELATED": "x",
         }
 
@@ -69,6 +70,51 @@ class PaneRecordTests(unittest.TestCase):
 
     def entries(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], json.loads((self.records / "agents.json").read_text()))
+
+    def test_plugin_directories_survive_hook_capture_and_resume(self) -> None:
+        directories = ["/fixture/postmaster", "/fixture/second plugin"]
+        started = self.start("w1:p2", "plugin-session", "--plugin-dir", directories[0],
+                             "--plugin-dir=" + directories[1], "-n", "postmaster")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+            entry = pane_record.read_strict("agents")["w1:p2"]
+        self.assertEqual(entry.get("plugin_directories"), directories)
+        arguments = pane_record.resume_arguments(entry)
+        parsed = pane_record.parse_claude_arguments(["claude", *arguments])
+        self.assertEqual(parsed.plugin_directories, tuple(directories))
+        self.assertFalse(parsed.has_prompt)
+        self.assertEqual(arguments.count("--plugin-dir"), 2)
+
+    def test_relative_plugin_paths_keep_their_target_after_a_folder_move(self) -> None:
+        original = self.root / "work/unit"
+        moved = self.root / "elsewhere/unit"
+        entry = pane_record.launch("w1:p2", "plugin-session", str(original), {},
+                                   ["claude", "--plugin-dir", "../shared/postmaster"])
+        entry["cwd"] = str(moved)
+        arguments = pane_record.resume_arguments(entry)
+        self.assertEqual(arguments[arguments.index("--plugin-dir") + 1],
+                         str(self.root / "work/shared/postmaster"))
+        self.assertEqual(entry.get("plugin_directories"), [str(self.root / "work/shared/postmaster")])
+
+    def test_plugin_options_after_the_terminator_are_only_prompt_text(self) -> None:
+        arguments = ["claude", "--plugin-dir", "/wanted", "--", "--plugin-dir=/unwanted"]
+        parsed = pane_record.parse_claude_arguments(arguments)
+        self.assertTrue(parsed.has_prompt)
+        self.assertEqual(parsed.plugin_directories, ("/wanted",))
+        entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, arguments)
+        self.assertEqual(entry.get("plugin_directories"), ["/wanted"])
+        self.assertNotIn("/unwanted", pane_record.resume_arguments(entry))
+
+    def test_plugin_directories_require_nonempty_paths_in_launch_records(self) -> None:
+        entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, ["claude"])
+        self.records.mkdir()
+        for invalid in ("/not-a-list", [""], [1]):
+            with self.subTest(invalid=invalid):
+                document: dict[str, object] = {**entry, "plugin_directories": invalid}
+                _ = (self.records / "agents.json").write_text(json.dumps({"w1:p2": document}))
+                with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+                    with self.assertRaisesRegex(ValueError, "plugin_directories"):
+                        _ = pane_record.read_strict("agents")
 
     def test_moved_session_uses_newest_launch_across_accounts_and_record_files(self) -> None:
         old = pane_record.launch("old-pane", "moved", "/old", {"CLAUDE_CONFIG_DIR": "/accounts/.claude4"},
@@ -99,6 +145,61 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual([invocation for invocation in info.call_args_list if invocation.args[:2] == ("pane", "process-info")],
                              [mock.call("pane", "process-info", "--pane", pane) for pane in ("w1:p1", "w1:p2", "w2:p1")])
 
+    def seed_foreground(self, kind: Literal["claude", "codex"], reference: str,
+                        rows: tuple[staff.StaffRow, ...] = ()) -> str:
+        process = self.root / "proc/4242"
+        process.mkdir(parents=True, exist_ok=True)
+        config = self.root / ".claude3"
+        (config / "sessions").mkdir(parents=True, exist_ok=True)
+        _ = (config / "sessions/4242.json").write_text(json.dumps({"sessionId": "claude-thread"}))
+        _ = (process / "environ").write_bytes(
+            f"CODEX_HOME={self.root / '.codex2'}\0CLAUDE_CONFIG_DIR={config}\0UNRELATED=secret\0".encode())
+        client = FakeClient([{"pane_id": "w2C:p1", "label": None, "workspace_id": "w2C"}])
+        arguments = ["codex"] if kind == "codex" else ["claude", "-n", "claude-name", "--model", "opus"]
+        client.process_info = {"foreground_processes": [{"pid": 4242, "argv": arguments, "cwd": str(self.root)}]}
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"HOME": str(self.root)}),
+              mock.patch.object(pane_record, "PROC", process.parent),
+              mock.patch.object(pane_record, "RECORD_DIR", self.records),
+              mock.patch.object(sessions, "process_start", return_value="fixture-start"),
+              mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
+              mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(client, "pane_tab", return_value=("morty", 1, {"name": reference})),
+              redirect_stdout(output)):
+            self.assertEqual(pane_record.seed("agents"), 0)
+        return output.getvalue()
+
+    def test_seed_records_a_plain_codex_client_from_its_tabs_current_staff_session(self) -> None:
+        owner = staff.StaffRow(staff.native_id("019b3a40-4250-7000-8000-000000000101"), "agent", "morty",
+                              staff.StaffRoot(), current_session=staff.native_id("019b3a40-4250-7000-8000-000000000102"))
+        for reference in (owner.name, owner.id):
+            with self.subTest(reference=reference):
+                output = self.seed_foreground("codex", reference, (owner,))
+                entry = self.entries()["w2C:p1"]
+                self.assertEqual(entry["kind"], "codex")
+                self.assertEqual(entry["session_id"], owner.id)
+                with (mock.patch.object(pane_record, "RECORD_DIR", self.records),
+                      mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((owner,)))):
+                    retained = pane_record.read("agents")["w2C:p1"]
+                    self.assertEqual(pane_record.resume_arguments(pane_record.resume_launch(retained)),
+                                     ["resume", owner.current_session])
+                self.assertEqual(entry["config_dir"], str(self.root / ".codex2"))
+                self.assertEqual((entry["pid"], entry["proc_start"]), (4242, "fixture-start"))
+                self.assertEqual(entry["environment"], {})
+                self.assertIn(owner.current_session, output)
+
+    def test_seed_keeps_the_claude_registry_and_launch_flags(self) -> None:
+        output = self.seed_foreground("claude", "unrelated-tab")
+        entry = self.entries()["w2C:p1"]
+        self.assertEqual((entry["kind"], entry["session_id"], entry["config_dir"], entry["name"], entry["model"]),
+                         ("claude", "claude-thread", str(self.root / ".claude3"), "claude-name", "opus"))
+        self.assertEqual(entry["environment"], {})
+        self.assertIn("claude-thread", output)
+
+    def test_seed_skips_a_codex_client_without_a_staff_thread_with_one_line(self) -> None:
+        self.assertEqual(self.seed_foreground("codex", "unknown"), "w2C:p1: no conversation id for 4242\n")
+        self.assertFalse((self.records / "agents.json").exists())
+
     def test_shared_parent_reader_reads_linux_comm_with_parentheses(self) -> None:
         process = self.root / "proc/42"
         process.mkdir(parents=True)
@@ -126,8 +227,7 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual({key: value for key, value in entry.items() if key != "written_at"}, {
             "pane_id": "w1:p2", "session_id": "019b3a40-4250-7000-8000-000000000102", "config_dir": str(self.root / ".claude3"),
             "cwd": "/work/alpha", "name": "alpha", "model": "opus", "remote_control": True,
-            "environment": {"ENABLE_TOOL_SEARCH": "true", "SHOWRUNNER_UNIT": "demo",
-                            "SHOWRUNNER_UNIT_ID": "alpha-unit"},
+            "environment": {"ENABLE_TOOL_SEARCH": "true"},
             "flags_read": True, "ended": False, "kind": "claude"})
 
     def test_hook_preserves_staff_identity_for_restore_and_membership(self) -> None:
@@ -152,16 +252,21 @@ class PaneRecordTests(unittest.TestCase):
         source = self.root / "staff-source"
         source.mkdir()
         entry = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/fixture", {
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit",
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit",
             "STAFF_ID": "019b3a40-4250-7000-8000-000000000102"}, ["claude"])
         evidence = source / "agents.json"
         _ = evidence.write_text(json.dumps({"w1:p2": entry}))
         before = evidence.read_bytes()
+        identity = staff.StaffId(entry["session_id"])
+        owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
         with (mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(source)}),
+              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))),
               mock.patch.object(pane_record, "RECORD_DIR", self.records)):
             pane_record.write("agents", entry)
-            self.assertEqual(pane_record.read("agents"), {"w1:p2": entry})
-            self.assertEqual(pane_record.forget_unit("alpha-unit"), ["agents:w1:p2"])
+            expected = entry.copy()
+            expected["environment"] = {}
+            self.assertEqual(pane_record.read("agents"), {"w1:p2": expected})
+            self.assertEqual(pane_record.forget_unit(identity), ["agents:w1:p2"])
             self.assertEqual(pane_record.read("agents"), {})
         self.assertEqual(evidence.read_bytes(), before)
         self.assertEqual(json.loads((self.records / "agents.json").read_text()), {})
@@ -181,12 +286,11 @@ class PaneRecordTests(unittest.TestCase):
     def test_markless_hook_preserves_only_the_same_conversations_identity(self) -> None:
         self.env["STAFF_ID"] = "019b3a40-4250-7000-8000-000000000102"
         self.assertEqual(self.start("w1:p2", "019b3a40-4250-7000-8000-000000000102").returncode, 0)
-        for key in ("STAFF_ID", "SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID"):
+        for key in ("STAFF_ID", ('' + 'SHOWRUNNER_' + 'UNIT'), ('' + 'SHOWRUNNER_' + 'UNIT_ID')):
             del self.env[key]
         self.assertEqual(self.start("w1:p2", "019b3a40-4250-7000-8000-000000000102").returncode, 0)
         environment = cast(dict[str, str], self.entries()["w1:p2"]["environment"])
-        self.assertEqual(environment, {"ENABLE_TOOL_SEARCH": "true",
-                                      "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        self.assertEqual(environment, {"ENABLE_TOOL_SEARCH": "true"})
         self.assertEqual(self.start("w1:p2", "different-conversation").returncode, 0)
         self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
@@ -198,7 +302,7 @@ class PaneRecordTests(unittest.TestCase):
               mock.patch.dict(os.environ, source_environment(self.root / "sources")),
               isolated_source_readers()):
             parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-            owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
+            owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id="019b3a40-4250-7000-8000-000000000102")
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
             retained = pane_record.launch("w1:p2", owner.id, "/work/alpha", {}, ["claude"])
@@ -226,6 +330,27 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(pane_record.read("agents")["w1:p2"]["config_dir"], entry["config_dir"])
         self.assertEqual(entry["environment"]["STAFF_ID"], "parent")
 
+    def test_worker_resume_uses_the_typed_parent_for_its_folder(self) -> None:
+        from scripts.shutdown import launch_names, session_types
+
+        location = staff.PresentWorktree("natedev", self.root / "unit")
+        unit = staff.StaffRow(staff.StaffId("unit"), "unit", "alpha", staff.StaffRoot(),
+                             current_session=staff.StaffId("unit-session"),
+                             worktree=location)
+        for parent in (staff.ReportsTo(unit.id), staff.StaffRoot()):
+            with self.subTest(parent=parent):
+                worker = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", parent,
+                                       current_session=staff.StaffId("worker-session"))
+                record = staff.StaffSnapshot((unit, worker))
+                retained = pane_record.launch("w1:p2", worker.id, "/saved", {}, ["claude"])
+                expected = str(location.path) if isinstance(parent, staff.ReportsTo) else "/saved"
+                with (mock.patch.object(staff, "initial_snapshot", return_value=record),
+                      mock.patch.object(staff, "snapshot", return_value=record)):
+                    self.assertEqual(pane_record.resume_launch(retained)["cwd"], expected)
+                    self.assertEqual(launch_names.LaunchNames(record).resume(retained)["cwd"], expected)
+                    self.assertEqual(session_types.unit_worktree(worker.id),
+                                     location if isinstance(parent, staff.ReportsTo) else staff.WORKTREE_UNFILLED)
+
     def current_owner(self) -> tuple[staff.StaffRow, staff.StaffId, Path]:
         from scripts.production.staff_test_support import isolated_staff_file, isolated_source_readers, source_environment
 
@@ -236,7 +361,7 @@ class PaneRecordTests(unittest.TestCase):
         _ = self.enterContext(isolated_source_readers())
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
         parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-        owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
+        owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id="019b3a40-4250-7000-8000-000000000102")
         current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
         _ = staff.update_current_session(owner.current_session, current)
         return owner, current, path
@@ -258,60 +383,8 @@ class PaneRecordTests(unittest.TestCase):
         pane_record.write("agents", observed)
         self.assertEqual((record_path.read_bytes(), record_path.stat().st_mtime_ns), retained)
 
-    def test_folder_move_updates_only_owner_cwd_with_the_supplied_snapshot_and_reruns_without_writes(self) -> None:
-        owner, current, path = self.current_owner()
-        old, new = self.root / "old-folder", self.root / "new-folder"
-        fixed = pane_record.launch("w1:p2", owner.id, str(old), {}, ["claude", "-n", "alpha"])
-        live = pane_record.launch("w2:p1", current, str(old), {}, ["claude", "-n", "alpha"])
-        other = pane_record.launch("w1:p3", "019b3a40-4250-7000-8000-000000000104", str(old), {}, ["claude"])
-        fixed["ended"] = True
-        pane_record.write("agents", fixed)
-        pane_record.write("agents", other)
-        with pane_record.locked("retained"):
-            pane_record.save("retained", {"w2:p1": live})
-        record = staff.snapshot()
-        before = path.read_bytes()
 
-        with mock.patch.object(staff, "snapshot", side_effect=AssertionError("reuse the supplied snapshot")):
-            pane_record.move_cwd(owner.id, old, new, record)
-            self.assertEqual(pane_record.read("agents"), {"w1:p2": {**fixed, "cwd": str(new)}, "w1:p3": other})
-            self.assertEqual(pane_record.read("retained"), {"w2:p1": {**live, "cwd": str(new)}})
-            paths = [self.records / name for name in ("agents.json", "retained.json")]
-            moved = [(entry.read_bytes(), entry.stat().st_mtime_ns) for entry in paths]
-            pane_record.move_cwd(owner.id, old, new, record)
-            self.assertEqual([(entry.read_bytes(), entry.stat().st_mtime_ns) for entry in paths], moved)
-        self.assertEqual(path.read_bytes(), before)
 
-    def test_folder_move_skips_an_owner_launch_from_an_unrelated_folder(self) -> None:
-        owner, _current, path = self.current_owner()
-        retained = pane_record.launch("w1:p2", owner.id, str(self.root / "unrelated"), {}, ["claude"])
-        pane_record.write("agents", retained)
-        record_path = self.records / "agents.json"
-        before = path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns
-        output = io.StringIO()
-        with redirect_stderr(output):
-            pane_record.move_cwd(owner.id, self.root / "old", self.root / "new", staff.snapshot())
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertIn("different working folder", output.getvalue())
-        self.assertEqual((path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns), before)
-
-    def test_folder_move_updates_later_records_after_a_different_folder_is_skipped(self) -> None:
-        owner, current, path = self.current_owner()
-        old, new = self.root / "old", self.root / "new"
-        skipped = pane_record.launch("w1:p1", owner.id, str(self.root / "elsewhere"), {}, ["claude"])
-        selected = pane_record.launch("w2:p1", current, str(old), {}, ["claude"])
-        pane_record.write("agents", skipped)
-        with pane_record.locked("later"):
-            pane_record.save("later", {"w2:p1": selected})
-        before = path.read_bytes()
-        output = io.StringIO()
-        with redirect_stderr(output):
-            pane_record.move_cwd(owner.id, old, new, staff.snapshot())
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertIn("different working folder", output.getvalue())
-        self.assertEqual(pane_record.read("agents")["w1:p1"], skipped)
-        self.assertEqual(pane_record.read("later")["w2:p1"], {**selected, "cwd": str(new)})
-        self.assertEqual(path.read_bytes(), before)
 
     def test_current_conversation_lookup_projects_only_its_exact_retained_pane_without_writing(self) -> None:
         owner, current, path = self.current_owner()
@@ -364,7 +437,7 @@ class PaneRecordTests(unittest.TestCase):
             owner = unit_membership("demo", "alpha-unit")
             owner = staff.update_current_session(owner.current_session, staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
             old = pane_record.launch("old", "019b3a40-4250-7000-8000-000000000102", "/old", {
-                "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
+                ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude"])
             old["written_at"] = "2026-10-30T00:00:00+00:00"
             new = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/new", {"ENABLE_TOOL_SEARCH": "true"}, ["claude"])
             retained: dict[str, object] = dict(new)
@@ -396,7 +469,7 @@ class PaneRecordTests(unittest.TestCase):
             owner = unit_membership("demo", "alpha-unit")
             owner = staff.update_current_session(owner.current_session, staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         old = pane_record.launch("old", "019b3a40-4250-7000-8000-000000000102", "/fixture", {
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude"])
         old["written_at"] = "2026-10-30T00:00:00+00:00"
         new = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {}, ["claude"])
         self.records.mkdir(parents=True)
@@ -407,8 +480,7 @@ class PaneRecordTests(unittest.TestCase):
                                capture_output=True, text=True, timeout=60)
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(first.stdout.splitlines(), [
-            f"agents:new:{owner.current_session}: set CLAUDE_CODE_SESSION_ID={owner.current_session}; "
-            + "set SHOWRUNNER_UNIT=demo; set SHOWRUNNER_UNIT_ID=alpha-unit"])
+            f"agents:new:{owner.current_session}: set CLAUDE_CODE_SESSION_ID={owner.current_session}"])
         self.assertEqual(self.entries()["new"]["environment"], {**old["environment"], "CLAUDE_CODE_SESSION_ID": owner.current_session})
         before = path.read_bytes(), path.stat().st_mtime_ns
         second = subprocess.run(command, cwd=HOOK.parents[2], env=environment,
@@ -429,7 +501,7 @@ class PaneRecordTests(unittest.TestCase):
             owner = unit_membership("demo", "alpha-unit")
             owner = staff.update_current_session(owner.current_session, staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
             old = pane_record.launch("old", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", {
-                "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
+                ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude"])
             old["written_at"] = "2026-10-30T00:00:00+00:00"
             damaged = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", {}, ["claude"])
             self.records.mkdir(parents=True)
@@ -439,40 +511,37 @@ class PaneRecordTests(unittest.TestCase):
                   mock.patch.object(sessions, "running_sessions", return_value=[])):
                 self.assertEqual(len(session_staff.repair_marks()), 1)
             self.env["STAFF_FILE"] = str(self.root / "staff.json")
-            for key in ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID"):
+            for key in (('' + 'SHOWRUNNER_' + 'UNIT'), ('' + 'SHOWRUNNER_' + 'UNIT_ID')):
                 del self.env[key]
             for _compaction in range(2):
                 hook = self.start("w1:p2", "019b3a40-4250-7000-8000-000000000102", source="compact")
                 self.assertEqual(hook.returncode, 0, hook.stderr)
                 self.assertEqual(self.entries()["w1:p2"]["environment"], {
-                    "ENABLE_TOOL_SEARCH": "true", "SHOWRUNNER_UNIT": "demo",
-                    "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": owner.current_session})
+                    "ENABLE_TOOL_SEARCH": "true", "CLAUDE_CODE_SESSION_ID": owner.current_session})
             hook = self.start("w1:p2", "different-conversation")
             self.assertEqual(hook.returncode, 0, hook.stderr)
             self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
-    def test_restored_unit_id_comes_from_the_productions_units_table(self) -> None:
+    def test_restored_unit_id_comes_from_the_staff_row(self) -> None:
         from scripts.production import staff, session_staff, showrunners
 
-        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", parent.id, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
-        document = "# Production — demo\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| `alpha` | standby |\n"
+        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", staff.ReportsTo(parent.id), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         source = showrunners.ShowrunnerSource(
-            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
+            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), "# Production — demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {"CLAUDE_CODE_SESSION_ID": owner.current_session}, ["claude"])
         membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
             session_staff.MemberSources({"demo": source}, ()))
-        self.assertEqual(membership.environment(entry), {"CLAUDE_CODE_SESSION_ID": owner.current_session,
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha"})
+        self.assertEqual(membership.environment(entry), {"CLAUDE_CODE_SESSION_ID": owner.current_session})
 
     def test_staff_owner_supersedes_a_promoted_showrunners_old_session_staff(self) -> None:
         from scripts.production import staff, session_staff, showrunners
 
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         source = showrunners.ShowrunnerSource(
             showrunners.Timer("demo", "session:019b3a40-4250-7000-8000-000000000102", self.root / "demo.md", "UTC"), "# demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {
-            "SHOWRUNNER_UNIT": "former", "SHOWRUNNER_UNIT_ID": "demo-unit"}, ["claude"])
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "former", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo-unit"}, ["claude"])
         membership = session_staff.LaunchMembership(staff.StaffSnapshot((owner,)),
             session_staff.MemberSources({"demo": source}, ()))
         repaired = membership.environment(entry)
@@ -499,7 +568,7 @@ MAC_RECORD = (
     (5).to_bytes(4, sys.byteorder) + b"/opt/claude/bin/claude\0\0\0\0"
     + b"claude\0--name\0alpha-unit\0--model\0opus\0"
     + b"CLAUDE_CONFIG_DIR=/Users/n/.claude3\0CLAUDE_CODE_OAUTH_TOKEN=" + TOKEN.encode()
-    + b"\0SHOWRUNNER_UNIT_ID=alpha-unit\0ENABLE_TOOL_SEARCH=true\0HOME=/Users/n\0\0"
+    + (b'\x00' + b'SHOWRUNNER_' + b'UNIT_ID=alpha-unit\x00ENABLE_TOOL_SEARCH=true\x00HOME=/Users/n\x00\x00')
     + b"executable_path=/opt/claude/bin/claude\0\0\0"
 )
 

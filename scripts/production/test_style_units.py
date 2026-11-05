@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -17,9 +18,11 @@ import proposal_issue
 import style_units
 import style_ledger
 import unit_lookup
-import unit_table_cells
+import display_cells
 from herdr import HerdrPlace
 from scripts.direct import plan_history
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
 
 NOW = datetime(2026, 10, 28, 12, tzinfo=UTC)
@@ -31,18 +34,28 @@ def live_unit(name: str, session: str = "") -> live_units.LiveUnit:
     if not session:
         return live_units.LiveUnit(name, None)
     claude = unit_lookup.LiveClaude(session, session + "-id", "/tmp/claude/test.sock", 1)
-    marked = unit_lookup.MarkedUnit(name, claude, HerdrPlace("test", "w1:p1"))
+    marked = unit_lookup.LabeledSession(name, claude, HerdrPlace("test", "w1:p1"))
     return live_units.LiveUnit(name, marked)
 
 
 class StyleUnitsTests(unittest.TestCase):
     root: Path = Path()
     database: Path = Path()
+    doc: Path = Path()
+    owners: dict[str, staff.StaffRow] = {}
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp/claude")))
         self.database = self.root / "ledger.sqlite"
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.enterContext(patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}))
+        self.doc = self.root / "style-production.md"
+        _ = self.doc.write_text("# Production\n")
+        owner = fixture_member("showrunner", name="style-owner", doc=staff.LiveDoc("natedev", self.doc))
+        self.owners = {name: fixture_member("unit", name=name, parent=owner.id)
+                       for name in ("names", "types")}
+
         with closing(sqlite3.connect(self.database)) as connection:
             _ = connection.executescript("""
                 CREATE TABLE tickets (
@@ -64,11 +77,12 @@ class StyleUnitsTests(unittest.TestCase):
     def ticket(self, *, unit: str = "names-unit", number: str = "42", kind: str = "proposal",
                rule: str = RULE, rules: tuple[str, ...] = (), count: int = 2, state: str = "assigned",
                created_at: str = "2026-10-27T10:00:00+00:00", family: str = "names") -> str:
-        ticket_id = unit + "-" + number
+        ticket_id = number
+        holder = self.owners[unit.removesuffix("-unit")]
         items = list(range(count))
         with closing(sqlite3.connect(self.database)) as connection, connection:
             _ = connection.execute("INSERT INTO tickets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-                ticket_id, unit, kind, family, rule, "cargo-liner", json.dumps(items), json.dumps(items),
+                ticket_id, str(holder.id), kind, family, rule, "cargo-liner", json.dumps(items), json.dumps(items),
                 json.dumps(rules), json.dumps(items), state, created_at, "2026-10-28T11:59:00+00:00",
             ))
         return ticket_id
@@ -98,8 +112,38 @@ class StyleUnitsTests(unittest.TestCase):
     def render(self, units: list[live_units.LiveUnit] | None = None,
                records: dict[str, object] | None = None) -> str:
         selected = [live_unit("names-unit", "names")] if units is None else units
-        return style_units.table(selected, {} if records is None else records, now=NOW, zone=ZONE,
+        return style_units.table(selected, {} if records is None else records, doc=self.doc, now=NOW, zone=ZONE,
                                  ledger_paths={unit.unit: self.database for unit in selected})
+
+    def test_same_named_unit_in_another_production_keeps_its_own_ticket(self) -> None:
+        _ = self.ticket(number="14")
+        other_doc = self.root / "other-production.md"
+        _ = other_doc.write_text("# Production\n")
+        other = fixture_member("showrunner", name="other-style", doc=staff.LiveDoc("natedev", other_doc))
+        unit = fixture_member("unit", name="names", parent=other.id)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            _ = connection.execute("INSERT INTO tickets SELECT '15',?,kind,family,rule,crate,files,sites,rules,finding_ids,state,created_at,updated_at "
+                + "FROM tickets WHERE id='14'", (str(unit.id),))
+        output = self.render()
+        self.assertIn("#14 ·", output)
+        self.assertNotIn("#15 ·", output)
+        other_output = style_units.table([live_unit("names-unit")], {}, doc=other_doc,
+            ledger_paths={"names-unit": self.database}, now=NOW, zone=ZONE)
+        self.assertIn("#15 ·", other_output)
+        self.assertNotIn("#14 ·", other_output)
+
+    def test_fixed_ticket_owner_survives_a_clear_and_a_unit_rename(self) -> None:
+        _ = self.ticket(number="14")
+        row = self.owners["names"]
+        _ = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("table-cleared")))
+        _ = staff.rename(row.id, "sample-style-names")
+        before = self.database.read_bytes()
+
+        output = self.render([live_unit("sample-style-names-unit")])
+
+        self.assertIn("#14 · comments-name-code-constructs", output)
+        self.assertNotIn(str(row.id), output)
+        self.assertEqual(self.database.read_bytes(), before)
 
     def test_every_ticket_kind_uses_its_own_count_and_singular(self) -> None:
         for kind, noun in (("proposal", "finding"), ("listed", "site"), ("read", "file"), ("structure", "file")):
@@ -115,7 +159,7 @@ class StyleUnitsTests(unittest.TestCase):
         for kind, noun, expected in (("proposal", "findings", 3), ("listed", "sites", 2), ("read", "file", 1),
                                      ("structure", "file", 1)):
             with self.subTest(kind=kind):
-                ticket = style_units.Ticket("names-unit-104", "names-unit", kind, RULE, "cargo-liner",
+                ticket = style_units.Ticket("104", str(self.owners["names"].id), kind, RULE, "cargo-liner",
                                             '["file.rs"]', '[{}, {}]', "[]", '["a", "b", "c"]', "assigned")
                 self.assertEqual(style_units.ticket_cell(ticket),
                                  f"#104 · comments-name-code-constructs · cargo-liner · {expected} {noun}")
@@ -124,10 +168,10 @@ class StyleUnitsTests(unittest.TestCase):
         for rules, expected in (((RULE,), "comments-name-code-constructs"),
                                 ((RULE, "local:rust/one.md", "global:rust/two.md"), "comments-name-code-constructs+2")):
             with self.subTest(rules=rules):
-                ticket = style_units.Ticket("names-unit-8", "names-unit", "read", "", "cargo-liner", '["a"]', "[]",
+                ticket = style_units.Ticket("8", str(self.owners["names"].id), "read", "", "cargo-liner", '["a"]', "[]",
                                             json.dumps(rules), "[]", "assigned")
                 self.assertEqual(style_units.ticket_cell(ticket), f"#8 · {expected} · cargo-liner · 1 file")
-        ticket = style_units.Ticket("names-unit-9", "names-unit", "read", RULE, "cargo-liner", '["a"]', "[]",
+        ticket = style_units.Ticket("9", str(self.owners["names"].id), "read", RULE, "cargo-liner", '["a"]', "[]",
                                     '["global:rust/ignored.md"]', "[]", "assigned")
         self.assertIn("· comments-name-code-constructs ·", style_units.ticket_cell(ticket))
 
@@ -418,7 +462,7 @@ class StyleUnitsTests(unittest.TestCase):
                         if missing in ("build_ticket", "both"):
                             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN build_ticket")
                 before = database.read_bytes()
-                output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
+                output = style_units.table([live_unit("names-unit")], {}, doc=self.doc, now=NOW, zone=ZONE,
                                            ledger_paths={"names-unit": database})
                 self.assertIn("| 3 | 2 | 4 |", output)
                 self.assertEqual(output.splitlines()[-1],
@@ -462,12 +506,12 @@ class StyleUnitsTests(unittest.TestCase):
                     with connection:
                         _ = connection.execute(f"DROP TABLE {missing}")
                 before = database.read_bytes()
-                output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
+                output = style_units.table([live_unit("names-unit")], {}, doc=self.doc, now=NOW, zone=ZONE,
                                            ledger_paths={"names-unit": database})
                 self.assertIn("| gone | idle | idle | — | 0 | 0 | 0 |", output)
                 self.assertEqual(database.read_bytes(), before)
         database = self.root / "absent" / "ledger.sqlite"
-        output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
+        output = style_units.table([live_unit("names-unit")], {}, doc=self.doc, now=NOW, zone=ZONE,
                                    ledger_paths={"names-unit": database})
         self.assertIn("All families: 0 findings built · 0 approved findings left", output)
         self.assertFalse(database.parent.exists())
@@ -497,7 +541,7 @@ class StyleUnitsTests(unittest.TestCase):
         records: dict[str, object] = {"names-unit": {"plan": str(self.root / "names.md")}}
         with (patch.object(style_ledger, "ledger_location", side_effect=AssertionError("no phase-based lookup")),
               self.assertRaisesRegex(TypeError, "ledger_paths")):
-            _ = style_units.table([live_unit("names-unit")], records)  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+            _ = style_units.table([live_unit("names-unit")], records, doc=self.doc)  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
 
     def test_an_explicit_ledger_path_keeps_ticket_and_counts_when_the_phase_record_is_unavailable(self) -> None:
         _ = self.ticket(count=3)
@@ -513,7 +557,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.assertIn("| names\\|worker | idle |", output)
         self.assertIn("| gone | idle |", output)
         self.assertNotIn("| names-unit |", output)
-        self.assertEqual(unit_table_cells.session_cell(units[0]), "names|worker")
+        self.assertEqual(display_cells.session_cell(units[0]), "names|worker")
 
 
 if __name__ == "__main__":

@@ -29,8 +29,13 @@ else:
 import offload
 if TYPE_CHECKING:
     from ..build_targets import target_config
+    from ..buildlog import sync as buildlog_sync, health as buildlog_health, record as buildlog_record, store as buildlog_store
 else:
     import target_config
+    import sync as buildlog_sync
+    import health as buildlog_health
+    import record as buildlog_record
+    import store as buildlog_store
 import conf
 from offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
 
@@ -58,6 +63,93 @@ class LintVerbTests(unittest.TestCase):
                     self.assertEqual(answer.stdout.splitlines(), expected)
 
 
+class RunnerCompletionTests(unittest.TestCase):
+    def test_missing_completion_reports_the_runner_exit_without_claiming_link_loss(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            answer = offload.ProcessController().stream_mac_run([
+                "/bin/sh", "-c", "echo admission-wait-ended; exit 143",
+            ])
+        self.assertIsInstance(answer, offload.MissingMacStatus)
+        if not isinstance(answer, offload.MissingMacStatus):
+            self.fail("The runner did not send a completion marker")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result"
+            target = target_config.SshTarget("aws", "linux", Path(directory) / "aws.conf")
+            with redirect_stdout(output), mock.patch.object(target_config, "read_targets", return_value=(target,)):
+                status = offload.write_result(offload.LostMacRun(1, answer.detail), offload.ResultFile(path), target="aws")
+            self.assertEqual(status, 75)
+            self.assertIn("reason=runner exited with status 143 without a final status\n", path.read_text())
+        self.assertIn("the aws runner exited with status 143 without a final status", output.getvalue())
+        self.assertNotIn("link", output.getvalue())
+        self.assertNotIn("running on natedev instead", output.getvalue())
+
+    def test_interruption_reports_the_instance_generation_without_claiming_link_loss(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = offload.write_result(offload.InterruptedTargetRun("generation-one", 1),
+                                          offload.NO_RESULT_FILE, target="aws")
+        self.assertEqual(status, 75)
+        self.assertEqual(output.getvalue(), "mac_test: the aws instance was interrupted (generation generation-one)\n")
+
+
+class CompletedRunSyncTests(unittest.TestCase):
+    def test_finished_runs_exchange_after_release_and_preserve_results(self) -> None:
+        for target in ("aws", "mac"):
+            for status in (0, 42):
+                for fails in (False, True):
+                    with self.subTest(target=target, status=status, fails=fails), tempfile.TemporaryDirectory() as directory:
+                        self.check_finished_run(Path(directory), target, status, fails)
+
+    def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
+        configured = target_config.SshTarget(target, "linux" if target == "aws" else "macos", root / "target.conf")
+        config = offload.OffloadConfig(True, offload.SshConnectionSettings("aws-build", 1, 1), 1, 1, 1, "1", {})
+        request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), target=target)
+        controller = offload.ProcessController()
+        output = io.StringIO()
+
+        def release(_controller: offload.ProcessController, _target: str) -> None:
+            self.assertEqual(exchange.call_count, 0)
+
+        def exchange_records(*_args: object) -> int:
+            released.assert_called_once_with(controller, target)
+            if fails:
+                raise OSError("fixture exchange failure")
+            return 0
+
+        with (
+            mock.patch.object(offload, "configured_ssh_target", return_value=configured),
+            mock.patch.object(offload, "expected_instance_generation", return_value=""),
+            mock.patch.object(offload, "expected_linux_parity", return_value={}),
+            mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
+            mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
+            mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "aws-build")),
+            mock.patch.object(offload, "remote_test_command", return_value="fixture step"),
+            mock.patch.object(controller, "stream_mac_run", return_value=offload.ReportedMacStatus(status, offload.CleanupKept())),
+            mock.patch.object(offload, "release_claim", side_effect=release) as released,
+            mock.patch.object(time, "monotonic", return_value=5),
+            mock.patch.object(buildlog_store, "root", return_value=root),
+            mock.patch.object(buildlog_store, "host_name", return_value="natedev"),
+            mock.patch.object(buildlog_sync, "configured_peers", return_value=(buildlog_sync.SyncPeer("aws", "aws-build"),)),
+            mock.patch.object(buildlog_record, "target_hosts", return_value=("aws-build",)),
+            mock.patch.object(buildlog_record, "sync_config", return_value={
+                "sync.connect_timeout_s": "3", "sync.reach_timeout_s": "7", "sync.rsync_timeout_s": "11"}),
+            mock.patch.object(buildlog_health, "write_snapshot"),
+            mock.patch.object(buildlog_sync, "sync_peer", side_effect=exchange_records) as exchange,
+            mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")),
+            mock.patch.object(subprocess, "Popen", side_effect=AssertionError("No child process expected")),
+            redirect_stdout(output),
+        ):
+            result = offload.claimed_run(controller, config, request, offload.KnownRepository("hana"), 1)
+        expected = offload.PassedOnMac(4) if status == 0 else offload.FailedOnMac(status, 4)
+        self.assertEqual(result, expected)
+        released.assert_called_once_with(controller, target)
+        if target == "aws":
+            self.assertEqual(exchange.call_args.args[0], buildlog_sync.SyncPeer("aws", "aws-build"))
+            self.assertEqual(exchange.call_args.args[-2:], (7, 11))
+            self.assertEqual(output.getvalue().count("exchange failed"), int(fails))
+
+
 class OffloadSettingsTests(unittest.TestCase):
     root: Path = Path()
     settings: Path = Path()
@@ -75,6 +167,17 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch("subprocess.run", side_effect=AssertionError("No external command expected")))
         _ = self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("No external command expected")))
+
+    def test_mac_command_sends_repository_identity_only_when_nonempty(self) -> None:
+        config = offload.read_config(self.settings)
+        request = offload.OffloadRequest(self.root, "hana", "fixture-call", offload.NO_RESULT_FILE, ())
+        for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
+            with self.subTest(key=key):
+                words = shlex.split(offload.remote_test_command(
+                    config, request, offload.KnownRepository("hana", key),
+                ))
+                assignments = [word for word in words if word.startswith("BUILDLOG_REPO_IDENTITY=")]
+                self.assertEqual(assignments, [f"BUILDLOG_REPO_IDENTITY={key}"] if key else [])
 
     def test_ssh_target_state_path_needs_no_registry(self) -> None:
         with mock.patch.object(target_config, "read_targets", side_effect=AssertionError("No registry read expected")):
@@ -101,6 +204,29 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(config.default_target_budget_gib, "6")
         self.assertEqual(config.values["mac_budget_gib.hana"], "7")
         self.assertEqual(config.values["linux_only.hana"], "local-package")
+
+    def test_sender_normalizes_multiline_tool_versions_before_parity(self) -> None:
+        versions = {"rustc": " rustc fixture \n", "nextest":
+            " cargo-nextest 0.9.143  \n release: 0.9.143\n commit: abc\n date: today\n host: linux \n",
+            "mend": " mend fixture \n", "git": "fixture-commit\n"}
+        controller = offload.ProcessController()
+
+        def capture(arguments: Sequence[str],
+                    deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT) -> offload.CapturedCommandResult:
+            del deadline
+            name = "nextest" if arguments[:2] == ["cargo", "nextest"] else "mend" if arguments[0] == "cargo" else arguments[0]
+            return offload.CommandOutput(0, versions[name], "")
+
+        with mock.patch.object(controller, "capture", side_effect=capture):
+            expected = offload.expected_linux_parity(controller, offload.read_config(self.settings))
+
+        self.assertNotIsInstance(expected, offload.UnavailableToolParity)
+        if isinstance(expected, offload.UnavailableToolParity):
+            self.fail("The sender must read all fixture versions")
+        self.assertEqual(expected["nextest"],
+            "cargo-nextest 0.9.143 release: 0.9.143 commit: abc date: today host: linux")
+        self.assertEqual((expected["rustc"], expected["mend"], expected["scripts_commit"]),
+                         ("rustc fixture", "mend fixture", "fixture-commit"))
 
     def test_no_argument_config_reader_uses_the_file_values(self) -> None:
         config = offload.read_config()
@@ -240,6 +366,7 @@ class OffloadSettingsTests(unittest.TestCase):
             result = offload.check_leftovers(config.connection, "kept-host", HANA)
         self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
         self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
+        self.settings.unlink()
         _ = write_config_fixture(self.settings, template="mac_test")
         commit_config_fixture(self.settings)
         for value in ("bad", "0", "-1", "nan", "inf"):
@@ -562,6 +689,50 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assert_claimed_commands()
 
+    def test_copy_refusal_keeps_rsync_stderr_in_output_and_the_result(self) -> None:
+        self.fixture["rsync_status"] = 23
+        self.sync_fixture()
+        stub = self.bin_directory / "command-stub"
+        source = stub.read_text().replace('    exit "$rsync_status"',
+            "    printf '%s\\n' 'rsync: destination denied' 'rsync error: code 23' >&2\n"
+            + '    exit "$rsync_status"')
+        _ = stub.write_text(source)
+
+        result = self.command()
+
+        self.assert_declined(result, "copy: rsync: rsync: destination denied; rsync error: code 23")
+        self.assert_claimed_commands()
+        self.assertEqual(len(self.events_for("rsync")), 1)
+        self.assertEqual(len(self.events_for("ssh")), 1)
+
+    def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
+        controller = offload.ProcessController()
+        config = offload.read_config(self.config_path)
+        commands: list[list[str]] = []
+
+        def capture(arguments: Sequence[str],
+                    deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT) -> offload.CapturedCommandResult:
+            del deadline
+            argv = list(arguments)
+            commands.append(argv)
+            if argv[0] == "rsync":
+                return offload.CommandOutput(23, "", "rsync: config denied\n")
+            if "ls-files" in argv:
+                return offload.CommandOutput(0, "scripts/mac_test/linux_runner.py\0", "")
+            if "rev-parse" in argv:
+                return offload.CommandOutput(0, "fixture-commit\n", "")
+            return offload.CommandOutput(0, "", "")
+
+        parity: offload.PublicToolParity = {"rustc": "fixture", "nextest": "fixture",
+                                           "mend": "fixture", "scripts_commit": "fixture-commit"}
+        with mock.patch.object(controller, "capture", side_effect=capture), \
+                mock.patch.object(offload, "expected_linux_parity", return_value=parity):
+            copied = offload.copy_tracked_scripts(controller, config)
+
+        self.assertFalse(copied)
+        self.assertEqual(controller.copy_failure_detail, "copy: rsync: rsync: config denied")
+        self.assertEqual(commands[-1][0], "rsync")
+
     def test_each_mac_verb_keeps_arguments_and_names_its_claim(self) -> None:
         self.write_portable_workspace()
         self.config["mac_skip.hana"] = "test(skip-this)"
@@ -747,7 +918,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 "mac:.local/state/mac-test/mirror/hana/",
             ],
         )
-        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/generated/\n")
+        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/.mac-test-mirror\n/generated/\n")
 
         run = events[2]["args"]
         self.assertEqual(run[: len(ssh_arguments)], ssh_arguments)

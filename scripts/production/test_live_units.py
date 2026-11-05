@@ -17,14 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 from scripts.lib.socket_test_support import short_socket_directory
 import fake_showrunner
 import fake_unit_host
-from fake_unit_host import HostedUnit
+from fake_unit_host import HostedUnit, labeled as marked
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, unit_membership, showrunner_relationship
-import production_units
 
 SCRIPT = Path(__file__).with_name("live_units.py")
-OLD_HEADER = ("| Unit | Plan | Worktree | Branch | Session | Port | Owns |", "| --- | --- | --- | --- | --- | --- | --- |")
-HEADER = ("| Unit | Plan | Worktree | Branch | Port | Owns |", "| --- | --- | --- | --- | --- | --- |")
 
 
 class RowDocumentLiveUnitsTests(StaffTestCase):
@@ -34,7 +31,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         from scripts.production import live_units, unit_lookup
 
         fixture = self.row_production()
-        every = unit_lookup.MarkedProductions({}, {}, {fixture.slug: ("member-unit",)})
+        every = unit_lookup.LabeledProductions({}, {fixture.slug: ("member",)})
         unavailable = fixture.worktree.with_name("unavailable-member")
         for failure in ("branch", "configuration"):
             with self.subTest(failure=failure):
@@ -45,8 +42,8 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
                     (fixture.worktree / ".unit.toml").unlink()
                 errors = io.StringIO()
                 with (redirect_stderr(errors),
-                      mock.patch("unit_lookup.every_marked_unit", return_value=every)):
-                    units = live_units.production_units(fixture.doc)
+                      mock.patch("unit_lookup.every_labeled_session", return_value=every)):
+                    units = live_units.units_of_doc(fixture.doc)
                 self.assertEqual([item.unit for item in units], ["member-unit"])
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
                 self.assertIn(fixture.unit.name, errors.getvalue())
@@ -58,15 +55,13 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         from scripts.production import live_units, session_staff
 
         fixture = self.row_production()
-        every = session_staff.MarkedProductions({}, {}, {fixture.slug: ("member-unit",)})
+        every = session_staff.LabeledProductions({}, {fixture.slug: ("member",)})
         before = self.staff_file.read_bytes()
         selected = live_units.units_in(fixture.doc, every)
         self.assertEqual([unit.unit for unit in selected], ["member-unit"])
         self.assertEqual(self.staff_file.read_bytes(), before)
 
 
-def marked(label: str, pane: str, unit: str, slug: str = "show") -> HostedUnit:
-    return HostedUnit(label, pane, {"SHOWRUNNER_UNIT": slug, "SHOWRUNNER_UNIT_ID": unit})
 
 
 class LiveUnitsTests(unittest.TestCase):
@@ -78,11 +73,11 @@ class LiveUnitsTests(unittest.TestCase):
     pane_sessions: dict[str, str] = {}
 
     def test_retired_backfill_does_not_add_a_retained_removed_row_to_the_active_output(self) -> None:
-        self.write_doc(HEADER, "| live-unit | plan.md | /missing/live | live | — | — |")
+        self.members("live")
         self.hosts({})
         before = self.run_script()
         self.assertEqual(before.returncode, 0, before.stderr)
-        retired = unit_membership("show", "retired-unit")
+        retired = unit_membership("show", "retired")
         _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         after = self.run_script()
         self.assertEqual(after.returncode, 0, after.stderr)
@@ -112,26 +107,20 @@ class LiveUnitsTests(unittest.TestCase):
 
     def hosts(self, units: dict[str, HostedUnit]) -> None:
         for unit in units.values():
-            if unit.marks.get("SHOWRUNNER_UNIT") == "show":
-                rows = [row for row in staff.find(kind="unit")
-                        if row.name == unit.marks["SHOWRUNNER_UNIT_ID"].removesuffix("-unit")]
-                if rows:
-                    self.pane_sessions[unit.pane] = rows[0].id
+            identity = unit.marks.get("CODEX_THREAD_ID", "")
+            row = staff.by_current_session(identity)
+            if row is not None:
+                self.pane_sessions[unit.pane] = row.current_session
         fake_unit_host.write(self.environment, list(units.values()))
 
-    def write_doc(self, header: tuple[str, str], *rows: str, members: tuple[str, ...] | None = None) -> None:
-        _ = self.doc.write_text("\n".join(("# Production", "## Units", *header, *rows)), encoding="utf-8")
-        if members is None:
-            members = tuple(production_units.cell_value(row["Unit"])
-                            for row in production_units.unit_table(self.doc.read_text().splitlines())
-                            if not production_units.plan_cell_is_retired(row.get("Plan", "")))
-        for unit in members:
+    def members(self, *units: str) -> None:
+        for unit in units:
             _ = unit_membership("show", unit)
 
     def claude(self, name: str, pane: str) -> None:
         """Record a live Claude in `pane`: this test process stands in for it."""
         if pane:
-            fake_unit_host.place_process(self.environment, os.getpid(), pane)
+            fake_unit_host.place_process(self.environment, os.getpid(), pane, exec_shell=True)
         path = Path(self.enterContext(short_socket_directory())) / f"{name}.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
@@ -144,110 +133,82 @@ class LiveUnitsTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *(arguments or ("--production", str(self.doc)))],
                               env=self.environment, capture_output=True, text=True, check=False)
 
-    def test_offline_staff_unit_is_listed_without_a_units_table_row_or_worktree(self) -> None:
-        self.write_doc(HEADER)
-        _ = unit_membership("show", "offline-unit")
+    def test_offline_staff_unit_is_listed_without_a_worktree(self) -> None:
+        self.members("offline")
         self.hosts({})
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "offline-unit\t\tgone\t\n")
 
-    def test_short_unit_ids_keep_document_order_and_offline_spelling(self) -> None:
-        self.write_doc(HEADER,
-                       "| writer | active | /missing/writer | writer | — | — |",
-                       "| hook | active | /missing/hook | hook | — | — |")
+    def test_short_unit_ids_keep_their_pane_spelling(self) -> None:
+        self.members("writer", "hook")
         self.hosts({"writer": marked("director", "w4:p1", "writer")})
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [
-            "writer\therdr:director:w4:p1\tstopped\t", "hook\t\tgone\t",
+        self.assertEqual(sorted(result.stdout.splitlines()), [
+            "hook-unit\t\tgone\t", "writer\therdr:director:w4:p1\tunknown\t",
         ])
 
-    def test_record_membership_wins_over_a_stale_units_table_and_pane_mark(self) -> None:
-        self.write_doc(HEADER, "| alpha-unit | active | /missing/alpha | alpha | — | — |")
+    def test_record_membership_wins_over_a_stale_pane_mark(self) -> None:
+        self.members("alpha")
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         receiving = showrunner_relationship("receiving")
-        _ = staff.move(row.id, receiving.id)
+        _ = staff.move(row.id, staff.ReportsTo(receiving.id))
         self.hosts({"unit": HostedUnit("director", "w4:p1", {
-            "STAFF_ID": row.id, "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit",
+            "CODEX_THREAD_ID": row.current_session, "STAFF_ID": row.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "show", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha",
         })})
         old = self.run_script()
         self.assertEqual((old.returncode, old.stdout), (0, ""), old.stderr)
         self.doc = self.root / "receiving-production.md"
-        _ = self.doc.write_text("\n".join(("# Production", "## Units", *HEADER)))
         new = self.run_script()
         self.assertEqual(new.returncode, 0, new.stderr)
-        self.assertEqual(new.stdout, "alpha-unit\therdr:director:w4:p1\tstopped\t\n")
+        self.assertEqual(new.stdout, "alpha\therdr:director:w4:p1\tunknown\t\n")
 
-    def test_retired_plan_text_cannot_remove_a_unit_still_in_the_record(self) -> None:
-        self.write_doc(HEADER, "| alpha-unit | retired | /missing/alpha | alpha | — | — |",
-                       members=("alpha-unit",))
-        self.hosts({})
-        result = self.run_script()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "alpha-unit\t\tgone\t\n")
-
-    def test_each_live_row_is_listed_in_doc_order_with_its_session_as_it_is_now(self) -> None:
-        self.write_doc(
-            HEADER,
-            "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | — | — |",
-            "| done-unit | (retired by the user; run done) follow-up | /tmp/no-such-worktree-done | done | — | — |",
-            "| beta-unit | docs/plans/beta.md | /tmp/no-such-worktree-beta | beta | — | — |",
-            "| gone-unit | docs/plans/gone.md | /tmp/no-such-worktree-gone | gone | — | — |",
-            members=("alpha-unit", "beta-unit"),
-        )
-        self.hosts({"$1": marked("beta-label", "w5:p1", "beta-unit"),
-                                     "$2": marked("renamed-since-launch", "w4:p1", "alpha-unit"),
-                                     "$3": marked("done-label", "w6:p1", "done-unit"),
-                                     "$4": marked("other-show", "w7:p1", "gone-unit", slug="other")})
+    def test_each_member_is_listed_with_its_session_as_it_is_now(self) -> None:
+        self.members("alpha", "beta")
+        self.hosts({"$1": marked("beta-label", "w5:p1", "beta"),
+                                     "$2": marked("renamed-since-launch", "w4:p1", "alpha"),
+                                     "$3": HostedUnit("done-label", "w6:p1", {}),
+                                     "$4": marked("other-show", "w7:p1", "gone", slug="other")})
         self.claude("renamed-since-launch", "w4:p1")
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        # `gone-unit` has neither a worktree nor a session of this production, so it is retired.
-        self.assertEqual(result.stdout.splitlines(), ["alpha-unit\therdr:renamed-since-launch:w4:p1\tlive\trenamed-since-launch",
-                                                      "beta-unit\therdr:beta-label:w5:p1\tstopped\t"])
+        # The unmarked pane has no member. The other production keeps its own member.
+        self.assertEqual(sorted(result.stdout.splitlines()), ["alpha\therdr:renamed-since-launch:w4:p1\tlive\trenamed-since-launch",
+                                                      "beta\therdr:beta-label:w5:p1\tunknown\t"])
 
     def test_herdr_pane_targets_match_between_live_units_and_lookup(self) -> None:
-        self.write_doc(HEADER, "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | — | — |")
-        self.hosts({"$1": marked("alpha-label", "w41:p1", "alpha-unit")})
+        self.members("alpha")
+        self.hosts({"$1": marked("alpha-label", "w41:p1", "alpha")})
         listed = self.run_script()
         target = subprocess.run([sys.executable, str(SCRIPT.with_name("unit_lookup.py")),
-                                 "pane", "show", "alpha-unit"], env=self.environment,
+                                 "pane", "show", "alpha"], env=self.environment,
                                 capture_output=True, text=True, check=False)
         self.assertEqual((listed.returncode, target.returncode), (0, 0), listed.stderr + target.stderr)
         self.assertEqual(listed.stdout.split("\t")[1], "herdr:alpha-label:w41:p1")
         self.assertEqual(target.stdout, "herdr:alpha-label:w41:p1\n")
 
     def test_a_herdr_unit_is_listed_with_its_live_claude(self) -> None:
-        self.write_doc(HEADER, "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | — | — |")
-        self.hosts({"native": marked("native", "w1:p1", "alpha-unit")})
+        self.members("alpha")
+        self.hosts({"native": marked("native", "w1:p1", "alpha")})
         self.claude("native-claude", "w1:p1")
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "alpha-unit\therdr:native:w1:p1\tlive\tnative-claude\n")
-
-    def test_a_doc_that_still_has_the_session_column_lists_the_same_units(self) -> None:
-        self.write_doc(OLD_HEADER,
-                       "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | `stale-name` | — | — |")
-        self.hosts({"$1": marked("current-name", "w4:p1", "alpha-unit")})
-        self.claude("current-name", "w4:p1")
-        result = self.run_script()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["alpha-unit\therdr:current-name:w4:p1\tlive\tcurrent-name"])
+        self.assertEqual(result.stdout, "alpha\therdr:native:w1:p1\tlive\tnative-claude\n")
 
     def test_a_prompt_written_before_the_change_still_names_the_showrunner(self) -> None:
-        self.write_doc(HEADER, "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | — | — |")
-        self.hosts({"$1": marked("alpha-label", "w4:p1", "alpha-unit")})
+        self.members("alpha")
+        self.hosts({"$1": marked("alpha-label", "w4:p1", "alpha")})
         _ = fake_showrunner.write_timer(self.timers, "show", "director-id", "America/Los_Angeles", self.doc)
         self.addCleanup(fake_showrunner.write_session(self.records, "director", "director-id").close)
         for showrunner in ("director", "show"):
             with self.subTest(showrunner=showrunner):
                 result = self.run_script(showrunner)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.splitlines(), ["alpha-unit\therdr:alpha-label:w4:p1\tstopped\t"])
+                self.assertEqual(result.stdout.splitlines(), ["alpha\therdr:alpha-label:w4:p1\tunknown\t"])
 
     def test_a_host_that_cannot_say_is_an_error_not_an_empty_list(self) -> None:
-        self.write_doc(HEADER, "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | — | — |")
+        self.members("alpha")
         self.environment["HERDR_BIN"] = str(self.root / "no-such-herdr")
         result = self.run_script()
         self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)

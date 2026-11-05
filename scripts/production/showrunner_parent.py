@@ -10,6 +10,7 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.production.store_owner import showrunner_id
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff, staff_sources
@@ -20,7 +21,7 @@ def attach(child: str, parent: str, *, record: staff.StaffSnapshot | None = None
     """Store the checked desired parent; repeat calls keep the same file."""
     child, parent = showrunners.canonical_slug(child), showrunners.canonical_slug(parent)
     showrunner_tree.check_attach(child, parent, record=record)
-    path = showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE
+    path = showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(child, record=record) / showrunners.PARENT_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, f"{parent}\n")
 
@@ -29,7 +30,7 @@ def detach(child: str, *, record: staff.StaffSnapshot | None = None) -> str:
     """Remove the parent file, returning its former parent or an empty string."""
     child = showrunners.canonical_slug(child)
     parent = showrunner_tree.parent_of(child, record=record)
-    (showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE).unlink(missing_ok=True)
+    (showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(child, record=record) / showrunners.PARENT_FILE).unlink(missing_ok=True)
     return parent
 
 
@@ -45,7 +46,7 @@ class NoPendingParentNotice:
 
 
 def _notice_file(child: str) -> Path:
-    return showrunners.SHOWRUNNER_STATE_DIR / child / "parent_notice.json"
+    return showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(child) / "parent_notice.json"
 
 
 def _pending_notice(child: str) -> PendingParentNotice | NoPendingParentNotice:
@@ -101,27 +102,27 @@ def attach_parent(child: str, parent: str = "") -> None:
         if isinstance(pending, PendingParentNotice) and pending != PendingParentNotice("attach", parent):
             raise staff.StaffRefused(f"{child}: finish its pending {pending.action} to {pending.parent} first")
         child_row, parent_row = _row(child, record), _row(parent, record)
-        path = showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE
+        path = showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(child, record=record) / showrunners.PARENT_FILE
         try:
             recorded_parent = path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             recorded_parent = ""
-        finished = (child_row.parent == parent_row.id and recorded_parent == parent
+        finished = (child_row.parent == staff.ReportsTo(parent_row.id) and recorded_parent == parent
                     and isinstance(pending, NoPendingParentNotice))
         if finished:
             print(f"{child} already reports to {parent}; done")
             return
         if isinstance(pending, NoPendingParentNotice):
             _save_notice(child, PendingParentNotice("attach", parent))
-        if child_row.parent != parent_row.id:
-            _ = staff.move(child_row.id, parent_row.id)
+        if child_row.parent != staff.ReportsTo(parent_row.id):
+            _ = staff.move(child_row.id, staff.ReportsTo(parent_row.id))
         attach(child, parent, record=record)
         top = showrunner_tree.root_of(parent, record=record)
         print(f"{child} now reports to {parent}")
         _tell(child, {
             child: f"{child} now reports to {parent}. The root is {top}: send it each item for the user. {showrunners.RULES}",
-            parent: f"{child} now reports to {parent}. It is a child showrunner, never a unit: it has no Units "
-                    + f"row, and no broadcast is passed on to it. {showrunners.RULES}",
+            parent: f"{child} now reports to {parent}. It is a child showrunner, never a unit: "
+                    + f"no broadcast is passed on to it. {showrunners.RULES}",
         })
 
 
@@ -138,8 +139,8 @@ def detach_parent(child: str) -> None:
         row = _row(child, record)
         if parent and isinstance(pending, NoPendingParentNotice):
             _save_notice(child, PendingParentNotice("detach", parent))
-        if row.parent is not None:
-            _ = staff.move(row.id, None)
+        if isinstance(row.parent, staff.ReportsTo):
+            _ = staff.move(row.id, staff.StaffRoot())
         _ = detach(child, record=record)
         if not parent:
             print(f"{child} reports to no one; done")

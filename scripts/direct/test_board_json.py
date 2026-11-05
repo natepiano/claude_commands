@@ -26,7 +26,7 @@ from scripts.production import fake_showrunner, showrunner_parent, staff, showru
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import isolated_staff_file, production_membership, showrunner_launch
 from scripts.shutdown import pane_record
-import unit_table_cells
+import display_cells
 
 
 CONTRACT = Path(__file__).resolve().parents[2] / "mods/unit-board/types/board.d.ts"
@@ -135,7 +135,6 @@ class BoardJsonTests(unittest.TestCase):
         worktree = self.root / f"{slug}-unit"
         checkout.mkdir()
         worktree.mkdir()
-        # live_unit_table retains a linked worktree without querying session marks.
         _ = subprocess.run(["git", "init", "-b", "branch", "--separate-git-dir", str(self.root / f"{slug}-unit-git"), str(worktree)], check=True, capture_output=True)
         plan = worktree / "plan.md"
         document = checkout / f"{slug}-production.md"
@@ -143,10 +142,7 @@ class BoardJsonTests(unittest.TestCase):
             f"# Production — {slug}", "", "## Production Context", "",
             "- **Merge branch:** main",
             f"- **Showrunner checkout:** {checkout}",
-            "- **Log:** show.log", "- **User zone:** UTC", "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Owns |",
-            "| --- | --- | --- | --- | --- |",
-            f"| {unit_name} | {plan} | {worktree} | branch | fixture.py |", "",
+            "- **Log:** show.log", "- **User zone:** UTC", "",
         )), encoding="utf-8")
         fixture = ProductionFixture(slug, checkout, worktree, plan, document)
         self.plan(fixture)
@@ -184,13 +180,13 @@ class BoardJsonTests(unittest.TestCase):
 
     def attach(self, child: str, parent: str) -> None:
         self.move_parent(child, parent)
-        directory = self.showrunner_state / child
+        directory = self.showrunner_state / next(row.id for row in staff.find(kind="showrunner") if row.name == child)
         directory.mkdir(parents=True, exist_ok=True)
         _ = (directory / "parent").write_text(f"{parent}\n", encoding="utf-8")
 
     def move_parent(self, child: str, parent: str = "") -> None:
         rows = {row.name: row.id for row in staff.find(kind="showrunner")}
-        _ = staff.move(rows[child], rows[parent] if parent else None)
+        _ = staff.move(rows[child], staff.ReportsTo(rows[parent]) if parent else staff.StaffRoot())
 
     def staff_launch(self, row: staff.StaffRow, session: str, *,
                      pane: str = "unit", at: str = "2026-10-31T10:00:00+00:00") -> None:
@@ -243,20 +239,24 @@ class BoardJsonTests(unittest.TestCase):
         root = self.root / ".local/state/style" if default_path else self.root / "style-ledgers"
         database = root / fixture.checkout.name / "ledger.sqlite"
         database.parent.mkdir(parents=True, exist_ok=True)
+        parent = next(row for row in staff.find(kind="showrunner") if row.name == fixture.slug)
+        unit_ids = {f"{row.name}-unit": row.id for row in staff.find(kind="unit", parent=parent.id)}
         connection = sqlite3.connect(database)
         try:
             _ = connection.execute(
                 "CREATE TABLE tickets (id TEXT, unit TEXT, state TEXT, created_at INTEGER)",
             )
             _ = connection.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?)", [
-                ("alpha-unit-1", "alpha-unit", "merged", 1),
-                ("alpha-unit-2", "alpha-unit", "merged", 2),
-                ("alpha-unit-3", "alpha-unit", "open", 3),
-                ("alpha-unit-4", "alpha-unit", "rejected", 4),
-                ("other-unit-1", "other-unit", "merged", 5),
-                ("alpha-1", "alpha", "merged", 6),
-                *tickets,
-            ])
+                (ticket, unit_ids.get(owner, fixture_runtime_id(owner)), state, created_at)
+                for ticket, owner, state, created_at in [
+                    ("alpha-unit-1", "alpha-unit", "merged", 1),
+                    ("alpha-unit-2", "alpha-unit", "merged", 2),
+                    ("alpha-unit-3", "alpha-unit", "open", 3),
+                    ("alpha-unit-4", "alpha-unit", "rejected", 4),
+                    ("other-unit-1", "other-unit", "merged", 5),
+                    ("alpha-1", "alpha", "merged", 6),
+                    *tickets,
+            ]])
             connection.commit()
         finally:
             connection.close()
@@ -273,8 +273,11 @@ class BoardJsonTests(unittest.TestCase):
     def write_run(self, fixture: ProductionFixture, events: list[dict[str, object]],
                   *, name: str = "current", started: int = NOW - 7_200) -> Path:
         path = self.history / "runs" / f"{name}.jsonl"
+        member = next(row for row in staff.find(kind="unit")
+                      if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.path == fixture.worktree)
         first: dict[str, object] = {
             "event_type": "run_started", "working_dir": str(fixture.worktree),
+            "main_agent": {"session_id": member.current_session},
             "plan_doc": str(fixture.plan), "project_plan_doc": str(fixture.plan),
             "timestamp_epoch": started, "run_started_at": started,
         }
@@ -402,7 +405,7 @@ class BoardJsonTests(unittest.TestCase):
                 self.assertNotIn("focus", response)
                 self.assertEqual(response["watch"], sorted(str(path.resolve()) for path in (
                     self.notifier, self.showrunner_state,
-                    self.showrunner_state / child.slug, self.showrunner_state / grandchild.slug,
+                    self.showrunner_state / fixture_runtime_id(f"showrunner::{child.slug}"), self.showrunner_state / fixture_runtime_id(f"showrunner::{grandchild.slug}"),
                 )))
                 for fixture, document in zip((root, child, grandchild), documents, strict=True):
                     unit = object_fields(array_items(document["units"])[0])
@@ -497,7 +500,7 @@ class BoardJsonTests(unittest.TestCase):
         other = self.unit_member(second.slug)
         _ = staff.rename(other.id, "unrelated")
         _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", second.worktree), expected=other.worktree)
-        moved = staff.move(unit.id, second_parent.id)
+        moved = staff.move(unit.id, staff.ReportsTo(second_parent.id))
         self.staff_launch(moved, moved.id, pane="newer")
 
         _, documents = self.generate("--session", moved.id)
@@ -522,7 +525,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_missing_staff_id_and_launch_records_have_no_showrunner_board(self) -> None:
         _ = self.production(running=False)
-        missing = staff.StaffRow(staff.native_id(fixture_runtime_id("absent-board-unit")), "unit", "alpha", None, current_session=staff.native_id(fixture_runtime_id("absent-board-unit")))
+        missing = staff.StaffRow(staff.native_id(fixture_runtime_id("absent-board-unit")), "unit", "alpha", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("absent-board-unit")))
         self.staff_launch(missing, missing.id, pane="missing")
 
         for session in ("no-launch-session", missing.id):
@@ -533,7 +536,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_unit_without_a_showrunner_ancestor_has_no_board(self) -> None:
         _ = self.production(running=False)
-        orphan = staff.StaffRow(staff.native_id(fixture_runtime_id("orphan-board-unit")), "unit", "orphan", None, current_session=staff.native_id(fixture_runtime_id("orphan-board-unit")))
+        orphan = staff.StaffRow(staff.native_id(fixture_runtime_id("orphan-board-unit")), "unit", "orphan", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("orphan-board-unit")))
         self.staff_launch(orphan, orphan.id)
         # The writer forbids orphan units; pin the reader's defensive boundary
         # with the same snapshot shape should an incomplete ancestry reach it.
@@ -549,7 +552,7 @@ class BoardJsonTests(unittest.TestCase):
         child = self.production("child", running=False)
         sibling = self.production("sibling", running=False)
         self.move_parent(child.slug, root.slug)
-        stale_child = self.showrunner_state / child.slug
+        stale_child = self.showrunner_state / fixture_runtime_id(f"showrunner::{child.slug}")
         stale_child.mkdir(parents=True)
         _ = (stale_child / "parent").write_text(sibling.slug + "\n", encoding="utf-8")
 
@@ -621,7 +624,7 @@ class BoardJsonTests(unittest.TestCase):
     def test_attach_and_detach_change_a_watched_directory_and_refresh_the_subtree(self) -> None:
         root = self.production("root")
         child = self.production("child")
-        child_state = self.showrunner_state / child.slug
+        child_state = self.showrunner_state / fixture_runtime_id(f"showrunner::{child.slug}")
         child_state.mkdir(parents=True)
         # An unrelated directory must not become a discovery source.
         (self.showrunner_state / "unregistered").mkdir()
@@ -728,10 +731,6 @@ class BoardJsonTests(unittest.TestCase):
         fixture.plan.unlink()
         as_built = fixture.worktree / "as-built.md"
         _ = as_built.write_text("# Delivered feature\n", encoding="utf-8")
-        _ = fixture.document.write_text(
-            fixture.document.read_text(encoding="utf-8").replace(str(fixture.plan), str(as_built)),
-            encoding="utf-8",
-        )
 
         _ = recorded_unit(fixture.slug, "alpha-unit", fixture.worktree, fixture.document, plan="as-built.md")
         _, unit = self.unit(fixture)
@@ -816,6 +815,27 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(connect.call_args.args, (f"file:{database}?mode=ro",))
         self.assertEqual(connect.call_args.kwargs, {"uri": True, "timeout": 0})
 
+    def test_unit_rename_preserves_merged_count_and_active_ticket(self) -> None:
+        fixture = self.production(unit_name="names-unit")
+        self.standing_plan(fixture, phase_id="124", title="Current work")
+        owner = self.unit_member(fixture.slug, "names")
+        database = self.ledger(fixture, tickets=(
+            ("123", "names-unit", "merged", 123),
+            ("124", "names-unit", "merged", 124),
+            ("125", "names-unit", "assigned", 125),
+        ))
+        before = database.read_bytes(), database.stat().st_mtime_ns
+        _ = staff.rename(owner.id, "renamed")
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["key"], "renamed")
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "125", "title": "Current work", "merged": 2,
+        })
+        self.assertEqual(unit["stage"], "Ticket 125 running")
+        self.assertEqual((database.read_bytes(), database.stat().st_mtime_ns), before)
+
     def test_renamed_unit_selects_the_open_phase_by_its_unchanged_ledger_ticket_id(self) -> None:
         fixture = self.production(unit_name="cargo-liner-style-names-unit")
         self.standing_plan(fixture, phase_id="63", title="names-unit-63 — Fix names")
@@ -844,19 +864,20 @@ class BoardJsonTests(unittest.TestCase):
         fixture = self.production(unit_name="types-unit")
         self.standing_plan(fixture, phase_id="124", title="types-unit-124")
         database = self.ledger(fixture)
+        unit_id = self.unit_member(fixture.slug, "types").id
         for state in ("assigned", "checkpointed"):
             with self.subTest(state=state):
                 connection = sqlite3.connect(database)
                 try:
                     _ = connection.execute("DELETE FROM tickets")
                     _ = connection.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?)", [
-                        ("types-unit-125", "types-unit", state, 500),
-                        ("types-unit-126", "types-unit", "assigned", 300),
-                        ("types-unit-124", "types-unit", "checkpointed", 400),
-                        ("types-unit-127", "types-unit", "merged", 600),
-                        ("types-unit-128", "types-unit", "rejected", 700),
-                        ("types-unit-129", "types-unit", "open", 800),
-                        ("types-unit-extra-999", "types-unit-extra", "assigned", 900),
+                        ("types-unit-125", unit_id, state, 500),
+                        ("types-unit-126", unit_id, "assigned", 300),
+                        ("types-unit-124", unit_id, "checkpointed", 400),
+                        ("types-unit-127", unit_id, "merged", 600),
+                        ("types-unit-128", unit_id, "rejected", 700),
+                        ("types-unit-129", unit_id, "open", 800),
+                        ("types-unit-extra-999", fixture_runtime_id("types-unit-extra"), "assigned", 900),
                     ])
                     connection.commit()
                 finally:
@@ -1205,8 +1226,8 @@ class BoardJsonTests(unittest.TestCase):
             self.event("progress_reported", NOW - 100, activity="delivery ready for review"),
         ])
 
-        with (patch.object(unit_table_cells, "open_step", wraps=unit_table_cells.open_step) as open_step,
-              patch.object(unit_table_cells, "run_events", wraps=unit_table_cells.run_events) as run_events):
+        with (patch.object(display_cells, "open_step", wraps=display_cells.open_step) as open_step,
+              patch.object(display_cells, "run_events", wraps=display_cells.run_events) as run_events):
             _, unit = self.unit(fixture)
 
         self.assertTrue(open_step.called)

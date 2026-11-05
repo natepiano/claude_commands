@@ -30,7 +30,7 @@ from scripts.usage.agents_log import state_dir
 from scripts.usage.usage_report import UnitWorktree
 from scripts.production import session_staff, staff
 from scripts.shutdown import remote
-from scripts.message import send_budget
+from scripts.message import send_budget, session_send
 
 
 WINDOW = timedelta(hours=2)
@@ -48,11 +48,6 @@ WORKER_ROLES = frozenset({"impl", "test", "fix", "review", "worker"})
 ALERT_INTERVAL = timedelta(hours=6)
 WORST_THREADS = 3
 SENDER = "usage-waste-watch"
-REPOSITORY = Path(__file__).resolve().parents[2]
-
-
-def send_script() -> Path:
-    return Path(os.environ.get("WASTE_WATCH_SEND") or REPOSITORY / "scripts/message/send.py")
 
 
 def state_file() -> Path:
@@ -184,7 +179,10 @@ def registered_showrunners(*, resolver: session_staff.RowResolver | None = None)
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
         record = resolver.record
         problems: list[str] = []
-        runners = unit_labels.registered_showrunners(problems, membership=record, resolver=resolver)
+        diagnostics = unit_labels.StaffDiagnostics(problems)
+        runners = unit_labels.registered_showrunners(diagnostics, membership=record, resolver=resolver)
+        for warning in diagnostics.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
         found = tuple(Showrunner(runner["slug"], f"uds:{runner['socket']}" if runner["socket"] else "",
                                 usage_report.document_units(Path(runner["doc"]), resolver=resolver))
                       for runner in runners)
@@ -319,8 +317,9 @@ class NotSent:
 def send(address: str, text: str) -> Delivered | NotSent:
     """send.py exit 0 is delivered and exit 1 is queued for the session; both count as delivered."""
     try:
-        result = subprocess.run([sys.executable, str(send_script()), "--to", address, "--from", SENDER,
-                                 "--text", text], capture_output=True, text=True, check=False, timeout=send_budget.seconds())
+        result = subprocess.run(session_send.send_argv("--to", address, "--from", SENDER, "--text", text,
+                                 send_script=Path(os.environ.get("WASTE_WATCH_SEND") or session_send.SEND_SCRIPT)),
+                                capture_output=True, text=True, check=False, timeout=send_budget.seconds())
     except (OSError, subprocess.TimeoutExpired) as error:
         return NotSent(f"send.py failed: {' '.join(str(error).split())}")
     if result.returncode in (0, 1):

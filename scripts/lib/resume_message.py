@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import json
 import shlex
+from datetime import datetime, timezone
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from scripts.lib.script_envelope import script_prompt
+from scripts.usage import agents_log
 
 if TYPE_CHECKING:
     from scripts.shutdown.inventory import PausedSeat
@@ -85,13 +87,16 @@ def _resume_phase_id(seat: PausedSeat) -> str:
 def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     """Build a complete launcher invocation that continues this worker's thread."""
     from scripts.direct.worker_state import worker_slot
+    from scripts.production import session_staff
 
     launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
     prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
-    resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
-    if resumed is not None:
-        return resumed
-    # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
+    if seat["turn_live"] and seat["launcher_command"]:
+        try:
+            return _resume_task(seat, cwd, prompt)
+        except ValueError:
+            pass
+    # Find the saved slot through staff_id, including identities from named fix workers.
     recorded_slot = worker_slot(Path(seat["run_dir"]), seat["seat"]) or ""
     team_role = recorded_slot or seat["role"]
     phase_id = _resume_phase_id(seat)
@@ -99,6 +104,11 @@ def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"]]
     if phase_id:
         start.extend(("--phase", phase_id))
+    if launcher == "review.sh":
+        assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                                       session_staff.worker_session(seat), datetime.now(timezone.utc))
+        if isinstance(assignment, agents_log.Assignment) and assignment.role == "review" and assignment.lens:
+            start.extend(("--lens", assignment.lens))
     kind = team_role if team_role in {"impl", "test", "fix"} else "impl"
     if seat["role"] == "fix":
         kind = "fix"
@@ -110,27 +120,26 @@ def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", team_role])
 
 
-def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str | None:
-    """Keep the recorded task arguments, following the worker with its resume prompt; None when incomplete."""
-    index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
+
+def _resume_task(seat: PausedSeat, cwd: str, prompt: str) -> str:
+    """Keep task options and arguments with the current folder and resume prompt."""
+    command = seat["launcher_command"]
+    index = next((i for i, value in enumerate(command) if Path(value).name in {"implement.sh", "review.sh"}), -1)
     if index < 0:
-        return None
-    # Retain supported task options; saved commands may predate the current launcher.
-    supported = {"--phase", "--lens"} if Path(command[index]).name == "review.sh" else {"--phase", "--fix-cause"}
+        raise ValueError("the saved command has no worker launcher")
+    review = Path(command[index]).name == "review.sh"
+    supported = {"--phase", "--lens"} if review else {"--phase", "--fix-cause"}
     position = index + 1
     options: list[str] = []
     while position < len(command) and command[position].startswith("--"):
         if position + 1 >= len(command):
-            return None
-        option, value = command[position], command[position + 1]
+            raise ValueError("the saved command has an incomplete option")
+        option, value = command[position:position + 2]
         if option in supported:
             options.extend((option, value))
         position += 2
     arguments = command[position:]
-    # implement.sh requires its team role as the ninth argument; review.sh has defaults after three.
-    if len(arguments) < (9 if Path(command[index]).name == "implement.sh" else 3):
-        return None
-    arguments[2] = prompt
-    return shlex.join([*command[:index + 1], *options, "--to", seat, *arguments])
-
-
+    if len(arguments) < (3 if review else 9):
+        raise ValueError("the saved command has incomplete task arguments")
+    arguments[:3] = [seat["run_dir"], cwd, prompt]
+    return shlex.join([*command[:index + 1], *options, "--to", seat["seat"], *arguments])

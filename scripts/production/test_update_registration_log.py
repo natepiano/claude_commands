@@ -6,6 +6,8 @@ import json
 import re
 import unittest
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member
 from scripts.production.update_registration_test_support import RegistrationFixture
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
@@ -27,9 +29,11 @@ class RegistrationTests(RegistrationFixture):
         self.assertRegex(result.stdout, r"^time: ok — 09:05 P[DS]T\n$")
 
     def test_tenth_log_event_lists_every_doc_unit_without_state(self) -> None:
-        doc = self.doc.read_text(encoding="utf-8")
-        doc = doc.replace("\n## Gates", "| `beta-unit` | `docs/beta.md` | `/tmp/beta` | `beta` | `beta-session` | — | — |\n\n## Gates")
-        _ = self.doc.write_text(doc, encoding="utf-8")
+        alpha = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        beta = self.root / "beta"
+        beta.mkdir()
+        _ = (beta / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        _ = fixture_member("unit", name="beta", parent=alpha.parent, worktree=staff.PresentWorktree("natedev", beta))
         for number in range(1, 11):
             result = self.run_command("log", f"event {number}")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -45,7 +49,7 @@ class RegistrationTests(RegistrationFixture):
         _ = outstanding.write_text(json.dumps([{"since": "2026-10-04T10:00", "text": "review colors"}]) + "\n",
                                    encoding="utf-8")
         state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"units": [{"unit": "alpha-unit", "phase": "Phase 2 of 3: panels",
+        _ = state.write_text(json.dumps({"units": [{"unit": self.fixture_staff_id("alpha-unit"), "phase": "Phase 2 of 3: panels",
                                                     "wait": "review"}],
                                            "merges_held": ["alpha phase 2"],
                                            "open_for_user": ["stale state item"],
@@ -69,10 +73,11 @@ class RegistrationTests(RegistrationFixture):
         (scratch / "unit_status").mkdir(parents=True)
         _ = (scratch / "unit_status" / "blocks_open").write_text("alpha-unit\n", encoding="utf-8")
         _ = (scratch / "showrunner_state.json").write_text('{"merges_held": ["from scratch"]}\n', encoding="utf-8")
-        target = self.state / "showrunner" / slug / "session"
+        owner = self.fixture_staff_id()
+        target = self.state / "showrunner" / owner / "session"
         target.mkdir(parents=True)
         _ = (target / "showrunner_state.json").write_text('{"merges_held": ["kept"]}\n', encoding="utf-8")
-        prompt = self.state / "showrunner" / slug / "prompt.txt"
+        prompt = self.state / "showrunner" / owner / "prompt.txt"
         _ = prompt.write_text("an old prompt with <SCRATCH>/unit_status\n", encoding="utf-8")
         env = {**self.env, "SHOWRUNNER_SCRATCH_ROOT": str(self.root / "tmp")}
 

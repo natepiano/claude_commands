@@ -1,6 +1,8 @@
 """Workspace bulk runs use temporary Git repos and a fake command runner; never build Rust."""
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import json
 import os
 import signal
@@ -22,6 +24,7 @@ from typing import TypedDict, cast, final, override
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bulk_run as run
+import style_sync
 import bulk_rename as bulk
 import fake_fmt
 from style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
@@ -265,7 +268,7 @@ class WorkspaceRunTests(CargoProjectTests):
         # An independent ledger connection takes the still-unreserved ID.
         other = ledger_api.Ledger(self.repo, ledger.database)
         self.addCleanup(other.close)
-        other.ticket_add(ticket, ticket.rsplit("-", 1)[0], "proposal", "names", ".",
+        other.ticket_add(ticket, ticket_owner_id("other"), "proposal", "names", ".",
                          [finding.path], [finding.rule], proposal=str(finding.state.proposal),
                          finding_ids=(finding.finding_id,))
         before = next(item for item in other.proposal_tickets() if item["id"] == ticket)
@@ -292,14 +295,14 @@ class WorkspaceRunTests(CargoProjectTests):
         intent_path = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "style-batch-intent.json"))
         record = bulk.object_fields(cast(object, json.loads(intent_path.read_text())))
         ticket = cast(list[str], record["tickets"])[0]
-        unit = ticket.rsplit("-", 1)[0]
+        unit = "other"
         with ledger_api.Ledger(self.repo, ledger.database) as other:
-            other.ticket_add(ticket, unit, "read", "names", ".", [findings[0].path], [definition.rule_id])
-            before = other.queued_tickets(unit)[0]
+            other.ticket_add(ticket, ticket_owner_id(unit), "read", "names", ".", [findings[0].path], [definition.rule_id])
+            before = other.queued_tickets(ticket_owner_id(unit))[0]
             output = StringIO()
             with redirect_stdout(output):
                 _ = self.execute(ledger, definition)
-            self.assertEqual(other.queued_tickets(unit)[0], before)
+            self.assertEqual(other.queued_tickets(ticket_owner_id(unit))[0], before)
             self.assertIn(ticket, output.getvalue())
 
     def test_workspace_recovers_claim_committed_before_analysis(self) -> None:
@@ -343,6 +346,12 @@ class WorkspaceRunTests(CargoProjectTests):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root / "gate-home"),
+            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
+        }))
+        _ = self.enterContext(mock.patch.object(style_sync, "gate_owner", return_value="sample-style"))
+
         _ = (self.repo / "Cargo.toml").write_text((self.repo / "Cargo.toml").read_text() + '\n[workspace]\nmembers=[".", "beta"]\n')
         (self.repo / "beta/src").mkdir(parents=True)
         _ = (self.repo / "beta/Cargo.toml").write_text('[package]\nname="beta"\nversion="0.1.0"\nedition="2021"\n')
@@ -469,18 +478,18 @@ class WorkspaceRunTests(CargoProjectTests):
         ledger.set_tip(self.base)
         definition = next(rule for rule in rules.load_rules(self.repo) if rule.name == "prefer-type-named-fields-and-bindings")
         paths = ["src/lib.rs", "beta/src/lib.rs"]
-        ledger.ticket_add("read-1", "read", "read", "names", ".", paths, [definition.rule_id])
-        ledger.ticket_assign("read-1", "main")
-        _ = ledger.ticket_base("read-1")
+        ledger.ticket_add("1001", ticket_owner_id("read"), "read", "names", ".", paths, [definition.rule_id])
+        ledger.ticket_assign("1001", "main")
+        _ = ledger.ticket_base("1001")
         findings: list[ledger_api.HeldFinding] = []
         for index, path in enumerate(paths):
             issue = self.root / ("decision.md" if shared_proposal else f"decision-{index}.md")
             _ = issue.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved rename\n')
             finding = ledger.hold(definition.rule_id, path, 2, (self.repo / path).read_text().splitlines()[1],
-                                  "rename", "old", "number", definition.blob, "read-1")
+                                  "rename", "old", "number", definition.blob, "1001")
             ledger.file_held(finding.finding_id, issue)
             findings.extend(ledger.named_held((finding.finding_id,)))
-        ledger.ticket_drop("read-1")
+        ledger.ticket_drop("1001")
         return ledger, definition, tuple(findings)
 
     def test_queue_refusal_keeps_workspace_tickets_without_finding_dispositions(self) -> None:
@@ -791,13 +800,13 @@ class WorkspaceRunTests(CargoProjectTests):
                       mock.patch.object(run, "claim", side_effect=AssertionError("restart claimed tickets"))):
                     authority = fresh
                     def test_tree(repo: Path, _commit: str, _tree: str, runner: run.Runner,
-                                  times: dict[str, float]) -> run.CommandResult:
+                                  times: dict[str, float], *, owner: str = "") -> run.CommandResult:
                         self.assertNotEqual(run.git(repo, "rev-parse", "HEAD"), self.base)
                         self.assertFalse(intent.retry_eligible())
                         self.assertEqual(journal_owner(), ownership)
                         if case == "tested_interrupt":
                             raise KeyboardInterrupt()
-                        return original_test_tree(repo, _commit, _tree, runner, times)
+                        return original_test_tree(repo, _commit, _tree, runner, times, owner=owner)
                     original_test_tree = run.test_tree
                     with mock.patch.object(run, "test_tree", new=test_tree):
                         if case == "tested_interrupt":
@@ -889,16 +898,16 @@ class WorkspaceRunTests(CargoProjectTests):
 
     def approve_extra_rename(self, ledger: ledger_api.Ledger, definition: rules.Rule,
                              line: int, old: str, new: str, path: str = 'src/lib.rs') -> ledger_api.HeldFinding:
-        ledger.ticket_add('read-extra-1', 'read-extra', 'read', 'names', '.', [path], [definition.rule_id])
-        ledger.ticket_assign('read-extra-1', 'main')
-        _ = ledger.ticket_base('read-extra-1')
+        ledger.ticket_add('14001', ticket_owner_id('read-extra'), 'read', 'names', '.', [path], [definition.rule_id])
+        ledger.ticket_assign('14001', 'main')
+        _ = ledger.ticket_base('14001')
         finding = ledger.hold(definition.rule_id, path, line,
                               (self.repo / path).read_text().splitlines()[line - 1],
-                              'rename', old, new, definition.blob, 'read-extra-1')
+                              'rename', old, new, definition.blob, '14001')
         proposal = self.root / 'decision-extra.md'
         _ = proposal.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved extra rename\n')
         ledger.file_held(finding.finding_id, proposal)
-        ledger.ticket_drop('read-extra-1')
+        ledger.ticket_drop('14001')
         return finding
 
     def setup_field_reference(self, tail: str = '') -> tuple[ledger_api.Ledger, rules.Rule, tuple[ledger_api.HeldFinding, ...]]:
@@ -1191,9 +1200,9 @@ class WorkspaceRunTests(CargoProjectTests):
         definition = next(rule for rule in rules.load_rules(self.repo) if rule.name == 'no-magic-values')
         ledger.set_tip(self.base)
         paths = ['src/worker.rs', 'beta/src/worker.rs']
-        ledger.ticket_add('values-read-1', 'values-read', 'read', 'values', '.', paths, [definition.rule_id])
-        ledger.ticket_assign('values-read-1', 'main')
-        _ = ledger.ticket_base('values-read-1')
+        ledger.ticket_add('11001', ticket_owner_id('values-read'), 'read', 'values', '.', paths, [definition.rule_id])
+        ledger.ticket_assign('11001', 'main')
+        _ = ledger.ticket_base('11001')
         identities: list[str] = []
         for index, (path, line, after, answer) in enumerate((
             (paths[0], 2, 'Add `const FIRST: usize = 42;` in constants.rs.', ''),
@@ -1201,13 +1210,13 @@ class WorkspaceRunTests(CargoProjectTests):
             (paths[0], 3, 'Compute a better value instead.', ''),
             (paths[0], 4, 'Add `const THIRD: usize = 44;` in constants.rs.', 'declined'),
         )):
-            issue = self.root / f'values-{index}.md'
+            issue = self.root / f'{44000 + index}.md'
             _ = issue.write_text('---\nstatus: open\n' + (f'style_answer: {answer}\n' if answer else '') + '---\nValues decision\n')
             finding = ledger.hold(definition.rule_id, path, line, source.splitlines()[line - 1],
-                                  'restructure', str(40 + line), after, definition.blob, 'values-read-1')
+                                  'restructure', str(40 + line), after, definition.blob, '11001')
             ledger.file_held(finding.finding_id, issue)
             identities.append(finding.finding_id)
-        ledger.ticket_drop('values-read-1')
+        ledger.ticket_drop('11001')
         return ledger, definition, ledger.named_held(identities)
 
     def test_values_apply_in_one_tested_commit_and_keep_refusals_filed(self) -> None:
@@ -1375,7 +1384,7 @@ class WorkspaceRunTests(CargoProjectTests):
         ledger, definition, findings = self.setup_values()
         other = next(finding for finding in findings if finding.path.startswith('beta/'))
         assert isinstance(other.state, ledger_api.Filed)
-        ledger.ticket_add('other-values-1', 'other-values', 'proposal', 'values', 'beta', [other.path],
+        ledger.ticket_add('34001', ticket_owner_id('other-values'), 'proposal', 'values', 'beta', [other.path],
                           [definition.rule_id], proposal=str(other.state.proposal), finding_ids=(other.finding_id,))
         report = self.execute(ledger, definition)
         self.assertEqual((report['applied'], report['refused']), (1, 1))
@@ -1444,13 +1453,13 @@ class WorkspaceRunTests(CargoProjectTests):
         selected = run.select(ledger, definition)
         self.assertEqual({f.path for f in selected.findings}, {"src/lib.rs", "beta/src/lib.rs"})
         first, second = findings
-        ledger.ticket_add("other-1", "other", "proposal", "names", "beta", [second.path], [second.rule],
+        ledger.ticket_add("5001", ticket_owner_id("other"), "proposal", "names", "beta", [second.path], [second.rule],
                           proposal=str(cast(ledger_api.Filed, second.state).proposal), finding_ids=(second.finding_id,))
         # Queued tickets own findings too, before any branch is assigned.
         selected = run.select(ledger, definition)
         self.assertEqual([f.finding_id for f in selected.findings], [first.finding_id])
         self.assertEqual([(f.finding_id, f.reason) for f in selected.skipped], [(second.finding_id, "held by another open ticket")])
-        ledger.ticket_drop("other-1")
+        ledger.ticket_drop("5001")
         with closing(sqlite3.connect(ledger.database)) as connection:
             _ = connection.execute("UPDATE held_findings SET state='built' WHERE finding_id=?", (first.finding_id,))
             _ = connection.execute("UPDATE held_findings SET state='withdrawn' WHERE finding_id=?", (second.finding_id,))
@@ -1508,7 +1517,7 @@ class WorkspaceRunTests(CargoProjectTests):
                                        ("bash", verify, "final-pass", str(report["tested_tree"]))])
         self.assertTrue(all(folder == self.runner.test_checkout for folder, args in self.runner.calls if args[0] == "bash"))
         self.assertNotEqual(self.runner.test_checkout, self.repo)
-        self.assertFalse(self.runner.test_checkout.exists())
+        self.assertTrue((self.runner.test_checkout / ".git").is_dir())
         self.assertEqual(self.runner.test_tree, report["tested_tree"])
         self.assertEqual(self.git("rev-list", "--count", f"{self.base}..HEAD"), "1")
         self.assertIn(f"Tested-Tree: {report['tested_tree']}", self.git("log", "-1", "--format=%B"))
@@ -2082,7 +2091,7 @@ class WorkspaceRunTests(CargoProjectTests):
                 self.runner.mutate_stage = stage
                 with self.assertRaisesRegex(bulk.BulkRenameError, "clean checkout"):
                     _ = run.test_tree(self.repo, self.base, self.tree, self.runner, {})
-                self.assertFalse(self.runner.test_checkout.exists())
+                self.assertTrue((self.runner.test_checkout / ".git").is_dir())
                 self.assertEqual(self.runner.calls[-1][1][2], stage)
 
     def test_hidden_untracked_test_output_never_publishes_or_keeps_the_batch_commit(self) -> None:
@@ -2106,7 +2115,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
         self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == "bash"], ["final"])
-        self.assertFalse(self.runner.test_checkout.exists())
+        self.assertTrue((self.runner.test_checkout / ".git").is_dir())
         self.assertFalse(tuple(ticket for ticket in ledger.proposal_tickets()
                                if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
         self.assertTrue(all(isinstance(f.build_ticket, ledger_api.NoBuildTicket)

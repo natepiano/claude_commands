@@ -14,12 +14,10 @@ from scripts.build_queue.queue_lines import (
     clip,
     cut_tail,
     json_form,
-    pad_left,
-    pad_right,
     plain,
-    terminal_width,
     wrap,
 )
+from scripts.lib.terminal_cells import terminal_width
 
 
 def styled_letters(lines: Sequence[Line]) -> list[tuple[str, str, bool]]:
@@ -36,16 +34,6 @@ class StepAgeTests(unittest.TestCase):
 
 
 class CellWidthTests(unittest.TestCase):
-    def test_padding_aligns_columns_by_cells_and_keeps_overflow_intact(self) -> None:
-        self.assertEqual(pad_left("界7", 6), "   界7")
-        self.assertEqual(pad_right("界7", 6), "界7   ")
-        self.assertEqual(pad_left("e\u0301", 3), "  e\u0301")
-        self.assertEqual(pad_right("e\u0301", 3), "e\u0301  ")
-        for text, cells in (("nextest", 3), ("界", 2), ("", 0)):
-            with self.subTest(text=text, cells=cells):
-                self.assertEqual(pad_left(text, cells), text)
-                self.assertEqual(pad_right(text, cells), text)
-
     def test_cut_tail_reserves_a_cell_for_the_ellipsis_only_on_overflow(self) -> None:
         for text, cells, expected in (("worker", 6, "worker"), ("worker", 8, "worker"),
                                       ("worker", 4, "wor…"), ("worker", 1, "…"),
@@ -80,9 +68,9 @@ class WrappingTests(unittest.TestCase):
 
     def test_word_wrap_uses_the_requested_hanging_indent_and_retains_styles(self) -> None:
         line = (Span("Waits on ", "default", True), Span("memory pressure", "error"),
-                Span(" and budget", "warning"))
+                Span(" and room", "warning"))
         lines = wrap(line, 20, indent=4)
-        self.assertEqual(plain(lines), "Waits on memory\n    pressure and\n    budget")
+        self.assertEqual(plain(lines), "Waits on memory\n    pressure and\n    room")
         self.assertEqual(styled_letters(lines), styled_letters([line]))
         self.assertTrue(all(terminal_width(plain([row])) <= 20 for row in lines))
 

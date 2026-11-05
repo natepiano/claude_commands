@@ -4,11 +4,42 @@ from __future__ import annotations
 
 import unittest
 import json
+import os
+from dataclasses import replace
 from typing import cast
+from unittest.mock import patch
 from scripts.direct.implement_launcher_claude_test_support import ClaudeLauncherFixture
+from scripts.production import staff, worker_admission
+from scripts.production.staff_test_support import CHECKOUT, fixture_worker, isolated_staff_file, transcript_fixture, stopped_worker_module
 
 
 class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
+    def test_codex_slot_uses_claude_start_and_receives_the_extract_after_publication(self) -> None:
+        run = self.start_phase("codex-to-claude")
+        with isolated_staff_file(self.root / "staff.json", {}):
+            old = fixture_worker(self.working_dir.name + "-impl", staff.native_id(self.staff_parent),
+                                 backend=staff.CodexBackend(self.root / ".codex"))
+        source, evidence = transcript_fixture(old, staff.CodexBackend(self.root / ".codex"))
+        reference = run / "impl_worker_impl.json"
+        _ = reference.write_text(json.dumps({"staff_id": old.id, "slot": "impl", "model": "gpt-6"}))
+        modules = stopped_worker_module(self.root / "switch-modules")
+        environment = self.environment()
+        environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
+        with patch.object(self, "environment", return_value=environment):
+            result = self.claude_launch(run, "sonnet:low")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = self.recorded_worker(run)
+        self.assertNotEqual(current.current_session, old.current_session)
+        self.assertEqual(current, replace(old, current_session=current.current_session))
+        rows = cast(list[dict[str, object]], json.loads((self.root / "staff-at-work.json").read_text()))
+        self.assertIn(current.to_json(), rows)
+        prompt = (self.root / "opening-message.txt").read_text()
+        extract = worker_admission.handoff_path(run, old)
+        self.assertLess(prompt.index(str(extract)), prompt.index(str(source)))
+        self.assertIn(evidence[0][0], extract.read_text())
+        stored = cast(dict[str, object], json.loads(reference.read_text()))
+        self.assertEqual((stored["staff_id"], stored["slot"]), (old.id, "impl"))
+
     def test_claude_repair_in_the_impl_slot_keeps_a_distinct_worker_identity(self) -> None:
         run = self.start_phase("claude-repair-identity")
         first = self.claude_launch(run, "sonnet:low")
@@ -20,8 +51,12 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual((run / "impl_worker_impl.json").read_bytes(), original)
         identity = cast(dict[str, object], json.loads((run / "impl_worker_fix.json").read_text()))
         original_identity = cast(dict[str, object], json.loads(original))
-        self.assertNotEqual(identity["name"], original_identity["name"])
-        self.assertEqual(identity["family"], "claude")
+        self.assertNotEqual(identity["staff_id"], original_identity["staff_id"])
+        account = cast(dict[str, str], json.loads((self.root / "launch_environment.json").read_text()))
+        with isolated_staff_file(self.root / "staff.json", {
+            "CLAUDE_CONFIG_DIR": account["CLAUDE_CONFIG_DIR"] or str(self.root / ".claude"),
+        }):
+            self.assertIsInstance(staff.local_snapshot().backends[self.recorded_worker(run, "fix").id], staff.ClaudeBackend)
         self.assertFalse((run / "mesh_roster.json").exists())
 
     def test_claude_fresh_refusal_preserves_artifacts_and_opens_no_pass_or_process(self) -> None:
@@ -69,7 +104,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual(len(workers), 1)
         self.assertEqual(workers[0]["parent"], self.environment()["CODEX_THREAD_ID"])
         identity = cast(dict[str, object], json.loads((run / "impl_worker_impl.json").read_text()))
-        self.assertEqual(workers[0]["id"], identity["worker_id"])
+        self.assertEqual(workers[0]["id"], identity["staff_id"])
         self.assertEqual((self.root / "opening-message.txt").read_bytes(), self.prompt_file.read_bytes())
 
 

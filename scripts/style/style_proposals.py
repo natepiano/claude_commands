@@ -34,7 +34,7 @@ from approved_renames import (ApprovedRename, BindingRename, BindingScope, NoApp
 from add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
 from declarations import declaration_line
 from issues import Issue, frontmatter, open_issues, plain
-from production_units import cell_value, plan_cell_is_retired, unit_table
+from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
                             UnansweredDecision, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from unit_files import file_text, git, unit_file_holders
@@ -295,17 +295,29 @@ def decision_kind(findings: tuple[style_ledger.HeldFinding, ...],
 
 @dataclass(frozen=True)
 class FamilyUnit:
-    """The live unit of the standing style production that builds one family's decisions, with its Plan cell."""
+    """The live unit of the standing style production that builds one family's decisions, with its `.unit.toml` plan."""
     unit: str
     plan: str
 
 
 def family_units(doc: Path) -> dict[rules.Family, FamilyUnit]:
+    record = staff.snapshot()
+    resolver = session_staff.RowResolver(record)
+    try:
+        rows = unit_lookup.doc_units(doc, record)
+    except staff.StaffUnreadable as error:
+        raise style_ledger.LedgerError(str(error)) from error
     units: dict[rules.Family, FamilyUnit] = {}
-    for row in unit_table(doc.read_text().splitlines()):
-        family = rules.style_family(cell_value(row["Unit"]))
-        if not isinstance(family, rules.NotStyleUnit) and not plan_cell_is_retired(row.get("Plan", "")):
-            units[family] = FamilyUnit(cell_value(row["Unit"]), cell_value(row["Plan"]))
+    for row in rows:
+        unit = unit_names.unit_id(row.name)
+        family = rules.style_family(unit)
+        if isinstance(family, rules.NotStyleUnit) or isinstance(row.worktree, staff.RemovedWorktree):
+            continue
+        match resolver.unit_config(row):
+            case unit_config.UnitConfig(plan=unit_config.PlanFile(path)):
+                units[family] = FamilyUnit(unit, path.as_posix())
+            case _:
+                continue
     return units
 
 
@@ -945,10 +957,18 @@ def candidates(ledger: style_ledger.Ledger) -> None:
     groups: dict[str, list[style_ledger.RuleCandidate]] = defaultdict(list)
     for candidate in ledger.rule_candidates():
         groups[candidate.idea].append(candidate)
+    unavailable: set[str] = set()
     for idea, items in sorted(groups.items()):
         print(idea)
         for item in items:
-            print(f"  {item.path}:{item.line} — {item.ticket} ({item.unit})")
+            try:
+                owner = ledger.unit_name(item.unit)
+            except style_ledger.LedgerError as error:
+                if item.ticket not in unavailable:
+                    print(f"anomaly: ticket {item.ticket}: " + " ".join(str(error).splitlines()))
+                    unavailable.add(item.ticket)
+                continue
+            print(f"  {item.path}:{item.line} — {item.ticket} ({owner})")
 
 
 def drop_candidate(ledger: style_ledger.Ledger, idea: str) -> None:

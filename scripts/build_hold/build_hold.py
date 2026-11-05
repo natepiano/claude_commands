@@ -37,9 +37,13 @@ from target_config import ConfigError, SshTarget, read_targets
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
-    from ..build_queue import admission_client, admission_protocol
+    from ..build_queue import admission_service
+    from ..buildlog import store
+    from ..message import session_send
 else:
-    from scripts.build_queue import admission_client, admission_protocol
+    from scripts.build_queue import admission_service
+    from scripts.buildlog import store
+    from scripts.message import session_send
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -564,10 +568,13 @@ def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> Own
 
 
 def admitted_processes() -> frozenset[ProcessIdentity]:
-    """Read reservation owners from the bounded service view."""
-    reading = admission_client.view()
-    return frozenset(ProcessIdentity(row["pid"], row["start_time"])
-                     for row in reading.explanation.decided_from.reservations)
+    """Read durable grants, which precede replies and the next decision pass."""
+    try:
+        state = admission_service.read_state(store.root() / "admission")
+    except (OSError, ValueError) as error:
+        raise OSError(f"admission state unavailable: {error}") from error
+    return frozenset(ProcessIdentity(record.owner.pid, record.owner.start_time)
+                     for record in state.reservations.values())
 
 
 def owner_is_sole_holder(owner: OwningSession | NoOwningSession, holders: Sequence[Holder]) -> bool:
@@ -590,10 +597,7 @@ def hold_enforcer() -> HoldEnforcer:
 
 def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
     processes = read_audit_processes(proc_root)
-    try:
-        admitted = admitted_processes()
-    except admission_protocol.AdmissionUnavailable as error:
-        raise OSError(f"admission service unavailable: {error.reason}") from error
+    admitted = admitted_processes()
     builds: list[AuditedBuild] = []
     children: dict[int, list[ProcessIdentity]] = {}
     roots: list[AuditProcess] = []
@@ -1420,10 +1424,9 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
 
 def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
     """Tell a recipient to start its builds; the memory gate orders them."""
-    script = Path(__file__).resolve().parent.parent / "message" / "send.py"
     notice = f"{RELEASE_NOTICE} Session {entry['session_id']}."
     try:
-        result = subprocess.run([sys.executable, str(script), "--to", f"uds:{socket}", "--text", notice], capture_output=True, text=True)
+        result = subprocess.run(session_send.send_argv("--to", f"uds:{socket}", "--text", notice), capture_output=True, text=True)
     except OSError as error:
         return ReleaseSendFailed(str(error))
     if result.returncode == 0:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import subprocess
 import sys
 import unittest
@@ -15,6 +16,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import write_registry
+from scripts.accounts.home_test_support import scratch_accounts_config
+from scripts.message import send_budget
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 import review
@@ -25,6 +28,7 @@ from user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_TELL_USER, REFUSAL_ACTION, REGISTRY as REGISTRY
 
 setUpModule = support.setUpModule
+REAL_RELAY = quota_alert.relay
 
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
@@ -68,6 +72,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_user_delivery_names_success_process_failure_and_launch_failure(self) -> None:
         push = render("quota.claude_next_move", account="claude2", remaining="0%")
         for code, line, expected in ((0, "SENT: to the user", quota_alert.PushSent()),
+                                     (6, "RETRY: active", quota_alert.PushFailed("RETRY: active")),
                                      (3, "FAILED: channel unavailable", quota_alert.PushFailed("stdout: FAILED: channel unavailable"))):
             with self.subTest(code=code), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, line, "")):
                 self.assertEqual(REAL_TELL_USER(push), expected)
@@ -85,7 +90,24 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertEqual(float(command[command.index("--timeout") + 1]), review.user_send_seconds())
             self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 140)
             self.assertNotIn("input", run.call_args.kwargs)
-        self.assertEqual(quota_alert.RELAY_TIMEOUT, 40)
+            self.assertIsNone(REAL_RELAY("fixture", "message", None))
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(command[command.index("--timeout") + 1], "30")
+            self.assertEqual(run.call_args.kwargs["timeout"], send_budget.seconds(30))
+
+    def test_relay_reads_the_current_account_timeout(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        for name in ("send", "postmaster", "codex_daemon"):
+            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf", config.with_name(f"{name}.conf"))
+        original = config.read_text()
+        done = subprocess.CompletedProcess([], 0, "SENT: fixture", "")
+        for limit in (40, 55):
+            _ = config.write_text(original.replace("quota_relay_timeout_seconds=40", f"quota_relay_timeout_seconds={limit}"))
+            with self.subTest(limit=limit), mock.patch.object(subprocess, "run", return_value=done) as run:
+                self.assertIsNone(REAL_RELAY("fixture", "message", None))
+                command = cast(list[str], run.call_args.args[0])
+                self.assertEqual(command[command.index("--timeout") + 1], str(limit - quota_alert.KILL_GRACE))
+                self.assertEqual(run.call_args.kwargs["timeout"], send_budget.seconds(limit - quota_alert.KILL_GRACE))
 
     def test_failed_codex_reminder_retries_phone_delivery_without_session_alerts(self) -> None:
         config = quota_alert.load_config()
@@ -184,6 +206,7 @@ class RelayOutcomeTests(unittest.TestCase):
         for code, header, expected in ((0, "SENT", None), (0, "SKIPPED", None),
                                       (0, "KEPT", None), (0, "REPLACED", None),
                                       (1, "QUEUED", "QUEUED: fixture detail"),
+                                      (6, "RETRY", "RETRY: fixture detail"),
                                       (3, "FAILED", "stdout: FAILED: fixture detail"),
                                       (2, "REFUSED", "stdout: REFUSED: fixture detail"),
                                       (4, "HELD", "stdout: HELD: fixture detail"),

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import unit_membership, fixture_member, fixture_runtime_id
 
 import json
 import io
@@ -12,7 +12,6 @@ from dataclasses import FrozenInstanceError
 import os
 import re
 import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -25,7 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -119,7 +118,7 @@ raise SystemExit(1)
             self.children.append(child)
             pid = child.pid
         for unit in self.hosted_units:
-            if name in (unit.session, unit.marks.get("SHOWRUNNER_UNIT_ID"), unit.marks.get("SHOWRUNNER_UNIT_ID", "").removesuffix("-unit")):
+            if name == unit.session or session_id == unit.marks.get("CODEX_THREAD_ID"):
                 fake_unit_host.place_process(self.environment(), pid, unit.pane)
         _ = (self.sessions / f"{pid}.json").write_text(json.dumps({
             "pid": pid, "name": name, "sessionId": session_id,
@@ -197,22 +196,29 @@ raise SystemExit(1)
         sent = [cast(list[str], json.loads(line)) for line in self.sent.read_text().splitlines()]
         return [(one[one.index("--to") + 1], one[one.index("--text") + 1]) for one in sent]
 
+    def parent_receipt(self, child: str) -> Path:
+        """Select the private owner's parent receipt."""
+        row = staff.snapshot().by_path(child)
+        assert row is not None
+        return self.state / row.id / "parent"
+
     def stored_parent(self, child: str, parent: str) -> None:
-        """Write a parent file by hand, as `attach` never would for a missing parent or a cycle."""
-        (self.state / child).mkdir(parents=True, exist_ok=True)
-        _ = (self.state / child / "parent").write_text(f"{parent}\n")
+        """Write a private parent receipt for missing-parent and cycle tests."""
+        path = self.parent_receipt(child)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(f"{parent}\n")
 
     def recorded_parent(self, child: str, parent: str) -> None:
         """Prepare authoritative edges alongside the legacy files still written by tools."""
         record = staff.initial_snapshot()
         parent_row = record.by_path(parent) or fixture_member("showrunner", name=parent)
         child_row = record.by_path(child) or fixture_member("showrunner", name=child)
-        _ = staff.move(child_row.id, parent_row.id)
+        _ = staff.move(child_row.id, staff.ReportsTo(parent_row.id))
         self.stored_parent(child, parent)
 
     def unit_session(self, unit: str, pane: str) -> None:
         """Give the production `show` one marked herdr pane."""
-        marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": unit}
+        marks: dict[str, str] = {"CODEX_THREAD_ID": unit_membership("show", unit).current_session}
         self.hosted_units.append(HostedUnit(f"label-of-{unit}", pane, marks))
         fake_unit_host.write(self.environment(), self.hosted_units)
 
@@ -292,27 +298,25 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
                 else:
                     _ = source.write_text('{"complete": true}\n')
 
-                def interrupted_copy(source: Path, destination: Path) -> None:
-                    if source.is_dir():
-                        destination.mkdir()
-                        _ = (destination / "first").write_text("partial")
-                    else:
-                        _ = destination.write_text("partial")
+                owner_id = fixture_runtime_id(f"adoption-owner:{name}")
+
+                def interrupted_copy(destination: Path, data: bytes) -> None:
+                    if directory:
+                        write_bytes_atomic(destination, data)
                     raise InterruptedError("copy stopped")
 
-                with mock.patch.object(shutil, "copytree" if directory else "copy2",
-                                       side_effect=interrupted_copy), self.assertRaises(InterruptedError):
-                    _ = showrunners.copy_session_state(name, scratch)
-                copied = showrunners.copy_session_state(name, scratch)
+                with mock.patch.object(showrunners, "write_bytes_atomic", side_effect=interrupted_copy), self.assertRaises(InterruptedError):
+                    _ = showrunners.copy_session_state(owner_id, scratch)
+                copied = showrunners.copy_session_state(owner_id, scratch)
                 self.assertEqual(copied, [name])
-                target = showrunners.session_state_dir(name) / name
+                target = showrunners.session_state_dir(owner_id) / name
                 if directory:
                     self.assertEqual({p.name: p.read_bytes() for p in target.iterdir()},
                                      {p.name: p.read_bytes() for p in source.iterdir()})
                 else:
                     self.assertEqual(target.read_bytes(), source.read_bytes())
                 self.assertEqual(sorted(p.name for p in target.parent.iterdir()), [name])
-                self.assertEqual(showrunners.copy_session_state(name, scratch), [])
+                self.assertEqual(showrunners.copy_session_state(owner_id, scratch), [])
 
     def test_checked_doc_reads_absolute_path_after_check_script(self) -> None:
         directory = self.notifier / "showrunner-check"

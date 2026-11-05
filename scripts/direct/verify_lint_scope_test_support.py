@@ -5,7 +5,7 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import cache_file_name
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
 import json
 import os
@@ -70,8 +70,22 @@ from pathlib import Path
 import sys
 
 arguments = sys.argv[1:]
-with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
-    output.write(json.dumps({"args": arguments}) + "\n")
+version_tools = {
+    ("mend", "--version"): "MEND",
+    ("+nightly", "fmt", "--version"): "RUSTFMT",
+    ("clippy", "--version"): "CLIPPY",
+}
+version_tool = version_tools.get(tuple(arguments))
+# Existing scope tests also record the rustfmt availability check.
+if not version_tool or version_tool == "RUSTFMT":
+    with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
+        output.write(json.dumps({"args": arguments}) + "\n")
+if version_tool:
+    if "TEST_VERSION_EVENTS" in os.environ:
+        with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
+            output.write(version_tool + "\n")
+    print(os.environ.get("TEST_VERSION_" + version_tool, version_tool + " fixture"))
+    raise SystemExit(0)
 if arguments[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
 elif arguments[:1] not in (["mend"], ["clippy"], ["doc"], ["+nightly"]):
@@ -121,6 +135,12 @@ import os
 from pathlib import Path
 import sys
 
+if sys.argv[1:] == ["--version"]:
+    if "TEST_VERSION_EVENTS" in os.environ:
+        with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
+            output.write("TAPLO\n")
+    print(os.environ.get("TEST_VERSION_TAPLO", "taplo fixture"))
+    raise SystemExit(0)
 with Path(os.environ["TEST_TAPLO_EVENTS"]).open("a", encoding="utf-8") as output:
     output.write(json.dumps({"args": sys.argv[1:], "cwd": str(Path.cwd())}) + "\n")
 status = int(os.environ["TEST_TAPLO_STATUS"])
@@ -228,7 +248,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         interpreter_cache.parent.mkdir()
         _ = interpreter_cache.write_text(sys.executable + "\n", encoding="utf-8")
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
         _ = (self.root / "Cargo.toml").write_text(
@@ -389,10 +409,11 @@ raise SystemExit(128 + signal if signal else result.returncode)
     def isolate_path_without_taplo(self) -> None:
         tools = self.root / "tools"
         tools.mkdir()
+        hash_tool = "sha256sum" if shutil.which("sha256sum") else "shasum"
         for name in (
             "bash", "python3", "awk", "cat", "cut", "date", "dirname", "env", "grep",
             "head", "mkdir", "mktemp", "mv", "ps", "rm", "sed", "sleep",
-            "sort", "tail", "tee", "tr", "uname", "wc",
+            "sort", "tail", "tee", "tr", "uname", "wc", hash_tool,
         ):
             executable = shutil.which(name)
             if executable is None:

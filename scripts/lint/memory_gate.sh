@@ -10,6 +10,10 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_queue" && pwd)/admission_client.py"
 
+# Each new wait uses its own identity. Rejoining callers restore it after sourcing.
+BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_MEM_WAIT_FIRST_FILE=""
+export -n BUILDLOG_MEM_WAIT_SINCE BUILDLOG_MEM_WAIT_FIRST_FILE
+
 buildlog_memory_python() {
     if [[ -x "$HOME/.claude/scripts/lib/py" ]]; then
         "$HOME/.claude/scripts/lib/py" "$@"
@@ -41,11 +45,17 @@ build_hold_nothing_held() {
 # no call record.
 BUILDLOG_HOLD_CALL_ID="${BUILDLOG_HOLD_CALL_ID:-}" BUILDLOG_HOLD_CALLER=""
 
+# Linux target slots and their build budget provide admission on the target.
+buildlog_target_admitted() {
+    [[ "${BUILDLOG_CALLER:-}" == verify-linux ]]
+}
+
 # Status 0 when natedev's hold applies to this step's caller. The Mac leg of a
 # test (verify-mac) and every run on the Mac answer to the Mac's claims, not
 # to natedev's hold. Other callers ask the check when the fast path cannot
 # prove that the holder directory is empty.
 build_hold_applies() {
+    buildlog_target_admitted && return 1
     if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then return 0; fi
     [[ "${BUILDLOG_CALLER:-}" != verify-mac && "${OSTYPE:-}" != darwin* ]] || return 1
     return 0
@@ -150,7 +160,7 @@ buildlog_wait_for_memory() {
     local -
     set -o pipefail
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
-    if [[ "${OSTYPE:-}" == darwin* && -z "${BUILDLOG_MEMINFO+x}" ]]; then
+    if buildlog_target_admitted || [[ "${OSTYPE:-}" == darwin* && -z "${BUILDLOG_MEMINFO+x}" ]]; then
         BUILDLOG_MEM_OUTCOME=Granted
         return 0
     fi
@@ -186,17 +196,7 @@ buildlog_wait_for_memory() {
 buildlog_release_memory() {
     local reservation="${BUILDLOG_MEM_RESERVATION:-}"
     BUILDLOG_MEM_RESERVATION=""
+    export BUILDLOG_MEM_CLEANUP_TIMING
     [[ -n "$reservation" ]] || return 0
     buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true
-}
-
-buildlog_token_wait() {
-    local reservation="${BUILDLOG_MEM_RESERVATION:-}" status=0
-    [[ -n "$reservation" ]] || return 0
-    buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" token-wait "$reservation" >/dev/null || status=$?
-    if (( status != 0 )); then
-        buildlog_memory_refuse "cannot enter token wait (exit $status)"
-        return 2
-    fi
-    BUILDLOG_MEM_RESERVATION=""
 }

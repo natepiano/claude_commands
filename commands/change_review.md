@@ -4,6 +4,21 @@ description: Add a change for the user to check to the top-level showrunner's ch
 
 # Change review
 
+## Bare command
+
+For `/change_review` with no action:
+
+1. Run the page script:
+
+   ```sh
+   "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py"
+   ```
+
+2. Check the printed link with `curl` on the publishing machine.
+3. Give the user only the link, then stop. Say nothing else.
+
+The actions below remain for unit directors and showrunners.
+
 Each top-level showrunner keeps one list of changes waiting for the user's
 check, named for it: `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
 such as `change-review - natedev.md`. A child production's rows go to its
@@ -60,8 +75,9 @@ sees in the app, such as a table's columns or a status line.
 `--due`), `later` or `user`; leave it out for a normal row. `--after` names a
 row that must be checked first.
 
-One row per change, written for a person with no context. Each part is one
-line. `--check` names the machine (natedev or the Mac), the session (a
+One row per change, written for a person with no context.
+The change description uses one line. The check and result can use several lines.
+`--check` names the machine (natedev or the Mac), the session (a
 terminal, a showrunner session, a unit session, any Claude session) and what to
 type; `--see` is what the person then sees. Example: `--change "The unit board
 shows each unit's phase" --check "In a showrunner session on natedev, type
@@ -83,14 +99,7 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 
 ## show
 
-When the user asks to review changes, open the prepared page:
-
-```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py"
-```
-
-1. Check the printed link with `curl` on the publishing machine.
-2. Give the link to the user.
+When the user asks to review changes, follow [Bare command](#bare-command).
 
 The page contains every waiting change, with staff-based showrunner tabs.
 Each row stores its producer's fixed staff id in the Producer cell.
@@ -113,7 +122,7 @@ A failed HTTP save keeps the typed answer, error text, answer form, and waiting 
 A saved verdict shows **Saved: <answer>**.
 Validate yourself removes the row from every waiting count and Next order when the request saves.
 A direct link shows **The showrunner will validate this** without answer buttons.
-Ask a question uses the one-line feedback field.
+Ask a question uses the feedback box.
 It removes the row from every waiting count until the showrunner answers.
 A direct link shows **The showrunner will answer this** without answer buttons.
 Send feedback saves the text unchanged; text that starts with `works` or `fine` can land the change.
@@ -130,6 +139,7 @@ Recovery skips records that a live request owns.
 It ignores legacy failed records and preserves validation ownership and open questions.
 The router alerts `unrouted_alert_recipient` once for each unrouted row and reason.
 It alerts only for a list in the real change-review folder; a list elsewhere never alerts.
+It alerts only from the production staff record; a `STAFF_FILE` override never alerts.
 This config key starts at `natedev`.
 `unrouted_alert_retry_seconds` starts at 60 seconds and accepts 5 through 3600 seconds.
 Both keys are in `config/review_links.conf` and are read when used.
@@ -157,7 +167,9 @@ copy), make it after `add` prints the row's number, never by hand:
 It prints `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Name that path in the row's How to check cell (`edit`). `adopt <path>` with the
 same options moves a folder that already exists there. Without `--visible`
-the folder goes in `/tmp/claude/scratch`. The row's verdict removes both.
+the folder uses the configured scratch root. The row's verdict removes the folder and its owned Cargo outputs.
+Cargo stores final binaries in `target_directory` and intermediates in `build_directory`.
+Check both output filesystems with `df -h` before a large build.
 
 ## verdict
 
@@ -209,6 +221,7 @@ Use the `verdict` command above for both. The row stays out of the user's count 
 ```
 
 The row returns to the user's count with the question and answer below the change.
+The answer and cells can hold several lines; lines that start with `- ` or `1. ` show as lists.
 The user can give a verdict or ask another question.
 The same question ID and answer text change nothing and exit 0 on a rerun.
 The command refuses an old or unknown ID, a different answer, or a row without an open question.
@@ -221,29 +234,10 @@ counted among the open questions. It goes on this list, and the user asks for
 
 ### Producer ids
 
-The merge writer matches each checkpoint branch to a Units row.
-It reads that row's Worktree path and stores the unit's fixed staff id in Producer.
-An unregistered unit leaves the cell empty and prints one named note.
+The merge writer matches each checkpoint branch to a unit staff row and stores that row's id in Producer.
+A unit with no staff row leaves the cell empty and prints one named note.
 For `add`, `--repo` selects the directory; the default is `.`.
 A unit worktree stores its id.
 A showrunner directory or an unowned directory leaves the cell empty.
 The page, status line, and `/next` use one staff routing rule.
 The owner's staff showrunner supplies the production document, even when the list's document reference is missing.
-
-1. Run `change_review.py backfill-producer [--list <path>]` to inspect older rows.
-2. Run the command with `--write` to fill mapped Producer cells.
-3. Read each named report for an unmapped row.
-
-The command searches To review and Reviewed.
-It uses the checkpoint's Change-Review text when a merge contains several units.
-If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
-It matches old Branch, Plan, and Unit names through retained Worktree paths.
-When that lookup fails, the command removes `build-followups-` from the checkpoint name.
-Exactly one staff unit with the remaining name supplies the id. Retired units count.
-Zero or several matches leave Producer empty. A valid Worktree result wins.
-It copies each changed list to `<name>.backup-<timestamp>` before the locked write.
-An unmapped row stays empty.
-A repeated run changes nothing.
-After the lists are filled, remove `scripts/production/producer_backfill.py`, including its adapter.
-Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
-Remove `scripts/production/test_producer_backfill.py`.

@@ -2,6 +2,7 @@
 """Install the repository's messaging instructions in Codex AGENTS.md.
 
 codex/AGENTS-messaging.md supplies the generated messaging block and its registered phone paths.
+That source requires a filed question and --question for decision.choices.
 After editing either, run this installer once here and once with --machine mac.
 """
 

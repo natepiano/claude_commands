@@ -7,7 +7,7 @@ import io
 import os
 import shutil
 import unittest
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +15,8 @@ from typing import IO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.production import session_staff, staff
+from scripts.production import rename_unit, session_staff, staff
+from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, fixture_showrunner_name, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
@@ -23,11 +24,9 @@ from scripts.production.update_registration_test_support import RegistrationFixt
 import dailies_input
 import footer_counts
 import next_item
-import rename_state
 import tidy_wrapped
 from scripts.hooks import showrunner_footer
 
-from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
 
 class RegistrationTests(RegistrationFixture):
@@ -147,7 +146,7 @@ class RegistrationTests(RegistrationFixture):
         prompt = prompts[0].read_text(encoding="utf-8")
         self.assertIn("unit_status.txt", prompt)
         self.assertIn("/showrunner:dailies gantt", prompt)
-        state_dir = self.state / "showrunner" / self.doc.name.removesuffix("-production.md") / "session"
+        state_dir = self.state / "showrunner" / self.fixture_staff_id() / "session"
         self.assertEqual(prompt.count(f"Pass `--render-state {state_dir}/dailies_state.json` to the builder"), 1)
         self.assertIn(f"unit_status.sh {state_dir}/unit_status ", prompt)
         self.assertNotIn("<STATE_DIR>", prompt)
@@ -167,11 +166,6 @@ class QuestionIdentityTests(RegistrationFixture):
         super().setUp()
         self.issues = self.root / "issues"
         self.issues.mkdir(exist_ok=True)
-        text = self.doc.read_text(encoding="utf-8")
-        if "- **Proposals:**" not in text:
-            _ = self.doc.write_text(text.replace("## Units", f"- **Proposals:** `{self.issues}`\n\n## Units"),
-                                    encoding="utf-8")
-            _ = self.git("commit", "-qam", "Set the private proposals folder")
         self.timer("example")
         parent = showrunner_relationship(fixture_showrunner_name("example", self.doc))
         self.asker_id = fixture_member("unit", name="alpha", parent=parent.id,
@@ -241,10 +235,11 @@ class QuestionIdentityTests(RegistrationFixture):
         _ = self.outstanding().write_text(json.dumps([legacy]))
         self.migrate()
         with self.forbid_legacy_question_access():
+            owner = registration.QuestionStaff.read().owner(self.doc)
             after = next_item.read_queue("question", self.doc)
-        self.assertEqual(after.name, "question-example")
+        self.assertEqual(after.name, f"question-{owner.id}")
         self.assertEqual(len(after.entries), 1)
-        self.assertEqual(after.entries[0].key, "example: Choose the layout")
+        self.assertEqual(after.entries[0].key, f"{owner.id}: Choose the layout")
         self.assertEqual(after.entries[0].item,
                          "example [user], since Tue Oct 06 08:00, asked by alpha-unit: Keep the layout?")
 
@@ -302,9 +297,20 @@ class QuestionIdentityTests(RegistrationFixture):
         self.file_question()
         self.migrate()
         before = {path: path.read_bytes() for path in self.issues.glob("*.md")}
+        row = staff.by_id(self.asker_id)
+        assert row is not None
+        removed = self.root / "removed-asker-worktree"
+        self.assertFalse(removed.exists())
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", removed),
+                                 expected=row.worktree)
+        displays = RenameDisplays(row, live=False)
         with (self.forbid_legacy_question_access(),
-              mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner")):
-            self.assertFalse(rename_state.rename_outstanding("example", (("alpha-unit", "renamed-unit"),)))
+              displays.installed(), redirect_stdout(io.StringIO())):
+            _ = rename_unit.apply("example", "alpha", "renamed")
+            renamed = staff.by_id(self.asker_id)
+            assert renamed is not None
+            self.assertEqual((renamed.id, renamed.name), (self.asker_id, "renamed"))
+            _ = rename_unit.apply("example", "renamed", "renamed")
         self.assertEqual({path: path.read_bytes() for path in self.issues.glob("*.md")}, before)
         self.assertEqual(self.question_rows()[0]["asked_by"], self.asker_id)
 
@@ -403,6 +409,27 @@ class QuestionIdentityTests(RegistrationFixture):
         self.migrate()
         self.assertEqual(self.store_snapshot(), before)
 
+    def test_next_keeps_local_items_when_a_remote_child_has_a_local_reminder(self) -> None:
+        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout"})
+        parent = staff.by_id(self.asker_id)
+        assert parent is not None
+        child = fixture_member("showrunner", name="remote-child", parent=parent.parent,
+                               doc=staff.LiveDoc("macbook", self.doc.with_name("remote-child-production.md")))
+        reminder = self.outstanding().with_name("remote-child.json")
+        _ = reminder.write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "Choose the compiler"}]))
+        before = reminder.read_bytes()
+        errors = io.StringIO()
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            identities = registration.QuestionStaff.read()
+            self.assertIn(child.name, identities.slugs("example", below=True))
+            self.assertNotIn(child.name, identities.documents())
+            owner = identities.owner(self.doc)
+            with redirect_stderr(errors):
+                queue = next_item.read_queue("question", self.doc, below=True, record=identities.record)
+        self.assertEqual([entry.key for entry in queue.entries], [f"{owner.id}: Choose the layout"])
+        self.assertEqual(errors.getvalue().splitlines(), ["questions: remote-child: ownership evidence is unavailable"])
+        self.assertEqual(reminder.read_bytes(), before)
+
     def test_descendant_without_a_timer_remains_in_next_and_answer_search(self) -> None:
         child_doc = self.document_for("child")
         parent = staff.by_id(self.asker_id)
@@ -414,7 +441,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertFalse((self.state / "notifier/showrunner-child").exists())
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             queue = next_item.read_queue("question", self.doc, below=True)
-        self.assertEqual([entry.key for entry in queue.entries], ["child: Choose the compiler"])
+        self.assertEqual([entry.key for entry in queue.entries], [f"{child.id}: Choose the compiler"])
         answer = self.run_command("answer", "--item", "Choose the compiler")
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assertIn("child: Choose the compiler", answer.stdout)
@@ -439,8 +466,8 @@ class QuestionIdentityTests(RegistrationFixture):
     def test_footer_ignores_questions_when_the_document_has_no_local_staff_owner(self) -> None:
         self.file_question()
         owner = staff.by_id(self.asker_id)
-        assert owner is not None and owner.parent is not None
-        _ = staff.set_doc(owner.parent, staff.LiveDoc("macbook", self.doc))
+        assert owner is not None and isinstance(owner.parent, staff.ReportsTo)
+        _ = staff.set_doc(owner.parent.id, staff.LiveDoc("macbook", self.doc))
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
                             showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
@@ -476,7 +503,7 @@ class QuestionIdentityTests(RegistrationFixture):
     def test_answer_resolves_the_fixed_asker_after_a_transfer(self) -> None:
         self.file_question()
         destination = fixture_member("showrunner", name="destination")
-        _ = staff.move(self.asker_id, destination.id)
+        _ = staff.move(self.asker_id, staff.ReportsTo(destination.id))
         references: list[str] = []
         resolve = staff.StaffSnapshot.by_member_reference
 
@@ -605,6 +632,28 @@ class QuestionIdentityTests(RegistrationFixture):
         rows = self.question_rows()
         self.assertEqual(rows[0]["asked_by"], self.asker_id)
         self.assertEqual(rows[0]["review_unavailable"], "fixture timeout")
+
+    def test_open_and_answer_use_the_document_owner_without_a_timer_after_rename(self) -> None:
+        self.file_question()
+        owner = staff.snapshot().by_doc("natedev", self.doc)
+        assert owner is not None
+        timer = self.state / "notifier/showrunner-example"
+        shutil.rmtree(timer)
+        _ = staff.rename(owner.id, "different-display-name")
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            identities = registration.QuestionStaff.read()
+            self.assertNotIn("example", identities.sources.productions)
+            self.assertEqual(identities.documents()["example"], self.doc)
+            self.assertEqual(registration.outstanding_file("example", identities=identities),
+                             self.state / "showrunner/outstanding" / f"{owner.id}.json")
+        listed = self.run_command("open")
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertIn("Keep the layout?", listed.stdout)
+        answered = self.run_command("answer", "--item", "Choose the layout")
+        self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+        self.assertEqual(self.question_rows(), [])
+        self.assertFalse(timer.exists())
+        self.assertFalse((self.state / "showrunner/outstanding/example.json").exists())
 
 
 if __name__ == "__main__":

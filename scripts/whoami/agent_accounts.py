@@ -46,6 +46,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone as setting_zone  # noqa: E402
+from scripts.lib import conf
 from scripts.maintenance.schedule import IntervalHistory
 
 
@@ -539,10 +540,11 @@ def executable(name: str) -> str:
 
 def command_json(*args: str, environment: dict[str, str] | None = None) -> object:
     command = (executable(args[0]), *args[1:])
+    timeout = conf.read("accounts").whole("account_command_timeout_seconds")
     if environment is None:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     else:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=15, env=environment)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, env=environment)
     # Claude reports a signed-out session as JSON with exit 1.
     if result.returncode and (result.returncode != 1 or args != ("claude", "auth", "status")):
         raise RuntimeError("account command failed")
@@ -645,7 +647,7 @@ def codex_home_display(home: Path) -> str:
 
 
 def codex_homes(workers_home: Path | NoWorkersHome) -> list[Path]:
-    """The default home, existing numbered homes, and any other home in use."""
+    """List account homes without an empty numbered copy of the default home's login."""
     default = Path.home() / ".codex"
     numbered: list[tuple[int, Path]] = []
     try:
@@ -658,7 +660,10 @@ def codex_homes(workers_home: Path | NoWorkersHome) -> list[Path]:
     homes = [default, *(home for _, home in sorted(numbered))]
     if isinstance(workers_home, Path) and workers_home not in homes:
         homes.append(workers_home)
-    return homes
+    identity = codex_account(default)
+    return [home for home in homes if not (
+        isinstance(identity, KnownCodexAccount) and home == Path.home() / f".{identity.label}"
+        and not os.path.lexists(home / "auth.json"))]
 
 
 def codex_report_in_use(report: Report, workers_home: Path | NoWorkersHome) -> bool:
@@ -840,7 +845,8 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
                 report.usage_read_outcome = UsageReadOutcome.HELD
                 return report
             report.usage_read_claim = claim
-        opened = cast(http.client.HTTPResponse, urllib.request.urlopen(request, timeout=15))
+        opened = cast(http.client.HTTPResponse, urllib.request.urlopen(
+            request, timeout=conf.read("accounts").whole("claude_usage_timeout_seconds")))
         with opened as response:
             usage = cast(dict[str, object], json.loads(response.read()))
         report.quotas = claude_usage_quotas(usage)
@@ -1006,7 +1012,7 @@ class CodexServer:
         except ProcessLookupError:
             pass
         try:
-            _ = await asyncio.wait_for(self.process.wait(), timeout=3)
+            _ = await asyncio.wait_for(self.process.wait(), timeout=conf.read("accounts").whole("codex_close_timeout_seconds"))
         except asyncio.TimeoutError:
             self.process.kill()
             _ = await self.process.wait()
@@ -1143,7 +1149,7 @@ async def codex_live(home: Path) -> Report:
         numbered = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name)
         if not initialized and home.parent == Path.home() and numbered is not None:
             report.codex_startup = CodexStartupFailure(
-                home, f"/showrunner:accounts setup codex{numbered.group(1)}",
+                home, f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex{numbered.group(1)}",
             )
             report.problem = report.codex_startup.problem
         elif report.email is None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import cast
 from unittest import mock
@@ -19,6 +19,35 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
+    def check_question_reopening(self, minutes: int) -> tuple[str, str]:
+        title = "Choose the layout"
+        first = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+        moment = first
+
+        def now(zone: tzinfo | None = None) -> datetime:
+            return moment.astimezone(zone)
+
+        with (mock.patch.object(registration, "datetime", wraps=datetime, now=now),
+              mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?"))):
+            _ = self.run_ask(title, "Keep this layout?")
+            path = self.question_record_path(title)
+            first_since = self.open_rows()[0]["since"]
+            answered = self.run_command("answer", "--item", title)
+            self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+            self.assertIn("status: closed", path.read_text().splitlines())
+            moment = first + timedelta(minutes=minutes)
+            _ = self.run_ask(title, "Keep this layout?")
+        self.assertEqual(self.question_record_path(title), path)
+        return first_since, self.open_rows()[0]["since"]
+
+    def test_reopening_a_question_in_a_later_minute_changes_since(self) -> None:
+        first, reopened = self.check_question_reopening(1)
+        self.assertNotEqual(reopened, first)
+
+    def test_same_minute_reopening_keeps_since_as_a_documented_limit(self) -> None:
+        first, reopened = self.check_question_reopening(0)
+        self.assertEqual(reopened, first)
+
     def test_question_from_a_linked_checkout_uses_the_showrunner_relative_proposals_folder(self) -> None:
         main = self.checkout
         relative = self.doc.relative_to(main)
@@ -78,18 +107,21 @@ class RegistrationTests(RegistrationFixture):
                           for path in self.state.rglob("*") if path.is_file()}, before)
         self.assertEqual(list((self.root / "issues").iterdir()), [])
 
-    def test_footer_sources_refuses_ambiguous_document_ownership_without_a_traceback(self) -> None:
+    def test_footer_sources_reports_ambiguous_document_ownership_without_a_traceback(self) -> None:
         import footer_counts
 
         document, first, second = self.ambiguous_question_document()
         staff_file = self.state / "staff/staff.json"
         before = staff_file.read_bytes(), staff_file.stat().st_mtime_ns
         def read_sources() -> int:
-            _ = footer_counts.sources(document)
+            for path in footer_counts.sources(document):
+                print(path)
             return 0
 
         result = invoke_cli(footer_counts, read_sources, [], self.env, self.checkout, production_state=True)
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(document), result.stdout.splitlines())
+        self.assertIn("unavailable", result.stderr)
         self.assertIn(str(first), result.stderr)
         self.assertIn(str(second), result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -251,7 +283,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual([item["text"] for item in entries], ["Earlier registration", "retry?"])
 
     def test_stopped_report_replacement_preserves_report_and_rerun_updates_it(self) -> None:
-        reports = self.outstanding().parent.parent / "reports/example.json"
+        reports = self.outstanding().parent.parent / "reports" / self.outstanding().name
         reports.parent.mkdir(parents=True)
         _ = reports.write_text('[{"text":"Earlier report","until":"2026-10-17T09:00"}]\n')
         before = reports.read_bytes()
@@ -293,7 +325,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(json.loads(outstanding.read_text(encoding="utf-8")), [])
 
     def test_questions_state_replaces_reports_only_when_report_to_user_is_present(self) -> None:
-        written = self.outstanding().parent.parent / "reports/example.json"
+        written = self.outstanding().parent.parent / "reports" / self.outstanding().name
         state = self.root / "judgment.json"
         report = {"text": "hanadocs is back", "until": "2026-10-17T09:00"}
         _ = state.write_text(json.dumps({"report_to_user": [report]}), encoding="utf-8")

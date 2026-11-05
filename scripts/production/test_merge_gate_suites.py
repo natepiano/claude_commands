@@ -11,22 +11,65 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    def test_modules_run_the_checkout_runner_and_import_from_the_checkout(self) -> None:
+        runner = self.checkout / "scripts/test_times/module_run.py"
+        source = Path(merge_gate.__file__).resolve().parents[1] / "test_times/module_run.py"
+        marker = self.state / "checkout-runner"
+        self.write(runner, source.read_text().replace(
+            'if __name__ == "__main__":',
+            f'Path({str(marker)!r}).write_text(str(Path(__file__).resolve()))\n\n'
+            + 'if __name__ == "__main__":'))
+        self.write(self.checkout / "checkout_identity.py", 'VALUE = "tested checkout"\n')
+        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE + '''
+    def test_imports_use_the_checkout(self):
+        import checkout_identity
+        self.assertEqual(checkout_identity.VALUE, "tested checkout")
+''')
+        result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(marker.read_text(), str(runner))
+        self.assert_all_modules_started()
+
+    def test_a_missing_checkout_runner_is_refused_before_any_job_starts(self) -> None:
+        runner = self.checkout / "scripts/test_times/module_run.py"
+        runner.unlink(missing_ok=True)
+        result = self.run_gate("--tests-only", "--full")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.strip(), f"REFUSED: test runner not found: {runner}")
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.module_events(), [])
+
     def test_recovery_suites_include_their_real_regression_modules(self) -> None:
         repo = Path(__file__).resolve().parents[2]
-        found = {(suite, merge_gate.test_module_name(repo, suite, path))
-                 for suite, path in merge_gate.discover_test_modules(repo)}
+        found = {(suite, test_module_name(repo, suite, path))
+                 for suite, path in discover_test_modules(repo)}
         self.assertTrue({
             ("release", "test_release.py"), ("claude_to_codex", "test_sync.py"),
             ("new_rust_project", "test_rust_generate.py"), ("validate_and_push", "test_rerun.py"),
             ("exclude", "test_exclude.py"), ("prioritize", "tests/test_renumber.py"),
             ("prioritize", "tests/test_run_watcher.py"),
         }.issubset(found), found)
+
+    def test_discovery_keeps_path_order_and_skips_cache_folders(self) -> None:
+        repo = self.checkout / "discovery"
+        for name in ("z/test_last.py", "a/test_last.py", "a/nested/test_first.py",
+                     "a/__pycache__/test_hidden.py", "__pycache__/test_hidden.py"):
+            self.write(repo / "scripts" / name, "# A fixture module.\n")
+        found = discover_test_modules(repo)
+        self.assertEqual(found, [
+            ("a", repo / "scripts/a/nested/test_first.py"),
+            ("a", repo / "scripts/a/test_last.py"),
+            ("z", repo / "scripts/z/test_last.py"),
+        ])
+        self.assertEqual([test_module_name(repo, suite, path) for suite, path in found],
+                         ["nested/test_first.py", "test_last.py", "test_last.py"])
 
     @gate_suites("prioritize")
     def test_a_nested_suite_module_runs_and_retries_at_its_discovered_path(self) -> None:
@@ -103,7 +146,11 @@ class MergeGateSuitesTests(GateSuitesFixture):
         for row in rows:
             self.assertTrue(Path(row["buildlog"]).is_relative_to(row["tmpdir"]))
             self.assertFalse(Path(row["tmpdir"]).exists())
-        self.assertEqual(set(caller_log.iterdir()), {caller_log / "keep"})
+        gate_records = [cast(dict[str, object], json.loads(line))
+                        for path in caller_log.rglob("*")
+                        if path.is_file() and path != caller_log / "keep"
+                        for line in path.read_text().splitlines()]
+        self.assertEqual([record.get("kind") for record in gate_records], ["gate_run"])
         self.assertEqual((caller_log / "keep").read_text(), "caller log")
         self.assertEqual(list((caller_log / "admission").glob("*.reservation")), [])
         self.assertEqual(list((caller_log / "admission").glob("*.waiting")), [])

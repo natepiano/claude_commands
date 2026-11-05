@@ -5,7 +5,7 @@ Usage: log_backup.py <production doc>
 
 `production_check.sh` runs this for a running production, and the notifier runs that check once per
 scheduled update tick, so every production is covered with no setup of its own. Copies go to
-`<state>/<slug>/log-backups/log-<YYYYmmddTHHMM>.md`, stamped in the production's zone as LOG lines
+`<state>/<staff id>/log-backups/log-<YYYYmmddTHHMM>.md`, stamped in the production's zone as LOG lines
 are, and the newest KEEP stay.
 
 An empty or missing LOG is not copied, so an emptied LOG never pushes out a good copy. A LOG unchanged
@@ -18,8 +18,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from production_units import read_production
-from production_units import Refusal
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production.store_owner import document_id
+from scripts.production import staff
+from scripts.lib.atomic_file import write_bytes_atomic
+from scripts.production.production_doc import Refusal, read_production  # noqa: E402
 
 STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 BACKUPS = "log-backups"
@@ -44,10 +47,7 @@ def backup(log: Path, directory: Path, now: datetime) -> Path | None:
         return None
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / f"log-{now:%Y%m%dT%H%M}.md"
-    # Written beside the target and renamed, so a copy is never seen half-written.
-    scratch = target.with_name(f".{target.name}.{os.getpid()}")
-    _ = scratch.write_bytes(content)
-    _ = scratch.replace(target)
+    write_bytes_atomic(target, content)
     for old in copies(directory)[:-KEEP]:
         old.unlink()
     return target
@@ -59,8 +59,8 @@ def main(arguments: list[str]) -> int:
         return 2
     try:
         production = read_production(Path(arguments[0]))
-        target = backup(production.log, STATE_DIR / production.slug / BACKUPS, datetime.now(production.zone))
-    except (Refusal, OSError) as error:
+        target = backup(production.log, STATE_DIR / document_id(production.doc) / BACKUPS, datetime.now(production.zone))
+    except (Refusal, OSError, staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"log_backup: {error}", file=sys.stderr)
         return 1
     print(f"copied to {target}" if target else "nothing new to copy")

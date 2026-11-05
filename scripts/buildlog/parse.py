@@ -12,8 +12,11 @@ than 0: None means "not measured", never "zero".
 
 from __future__ import annotations
 
+import os
 import re
-from pathlib import PurePath
+import shlex
+from collections.abc import Mapping
+from pathlib import Path, PurePath
 from typing import TypedDict
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
@@ -42,7 +45,6 @@ SUMMARY = re.compile(r"^\s*Summary \[\s*[\d.]+s\]\s+(\d+)(?:/\d+)? tests? run:(.
 NOT_RESULT = frozenset({"START", "DELAY", "RETRY", "CANCEL", "SKIP", "FLAKY", "SETUP"})
 PASSED = frozenset({"PASS", "LEAK", "TMPASS"})
 TIMED_OUT = frozenset({"TIMEOUT", "TMT"})
-SLOW_TEST_S = 1.0
 
 MEND_APPLIED = re.compile(r"^\s*mend: applied\b(.*)$")
 MEND_NONE = re.compile(r"^\s*mend: no\b.*\bfix(?:es)? available")
@@ -103,20 +105,49 @@ def no_facts() -> LogFacts:
     }
 
 
-def command_words(argv: list[str]) -> list[str]:
-    """argv without a leading `env` and its options and NAME=VALUE words."""
-    if not argv or PurePath(argv[0]).name != "env":
-        return argv
-    index = 1
-    while index < len(argv):
-        word = argv[index]
-        if word in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
-            index += 2
-        elif word.startswith("-") or "=" in word:
-            index += 1
+def command_context(argv: list[str], cwd: str, environment: Mapping[str, str]) -> tuple[list[str], str, dict[str, str]]:
+    """Apply env options and assignments before identifying the command."""
+    words, effective = list(argv), dict(environment)
+    if not words or PurePath(words[0]).name != "env":
+        return words, cwd, effective
+    position, options = 1, True
+    while position < len(words):
+        word = words[position]
+        if options and word == "--":
+            options = False
+        elif options and word in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
+            if position + 1 >= len(words):
+                return [], cwd, effective
+            value = words[position + 1]
+            if word in ("-u", "--unset"):
+                _ = effective.pop(value, None)
+            elif word in ("-C", "--chdir"):
+                cwd = str((Path(cwd) / value).resolve())
+            else:
+                words[position:position + 2] = shlex.split(value)
+                continue
+            position += 1
+        elif options and word.startswith("--unset="):
+            _ = effective.pop(word.partition("=")[2], None)
+        elif options and word.startswith("--chdir="):
+            cwd = str((Path(cwd) / word.partition("=")[2]).resolve())
+        elif options and word in ("-i", "--ignore-environment", "-"):
+            effective.clear()
+        elif options and word in ("-v", "--debug"):
+            pass
+        elif "=" in word and not word.startswith("-"):
+            name, _, value = word.partition("=")
+            effective[name] = value
+            options = False
         else:
             break
-    return argv[index:]
+        position += 1
+    return words[position:], cwd, effective
+
+
+def command_words(argv: list[str]) -> list[str]:
+    """Return the command after its env options and assignments."""
+    return command_context(argv, os.getcwd(), {})[0]
 
 
 def step_name(argv: list[str]) -> str:
@@ -230,12 +261,19 @@ def result_status(word: str) -> str:
     return "failed"
 
 
+def nextest_slow_test_s() -> float:
+    """Read the nextest recording threshold at use."""
+    from scripts.lib import conf
+
+    return conf.read("test_times").number("NEXTEST_SLOW_TEST_S")
+
+
 def test_results(lines: list[str]) -> tuple[list[TestRow], list[Summary]]:
     """Per-test rows worth keeping, and the Summary counts.
 
     Only lines before the Summary count: nextest reprints the failed and flaky
     ones after it. A row is kept for a test that failed, was retried, ran past
-    SLOW_TEST_S or was reported SLOW; the counts cover every test.
+    NEXTEST_SLOW_TEST_S or was reported SLOW; the counts cover every test.
     """
     tests: dict[tuple[str, str], TestRow] = {}
     summaries: list[Summary] = []
@@ -264,13 +302,16 @@ def test_results(lines: list[str]) -> tuple[list[TestRow], list[Summary]]:
             row["attempts"] = attempt
             row["status"] = result_status(word)
             row["duration_s"] = float(duration)
+    if not tests:
+        return [], summaries
+    slow_test_s = nextest_slow_test_s()
     rows: list[TestRow] = []
     for row in tests.values():
         if row["attempts"] == 0:
             row["attempts"] = 1
         if row["status"] == "passed" and row["attempts"] > 1:
             row["status"] = "flaky"
-        if row["status"] != "passed" or row["attempts"] > 1 or row["slow"] or (row["duration_s"] or 0) > SLOW_TEST_S:
+        if row["status"] != "passed" or row["attempts"] > 1 or row["slow"] or (row["duration_s"] or 0) > slow_test_s:
             rows.append(row)
     return rows, summaries
 
@@ -323,3 +364,21 @@ def log_facts(step: str, text: str) -> LogFacts:
     if step == "sweep":
         facts["sweep_freed_bytes"] = sweep_freed(lines)
     return facts
+
+def test_threads(argv: list[str]) -> int | None:
+    """Return nextest's explicitly requested test width, when it is numeric."""
+    for index, argument in enumerate(argv):
+        value: str | None = None
+        if argument in ("--test-threads", "-j"):
+            if index + 1 < len(argv):
+                value = argv[index + 1]
+        elif argument.startswith("--test-threads="):
+            value = argument.removeprefix("--test-threads=")
+        elif argument.startswith("-j") and len(argument) > 2:
+            value = argument[2:]
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None

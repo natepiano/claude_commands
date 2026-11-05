@@ -289,7 +289,7 @@ MacBlockFooterState = NoMacBlock | PendingMacBlock | ActiveMacBlock | Unreadable
 
 @dataclass(frozen=True)
 class ProductionCount:
-    """One count config/dailies.conf names for this production; `None` when its source is missing."""
+    """One count selected by the fixed showrunner id; `None` means the source is missing."""
 
     label: str
     number: int | None
@@ -1026,7 +1026,8 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     if "held" not in fields:
         raise InputError(f"{where}.held: required; the reason the phase's checkpoint is not merged, or null when no checkpoint waits")
     unit = text(fields, "unit", where)
-    label = optional_text(fields, "label", where) or unit.removesuffix("-unit")
+    name = optional_text(fields, "name", where) or unit
+    label = optional_text(fields, "label", where) or name.removesuffix("-unit")
     if len(label) > LABEL_LIMIT:
         raise InputError(f"{where}.label: {label!r} is longer than {LABEL_LIMIT}; give a short label")
     phase = text(fields, "phase", where)
@@ -1083,7 +1084,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         raise InputError(f"{where}.holds_builds: true while the unit's own session holds the builds, else left out")
     return Unit(
         unit=unit,
-        name=optional_text(fields, "name", where) or unit,
+        name=name,
         label=label,
         project=text(fields, "project", where),
         goal=parse_goal(fields.get("goal"), f"{where}.goal"),
@@ -1858,7 +1859,7 @@ def last_report(value: object, state_path: Path, at: str | None, cadence: Report
 
 
 def log_line(report: Report, resolved: dict[str, ResolvedEta], now: datetime, zone_name: str) -> str:
-    parts = [f"{unit.unit} {unit.phase.split(':')[0]} "
+    parts = [f"{unit.name} {unit.phase.split(':')[0]} "
              + eta_text(unit, NoLastUnitReport(), resolved[unit.unit], now, zone_name, with_note=False)
              for unit in report.units]
     parts.extend(f"{topic.title} {topic.eta}" for topic in report.topics)

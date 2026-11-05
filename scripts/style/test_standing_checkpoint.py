@@ -21,6 +21,7 @@ from style_child_test_support import style_cli_command
 import mechanical_classes
 import style_ledger
 import style_rules
+from scripts.production import unit_config
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 
 
@@ -99,6 +100,8 @@ class StandingCheckpointTests(unittest.TestCase):
         owner = recorded_showrunner("sample-style", self.doc)
         _ = fixture_unit_location(owner, "names-unit", self.unit)
         self.plan = self.unit / "docs/style-production/units/names-unit.md"
+        _ = unit_config.write(self.unit, unit_config.UnitConfig(
+            unit_config.PlanFile(self.plan.relative_to(self.unit)), unit_config.NoAppPort(), ()))
         self.template = self.style / "docs/style-production/units/names-unit.md"
         header = "\n".join([
             "# Standing names", "> **Standing:** style_plan.py",
@@ -137,10 +140,7 @@ class StandingCheckpointTests(unittest.TestCase):
     def production(self, branch: str, checkout: Path) -> str:
         return "\n".join([
             "# Production", f"- **Merge branch:** {branch}", f"- **Showrunner checkout:** {checkout}",
-            "- **Log:** docs/sample-style-log.md", "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
-            *([f"| names-unit | docs/style-production/units/names-unit.md | {self.unit} | sample-style-names |"]
-              if branch == "style/main" else []), "",
+            "- **Log:** docs/sample-style-log.md", "",
         ])
 
     def refill(self) -> subprocess.CompletedProcess[str]:
@@ -180,7 +180,7 @@ class StandingCheckpointTests(unittest.TestCase):
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
                              + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
                              + f'style_rule_blob: {rule_blob}\nstyle_count: 1\n---\n')
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {issue.parent}\n\n## Units"))
+        _ = self.doc.write_text(self.doc.read_text() + f"- **Proposals:** {issue.parent}\n")
         result = self.refill()
         self.assertEqual(result.returncode, 0, result.stderr)
         ticket = self.open_ticket()
@@ -261,9 +261,9 @@ class StandingCheckpointTests(unittest.TestCase):
         result = self.refill()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"discarded {ticket['id']}: merged", result.stdout)
-        self.assertIn("phase written: names-unit-2", result.stdout)
+        self.assertIn("phase written: 2", result.stdout)
         self.assertNotIn(f"### Phase 1 — {ticket['id']}", self.plan.read_text())
-        self.assertIn("### Phase 2 — names-unit-2", self.plan.read_text())
+        self.assertIn("### Phase 2 — 2", self.plan.read_text())
         self.assertEqual(self.template.read_bytes(), self.template_before)
         self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), head)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 
 
+import contextlib
 import json
 import os
 import socket
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment
@@ -25,7 +27,9 @@ else:
 
 import index
 import memory
-from cgroup_test_support import CPU, GIB, IO_LINES, slice_reading, write_cgroup
+import scratch
+import sweep
+from cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
 if TYPE_CHECKING:
@@ -43,6 +47,12 @@ END_UTC = "2026-10-05T07:30:00.000Z"
 def write_lint_config(root: Path, adjustment: int | str, *, include_adjustment: bool = True) -> Path:
     path = root / "lint.conf"
     _ = path.write_text(f"# whole: -1000..1000\nbuild_oom_score_adj={adjustment}\n" if include_adjustment else "clippy=on\n")
+    return path
+
+
+def cargo_output(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _ = (path / sweep.RUSTC_INFO).write_text("{}")
     return path
 
 
@@ -79,7 +89,7 @@ def snapshot(at: str, high: int, peak: int, *, ci: Record | None = None) -> Reco
         "at": at,
         "host": "natedev",
         "slices": {"builds": present_slice(high, peak), "ci": ci or {"state": "absent"}},
-        "zram": {"state": "present", "data_bytes": 3 * GIB, "compressed_bytes": GIB},
+        "zram": ZRAM_READING,
     }
 
 
@@ -112,6 +122,30 @@ class MemoryWindowTests(unittest.TestCase):
         self.fake_bin = self.base / "bin"
         self.fake_bin.mkdir()
         point_root_at(self, self.root)
+
+    def test_window_report_uses_the_recorded_cap_and_room_formatter(self) -> None:
+        from scripts.build_queue import queue_snapshot
+        from scripts.build_queue.queue_evidence import room_text
+        from scripts.lint import memory_admit as gate
+
+        self.stub_journal(early=[], kernel=[])
+        start, end = datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC)
+        configuration = gate.read_memory_config()
+        inputs = gate.QueueInputs([], (), (), gate.HostMemory(30 * GIB, 60 * GIB),
+            gate.NoPressureHold(), gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), start.timestamp())
+        directory = self.root / "admission"
+        directory.mkdir(parents=True)
+        queue_snapshot.write_queue_snapshot(directory, inputs, configuration.policy)
+        _ = index.update()
+        with index.read_only() as connection:
+            text = memory.window_report(connection, start, end)
+        room = gate.memory_room(inputs.host, (), start.timestamp(), configuration.policy)
+        self.assertIn(room_text(room), text)
+        self.assertIn("Cap 27.0 GiB", text)
+        with index.read_only() as connection:
+            older = memory.window_report(connection, start - timedelta(days=2), start - timedelta(days=1))
+        self.assertNotIn("Cap 27.0 GiB", older)
+        self.assertIn("Cap: no recorded admission pass in this window", older)
 
     def env(self, **extra: str) -> dict[str, str]:
         return {
@@ -169,11 +203,12 @@ class MemoryWindowTests(unittest.TestCase):
             return memory.earlyoom_kills(datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC))
 
     def test_earlyoom_reader_classifies_gate_target_programs_and_other_kills(self) -> None:
+        target = cargo_output(self.base / "cargo-output")
         at = datetime.fromisoformat(START_UTC)
         messages = [
             earlyoom_message(101, cmdline="/usr/bin/rustc --crate-name hana"),
             earlyoom_message(102, command="hana-test", signal="SIGKILL", adj=200,
-                             cmdline="/work/hana/target/debug/deps/hana-abc --test"),
+                             cmdline=f"{target}/debug/deps/hana-abc --test"),
             earlyoom_message(103, command="python", adj=200,
                              cmdline="/usr/bin/python /work/target/debug/helper"),
             earlyoom_message(104, command="legacy", adj=None),
@@ -196,7 +231,7 @@ class MemoryWindowTests(unittest.TestCase):
                          [500, 200, 200, memory.OomScoreAdjUnavailable.VALUE])
         self.assertEqual([kill.is_build for kill in kills], [True, True, False, False])
         self.assertEqual([kill.outside_build_gate for kill in kills], [False, True, False, False])
-        self.assertEqual(kills[1].cmdline, "/work/hana/target/debug/deps/hana-abc --test")
+        self.assertEqual(kills[1].cmdline, f"{target}/debug/deps/hana-abc --test")
         self.assertIs(kills[3].cmdline, memory.CmdlineUnavailable.VALUE)
 
     def test_earlyoom_unavailable_is_distinct_from_an_empty_journal_and_mac_never_reads_it(self) -> None:
@@ -211,16 +246,17 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual((self.base / "journal-args.jsonl").read_bytes(), before)
 
     def test_target_program_with_unquoted_apostrophe_arguments_is_a_build_kill(self) -> None:
+        target = cargo_output(self.base / "cargo-output")
         at = datetime.fromisoformat(START_UTC)
         self.stub_journal(early=[journal_entry(at, earlyoom_message(
-            105, adj=200, cmdline="/work/hana/target/debug/deps/test-abc --case O'Reilly"))], kernel=[])
+            105, adj=200, cmdline=f"{target}/debug/deps/test-abc --case O'Reilly"))], kernel=[])
         kills = self.earlyoom()
         if not isinstance(kills, list):
             self.fail("the fixture journal was unavailable")
         self.assertEqual(len(kills), 1)
         self.assertTrue(kills[0].is_build)
         self.assertTrue(kills[0].outside_build_gate)
-        self.assertEqual(kills[0].cmdline, "/work/hana/target/debug/deps/test-abc --case O'Reilly")
+        self.assertEqual(kills[0].cmdline, f"{target}/debug/deps/test-abc --case O'Reilly")
 
     def test_snapshot_cli_prints_and_appends_exactly_one_record_from_fake_cgroups(self) -> None:
         builds = self.base / "builds.slice"
@@ -236,8 +272,7 @@ class MemoryWindowTests(unittest.TestCase):
         ):
             _ = (builds / name).write_text(value + "\n")
         zram = self.base / "zram0"
-        zram.mkdir()
-        _ = (zram / "mm_stat").write_text("3221225472 1073741824 0 0 0\n")
+        write_zram(zram)
 
         result = self.cli("snapshot")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -257,11 +292,11 @@ class MemoryWindowTests(unittest.TestCase):
             "stall_some_us": 1_250_000,
         })
         self.assertEqual(slices["ci"], {"state": "absent"})
-        self.assertEqual(recorded["zram"], {"state": "present", "data_bytes": 3 * GIB, "compressed_bytes": GIB})
+        self.assertEqual(recorded["zram"], ZRAM_READING)
         files = list(self.root.glob("*/*.jsonl"))
         self.assertEqual(len(files), 1)
         self.assertEqual([json.loads(line) for line in files[0].read_text().splitlines()], [recorded])
-        self.assertFalse((self.root / "index.sqlite").exists())
+        self.assertFalse(index.index_path_in(self.root).exists())
 
     def test_missing_or_unreadable_slice_pressure_has_named_unavailable_state(self) -> None:
         builds = self.base / "builds.slice"
@@ -296,7 +331,7 @@ class MemoryWindowTests(unittest.TestCase):
         row = next(line for line in result.stdout.splitlines() if "2026-10-02 05:00 -0700" in line)
         self.assertIn("12.0 (1)", row)
         self.assertIn("3.0 (1)", row)
-        self.assertTrue((self.root / "index.sqlite").is_file())
+        self.assertTrue(index.index_path_in(self.root).is_file())
 
     def test_slice_capture_keeps_whole_charge_components_and_stacked_devices_separate(self) -> None:
         builds = self.base / "builds.slice"
@@ -555,6 +590,137 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("memory waits: 2 steps, total 50.0 s", result.stdout)
 
+    def test_old_tick_and_standalone_snapshots_show_the_same_slice_memory(self) -> None:
+        records: list[Record] = []
+        expected_slices: object = {}
+        for at, high, peak in ((START_UTC, 2, 8 * GIB), (END_UTC, 5, 12 * GIB)):
+            standalone = snapshot(at, high, peak, ci=present_slice(high, peak))
+            expected_slices = standalone["slices"]
+            old_snapshot = {**standalone, "host": "old"}
+            old_sample = sample(at, host="old", slices={"builds": {"state": "absent"}, "ci": {"state": "absent"}})
+            tick_snapshot: Record = {"kind": "memory_snapshot", "host": "tick", "at": at, "zram": standalone["zram"]}
+            tick_sample = sample(at, host="tick", slices=expected_slices)
+            new_sample = sample(at, host="new-log", slices=expected_slices, zram=standalone["zram"])
+            standalone_snapshot = {**standalone, "host": "standalone"}
+            records.extend((old_sample, old_snapshot, tick_sample, tick_snapshot, new_sample, standalone_snapshot))
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
+        _ = index.update()
+        connection = index.read_only()
+        reports: list[str] = []
+        try:
+            with patch.object(memory, "journal_messages", return_value=memory.JournalUnavailable.VALUE):
+                for host in ("old", "tick", "new-log", "standalone"):
+                    with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
+                        found = memory.nearest_snapshot(connection, datetime.fromisoformat(END_UTC))
+                        self.assertEqual(found["kind"], "memory_snapshot")
+                        if found["kind"] != "memory_snapshot":
+                            self.fail("the snapshot is unavailable")
+                        self.assertEqual(found["slices"], expected_slices)
+                        self.assertEqual(found["zram"]["state"], "present")
+                        reports.append(memory.window_report(connection, datetime.fromisoformat(START_UTC),
+                                                            datetime.fromisoformat(END_UTC)))
+        finally:
+            connection.close()
+        self.assertEqual(reports[0], reports[1])
+        self.assertEqual(reports[0], reports[2])
+        self.assertEqual(reports[0], reports[3])
+        self.assertIn("builds: high +3, max +0, oom_kill +0", reports[0])
+        self.assertIn("peak 12.0 GiB", reports[0])
+        self.assertIn("CI: high +3", reports[0])
+        self.assertIn("zram: 3.0 GiB stored in 1.0 GiB", reports[0])
+
+    def test_tick_report_uses_sample_slices_with_different_timestamp_text(self) -> None:
+        records: list[Record] = []
+        expected_slices: object = {}
+        for at, high, peak in ((START_UTC, 2, 8 * GIB), (END_UTC, 5, 12 * GIB)):
+            reading = snapshot(at, high, peak, ci=present_slice(high, peak))
+            expected_slices = reading["slices"]
+            for host, sample_at in (("format", at.replace(".000Z", "Z")),
+                                    ("second", at.replace(":00.000Z", ":01.000Z"))):
+                records.extend((
+                    sample(sample_at, host=host, slices=expected_slices),
+                    {"kind": "memory_snapshot", "host": host, "at": at, "zram": reading["zram"]},
+                ))
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            with patch.object(memory, "journal_messages", return_value=memory.JournalUnavailable.VALUE):
+                for host in ("format", "second"):
+                    with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
+                        found = memory.nearest_snapshot(connection, datetime.fromisoformat(END_UTC))
+                        self.assertEqual(found["kind"], "memory_snapshot")
+                        if found["kind"] != "memory_snapshot":
+                            self.fail("the sample slices are unavailable")
+                        self.assertEqual(found["slices"], expected_slices)
+                        report = memory.window_report(connection, datetime.fromisoformat(START_UTC),
+                                                      datetime.fromisoformat(END_UTC))
+                        self.assertIn("builds: high +3, max +0, oom_kill +0", report)
+                        self.assertIn("peak 12.0 GiB", report)
+                        self.assertIn("CI: high +3", report)
+                        self.assertIn("zram: 3.0 GiB stored in 1.0 GiB", report)
+        finally:
+            connection.close()
+
+    def test_zram_report_marks_absent_and_missing_readings_unavailable(self) -> None:
+        records: list[Record] = []
+        for at, high, peak in ((START_UTC, 2, 8 * GIB), (END_UTC, 5, 12 * GIB)):
+            reading = snapshot(at, high, peak)
+            records.extend((
+                sample(at, host="absent", slices=reading["slices"], zram={"state": "absent"}),
+                sample(at, host="missing", slices=reading["slices"]),
+            ))
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            with patch.object(memory, "journal_messages", return_value=memory.JournalUnavailable.VALUE):
+                for host in ("absent", "missing"):
+                    with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
+                        report = memory.window_report(connection, datetime.fromisoformat(START_UTC),
+                                                      datetime.fromisoformat(END_UTC))
+                        self.assertEqual([line for line in report.splitlines() if line.startswith("zram:")],
+                                         ["zram: unavailable"])
+        finally:
+            connection.close()
+
+    def test_zram_uses_nearest_reading_and_prefers_snapshot_on_equal_distance(self) -> None:
+        records: list[Record] = []
+        for host, snapshot_at in (("nearer-sample", "2026-10-05T07:29:59.000Z"),
+                                  ("equal-distance", END_UTC.replace(".000Z", "Z"))):
+            reading = snapshot(snapshot_at, 2, 8 * GIB)
+            records.extend((
+                {**reading, "host": host},
+                sample(END_UTC, host=host, slices=reading["slices"],
+                       zram={"state": "present", "data_bytes": 4 * GIB, "compressed_bytes": GIB}),
+            ))
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", *records)
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            for host, data in (("nearer-sample", 4 * GIB), ("equal-distance", 3 * GIB)):
+                with self.subTest(host=host), patch.object(store, "host_name", return_value=host):
+                    found = memory.nearest_snapshot(connection, datetime.fromisoformat(END_UTC))
+                    if found["kind"] != "memory_snapshot":
+                        self.fail("The zram reading is unavailable.")
+                    self.assertEqual(found["zram"], {"state": "present", "data_bytes": data,
+                                                   "compressed_bytes": GIB})
+        finally:
+            connection.close()
+
+    def test_tick_without_slice_readings_is_unavailable(self) -> None:
+        host = store.host_name()
+        self.write(self.root / host / "samples-2026-10.jsonl", {
+            "kind": "memory_snapshot", "host": host, "at": END_UTC, "zram": {"state": "absent"},
+        })
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            found = memory.nearest_snapshot(connection, datetime.fromisoformat(END_UTC))
+        finally:
+            connection.close()
+        self.assertEqual(found, {"kind": "unavailable"})
+
     def test_submillisecond_snapshot_search_excludes_instant_before_left_edge(self) -> None:
         instant = datetime.fromisoformat("2026-10-05T07:00:00.000500+00:00")
         host = store.host_name()
@@ -585,6 +751,65 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertIn("builds: reset in the window; since the reset high 2, max 0, oom_kill 0; stall 0.0 s; peak 4.0", result.stdout)
         self.assertIn("CI: reset in the window; since the reset high 1, max 1, oom_kill 0; stall 0.0 s; peak 6.0", result.stdout)
         self.assertNotIn("no new high in the window", result.stdout)
+
+
+class BuildOutputProgramTests(unittest.TestCase):
+    base: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+
+    def test_rustc_marker_identifies_an_unrecorded_build_program(self) -> None:
+        target = cargo_output(self.base / "unrecorded-output")
+        self.assertTrue(memory.build_output_program(str(target / "debug/deps/test")))
+
+    def test_cargo_cache_tag_with_a_build_tree_identifies_a_build_program(self) -> None:
+        target = self.base / "tagged-output"
+        (target / "debug/.fingerprint").mkdir(parents=True)
+        scratch.mark_cargo_cache(target)
+        self.assertTrue(memory.build_output_program(str(target / "debug/deps/test")))
+
+    def test_cache_tag_without_a_build_tree_is_not_a_build_program(self) -> None:
+        registry = self.base / "registry"
+        scratch.mark_cargo_cache(registry)
+        self.assertFalse(memory.build_output_program(str(registry / "tool")))
+
+    def test_plain_folder_does_not_identify_a_build_program(self) -> None:
+        plain = self.base / "target/debug"
+        plain.mkdir(parents=True)
+        self.assertFalse(memory.build_output_program(str(plain / "app")))
+
+    def test_relative_program_does_not_identify_a_build(self) -> None:
+        target = cargo_output(self.base / "target")
+        self.enterContext(contextlib.chdir(self.base))
+        self.assertFalse(memory.build_output_program(str((target / "debug/app").relative_to(self.base))))
+
+    def test_program_symlink_uses_the_resolved_cargo_folder(self) -> None:
+        target = cargo_output(self.base / "output")
+        alias = self.base / "app"
+        alias.symlink_to(target / "debug/app")
+        self.assertTrue(memory.build_output_program(str(alias)))
+
+    def test_removed_cargo_folder_does_not_keep_its_build_class(self) -> None:
+        target = cargo_output(self.base / "removed-output")
+        marker = target / sweep.RUSTC_INFO
+        program = str(target / "debug/app")
+        self.assertTrue(memory.build_output_program(program))
+        marker.unlink()
+        target.rmdir()
+        self.assertFalse(memory.build_output_program(program))
+
+    def test_gate_adjustment_keeps_build_and_outside_gate_rules(self) -> None:
+        self.enterContext(patch.dict(os.environ, config_environment(self.base)))
+        target = cargo_output(self.base / "output")
+        _ = write_lint_config(Path(os.environ["CONF_DIR"]), 321)
+        at = datetime.fromisoformat(START_UTC)
+        for program in (str(target / "debug/app"), "/usr/bin/python"):
+            with self.subTest(program=program):
+                kill = memory.EarlyoomKill(at, 100, "app", 321, program)
+                self.assertTrue(kill.is_build)
+                self.assertFalse(kill.outside_build_gate)
 
 
 if __name__ == "__main__":
