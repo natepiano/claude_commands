@@ -343,39 +343,23 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 13 — The slowest modules lose the tests that only repeat other tests  · status: done
 **Depends on:** Phase 12, Phase 7, Phase 14, Phase 15
 
-#### Work Order
+#### As-built
 
-**Goal:** five of the slowest live modules of `test_times top` keep every checked behavior and lose each test that only repeats another.
-
-**Spec:**
-
-1. At dispatch, the director takes the 10 modules from `test_times top` (the Phase 14 ranking) and splits them between writers by folder. First drop each floored module in `builds-natest-next.md` whose gate median is not 20% above its floor (Standing work item 3). When fewer than 10 modules qualify, take fewer.
-2. For each module, run `coverage_overlap.py`. For each candidate, compare its assertions with the covering tests. Remove it only when a covering test checks the same result; otherwise keep it and give the reason in the summary.
-3. Measure the gain with same-load pairs (Speed method step 5).
-4. Report each removed test, its covering test, and the time saved; and each kept candidate with its reason.
-
-**Dispatch (2026-11-04):** `test_times top` gave 10 modules after the floor rule (`test_simplify_lens.py` and `test_fast_track.py` are within 20% of their floors) and without `test_codex_mesh.py` (retiring). The showrunner held five that open branches edit: `direct/test_verify_lint_cache_versions.py`, `direct/test_verify_ssh_targets_retained.py`, `style/test_crate_run.py`, `direct/test_verify_mac_lifecycle.py`, `direct/test_assign_launcher_reuse.py`. They go to a later phase when their branches land. Outside owners: verify-unit (the three `direct/` modules), aws-unit (`test_deploy.py`), the hana_shot owner (`test_hana_shot.py`). Test each against its owner's tip: merge origin/builds before the gate.
+- No test was removed. Two workers read each candidate's assertions against those of its covering tests. None checked the same result.
+- `scripts/direct/test_verify_ssh_targets_routing.py`, `_results.py`, `_retry.py`: 25 tests, 24 unknown (unverified launches of bash, git, rustc, ssh, rsync, ps; forks; one shared thread), 0 candidates.
+- `scripts/aws_target/test_deploy.py`: 97 tests, 39 candidates kept, 4 unknown (bash, env launches).
+- `scripts/hana_shot/test_hana_shot.py`: 113 tests, 42 candidates kept, 22 unknown (magick launches, shared threads, a thread that outlived its test, an unreported Python child).
+- The five modules held back by the showrunner (other units' unlanded branches) were not read.
 
 **Files:**
-- `scripts/direct/test_verify_ssh_targets_routing.py`, `scripts/direct/test_verify_ssh_targets_results.py`, `scripts/direct/test_verify_ssh_targets_retry.py` — verify-unit's tests (gate medians 138, 73 and 73 s)
-- `scripts/aws_target/test_deploy.py` — aws-unit's tests (gate median 116 s)
-- `scripts/hana_shot/test_hana_shot.py` — the hana_shot owner's tests (gate median 66 s)
-- `scripts/test_times/coverage_overlap.py` — read only
+- none changed; `scripts/test_times/coverage_overlap.py` was run on the five modules above
 
-**Workers:** 2 writers — modules split by folder; no hub file.
-- `impl` — the three `scripts/direct/test_verify_ssh_targets_*.py` modules
-- `test` (opens as impl) — `scripts/aws_target/test_deploy.py`, `scripts/hana_shot/test_hana_shot.py`
+**Binds later work:**
+- Line overlap does not prove a repeat in a process-heavy module. Speed work on the slowest modules targets process starts and fixed waits.
+- Speed proposals sent to the showrunner: the hana_shot fixture server stop (0.5 s `serve_forever` poll, upper bound 47.5 s of 74 s); the hana_shot busy-capture deadline (2.7 s); fake AWS process starts in `test_deploy.py` (three tests near 13 s).
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 12: `coverage_overlap.py` and its `child: unknown` rule.
-- Phase 15: an unknown test names its cause (shared child, shared thread, child outlived its test, unverified launch git). An unknown test is never a removal candidate. On test_fast_track.py, 28 of 55 tests stay unknown through "unverified launch git".
-
-**Acceptance gate:**
-- every changed module green in the checkpoint gate run
-- each removal names a covering test that checks the same result
-- the pair medians show each changed module's wall and CPU time not higher than before
+**Gotchas:**
+- `test_held_local_target_does_not_block_linux_check` fails under the collector: its fixture mocks `subprocess.Popen`, and `line_collector.py` checks `isinstance` against it. Phase 19 owns the fix.
 
 ### Phase 14 — `test_times top` ranks only valid runs  · status: done
 **Depends on:** none
