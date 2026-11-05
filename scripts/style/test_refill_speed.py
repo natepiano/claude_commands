@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import io
 import sys
 from collections.abc import Callable
@@ -136,7 +138,7 @@ class RefillWaitTests(StylePlanFixture):
                       mock.patch.object(style_plan, "unsynced_changes", return_value=unsynced),
                       mock.patch.object(ledger, "_declaration_reading", side_effect=AssertionError("blocked file requested site proof")),
                       redirect_stdout(io.StringIO())):
-                    result = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
+                    result = style_plan._select_phase(ledger, ticket_owner_id("names-unit"), "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
                         self.doc, self.plan.read_text(), scope, busy, frozenset(), definitions,
                         style_plan.MainChanges(self.tip), family="names", selection=style_plan.FamilySelection.COUNT)
                 self.assertIsInstance(result, style_plan.BuildableFindings)

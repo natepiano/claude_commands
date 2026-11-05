@@ -85,14 +85,10 @@ def running_work(session_dir: Path) -> str | None:
     """Name work in flight, or return None when the unit is waiting."""
     # A launch that names its phase writes its status in that phase's directory.
     directories = [session_dir, *(path for path in session_dir.glob("phases/*") if path.is_dir())]
-    if any(
-        _text(path) == "implementing"
-        for directory in directories
-        for path in directory.glob("impl_status*")
-        if path.name == "impl_status" or path.name.startswith("impl_status_")
-    ):
+    statuses = [path for directory in directories for path in directory.glob("*_status*")]
+    if any(_text(path) in {"implementing", "running"} for path in statuses):
         return "an implementation or fix pass"
-    if any(_text(path) == "reviewing" for directory in directories for path in directory.glob("review_status*")):
+    if any(_text(path) == "reviewing" for path in statuses):
         return "a review pass"
     state_text = _text(session_dir / "progress_history_state.json")
     if state_text:

@@ -130,7 +130,7 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 - `status [--rule ID] [--crate K] [--json]`: `unclassified: <n> rules — pull nate_style` when n > 0, then `rule current stale open awaiting merge held done`. Under `--crate`, `done` is crate-scoped.
 - `summary [--json]`, `reconcile --branch-point B --style-branch S`, `candidate --ticket T --site <path>:<line> --idea I`.
 - `ticket add|assign --branch B|checkpoint --commit C [--session-dir S --phase P]|merge|drop|yield --path P --id ID`, `ticket open --unit U`. `--session-dir` and `--phase` go together.
-- `unit rename --from OLD --to NEW` prints `moved <n> tickets and <n> sync waits`.
+- `migrate-staff-ids [--references PATH ...] [--stop-after-first]` migrates ticket ids, owners, and references. It never writes staff.
 - `handoff add|send --to SLUG|reroute --to SLUG|merged [--merge-commit M] --checkpoint C`, `handoff pending`.
 - `tip seen --tip C` (prints `new` or `seen`), `tip done --tip C`.
 - `held add ...` (prints the finding id), `held file --id F --proposal PATH`, `held waive --id F (--ticket T | --person NAME)`, `held replace --id F --after TEXT [--person NAME]`, `held built --id F [--id F ...] [--commit <merge> [--by <who>]]` (`--commit` must contain each non-dropped ticket checkpoint of the finding), `held list [--state S] [--json]`.
@@ -138,7 +138,25 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 ### Tickets, hand-offs, processed tips, reconcile
 
 - **Ticket kinds:** `read`, `listed`, `structure`, `proposal`. **States:** `queued` → `assigned` → `checkpointed` → `merged`; any non-final → `dropped`. `merged` and `dropped` are final.
-- `ticket_add(id, unit, kind, family, crate, files, rules, rule="", sites=None, proposal="", cells=(), finding_ids=())` pins each rule's blob in `rule_blobs` and its bytes in `rule_texts` once `git hash-object --stdin` equals the pin, else `LedgerError("<rule id>: rule changed while pinning; rerun")`. A pseudo-rule pins its parent's blob. A new id must be `<unit>-<n>`. A repeat add of an existing ticket with the same fields succeeds before that check, so a ticket that a unit rename moved keeps its old prefix. `pinned_rule_texts(id)`, `queued_tickets(unit)` (by `created_at, id`), `next_ticket_id(unit)` (highest n + 1 over every state, counting only ids with the `<unit>-` prefix, so the first new ticket after a rename is `<new id>-1`), `ticket_base(id)` (stored once from the branch tip while `assigned`; then returned in any state).
+- `ticket_add(id, unit, kind, family, crate, files, rules, ...)` accepts a positive decimal ticket id and a fixed staff id.
+  It pins each rule's blob and bytes after the current content matches the pin.
+  `next_ticket_id()` reserves one global decimal number across all units and ticket states.
+  Unused reservations remain reserved after the ledger closes.
+  `pinned_rule_texts(id)` reads those pinned texts.
+  `queued_tickets(unit)` reads tickets for a fixed staff id in `created_at, id` order.
+  `ticket_base(id)` stores the branch tip once while the ticket is assigned.
+  Unit renames and conversation changes preserve ticket ids and fixed owners.
+- The migration publishes reference files before the ledger transaction.
+  It renumbers every legacy ticket and updates all linked ticket references.
+  It keeps workspace proof groups and uses their smallest migrated member in string order as the batch id.
+  It converts an owner only when staff proves that owner.
+  An unknown owner keeps its old text and produces one `anomaly:` line.
+  Unknown owners do not prevent healthy owners from creating tickets after migration.
+  Readers report unavailable owners and continue with other tickets.
+  An interrupted migration finishes on rerun.
+  A finished rerun changes no bytes or times and exits 0.
+  The migration is removed in Phase 18.
+
 - `record --verdict removed --ticket T` closes a cell whose file the ticket deleted (`record_removed`, which `record` calls for that verdict). The ledger finds the deleting commit with one git call: the newest first-parent commit from the ticket's `base` to `--commit` (the own-commits rule of `checkpoint_restamps`) whose diff against its first parent deletes the path (`git log --first-parent --diff-merges=first-parent --diff-filter=D --no-renames --format='%H %P' -n 1 <commit> ^<base> -- <path>`). That commit must not be a merge (more than one parent): a delete that a merge brings in is not the ticket's. A first-parent merge that only brings in other work deletes nothing in its first-parent diff, so it is not the deleting commit. Commits of other work that changed the file before the delete, such as edits a sync merge of the style branch brings in, do not matter. It refuses a ticket the ledger does not hold, a cell outside the ticket's owned cells (`_ticket_cells`), a ticket with no `base`, a commit not under the base, a path that is not a file at the base (so a crate folder cell and a file deleted before the base refuse), a path still in the tree at the commit, a path whose newest first-parent delete is a merge, a path that no first-parent commit deletes, `--reads`, `--input-scope file`, and, under the write lock, a yielded path. The row keeps the ticket, the deleting commit and the pinned blob. The command prints the cell's state line, `<rule> <path>: removed by ticket <id> at <c7>`; other verdicts print nothing. `TicketRecord.removed` (`RemovedCell`: rule, path, commit, `state` = `removed by ticket <id> at <c7>`) carries each cell whose newest ticket row is removed, so `ticket open` JSON shows it and `coverage_report.ticket_line` puts one `<rule> <path>: removed by ticket <id> at <c7>` line under the ticket. A proposal ticket owns no cells at checkpoint; `record --verdict removed` takes its rule and file cells under the same refusals, for a file rename that deletes a file.
 - `record --ticket` and `held add --ticket` take the pinned blob, so a judgment on a ticket whose rule changed stays stale against the new text.
 - `ticket checkpoint` refuses while any owned cell is neither recorded nor removed, and names each such cell (`<id>: unjudged cells: <rule> <path>, ...`). A cell with a removed row of any ticket counts as removed only while nothing is at its path in the checkpoint commit. A file there again is unjudged until the ticket records a row that coverage reads after the removals: the same ancestry rule (`_rows_after_removals`) over the rows of every ticket, so a removal by another ticket sets the boundary too, and a row of the ticket on a commit before a delete does not count, whenever it was recorded (`unjudged_ticket_cells`; the gate looks for the path in the worktree and takes the removals in `HEAD`). `ticket merge` needs state `checkpointed` and the checkpoint inside the stored style branch tip. It marks a proposal ticket's findings `built` in the same transaction (only on `AppliedInCode`), prints a `not built` line per other finding, and calls `style_sync.py wake-waiters`. `ticket merge` checks ancestry against the style branch and refuses a successor until its recorded predecessor is merged; `reconcile` processes contained predecessors before successors.
@@ -374,7 +392,12 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - A fix applies without asking only when `style_footprint.py` calls it mechanical. Every other change is held and shown only when asked.
 - Any code that matches tiers handles `"unclassified"`. An unclassified rule has no cells or tickets and never counts as current or done.
 - `candidate_generators` returns every site. Any limit belongs to its callers.
-- `rules.style_family(unit)` maps old and full unit ids to `Family | NotStyleUnit`. Plan readers use the Units row's Plan cell relative to the unit worktree; rename keeps that path. `Ledger.rename_unit(old, new) -> UnitRenamed(tickets, waits)` and `unit rename --repo <checkout> --from <old> --to <new>` move current ticket owners and sync waits in one transaction. Ticket ids and history stay unchanged; reapplying moves zero rows. The target must own no current rows, and both ids must name the same family. New ticket numbers use only their own id prefix. `rename_unit.py` runs this move for a `Kind: style` production (`docs/as-built/unit-rename.md`). `board_json.py` finds a unit's current phase through `phase_table.build_run` records, so a moved ticket with the old prefix still shows.
+- `rules.style_family(unit)` maps unit names to `Family | NotStyleUnit`.
+  Ticket ownership uses the fixed staff id.
+  Commands resolve names once within their production before they call the ledger.
+  A unit rename changes no ticket or sync wait.
+  `board_json.py` joins ticket owners through staff and reads phase records through `phase_table.build_run`.
+
 - A style unit id already starts with `<style slug>-`. Code that builds a worktree, branch or herdr host name from a unit stem goes through `unit_names.branch` (or `worktree`), which returns the stem unchanged when it starts with `<slug>-`; else the prefix doubles. `add_unit.host_session_name` uses this rule. Shutdown restart uses the staff name.
 - Every ledger row and `--rule` uses `Rule.rule_id`. Map a unit to its branch through the Units row, never by name derivation.
 - Every `set-tip` caller that expects awaiting-merge cells passes `--style-branch`. `reconcile` never moves the synced tip.

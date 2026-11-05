@@ -139,7 +139,7 @@ def main(arguments: list[str]) -> int:
         return 0
     if style:
         import style_units
-        print(style_units.table(units, records, ledger_paths=paths))
+        print(style_units.table(units, records, doc=doc, ledger_paths=paths))
     else:
         print(table(units, records))
     return 0

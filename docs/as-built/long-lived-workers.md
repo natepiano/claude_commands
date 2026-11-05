@@ -119,7 +119,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 - Without `--to`, it opens a new worker named by `worker_name.sh`. After the turn it writes the worker's identity file.
 - With `--to`, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
-  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, worker_id}` for this launch, with `worker_id` the thread id. The saved `model` is retained for compatibility with old identity files; it does not select a turn's model or effort. Each turn uses an explicit override or the current role default. A mismatch fails with `has no matching durable worker identity`. A missing file with a roster thread for the name is not a mismatch: the claim writes the identity from the roster and continues. That resumes a reopened worker, and a fix worker of a run from before 2026-10-17, whose record the impl worker's replaced. A worker recorded under another slot is still refused.
+  1. Finds the saved identity through its `staff_id`. A new identity uses `impl_worker_<slot>.json`. The compatibility launcher uses `impl_worker_fix.json` for a repair in the `impl` slot. Named `assign.sh` workers use their names as new slots. The saved model does not select the next turn's model. Each turn uses an explicit override or the current role default. A missing identity is created from the roster. A worker recorded under another slot is refused.
   2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
   3. If the roster's `context_tokens` is an integer greater than `UNIT_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On exit 4 (the roster changed during compaction) it refuses the follow-up and advises inspection and same-thread `reopen` when idle. On other failures it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
@@ -130,7 +130,15 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 **Code review dispatch.** Use `assign.sh --role review --session-dir <run>
 --phase <phase> --prompt <file> --cwd <worktree>`. Each broad-review lens has
-its own dispatch; closure review omits the lens. The returned handle names its
+its own dispatch; closure review omits the lens.
+Each artifact uses the worker name: `<worker>_status`, `<worker>_summary.txt`,
+`<worker>_agent.log`, and `<worker>_reply.txt`.
+Reviews add `_<lens>_<pass>`, or `_<pass>` without a lens.
+The launcher claims the worker before it writes these artifacts.
+A refused claim leaves the artifacts unchanged.
+Use `arm-review --worker <worker>` for an early named reviewer.
+Its marker reads `<worker>_status_<lens>` and `<worker>_pid_<lens>`.
+Legacy `review.sh` markers retain their `review` prefix. The returned handle names its
 status, log and summary. The allocator uses `review`, then `review2` when the
 first worker is busy. Both threads stay read-only.
 
