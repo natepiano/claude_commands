@@ -60,6 +60,7 @@ if TYPE_CHECKING:
 else:
     from scripts.copies import copies
     from scripts.production.cli_fixture import ImmutableGitSeed
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
     import build_hold
     import record
     import store
@@ -171,6 +172,41 @@ def fake_sender_process(sender: Path) -> Generator[mock.Mock]:
 
     with mock.patch.object(subprocess, "run", side_effect=run) as process:
         yield process
+
+
+def fresh_import_modules(base: Path, directory: str, module: str) -> list[str]:
+    root = Path(__file__).resolve().parents[2]
+    environment = {**os.environ, **config_environment(base / "config"),
+                   "STAFF_FILE": "/nonexistent/staff.json",
+                   "BUILD_HOLD_DIR": str(base / "holders"),
+                   "BUILD_HOLD_RELEASE_DIR": str(base / "release"),
+                   "BUILDLOG_DIR": str(base / "buildlog"),
+                   sweep.tmp_sweep.STATE_ENV: str(base / "state"),
+                   "NOTIFIER_SESSIONS_DIR": str(base / "sessions"),
+                   "PYTHONPATH": os.pathsep.join((str(root / "scripts" / directory), str(root)))}
+    for name in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD"):
+        _ = environment.pop(name, None)
+    command = f"import json, sys, {module}; print(json.dumps(sorted(sys.modules)))"
+    result = subprocess.run([sys.executable, "-c", command], cwd=root, env=environment,
+                            capture_output=True, text=True, check=False,
+                            timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+    assert result.returncode == 0, result.stderr
+    return cast(list[str], json.loads(result.stdout))
+
+
+class ImportTests(unittest.TestCase):
+    def test_imports_leave_coordination_modules_unloaded(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for directory, module in (("mac_test", "offload"), ("lint", "sweep")):
+            with self.subTest(module=module):
+                loaded = fresh_import_modules(base, directory, module)
+                coordination = [
+                    name for name in loaded
+                    if name in {"build_hold", "scripts.build_hold.build_hold",
+                                "memory_admit", "scripts.lint.memory_admit"}
+                    or name.startswith("scripts.build_queue")
+                ]
+                self.assertEqual(coordination, [])
 
 
 class Target:
@@ -6261,6 +6297,44 @@ class LockHolderTests(unittest.TestCase):
 
 
 class HolderSessionTests(unittest.TestCase):
+    def test_repeated_holder_queries_preserve_the_import_path(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tree, _ = cargo_target(base, "held", APP, time.time())
+        holders = base / "holders"
+        holders.mkdir()
+        _ = (holders / "holder-session").write_text(json.dumps({
+            "holder": "hana-unit", "since": datetime.now(PACIFIC).isoformat(),
+            "for": "timed builds", "release_eta": "unknown",
+        }))
+        proc = base / "proc"
+        (proc / "100").mkdir(parents=True)
+        (proc / "100" / "cwd").symlink_to(tree.parent.parent, target_is_directory=True)
+        record = cast(sessions.SessionRecord, cast(object, {
+            "pid": 100, "sessionId": "holder-session", "name": "hana-unit",
+            "messagingSocketPath": "/tmp/s.sock", "updatedAt": 1, "tmux": "", "formerNames": [],
+        }))
+        table = {
+            100: process_table.Process(100, 1, "claude", "claude"),
+            300: process_table.Process(300, 100, "cargo", "cargo build"),
+        }
+        with (mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders),
+                                          sweep.tmp_sweep.STATE_ENV: str(base / "state")}),
+              mock.patch.object(build_hold, "live_sessions", return_value=[]),
+              mock.patch.object(sessions, "live_sessions", return_value=[record]),
+              mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(sweep, "PROC_DIR", str(proc))):
+            original_path = list(sys.path)
+            for attempt in range(2):
+                with (self.subTest(query="build_hold_targets", attempt=attempt),
+                      mock.patch.object(sys, "path", list(original_path))):
+                    self.assertEqual(sweep.build_hold_targets([str(tree.parent)], {}),
+                                     {str(tree.parent): sweep.BuildHoldTarget("hana-unit")})
+                    self.assertEqual(sys.path, original_path)
+                with (self.subTest(query="holder_sessions", attempt=attempt),
+                      mock.patch.object(sys, "path", list(original_path))):
+                    self.assertEqual(sweep.holder_sessions([300]), {300: "hana-unit"})
+                    self.assertEqual(sys.path, original_path)
+
     def test_a_pid_belongs_to_its_nearest_named_session(self) -> None:
         table = {
             1: process_table.Process(1, 0, "systemd", "/sbin/init"),
@@ -6357,26 +6431,7 @@ class BudgetTests(unittest.TestCase):
 
     def test_sweep_import_loads_one_copy_of_record_index_and_step_outputs(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        root = Path(__file__).resolve().parents[2]
-        environment = {**os.environ, **config_environment(base / "config"),
-                       "STAFF_FILE": "/nonexistent/staff.json",
-                       "BUILD_HOLD_DIR": str(base / "holders"),
-                       "BUILD_HOLD_RELEASE_DIR": str(base / "release"),
-                       "BUILDLOG_DIR": str(base / "buildlog"),
-                       sweep.tmp_sweep.STATE_ENV: str(base / "state"),
-                       "NOTIFIER_SESSIONS_DIR": str(base / "sessions"),
-                       "PYTHONPATH": os.pathsep.join((str(root / "scripts/lint"), str(root)))}
-        for name in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD"):
-            _ = environment.pop(name, None)
-        command = ("import json, sys; import sweep; "
-                   "print(json.dumps([name for name in sys.modules "
-                   "if name in ('record', 'scripts.buildlog.record', 'index', 'scripts.buildlog.index', "
-                   "'step_outputs', 'scripts.buildlog.step_outputs')]))")
-        result = subprocess.run([sys.executable, "-c", command], cwd=root, env=environment,
-                                capture_output=True, text=True, check=False,
-                                timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        loaded = cast(list[str], json.loads(result.stdout))
+        loaded = fresh_import_modules(base, "lint", "sweep")
         for name in ("record", "index", "step_outputs"):
             with self.subTest(module=name):
                 self.assertEqual(len(set(loaded) & {name, "scripts.buildlog." + name}), 1, loaded)

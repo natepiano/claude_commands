@@ -1323,7 +1323,6 @@ def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
         from ..message import process_table
         from ..message.sessions import live_sessions
     else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
         import process_table
         from sessions import live_sessions
     try:
@@ -3389,11 +3388,10 @@ def send_floor_alert(message: str, *,
 
 
 if TYPE_CHECKING:
-    from ..build_hold import build_hold
     from ..message import sessions
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
-    import build_hold
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import sessions
 
 
@@ -3408,6 +3406,10 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> dict[str, BuildHoldTarget]:
     """Protect session workspaces and recently written build trees without reading build output."""
+    if TYPE_CHECKING:
+        from ..build_hold import build_hold
+    else:
+        import build_hold
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     state = build_hold.read_holders(build_hold.holder_directory())
