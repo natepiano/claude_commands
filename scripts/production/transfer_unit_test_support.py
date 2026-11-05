@@ -75,6 +75,7 @@ class UnitTransferFixture(StaffTestCase):
                    "TARGET=session:cc9c5b71-6f71-5499-a4bb-e6ad5d02930d\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
                    str(self.receiving / "docs/plans/other-production.md")]) + "\n")
         for module, name, value in (
+            (showrunners, "SEND", self.root / "fake_send.py"),
             (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
             (showrunners, "CONFIG", self.root / "home/.claude/showrunners.json"),
