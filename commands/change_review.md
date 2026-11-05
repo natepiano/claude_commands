@@ -75,8 +75,9 @@ sees in the app, such as a table's columns or a status line.
 `--due`), `later` or `user`; leave it out for a normal row. `--after` names a
 row that must be checked first.
 
-One row per change, written for a person with no context. Each part is one
-line. `--check` names the machine (natedev or the Mac), the session (a
+One row per change, written for a person with no context.
+The change description uses one line. The check and result can use several lines.
+`--check` names the machine (natedev or the Mac), the session (a
 terminal, a showrunner session, a unit session, any Claude session) and what to
 type; `--see` is what the person then sees. Example: `--change "The unit board
 shows each unit's phase" --check "In a showrunner session on natedev, type
@@ -121,7 +122,7 @@ A failed HTTP save keeps the typed answer, error text, answer form, and waiting 
 A saved verdict shows **Saved: <answer>**.
 Validate yourself removes the row from every waiting count and Next order when the request saves.
 A direct link shows **The showrunner will validate this** without answer buttons.
-Ask a question uses the one-line feedback field.
+Ask a question uses the feedback box.
 It removes the row from every waiting count until the showrunner answers.
 A direct link shows **The showrunner will answer this** without answer buttons.
 Send feedback saves the text unchanged; text that starts with `works` or `fine` can land the change.
@@ -220,6 +221,7 @@ Use the `verdict` command above for both. The row stays out of the user's count 
 ```
 
 The row returns to the user's count with the question and answer below the change.
+The answer and cells can hold several lines; lines that start with `- ` or `1. ` show as lists.
 The user can give a verdict or ask another question.
 The same question ID and answer text change nothing and exit 0 on a rerun.
 The command refuses an old or unknown ID, a different answer, or a row without an open question.

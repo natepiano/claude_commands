@@ -122,6 +122,7 @@ _ROW = re.compile(r"^[A-Z]\d+$")
 _LANDS = re.compile(r"^\s*(?:(?:okay|ok)\s+)?(?:c\d+\s+)?(?:works|fine)\b", re.IGNORECASE)
 # A cell boundary is a `|` that _cell did not escape.
 _BOUNDARY = re.compile(r"(?<!\\)\|")
+_BREAK_TAG = re.compile(r"<(\\*)br>")
 _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
 _HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
 # The columns an older row keeps its merge hash in, in the order they are read.
@@ -363,11 +364,18 @@ def today() -> date:
 
 
 def _cell(text: str) -> str:
-    return text.replace("|", "\\|")
+    """Encode a cell as one table line.
+
+    A final line separator can drop because callers strip cell text.
+    """
+    escaped = _BREAK_TAG.sub(lambda match: "<\\" + match[1] + "br>", text.replace("|", "\\|"))
+    return "<br>".join(escaped.splitlines())
 
 
 def _plain(cell: str) -> str:
-    return cell.replace("\\|", "|")
+    """Decode line breaks and remove one backslash from each typed break tag."""
+    return _BREAK_TAG.sub(lambda match: "<" + match[1][1:] + "br>" if match[1] else "\n",
+                          cell.replace("\\|", "|"))
 
 
 def _cells(line: str) -> list[str]:
@@ -1520,7 +1528,11 @@ def _list(options: CommandLine) -> Path:
 
 def _visible(options: CommandLine) -> Visible:
     """The change, how to try it and what the user sees, from --change, --check and --see."""
-    return Visible(_words("change", options.change), _words("check", options.check), _words("see", options.see))
+    change = _words("change", options.change)
+    for name, value in (("check", options.check), ("see", options.see)):
+        if not value.strip():
+            _ = _words(name, value)
+    return Visible(change, options.check.strip(), options.see.strip())
 
 
 @dataclass(frozen=True)
