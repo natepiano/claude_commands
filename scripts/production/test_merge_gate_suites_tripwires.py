@@ -20,6 +20,102 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class MergeGateTripwiresTests(GateSuitesFixture):
+    def guarded_job(self, source: str) -> merge_gate.RunningGateJob:
+        root = self.root / "guard-job"
+        root.mkdir()
+        environment = merge_gate.test_module_environment(root, self.environment)
+        with mock.patch.object(merge_gate, "LIVE_ROOTS", (str(self.root),)):
+            return merge_gate.start_gate_job(
+                "hooks", Path("test_guard.py"), [sys.executable, "-c", source],
+                self.checkout, environment, root / "output.log")
+
+    def test_checkout_below_a_live_root_allows_writes_and_symlink_cleanup(self) -> None:
+        target = self.checkout / "scripts/lib/guard-fixture"
+        job = self.guarded_job(f'''import os, tempfile
+from pathlib import Path
+target = Path({str(target)!r})
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_text("checkout write")
+with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as temporary:
+    (Path(temporary) / "checkout-file").symlink_to(target)
+print(target.read_text())
+''')
+        status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+        result = merge_gate.finish_gate_job(job, status)
+        self.assertEqual(result.returncode, 0, result.output)
+        self.assertFalse(result.tripwire_tripped)
+        self.assertEqual(target.read_text(), "checkout write")
+
+    def test_private_roots_below_a_live_root_allow_writes(self) -> None:
+        job = self.guarded_job('''import os
+from pathlib import Path
+for name in ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "SCRATCH_ROOT", "TMPDIR"):
+    root = Path(os.environ[name])
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "guard-fixture"
+    target.write_text(name)
+    print(target.read_text())
+''')
+        status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+        result = merge_gate.finish_gate_job(job, status)
+        self.assertEqual(result.returncode, 0, result.output)
+        self.assertFalse(result.tripwire_tripped)
+        self.assertEqual(result.output.splitlines(),
+                         ["HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "SCRATCH_ROOT", "TMPDIR"])
+
+    def test_other_live_path_refusal_records_the_marker_without_recursion(self) -> None:
+        target = self.root / "merge-live-state"
+        self.write(target, "live state")
+        job = self.guarded_job(f'''from pathlib import Path
+try:
+    Path({str(target)!r}).write_text("forbidden")
+except PermissionError as error:
+    print(type(error).__name__ + ": " + str(error))
+else:
+    raise AssertionError("the live write passed")
+''')
+        status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+        detail = f"test refused a write to a live root: {target}"
+        self.assertEqual((job.log.parent / "refused-effects").read_text(), detail + "\n")
+        result = merge_gate.finish_gate_job(job, status)
+        self.assertEqual(status, 0, result.output)
+        self.assertEqual(result.returncode, 1, result.output)
+        self.assertTrue(result.tripwire_tripped)
+        self.assertIn("PermissionError: " + detail, result.output)
+        self.assertNotIn("RecursionError", result.output)
+        self.assertEqual(target.read_text(), "live state")
+
+    def test_pipe_descriptors_allow_git_output_below_a_live_root(self) -> None:
+        job = self.guarded_job('''import subprocess
+result = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                        input="", capture_output=True, text=True, check=True)
+print(result.stdout.strip())
+''')
+        status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+        result = merge_gate.finish_gate_job(job, status)
+        self.assertEqual(result.returncode, 0, result.output)
+        self.assertFalse(result.tripwire_tripped)
+        self.assertEqual(result.output.strip(), str(self.checkout))
+
+    def test_checkout_exception_keeps_the_pushover_credential_refusal(self) -> None:
+        target = self.checkout / "guard-pushover-env"
+        self.write(target, "private credentials")
+        with mock.patch.object(merge_gate, "LIVE_PUSH_KEYS", (str(target),)):
+            job = self.guarded_job(f'''from pathlib import Path
+try:
+    Path({str(target)!r}).read_text()
+except PermissionError as error:
+    print(error)
+else:
+    raise AssertionError("the credential read passed")
+''')
+        status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+        result = merge_gate.finish_gate_job(job, status)
+        self.assertEqual(status, 0, result.output)
+        self.assertEqual(result.returncode, 1, result.output)
+        self.assertTrue(result.tripwire_tripped)
+        self.assertIn(f"test refused Pushover credential access: {target}", result.output)
+
     def test_module_tool_calls_fail_even_when_its_tests_pass(self) -> None:
         commands = [["cargo", "check"], ["cargo", "metadata"], ["rustc", "--version"],
                     ["rustdoc", "--version"], ["rustup", "show"], ["cargo-nextest", "--version"]]

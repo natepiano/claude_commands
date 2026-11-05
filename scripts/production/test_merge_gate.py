@@ -38,9 +38,10 @@ class ModuleRootTests(unittest.TestCase):
             job_root.mkdir()
             environment = merge_gate.test_module_environment(job_root, dict(os.environ))
             environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            runner = merge_gate.module_runner(Path(__file__).resolve().parents[2])
             with mock.patch.object(merge_gate, "LIVE_ROOTS", (str(live),)):
                 job = merge_gate.start_gate_job(
-                    "fixture", module, [sys.executable, str(merge_gate.RUNNER), str(root), module.name],
+                    "fixture", module, [sys.executable, str(runner), str(root), module.name],
                     root, environment, job_root / "output.log")
             status = job.process.wait(timeout=30)
             result = merge_gate.finish_gate_job(job, status)

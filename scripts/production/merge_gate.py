@@ -122,9 +122,10 @@ LIVE_PUSH_KEYS = tuple(str(path.resolve()) for path in (
 SUITE_GUARD = r'''import os, sys
 from urllib.parse import urlsplit
 
+marker_descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+
 def refuse(detail):
-    with open(marker, "a") as output:
-        output.write(detail + "\n")
+    os.write(marker_descriptor, (detail + "\n").encode())
     raise PermissionError(detail)
 
 def refuse_external_effect(event, args):
@@ -155,6 +156,8 @@ def refuse_external_effect(event, args):
     for path, directory in paths:
         if isinstance(path, int):
             path = os.readlink("/proc/self/fd/" + str(path))
+            if not os.path.isabs(path):
+                continue
         if not isinstance(path, (str, bytes)):
             continue
         path = os.fsdecode(path)
@@ -163,6 +166,8 @@ def refuse_external_effect(event, args):
         path = os.path.realpath(path)
         if path in push_keys:
             refuse("test refused Pushover credential access: " + path)
+        if any(path == root or path.startswith(root + os.sep) for root in writable_roots):
+            continue
         if writing and any(path == root or path.startswith(root + os.sep) for root in live_roots):
             refuse("test refused a write to a live root: " + path)
 
@@ -712,6 +717,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
             guard.mkdir(parents=True)
             _ = (guard / "sitecustomize.py").write_text(
                 f"live_roots = {LIVE_ROOTS!r}\npush_keys = {LIVE_PUSH_KEYS!r}\n"
+                + f"writable_roots = {(str(repo.resolve()), str(log.parent.resolve()))!r}\n"
                 + f"push_host = {API_HOST!r}\nmarker = {str(log.parent / 'refused-effects')!r}\n" + SUITE_GUARD)
             environment = {**environment, "HOME": str(home), "XDG_STATE_HOME": str(state),
                            "XDG_CONFIG_HOME": str(config), "SCRATCH_ROOT": str(claude / "scratch"),
