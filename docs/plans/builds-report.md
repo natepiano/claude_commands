@@ -516,35 +516,24 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 - `basedpyright` on both files: 0 errors, 0 warnings, 0 notes.
 
 ### Phase 25 — A kill counts as a build when its program is under a Cargo target folder  · status: done
-**Depends on:** builds showrunner ruling 2026-11-05 on Phase 23 F011 ("one classifier for a cargo target is the right count").
 
-#### Work Order
+#### As-built
 
-**Goal:** `EarlyoomKill.is_build` and `outside_build_gate` classify a program with `sweep.is_cargo_target` on its folders. No `cargo metadata` probe and no index read run.
-
-**Spec:**
-- `scripts/buildlog/memory.py:115-122` `build_output_program(program)`: keep the rule that a relative program is not a build. Resolve the absolute path. Return True when any parent folder of the resolved program satisfies `sweep.is_cargo_target(str(parent))` (`scripts/lint/sweep.py:852`). Stop at the filesystem root.
-- This changes kill counts: a program under any Cargo target folder counts, also a target folder that no recorded step and no current checkout names. The builds showrunner approved this change.
-- Delete `build_output_roots` (memory.py:89-112) with its `lru_cache`, the `ThreadPoolExecutor` import, the lazy `build_shape` import, the `read_cargo_output_roots` and `CargoOutputRoots` imports when unused, and `index.index_path()`/`store.host_name()` uses that only it needed. Check each with LSP `findReferences`.
-- Delete `METADATA_PROBE_WORKERS` and its comment block from `config/buildlog.conf`.
-  Director amendment 2026-11-05: a config key deletion needs the user's go; builds filed the question. The checkpoint leaves the key in place. On a go, the key goes in its own commit; a "keep" answer goes back to builds.
-- Import `sweep` lazily inside `build_output_program` if a top-level import would load it in `buildlog snapshot`; say which and why in the summary.
-- A folder that is gone at classification time is not a Cargo target. Keep `is_cargo_target`'s own rules; do not copy them.
+- `memory.build_output_program(program)` returns True when a resolved parent folder of an absolute program satisfies `sweep.is_cargo_target`. A relative program is never a build. `sweep` is imported lazily under the module name `sweep`, as in `disk.py`.
+- `EarlyoomKill.is_build` is the configured `build_oom_score_adj` or a target program. `outside_build_gate` is a target program without that adjustment. One `_target_program` helper holds the folder check.
+- No root cache, no index read and no `cargo metadata` probe run. The first kill lookup in a fresh process takes 0.09 s CPU and 0.09 s wall on natedev.
+- A kill under a removed Cargo folder is not a build. On natedev, 5 of 6 logged kills count as build.
+- The build report's kill definition line says "under a Cargo target folder".
 
 **Files:**
-- `scripts/buildlog/memory.py` — the new `build_output_program`; deletions above.
-- `config/buildlog.conf` — `METADATA_PROBE_WORKERS` removed.
-- `scripts/buildlog/test_memory_window.py` — delete `BuildOutputRootsTests` and its helpers (`probe`, `build_roots`, `configure_workers`, `probes_meet`, the cache clears at lines 793-794). Add tests on fixture folders: a program under a folder with `.rustc_info.json` is a build; a program under a folder whose `CACHEDIR.TAG` has the Cargo tag and a build tree is a build; a program under a plain folder is not; a relative program is not. Both `EarlyoomKill.is_build` and `outside_build_gate` keep their `build_oom_score_adj` rules.
-- `scripts/buildlog/test_memory_records.py:85-95` — replace the resolved-roots test with the target-folder rule. A program under `<base>/target/debug` without Cargo markers is now not a build only because the folder is not a Cargo target.
-- `docs/as-built/buildlog-memory-stalls.md` — the kill classification sentence(s) name `sweep.is_cargo_target`.
+- `scripts/buildlog/memory.py` — the classifier.
+- `scripts/buildlog/test_memory_window.py` — `cargo_output(path)` fixture helper; `BuildOutputProgramTests`.
+- `scripts/buildlog/test_moments.py` — moment tests use `cargo_output` folders.
+- `scripts/buildlog/report.py` — kill definition line.
+- `docs/as-built/buildlog-memory-stalls.md` — classifier paragraph.
 
-**Workers:** 1 writer — nothing splits; `rowcpu` owns all files.
+**Gotchas:**
+- `METADATA_PROBE_WORKERS` stays in `config/buildlog.conf` with no reader until the user answers the key deletion question.
+- Tests that classify kills need a fixture folder with Cargo markers; a plain `target/debug` path is not a build.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 20 and Phase 23 built the probe path that this phase deletes. Resources Phase 64 moves `build_shape.recorded_output_roots`; after this phase memory.py no longer calls it. `scripts/lint/sweep.py` is resources' file and is read only here.
-
-**Acceptance gate:**
-- `scripts.buildlog.test_memory_window`, `scripts.buildlog.test_memory_records`, `scripts.buildlog.test_report`, `scripts.buildlog.test_sample`, `scripts.lint.test_build_shape`, `scripts.lib.test_conf` green, from the worktree root with and without `PYTHONPATH`, and with a tripwire `cargo` (exit 99) first on PATH.
-- On the live natedev index: the first kill classification in a fresh process, before (5897f0fdf: 1.08 s wall, 5.54 s total CPU) and after. Report the count of earlyoom kills in the live log that each version calls a build, and list each kill whose class changes.
-- `basedpyright` on every changed Python file: 0 errors, 0 warnings, 0 notes.
+**Ruled out:** a per-kill `cached_property` (under 1 ms per report).
