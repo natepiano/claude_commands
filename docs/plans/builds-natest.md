@@ -219,8 +219,10 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - A per-class recorder seed for the assign launcher tests (F025): it gained about 4%, so simple wins (showrunner ruling).
 
-### Phase 7 — The fast-track module and the next live slow module run in half their time  · status: todo
+### Phase 7 — The fast-track module and the next live slow module run in half their time  · status: done
 **Depends on:** none (its two modules share no file with Phase 6; each baseline is its own gate median and an idle-host run, so Phase 6 need not land first)
+
+**Result:** half was not reached. Same-load pairs (3 rounds, load 40-73): `test_fast_track.py` 304 to 193 s wall, 202 to 110 s CPU. Its floor is 55 tests at about 3.5 s each, from real Git work; the architecture proposal went to the showrunner. `test_crate_run.py`: a per-class seed gave no gain under the same load (128 to 126 s) and was removed.
 
 #### Work Order
 

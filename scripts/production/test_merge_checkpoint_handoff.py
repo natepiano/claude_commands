@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.cli_fixture import process_boundary
+
 import json
 import shutil
 import subprocess
@@ -26,6 +28,8 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    # Keep the child CLI process boundary.
+    @process_boundary
     def test_attached_child_handoff_merges_without_a_units_row_and_acknowledges_after_push(self) -> None:
         _ = self.child_production()
         checkpoint = self.checkpoint()
