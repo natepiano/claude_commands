@@ -649,38 +649,20 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 25 — The merge gate runs the `module_run.py` of the tree it tests  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** each gate test job starts the tested checkout's own `scripts/test_times/module_run.py`, so an older tree never runs under a newer runner.
-
-**Spec:** The builds showrunner assigned this fix on 2026-11-05, ahead of Phase 24 code. It is a defect in Phase 21's delivery path: sdlc found that the nightly on main 72539dc10 went red in `test_session_send.py` and `test_disk.py`.
-1. Cause: `merge_gate.py:110` sets `RUNNER` from `Path(__file__)`, the installed `~/.claude` copy. Line 1064 starts that runner for every test module of any checkout. The installed runner (with Phase 21) read `sender_violation` from a tree that did not have it. queue-unit confirmed that both modules pass at 72539dc10 under that tree's own runner.
-2. Replace the module constant with one function that takes the checkout and returns `<checkout>/scripts/test_times/module_run.py`. Every test job uses it. Keep the job argv shape: `python, runner, folder, module`.
-3. A checkout with no `scripts/test_times/module_run.py` refuses the gate before any job starts, with one line that names the missing path. Do not fall back to the installed runner: a fallback brings back the mixed-version run.
-4. Confirm that the runner's own imports (`sys.path`) resolve in the tested checkout, not in `~/.claude`. If they do not, fix that in `module_run.py`.
-5. Change no other gate behavior: the job environment, admission, reruns and timing records stay as they are.
-6. Verify every caller: each `scripts/production/test_merge_gate*.py` module.
+- `scripts/production/merge_gate.py` `module_runner(repo)` returns `<checkout>/scripts/test_times/module_run.py`. `run_suites` calls it once after discovery, and every test job starts that runner. The unit gate, `--tests-only` and `--nightly` (its prepared clone) all pass the tested checkout.
+- A checkout with no runner refuses the gate with `REFUSED: test runner not found: <path>`, before any ledger row, admission or temporary folder. There is no fallback to the installed copy.
+- `module_run.py` puts the cwd first on `sys.path`, and the gate starts each job in the checkout, so a job imports only the tested tree. This ended the nightly red at main 72539dc10, where the installed runner read guard state that the older tree lacked.
+- Checks: the older tree's `test_session_send.py` and `test_disk.py` pass through the new job form; the branch's own gate on this phase plus builds 56ca7bc7a was green (1131 s, full suite).
 
 **Files:**
-- `scripts/production/merge_gate.py` — the runner function and the refusal
-- `scripts/production/test_merge_gate.py`, `scripts/production/test_merge_gate_test_times.py` — the three `merge_gate.RUNNER` assertions now expect the checkout's runner; fixture checkouts get a runner file
-- `scripts/production/test_merge_gate_suites.py` — a test that a checkout whose runner differs from the installed one gets its own runner, and a test for the refusal
-- `scripts/production/merge_gate_test_support.py` — `MergeGateFixture.build_fixture` commits a runner file into each fixture checkout
-- `scripts/test_times/module_run.py` — only if step 4 finds a defect
-- `scripts/test_times/test_module_run.py` — only if step 4 finds a defect
+- `scripts/production/merge_gate.py` — `module_runner` and the refusal
+- `scripts/production/merge_gate_test_support.py` — `MergeGateFixture.build_fixture` commits the real runner into each fixture checkout
+- `scripts/production/test_merge_gate_suites.py` — the checkout-runner test and the refusal test
 
-**Workers:** 1 writer (one function and its callers; the files do not split)
-- `impl` — all files above
-
-**Constraints from prior phases:**
-- Phase 2 made `module_run.py` the gate's runner. Phase 21 made it read the sender guard state.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `/tmp/claude`.
-
-**Acceptance gate:**
-- every `scripts/production/test_merge_gate*.py` module green
-- an older tree: in a clone at main 72539dc10, `test_session_send.py` and `test_disk.py` pass through this branch's `merge_gate.py` job form, with the tree's own runner in the argv
-- a newer tree: the merge gate on this branch plus origin/builds passes
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+**Binds later work:**
+- A change to `module_run.py` takes effect for the tree that carries it; the installed copy no longer runs another tree's tests.
 
 ### Phase 26 — The sender guard also stops `send.py` started from its own folder or as a module  · status: todo
 **Depends on:** Phase 25
