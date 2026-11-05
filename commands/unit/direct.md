@@ -1078,7 +1078,7 @@ At an eligible point, in that same turn:
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
+   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
 
    Pass the same lens and phase the launch carries, and no lens where the
    launch carries none: the marker names the status and pid files it will watch for, and a
