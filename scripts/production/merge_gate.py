@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """Merge a checkpoint, run the complete gate, then push (and optionally promote).
 
-The default sampled memory cap is 6144 MiB. Full-tree basedpyright peaked at
-4065 MiB on 2026-10-30; its reservation is 4878 MiB. A sample is resident plus swapped memory.
-Each job reserves its last recorded peak times 1.2, using records from before this run.
-An unrecorded module reserves the largest recorded module peak times 1.2, or 640 MiB
-without module records. An unrecorded types job reserves 3072 MiB. Admission counts
-the latest aggregate sample, remaining running reservations and the next job's reservation.
-Samples are at least 0.25 seconds apart. One job is always allowed to progress;
-an observed overshoot makes the run red. This is admission on samples, not an
-OS allocation limit; growth between samples can still exceed the cap. A job whose
-own sampled memory goes over the cap is killed at that sample and fails the run, and so is
-a job still running at the module time limit (default 1800 s).
+The queue reservation and the test runner governor use separate configuration keys.
+The governor starts a job when its expected memory fits and a CPU slot is free.
+With no job running, the governor always starts one job.
+Memory samples update the queue reservation and the recorded peaks.
+A memory peak does not kill a job or fail the gate.
+A job still running at the module time limit fails the gate (default 1800 s).
 After the parallel pass, up to eight failed test modules run once more, alone.
 Runner-killed jobs and the type check do not run again. Each test module uses a
 builds.slice scope when its probe succeeds, unless disabled or already in that slice.
@@ -59,7 +54,7 @@ import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.production import change_review  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
@@ -80,9 +75,6 @@ from scripts.build_queue.queue_place import (  # noqa: E402
     QueuePlace, QueuePlaceRefused, defer_cleanup_signals, queue_place, suite_scope_prefix,
 )
 
-# Full-tree basedpyright peaked at 4065 MiB on 2026-10-30: its 4878 MiB reservation
-# leaves room for modules beside it under this cap.
-DEFAULT_MEMORY_CAP_MIB = 6144
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
@@ -138,7 +130,6 @@ class GateArguments(argparse.Namespace):
     ssh: str = ""
     mac_host: str = ""
     mac_repo: str = ""
-    memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB
     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     tests_only: bool = False
     promote_only: bool = False
@@ -181,14 +172,13 @@ class GateRun:
     jobs: tuple[GateJobResult, ...]
     seconds: float
     peak_memory_mib: float
-    memory_within_cap: bool = True
     tests_reused: bool = False
     # A valid affected selection may have no test modules at all.
     selection_certified: bool = False
 
     @property
     def passed(self) -> bool:
-        return (self.memory_within_cap and (bool(self.jobs) or self.tests_reused or self.selection_certified)
+        return ((bool(self.jobs) or self.tests_reused or self.selection_certified)
                 and all(job.returncode == 0 for job in self.jobs))
 
 
@@ -201,7 +191,7 @@ class RunningGateJob:
     output: TextIO
     log: Path
     module: str
-    # Set when the runner kills the job for its memory or time limit.
+    # Set when the runner kills the job for its time limit.
     killed_for: str = ""
     cpu_slot: SharedCPUSlot | NoSharedCPU = field(default_factory=lambda: NoSharedCPU())
     peak_memory_mib: float = 0.0
@@ -227,7 +217,7 @@ class RecordedJobPeaks:
 
 @dataclass
 class SampledRSSAdmission:
-    cap_mib: int
+    governor_mib: float
     latest_mib: float = 0.0
     job_memory_mib: dict[int, float] = field(default_factory=dict)
     reservations_mib: dict[int, float] = field(default_factory=dict)
@@ -250,7 +240,7 @@ class SampledRSSAdmission:
         self.next_sample_at = now + MEMORY_SAMPLE_SECONDS
 
     def admits(self, expected_mib: float) -> bool:
-        return not self.reservations_mib or self.latest_mib + self.reserved_mib + expected_mib <= self.cap_mib
+        return not self.reservations_mib or self.latest_mib + self.reserved_mib + expected_mib <= self.governor_mib
 
     def reserve(self, pid: int, expected_mib: float) -> None:
         self.job_memory_mib[pid] = 0.0
@@ -333,14 +323,23 @@ def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
                 os.close(descriptor)
 
 
+def merge_gate_memory_gib(key: str) -> float:
+    """Read one memory setting when the gate uses it."""
+    try:
+        value = conf.read("build_admission").number(key)
+    except conf.Unusable as error:
+        raise GateRefused(str(error)) from error
+    return value
+
+
 @contextmanager
-def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldWait) -> Generator[QueuePlace]:
+def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
-    cap = cap_mib * (1 << 20)
+    need = int(merge_gate_memory_gib("merge_gate_reservation_gib") * memory_admit.GIB)
     try:
         with queue_place("merge-gate", repo,
-                         sizing=memory_admit.FixedCapSizing(cap),
+                         sizing=memory_admit.FixedCapSizing(need),
                          before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
             yield place
     except QueuePlaceRefused as error:
@@ -915,12 +914,11 @@ def module_runner(repo: Path) -> Path:
     return runner
 
 
-def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
+def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False) -> GateRun:
-    if memory_cap_mib <= 0:
-        raise GateRefused("memory cap must be positive")
+    governor_gib = merge_gate_memory_gib("merge_gate_governor_gib")
     if module_time_limit_s <= 0:
         raise GateRefused("module time limit must be positive")
     if max_running_jobs <= 0:
@@ -955,7 +953,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         if isinstance(selection, AffectedSelection):
             selected = set(selection.modules)
             modules = [(suite, path) for suite, path in modules if path in selected]
-    print(f"Runner: {len(modules)} modules, sampled memory cap {memory_cap_mib} MiB", flush=True)
+    print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     scope_prefix = suite_scope_prefix()
     timings_path = gate_state_dir() / "module_seconds.json"
     timings = read_measures(timings_path)
@@ -981,7 +979,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     rerunning = False
     suite_started: dict[str, float] = {}
     suite_finished: dict[str, float] = {}
-    admission = SampledRSSAdmission(memory_cap_mib)
+    admission = SampledRSSAdmission(governor_gib * 1024)
     largest_module_peak_mib = 0.0
     largest_module = ""
     starting_load = one_minute_load()
@@ -998,7 +996,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
                         wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
                         reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
-                        cap_mib=memory_cap_mib, aborted=aborted)
+                        cap_mib=admission.governor_mib, aborted=aborted)
 
     @contextmanager
     def record_on_abort() -> Generator[None, None, None]:
@@ -1012,7 +1010,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     with (record_on_abort(),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               build_folders.FOLDER_PREFIXES["merge-gate"], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
-          gate_reservation(repo, memory_cap_mib, temporary, hold) as reservation,
+          gate_reservation(repo, temporary, hold) as reservation,
           shared_cpu_pool() as cpu_pool):
         environment = {**os.environ, "TMPDIR": str(temporary)}
         types_python = typecheck_python() if type_dirs else ""
@@ -1040,13 +1038,6 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         if job.kind is GateJobKind.TEST_MODULE and measured > largest_module_peak_mib:
                             largest_module_peak_mib = measured
                             largest_module = f"{job.suite}/{job.module}"
-                        if measured > memory_cap_mib and not job.killed_for:
-                            # Admission cannot stop a job that grows after it starts; on 2026-10-18 one
-                            # module grew to 28 GiB in 56 minutes and filled natedev's swap.
-                            job.killed_for = (f"killed: sampled memory {measured / 1024:.3f} GiB is over the "
-                                              + f"{memory_cap_mib / 1024:.3f} GiB cap")
-                            print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
-                            kill_job_group(job)
                 while (pending and len(running) < max_running_jobs
                        and admission.admits(recorded_peaks.reservation_mib(pending[0]))
                        and (not rerunning or not running)):
@@ -1156,9 +1147,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
             save_measures(types_peaks_path, types_peaks)
             save_measures(module_peaks_path, module_peaks)
             save_measures(history_path, history)
-        reservation.status = int(admission.peak_mib > memory_cap_mib or any(result.returncode for result in results))
+        reservation.status = int(any(result.returncode for result in results))
     elapsed = time.monotonic() - began - (hold.seconds - initial_hold_seconds)
-    run = GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib, reused,
+    run = GateRun(tuple(results), elapsed, admission.peak_mib, reused,
                   isinstance(selection, AffectedSelection))
     record(0 if run.passed else 1, aborted=False)
     ending_load = one_minute_load()
@@ -1192,14 +1183,12 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         print(f"Gate hold wait: {hold.seconds:.2f}s (excluded from Gate tests)", flush=True)
     full_reason = f"; full suite: {reason}" if reason else ""
     print(f"Gate tests: {elapsed:.2f}s; at most {max_running_jobs} modules at once; "
-          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB{full_reason}", flush=True)
+          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory){full_reason}", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     most_cpu = sorted(run_cpu, key=lambda key: (-run_cpu[key], key))[:3]
     cpu_jobs = ", ".join(f"{run_cpu[key]:.2f} s {key}" for key in most_cpu) or "(none)"
     print(f"Most CPU: {cpu_jobs}; total {sum(run_cpu.values()):.2f} s", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
-    if admission.peak_mib > memory_cap_mib:
-        print("RED: sampled memory exceeded the cap", flush=True)
     if run.passed and not reused:
         ledger.record_pass(selection)
         if isinstance(selection, FullSuite):
@@ -1461,7 +1450,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         previous_unit = os.environ.get(memory_admit.BUILDLOG_UNIT)
         os.environ[memory_admit.BUILDLOG_UNIT] = args.unit
         try:
-            suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
+            suites = run_suites(repo, args.type_dirs, float(args.module_time_limit_s),
                                 source="checkpoint", full=args.full)
         finally:
             if previous_unit is None:
@@ -1583,7 +1572,7 @@ def nightly(args: GateArguments) -> int:
     with copies.standing(nightly_owner(args), repo, commit) as clone:
         tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
         try:
-            run = run_suites(clone, args.memory_cap_mib, args.type_dirs,
+            run = run_suites(clone, args.type_dirs,
                              module_time_limit_s=args.module_time_limit_s, full=True)
         except (GateRefused, OSError, subprocess.SubprocessError) as error:
             print(f"Nightly suite runner failed: {error}", flush=True)
@@ -1622,8 +1611,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--ssh", default="ssh")
     _ = parser.add_argument("--mac-host", default="mac")
     _ = parser.add_argument("--mac-repo", default="~/.claude")
-    _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
-                            help="sampled memory admission cap in MiB (default: 6144); full-tree basedpyright peaked at 4065 MiB on 2026-10-30, reserving 4878 MiB")
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")
@@ -1648,8 +1635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.nightly:
                 return nightly(args)
             if args.tests_only:
-                return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
-                                       args.type_dirs,
+                return 0 if run_suites(Path(str(args.repo)).resolve(), args.type_dirs,
                                        module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
             if args.promote_only:
                 promote(args)
