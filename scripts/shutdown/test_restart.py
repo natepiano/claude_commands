@@ -24,6 +24,7 @@ import shutdown
 from unit_staff_test_support import unit_host
 from scripts.production import fake_unit_host, session_staff, staff
 from scripts.accounts import accounts
+from scripts.message import codex_daemon
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.lib import unit_runs
 from test_support import ShutdownTestCase, registry_confirmation
@@ -59,6 +60,7 @@ class CodexSnapshotTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(herdr, "process_environment", return_value={}))
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=self.native))
         _ = self.enterContext(patch.object(unit_runs, "run_roots", return_value=()))
+        _ = self.enterContext(patch.object(codex_daemon, "read_daemons", return_value=[]))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
         records = registry_confirmation(frozenset(self.claude)).records
         _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=records))
@@ -100,6 +102,47 @@ class CodexSnapshotTests(ShutdownTestCase):
         with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
             self.assertEqual(restart.live_members(self.rows, staff.StaffSnapshot(self.rows), codex=snapshot), list(self.rows[:3]))
         scans.assert_not_called()
+
+    def test_live_rows_reports_one_shared_cause_and_one_unproved_row_count(self) -> None:
+        snapshot = herdr.CodexConversations({}, ("test-account (Codex daemon unknown: unreadable)",))
+        with (patch.object(herdr, "codex_conversations", return_value=snapshot) as scan,
+              patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.dict(os.environ, {"SHUTDOWN_DETAIL": "0"}),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), [])
+        scan.assert_called_once()
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "anomaly: test-account (Codex daemon unknown: unreadable); not blocking",
+            "anomaly: 4 rows not proved live or stopped (shared cause above); not blocking"])
+
+    def test_live_rows_detail_reports_each_row_with_shared_uncertainty(self) -> None:
+        snapshot = herdr.CodexConversations({}, ("test-account (Codex daemon unknown: unreadable)",))
+        with (patch.object(herdr, "codex_conversations", return_value=snapshot),
+              patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.dict(os.environ, {"SHUTDOWN_DETAIL": "1"}),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), [])
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(len(lines), 6)
+        for row, line in zip(self.rows, lines[1:-1], strict=True):
+            self.assertIn(f"{row.current_session} is not proved live or stopped", line)
+        self.assertEqual(lines[-1], "anomaly: 4 rows not proved live or stopped (shared cause above); not blocking")
+
+    def test_live_members_reports_shared_evidence_once_when_it_reads_the_snapshot(self) -> None:
+        snapshot = herdr.CodexConversations({}, ("test-account (Codex daemon unknown: unreadable)",))
+        with (patch.object(herdr, "codex_conversations", return_value=snapshot) as scan,
+              patch.object(herdr, "running_codex_threads") as threads,
+              patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch.dict(os.environ, {"SHUTDOWN_DETAIL": "0"}),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.live_members(self.rows, staff.StaffSnapshot(self.rows)), [])
+        scan.assert_called_once()
+        threads.assert_not_called()
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "anomaly: test-account (Codex daemon unknown: unreadable); not blocking",
+            "anomaly: 4 rows not proved live or stopped (shared cause above); not blocking"])
 
 
 def checkout() -> inventory.GitCheckout:

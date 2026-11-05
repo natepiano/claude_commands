@@ -31,6 +31,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 
 import herdr
 from scripts.lib import operation_deadline
+from scripts.message import session_send
 import pane_record
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
@@ -664,9 +665,8 @@ def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
     tab = _tab_of(session)
     if isinstance(tab, SessionNotFound):
         return
-    _ = subprocess.run([sys.executable, str(SCRIPTS / "message/send.py"),
-        "--to", f"session:{tab.session_id}", "--from", "shutdown",
-        "--text", f"Account move in {seconds} seconds: {why}. You will resume on {target}; continue your work and workers."],
+    _ = subprocess.run(session_send.send_argv("--to", f"session:{tab.session_id}", "--from", "shutdown",
+        "--text", f"Account move in {seconds} seconds: {why}. You will resume on {target}; continue your work and workers."),
         capture_output=True, timeout=15, check=False)
 
 

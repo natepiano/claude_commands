@@ -27,7 +27,7 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -276,6 +276,34 @@ class VerifyHoldWaitFixture(unittest.TestCase):
     def stop_process(self, process: subprocess.Popen[str]) -> None:
         self.fixture.stop_verify(process)
 
+    def start_memory_queued_lint(self) -> subprocess.Popen[str]:
+        """Keep the real admission client waiting behind a private memory limit."""
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        with admission.loop_turn():
+            _ = admission.occupy_host()
+            admission.free(0)
+        _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
+            'lint_config_enabled() {\n'
+            + '    [[ "$1" == clippy ]] || return 1\n'
+            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
+            + '}\n'
+            + 'lint_config_skip_notice() { :; }\n')
+        self.fixture.environment.update({
+            "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",
+            "LINT_SKIP_SWEEP": "1",
+        })
+        process = self.start("lint", "sample")
+        self.wait_for_call(process, "waiting for memory since")
+        return process
+
+    def memory_queue_pids(self) -> set[int]:
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        with admission.loop_turn():
+            return {waiting.request.owner.pid for waiting in admission.server.waiters.values()}
+
+    def wait_for_owned_exit(self, timeout: float) -> set[int]:
+        return wait_for_marker_exit(self.fixture.child_marker(), timeout)
+
     def wait_for_call(self, process: subprocess.Popen[str], announcement: str = VERIFY_WAITING) -> None:
         self.wait_for_waiting_diagnostic(process, announcement)
 
@@ -428,6 +456,9 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         observer = self.fixture.root / "python-observer"
         self.fixture.write_executable(observer, '''import json, os, sys
 from pathlib import Path
+if os.environ.get("TEST_PYTHON_STARTS"):
+    with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
+        output.write(json.dumps(sys.argv[1:]) + chr(10))
 if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "step":
     with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
         output.write(json.dumps({"start": sys.argv[4], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[9:]}) + chr(10))

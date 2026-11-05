@@ -204,7 +204,12 @@ class ConfigurationTests(IsolatedTargetTest):
         config = self.write_config("targets=fixture\nkind.fixture=local\nplatform.fixture=linux\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
             self.assertEqual(targets.read_targets(), (targets.LocalTarget("fixture", "linux"),))
-            self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (targets.LocalTarget("fixture", "linux"),))
+
+    def test_explicit_path_wins_over_environment(self) -> None:
+        config = self.write_config("targets=fixture\nkind.fixture=local\nplatform.fixture=linux\n")
+        explicit = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n", "explicit.conf")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
+            self.assertEqual(targets.read_targets(explicit), (targets.LocalTarget("natedev", "linux"),))
 
     def test_unknown_kind_names_its_key(self) -> None:
         config = self.write_config("targets=mac\nkind.mac=network\nplatform.mac=macos\n")
