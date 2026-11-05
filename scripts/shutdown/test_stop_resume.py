@@ -347,6 +347,22 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
         self.assertEqual(self.entry["name"], "alpha")
 
+    def test_pane_command_unsets_conductor_variables_and_removes_saved_values(self) -> None:
+        conductor = {"HERDR_TAB_ID": "w1:t9", "STAFF_ID": "conductor", "STAFF_OPERATION_FD": "81",
+                     "PYTHONUNBUFFERED": "1", "REFUSAL_WATCH_INVENTORY": "inventory", "STAFF_ROW_FD_x": "82"}
+        entry = self.entry.copy()
+        entry["environment"] = {**entry["environment"], **conductor,
+                                "STAFF_ROW_FD_saved": "83", "RESUME_TEST_VALUE": "kept"}
+        with patch.dict(os.environ, conductor):
+            command = stop_resume._pane_command(  # pyright: ignore[reportPrivateUsage]
+                herdr.TabSession("w1:p2", "alpha", "w1", entry["session_id"]), entry, "claude3")
+        environment = command[1:command.index("sh")]
+        for key in (*conductor, "STAFF_ROW_FD_saved"):
+            with self.subTest(key=key):
+                self.assertEqual(environment[environment.index(key) - 1], "-u")
+                self.assertFalse(any(argument.startswith(f"{key}=") for argument in environment))
+        self.assertIn("RESUME_TEST_VALUE=kept", environment)
+
     def test_pane_command_trusts_the_codex_folder(self) -> None:
         folder = str(self.root / 'a.b "folder"')
         entry = pane_record.launch("w1:p2", "thread", folder, {"CODEX_HOME": "/account"}, ["codex"], kind="codex")
