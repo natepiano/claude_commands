@@ -641,21 +641,13 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 23 — An unknown process does not refuse a staff write about another row  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+- `staff_sources.require_worker_stopped` prints each diagnostic on stderr as `anomaly: <line>` and continues. This covers a process with no thread id, a pane with no staff member and each `peer.problems` entry.
+- The target's own live identity and `PeerNotReached` still refuse.
+- `UnavailableWorkerPolicy` and its two raises are deleted. `observe_workers` always returns its diagnostics.
+- `live` and `migrate_staff_ids.py` did not change. No other check, guard or refusal is added.
 
-**Goal:** an unidentified process is a printed anomaly line, never a refusal (user rule, 2026-11-02). `astra_review.py` wrote its review on 2026-11-05 and then exited 1 at teardown: `staff.retire` raised `StaffUnreadable` ("Codex process 198033: native thread identity is unavailable"). Pid 198033 is one of Morty's bare `codex` panes.
+**Files:** `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py`.
 
-**Cause (found by the unit director):** `staff.retire` calls `require_stopped`, which calls `staff_sources.require_worker_stopped`, which calls `observe_workers` with its default policy `UnavailableWorkerPolicy.REFUSE`. That policy raises when any process on the machine has no thread id, whichever row the write is about.
-
-**Spec:**
-1. `scripts/production/staff_sources.py`: delete `UnavailableWorkerPolicy` and its two raises. `observe_workers` always returns its diagnostics.
-2. `require_worker_stopped`: print each diagnostic on stderr as `anomaly: <line>` and continue. It still refuses when the target's own native id is live. A `peer.problems` entry is also printed as an anomaly and is no longer a refusal; the peer's entries are still checked. `PeerNotReached` stays a refusal, because it is about the target's own machine.
-3. `scripts/production/migrate_staff_ids.py` keeps its behavior: it already adds the diagnostics to its missing list.
-4. Add no other check, guard or refusal. `live` and its `complete` field do not change in this phase.
-
-**Acceptance gate:**
-- One new test: `staff.retire` of a stopped row retires it while another Codex process has no thread id, and the anomaly line is printed.
-- The tests of the deleted policy lose their `assertRaises` blocks and the policy argument. Tests that the target's own live session refuses still pass, unchanged.
-- The unittest modules of every changed test file pass, and basedpyright on every changed file ends `0 errors, 0 warnings, 0 notes`.
+**Gotchas:** the gate on this checkpoint was red in 4 modules: `test_progress_history`, `test_session_pane`, `test_roles_audit` and `test_stop_resume`. The cause is outside this phase. Tests with a private staff record read the real timer folder, and the sdlc-devtools fix ec4762af6 repairs it.
