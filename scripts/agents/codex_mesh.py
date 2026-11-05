@@ -1,58 +1,5 @@
 #!/usr/bin/env python3
-"""codex_mesh.py — Run codex workers as addressable threads on one app-server.
-
-Why this exists rather than agent_exec.sh: a worker launched with `codex exec`
-is unreachable. Nothing outside its own process can hand it a message, so peers
-coordinate only through the board and a worker that goes down the wrong path
-stays there until its turn ends. `codex app-server` fixes that by hosting every
-worker as a thread on one local websocket: any process that can open a socket
-can queue a message for a named worker, or steer one mid-turn.
-
-The pieces this depends on, each verified against codex 0.162.0:
-
-  * `initialize` must declare `capabilities.experimentalApi`. Without it the
-    queue methods return -32600 with no hint that a flag is missing.
-  * `sandbox` takes the SandboxMode STRING ("danger-full-access"), not the
-    SandboxPolicy object the generated schema shows for other fields.
-  * `thread/queue/add` reaches a thread between turns; `turn/steer` interrupts a
-    running one and needs the turn id the worker is currently on.
-
-`start` deliberately blocks for the worker's lifetime. Launches that return
-immediately would break every caller that waits on a pid, so this stays in the
-foreground and implement.sh's `wait`, heartbeat watch, and pass recording work
-unchanged.
-
-Verbs:
-  serve  Start the session's app-server and record where it listens.
-  start  Launch one worker as a named thread; block until its turn ends.
-         The last reply lands in --summary-file, unless --reply-file names
-         where replies go. A writable worker may supply its own summary;
-         otherwise the runner fills the empty summary from the final reply.
-         Read-only reviewers return their entire result in that reply.
-         With --resident, stay attached across turns instead: each finished
-         turn is printed to stdout and delivered the same way, the thread
-         keeps accepting `send`, and only `end` releases the block.
-  follow Resume a finished named thread, start one turn, and block for that turn.
-  compact
-         Compact a finished named thread and print its context size before and
-         after compaction.
-         A compaction that does not finish in time is interrupted, so the
-         worker can still take a follow-up (exit 1). Exit 3 means a turn is
-         still live on the thread and no follow-up can be sent.
-  send   Queue a message for a named worker, delivered at its next turn.
-  steer  Inject into a named worker's running turn.
-  interrupt
-         Stop a named worker's running turn and keep the worker. A --message
-         is held first and opens its next turn.
-  end    Finish a resident worker: drop its queued messages, interrupt its
-         running turn, if any, and release its `start`.
-  stop   Stop the session's app-server, and any it replaced mid-run.
-  signin-changed
-         Move every run off an app-server started before the Codex sign-in
-         last changed, and tell the session holding each run. A path watch
-         on the sign-in file runs it.
-  list   Print the roster of named workers and what each is doing.
-"""
+"""See docs/as-built/long-lived-workers.md for worker and server operations."""
 
 from __future__ import annotations
 
@@ -96,6 +43,7 @@ from scripts.lib.unit_runs import SERVER_FILE as SERVER_FILE
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import staff, worker_admission, session_staff
 from scripts.production.worker_admission import WorkerStartAllowed
+from scripts.shutdown.stop_results import SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.message import repeat_guard
@@ -716,16 +664,19 @@ def _roster_role(value: object) -> RosterRole:
     return AssignedWorkerRole(cast(WorkerRole, role))
 
 
-def task_role(thread_id: str) -> RosterRole:
+def task_assignments() -> agents_log.RoleLog:
     try:
-        assignment = agents_log.role_at(
-            agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-            thread_id, datetime.now(timezone.utc))
-        if isinstance(assignment, agents_log.Assignment):
-            return _roster_role(assignment.role)
+        return agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
     except Exception as error:
         print("agents_log: " + " ".join(str(error).splitlines()), file=sys.stderr)
-    return RolelessThread()
+        return agents_log.RoleLog({}, ())
+
+
+def task_role(thread_id: str, assignments: agents_log.RoleLog, *, default_role: str = "") -> RosterRole:
+    assignment = agents_log.role_at(assignments, thread_id, datetime.now(timezone.utc))
+    if isinstance(assignment, agents_log.Assignment):
+        return _roster_role(assignment.role)
+    return _roster_role(default_role) if default_role in (*WORKER_ROLES, "astra-reviewer", "astra-designer") else RolelessThread()
 
 
 def _worker_role(args: argparse.Namespace) -> WorkerRole:
@@ -4162,29 +4113,22 @@ def command_release_follow(args: argparse.Namespace) -> int:
 
 def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = False,
                 admission: WorkerAdmission | IndependentWorkerAdmission = INDEPENDENT_WORKER_ADMISSION,
-                staff_admission: WorkerStartAllowed | None = None) -> RunOutcome:
+                staff_admission: WorkerStartAllowed) -> RunOutcome:
     """Attach one worker to the app-server on `port` and run it to its end."""
     session_dir = _as_str(_attr(args, "session_dir"))
-    if staff_admission is None:
-        try:
-            staff_admission = worker_admission.admit(_as_str(_attr(args, "name")), Path(session_dir),
-                role=_as_str(_attr(args, "role")) or "impl", reference=_as_str(_attr(args, "staff_id")))
-        except ValueError as error:
-            print(str(error), file=sys.stderr)
-            return WorkerLaunchRefused()
     name = staff_admission.name
     prompt_path = Path(_as_str(_attr(args, "prompt_file")))
     request = worker_admission.assignment_id(prompt_path)
     args.switch_request = request
     previous = worker_admission.dispatch_record(staff_admission)
-    if previous.get("assignment_id") == request and previous.get("dispatch_state") == "accepted":
+    if previous.assignment_id == request and previous.state is worker_admission.SwitchState.ASSIGNMENT_ACCEPTED:
         print("unchanged")
         return RunCompleted()
     timeout = _as_float(_attr(args, "timeout"), 86400.0)
     opened = time.time()
     try:
         with contextlib.ExitStack() as dispatch_lock:
-            _ = dispatch_lock.enter_context(staff.row_operation(staff_admission.lock_reference))
+            _ = dispatch_lock.enter_context(worker_admission.worker_operation(staff_admission))
             return _attach_and_run(args, port, session_dir, name, timeout, opened, started_here=started_here, admission=admission, staff_admission=staff_admission, dispatch_lock=dispatch_lock)
     except worker_admission.AdmissionRefused as error:
         print(str(error), file=sys.stderr)
@@ -4221,55 +4165,31 @@ def _thread_start_params(args: argparse.Namespace, cwd: Path) -> dict[str, objec
     return params
 
 
-def _publish_created_worker(client: Client, session_dir: str, allowed: WorkerStartAllowed,
-                            thread_id: str) -> worker_admission.PublishedWorker:
-    try:
-        return worker_admission.publish(allowed, thread_id)
-    except worker_admission.AdmissionRefused as error:
-        released = _release_worker_thread(client, thread_id, session_dir)
-        detail = (f"; cleanup unproved: {released.reason}" if isinstance(released, WorkerThreadStateUnknown)
-                  else "; created thread stopped")
-        raise worker_admission.AdmissionRefused(f"{error}{detail}") from error
+def _cleanup_created_thread(client: Client, session_dir: str, identity: str) -> str:
+    released = _release_worker_thread(client, identity, session_dir)
+    return (f"; cleanup unproved: {released.reason}" if isinstance(released, WorkerThreadStateUnknown)
+            else "; created thread stopped")
 
 
-def _create_worker_backend(client: Client, method: str, params: dict[str, object], *,
-                           submits_work: bool = False,
-                           stopped: RefusalCommandContext = REFUSAL_WITHOUT_COMMAND_EXIT,
-                           ) -> str:
-    result = _serving_request(client, method, params, submits_work=submits_work, stopped=stopped)
+def _thread_id(result: dict[str, object]) -> str:
     return _as_str(_as_dict(result.get("thread")).get("id"))
 
 
 def _create_published_worker(client: Client, session_dir: str, allowed: WorkerStartAllowed,
-                             method: str, params: dict[str, object], *, membership: staff.StaffSnapshot, request: str = "",
+                             method: str, params: dict[str, object], *, request: str = "",
                              submits_work: bool = False,
                              stopped: RefusalCommandContext = REFUSAL_WITHOUT_COMMAND_EXIT,
                              ) -> worker_admission.PublishedWorker:
-    previous = worker_admission.dispatch_record(allowed)
-    if isinstance(allowed.slot, worker_admission.ExistingWorkerSlot) and (not isinstance(
-            membership.backends.get(allowed.slot.row.id), staff.CodexBackend)
-            or request and previous.get("assignment_id") == request):
-        def start(handoff: worker_admission.FamilyHandoff) -> str:
-            if not submits_work and isinstance(handoff, worker_admission.TranscriptHandoff):
-                params["developerInstructions"] = handoff.opening(str(params.get("developerInstructions", "")))
-            with worker_lifecycle.lock_worker(session_dir, allowed.name):
-                return _create_worker_backend(client, method, params, submits_work=submits_work, stopped=stopped)
+    def start(handoff: worker_admission.FamilyHandoff) -> str:
+        if not submits_work and isinstance(handoff, worker_admission.TranscriptHandoff):
+            params["developerInstructions"] = handoff.opening(str(params.get("developerInstructions", "")))
+        with worker_lifecycle.lock_worker(session_dir, allowed.name):
+            result = _serving_request(client, method, params, submits_work=submits_work, stopped=stopped)
+            return _thread_id(result)
 
-        def dispatch(published: worker_admission.PublishedWorker) -> bool:
-            del published
-            return not submits_work
-
-        def cleanup(identity: str) -> None:
-            released = _release_worker_thread(client, identity, session_dir)
-            if isinstance(released, WorkerThreadStateUnknown):
-                print(f"anomaly: {identity}: {released.reason}", file=sys.stderr)
-
-        return worker_admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=cleanup, request=request)
-    with worker_lifecycle.lock_worker(session_dir, allowed.name):
-        retained = _create_worker_backend(client, method, params, submits_work=submits_work, stopped=stopped)
-    return _publish_created_worker(client, session_dir, allowed, retained)
-
-
+    return worker_admission.switch_worker(allowed, "codex", start=start,
+        dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION,
+        cleanup=lambda identity: _cleanup_created_thread(client, session_dir, identity), request=request)
 
 
 def _attach_and_run(
@@ -4375,8 +4295,8 @@ def _attach_and_run(
             lifecycle.close()
             published = _create_published_worker(client, session_dir, staff_admission, "thread/start",
                 _thread_start_params(args, session_staff.worker_directory(membership_record, staff_admission.parent)),
-                submits_work=True, stopped=CommandStoppedBeforeThread(session_dir), membership=membership_record,
-                request=worker_admission.assignment_id(Path(_as_str(_attr(args, "prompt_file")))))
+                submits_work=True, stopped=CommandStoppedBeforeThread(session_dir),
+                request=_as_str(_attr(args, "switch_request")))
             _ = lifecycle.enter_context(worker_lifecycle.lock_worker(session_dir, name))
             thread_id = published.row.current_session
             if isinstance(published.handoff, worker_admission.TranscriptHandoff):
@@ -5651,9 +5571,10 @@ def _resume_worker_thread(
                                               workers_home, staff_admission=staff_admission)
     role = _as_str(_attr(args, "role"))
     if resumed.thread_replaced and not role:
-        assignment = task_role(thread_id)
+        assignment = task_role(thread_id, task_assignments())
         role = assignment.role if isinstance(assignment, AssignedWorkerRole) else ""
-    _ = _publish_created_worker(client, session_dir, staff_admission, resumed.thread_id)
+    _ = worker_admission.publish_created(staff_admission, resumed.thread_id,
+        lambda identity: _cleanup_created_thread(client, session_dir, identity))
     if resumed.thread_replaced:
         _ = client.call("thread/name/set", {"threadId": resumed.thread_id,
             "name": unit_workers.shown_name(Path(session_dir), name, role=role)})
@@ -5684,7 +5605,7 @@ def _resume_locked_worker_thread(
                 _ = _require(resumed, "thread/resume")
     if not resumed.get("error"):
         result = _require(resumed, "thread/resume")
-        if _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
+        if _thread_id(result) != thread_id:
             raise SystemExit("RoleNeedsRecovery: resumed thread identity differs; replacement refused")
         return _WorkerThreadForHome(thread_id, False)
     if isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker):
@@ -5699,7 +5620,8 @@ def _resume_locked_worker_thread(
         start_params.update({
             "developerInstructions": params["developerInstructions"], "approvalPolicy": "never",
         })
-    replacement = _create_worker_backend(client, "thread/start", start_params, submits_work=True)
+    created = _serving_request(client, "thread/start", start_params, submits_work=True)
+    replacement = _thread_id(created)
     name = staff_admission.name
     record: StartingRecord = {"thread_id": replacement, "status": "starting", "port": client.port,
                               "launcher_pid": _as_int(previous_record.get("launcher_pid")) or client.launcher_pid}
@@ -5958,7 +5880,7 @@ def _move_idle_worker(
                                  "continuation_owed": owes_continuation},
                                 RosterActiveLauncher(thread_id, (client.launcher_pid, os.getpid()))):
                                 raise SystemExit(f"codex_mesh: {name}: roster ownership changed during replacement")
-                            role = task_role(thread_id)
+                            role = task_role(thread_id, task_assignments())
                             if isinstance(role, AssignedWorkerRole):
                                 _record_assignment(thread_id, role.role, _dispatch_lens(args))
                     except (ConnectionError, OSError, SystemExit, worker_admission.AdmissionRefused) as error:
@@ -6188,16 +6110,15 @@ def _start_turn(
         allowed = worker_admission.admit(_as_str(_attr(args, "name")), Path(client.session_dir), role="",
                                         reference=_as_str(_attr(args, "staff_id")))
         previous = worker_admission.dispatch_record(allowed)
-        if previous.get("assignment_id") == request:
-            if previous.get("dispatch_state") == "sending":
+        if previous.assignment_id == request:
+            if previous.state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
                 accepted = _accepted_assignment(client, thread_id, message)
-            worker_admission.record_dispatch(allowed, request, "sending")
+            worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.DISPATCH_IN_FLIGHT, expected_request=request)
     result = {} if accepted else _serving_request(client, "turn/start", params, submits_work=True)
     turn_id = accepted or _as_str(_as_dict(result.get("turn")).get("id"))
     if turn_id:
-        if allowed is not None and worker_admission.dispatch_record(allowed).get("assignment_id") == request:
-            worker_admission.record_dispatch(allowed, request, "accepted")
-    if turn_id:
+        if allowed is not None:
+            worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, expected_request=request)
         args.switch_request = ""
         session_dir = _as_str(_attr(args, "session_dir"))
         name = _as_str(_attr(args, "name")) or _as_str(_attr(args, "to"))
@@ -6523,7 +6444,8 @@ def end_worker_locked(args: argparse.Namespace) -> int:
             deadline = time.time() + END_OPERATION_TIMEOUT_SECS
             if _attr(args, "idle_only"):
                 reason = "worker is running" if status in ("running", "starting", WAITING_CAPACITY) else _worker_idle_reason_with_inbox(
-                    session_dir, target, record, pending_file, paused=False, adopting=True, deadline=deadline)
+                    session_dir, target, record, pending_file, paused=False, adopting=True, deadline=deadline,
+                    membership=staff.local_snapshot())
                 if reason:
                     print(f"codex_mesh: {target}: {reason}; nothing ended", file=sys.stderr)
                     return 2
@@ -6766,7 +6688,7 @@ def _recovery_idle_reason(session_dir: str, name: str, thread_id: str) -> str:
         client = Client(port, f"recover-{name}", deadline=deadline)
         try:
             result = _require(client.call("thread/resume", _resume_params(session_dir, name, thread_id)), "thread/resume")
-            if _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
+            if _thread_id(result) != thread_id:
                 return "resumed thread identity differs; replacement refused"
             live = _read_live_turn(client, thread_id)
             if not isinstance(live, ThreadIdle):
@@ -6780,13 +6702,9 @@ def _recovery_idle_reason(session_dir: str, name: str, thread_id: str) -> str:
         return f"cannot establish idle state: {error}"
 
 
-
-
 def finished_run_status(session_dir: str) -> str:
     """Public run-lifetime check used before a unit allocates any worker."""
     return _finished_run(session_dir)
-
-
 
 
 def worker_launcher_attached(record: Mapping[str, object]) -> bool:
@@ -6795,13 +6713,13 @@ def worker_launcher_attached(record: Mapping[str, object]) -> bool:
 
 
 def worker_idle_reason(session_dir: str, name: str, record: Mapping[str, object],
-                       *, paused: bool = False, adopting: bool = False) -> str:
+                       *, membership: staff.StaffSnapshot, paused: bool = False, adopting: bool = False) -> str:
     """Require positive idle evidence before a unit worker changes run owners."""
     try:
         with _pending_file(session_dir, name, blocking=False) as inbox:
             return _worker_idle_reason_with_inbox(
                 session_dir, name, record, inbox, paused=paused, adopting=adopting,
-                deadline=time.time() + THREAD_RELEASE_TIMEOUT_SECS)
+                deadline=time.time() + THREAD_RELEASE_TIMEOUT_SECS, membership=membership)
     except BlockingIOError:
         # Adoption holds the roster: never wait for an inbox in that order.
         return "pending inbox is in use; retry allocation"
@@ -6809,14 +6727,14 @@ def worker_idle_reason(session_dir: str, name: str, record: Mapping[str, object]
 
 def _worker_idle_reason_with_inbox(
     session_dir: str, name: str, record: Mapping[str, object], inbox: worker_lifecycle.WorkerStateFile,
-    *, paused: bool, adopting: bool, deadline: float,
+    *, paused: bool, adopting: bool, deadline: float, membership: staff.StaffSnapshot,
 ) -> str:
     """One idle rule over a caller-owned snapshot and locked inbox.
 
     Adoption and explicit end may carry or cancel queued work; reservations,
     launchers, detached runs and active turns still prevent an idle transition.
     """
-    thread_id = _as_str(session_staff.worker_session(record))
+    thread_id = session_staff.worker_session(record, membership)
     if not thread_id:
         return "missing thread id"
     if record.get("held_design_id"):
@@ -6879,7 +6797,7 @@ def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
         admitted = worker_admission.admit(name, Path(session_dir), role=role)
     except ValueError as error:
         raise unit_workers.WorkerUnavailable(str(error)) from error
-    with staff.row_operation(admitted.lock_reference):
+    with worker_admission.worker_operation(admitted):
         return _open_admitted_worker(session_dir, role, admitted, model=model, effort=effort)
 
 
@@ -6921,7 +6839,7 @@ def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllo
                 if resume and existing is not None:
                     params["threadId"] = existing.current_session
                 published = _create_published_worker(client, session_dir, admitted,
-                    "thread/resume" if resume else "thread/start", params, membership=membership_record)
+                    "thread/resume" if resume else "thread/start", params)
                 _ = lifecycle.enter_context(worker_lifecycle.lock_worker(session_dir, name))
                 thread_id = published.row.current_session
                 allocation = UnrecordedWorkerThread(thread_id)
@@ -6963,25 +6881,67 @@ def command_adopt(args: argparse.Namespace) -> int:
     return 0
 
 
-def stop_worker_for_switch(row: staff.StaffRow, runs: tuple[Path, ...]) -> None:
+def stop_worker_for_switch(row: staff.StaffRow, runs: tuple[Path, ...]) -> SourceRelease:
     """Preserve and release the source identified by its fixed staff id."""
-    record = staff.local_snapshot()
-    source = record.by_id(row.id)
+    source = staff.local_snapshot().by_id(row.id)
     if source is None or source.current_session != row.current_session:
-        raise worker_admission.AdmissionRefused(f"{row.id}: source identity changed")
+        return SourceUnresolved(f"{row.id}: source identity changed")
     observed = False
-    for folder in dict.fromkeys(runs):
-        with worker_lifecycle.membership_operation(folder), worker_lifecycle.lock_worker(folder, row.name):
-            observed = _preserve_worker_servers(str(folder), row.name, row.current_session,
-                deadline=worker_lifecycle.effective_deadline(), reference=row.id, release=True)[0] or observed
-    if not observed:
-        raise worker_admission.AdmissionRefused(f"{row.id}: source thread stop is unresolved")
+    try:
+        for folder in dict.fromkeys(runs):
+            with worker_lifecycle.membership_operation(folder), worker_lifecycle.lock_worker(folder, row.name):
+                released = _release_source_servers(str(folder), row, deadline=worker_lifecycle.effective_deadline())
+                if isinstance(released, SourceReleaseUnknown):
+                    return released
+                observed = isinstance(released, SourceReleased) or observed
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
+    except (OSError, ValueError, RuntimeError, SystemExit) as error:
+        return SourceReleaseUnknown(str(error))
+    return (SourceReleased() if observed else
+            SourceUnresolved(f"{row.id}: source thread stop is unresolved"))
+
+
+def _release_source_servers(session_dir: str, row: staff.StaffRow, *, deadline: float) -> SourceRelease:
+    """Require source identity and complete release evidence from the recorded servers."""
+    roster = session_staff.read_worker_roster(Path(session_dir) / ROSTER_FILE)
+    identified = any(_as_dict(entry).get("staff_id") == row.id for entry in roster.values())
+    evidence = _read_json_object(_session_path(session_dir, SERVER_FILE))
+    retained = evidence.get("previous_servers", [])
+    if not isinstance(retained, list) or any(not isinstance(item, dict) for item in cast(list[object], retained)):
+        return SourceReleaseUnknown("source server records are invalid")
+    records = _recorded_run_servers(session_dir)
+    observed = False
+    for record in records:
+        pid = record.get("pid")
+        if type(pid) is not int or pid <= 0:
+            return SourceReleaseUnknown("source server pid is invalid")
+        server = _recorded_server_availability(record)
+        if not isinstance(server, LiveServer):
+            if _pid_alive(pid):
+                return SourceReleaseUnknown("source server endpoint is unknown")
+            observed = True
+            continue
+        client = Client(server.port, f"release-{os.getpid()}", operation_deadline=deadline)
+        try:
+            if row.current_session in _loaded_thread_ids(client, deadline):
+                identified = True
+                _ = _preserve_paused_thread(client, session_dir, row.name, row.current_session,
+                    deadline=deadline, reference=row.id)
+                released = _release_worker_thread(client, row.current_session, session_dir)
+                if isinstance(released, WorkerThreadStateUnknown):
+                    return SourceReleaseUnknown(released.reason)
+            observed = True
+        finally:
+            client.close()
+    return (SourceReleased() if identified and observed else
+            SourceUnresolved(f"{row.id}: source thread stop is unresolved"))
 
 
 def _preserve_worker_servers(session_dir: str, name: str, thread_id: str, *, deadline: float,
-                             reference: str = "", release: bool = False) -> tuple[bool, bool]:
+                             reference: str = "") -> tuple[bool, bool]:
     """Preserve loaded threads while the caller holds the lifecycle lock."""
-    observed = interrupted = False
+    observed, interrupted = False, False
     for server_record in _recorded_run_servers(session_dir):
         server = _recorded_server_availability(server_record)
         if not isinstance(server, LiveServer):
@@ -6992,10 +6952,6 @@ def _preserve_worker_servers(session_dir: str, name: str, thread_id: str, *, dea
                 continue
             interrupted = _preserve_paused_thread(client, session_dir, name, thread_id,
                 deadline=deadline, reference=reference) or interrupted
-            if release:
-                released = _release_worker_thread(client, thread_id, session_dir)
-                if isinstance(released, WorkerThreadStateUnknown):
-                    raise worker_admission.AdmissionRefused(released.reason)
             observed = True
         finally:
             client.close()
@@ -8853,7 +8809,7 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
         if current != record:
             print(f"codex_mesh: {name}: worker changed before account move claim", file=sys.stderr)
             return 2
-        role = task_role(session_staff.worker_session(record))
+        role = task_role(session_staff.worker_session(record), task_assignments())
         if not isinstance(role, AssignedWorkerRole):
             _fail_account_move(session_dir, name, marker, "resume failed: worker has no recorded role")
             return 1
@@ -9192,7 +9148,7 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowe
             client = Client(port, name)
             _ = _bind_serving_server(client, session_dir, started_here=_fresh)
             lifecycle.close()
-            published = _create_published_worker(client, session_dir, admitted, "thread/start", params, membership=membership_record)
+            published = _create_published_worker(client, session_dir, admitted, "thread/start", params)
             _ = lifecycle.enter_context(worker_lifecycle.lock_worker(session_dir, name))
             thread_id = published.row.current_session
             name = published.row.name
@@ -9293,7 +9249,7 @@ def _fork_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowed
             fork_params = dict(params)
             fork_params.update({"sandbox": READ_ONLY_SANDBOX, "approvalPolicy": "never"})
             lifecycle.close()
-            published = _create_published_worker(client, session_dir, admitted, "thread/fork", fork_params, membership=membership_record)
+            published = _create_published_worker(client, session_dir, admitted, "thread/fork", fork_params)
             _ = lifecycle.enter_context(worker_lifecycle.lock_workers(*workers))
             thread_id = published.row.current_session
             name = published.row.name
@@ -9403,7 +9359,7 @@ def command_reset(args: argparse.Namespace) -> int:
                 reason = state.reason if isinstance(state, InvalidThread) else "worker is busy or not followable"
                 print(f"codex_mesh: {name}: {reason}; reset refused", file=sys.stderr)
                 return 2
-            role = task_role(state.thread_id)
+            role = task_role(state.thread_id, task_assignments())
             reset_role = role.role if isinstance(role, AssignedWorkerRole) else "review"
             port, _fresh = ensure_server(session_dir)
             released = _release_other_worker_writers(session_dir, name, state.thread_id, port)

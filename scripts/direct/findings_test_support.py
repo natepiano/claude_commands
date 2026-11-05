@@ -14,7 +14,7 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest.mock import patch
 
-from scripts.production.cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Only the fsync test calls a function directly; never initialize it from live config.
@@ -79,11 +79,7 @@ class FindingsLedgerFixture(unittest.TestCase):
 
     def invoke(self, arguments: tuple[str, ...], at: int) -> subprocess.CompletedProcess[str]:
         command = [*arguments, "--session-dir", str(self.session_dir)]
-        # Retain executable and cross-process persistence/configuration coverage.
-        if self._testMethodName in (
-            "test_ids_are_stable_across_rounds",
-            "test_an_unusable_config_value_stops_the_run",
-        ):
+        if process_boundary_for_case(self):
             return subprocess.run(
                 [sys.executable, str(SCRIPT), *command], capture_output=True, text=True,
                 env=self.environment(at), check=False, timeout=TEST_HANG_GUARD_SECS,

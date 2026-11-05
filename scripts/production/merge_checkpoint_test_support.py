@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.fake_unit_host import labeled as labeled_host
+
 from scripts.lint.memory_test_support import config_environment
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import closing, contextmanager
@@ -30,12 +32,13 @@ import merge_checkpoint
 import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.production.cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host, staff
 from scripts.message import sessions
+from scripts.herdr.herdr import NATIVE_ID_MARKS
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, production_membership, unit_membership
 
 
@@ -145,6 +148,7 @@ import subprocess
 sys.path.insert(0, __TEST_REPOSITORY__)
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.message import sessions
+from scripts.herdr.herdr import NATIVE_ID_MARKS
 
 def git(*arguments):
     return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
@@ -466,9 +470,7 @@ class MergeCheckpointFixture(unittest.TestCase):
             production_membership("example", "alpha-unit")
             runner = fixture_member("showrunner", name="example")
             director = unit_membership("example", "alpha-unit")
-        fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
-            "fixture-unit", "w1:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "alpha-unit"},
-        )])
+            fake_unit_host.write(self.env, [labeled_host("fixture-unit", "w1:p1", "alpha-unit", slug="example")])
         records = self.root / "sessions"
         records.mkdir()
         self.env["NOTIFIER_SESSIONS_DIR"] = str(records)
@@ -527,6 +529,13 @@ class MergeCheckpointFixture(unittest.TestCase):
                 old_id = staff.native_id(cast(str, row["sessionId"]))
                 new_id = staff.native_id(fixture_runtime_id("moved-recipient:" + old_id))
                 _ = staff.update_current_session(old_id, new_id)
+                for environment in Path(self.env["HERDR_PROC"]).glob("*/environ"):
+                    parts = environment.read_bytes().split(b"\0")
+                    for index, part in enumerate(parts):
+                        key, separator, value = part.partition(b"=")
+                        if key.decode() in NATIVE_ID_MARKS and value.decode() == old_id:
+                            parts[index] = key + separator + new_id.encode()
+                    _ = environment.write_bytes(b"\0".join(parts))
                 row["sessionId"] = new_id
                 row["name"] = cast(str, row["name"]) + "-moved"
                 _ = path.write_text(json.dumps(row))
@@ -777,11 +786,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         return rows[0]
 
     def invoke(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        # Keep real executable coverage for both the unit and child entry paths.
-        if self._testMethodName in (
-            "test_checkpoint_receipt_names_pushed_merge_and_source_once_on_retry",
-            "test_attached_child_handoff_merges_without_a_units_row_and_acknowledges_after_push",
-        ):
+        if process_boundary_for_case(self):
             return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
                                   env=self.env, capture_output=True, text=True, check=False,
                                   timeout=TEST_HANG_GUARD_SECS)

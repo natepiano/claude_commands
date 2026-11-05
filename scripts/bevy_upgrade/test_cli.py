@@ -1,6 +1,8 @@
 """Exercise the real Bevy upgrade CLI with private fixtures and tool boundaries."""
 from __future__ import annotations
 
+from scripts.production.cli_fixture import process_boundary
+
 import json
 import unittest
 from datetime import datetime
@@ -16,6 +18,8 @@ from cli_test_support import OWNER_ID, CURRENT_ID, CliFixture, ZONE, REGISTRY, u
 
 @final
 class CliTests(CliFixture):
+    # Keep one complete CLI process case.
+    @process_boundary
     def test_start_reads_the_production_checkout_and_writes_an_open_record(self) -> None:
         result = self.run_cli("start", "0.20")
         self.assert_table(result)

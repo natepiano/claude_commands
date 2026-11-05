@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from scripts.usage import agents_log
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
@@ -94,8 +95,6 @@ class Paused:
     """The worker has no active run owner."""
 
 
-
-
 @dataclass(frozen=True)
 class Retired:
     """This worker must never be allocated again."""
@@ -126,6 +125,8 @@ class UnitWorker:
 
 @dataclass
 class UnitWorkers:
+    membership: staff.StaffSnapshot
+    assignments: agents_log.RoleLog
     workers: dict[str, UnitWorker] = field(default_factory=dict)
     history: dict[staff.StaffId, list[WorkerEvent]] = field(default_factory=dict)
     unresolved: dict[str, object] = field(default_factory=dict)
@@ -178,14 +179,17 @@ def _encode_event(event: WorkerEvent) -> dict[str, object]:
     return {"kind": event.kind, "cause": event.cause, "run": event.run, "at": event.at, **event.details}
 
 
-def _worker_task_role(record: Mapping[str, object], membership: staff.StaffSnapshot) -> str:
+def _worker_task_role(record: Mapping[str, object], membership: staff.StaffSnapshot,
+                      assignments: agents_log.RoleLog) -> str:
     from scripts.agents import codex_mesh
-    assignment = codex_mesh.task_role(session_staff.worker_session(record, membership))
+    assignment = codex_mesh.task_role(session_staff.worker_session(record, membership), assignments,
+                                     default_role=session_staff.worker_name(record, membership))
     return (assignment.role if isinstance(assignment, codex_mesh.AssignedWorkerRole)
             else session_staff.worker_name(record, membership))
 
 
-def _decode_worker(name: str, record: dict[str, object], membership: staff.StaffSnapshot) -> UnitWorker:
+def _decode_worker(name: str, record: dict[str, object], membership: staff.StaffSnapshot,
+                   assignments: agents_log.RoleLog) -> UnitWorker:
     owner = _object(record.get("ownership"))
     found = session_staff.worker_backend(membership, staff.StaffId(_text(record.get("staff_id"))))
     if isinstance(found, session_staff.WorkerBackendUnavailable):
@@ -205,7 +209,7 @@ def _decode_worker(name: str, record: dict[str, object], membership: staff.Staff
     if not isinstance(events, list):
         raise WorkerUnavailable(f"{name}: invalid events")
     return UnitWorker(member.name,
-                      _worker_task_role(record, membership),
+                      _worker_task_role(record, membership, assignments),
                       "codex" if isinstance(identity, CodexThread) else "claude",
                       _text(record.get("model")), _text(record.get("effort")),
                       _object(record.get("access_policy")), identity, ownership,
@@ -249,7 +253,10 @@ class UnitWorkerLedger:
         _atomic(self.path, data)
 
     @contextmanager
-    def locked(self, *, write: bool = True, deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[UnitWorkers, None, None]:
+    def locked(self, *, membership: staff.StaffSnapshot | None = None, write: bool = True,
+               deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[UnitWorkers, None, None]:
+        """None reads one fresh snapshot under the lock; allocation passes the snapshot that found the ledger."""
+        from scripts.agents import codex_mesh
         with worker_lifecycle.operation_deadline(deadline=deadline):
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
@@ -258,7 +265,7 @@ class UnitWorkerLedger:
                     data = _read(self.path)
                 except worker_lifecycle.WorkerStateUnreadable as error:
                     raise WorkerUnavailable(str(error)) from error
-                ledger = UnitWorkers()
+                ledger = UnitWorkers(membership if membership is not None else staff.local_snapshot(), codex_mesh.task_assignments())
                 history = data.get("history", {})
                 if not isinstance(history, dict):
                     raise WorkerUnavailable("invalid worker history")
@@ -267,10 +274,9 @@ class UnitWorkerLedger:
                         raise WorkerUnavailable(f"{identity}: invalid worker history")
                     ledger.history[staff.native_id(identity)] = [
                         _decode_event(_object(event)) for event in cast(list[object], raw_events)]
-                membership = staff.local_snapshot()
                 for name, record in _object(data.get("workers")).items():
                     try:
-                        worker = _decode_worker(name, _object(record), membership)
+                        worker = _decode_worker(name, _object(record), ledger.membership, ledger.assignments)
                         ledger.workers[worker.name] = worker
                     except WorkerUnavailable as error:
                         ledger.unresolved[name] = record
@@ -280,14 +286,14 @@ class UnitWorkerLedger:
                     self.save(ledger)
 
 
-def _ledger_for_run(run: Path) -> UnitWorkerLedger:
+def _ledger_for_run(run: Path) -> tuple[staff.StaffRow, UnitWorkerLedger, staff.StaffSnapshot]:
     membership = staff.local_snapshot()
     owner = worker_admission.parent(membership, staff_id=staff.runtime_id(), run=run)
-    return UnitWorkerLedger(_ledger_path(owner.id))
+    return owner, UnitWorkerLedger(_ledger_path(owner.id)), membership
 
 
 def ledger_for_run(run: Path) -> UnitWorkerLedger:
-    return _ledger_for_run(run)
+    return _ledger_for_run(run)[1]
 
 
 @contextmanager
@@ -355,7 +361,8 @@ def _event(kind: Literal["opened", "replaced", "ended"], cause: str, run: Path,
     return WorkerEvent(kind, cause, str(run), time.time(), details)
 
 
-def _worker_from_record(name: str, run: Path, record: dict[str, object]) -> UnitWorker:
+def _worker_from_record(name: str, run: Path, record: dict[str, object], membership: staff.StaffSnapshot,
+                         assignments: agents_log.RoleLog) -> UnitWorker:
     from scripts.agents import codex_mesh
     from scripts.astra.design_roles import PhaseBoundDesigner
     access = codex_mesh.roster_access_policy(record)
@@ -363,12 +370,12 @@ def _worker_from_record(name: str, run: Path, record: dict[str, object]) -> Unit
     if isinstance(access, PhaseBoundDesigner):
         policy.update({"binding_generation": access.binding_generation, "launch_sandbox": access.launch_sandbox})
     settings = codex_mesh.recorded_turn_settings(record)
-    return UnitWorker(name, _worker_task_role(record, staff.local_snapshot()), "codex", settings.model,
+    return UnitWorker(name, _worker_task_role(record, membership, assignments), "codex", settings.model,
                       settings.effort, policy,
-                      CodexThread(_text(session_staff.worker_session(record)), _text(session_staff.worker_home(record)) or
+                      CodexThread(_text(session_staff.worker_session(record, membership)), _text(session_staff.worker_home(record, membership)) or
                                   str(codex_mesh.server_record_home(_read(run / "mesh_server.json")))),
                       HeldBy(str(run)), [_event("opened", "registered existing roster", run,
-                                               thread_id=_text(session_staff.worker_session(record)))], staff.StaffId(_text(record.get("staff_id"))))
+                                               thread_id=_text(session_staff.worker_session(record, membership)))], staff.StaffId(_text(record.get("staff_id"))))
 
 
 @contextmanager
@@ -469,66 +476,51 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
     if role not in ROLES:
         raise WorkerUnavailable(f"unsupported worker role: {role}")
     run = run.expanduser().resolve()
-    store = ledger_for_run(run)
-    membership = staff.local_snapshot()
-    reviewer_base = _reviewer_destination(run) if role == "review" else role
-    with store.locked(write=False) as ledger:
-        pass
-    permissions = {name: worker_admission.admit(name, run, role=role)
-                   for name, worker in ledger.workers.items()
-                   if worker.role == role and not isinstance(worker.ownership, Retired)}
-    for name, value in _read_roster(run).items():
-        if _worker_task_role(_object(value), membership) == role and name not in permissions:
-            permissions[name] = worker_admission.admit(name, run, role=role)
-    with store.locked() as ledger:
+    owner, store, membership = _ledger_for_run(run)
+    reviewer_base = _reviewer_destination(owner) if role == "review" else role
+    with store.locked(membership=membership) as ledger:
+        assignments = ledger.assignments
         roster = _read_roster(run)
-        for name, value in sorted(roster.items(), key=lambda item: (role == "review" and item[0] != reviewer_base, item[0])):
+        candidates = sorted(roster.items(), key=lambda item: (
+            _object(item[1]).get("status") not in ("done", "failed", "paused"),
+            role == "review" and item[0] != reviewer_base, item[0]))
+        for name, value in candidates:
             record = _object(value)
-            if _worker_task_role(record, membership) != role or new_name:
+            if new_name or _worker_task_role(record, membership, assignments) != role:
                 continue
             registered = ledger.workers.get(name)
-            if registered is not None and isinstance(registered.ownership, Retired):
-                continue
             paused = record.get("status") == "paused" or registered is not None and isinstance(registered.ownership, Paused)
-            if record.get("status") in ("done", "failed", "paused") and not codex_mesh.worker_idle_reason(
-                    str(run), name, record, paused=paused):
-                if name not in ledger.workers:
-                    ledger.workers[name] = _worker_from_record(name, run, record)
-                try:
-                    permission = permissions.get(name)
-                    if permission is None:
-                        raise WorkerUnavailable(f"{name}: worker changed during admission")
+            try:
+                if record.get("status") in ("done", "failed", "paused"):
+                    if registered is not None and isinstance(registered.ownership, Retired):
+                        continue
+                    if codex_mesh.worker_idle_reason(str(run), name, record, paused=paused, membership=membership):
+                        continue
+                    permission = worker_admission.admit(name, run, role=role)
                     _ = worker_admission.publish(permission, _text(session_staff.worker_session(record, membership)))
-                    _reserve(run, name, store, owner_pid, paused=paused)
-                except WorkerUnavailable:
+                elif record.get("status") in ("ended", "running", "starting"):
+                    if codex_mesh.worker_idle_reason(str(run), name, record, membership=membership):
+                        continue
+                    if codex_mesh.command_reopen(argparse.Namespace(session_dir=str(run), to=name, quiet=True)):
+                        continue
+                    paused = False
+                else:
                     continue
-                ledger.workers[name].ownership = HeldBy(str(run))
-                return name
-        for name, value in sorted(roster.items(), key=lambda item: (role == "review" and item[0] != reviewer_base, item[0])):
-            record = _object(value)
-            if (_worker_task_role(record, membership) != role or new_name
-                    or record.get("status") not in ("ended", "running", "starting")):
-                continue
-            if codex_mesh.worker_idle_reason(str(run), name, record):
-                continue
-            if codex_mesh.command_reopen(argparse.Namespace(
-                    session_dir=str(run), to=name, quiet=True)) == 0:
                 if name not in ledger.workers:
-                    ledger.workers[name] = _worker_from_record(name, run, record)
-                try:
-                    _reserve(run, name, store, owner_pid)
-                except WorkerUnavailable:
-                    continue
-                ledger.workers[name].ownership = HeldBy(str(run))
-                return name
-        occupied = dict(roster)
-        name = _next_worker_name(ledger, occupied, reviewer_base)
+                    ledger.workers[name] = _worker_from_record(name, run, record, membership, assignments)
+                _reserve(run, name, store, owner_pid, paused=paused)
+            except worker_admission.AdmissionRefused as error:
+                print(str(error), file=sys.stderr)
+                continue
+            except WorkerUnavailable:
+                continue
+            ledger.workers[name].ownership = HeldBy(str(run))
+            return name
+        name = _next_worker_name(ledger, roster, reviewer_base)
         carried: UnitWorker | None = None
         if not roster and not new_name:
-            membership = staff.local_snapshot()
-            owner = worker_admission.parent(membership, staff_id=staff.runtime_id(), run=run)
             for row in membership.find(kind="worker", parent=owner.id):
-                if _worker_task_role({"staff_id": row.id}, membership) != role:
+                if _worker_task_role({"staff_id": row.id}, membership, assignments) != role:
                     continue
                 worker = ledger.workers.get(row.name)
                 if worker is not None:
@@ -538,7 +530,7 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
                         previous_run = Path(worker.ownership.run)
                         if (previous_run / ROSTER).exists():
                             previous = _object(_read_roster(previous_run).get(row.name))
-                            if codex_mesh.worker_idle_reason(str(previous_run), row.name, previous, adopting=True):
+                            if codex_mesh.worker_idle_reason(str(previous_run), row.name, previous, adopting=True, membership=membership):
                                 continue
                 name, carried = row.name, worker
                 break
@@ -554,19 +546,20 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
             with _roster_locked(run) as (handle, current):
                 current[name] = record
                 _write_roster(handle, current)
-        ledger.workers[name] = _worker_from_record(name, run, record)
+        membership = staff.local_snapshot()
+        ledger.workers[name] = _worker_from_record(name, run, record, membership, assignments)
         ledger.workers[name].events = [_event("opened", "no idle worker for role", run,
-                                             thread_id=_text(session_staff.worker_session(record)))]
+                                             thread_id=_text(session_staff.worker_session(record, membership)))]
         _reserve(run, name, store, owner_pid)
         return name
 
 
-def _reviewer_destination(run: Path) -> str:
-    membership = staff.local_snapshot()
-    owner = worker_admission.parent(membership, staff_id=staff.runtime_id(), run=run)
+def _reviewer_destination(owner: staff.StaffRow) -> str:
     if owner.kind == "unit" and not isinstance(owner.worktree, staff.PresentWorktree):
         raise WorkerUnavailable("invalid worker state: missing working_dir")
-    directory = str(session_staff.worker_directory(membership, owner.id))
+    from scripts.production.production_doc import read_production
+    directory = str(read_production(owner.doc.path).checkout if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
+                    else owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd())
     result = subprocess.run(
         ["bash", str(Path(__file__).with_name("worker_name.sh")),
          directory, "review", "review"],
@@ -635,7 +628,10 @@ def resolve_live_unit_director(
         if session["sessionId"] == parent.current_session:
             return LiveUnitDirector(session["sessionId"], session["pid"])
     if use_live_marks and isinstance(production, str) and isinstance(unit, str) and production and unit:
-        marked = unit_lookup.marked_unit(production, unit, record=record, sources=sources, running=running)
+        try:
+            marked = unit_lookup.labeled_session(production, unit, record=record, sources=sources, running=running)
+        except OSError:
+            return NoLiveUnitDirector()
         if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
             if marked.claude.session_id == parent.current_session:
                 return LiveUnitDirector(marked.claude.session_id, marked.claude.pid)
@@ -805,6 +801,7 @@ def end_unit(owner: staff.StaffRow) -> None:
 
 def shown_name(run: Path, address: str, *, role: str = "", held_design_id: str = "", held_role: str = "") -> str:
     """Render current unit context and stored assignment without changing the address."""
+    from scripts.agents import codex_mesh
     titles = cast(TitleRenderer, cast(object, import_module("scripts.message.roster")))
     record = _object(_read_roster(run).get(address))
     if held_design_id or record.get("held_design_id"):
@@ -812,7 +809,7 @@ def shown_name(run: Path, address: str, *, role: str = "", held_design_id: str =
             **record, "held_design_id": held_design_id or record.get("held_design_id", ""),
             "held_role": held_role or record.get("held_role", "")})
     membership = staff.local_snapshot()
-    member = worker_admission.member(run, address)
+    member = worker_admission.member(run, address, membership)
     if member is None:
         return address
     parent = membership.parent_of(member)
@@ -826,7 +823,7 @@ def shown_name(run: Path, address: str, *, role: str = "", held_design_id: str =
     peers = [row.name for row in membership.find(kind="worker", parent=parent.id)]
     ordinal = peers.index(address) + 1
     return titles.unit_worker_title(owner.name if owner is not None else "", parent.name,
-                                    jobs.get(role or _worker_task_role({"staff_id": member.id}, membership), "worker"),
+                                    jobs.get(role or _worker_task_role({"staff_id": member.id}, membership, codex_mesh.task_assignments()), "worker"),
                                     ordinal, address)
 
 

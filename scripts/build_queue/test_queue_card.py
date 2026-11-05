@@ -6,7 +6,7 @@ from scripts.lint.memory_test_support import admission_policy_fixture
 from dataclasses import replace
 import unittest
 
-from scripts.build_queue import head_facts, queue_card, queue_view
+from scripts.build_queue import head_facts, queue_card, queue_evidence, queue_view
 from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixtureTests, queue_read_fixture
 from scripts.build_queue.queue_lines import plain
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses
@@ -16,6 +16,7 @@ from scripts.message.unit_labels import UnitLabels
 
 
 class QueueCardTests(QueueFixtureTests):
+
     def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
         model = self.fixture.model()
         for position in (1, 2, 4):
@@ -28,31 +29,31 @@ class QueueCardTests(QueueFixtureTests):
                 self.assertNotIn("the user's bump", text)
                 if position > 1:
                     self.assertIn(f"{min(position - 1, 3)} of cables (queue priority)", text)
-                need, total = ("11.5", "22.6") if position == 2 else ("7.6", "18.7")
-                self.assertIn(f"Build budget: charged 11.1 + need {need} = {total} GiB", text)
-                self.assertIn("21.0 GiB", text)
+                need = "11.5" if position == 2 else "7.6"
+                self.assertIn(f"Room: need {need} GiB", text)
+                self.assertNotIn("Build budget:", text)
 
     def test_follower_names_the_eligible_heads_place_after_a_token_waiter(self) -> None:
         inputs = self.fixture.inputs(policy=admission_policy_fixture())
         (token_path, token), (head_path, head), (follower_path, follower) = inputs.ordered[:3]
         inputs = replace(inputs,
             host=gate.HostMemory(14 * gate.GIB, 60 * gate.GIB), pressure=gate.NoPressureHold(),
-            running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB)),),
+            running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB, anonymous=gate.AnonymousRunUse(gate.GIB))),),
             reservations=({**inputs.reservations[0], "need": gate.GIB},), ordered=[
                 (token_path, {**token, "token_left_at": NOW - 10}),
                 (head_path, {**head, "need": 21 * gate.GIB, "priority_since": NOW - 60}),
                 (follower_path, {**follower, "need": 10 * gate.GIB}),
             ])
-        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB),
+        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(3 * gate.GIB),
                                        policy=admission_policy_fixture())
         self.assertEqual([step.pid for step in reading.view.waiting], [token["pid"], head["pid"], follower["pid"]])
         self.assertIsInstance(reading.view.waiting[2].reason, gate.BehindHead)
-        self.assertEqual(queue_view.reason_phrase(reading.view.waiting[2].reason, reading.view.waiting), "#2's turn")
+        self.assertEqual(queue_view.reason_phrase(reading.view.waiting[2].reason, reading.view.waiting), "behind #2")
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_card(model, [3], 400))
         self.assertIn("#2's turn", text)
         self.assertNotIn("#1's turn", text)
-        self.assertIn("younger steps wait", text)
+        self.assertIn("younger runs start only if room still covers the first run's need of 21.0 GiB", text)
 
     def test_unit_override_card_heading_matches_golden(self) -> None:
         model = self.fixture.model()
@@ -85,24 +86,23 @@ class QueueCardTests(QueueFixtureTests):
             explanation=replace(explanation, line=replace(explanation.line, steps=remaining))))
         checks = queue_view.step_checks(model, 2)
         self.assertEqual(checks, gate.ReadingUnavailable("step admission checks unavailable"))
-        self.assertEqual(plain(queue_view.check_lines(checks, model)), "memory reading unavailable")
+        self.assertEqual(plain(queue_view.check_lines(checks, model)), "step admission checks unavailable")
         self.assertEqual(queue_view.step_checks(model, 3), other)
         text = plain(queue_card.render_selection(model, "2", 400))
         self.assertIn("#2 of 32", text)
-        self.assertIn("memory reading unavailable", text)
+        self.assertIn("step admission checks unavailable", text)
 
     def test_unowned_slice_owner_selector_marks_its_running_record_once_on_the_complete_page(self) -> None:
         model = self.fixture.model()
         running = model.reading.explanation.running[0]
         run = LiveBuildRun(123, "123", NOW - 600)
         activity = ScopeProcesses(1, "run-owner", "run-owner", "/tmp/run", "bash", NOW - 600, False, run)
-        memory = gate.UnownedSliceMemory(5 * gate.GIB, cgroup="verify.scope", owner="run-owner", activity=activity)
+        memory = gate.UnownedSliceMemory(5 * gate.GIB, cgroup="verify.scope", owner="run-owner", activity=activity, pid=run.pid)
         step = replace(running.step, session_id="run-owner", session_name="run-owner", measured=memory,
                        step="between steps", promise=0, run=run)
-        running = replace(running, step=step, measured=5 * gate.GIB)
-        model = replace(model, reading=replace(model.reading,
-            view=replace(model.reading.view, running=(step,)),
-            explanation=replace(model.reading.explanation, running=(running,))))
+        reading = queue_read_fixture(replace(model.reading.view, running=(step,)),
+                                     policy=admission_policy_fixture())
+        model = replace(model, reading=reading)
         model = replace(model, labels={**model.labels, "run-owner": UnitLabels("worker", "builds", "run-unit")})
         view = queue_view.render_view(model, 400, selector="run-owner")
         card = queue_card.render_selection(model, "run-owner", 400)
@@ -126,7 +126,7 @@ class QueueCardTests(QueueFixtureTests):
         second = {**second, "priority_since": 0, "priority_rank": 1,
                   "since": NOW - 300}
         reading = gate.queue_read_from(replace(inputs, ordered=[(first_path, first), (second_path, second)]),
-            gate.resolve_admission_limits(60 * gate.GIB, gate.read_memory_config()), policy=admission_policy_fixture())
+            gate.resolve_admission_limits(gate.read_memory_config()), policy=admission_policy_fixture())
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_selection(model, "2", 400))
         selected = text.split("\nHost:", 1)[0]
@@ -138,31 +138,30 @@ class QueueCardTests(QueueFixtureTests):
         inputs = self.fixture.inputs(policy=admission_policy_fixture())
         path, row = inputs.ordered[1]
         reading = gate.queue_read_from(replace(inputs, ordered=[inputs.ordered[0],
-            (path, {**row, "estimated_at": NOW - 600})]), gate.resolve_admission_limits(60 * gate.GIB, gate.read_memory_config()), policy=admission_policy_fixture())
+            (path, {**row, "estimated_at": NOW - 600})]), gate.resolve_admission_limits(gate.read_memory_config()), policy=admission_policy_fixture())
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_card(model, [2], 400))
         self.assertIn("✗ estimate       the estimate expired at 10:36; the client refreshes it through the admission service", text)
-        self.assertLess(text.index("✗ estimate"), text.index("Build budget:"))
-        self.assertLess(text.index("✗ estimate"), text.index("Free memory:"))
+        self.assertLess(text.index("✗ estimate"), text.index("Room:"))
+        self.assertLess(text.index("✗ estimate"), text.index("Room:"))
 
-    def test_strict_room_follower_that_fits_has_a_passing_order_check(self) -> None:
+    def test_a_smaller_follower_keeps_a_failing_order_check(self) -> None:
         inputs = self.fixture.inputs(policy=admission_policy_fixture())
         path, head = inputs.ordered[0]
         follower_path, follower = inputs.ordered[1]
         reading = gate.queue_read_from(replace(inputs,
             host=gate.HostMemory(10 * gate.GIB, 60 * gate.GIB), pressure=gate.NoPressureHold(),
-            running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB)),),
+            running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB, anonymous=gate.AnonymousRunUse(gate.GIB))),),
             reservations=({**inputs.reservations[0], "need": gate.GIB},), ordered=[
-                (path, {**head, "need": 15 * gate.GIB, "priority_since": NOW - 60}),
-                (follower_path, {**follower, "need": gate.GIB})]), gate.resolve_admission_limits(60 * gate.GIB, gate.read_memory_config()), policy=admission_policy_fixture())
-        self.assertIsInstance(reading.view.waiting[1].reason, gate.ReadyForAdmission)
-        from scripts.build_queue import queue_view
-        self.assertEqual(queue_view.reason_phrase(reading.view.waiting[1].reason, reading.view.waiting),
-                         "starts at the next check")
+                (path, {**head, "need": 15 * gate.GIB}),
+                (follower_path, {**follower, "need": gate.GIB})]),
+                gate.resolve_admission_limits(gate.read_memory_config()),
+                policy=admission_policy_fixture())
+        self.assertIsInstance(reading.view.waiting[1].reason, gate.BehindHead)
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_card(model, [2], 400))
-        self.assertIn("✓ queue order", text)
-        self.assertNotIn("younger steps wait", text)
+        self.assertIn("✗ #1's turn", text)
+        self.assertNotIn("younger steps wait until", text)
 
     def test_multiple_matches_share_one_evidence_and_release_block(self) -> None:
         model = self.fixture.model()
@@ -190,8 +189,8 @@ class QueueCardTests(QueueFixtureTests):
     def test_first_card_answers_next_and_shares_all_head_checks(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [1], 400))
         self.assertIn("Next? Yes, it is first. It starts when the checks below pass.", text)
-        self.assertIn("✓ Build budget: charged 11.1 + need 7.6 = 18.7 GiB <= 21.0 GiB: pass", text)
-        self.assertIn("✓ Free memory: free 24.5 GiB >= need 7.6 + earlyoom 3.0 + promise not yet used 6.0 = 16.6 GiB: pass", text)
+        self.assertIn("Room: need 7.6 GiB", text)
+        self.assertNotIn("Build budget:", text)
         self.assertIn("✗ memory pressure: full avg10 7.7", text)
         self.assertNotIn("/build:queue bump", text)
 
@@ -200,7 +199,8 @@ class QueueCardTests(QueueFixtureTests):
         head = model.reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
         head = replace(head, decision=replace(head.decision, state="admit", pressure=gate.NoPressureHold(),
-            budget_passes=True), budget=replace(head.budget, passes=True))
+            free_passes=True), room=replace(head.room, passes=True, basis=gate.Fits()),
+            cause=gate.ReadyForAdmission())
         host = model.reading.explanation.host
         assert isinstance(host, gate.HostAvailable)
         model = replace(model, reading=replace(model.reading,
@@ -212,19 +212,19 @@ class QueueCardTests(QueueFixtureTests):
         self.assertIn("Next? Yes. It starts at the next check.", text)
         self.assertIn("✓ memory pressure: no hold", text)
 
-    def test_ready_follower_answers_yes_while_a_larger_head_waits_for_memory(self) -> None:
+    def test_a_follower_card_names_the_protected_head(self) -> None:
         head = gate.WaitingStep(101, "large-id", "large", "nextest", "/tmp/large", NOW - 120,
             15 * gate.GIB, gate.NeedsMemory(15 * gate.GIB, 10 * gate.GIB,
                 threshold=18 * gate.GIB, reserve=3 * gate.GIB))
         follower = gate.WaitingStep(102, "small-id", "small", "clippy", "/tmp/small", NOW - 60,
-            gate.GIB, gate.ReadyForAdmission())
+            gate.GIB, gate.BehindHead("large", head.since, head.session_id))
         reading = queue_read_fixture(gate.QueueView((head, follower), (), 10 * gate.GIB, 0,
                                                     3 * gate.GIB, NOW), policy=admission_policy_fixture())
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_card(model, [2], 400))
-        self.assertIn("Next? Yes. It starts at the next check.", text)
-        self.assertNotIn("Next? No.", text)
-        self.assertIn("#1    large nextest", text)
+        self.assertIn("Next? No.", text)
+        self.assertNotIn("Next? Yes.", text)
+        self.assertIn("#1 pid 101 ·    large nextest", text)
 
     def test_fourth_card_counts_moves_and_join_order_with_recorded_checks(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [4], 400))
@@ -232,8 +232,8 @@ class QueueCardTests(QueueFixtureTests):
         self.assertIn("joined 10:10, 3 min after it", text)
         self.assertIn("It joined 1st of the steps waiting now.", text)
         self.assertIn("✓ queue order", text)
-        self.assertIn("✓ Build budget: charged 11.1 + need 7.6 = 18.7 GiB <= 21.0 GiB: pass", text)
-        self.assertIn("✓ Free memory: free 24.5 GiB >= need 7.6 + earlyoom 3.0 + promise not yet used 6.0 = 16.6 GiB: pass", text)
+        self.assertIn("Room: need 7.6 GiB", text)
+        self.assertNotIn("Build budget:", text)
         self.assertIn("✗ memory pressure: full avg10 7.7%, some avg10 0.0%, swap used 0.0%; starts below full avg10 5.0%", text)
         self.assertIn("Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.", text)
 
@@ -243,7 +243,7 @@ class QueueCardTests(QueueFixtureTests):
         assert isinstance(facts, head_facts.HeadFacts)
         model = replace(model, facts=replace(facts, bump_records=()))
         text = plain(queue_card.render_card(model, [4], 400))
-        self.assertIn("#2 ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 32 min after it", text)
+        self.assertIn("#2 pid 1001 · ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 32 min after it", text)
         self.assertNotIn("0 min before it", text)
 
     def test_position_id_recorded_name_and_folder_select_the_same_step(self) -> None:
@@ -268,16 +268,15 @@ class QueueCardTests(QueueFixtureTests):
         model = self.fixture.model()
         follower = model.reading.explanation.line.steps[3]
         self.assertEqual(follower.waiter, model.reading.view.waiting[4])
-        self.assertEqual(follower.budget.need, int(2.9 * gate.GIB))
+        self.assertEqual(follower.room.need, int(2.9 * gate.GIB))
         self.assertEqual(follower.free.need, int(2.9 * gate.GIB))
         from unittest import mock
         release = gate.smallest_head_release(model.reading.explanation)
         with mock.patch.object(gate, "smallest_head_release", return_value=release), \
              mock.patch.object(gate, "decide", side_effect=AssertionError("card recalculated admission")):
             text = plain(queue_card.render_card(model, [5], 400))
-        self.assertIn("Build budget: charged 11.1 + need 2.9 = 14.0 GiB <= 21.0 GiB: pass", text)
-        self.assertIn("Free memory: free 24.5 GiB >= need 2.9 + earlyoom 3.0 + promise not yet used 6.0 = 11.9 GiB: pass", text)
-        self.assertIn("need 2.9 + earlyoom 3.0 + promise not yet used 6.0", text)
+        self.assertIn(queue_evidence.room_check_text(follower.room), text)
+        self.assertNotIn("Build budget:", text)
         self.assertIn("memory pressure: full avg10 7.7", text)
 
     def test_unavailable_selected_checks_keep_valid_head_evidence_separate(self) -> None:
@@ -293,14 +292,14 @@ class QueueCardTests(QueueFixtureTests):
                 text = plain(queue_card.render_card(replace(model, reading=reading), [4], 400))
                 self.assertIn("memory reading unavailable", text)
                 selected = text.split("\nHost:", 1)[0]
-                self.assertNotIn("Build budget:", selected)
-                self.assertNotIn("Free memory:", selected)
+                self.assertNotIn("Room:", selected)
+                self.assertNotIn("Room:", selected)
                 if isinstance(host, gate.ReadingUnavailable):
                     self.assertNotIn("Build budget:", text)
                     self.assertNotIn("Free memory:", text)
                 else:
-                    self.assertEqual(text.count("Build budget:"), 1)
-                    self.assertEqual(text.count("Free memory:"), 1)
+                    self.assertEqual(text.count("Room:"), 1)
+                    self.assertEqual(text.count("Room:"), 1)
                     self.assertIn("First in line:", text)
 
     def test_shown_name_match_wins_over_recorded_identity_and_numeric_place(self) -> None:
@@ -312,27 +311,12 @@ class QueueCardTests(QueueFixtureTests):
         labels = {**model.labels, fourth.session_id: UnitLabels("1")}
         self.assertEqual(queue_card.select_waiters(replace(model, labels=labels), "1"), [4, 23])
 
-    def test_older_fit_order_line_names_waiting_place_or_explicit_fallback(self) -> None:
-        model = self.fixture.model()
-        waiting = model.reading.view.waiting
-        older = waiting[2]
-        for reason, phrase in ((gate.BehindOlderFit("old-name", older.since, older.session_id),
-                                "behind #2, an older step that fits"),
-                               (gate.BehindOlderFit("old-name", older.since + 1, older.session_id),
-                                "behind an older step that fits")):
-            with self.subTest(reason=reason):
-                fourth = replace(waiting[3], reason=reason)
-                reading = replace(model.reading, view=replace(model.reading.view,
-                                  waiting=(*waiting[:3], fourth, *waiting[4:])))
-                line = queue_card.order_check(replace(model, reading=reading), 4)
-                self.assertEqual(plain([line]).split(), ("✗ queue order " + phrase).split())
-                self.assertEqual(line[0].tone, "error")
 
     def test_running_selector_prints_one_complete_running_evidence_record(self) -> None:
         text = plain(queue_card.render_selection(self.fixture.model(), "id-widget", 400))
-        expected = ("Selected running step: tool-based-ui / widget / widget-enhancements-title, nextest: "
-                    "admitted 10:45 (0 min ago); promise 11.1 GiB, charge 11.1 GiB, using now 5.1 GiB; "
-                    "ramp promise: first 2 min after admission")
+        expected = ("Selected running step: pid 900 · tool-based-ui / widget / widget-enhancements-title, nextest: "
+                    "admitted 10:45 (0 min ago); need 11.1 GiB; anonymous use 5.1 GiB; "
+                    "held slot 0.0 GiB; kept aside 6.0 GiB")
         self.assertEqual(text.count(expected), 1)
         self.assertNotIn("Next?", text)
 

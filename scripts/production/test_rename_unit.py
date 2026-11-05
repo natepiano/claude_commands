@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unittest
 import json
+import os
 from pathlib import Path
 from typing import final
 from unittest import mock
@@ -10,9 +11,10 @@ from unittest import mock
 from scripts.herdr import herdr
 from scripts.message import sessions
 from scripts.production import staff, unit_config
+from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.production.rename_test_support import RenameDisplays
-from scripts.production.rename_rerun_test_support import file_versions, final_files
+from scripts.production.rename_rerun_test_support import file_versions, final_files, saved_fixture
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture, UnitRenameFixture
 
 
@@ -198,6 +200,149 @@ class UnitRenameTests(UnitRenameFixture):
 class FolderRenameTests(FolderRenameFixture):
     old_name: str = "port"
     new_name: str = "x"
+
+    def test_rename_finishes_a_pending_folder_move_before_renaming_its_folder_and_branch(self) -> None:
+        from dataclasses import replace
+        from scripts.production import unit_move
+
+        moved = self.source.with_name("staging-port")
+        destination = moved.with_name("staging-x")
+        unit_move.prepare_move(self.owner, moved, unit_move.KeepBranch.CURRENT)
+        real_git, publish, prepare, rename = unit_move.git, staff.set_worktree, unit_move.prepare_move, staff.rename
+        with saved_fixture(self.root) as restore:
+            for point in ("complete", "folder move", "folder publication", "before rename journal",
+                          "rename journal", "staff rename", "rename move", "rename branch", "rename publication"):
+                with self.subTest(point=point):
+                    restore()
+                    displays = RenameDisplays(self.owner)
+                    displays.pane = displays.tab = self.owner.name
+
+                    def stop_after(step: str) -> None:
+                        if step == point:
+                            raise SystemExit(91)
+
+                    def git(folder: Path, *arguments: str) -> str:
+                        result = real_git(folder, *arguments)
+                        if arguments[:2] == ("worktree", "move"):
+                            stop_after("folder move" if folder == self.source else "rename move")
+                        elif arguments[:2] == ("branch", "-m"):
+                            stop_after("rename branch")
+                        return result
+
+                    def publish_worktree(identity: staff.StaffId,
+                                         value: staff.PresentWorktree | staff.RemovedWorktree, *,
+                                         expected: staff.PresentWorktree | staff.RemovedWorktree |
+                                         staff.WorktreeUnfilled) -> staff.StaffRow:
+                        result = publish(identity, value, expected=expected)
+                        stop_after("folder publication" if value.path == moved else "rename publication")
+                        return result
+
+                    def prepare_rename(row: staff.StaffRow, folder: Path, branch: str | unit_move.KeepBranch,
+                                       name: str = "") -> None:
+                        stop_after("before rename journal")
+                        prepare(row, folder, branch, name)
+                        stop_after("rename journal")
+
+                    def rename_row(identity: staff.StaffId, name: str) -> staff.StaffRow:
+                        result = rename(identity, name)
+                        stop_after("staff rename")
+                        return result
+
+                    with FolderSessionFixture(self.owner, live=False).installed(), displays.installed():
+                        with (mock.patch.object(unit_move, "git", side_effect=git),
+                              mock.patch.object(staff, "set_worktree", side_effect=publish_worktree),
+                              mock.patch.object(unit_move, "prepare_move", side_effect=prepare_rename),
+                              mock.patch.object(staff, "rename", side_effect=rename_row)):
+                            result = self.command()
+                        if point != "complete":
+                            self.assertEqual(result.returncode, 91, result.stdout + result.stderr)
+                            result = self.command()
+                        self.assertEqual((result.returncode, result.stderr), (0, ""))
+                        self.assertEqual(result.stdout.splitlines()[-1], "done")
+                        self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, name="x",
+                            worktree=staff.PresentWorktree("natedev", destination)))
+                        self.assertEqual(self.git("branch", "--show-current", cwd=destination), "cargo-liner-x")
+                        self.assertEqual((destination / "kept.txt").read_text(), "Keep this work.\n")
+                        self.assertEqual((displays.pane, displays.tab), ("x", "x"))
+                        before = file_versions(self.root)
+                        commands = list(displays.commands)
+                        rerun = self.command()
+                        self.assertEqual((rerun.returncode, rerun.stdout, rerun.stderr), (0, "unchanged\n", ""))
+                        self.assertEqual(file_versions(self.root), before)
+                        self.assertEqual(displays.commands, commands)
+
+    def test_f017_same_name_with_unit_suffix_changes_nothing(self) -> None:
+        from scripts.production import rename_unit, unit_move
+
+        displays = RenameDisplays(self.owner)
+        displays.pane = displays.tab = self.owner.name
+        labels = displays.pane, displays.tab, displays.workspace
+        before = file_versions(self.root)
+        arguments = ["apply", "folder-production", "port-unit", "port"]
+        with (FolderSessionFixture(self.owner, live=False).installed(), displays.installed(),
+              mock.patch.object(unit_move, "move_folder", wraps=unit_move.move_folder) as move):
+            result = invoke_cli(rename_unit, lambda: rename_unit.main(arguments), arguments,
+                                dict(os.environ), self.checkout)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "unchanged\n", ""))
+        move.assert_not_called()
+        self.assertEqual(file_versions(self.root), before)
+        self.assertEqual(staff.by_id(self.owner.id), self.owner)
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.source), "cargo-liner-port")
+        self.assertEqual((displays.pane, displays.tab, displays.workspace), labels)
+        self.assertEqual(displays.commands, [])
+
+    def test_f018_finished_pending_rename_reports_done_then_unchanged(self) -> None:
+        from dataclasses import replace
+        from scripts.production import unit_move
+
+        unit_move.prepare_move(self.owner, self.destination, "cargo-liner-x", "x")
+        renamed = staff.rename(self.owner.id, "x")
+        _ = self.git("worktree", "move", str(self.source), str(self.destination))
+        _ = self.git("branch", "-m", "cargo-liner-x", cwd=self.destination)
+        renamed = staff.set_worktree(renamed.id, staff.PresentWorktree("natedev", self.destination),
+                                    expected=renamed.worktree)
+        displays = RenameDisplays(renamed)
+        displays.pane = displays.tab = renamed.name
+        with FolderSessionFixture(renamed, live=False).installed(), displays.installed():
+            result = self.command()
+            self.assertEqual((result.returncode, result.stderr), (0, ""))
+            self.assertEqual(result.stdout.splitlines()[-1], "done")
+            self.assertEqual(staff.by_id(renamed.id), replace(self.owner, name="x",
+                worktree=staff.PresentWorktree("natedev", self.destination)))
+            self.assertEqual(self.git("branch", "--show-current", cwd=self.destination), "cargo-liner-x")
+            before = file_versions(self.root)
+            rerun = self.command()
+        self.assertEqual((rerun.returncode, rerun.stdout, rerun.stderr), (0, "unchanged\n", ""))
+        self.assertEqual(file_versions(self.root), before)
+
+    def test_f020_displays_change_before_the_folder_and_branch(self) -> None:
+        from scripts.production import unit_move
+
+        displays = RenameDisplays(self.owner)
+        events: list[str] = []
+        real_git = unit_move.git
+
+        def display(*arguments: str, **options: object) -> str:
+            result = displays.run(*arguments, **options)
+            events.append(arguments[0])
+            return result
+
+        def git(folder: Path, *arguments: str) -> str:
+            if arguments[:2] == ("worktree", "move"):
+                events.append("folder")
+            elif arguments[:2] == ("branch", "-m"):
+                events.append("branch")
+            return real_git(folder, *arguments)
+
+        with (FolderSessionFixture(self.owner, live=False).installed(), displays.installed(),
+              mock.patch.object(herdr.Herdr, "run", side_effect=display),
+              mock.patch.object(unit_move, "git", side_effect=git)):
+            result = self.command()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(events, ["pane", "tab", "folder", "branch"])
+        self.assertEqual((displays.pane, displays.tab), ("x", "x"))
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.destination), "cargo-liner-x")
+        self.assertEqual((self.destination / "kept.txt").read_text(), "Keep this work.\n")
 
     def test_same_name_writes_nothing_and_moves_nothing(self) -> None:
         from scripts.production import rename_unit, unit_move

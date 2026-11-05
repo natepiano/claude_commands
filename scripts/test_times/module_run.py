@@ -141,17 +141,18 @@ class TimedResult(TimedResultBase):
         self.collectedDurations[-1] = (test.id(), elapsed)
 
 
-def test_times(result: TimedResult) -> list[TestTime]:
-    """Combine durations and outcomes under each parent test id."""
+def timed_outcomes(result: TimedResult) -> list[tuple[str, TestStatus, float]]:
+    """Combine each full test id with its outcome and duration."""
     durations = dict(result.collectedDurations)
-    return [
-        {
-            "test": test_id if test_id in result.fixtures else test_id.partition(".")[2] or test_id,
-            "s": 0.0 if status == "skip" else durations.get(test_id, 0.0),
-            "status": status,
-        }
-        for test_id, status in result.outcomes.items()
-    ]
+    return [(test_id, status, 0.0 if status == "skip" else durations.get(test_id, 0.0))
+            for test_id, status in result.outcomes.items()]
+
+
+def test_times(result: TimedResult) -> list[TestTime]:
+    """Use short test names for the timing output."""
+    return [{"test": test_id if test_id in result.fixtures else test_id.partition(".")[2] or test_id,
+             "s": seconds, "status": status}
+            for test_id, status, seconds in timed_outcomes(result)]
 
 
 def write_times(path: Path, result: TimedResult, wall_s: float) -> None:
@@ -210,9 +211,18 @@ def main() -> None:
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output))
-    _ = unittest.main(module=None,
-                      argv=["python -m unittest", "discover", "-s", start_dir, "-p", pattern],
-                      testRunner=TimedRunner)
+    try:
+        _ = unittest.main(module=None,
+                          argv=["python -m unittest", "discover", "-s", start_dir, "-p", pattern],
+                          testRunner=TimedRunner)
+    except SystemExit:
+        if "scripts.message.session_send_test_support" in sys.modules:
+            from scripts.message import session_send_test_support
+
+            if isinstance(session_send_test_support.sender_violation, session_send_test_support.RealSenderRefused):
+                print(f"{pattern}: started the real scripts/message/send.py", file=sys.stderr)
+                sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":

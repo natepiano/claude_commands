@@ -258,6 +258,8 @@ Never paste its secret into a command, log, or tracked file.
 2. Confirm the clean `main` checkout at `nixos_configuration_directory` contains the reviewed box configuration.
 3. Run `python3 scripts/aws_target/deploy.py up --approve-resources` yourself.
 
+Device names in `config/aws-build-tailscale.json` must equal a machine name (first label of `DNSName` in `tailscale status`); `up` checks this first.
+
 The policy stage prints each change to `tag:build-aws` rules.
 It preserves unrelated rules and refuses a broad outbound rule that needs policy review.
 The join stage waits for SSM and sends one short-lived auth key through SSM stdin.
@@ -650,3 +652,19 @@ A missing deletion identity requires deploy.py up before deploy.py down.
 Before CREATE, the helper checks identity-<deployment_id> for a previous reservation.
 It verifies the saved DeploymentId and the StackId account before it saves the StackId.
 It resumes the change-set waiter without a second CREATE request.
+
+Existing stack updates preserve the previous Bootstrap when an InstanceId exists. Bootstrap applies only at first boot.
+The box-configuration stage changes a live box.
+
+The helper inspects an UPDATE change set before execution. It refuses protected resource removals and replacements, including conditional replacements.
+The protected types include the instance, volumes, volume attachments, network interfaces, interface attachments, Elastic IPs, IP associations, and Budget.
+Use `deploy.py down --approve-destroy`, then `deploy.py up --approve-resources` when replacement is required.
+A refusal deletes an unexecuted change set. A cleanup failure preserves the original error and names the remaining change set.
+An empty change set succeeds without execution. A new stack uses the current Bootstrap and the existing CREATE reservation path.
+
+Before a new compute request, the helper reconciles every outstanding request against the live stack.
+A completed rollback with an InstanceId confirms the instance. An operation in progress or a failed rollback refuses with its status.
+CREATE reservation failures and UPDATE failures include current failed resource events, the change-set reason, and the final stack status.
+A stable failure reconciles the compute request at once. A timeout or uncertain stack status keeps the request pending.
+The helper redacts the notification address from the prepared parameters. It does not read the private address file during failure reporting.
+The same administrator session reads failure details without another passphrase prompt.

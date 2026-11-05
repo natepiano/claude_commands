@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+
 import io
 import json
 import os
@@ -26,6 +27,11 @@ else:
 import targets
 import build_hold
 import mac_test
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
+
 import offload
 if TYPE_CHECKING:
     from . import target_config
@@ -347,7 +353,7 @@ class TargetStateTests(IsolatedTargetTest):
         args.what = "nextest hana"
         args.worktree = str(self.root)
         output = io.StringIO()
-        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"), \
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")), \
              mock.patch.object(mac_test, "start_claim_watcher") as watcher:
             with redirect_stdout(output):
                 code = mac_test.command_claim(args, mac_test.StatePaths(self.mac_state))
@@ -401,7 +407,7 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_live_claim_is_running(self) -> None:
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertEqual(
                 targets.target_state(self.mac()),
                 targets.Running((targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),)),
@@ -415,7 +421,7 @@ class TargetStateTests(IsolatedTargetTest):
         record["idle_since"] = END.isoformat()
         _ = liner.write_text(json.dumps(record), encoding="utf-8")
         self.write_claim("claims/hana.json")
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertEqual(targets.target_state(self.mac()), targets.Running((
                 targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),
                 targets.RunningJob("nextest cargo-liner", later, targets.IdleSince(END)),
@@ -428,7 +434,7 @@ class TargetStateTests(IsolatedTargetTest):
             record = cast(dict[str, object], json.loads(path.read_text()))
             record["holder_session"] = session_id
             _ = path.write_text(json.dumps(record))
-        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             state = targets.target_state(self.mac())
         self.assertEqual(state, targets.Running((
             targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE, targets.HolderSession("report-session")),
@@ -446,7 +452,7 @@ class TargetStateTests(IsolatedTargetTest):
         (self.mac_state / "claims").mkdir()
         _ = (self.mac_state / "claims" / "cargo-liner.json").write_text(json.dumps(record), encoding="utf-8")
         self.write_claim("claims/hana.json")
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertEqual(
                 targets.target_state(self.mac()),
                 targets.Running((targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),)),
@@ -460,25 +466,25 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_claim_with_gone_run_is_free(self) -> None:
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value=None):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
             self.assertEqual(targets.target_state(self.mac()), targets.Free())
 
     def test_claim_with_reused_pid_is_free(self) -> None:
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value="different-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("different-run-start")):
             self.assertEqual(targets.target_state(self.mac()), targets.Free())
 
     def test_active_block_precedes_live_claim(self) -> None:
         self.write_block()
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertEqual(targets.target_state(self.mac()),
                              targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END), targets.HolderSession("hana-session")))
 
     def test_retained_expired_block_precedes_live_claim(self) -> None:
         self.write_block(NOW - timedelta(seconds=1))
         self.write_claim()
-        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
             self.assertIsInstance(targets.target_state(self.mac()), targets.Held)
 
     def test_state_reads_leave_records_unchanged(self) -> None:
@@ -487,7 +493,7 @@ class TargetStateTests(IsolatedTargetTest):
         block = self.mac_state / "block.json"
         claim = self.mac_state / "run.json"
         before = (block.read_bytes(), claim.read_bytes())
-        with mock.patch("mac_test.process_start_time", return_value=None):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
             self.assertIsInstance(targets.target_state(self.mac()), targets.Held)
         self.assertEqual((block.read_bytes(), claim.read_bytes()), before)
 
@@ -495,7 +501,7 @@ class TargetStateTests(IsolatedTargetTest):
         self.write_claim()
         claim = self.mac_state / "run.json"
         before = claim.read_bytes()
-        with mock.patch.object(mac_test, "process_start_time", return_value=None):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
             self.assertEqual(targets.target_state(self.mac()), targets.Free())
         self.assertEqual(claim.read_bytes(), before)
 
