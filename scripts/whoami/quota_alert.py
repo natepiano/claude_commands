@@ -32,8 +32,7 @@ import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
-from scripts.message import send_result
-from scripts.message import send_budget
+from scripts.message import send_result, send_budget, session_send
 from scripts.whoami import note_file
 
 from scripts.lib import models_registry  # noqa: E402
@@ -248,7 +247,7 @@ from scripts.production.showrunners import (
 
 Config = ShowrunnerSettings
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
-SEND = Path(__file__).resolve().parent.parent / "message" / "send.py"
+SEND = session_send.SEND_SCRIPT
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
 AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
@@ -1499,8 +1498,8 @@ def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None
 
 def relay(recipient: str, text: str, key: str | None) -> str | None:
     """Deliver text to one session; None when it arrived, otherwise why not."""
-    command = [sys.executable, str(SEND), "--to", recipient, "--from", "quota_alert",
-               "--timeout", str(RELAY_TIMEOUT - KILL_GRACE), *(["--key", key] if key else [])]
+    command = session_send.send_argv("--to", recipient, "--from", "quota_alert",
+                                     "--timeout", str(RELAY_TIMEOUT - KILL_GRACE), *(["--key", key] if key else []))
     try:
         done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=send_budget.seconds(RELAY_TIMEOUT - KILL_GRACE),
                               check=False)
@@ -1514,6 +1513,8 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
             case "queued":
                 # refusal_watch accepts a queued copy through this header.
                 return " ".join(f"QUEUED: {outcome.header.detail}".split())
+            case "retry":
+                return " ".join(f"RETRY: {outcome.header.detail}".split())
             case "failed" | "refused" | "held" | "pending":
                 pass
     return " ".join(failure_detail(done).split())
@@ -1538,7 +1539,6 @@ def tell_user(push: RenderedPush) -> PushDelivery:
 
     user_send_timeout = review.user_send_seconds()
     command = user_send_argv(push, timeout=user_send_timeout)
-    command[1] = str(SEND)
     try:
         done = subprocess.run(command, capture_output=True, text=True,
                               timeout=send_budget.user_seconds(user_send_timeout),
@@ -1550,6 +1550,8 @@ def tell_user(push: RenderedPush) -> PushDelivery:
         match outcome.header.outcome:
             case "sent" | "skipped" | "kept" | "replaced":
                 return PushSent()
+            case "retry":
+                return PushFailed(" ".join(f"RETRY: {outcome.header.detail}".split()))
             case "queued" | "failed" | "refused" | "held" | "pending":
                 pass
     return PushFailed(" ".join(failure_detail(done).split()))

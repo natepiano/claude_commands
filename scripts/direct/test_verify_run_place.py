@@ -118,7 +118,7 @@ fi
             self.assertNotEqual(inner["pid"], outer["pid"])
             self.assertEqual(inner["run"], outer["run"])
             fixture.clock.advance(1)
-            second = fixture.request(run=run)
+            second = fixture.request(run=run, need=9 * 1024 ** 3)
             _ = fixture.server.handle_request(second)
             self.assertEqual(fixture.queue_pids(), [second.owner.pid, peer.owner.pid])
             self.assertEqual(fixture.server.waiters[second.episode].row["since"], second.since)

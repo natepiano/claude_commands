@@ -101,7 +101,7 @@ from scripts.message.unit_labels import (
     newest_sessions as _newest_sessions,
     registered_showrunners as _registered_showrunners,
     showrunner_ids as _showrunner_ids,
-    every_marked_unit as every_marked_unit,
+    every_labeled_session as every_labeled_session,
     production_places as _production_places,
     unit_labels_for as unit_labels_for,
     live_runs as _live_runs,
@@ -112,7 +112,7 @@ from scripts.message.unit_labels import (
 
 
 # Keep the discovery boundary for existing callers.
-_every_marked_unit = every_marked_unit
+_every_labeled_session = every_labeled_session
 
 @dataclass(frozen=True)
 class ThisMachine:
@@ -791,7 +791,7 @@ def _slot_role(name: str) -> str:
 
 
 def _worker_slot(run: Path, name: str, record: Mapping[str, object], problems: list[str]) -> str:
-    """The recorded slot can contain hyphens and is independent of the address."""
+    """Read the saved slot through staff_id, including named fix workers."""
     if slot := _as_string(record.get("slot")):
         return slot
     fallback = _slot_role(name)
@@ -1184,12 +1184,12 @@ def _review_workers(
     entries: list[RosterEntry] = []
     try:
         # A launch that names its phase writes in that phase's directory.
-        statuses = sorted([*run.path.glob("review_status*"), *run.path.glob("phases/*/review_status*")])
+        statuses = sorted([*run.path.glob("*_status*"), *run.path.glob("phases/*/*_status*")])
     except OSError as error:
         _problem(problems, f"review state in {run.path}", error)
         return entries
     for status_path in statuses:
-        suffix = status_path.name.removeprefix("review_status")
+        worker, _, suffix = status_path.name.rpartition("_status")
         if suffix and not suffix.startswith("_"):
             continue
         lens = suffix.removeprefix("_")
@@ -1200,7 +1200,7 @@ def _review_workers(
             continue
         if status != "reviewing":
             continue
-        pid_path = status_path.parent / f"review_pid{suffix}"
+        pid_path = status_path.parent / f"{worker}_pid{suffix}"
         try:
             launcher_pid = int(pid_path.read_text(encoding="utf-8").strip())
         except (OSError, UnicodeError, ValueError) as error:

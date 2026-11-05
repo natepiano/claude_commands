@@ -59,6 +59,27 @@ class HeartbeatCapTests(unittest.TestCase):
 
 
 class HeartbeatWatcherTests(unittest.TestCase):
+    def test_the_watcher_exits_after_its_agent_dies(self) -> None:
+        guard = LauncherHangGuard("heartbeat agent exit")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with subprocess.Popen([sys.executable, "-c", "pass"]) as agent:
+                _ = agent.wait(timeout=guard.remaining())
+            watcher: subprocess.Popen[str] = subprocess.Popen(
+                ["bash", str(WATCHER), str(root / "heartbeat.log"), "fixture",
+                 str(agent.pid), str(root / "agent.log"), "1"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+            )
+            try:
+                output, errors = watcher.communicate(timeout=guard.remaining())
+                self.assertEqual(watcher.returncode, 0, output + errors)
+            finally:
+                try:
+                    send_process_group(watcher.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _ = watcher.communicate(timeout=guard.remaining())
+
     def test_stop_signals_close_the_output_pipes_and_reap_the_sleep(self) -> None:
         for stop_signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             with self.subTest(signal=stop_signal), tempfile.TemporaryDirectory() as directory:

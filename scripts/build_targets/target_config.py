@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import sys
 import os
-from typing import Literal
+import json
+from typing import Literal, cast
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -41,13 +42,23 @@ Target = LocalTarget | SshTarget
 ConfigError = conf.Unusable
 
 
+def ssh_target_state_directory(target: str) -> Path:
+    """Return the state path without requiring target registration."""
+    if target in (".", "..") or Path(target).name != target:
+        raise ConfigError(f"invalid target name: {target}")
+    if target != "mac":
+        return Path.home() / ".local/state/build-targets" / target
+    configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
+    return Path(configured).expanduser()
+
+
 def uses_legacy_mac_layout(platform: Platform) -> bool:
     """Mac targets retain one mirror and claim per source repository name."""
     return platform == "macos"
 
 
 def read_targets(path: Path | None = None) -> tuple[Target, ...]:
-    config = conf.path("build_targets") if path is None or os.environ.get("CONF_DIR") else path
+    config = conf.path("build_targets") if path is None else path
     values = conf.read(config).values()
     names = tuple(name.strip() for name in values.get("targets", "").split(","))
     if not all(names) or len(set(names)) != len(names):
@@ -74,3 +85,14 @@ def read_targets(path: Path | None = None) -> tuple[Target, ...]:
     return tuple(targets)
 
 
+def aws_routing_enabled(settings: conf.ConfigRead) -> bool:
+    """Read the external activation record before the legacy configuration value."""
+    path = ssh_target_state_directory('aws') / 'routing.json'
+    if path.exists():
+        value = cast(object, json.loads(path.read_text()))
+        if not isinstance(value, dict):
+            raise ConfigError('routing.json: expected an activation record')
+        record = cast(dict[str, object], value)
+        if record.get('settings') == str(settings.source.resolve()):
+            return record.get('enabled') is True
+    return settings.text('offload') == 'on'

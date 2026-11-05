@@ -145,7 +145,9 @@ def showrunner_state(session_id: str) -> Path | None:
     doc = showrunners.production_of(session_id) if session_id else None
     if doc is None:
         return None
-    return showrunners.session_state_dir(showrunners.production_slug(str(doc))) / "showrunner_state.json"
+    from scripts.production.store_owner import document_id
+
+    return showrunners.session_state_dir(document_id(doc)) / "showrunner_state.json"
 
 
 def log_debug(

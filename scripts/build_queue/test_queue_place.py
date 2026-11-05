@@ -233,14 +233,13 @@ class QueuePlaceFixture(ExitStack):
         self.enter_context(mock.patch.dict(os.environ, {
             **gate_isolation_environment(self.root), **fake_memory_readings(self.root),
             "LINT_CONFIG_FILE": str(self.config.with_name("lint.conf")), "BUILDLOG_DIR": str(self.log),
-            "BUILDLOG_PROC": str(self.proc), "BUILDLOG_BUILD_BUDGET_GIB": "60",
+            "BUILDLOG_PROC": str(self.proc),
             "BUILDLOG_SCOPE": "0", "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "UNIT_SESSION_DIR": "", "UNIT_RUN_DIR": "", "CLAUDE_CODE_SESSION_ID": "queue-place-test",
             "QUEUE_TEST_LIFELINE": str(self.lifeline_read),
         }))
         self.admission: AdmissionFixture = self.enter_context(AdmissionFixture(root=self.root))
         self.admission.clock.epoch = time.time()
-        self.enter_context(mock.patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "60"}))
         _ = self.enter_context(self.admission.serving())
         self.children: list[subprocess.Popen[bytes]] = []
         self.complete_scoped_launch: bool = False
@@ -366,6 +365,46 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_scope_sampler_uses_the_shared_anonymous_reader_and_skips_unavailable_use(self) -> None:
+        from scripts.lint.memory_test_support import admission_configuration_fixture
+
+        class SingleScopeSample(queue.QueuePlace):
+            def sample_once(self) -> None:
+                stopped = threading.Event()
+                stopped.set()
+                self._sample(queue.ScopedProgram(), stopped)
+
+        with tempfile.TemporaryDirectory(prefix="scope-sample-test-") as directory:
+            root = Path(directory)
+            scope = root / "program.scope"
+            scope.mkdir()
+            _ = (scope / "memory.current").write_text(str(11 * GIB))
+            _ = (scope / "memory.swap.current").write_text(str(2 * GIB))
+            sidecar = root / "program.cgroup"
+            _ = sidecar.write_text(str(scope) + "\n")
+            for available in (True, False):
+                with self.subTest(anonymous_available=available):
+                    contents = f"file {7 * GIB}\ninactive_file {GIB}\n"
+                    if available:
+                        contents += f"anon {3 * GIB}\n"
+                    _ = (scope / "memory.stat").write_text(contents)
+                    samples = root / str(available)
+                    samples.mkdir()
+                    place = SingleScopeSample(samples / "program", sidecar,
+                                              configuration=admission_configuration_fixture())
+                    with mock.patch.object(gate, "slice_working_set", wraps=gate.slice_working_set) as reader, \
+                         mock.patch.object(place, "observe", wraps=place.observe) as observe:
+                        place.sample_once()
+                    reader.assert_called_once_with(scope)
+                    if available:
+                        observe.assert_called_once_with(3 * GIB, 3 * GIB)
+                        self.assertEqual(place.peak_bytes, 3 * GIB)
+                        self.assertEqual(int(place.path.with_suffix(".max").read_text()), 3 * GIB)
+                    else:
+                        observe.assert_not_called()
+                        self.assertEqual(place.peak_bytes, 0)
+                        self.assertEqual(list(samples.iterdir()), [])
+
     def test_program_admission_carries_the_unit_override(self) -> None:
         with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {gate.BUILDLOG_UNIT: "queue-unit"}):
             with queue.queue_place("rust-analyzer", fixture.root):
@@ -452,12 +491,12 @@ class QueuePlaceTests(unittest.TestCase):
                     self.assertEqual(child.stdout.readline(), b"ready\n")
                     self.assertLess(time.monotonic() - started, 2)
                     scope = Path(place.sidecar.read_text().strip())
-                    self.assertIn(child.pid, queue.scope_members(scope))
+                    self.assertIn(child.pid, gate.scope_members(scope))
                     self.assertFalse(fixture.admission.server.reservations)
                     place.observe(2 * GIB, 2 * GIB)
                     self.assertEqual(place.peak_bytes, 2 * GIB)
             self.assertIsNotNone(child.poll())
-            self.assertEqual(queue.scope_members(scope), set())
+            self.assertEqual(gate.scope_members(scope), set())
             self.assertEqual(fixture.history(), [])
 
     def test_probe_history_does_not_size_server(self) -> None:
@@ -511,10 +550,10 @@ class QueuePlaceTests(unittest.TestCase):
                     child = fixture.start_blocked(place)
                     sidecar = place.sidecar
                     scope = Path(sidecar.read_text().strip())
-                    self.assertIn(child.pid, queue.scope_members(scope))
+                    self.assertIn(child.pid, gate.scope_members(scope))
                     write_memory_config(fixture.config, program_stop_seconds="invalid")
             self.assertIsNotNone(child.poll())
-            self.assertEqual(queue.scope_members(scope), set())
+            self.assertEqual(gate.scope_members(scope), set())
             fixture.assert_cleaned(self)
             self.assertFalse(sidecar.exists())
 
@@ -905,7 +944,7 @@ class QueuePlaceTests(unittest.TestCase):
                 self.assertEqual(fixture.children, [])
                 self.assertEqual(list(fixture.directory.glob("*.reservation")), [])
 
-    def test_fixed_cap_ignores_history_at_start_and_after_head_seconds(self) -> None:
+    def test_fixed_cap_ignores_history_at_start_and_after_estimate_refresh_seconds(self) -> None:
         with QueuePlaceFixture() as fixture:
             fixture.seed([2 * GIB] * 10)
             with queue.queue_place("rust-analyzer", fixture.root, sizing=gate.FixedCapSizing(12 * GIB)):
@@ -915,7 +954,7 @@ class QueuePlaceTests(unittest.TestCase):
                 self.assertEqual(gate.ExpectedPeak(row["need"], waiter.get("need_source", "fallback"),
                     waiter.get("need_runs", 0), gate.read_need_basis(waiter.get("need_basis"))),
                     gate.ExpectedPeak(12 * GIB, "cap", 0, gate.ProgramMemoryCap("rust-analyzer")))
-                fixture.admission.clock.advance(gate.read_memory_config().policy.timing.head_seconds + 1)
+                fixture.admission.clock.advance(gate.read_memory_config().policy.timing.estimate_refresh_seconds + 1)
                 with mock.patch.object(gate, "program_peak_estimate", side_effect=AssertionError("cap estimated history")):
                     _ = fixture.admission.run_pass()
                 _, current = fixture.reservation()
@@ -929,7 +968,7 @@ class QueuePlaceTests(unittest.TestCase):
     def test_invalid_config_warns_once_and_does_not_corrupt_child_protocol(self) -> None:
         with QueuePlaceFixture() as fixture:
             commit_config_fixture(fixture.config)
-            write_memory_config(fixture.config, head_seconds="abc", **{"program_first_peak_gib.rust-analyzer": "18"})
+            write_memory_config(fixture.config, estimate_refresh_seconds="abc", **{"program_first_peak_gib.rust-analyzer": "18"})
             diagnostics, output = io.StringIO(), io.StringIO()
             with redirect_stderr(diagnostics), redirect_stdout(output):
                 for _ in range(2):
@@ -938,13 +977,14 @@ class QueuePlaceTests(unittest.TestCase):
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
                         echoed, _ = child.communicate(b"Content-Length: 4\r\n\r\n{}\x00\xff", timeout=3)
                         self.assertEqual(echoed, b"Content-Length: 4\r\n\r\n{}\x00\xff")
-            self.assertIn("head_seconds='abc'", diagnostics.getvalue())
+            self.assertIn("estimate_refresh_seconds='abc'", diagnostics.getvalue())
             self.assertIn(str(fixture.config), diagnostics.getvalue())
             self.assertEqual(output.getvalue(), "")
 
     def test_waiting_checks_the_hold_before_each_attempt_and_never_starts_early(self) -> None:
         with QueuePlaceFixture() as fixture:
             fixture.admission.free(0)
+            fixture.admission.hold_starts()
             events: list[str] = []
             admit = client.admit
             def observed(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None],

@@ -1,7 +1,6 @@
 """Private Git fixtures and in-process production rename commands."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shlex
@@ -9,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
@@ -18,17 +18,16 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.astra import design_roles
 from scripts.direct import workers
-from scripts.astra.design_role_test_support import designer_fixture
-from scripts.production import staff, unit_config
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
+from scripts.production import staff, unit_config, fake_unit_host
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
 import fake_herdr
 import herdr
 from scripts.shutdown import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
+import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 import merge_checkpoint
 from scripts.production.production_doc import Production, read_production
@@ -39,7 +38,7 @@ import tidy_wrapped
 import unit_move
 import unit_names
 import unit_lookup
-from cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
@@ -102,7 +101,8 @@ class RenameDisplays:
               mock.patch.object(herdr.Herdr, "result", side_effect=self.result),
               mock.patch.object(herdr, "run_program", side_effect=self.native_result),
               mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-                  self.row.current_session, "probe-generation", {})),
+                  herdr.RolloutThread(self.row.current_session) if self.backend == "codex" else
+                  herdr.EnvironmentThread(self.row.current_session), "probe-generation", {})),
               mock.patch.object(herdr, "_LayoutLock"),
               mock.patch.object(herdr.Herdr, "order_tabs", return_value=False),
               mock.patch.object(herdr.Herdr, "save_layout")):
@@ -126,11 +126,21 @@ class FolderMoveBackend:
         self.config: Path = fixture.root / "home" / (".claude4" if kind == "claude" else ".codex2")
 
     def publish_process_state(self) -> None:
-        """Expose the private process and an empty rollout descriptor directory."""
-        process = self.fixture.root / "folder-processes" / str(self.pid)
-        (process / "fd").mkdir(parents=True, exist_ok=True)
+        """Expose the process generation and its current Codex rollout."""
+        environment = {"HERDR_PROC": str(self.fixture.root / "folder-processes")}
+        fake_unit_host.process(environment, self.shell_pid, 1, ["zsh"], {}, cwd=self.cwd)
         arguments = [self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]
-        _ = (process / "cmdline").write_bytes("\0".join(arguments).encode() + b"\0" if self.live else b"")
+        fake_unit_host.process(environment, self.pid, self.shell_pid if self.live else 1, arguments if self.live else [],
+                               self.environment(self.pid), cwd=self.cwd)
+        process = Path(environment["HERDR_PROC"]) / str(self.pid)
+        descriptors = process / "fd"
+        descriptors.mkdir(exist_ok=True)
+        descriptor = descriptors / "4"
+        descriptor.unlink(missing_ok=True)
+        if self.live and self.kind == "codex":
+            record = self.fixture.root / "rollout-folder-current.jsonl"
+            _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.fixture.owner.current_session}}) + "\n")
+            descriptor.symlink_to(record)
 
     def panes(self) -> list[herdr.PaneIdentity]:
         return [
@@ -157,20 +167,47 @@ class FolderMoveBackend:
 
     def result(self, *arguments: str) -> dict[str, object]:
         self.fixture.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
-        argv = [self.kind] if self.live else [sys.executable, "/fixture/accounts.py", "exec", self.config.name]
-        foreground: list[dict[str, object]] = [{"pid": self.pid, "argv": argv, "cwd": str(self.cwd)}]
+        argv = ([self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]) if self.live else ["zsh"]
+        foreground: list[dict[str, object]] = [{"pid": self.pid if self.live else self.shell_pid, "argv": argv, "cwd": str(self.cwd)}]
         return {"process_info": {"shell_pid": self.shell_pid, "cwd": str(self.cwd),
+                                 "foreground_process_group_id": self.pid if self.live else self.shell_pid,
                                  "foreground_processes": foreground}}
 
-    def run_in_pane(self, pane: str, command: list[str]) -> None:
+    def saved_row_tab(self, row_id: str, title: str) -> herdr.ExistingPane:
+        self.fixture.assertEqual((row_id, title), (str(self.fixture.owner.id), self.fixture.owner.name))
+        return herdr.ExistingPane("w1:p1", "kept-terminal")
+
+    def remember_row_tab(self, row_id: str, pane: str) -> None:
+        self.fixture.assertEqual((row_id, pane), (str(self.fixture.owner.id), "w1:p1"))
+
+    def focus_tab_of(self, pane: str) -> None:
         self.fixture.assertEqual(pane, "w1:p1")
+
+    def run_in_pane(self, pane: str, command: list[str], *, terminal: str = "") -> None:
+        self.fixture.assertEqual((pane, terminal), ("w1:p1", "kept-terminal"))
         self.fixture.assertFalse(self.live, "a live session must not start again")
         self.fixture.assertEqual(self.agents(), [])
-        self.cwd = Path(command[command.index("sh") + 4])
+        self.fixture.assertEqual(command[0], "eval")
+        words = shlex.split(command[1])
+        self.cwd = Path(words[words.index("cd") + 2])
         self.fixture.assertTrue(self.cwd.is_dir())
-        self.starts.append((pane, command.copy()))
+
+    def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
+                    timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
+        self.fixture.assertFalse(self.live, "a live session must not start again")
+        self.fixture.assertEqual((name, pane, kind), (self.fixture.owner.name, "w1:p1", self.kind))
+        self.fixture.assertIn(self.fixture.owner.current_session, agent_arguments)
+        self.fixture.assertIsInstance(opening, herdr.NoOpeningPrompt)
+        self.fixture.assertGreater(timeout_ms, 0)
+        self.starts.append((pane, agent_arguments.copy()))
+        entry = pane_record.launch(pane, self.fixture.owner.current_session, str(self.cwd),
+            self.environment(self.pid), [kind, *agent_arguments], kind=self.kind)
+        entry["name"] = name
+        pane_record.write(self.session, entry)
         self.live = True
         self.publish_process_state()
+        return herdr.PromptSubmissionNotRequired()
 
     def close_tab_confirmed(self, pane: str) -> None:
         raise AssertionError(f"a folder resume must keep its pane: {pane}")
@@ -257,7 +294,7 @@ class FolderMoveFixture(StaffTestCase):
         backend = FolderMoveBackend(self, kind, live)
         backend.publish_process_state()
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(
-            os.environ, {"HERDR_PROC": str(self.root / "folder-processes")})))
+            os.environ, {"HERDR_PROC": str(self.root / "folder-processes"), "SHUTDOWN_PROOF_WORKSPACE": "w1"})))
         account_key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
         launch = pane_record.launch("w1:p1", self.owner.id, str(self.old_folder),
             {account_key: str(backend.config)}, [kind, "-n", "kept-name", "--model", "opus"], kind=kind)
@@ -273,6 +310,11 @@ class FolderMoveFixture(StaffTestCase):
             self.assertEqual((pid, started), (backend.pid, "fixture-start"))
             return sessions.LiveSessionProcess(pid) if backend.live else sessions.SessionNotLive()
 
+        def stop_process_liveness(pid: int, started: str) -> stop_sessions.LiveSessionProcess | stop_sessions.SessionNotLive:
+            self.assertEqual((pid, started), (backend.pid, "fixture-start"))
+            return (stop_sessions.LiveSessionProcess(pid) if backend.live
+                    else stop_sessions.SessionNotLive())
+
         def signal_process(pid: int, signal: int) -> None:
             import signal as signals
 
@@ -285,11 +327,15 @@ class FolderMoveFixture(StaffTestCase):
 
         for target, attribute, replacement in (
             (herdr, "Herdr", mock.Mock(return_value=backend)),
+            (herdr, "shared_session", mock.Mock(return_value="agents")),
+            (pane_record, "seed", mock.Mock(return_value=0)),
             (herdr, "herdr_processes", backend.observed_processes),
             (herdr, "process_environment", backend.environment),
             (sessions, "session_liveness", session_liveness),
             (sessions, "process_liveness", process_liveness),
             (sessions, "process_start", mock.Mock(return_value="fixture-start")),
+            (stop_sessions, "process_liveness", stop_process_liveness),
+            (stop_sessions, "process_start", mock.Mock(return_value="fixture-start")),
             (staff, "runtime_id", mock.Mock(return_value=self.owner.current_session)),
             (os, "kill", signal_process),
         ):
@@ -301,93 +347,10 @@ OLD = "old"
 
 NEW = "new"
 
-UNITS = ("alpha-unit", "beta-unit")
-
 # The staff fixture suppresses live discovery. These lifecycle fixtures provide
 # their own fake host and session records, which the original readers must see.
 FIXTURE_SOCKET_FOR = showrunners.socket_for
-FIXTURE_MARKED_UNITS = unit_lookup.marked_units
-
-FAIL_STATE_MOVE = '''import os, runpy, sys
-from pathlib import Path
-
-state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
-blocked = state / "review-paused" / "old.json"
-def refusing_move(original):
-    def move(source, destination, *args, **kwargs):
-        if Path(source) == blocked:
-            raise OSError("simulated step 4 state move failure")
-        return original(source, destination, *args, **kwargs)
-    return move
-os.rename = refusing_move(os.rename)
-os.replace = refusing_move(os.replace)
-sys.argv = sys.argv[1:]
-sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
-runpy.run_path(sys.argv[0], run_name="__main__")
-'''
-
-CHECK_TIMER_HANDOFF = '''import os, runpy, subprocess, sys
-from pathlib import Path
-
-sys.argv = sys.argv[1:]
-sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
-sys.path.insert(0, str(Path(sys.argv[0]).resolve().parents[2]))
-from scripts.production import showrunners
-
-notifier = Path(os.environ["NOTIFIER_STATE_DIR"])
-old_timer = notifier / "showrunner-old"
-new_timer = notifier / "showrunner-new"
-seen = []
-def readable_timer(instance):
-    checked = showrunners.checked_doc(instance)
-    assert isinstance(checked, showrunners.CheckedDoc), checked
-    context = checked.path.read_text().split("## Production Context", 1)[1].split("\\n## ", 1)[0]
-    assert "- **Formerly:** `old`" in context, context
-    assert instance.name.removeprefix("showrunner-") in showrunners.timer_slugs()
-original_run = subprocess.run
-def observing_run(command, *args, **kwargs):
-    moving_doc = len(command) > 3 and command[0] == "git" and command[3] == "mv"
-    if moving_doc:
-        readable_timer(old_timer)
-    result = original_run(command, *args, **kwargs)
-    if moving_doc:
-        readable_timer(old_timer)
-        seen.append("doc")
-    return result
-original_rename = os.rename
-def observing_rename(source, destination, *args, **kwargs):
-    moving_timer = Path(source) == old_timer
-    if moving_timer:
-        readable_timer(old_timer)
-    result = original_rename(source, destination, *args, **kwargs)
-    if moving_timer:
-        readable_timer(new_timer)
-        assert showrunners.canonical_slug("old") == "new"
-        seen.append("timer")
-    return result
-subprocess.run = observing_run
-os.rename = observing_rename
-try:
-    runpy.run_path(sys.argv[0], run_name="__main__")
-except SystemExit as exit:
-    if exit.code == 0:
-        assert seen == ["doc", "timer"], seen
-    raise
-'''
-
-FAIL_PLAN_REWRITE = '''import os, runpy, sys
-from pathlib import Path
-
-original_replace = os.replace
-def refusing_replace(source, destination, *args, **kwargs):
-    if Path(destination).name == "alpha-unit.md":
-        raise OSError("simulated unit header rewrite failure")
-    return original_replace(source, destination, *args, **kwargs)
-os.replace = refusing_replace
-sys.argv = sys.argv[1:]
-sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
-runpy.run_path(sys.argv[0], run_name="__main__")
-'''
+FIXTURE_LABELED_SESSIONS = unit_lookup.labeled_sessions
 
 FAIL_GIT_MOVE_INDEX = '''import runpy, subprocess, sys
 from pathlib import Path
@@ -404,8 +367,6 @@ sys.argv = sys.argv[1:]
 sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
 runpy.run_path(sys.argv[0], run_name="__main__")
 '''
-
-# load 136 on natedev, 2026-10-29
 
 def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
                wrapper: str = "") -> subprocess.CompletedProcess[str]:
@@ -440,7 +401,7 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
         _ = scope.enter_context(mock.patch.object(subprocess, "run", side_effect=run))
-        _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback)))
+        _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback, monotonic=time.monotonic)))
         # Failure injection scripts assign these names just as they do in a CLI
         # subprocess. Each call restores them before another test can observe it.
         for module, names in ((os, ("rename", "replace")),
@@ -489,8 +450,8 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     _ = case.enterContext(mock.patch("progress_history.SESSION_ROOTS", roots))
     for name, attribute, reader in (
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
-        ("unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),
-        ("scripts.production.unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),
+        ("unit_lookup", "labeled_sessions", FIXTURE_LABELED_SESSIONS),
+        ("scripts.production.unit_lookup", "labeled_sessions", FIXTURE_LABELED_SESSIONS),
     ):
         module = sys.modules.get(name)
         if module is not None:
@@ -576,11 +537,13 @@ class ProductionRenameFixture(StaffTestCase):
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         self.old_tip = self.fixture_tip
-        bind_staff_fixture(self, self.env, {OLD: UNITS},
-                           locations={(OLD, unit): self.worktrees / unit for unit in UNITS},
-                           plans={(OLD, unit): Path(f"docs/plans/{unit}.md") for unit in UNITS})
-        production = next(row for row in staff.find(kind="showrunner") if row.name == OLD)
-        _ = fixture_member("showrunner", name="child", parent=production.id)
+        self.staff_file: Path = self.root / "state/staff/staff.json"
+        self.env.update(STAFF_FILE=str(self.staff_file), STAFF_TEST_OWNER_FILE=str(self.staff_file))
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.env)))
+        _ = self.enterContext(isolated_source_readers())
+        _ = fixture_member("showrunner", name=OLD, doc=staff.LiveDoc("natedev", self.doc))
+        with staff.operation(), unit_move.production_lock():
+            pass
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
@@ -626,6 +589,9 @@ class ProductionRenameFixture(StaffTestCase):
             path.mkdir(parents=True)
         config = self.home / ".claude"
         config.mkdir()
+        helper = config / "scripts/lib/py"
+        helper.parent.mkdir(parents=True)
+        helper.symlink_to(SCRIPT.parents[1] / "lib/py")
         (self.root / "state/sessions").mkdir(parents=True)
         self.write(self.root / "herdr-responses.json",
                    json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0},
@@ -641,31 +607,16 @@ class ProductionRenameFixture(StaffTestCase):
                 _ = self.git("-C", str(repo), "config", key, value)
         _ = self.git("remote", "add", "origin", str(self.origin))
         self.write(self.doc, self.production_doc())
-        for unit in UNITS:
-            header = f"> **Production: {OLD}**" if unit == "alpha-unit" else f"> **Production:** {OLD}"
-            self.write(self.plan_path(unit),
-                       f"# {unit}\n\n{header} — unit `{unit}`; "
-                       + "production doc `docs/plans/old-production.md`\n\n"
-                       + "Historical example: old stays in ordinary prose.\n")
         self.write(self.checkout / "README.md", "A production whose history says old.\n")
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "merge(old-alpha): fixture history")
         _ = self.git("push", "-u", "origin", OLD)
         self.old_tip = self.git("rev-parse", "HEAD")
-        for unit in UNITS:
-            _ = self.git("worktree", "add", "-b", f"old-{unit}", str(self.worktrees / unit), OLD)
         self.write(self.notifier / "showrunner-old/conf",
                    "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh", str(self.doc)])
                    + "\nPROMPT_FILE=unchanged-prompt\n")
         self.write(self.notifier / "showrunner-old/prompt", "Historical prompt mentions old.\n")
-        for relative, content in self.saved_state().items():
-            self.write(self.state / relative, content)
-        self.write(self.state / "child/parent", "old\n")
-        self.write(self.state / "other/parent", "oldish\n")
-        for unit in UNITS:
-            self.write(self.stall_path(OLD, unit), json.dumps({"unit": unit, "stretch": 17}) + "\n")
-        self.write(self.stall_path("unrelated", "alpha-unit"), '{"stretch": 99}\n')
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -677,13 +628,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual(result.returncode, 0, (arguments, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def plan_path(self, unit: str) -> Path:
-        return self.checkout / "docs/plans" / f"{unit}.md"
-
-    def stall_path(self, slug: str, unit: str) -> Path:
-        digest = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
-        return self.stall / f"{digest}.json"
-
     def production_doc(self) -> str:
         return "\n".join([
             "# Production — old", "", "> **Status: PRODUCTION — running.**", "",
@@ -692,18 +636,13 @@ class ProductionRenameFixture(StaffTestCase):
             "## Production rules", "", "History mentions old and stays unchanged.", "",
         ])
 
-    def saved_state(self) -> dict[str, str]:
-        return {"footers-off/old": "", "review-paused/old.json": '{"reason": "old review"}\n',
-                "outstanding/old.json": '{"question": "old question"}\n',
-                "old/parent": "top\n", "old/log-backups/phase.log": "merge(old): retained log\n"}
-
-    def run_rename(self, action: str, destination: str = NEW, *, fail_state: bool = False,
+    def run_rename(self, action: str, destination: str = NEW, *,
                    source: str = OLD) -> subprocess.CompletedProcess[str]:
-        if self._testMethodName == "test_apply_moves_state_and_commits_documents_on_the_new_merge_branch":
+        if process_boundary_for_case(self):
             return subprocess.run([sys.executable, str(SCRIPT), action, source, destination],
                                   cwd=self.checkout, env=self.env, capture_output=True,
                                   text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        return self.run_command(action, source, destination, wrapper=FAIL_STATE_MOVE if fail_state else "")
+        return self.run_command(action, source, destination)
 
     def assert_success(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -712,98 +651,5 @@ class ProductionRenameFixture(StaffTestCase):
         return {str(path.relative_to(self.root)): path.read_bytes()
                 for path in self.root.rglob("*") if path.is_file() and path != self.root / "herdr.jsonl"}
 
-    def unit_worktree(self, slug: str, unit: str) -> Path:
-        return self.worktrees / f"repo.name_with_punctuation-{slug}-{unit}"
-
-    def prepare_unit_moves(self) -> None:
-        for unit in UNITS:
-            old = self.worktrees / unit
-            destination = self.unit_worktree(OLD, unit)
-            _ = self.git("worktree", "move", str(old), str(destination))
-            row = unit_membership(OLD, unit)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination), expected=row.worktree)
-            _ = self.git("push", "origin", f"old-{unit}")
-
     def run_command(self, *arguments: str, wrapper: str = "", **environment: str) -> subprocess.CompletedProcess[str]:
         return run_rename(list(arguments), {**self.env, **environment}, self.checkout, wrapper)
-
-
-    def assert_unit_moved(self, unit: str) -> None:
-        old, new = self.unit_worktree(OLD, unit), self.unit_worktree(NEW, unit)
-        self.assertFalse(old.exists())
-        self.assertTrue((new / ".git").is_file())
-        self.assertEqual(self.git("-C", str(new), "branch", "--show-current"), f"new-{unit}")
-        self.assertEqual(self.git("rev-parse", f"new-{unit}"), self.old_tip)
-        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", f"refs/heads/old-{unit}"), "")
-        self.assertIn(f"worktree {new}\n", self.git("worktree", "list", "--porcelain") + "\n")
-        self.assertEqual(unit_membership(NEW, unit).worktree, staff.PresentWorktree("natedev", new))
-        self.assertEqual(self.git("status", "--porcelain"), "")
-
-    def assert_applied(self) -> None:
-        self.assertFalse(self.doc.exists())
-        text = self.new_doc.read_text(encoding="utf-8")
-        context = text.split("## Production Context", 1)[1].split("\n## ", 1)[0]
-        self.assertRegex(context, r"(?m)^- \*\*Formerly:\*\*.*`old`")
-        self.assertIn("- **Merge branch:** `new`", context)
-        self.assertIn("History mentions old and stays unchanged.", text)
-        for unit in UNITS:
-            plan = self.plan_path(unit).read_text(encoding="utf-8")
-            self.assertRegex(plan, r"(?m)^> \*\*Production:(?: new\*\*|\*\* new) — unit")
-            self.assertIn("production doc `docs/plans/new-production.md`", plan)
-            self.assertIn("Historical example: old stays in ordinary prose.", plan)
-            self.assertEqual(self.git("rev-parse", f"old-{unit}"), self.old_tip)
-            self.assertTrue((self.worktrees / unit / ".git").exists())
-            self.assertFalse(self.stall_path(OLD, unit).exists())
-            stretch = cast(object, json.loads(self.stall_path(NEW, unit).read_text()))
-            self.assertEqual(stretch, {"unit": unit, "stretch": 17})
-        self.assertFalse((self.notifier / "showrunner-old").exists())
-        conf = (self.notifier / "showrunner-new/conf").read_text(encoding="utf-8")
-        self.assertIn(str(self.new_doc), conf)
-        self.assertNotIn(str(self.doc), conf)
-        self.assertIn("TARGET=session:test-showrunner\n", conf)
-        self.assertEqual((self.notifier / "showrunner-new/prompt").read_text(),
-                         "Historical prompt mentions old.\n")
-        for relative, content in self.saved_state().items():
-            old_path = self.state / relative
-            new_path = self.state / relative.replace("old", "new", 1)
-            self.assertFalse(old_path.exists(), str(old_path))
-            self.assertEqual(new_path.read_text(), content)
-        self.assertEqual((self.state / "child/parent").read_text(), "new\n")
-        self.assertEqual((self.state / "other/parent").read_text(), "oldish\n")
-        self.assertEqual(self.stall_path("unrelated", "alpha-unit").read_text(), '{"stretch": 99}\n')
-        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", f"refs/heads/{OLD}"), "")
-        self.assertEqual(self.git("rev-parse", "new^"), self.old_tip)
-        self.assertEqual(self.git("log", "-1", "--format=%s", NEW), "chore(new): rename production from old")
-        committed = self.git("diff-tree", "--no-commit-id", "--name-only", "-r", NEW).splitlines()
-        self.assertEqual(set(committed), {"docs/plans/old-production.md", "docs/plans/new-production.md",
-                                         *(f"docs/plans/{unit}.md" for unit in UNITS)})
-        new_tip = self.git("rev-parse", NEW)
-        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"), f"{new_tip}\trefs/heads/new")
-        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
-        self.assertEqual(self.git("status", "--porcelain"), "")
-
-    def held_design(self, repository_id: str, checkout: Path) -> design_roles.HeldDesign:
-        """Save an open design with a private checkout."""
-        with mock.patch.dict(os.environ, self.env):
-            design_roles.register_repository(repository_id, {"fixture-host": str(checkout)})
-            placement = design_roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
-                                                            "host": "fixture-host", "request_id": repository_id})
-            parent = staff.snapshot().by_worktree("natedev", checkout) or staff.by_path(OLD)
-            assert parent is not None
-            row = designer_fixture(parent.id, f"old-{repository_id}-astra-designer", self.root / "codex-home")
-            self.env["CODEX_HOME"] = str(self.root / "codex-home")
-            design = design_roles.HeldDesign(
-                design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
-                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", design_roles.DesignUnbound(),
-                (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen(row.id)),
-                 design_roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", design_roles.RoleNotOpened())))
-            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
-            self.write(design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json", json.dumps(
-                {design.roles[0].name: {"staff_id": row.id, "status": "done"}}))
-        return design
-
-    def read_held(self, design: design_roles.HeldDesign) -> tuple[design_roles.HeldDesign, str]:
-        """Read the current design and its repository."""
-        with mock.patch.dict(os.environ, self.env):
-            current = design_roles.read_design(design.placement.design_id)
-        return current, current.repository

@@ -121,6 +121,7 @@
     {
       "root": "scripts/buildlog",
       "extraPaths": [
+        ".",
         "scripts/buildlog",
         "scripts/build_hold",
         "scripts/lint",

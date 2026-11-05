@@ -10,10 +10,10 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import TypedDict, final, override
+from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -25,7 +25,7 @@ MAC_TEST = SCRIPT.parent.parent / "mac_test" / "mac_test.py"
 SHA = "1234567890abcdef1234567890abcdef12345678"
 # build_hold.owning_session() reads these; a Mac block admits the session they name.
 SESSION_SELECTORS = frozenset({
-    "CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
+    "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
     "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
 })
 
@@ -38,101 +38,102 @@ class CommandEvent(TypedDict):
 
 
 COMMAND_STUB = r'''
-from __future__ import annotations
+state=$MAC_RUN_STUB_STATE
+command=${0:t}
+claimed=false
+[[ ! -e $MAC_TEST_STATE_DIR/run.json ]] || claimed=true
+input=""
+if [[ $command == ssh && ${@[-1]} == *'cat >'* ]]; then
+    input=$(cat; print -rn -- .)
+    input=${input%.}
+fi
+# NUL separates fields so labels and command input keep their original bytes.
+printf '%s\0' "$command" "$claimed" "$input" "$#" "$@" >> "$state/events"
 
-import json
+case $command in
+    systemd-run|scp|curl) exit 0 ;;
+    git)
+        if (( ${@[(Ie)merge-base]} && ${@[(Ie)--is-ancestor]} )); then
+            [[ -n $MAC_RUN_CLONE_DESCENDANT && ${@[-2]} == $MAC_RUN_SHA && ${@[-1]} == $MAC_RUN_CLONE_DESCENDANT ]]
+            exit $?
+        fi
+        if (( ${@[(Ie)rev-parse]} )); then
+            code=0
+            (( ! ${@[(Ie)--verify]} )) || code=${MAC_RUN_GIT_RESOLVE_STATUS:-0}
+            (( code != 0 )) || print -r -- "$MAC_RUN_SHA"
+            exit $code
+        fi
+        if (( ${@[(Ie)bundle]} && ${@[(Ie)create]} )); then
+            if [[ -n $MAC_RUN_CLONE_DESCENDANT ]] && (( ${@[(Ie)^$MAC_RUN_CLONE_DESCENDANT]} )); then
+                print -u2 -- 'fatal: Refusing to create empty bundle.'
+                exit 128
+            fi
+            bundle_index=${@[(Ie)-q]}
+            print -r -- bundle > "${@[$((bundle_index + 1))]}"
+        fi
+        exit 0 ;;
+    ssh) ;;
+    *) exit 99 ;;
+esac
+
+if [[ ${@[-1]} == true ]] && (( ${@[(Ie)-o]} )); then
+    [[ ${MAC_RUN_REACHABLE:-1} == 1 ]] && exit 0
+    exit 255
+fi
+
+remote=${@[-1]}
+clone_head=$state/clone-head
+if [[ $remote == *'hana_instances.py stop-checkout '* ]]; then
+    print -r -- called > "$state/cleanup-called"
+    code=${MAC_RUN_CLEANUP_STATUS:-0}
+    if [[ $code == 0 && ${MAC_RUN_CONFIRM_STOP:-1} == 1 ]]; then
+        print -r -- 'hana-instances: checkout clear'
+        print -r -- confirmed > "$state/checkout-clear"
+    fi
+    print -r -- "mac_exit=$code"
+    exit 0
+fi
+if [[ $remote == *'scratch.py end '* ]]; then
+    if [[ ! -e $state/checkout-clear ]]; then
+        print -u2 -- 'task end before confirmed exit'
+        exit 98
+    fi
+    print -r -- mac_exit=0
+    exit 0
+fi
+if [[ $remote == *'copies.py clone '* ]]; then
+    print -rl -- "$MAC_RUN_CHECKOUT" mac_exit=0
+    exit 0
+fi
+if [[ $remote == *'checkout -q --detach'* ]]; then
+    print -rn -- "$MAC_RUN_SHA" > "$clone_head"
+fi
+if [[ $MAC_RUN_HOLD_BUILD == 1 && $remote == *'cargo build -q -p hana'* ]]; then
+    exec "$MAC_RUN_PYTHON" -c '
 import os
 from pathlib import Path
 import signal
-import sys
-
-state = Path(os.environ["MAC_RUN_STUB_STATE"])
-command = Path(sys.argv[0]).name
-arguments = sys.argv[1:]
-event = {
-    "command": command,
-    "args": arguments,
-    "claimed": (Path(os.environ["MAC_TEST_STATE_DIR"]) / "run.json").exists(),
-    "input": sys.stdin.read() if command == "ssh" and "cat >" in arguments[-1] else "",
-}
-with (state / "events.jsonl").open("a", encoding="utf-8") as output:
-    output.write(json.dumps(event) + "\n")
-
-if command in {"systemd-run", "scp", "curl"}:
-    raise SystemExit(0)
-if command == "git":
-    if "merge-base" in arguments and "--is-ancestor" in arguments:
-        descendant = os.environ.get("MAC_RUN_CLONE_DESCENDANT", "")
-        raise SystemExit(
-            0 if descendant and arguments[-2:] == [os.environ["MAC_RUN_SHA"], descendant]
-            else 1
-        )
-    if "rev-parse" in arguments:
-        status = int(os.environ.get("MAC_RUN_GIT_RESOLVE_STATUS", "0")) if "--verify" in arguments else 0
-        if status == 0:
-            print(os.environ["MAC_RUN_SHA"])
-        raise SystemExit(status)
-    if "bundle" in arguments and "create" in arguments:
-        descendant = os.environ.get("MAC_RUN_CLONE_DESCENDANT", "")
-        if descendant and f"^{descendant}" in arguments:
-            print("fatal: Refusing to create empty bundle.", file=sys.stderr)
-            raise SystemExit(128)
-        bundle = Path(arguments[arguments.index("-q") + 1])
-        bundle.write_text("bundle\n", encoding="utf-8")
-    raise SystemExit(0)
-if command != "ssh":
-    raise SystemExit(99)
-
-if arguments[-1:] == ["true"] and "-o" in arguments:
-    raise SystemExit(0 if os.environ.get("MAC_RUN_REACHABLE", "1") == "1" else 255)
-
-remote = arguments[-1]
-clone_head = state / "clone-head"
-if "hana_instances.py stop-checkout " in remote:
-    (state / "cleanup-called").write_text("called\n", encoding="utf-8")
-    status = int(os.environ.get("MAC_RUN_CLEANUP_STATUS", "0"))
-    if status == 0 and os.environ.get("MAC_RUN_CONFIRM_STOP", "1") == "1":
-        print("hana-instances: checkout clear")
-        (state / "checkout-clear").write_text("confirmed\n", encoding="utf-8")
-    print(f"mac_exit={status}")
-    raise SystemExit(0)
-if "scratch.py end " in remote:
-    if not (state / "checkout-clear").exists():
-        print("task end before confirmed exit", file=sys.stderr)
-        raise SystemExit(98)
-    print("mac_exit=0")
-    raise SystemExit(0)
-if "copies.py clone " in remote:
-    print(os.environ["MAC_RUN_CHECKOUT"])
-    print("mac_exit=0")
-    raise SystemExit(0)
-if "checkout -q --detach" in remote:
-    clone_head.write_text(os.environ["MAC_RUN_SHA"], encoding="utf-8")
-if (
-    os.environ.get("MAC_RUN_HOLD_BUILD") == "1"
-    and "cargo build -q -p hana" in remote
-):
-    def stop(signum: int, _frame: object) -> None:
-        raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGTERM, stop)
-    (state / "build-started").write_text("started\n", encoding="utf-8")
-    signal.pause()
-
-if "; echo mac_exit=$?" in remote:
-    status = 142 if "perl -e" in remote else 0
-    print(f"mac_exit={status}")
-    raise SystemExit(0)
-if "git -C " in remote and "rev-parse HEAD" in remote:
-    print(
-        clone_head.read_text(encoding="utf-8") if clone_head.exists()
-        else os.environ.get("MAC_RUN_CLONE_DESCENDANT", os.environ["MAC_RUN_SHA"])
-    )
-    raise SystemExit(0)
-if "cat /tmp/mac_run_hana.status" in remote:
-    print("142")
-    raise SystemExit(0)
-raise SystemExit(0)
+signal.signal(signal.SIGTERM, lambda *arguments: os._exit(128 + arguments[0]))
+Path(os.environ["MAC_RUN_STUB_STATE"], "build-started").write_text("started\n")
+signal.pause()
+'
+fi
+if [[ $remote == *'; echo mac_exit=$?'* ]]; then
+    code=0
+    [[ $remote != *'perl -e'* ]] || code=142
+    print -r -- "mac_exit=$code"
+    exit 0
+fi
+if [[ $remote == *'git -C '* && $remote == *'rev-parse HEAD'* ]]; then
+    if [[ -e $clone_head ]]; then
+        print -r -- "$(< "$clone_head")"
+    else
+        print -r -- "${MAC_RUN_CLONE_DESCENDANT:-$MAC_RUN_SHA}"
+    fi
+    exit 0
+fi
+[[ $remote != *'cat /tmp/mac_run_hana.status'* ]] || print -r -- 142
+exit 0
 '''
 
 
@@ -191,6 +192,9 @@ class MacRunTests(unittest.TestCase):
         self.temp_directory = self.root / "tmp"
         self.temp_directory.mkdir()
         _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n")
+        # Keep both example argument forms without repeating all configured examples.
+        _ = write_config_fixture(self.root / "config/production.conf",
+                                 "mac_run_examples=hana_diegetic typography;hana_lagrange showcase fit_overlay\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
         for name in ("ssh", "scp", "git", "systemd-run", "gh", "rsync", "curl"):
@@ -210,13 +214,14 @@ class MacRunTests(unittest.TestCase):
             **config_environment(self.config_path.parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
             "MAC_RUN_SHA": SHA,
+            "MAC_RUN_PYTHON": sys.executable,
             "MAC_RUN_CHECKOUT": str(self.home / "scratch" / "gate-mac-run-private" / "checkout"),
             "HANA_TEST_PURPOSE": "Mac launch coordination",
             "TMPDIR": str(self.temp_directory),
         }
 
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
+        _ = path.write_text("#!/usr/bin/env zsh\n" + source, encoding="utf-8")
         path.chmod(0o755)
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -257,16 +262,22 @@ class MacRunTests(unittest.TestCase):
         )
 
     def events(self) -> list[CommandEvent]:
-        path = self.stub_state / "events.jsonl"
+        path = self.stub_state / "events"
         if not path.exists():
             return []
-        return [
-            cast(CommandEvent, json.loads(line))
-            for line in path.read_text(encoding="utf-8").splitlines()
-        ]
+        fields = path.read_bytes().decode("utf-8").split("\0")
+        events: list[CommandEvent] = []
+        position = 0
+        while position < len(fields) - 1:
+            command, claimed, input_text, argument_count = fields[position:position + 4]
+            start = position + 4
+            position = start + int(argument_count)
+            events.append({"command": command, "claimed": claimed == "true",
+                           "input": input_text, "args": fields[start:position]})
+        return events
 
     def clear_events(self) -> None:
-        (self.stub_state / "events.jsonl").unlink(missing_ok=True)
+        (self.stub_state / "events").unlink(missing_ok=True)
 
     def assert_no_build_started(self) -> None:
         self.assertFalse(
@@ -284,12 +295,7 @@ class MacRunTests(unittest.TestCase):
         self.assertFalse((self.state_directory / "run.json").exists())
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-        while time.monotonic() < deadline:
-            if path.exists():
-                return
-            time.sleep(0.01)
-        self.fail(f"timed out waiting for {path}")
+        wait_for_file(path)
 
     def test_blocked_mac_exits_nine_without_starting_build(self) -> None:
         blocked = self.state_command(
@@ -521,10 +527,10 @@ class MacRunTests(unittest.TestCase):
         for explicit_owner in (False, True):
             with self.subTest(explicit_owner=explicit_owner):
                 self.clear_events()
-                owner = "director's $(touch OWNER_INJECTION)" if explicit_owner else "resources director"
+                owner = "director's $(touch OWNER_INJECTION)" if explicit_owner else "019b3a40-4250-7000-8000-000000000104"
                 result = self.mac_run(extra={
                     "HANA_TEST_PURPOSE": purpose,
-                    "SHOWRUNNER_UNIT_ID": "resources director",
+                    "CLAUDE_CODE_SESSION_ID": "019b3a40-4250-7000-8000-000000000104",
                     "HANA_TEST_OWNER": owner if explicit_owner else "",
                 })
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

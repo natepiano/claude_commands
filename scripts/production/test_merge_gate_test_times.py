@@ -152,7 +152,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
                              if (job.suite, job.module, job.returncode) == (row["suite"], row["module"], row["status"]))
             self.assertEqual((row["wall_s"], row["cpu_s"]), (execution.seconds, execution.cpu_seconds))
             self.assertGreaterEqual(row["peak_mib"], 12.5)
-        runner = str(merge_gate.RUNNER)
+        runner = str(self.checkout / "scripts/test_times/module_run.py")
         self.assertEqual(len(launches), 4)
         for argv, root, environment in launches:
             self.assertEqual(argv[1], runner)
@@ -180,6 +180,8 @@ class MergeGateTestTimesTests(MergeGateFixture):
         self.assertEqual((full["selection"], full["source"], full["status"]), ("full", "checkpoint", 0))
         self.assertEqual(full["sha"], self.git(self.checkout, "rev-parse", "HEAD"))
         self.clear_gate_events()
+        with self.admission.loop_turn():
+            self.admission.allow_next_start()
         second = self.run_gate("--tests-only")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         records = self.records()
@@ -214,6 +216,8 @@ class MergeGateTestTimesTests(MergeGateFixture):
 
             for failure in ("write", "config"):
                 with self.subTest(failure=failure):
+                    with self.admission.loop_turn():
+                        self.admission.allow_next_start()
                     if failure == "write":
                         with mock.patch.object(gate_record, "write_gate_run", side_effect=blocked_write):
                             result = self.run_gate("--tests-only", "--full")

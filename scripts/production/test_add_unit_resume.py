@@ -26,7 +26,7 @@ from test_support import ShutdownTestCase
 
 
 from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
-from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_showrunner_name, unit_membership
 
 
 def setUpModule() -> None:
@@ -64,9 +64,9 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.staff.staff_file.parent.mkdir(parents=True, exist_ok=True)
         _ = self.staff.staff_file.write_text("broken record", encoding="utf-8")
         before = (self.doc.read_bytes(), self.git("rev-parse", "HEAD"), self.staff.staff_file.read_bytes())
-        stopped = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(),
-                                        HerdrPlace("old-host", "w2:p3"))
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(stopped)),
+        stopped = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(),
+                                        HerdrPlace("old-host", "w2:p3"), identity=unit_lookup.LiveSession(fixture_runtime_id("unreadable-stopped-session")))
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(stopped)),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
               patch.object(herdr, "close_agent") as closed):
             result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
@@ -80,13 +80,16 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         old_head = self.git("rev-parse", "build-followups")
-        stopped = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(),
-                                        HerdrPlace("old-host", "w2:p3"))
-        running = unit_lookup.MarkedUnit("alpha-unit",
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha")
+        row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
+        stopped = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(),
+                                        HerdrPlace("old-host", "w2:p3"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+        running = unit_lookup.LabeledSession("alpha-unit",
             unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture/socket", 4242),
-            HerdrPlace("agents", "w1:p1"))
+            HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
         order = Mock()
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(stopped)),
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(stopped)),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
               patch.object(herdr, "close_agent") as closed,
               patch.object(herdr, "start_agent", wraps=herdr.start_agent) as started,
@@ -147,20 +150,6 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assert_no_launch_change(document, head)
         self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
-    def test_resume_with_unreadable_registry_refuses_with_the_reason(self) -> None:
-        prior = self.root / "prior-session"
-        prior.mkdir()
-        registry = Path(self.env["NOTIFIER_SESSIONS_DIR"])
-        _ = (registry / "broken.json").write_text("{broken")
-        document = self.doc.read_text()
-        head = self.git("rev-parse", "HEAD")
-        result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
-                         + "unreadable session registry record: broken.json\n")
-        self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
-
     def test_resume_with_unreadable_process_identity_refuses_with_the_reason(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -195,8 +184,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(len(starts), 1)
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--resume") + 1], "62ccbd64-f22e-5647-b20e-7899aa39d766")
-        self.assertEqual(self.pane_environment()[unit_lookup.PRODUCTION_MARK], "build-followups")
-        self.assertEqual(self.pane_environment()[unit_lookup.UNIT_MARK], "alpha-unit")
+        self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in self.pane_environment()))
         self.assertIn(str(prior), self.opened())
         self.assertIn("attached 62ccbd64-f22e-5647-b20e-7899aa39d766 as alpha-unit: one process, pid 202", result.stdout)
         row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
@@ -392,7 +380,7 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_rerun_keeps_marked_herdr_and_prints_its_herdr_attach_command(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
-            result, error, commands, launches, writes = self.run_with_marked_unit(unit_lookup.ClaudeNotRunning())
+            result, error, commands, launches, writes = self.run_with_labeled_session(unit_lookup.ClaudeNotRunning())
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)

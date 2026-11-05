@@ -73,7 +73,7 @@ def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff
                        turns: int = 1, malformed: bool = False) -> tuple[Path, tuple[list[str], list[str], list[str]]]:
     """Write source evidence with private tool data between assignments and final replies."""
     path = _fixture_session_path(row.current_session, backend)
-    family = "codex" if isinstance(backend, staff.CodexBackend) else "claude"
+    family = backend.family
     path.parent.mkdir(parents=True, exist_ok=True)
     assignments = [f"Assignment {index}: preserve this complete requirement. " + "detail " * 90
                    for index in range(turns)]
@@ -152,6 +152,7 @@ def start(handoff):
     return identity
 def dispatch(published):
     assert staff.by_id(row.id) == published.row
+    return admission.SwitchState.ASSIGNMENT_ACCEPTED
 with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.current_session, 987654)):
     admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: None)
 '''
@@ -465,7 +466,7 @@ def isolated_source_readers() -> Generator[None]:
         for name in ("unit_lookup", "scripts.production.unit_lookup"):
             module = sys.modules.get(name)
             if module is not None:
-                _ = contexts.enter_context(mock.patch.object(module, "marked_units", return_value={}))
+                _ = contexts.enter_context(mock.patch.object(module, "labeled_sessions", return_value={}))
         yield
 
 
@@ -527,6 +528,9 @@ class StaffTestCase(unittest.TestCase):
     staff_file: Path = Path()
     mac_file: Path = Path()
     ssh_log: Path = Path()
+
+    def staff_state(self) -> tuple[bytes, int]:
+        return self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
 
     def assert_only_current_session_changed(self, before: bytes, old: staff.StaffRow, identity: str) -> None:
         self.assertEqual(self.staff_file.read_bytes(), before.replace(
@@ -607,10 +611,10 @@ class StaffTestCase(unittest.TestCase):
     def cli(self, *arguments: str, code: int = 0) -> subprocess.CompletedProcess[str]:
         return self.script(STAFF_SCRIPT, *arguments, code=code)
 
-    def script(self, script: Path, *arguments: str, code: int = 0) -> subprocess.CompletedProcess[str]:
+    def script(self, script: Path, *arguments: str, code: int = 0, input: str | None = None) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
             [sys.executable, "-c", OWNER_CLI, str(script), *arguments],
-            cwd=CHECKOUT, capture_output=True, text=True, check=False,
+            cwd=CHECKOUT, input=input, capture_output=True, text=True, check=False,
             timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(completed.returncode, code, completed.stderr)
@@ -659,7 +663,7 @@ class StaffTestCase(unittest.TestCase):
             if staff.initial_snapshot().by_id(staff.StaffId(identity)) is None:
                 _ = unit_membership(workspace or slug, unit)
             self.pane(f"fixture:{slug}/{unit}", session_id=identity,
-                      environment={"SHOWRUNNER_UNIT": slug, "SHOWRUNNER_UNIT_ID": unit},
+                      environment={"CLAUDE_CODE_SESSION_ID": identity},
                       written_at="2026-10-01T00:00:00+00:00")
         if parent:
             parent_file = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / slug / "parent"

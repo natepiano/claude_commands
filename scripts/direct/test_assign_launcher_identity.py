@@ -141,7 +141,7 @@ class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
         record.update({"status": "running", "launcher_pid": os.getpid(), "turn_id": "busy-turn"})
         self.write_pool_roster({name: record})
         started = [event for event in self.events() if event.get("event_type") == "pass_started"]
-        result = self.launch("implement", "--to", name, script=ASSIGN)
+        result = self.launch("implement", "--to", name, execution=launcher_fixture.LauncherScript(ASSIGN))
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.turn_starts, 1)
         self.assertEqual(len([event for event in self.events() if event.get("event_type") == "pass_started"]),

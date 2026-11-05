@@ -176,7 +176,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
         script = shlex.split(hook.command)[-1].replace("$HOME/.claude", str(INSTALLER.resolve().parents[2]))
         return subprocess.run([sys.executable, script], input=json.dumps({
-            "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)}),
+            "tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/"}),
             env={**self.environment, "PATH": os.environ["PATH"]}, text=True,
             capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 

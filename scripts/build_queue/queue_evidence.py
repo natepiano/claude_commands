@@ -5,12 +5,12 @@ from collections.abc import Mapping
 from dataclasses import replace
 
 from datetime import datetime
-from typing import assert_never
+from typing import assert_never, overload
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts
 from scripts.build_queue.queue_lines import age, field
-from scripts.build_queue.scope_activity import IdleService, NotServiceSlice, RunningServiceJob
+from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NotServiceSlice, RunningServiceJob
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 
@@ -25,6 +25,25 @@ def step_labels(step: gate.WaitingStep | gate.RunningStep,
     return unit_labels.UnitLabels(fallback, unit=unit or "—")
 
 
+@overload
+def step_pid(step: gate.WaitingStep) -> int: ...
+
+
+@overload
+def step_pid(step: gate.RunningStep) -> int | gate.PidNotRecorded: ...
+
+
+def step_pid(step: gate.WaitingStep | gate.RunningStep) -> int | gate.PidNotRecorded:
+    """Use the captured run owner or the captured process for this row."""
+    if isinstance(step.run, LiveBuildRun):
+        return step.run.pid
+    return step.pid
+
+
+def pid_text(pid: int | gate.PidNotRecorded) -> str:
+    return f"pid {pid}" if isinstance(pid, int) else "pid —"
+
+
 def gib(value: int) -> str:
     return f"{value / gate.GIB:.1f} GiB"
 
@@ -34,15 +53,14 @@ def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo, policy: gate.AdmissionP
     if isinstance(basis, gate.PromiseNoReading):
         return "promise: no reading yet"
     if isinstance(basis, gate.RampPromise):
-        return f"ramp promise: first {policy.timing.ramp_seconds / 60:g} min after admission"
+        return "recorded initial promise"
     if isinstance(basis, gate.LifetimePromise):
         name = "release build" if step == "build" else "merge gate" if step == "merge-gate" else step
         return f"{name} promise: holds until the step ends"
     if isinstance(basis, gate.TestPhaseCharge):
         need = basis.need
-        return (f"tests since {head_facts.clock(basis.started_at, zone, seconds=False)}: peak so far {gib(basis.peak_so_far)}, "
-                f"need {gib(need.bytes)} ({need.form}, p90 of {need.runs} runs at width {need.recorded_width}), "
-                f"× {basis.need.margin:g}")
+        return (f"tests started: need {gib(basis.bytes)} "
+                f"(test peak {gib(basis.peak_so_far)}, history {gib(need.bytes)} x {need.margin:g})")
     if isinstance(basis, gate.PeakSoFar):
         text = f"{gate.peak_activity(step)}, peak so far {gib(basis.bytes)}"
         if isinstance(basis.peak_at, float):
@@ -100,11 +118,11 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
             else:
                 text += "; no headroom factor"
         if isinstance(basis.cap, gate.CappedAtBudget):
-            limit = ("the build budget of that time" if isinstance(basis.cap.cap, gate.CapNotRecorded)
+            limit = ("an unrecorded amount" if isinstance(basis.cap.cap, gate.CapNotRecorded)
                      else gib(basis.cap.cap))
-            text += f"; capped at {limit} (uncapped {gib(basis.cap.uncapped)})"
+            text += f"; limited to {limit} at that time (uncut {gib(basis.cap.uncapped)})"
         else:
-            text += "; under build budget"
+            text += "; uncut estimate"
         return text
     if source.source == "measured":
         text = f"measured process-memory p90 of {source.runs} runs"
@@ -128,14 +146,41 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
     return text
 
 
-def budget_text(check: gate.BudgetCheck) -> str:
-    total = check.charged + check.need
-    terms = f"charged {check.charged / gate.GIB:.1f} + need {check.need / gate.GIB:.1f}"
-    relation = "<=" if total <= check.budget else ">"
-    result = "pass" if check.passes else "blocked"
-    exception = "; run-alone exception" if check.passes and total > check.budget else ""
-    return (f"Build budget: {terms} = {gib(total)} {relation} {gib(check.budget)}: {result}{exception}; "
-            + f"starts when charged falls to {gib(check.starts_at)}")
+def room_text(room: gate.MemoryRoom | gate.ReadingUnavailable) -> str:
+    """Show the calculation from the last admission pass."""
+    if isinstance(room, gate.ReadingUnavailable):
+        return "Cap unavailable: " + room.reason
+    if isinstance(room.cap, int):
+        calculation = f"Cap {gib(room.cap)}; anonymous use {gib(room.used)} + free {gib(room.available)}"
+    else:
+        missing = "; ".join(f"{run.owner}: {run.use.reason}" for run in room.cap.runs
+                            if isinstance(run.use, gate.RunUseUnavailable))
+        calculation = "Cap unavailable"
+        if missing:
+            calculation += f": anonymous use unavailable for {missing}"
+        calculation += f"; free {gib(room.available)}"
+    ci = f" (CI keep-aside {gib(room.ci_keep_aside.bytes)})" if room.ci_keep_aside.bytes > 0 else ""
+    text = (f"{calculation} "
+            f"− safety {gib(room.safety)}; kept aside {gib(room.kept)}{ci}; room {gib(room.room)}")
+    if room.shortfall:
+        text += f"; shortfall {gib(room.shortfall)}"
+    return text
+
+
+def room_check_text(check: gate.RoomCheck) -> str:
+    relation = "<=" if check.need <= check.room else ">"
+    result = "pass" if check.passes else "held"
+    basis = check.basis
+    exception = ("; starts alone" if isinstance(basis, gate.StartsAlone) else
+                 "; within held slot" if isinstance(basis, gate.WithinSlot) else
+                 "; head override" if isinstance(basis, gate.OverrideRoom) else "")
+    return f"Room: need {gib(check.need)} {relation} room {gib(max(0, check.room))}: {result}{exception}"
+
+
+def keep_aside_text(run: gate.RunKeepAside) -> str:
+    use = gib(run.use.bytes) if isinstance(run.use, gate.AnonymousRunUse) else "unavailable: " + run.use.reason
+    return (f"need {gib(run.need)}; anonymous use {use}; held slot {gib(run.held)}; "
+            f"kept aside {gib(run.bytes)}")
 
 
 def free_text(check: gate.FreeCheck) -> str:
@@ -146,11 +191,9 @@ def free_text(check: gate.FreeCheck) -> str:
     return f"Free memory: free {gib(check.available)} {relation} {terms} = {gib(check.threshold)}: {result}"
 
 
-def pressure_text(pressure: gate.MemoryPressure, zone: ZoneInfo,
-                  policy: gate.AdmissionPolicy) -> str:
-    if pressure.next_start_at:
-        return (f"recovery spacing: one start per {policy.timing.recovery_start_seconds:g} s; next start at "
-                + head_facts.clock(pressure.next_start_at, zone))
+def pressure_text(pressure: gate.MemoryPressure | gate.PressureUnavailable, policy: gate.AdmissionPolicy) -> str:
+    if isinstance(pressure, gate.PressureUnavailable):
+        return pressure.reason
     values = (f"memory pressure: full avg10 {pressure.full_avg10:.1f}%, "
               + f"some avg10 {pressure.some_avg10:.1f}%, swap used {pressure.swap_used_percent:.1f}%")
     if isinstance(pressure.condition, gate.PressureConditionNotRecorded):
@@ -175,40 +218,49 @@ def release_text(release: gate.HeadAfterEnd, explanation: gate.QueueExplanation,
         else:
             names = [step_labels(explanation.running[index].step, labels).session
                      + " " + explanation.running[index].step.step for index in release.ended]
-            text = (f"{' + '.join(names)} end (budget charge drops {gib(release.charge_drop)}; "
-                    + f"free memory rises {gib(release.freed)} and promise not yet used drops {gib(release.growth_drop)})")
+            text = (f"{' + '.join(names)} end (keep-aside drops {gib(release.growth_drop)}; "
+                    + f"free memory rises {gib(release.freed)})")
         if isinstance(release, gate.HeadStartsAt):
             starts_at = head_facts.clock(release.at, zone, zone_name=True)
-            text += ("; then " if release.ended else "; ") + f"recovery spacing starts it at {starts_at}"
+            text += ("; then " if release.ended else "; ") + f"start spacing permits it at {starts_at}"
     elif isinstance(release, gate.EstimateExpired):
         text = estimate_refresh_text(release, zone)
     elif isinstance(release, gate.HeadStillHeld):
-        text = "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
+        pressure = release.decision.pressure
+        causes = (pressure.reason if cause == "pressure" and isinstance(pressure, gate.PressureUnavailable) else cause
+                  for cause in release.causes)
+        text = "all running steps ending still leaves " + ", ".join(causes) + " holding the head"
     elif isinstance(release, gate.TokenWaitersOnly):
         text = "all waiting steps are waiting for the cargo token"
     elif isinstance(release, gate.ReadingUnavailable):
-        text = "admission memory reading unavailable"
+        text = release.reason
     else:
         text = "nothing waits"
     head = explanation.head
-    if (isinstance(head, gate.HeadExplanation) and isinstance(head.decision.pressure, gate.MemoryPressure)
+    if (isinstance(head, gate.HeadExplanation) and isinstance(head.cause, gate.MemoryPressure)
             and not isinstance(release, gate.HeadStartsAt)):
-        text += "; the pressure hold or recovery spacing must also clear"
+        text += "; the pressure hold must also clear"
     return text
 
 
-def service_text(memory: gate.CompilerServiceMemory | gate.UnownedSliceMemory, now: float) -> str:
-    """Show service RAM and swap with the job state from the same pass."""
+def service_activity_text(memory: gate.CompilerServiceMemory | gate.UnownedSliceMemory, now: float) -> str:
+    """Describe the recorded service state at the pass time."""
     state = memory.job_state
     if isinstance(state, NotServiceSlice):
         raise ValueError("a build scope has no service state")
     if isinstance(state, RunningServiceJob):
         elapsed = f"{age(state.started_at, now)} min" if state.started_at else "age unknown"
-        activity = f"running job, {elapsed}"
-    else:
-        activity = "idle"
+        return f"running job, {elapsed}"
+    return "idle"
+
+
+def service_text(memory: gate.CompilerServiceMemory | gate.UnownedSliceMemory, now: float) -> str:
+    """Show service RAM and swap with the job state from the same pass."""
+    if isinstance(memory, gate.UnownedSliceMemory) and memory.diagnostic:
+        return f"{pid_text(memory.pid)} · {field(memory.owner)}: unavailable; {memory.diagnostic}"
+    activity = service_activity_text(memory, now)
     name = memory.owner if isinstance(memory, gate.UnownedSliceMemory) else "sccache.service"
-    return f"{field(name)}: {activity}; {gib(memory.bytes)} RAM; {gib(memory.swap_bytes)} swapped"
+    return f"{pid_text(memory.pid)} · {field(name)}: {activity}; {gib(memory.bytes)} RAM; {gib(memory.swap_bytes)} swapped"
 
 
 def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExplanation,
@@ -216,17 +268,32 @@ def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExpl
     memory = running.step.measured
     if isinstance(memory, gate.CompilerServiceMemory) or (
             isinstance(memory, gate.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
-        return (service_text(memory, explanation.now)
-                + f"; promise {gib(running.promise)}, charge {gib(running.charged)}")
+        ci = explanation.room.ci_keep_aside.bytes if isinstance(explanation.room, gate.MemoryRoom) else 0
+        extra = f"; CI keep-aside {gib(ci)}" if ci and isinstance(memory, gate.UnownedSliceMemory) else ""
+        return service_text(memory, explanation.now) + extra
     identity = step_labels(running.step, labels)
     admitted = running.admitted_at
     started = ("admission time unknown" if isinstance(admitted, gate.AdmissionTimeNotRecorded) else
                f"admitted {head_facts.clock(admitted, zone, seconds=False)} ({age(admitted, explanation.now)} min ago)")
     using = gib(running.measured) if isinstance(running.step.measured, gate.MeasuredMemory) else "—"
     swap = f"; {gib(memory.swap_bytes)} swapped" if isinstance(memory, gate.MeasuredMemory) and memory.swap_bytes else ""
-    return (f"{identity.showrunner} / {identity.unit} / {identity.session}, {running.step.step}: {started}; "
-            + f"promise {gib(running.promise)}, charge {gib(running.charged)}, using now {using}; "
-            + charge_text(running.basis, zone, explanation.policy, running.step.step) + swap)
+    run = running.step.run
+    owner = f"{run.pid}-{run.start_time}" if isinstance(run, LiveBuildRun) else ""
+    if not owner:
+        reservations = iter(explanation.reservations)
+        for entry in explanation.running:
+            if gate.running_has_reservation(entry.step):
+                row = next(reservations)
+                if entry == running:
+                    owner = gate.reservation_run_owner(row, entry.step)
+                    break
+    room = explanation.room
+    keep = next((entry for entry in room.runs if entry.owner == owner), None) if isinstance(room, gate.MemoryRoom) else None
+    evidence = keep_aside_text(keep) if keep is not None else f"anonymous use {using}; no accepted run hold"
+    phase = ("; " + charge_text(running.basis, zone, explanation.policy, running.step.step)
+             if isinstance(running.basis, gate.TestPhaseCharge) else "")
+    return (f"{pid_text(step_pid(running.step))} · {identity.showrunner} / {identity.unit} / {identity.session}, {running.step.step}: {started}; "
+            + evidence + phase + swap)
 
 
 def need_details(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:

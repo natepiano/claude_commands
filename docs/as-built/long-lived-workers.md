@@ -119,7 +119,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 - Without `--to`, it opens a new worker named by `worker_name.sh`. After the turn it writes the worker's identity file.
 - With `--to`, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
-  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, worker_id}` for this launch, with `worker_id` the thread id. The saved `model` is retained for compatibility with old identity files; it does not select a turn's model or effort. Each turn uses an explicit override or the current role default. A mismatch fails with `has no matching durable worker identity`. A missing file with a roster thread for the name is not a mismatch: the claim writes the identity from the roster and continues. That resumes a reopened worker, and a fix worker of a run from before 2026-10-17, whose record the impl worker's replaced. A worker recorded under another slot is still refused.
+  1. Finds the saved identity through its `staff_id`. A new identity uses `impl_worker_<slot>.json`. The compatibility launcher uses `impl_worker_fix.json` for a repair in the `impl` slot. Named `assign.sh` workers use their names as new slots. The saved model does not select the next turn's model. Each turn uses an explicit override or the current role default. A missing identity is created from the roster. A worker recorded under another slot is refused.
   2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
   3. If the roster's `context_tokens` is an integer greater than `UNIT_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On exit 4 (the roster changed during compaction) it refuses the follow-up and advises inspection and same-thread `reopen` when idle. On other failures it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
@@ -130,7 +130,15 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 **Code review dispatch.** Use `assign.sh --role review --session-dir <run>
 --phase <phase> --prompt <file> --cwd <worktree>`. Each broad-review lens has
-its own dispatch; closure review omits the lens. The returned handle names its
+its own dispatch; closure review omits the lens.
+Each artifact uses the worker name: `<worker>_status`, `<worker>_summary.txt`,
+`<worker>_agent.log`, and `<worker>_reply.txt`.
+Reviews add `_<lens>_<pass>`, or `_<pass>` without a lens.
+The launcher claims the worker before it writes these artifacts.
+A refused claim leaves the artifacts unchanged.
+Use `arm-review --worker <worker>` for an early named reviewer.
+Its marker reads `<worker>_status_<lens>` and `<worker>_pid_<lens>`.
+Legacy `review.sh` markers retain their `review` prefix. The returned handle names its
 status, log and summary. The allocator uses `review`, then `review2` when the
 first worker is busy. Both threads stay read-only.
 
@@ -200,9 +208,9 @@ selects a private root). On first ledger binding, a production unit's run
 saves explicit production and unit fields in `progress_history_state.json`.
 Plan headers accept both Production forms and resolve former production names.
 Later reads use the saved identity, so moving a worktree does not change owners.
-`rename.py unit` uses the folder move (`unit_move.move_folder`): it pauses
-the unit's workers and starts the same threads with a note that names the new
-folder; see `production-rename.md`.
+`rename_unit.py` changes the unit row and repairs its session and display names.
+An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
+See `unit-rename.md`.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 
@@ -383,9 +391,13 @@ A different caller can resume the role.
 
 **Adoption.** `adopt` needs the authority's `adoption_required` source (`thread_id`, `name`, `mesh`, holder) to match. Steps: first the checks that change no authority state: the binding, the configured model, and the source entry, which must be idle on that thread (a `paused` entry counts as idle when `paused_from` is not busy). The source model and effort come from the roster entry; when it has none, from that thread's launch record (`impl_worker_<slot>.json` with the same `worker_id`, then the `phases/*/impl_agent_<slot>` file whose log names the worker and thread), and last from the source server's `thread/read` reply. Missing, conflicting or different values refuse with `AdoptionRequired:`. A refused adopt therefore leaves no `AdoptionReserved` claim. Then `adopt-reserve`; check the source entry again under its roster lock; write `transition.json` and `transfer.json` and set `transferring_role` on the source entry under its roster lock; on the source server park the queue, require `ThreadIdle` and release the writer; write the destination roster entry (same thread and name, saved prompt, access policy) and carry pending text; `confirm_adoption` resumes the same thread on the destination and requires `ThreadIdle`; set `role_redirect` on the source; write `adoption.json`; `adopt-commit`; write the hold. A retry with the same adoption ID completes from `adoption.json`. `_role_fence` and `transfer_route` make every old route refuse (`TransferringRole: use the destination holder route`), also after the source run folder is gone.
 
-**Unit rename.** `rename_unit.py` `_move_state` calls `design_roles.rename_holder(slug, old, new, old_worktree, new_worktree)` before relaunch: idle required, authority `checkout` then `advance`, holder, checkout, document and binding paths moved, generation +1, `design_context.json` rewritten, roster `cwd` set and `authorized_*` cleared. A failure raises `RenameRefused`; the rename journal retries it. `_state_failures` adds `design_roles.rename_failures`, which flags an old holder, old checkout in live fields or roster `cwd`, or a stale context. `unit_rename_sweep.py` `_history` treats `prompts/`, `replies/`, `adoption.json` and `transfer.json` as history, and `sweep` ignores role `name` and `aliases` in `design.json` and `aliases` in the roster as identity.
+**Unit rename.** `rename_unit.py` changes the staff row and repairs session, tab, and pane names.
+An explicit folder move uses `unit_move.move_folder` and the staff id.
+Role records retain their staff ids and history.
 
-**Unit transfer and production rename.** `rename_holder` is `move_holder(old_holder, new_holder, old_checkout, new_checkout, reason=...)` for one unit. `move_holder` moves every design held by `old_holder` to `new_holder`; when the checkout does not change, it keeps the repository, document, binding paths and roster `cwd`, and skips the `checkout` request. It writes `transition.json`, releases the servers, bumps the generation and clears `authorized_*`; a second call changes nothing. `holder_failures(old_holder, old_checkout='')` flags an old holder, a stale context and, with a checkout, the old checkout. `transfer_unit.py` `_move_state` moves `UnitHolder(from, unit)` to `UnitHolder(to, unit)` and `verify_failures` adds `holder_failures`. Production `rename.py` moves `ShowrunnerHolder(old)` to `ShowrunnerHolder(new)` in apply step 4, and each `UnitHolder(old, unit)` with its worktree paths in unit step 3. Role names keep the old slug: they are thread aliases, kept as history. A failure raises `RenameRefused`.
+**Unit transfer and production rename.** Staff ids keep design ownership stable across row renames and unit transfers.
+The rename commands change no design holder records.
+Role names remain thread aliases.
 
 ### Astra work header
 

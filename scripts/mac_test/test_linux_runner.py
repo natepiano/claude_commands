@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import chdir, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
 import hashlib
@@ -241,7 +241,7 @@ class LinuxShellTests(unittest.TestCase):
             if argv[:2] == [sys.executable, "-c"] and "sweep.sweep_workspace" in argv[2]:
                 if not self.use_real_sweep:
                     return subprocess.CompletedProcess(argv, 0, "", "")
-                with mock.patch.dict(os.environ, env or {}), \
+                with chdir(os.getcwd()), mock.patch.dict(os.environ, env or {}), \
                         mock.patch.object(sys, "argv", ["-c", argv[3]]), \
                         mock.patch.object(sweep, "process_uses", side_effect=private_uses), \
                         mock.patch.object(time, "time", return_value=1_793_570_400.0):
@@ -304,7 +304,30 @@ class LinuxShellTests(unittest.TestCase):
             event = self.assert_ran(self.request())
         self.assertEqual(event["environment"]["BUILDLOG_TARGET"], "aws")
         self.assertEqual(event["environment"]["BUILDLOG_PINNED_TARGET"], "aws")
+        self.assertEqual(event["environment"]["BUILDLOG_SYNC"], "1")
         self.assertEqual(event["cwd"], str(self.mirror))
+
+    def test_linux_command_forwards_repository_identity_only_when_nonempty(self) -> None:
+        for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
+            with self.subTest(key=key):
+                self.identity = offload.KnownRepository("phase-copy", key)
+                arguments = shlex.split(self.command(self.request()))
+                if key:
+                    self.assertEqual(arguments.count("--repo-identity"), 1)
+                    self.assertEqual(arguments[arguments.index("--repo-identity") + 1], key)
+                else:
+                    self.assertNotIn("--repo-identity", arguments)
+
+    def test_linux_step_environment_omits_an_empty_repository_identity(self) -> None:
+        self.identity = offload.KnownRepository(self.identity.name)
+        mirror = self.root / offload.remote_mirror(self.identity, "aws", 2)
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.mirror.rename(mirror)
+        self.mirror = mirror
+
+        event = self.assert_ran(self.request())
+
+        self.assertNotIn("BUILDLOG_REPO_IDENTITY", event["environment"])
 
     def test_sigterm_prints_one_interruption_marker_and_preserves_the_child_status(self) -> None:
         self.environment["FAKE_LINT_STATUS"] = "143"
@@ -425,9 +448,10 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(event["args"][:4], ["nextest", "-p", "hana", "-E"])
         self.assertIn("not (test(gpu))", event["args"][4])
         self.assertEqual(event["args"][5:], list(words[4:]))
-        self.assertEqual(event["environment"].get("BUILDLOG_BUILD_BUDGET_GIB"), "32")
+        self.assertNotIn("BUILDLOG_BUILD_BUDGET_GIB", event["environment"])
         self.assertEqual(event["environment"].get("LINT_SWEEP_BUDGET_GIB"), "31")
         self.assertEqual(event["environment"].get("BUILDLOG_SENT_TREE_KEY"), "sent-tree-key")
+        self.assertEqual(event["environment"].get("BUILDLOG_REPO_IDENTITY"), self.identity.key)
         self.assertEqual(event["environment"].get("BUILDLOG_CALL_ID"), "call with spaces")
         self.assertFalse((self.mirror / "INJECTION").exists())
 
@@ -482,7 +506,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertIn("mac_cleanup=0", result.stdout)
         self.assertFalse((self.mirror / "target").exists())
         event = self.events("lint")[-1]
-        self.assertEqual(event["environment"]["BUILDLOG_BUILD_BUDGET_GIB"], "40")
+        self.assertNotIn("BUILDLOG_BUILD_BUDGET_GIB", event["environment"])
         self.assertEqual(event["environment"]["LINT_SWEEP_BUDGET_GIB"], "35")
 
     def test_slot_budget_removes_only_the_selected_build_folder(self) -> None:
@@ -705,9 +729,10 @@ class LinuxShellTests(unittest.TestCase):
         real_run = subprocess.run
 
         def capture(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                    capture_output: bool = False, text: bool = False, timeout: float = 5) -> subprocess.CompletedProcess[str]:
+                    capture_output: bool = False, text: bool = False, timeout: float = 5,
+                    env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
             _ = text
-            reply = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True, timeout=timeout)
+            reply = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True, timeout=timeout, env=env)
             if not capture_output:
                 print(reply.stdout, end="")
                 print(reply.stderr, end="", file=sys.stderr)

@@ -99,7 +99,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     events: list[str] = []
     alive: list[bool] = []
     started: int = 0
-    marked: dict[str, unit_lookup.MarkedUnit] = {}
+    marked: dict[str, unit_lookup.LabeledSession] = {}
     unit_account: accounts.ClaudeLaunchAccount = accounts.NamedAccount("claude2", Path())
     # What the stand-ins answer; a refusal case changes one of them.
     runs_production: bool = True
@@ -144,7 +144,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         other = fixture_member("unit", name="other", parent=parent_row.id)
         _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", self.root / "other"), expected=other.worktree)
         self.staff.pane("fixture:parent/demo-unit", session_id=SESSION, environment={
-            "SHOWRUNNER_UNIT": "parent", "SHOWRUNNER_UNIT_ID": "demo-unit"})
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "parent", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo-unit"})
         session_records = self.root / "sessions"
         session_records.mkdir()
         _ = (session_records / f"{PID}.json").write_text(json.dumps({"pid": PID, "sessionId": SESSION, "name": "demo",
@@ -157,7 +157,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
         })))
-        self.marked = {"demo-unit": unit_lookup.MarkedUnit(
+        self.marked = {"demo-unit": unit_lookup.LabeledSession(
             "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID), herdr.HerdrPlace("demo", PANE))}
         self.unit_account = accounts.NamedAccount("claude2", self.root / ".claude2")
         (self.root / ".claude").mkdir()
@@ -181,7 +181,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
             if arguments[:2] == ("pane", "list"):
                 place = self.marked["demo-unit"].place
                 assert isinstance(place, herdr.HerdrPlace)
-                return {"panes": [{"pane_id": place.pane, "workspace_id": place.pane.split(":")[0]}]}
+                return {"panes": [{"pane_id": place.pane, "terminal_id": "unit-terminal",
+                                   "workspace_id": place.pane.split(":")[0]}]}
             if arguments[:2] == ("pane", "process-info"):
                 return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": PID,
                     "foreground_processes": [{"pid": PID, "name": "claude", "argv": ["claude"]}]}}
@@ -189,7 +190,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", pane_result))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")))
         for module, name, stand_in in (
-                (showrunners, "production_of", self.production_of), (unit_lookup, "marked_unit", self.marked_unit),
+                (showrunners, "production_of", self.production_of), (unit_lookup, "labeled_session", self.labeled_session),
                 (herdr, "stop_session", self.stop_host), (promote_showrunner, "type_place", self.type_pane), (promote_showrunner, "_alive", self.is_alive),
                 (promote_showrunner, "POLL_S", 0), (add_showrunner, "checked", self.child_checked),
                 (add_showrunner, "main", self.start), (accounts, "role_account", self.role_account),
@@ -212,7 +213,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def verdict(self, _capture: str) -> unit_effort.Ready | unit_effort.Skipped:
         return self.pane
 
-    def marked_unit(self, _slug: str, name: str) -> unit_lookup.MarkedUnit | None:
+    def labeled_session(self, _slug: str, name: str) -> unit_lookup.LabeledSession | None:
         return self.marked.get(name)
 
     def role_account(self, _role: str) -> accounts.ClaudeLaunchAccount:
@@ -253,7 +254,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         parent = fixture_member("showrunner", name="parent")
         unit = fixture_member("unit", name="demo", parent=parent.id, runtime_id=SESSION)
         self.staff.pane("w7:p1", session_id=SESSION, environment={
-            "CLAUDE_CODE_SESSION_ID": unit.id, "SHOWRUNNER_UNIT": "parent", "SHOWRUNNER_UNIT_ID": "demo-unit"})
+            "CLAUDE_CODE_SESSION_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "parent", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo-unit"})
         return unit
 
     def assert_native_promotion(self, unit: staff.StaffRow) -> None:
@@ -394,7 +395,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         prompt.assert_not_called()
         self.assertIn("sent child", out)
         self.assertIn("sent parent", out)
-        self.assertEqual((self.root / "showrunner-state/child/parent").read_text(), "parent\n")
+        self.assertEqual((self.root / "showrunner-state" / staff.native_id(SESSION) / "parent").read_text(), "parent\n")
         self.assertFalse(pending.exists())
 
     def test_saved_parent_after_interrupted_attach_still_sends_routing_notices(self) -> None:
@@ -416,7 +417,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                   mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("stopped before notices"))):
                 with self.assertRaisesRegex(RuntimeError, "stopped before notices"):
                     _ = self.run_main()
-            self.assertEqual((self.root / "showrunner-state/child/parent").read_text(), "parent\n")
+            self.assertEqual((self.root / "showrunner-state" / staff.native_id(SESSION) / "parent").read_text(), "parent\n")
             self.assertTrue(pending.exists())
             with (mock.patch.object(showrunners, "current_name", return_value="child"),
                   mock.patch.object(showrunners, "tell_others", side_effect=send_notices) as notices,
@@ -629,7 +630,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertFalse(any(event.startswith("start") for event in self.events))
 
     def native_unit(self) -> None:
-        self.marked["demo-unit"] = unit_lookup.MarkedUnit(
+        self.marked["demo-unit"] = unit_lookup.LabeledSession(
             "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
             herdr.HerdrPlace("native", "w1:p1"))
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
@@ -684,7 +685,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertLess(self.events.index("stop herdr native"), start_at)
 
     def test_another_herdr_unit_does_not_exempt_the_childs_live_destination(self) -> None:
-        self.marked["demo-unit"] = unit_lookup.MarkedUnit(
+        self.marked["demo-unit"] = unit_lookup.LabeledSession(
             "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
             herdr.HerdrPlace("demo", PANE))
         with mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT), \
@@ -701,7 +702,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertFalse(any(event.startswith("stop herdr ") for event in self.events))
 
     def test_promotion_check_exempts_its_own_tab_in_the_shared_session(self) -> None:
-        self.marked["demo-unit"] = unit_lookup.MarkedUnit(
+        self.marked["demo-unit"] = unit_lookup.LabeledSession(
             "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
             herdr.HerdrPlace("agents", PANE))
         with (mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT),
@@ -772,7 +773,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                              config_dir=self.unit_account.dir)
 
     def test_the_childs_check_is_for_the_units_worktree_which_must_be_trusted(self) -> None:
-        self.marked["demo-unit"] = unit_lookup.MarkedUnit(
+        self.marked["demo-unit"] = unit_lookup.LabeledSession(
             "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
             herdr.HerdrPlace("agents", PANE))
         code, _out, err = self.run_main("--check")

@@ -2,13 +2,15 @@
 """Find recorded production units and join their herdr panes by staff identity.
 
 Current names, places and messaging sockets come from herdr and live session
-records. Run state comes from /unit:direct records. Duplicate marks are refused.
+records. Run state comes from /unit:direct records.
 """
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -27,6 +29,7 @@ import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
 from sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
 from scripts.production import staff, showrunners, session_staff, unit_config  # noqa: E402
+from scripts.production.session_labels import StaffLabels
 from scripts.shutdown import remote
 from scripts.lib import unit_runs  # noqa: E402
 
@@ -34,8 +37,6 @@ USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <
 
 
 from scripts.production.session_staff import (
-    PRODUCTION_MARK as PRODUCTION_MARK,
-    UNIT_MARK as UNIT_MARK,
     ShowrunnerMember as ShowrunnerMember,
     UnitMember as UnitMember,
     ObservedUnit as ObservedUnit,
@@ -50,13 +51,17 @@ from scripts.production.session_staff import (
     ClaudeUnknown as ClaudeUnknown,
     Claude as Claude,
     Place as Place,
-    MarkedUnit as MarkedUnit,
+    LabeledSession as LabeledSession,
+    ObservedProcess as ObservedProcess,
+    ProcessUnobserved as ProcessUnobserved,
+    LiveSession as LiveSession,
+    NoSession as NoSession,
     place_text as place_text,
     holder_text as holder_text,
-    MarkedProductions as MarkedProductions,
+    LabeledProductions as LabeledProductions,
     lookup_slug as _lookup_slug,
     production_members as production_members,
-    group_marked_units as group_marked_units,
+    group_labeled_sessions as group_labeled_sessions,
     retained_session_labels,
     session_staff_and_directors as session_staff_and_directors,
 )
@@ -217,13 +222,7 @@ def unit_parent(unit: str,
                 reference: session_staff.StoredReference | session_staff.LiveSession | session_staff.ByName = session_staff.BY_NAME, *,
                 record: staff.StaffSnapshot, sources: MemberSources) -> UnitProduction:
     """Resolve identity and its current parent without another owner read."""
-    if isinstance(reference, session_staff.ByName):
-        selected = sources.member(ObservedUnit(unit), record)
-        if isinstance(selected, NoSuchMember):
-            raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
-        row = selected.row
-    else:
-        row = unit_row(unit, record, reference=reference)
+    row = unit_row(unit, record, reference=reference)
     return row_production(row, record, sources)
 
 
@@ -460,84 +459,116 @@ def _claudes(processes: list[herdr.HerdrProcess], *,
     return {pid: claude for pid, (_, claude) in newest.items()}, UnreadAt(unread, unplaced)
 
 
-def _herdr_marked(claudes: dict[int, LiveClaude], unread: UnreadAt,
-                  processes: list[herdr.HerdrProcess]) -> Iterable[tuple[str, MarkedUnit]]:
+def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
+                  processes: list[herdr.HerdrProcess]) -> Iterable[LabeledSession]:
     """Join live Claude by PID, retaining stopped panes and unknown evidence."""
     running = {session["name"] for session in herdr.live_sessions()}
-    unknown_seen: set[tuple[HerdrPlace, str, str]] = set()
-    live_marks = {(process.place, process.marks.get(PRODUCTION_MARK), process.marks.get(UNIT_MARK))
-                  for process in processes if process.pid in claudes}
+    holders = {process.pid: (process.place, claudes[process.pid].session_id if process.pid in claudes else
+                            process.marks.get("CODEX_THREAD_ID", "") or process.marks.get("CLAUDE_CODE_SESSION_ID", ""))
+               for process in processes}
+    process_counts = Counter(process.place for process in processes)
+    inherited: set[int] = set()
+    agents = [process for process in processes if holders[process.pid][1]
+              and (process.pid in claudes or process.command in ("claude", "codex"))]
+    if agents:
+        from scripts.message import process_table
+
+        darwin = os.environ.get("HERDR_PLATFORM", sys.platform) == "darwin"
+        try:
+            parents = process_table.snapshot() if darwin else {}
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            parents = {}
+        for process in agents:
+            try:
+                current = process.pid
+                seen: set[int] = {current}
+                while current > 1:
+                    if darwin:
+                        parent = parents.get(current)
+                        if parent is None:
+                            break
+                        current = parent.parent
+                    else:
+                        current = herdr.linux_process_parent(current)
+                    if current in seen:
+                        break
+                    seen.add(current)
+                    if holders.get(current) == holders[process.pid]:
+                        inherited.add(current)
+            except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+                # Keep this process evidence when its ancestry is unavailable.
+                pass
     for process in processes:
-        place = process.place
-        if place.session not in running:
+        if process.pid in inherited:
             continue
-        slug, unit = process.marks.get(PRODUCTION_MARK, ""), process.marks.get(UNIT_MARK, "")
-        staff_id = claudes[process.pid].session_id if process.pid in claudes else ""
-        if not unit and not staff_id:
+        if process.place.session not in running:
+            continue
+        native = holders[process.pid][1]
+        if not native:
+            if process.place in unread.places or process.command in ("claude", "codex"):
+                yield LabeledSession("", ClaudeUnknown("native runtime identity is unavailable"), process.place,
+                                     ObservedProcess(process.pid, process.command))
             continue
         claude: Claude
         if process.pid in claudes:
             claude = claudes[process.pid]
-        elif place in unread.places:
-            claude = ClaudeUnknown(unread.places[place])
+        elif process.place in unread.places:
+            claude = ClaudeUnknown(unread.places[process.place])
         elif isinstance(unread.unplaced, RecordsPartlyUnread):
-            if (place, slug, unit) in live_marks:
-                continue
             claude = ClaudeUnknown(unread.unplaced.reason)
-        else:
+        elif (process.command in ("sh", "bash", "zsh", "dash", "fish", "ksh") and process_counts[process.place] == 1
+              and process.marks.get("CLAUDE_CODE_SESSION_ID") == native
+              and not process.marks.get("CODEX_THREAD_ID")):
             claude = ClaudeNotRunning()
-        if isinstance(claude, ClaudeUnknown):
-            key = (place, slug, unit)
-            if key in unknown_seen:
-                continue
-            unknown_seen.add(key)
-        yield slug, MarkedUnit(unit, claude, place, process.pid, process.command, staff_id)
+        else:
+            claude = ClaudeUnknown("native process has no registered Claude session")
+        yield LabeledSession("", claude, process.place,
+                                 ObservedProcess(process.pid, process.command), LiveSession(native))
 
 
-def observed_staff_marks(*, running: Sequence[SessionRecord] | None = None) -> tuple[tuple[str, MarkedUnit], ...]:
-    """Read pane marks for stop and cleanup checks, including former staff names."""
+def observed_session_labels(*, record: staff.StaffSnapshot | None = None, running: Sequence[SessionRecord] | None = None) -> tuple[LabeledSession, ...]:
+    """Read native process identities for stop and cleanup checks."""
     try:
-        processes = herdr.herdr_processes()
+        record = record if record is not None else staff.snapshot()
+        processes = herdr.herdr_processes(membership=StaffLabels(record, {}, {}))
         claudes, unread = _claudes(processes, running=running)
-        return tuple(_herdr_marked(claudes, unread, processes))
+        return tuple(_herdr_labeled(claudes, unread, processes))
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
 
 
-def every_marked_unit(*, record: staff.StaffSnapshot | None = None,
+def every_labeled_session(*, record: staff.StaffSnapshot | None = None,
                       sources: MemberSources | None = None,
-                      running: Sequence[SessionRecord] | None = None) -> MarkedProductions:
+                      running: Sequence[SessionRecord] | None = None) -> LabeledProductions:
     """Read all herdr units once. An unreadable host raises OSError."""
-    return group_marked_units(observed_staff_marks(running=running), record=record, sources=sources)
+    record = record if record is not None else staff.snapshot()
+    return group_labeled_sessions(observed_session_labels(record=record, running=running), record=record, sources=sources)
 
 
-def marked_units(slug: str, *, record: staff.StaffSnapshot | None = None,
-                 sources: MemberSources | None = None) -> dict[str, MarkedUnit]:
-    """Every unit of the production. Unreadable herdr, or any unit's mark on two sessions, raises OSError."""
+def labeled_sessions(slug: str, *, record: staff.StaffSnapshot | None = None,
+                 sources: MemberSources | None = None) -> dict[str, LabeledSession]:
+    """Return the selected process state for each unit."""
     slug = _lookup_slug(slug)
-    found = every_marked_unit(record=record, sources=sources)
-    if fault := found.production_fault(slug):
-        raise OSError(fault)
-    return found.units.get(slug, {})
+    found = every_labeled_session(record=record, sources=sources)
+    return found.status_units(slug)
 
 
-def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = None,
+def labeled_session(slug: str, name: str, *, record: staff.StaffSnapshot | None = None,
                 sources: MemberSources | None = None,
-                running: Sequence[SessionRecord] | None = None) -> MarkedUnit | None:
-    """One unit of the production. Unreadable herdr, or this unit's mark on two sessions, raises OSError."""
+                running: Sequence[SessionRecord] | None = None) -> LabeledSession | None:
+    """Return one unit of the production. Unreadable herdr raises OSError."""
     slug = _lookup_slug(slug)
     record = record if record is not None else staff.snapshot()
     sources = sources if sources is not None else member_sources()
     selected = sources.member(UnitMember(slug, name), record)
-    marked = observed_staff_marks(running=running)
+    label = selected.row.name if isinstance(selected, MemberFound) else name
+    marked = observed_session_labels(record=record, running=running)
     if isinstance(selected, MemberFound):
         # A retained row still needs pane liveness checks when cleanup is retried.
         found = retained_session_labels(marked, selected.row, slug, record=record, sources=sources)
     else:
-        found = group_marked_units(marked, record=record, sources=sources)
-    if fault := found.faults.get(slug, {}).get(name):
-        raise OSError(fault)
-    return found.units.get(slug, {}).get(name)
+        found = group_labeled_sessions(marked, record=record, sources=sources)
+    return found.units.get(slug, {}).get(label)
 
 
 def main(arguments: list[str]) -> int:
@@ -545,7 +576,7 @@ def main(arguments: list[str]) -> int:
     try:
         match arguments:
             case ["list", slug]:
-                for unit in marked_units(slug).values():
+                for unit in labeled_sessions(slug).values():
                     claude = unit.claude
                     told = ((claude.name, claude.session_id, claude.socket) if isinstance(claude, LiveClaude)
                             else ("", "", ""))
@@ -553,7 +584,7 @@ def main(arguments: list[str]) -> int:
                                else "unknown" if isinstance(claude, ClaudeUnknown) else "stopped")
                     print("\t".join((unit.unit, place_text(unit.place), unit.place.session, running, *told)))
             case ["pane", slug, name]:
-                found = marked_unit(slug, name)
+                found = labeled_session(slug, name)
                 if found is None:
                     return 1
                 print(place_text(found.place))

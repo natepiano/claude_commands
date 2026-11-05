@@ -10,17 +10,29 @@ import sqlite3
 import sys
 import webbrowser
 from collections import defaultdict
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from contextlib import closing, suppress
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from enum import StrEnum
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+import conf
 import costs
 import index
 import moments
 from user_zone import user_zone
 from costs import CostUnavailable as CostUnavailable
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..review_links import review_link
+else:
+    from scripts.review_links import review_link
 
 
 @dataclass(frozen=True)
@@ -60,9 +72,79 @@ class ChartSet:
     events: tuple[moments.Moment, ...]
 
 
-CAUSES: tuple[costs.Cause, ...] = (
-    "Memory wait", "Cold rebuilds", "Reruns after a pass", "Failed runs", "Cancelled CI", "Mac idle while natedev waits",
-)
+@dataclass(frozen=True)
+class CostAction:
+    text: str
+    owner: str
+
+
+@dataclass(frozen=True)
+class WindowMatchesRecent:
+    pass
+
+
+@dataclass(frozen=True)
+class WindowDiffers:
+    value: ChartCost
+
+
+type WindowValue = WindowMatchesRecent | WindowDiffers
+
+
+@dataclass(frozen=True)
+class TopCost:
+    machine: str
+    cause: costs.Cause
+    recent: ChartCost
+    window: WindowValue
+    action: CostAction
+
+
+@dataclass(frozen=True)
+class TopCosts:
+    start: datetime
+    end: datetime
+    recent_days: int
+    rows: tuple[TopCost, ...] | NoDataYet
+
+
+@dataclass(frozen=True)
+class PageData:
+    charts: ChartSet
+    top: TopCosts
+
+
+@dataclass(frozen=True)
+class IndexUnavailable:
+    reason: str
+
+
+COST_KEYS: dict[costs.Cause, str] = {
+    "Memory wait": "MEMORY_WAIT",
+    "Cold rebuilds": "COLD_REBUILDS",
+    "Reruns after a pass": "RERUNS_AFTER_A_PASS",
+    "Failed runs": "FAILED_RUNS",
+    "Cancelled CI": "CANCELLED_CI",
+    "Mac idle while natedev waits": "MAC_IDLE_WHILE_NATEDEV_WAITS",
+}
+
+CAUSES = tuple(COST_KEYS)
+
+
+def with_first_sources(reading: costs.CostReading) -> costs.CostReading:
+    """Include the first observation when the source history has no earlier value."""
+    first_sources = dict(reading.first_sources)
+    for observation in reading.observations:
+        first_sources[observation.machine] = min(first_sources.get(observation.machine, observation.at), observation.at)
+    return replace(reading, first_sources=first_sources)
+
+
+def build_bucket(reading: costs.CostReading, start: datetime, end: datetime, *, thin: bool = False) -> DailyBucket:
+    """Use the same coverage and cost rules for each window."""
+    low, high = start.timestamp(), end.timestamp()
+    observed = frozenset(item.machine for item in reading.observations if low <= item.at < high)
+    covered = frozenset(item.machine for item in reading.coverage if item.start <= low and item.end >= high)
+    return DailyBucket(start, end, thin, costs.aggregate_costs(reading, start, end), observed | covered, reading.first_sources)
 
 
 def bucket_edges(start: datetime, end: datetime, zone: ZoneInfo) -> tuple[datetime, ...]:
@@ -83,6 +165,11 @@ def bucket_edges(start: datetime, end: datetime, zone: ZoneInfo) -> tuple[dateti
 
 def build_series(reading: costs.CostReading, start: datetime, end: datetime, zone: ZoneInfo,
                  configured: tuple[str, ...] = ()) -> ChartSet:
+    return chart_series(with_first_sources(reading), start, end, zone, configured)
+
+
+def chart_series(reading: costs.CostReading, start: datetime, end: datetime, zone: ZoneInfo,
+                 configured: tuple[str, ...]) -> ChartSet:
     edges = bucket_edges(start, end, zone)
     stamps = [edge.timestamp() for edge in edges]
     count = len(edges)-1
@@ -90,9 +177,6 @@ def build_series(reading: costs.CostReading, start: datetime, end: datetime, zon
     observations: defaultdict[int, list[costs.SourceObservation]] = defaultdict(list)
     phases: defaultdict[int, list[moments.ProgressFinish]] = defaultdict(list)
     spans: defaultdict[int, list[costs.IdleSpan]] = defaultdict(list)
-    first_sources = dict(reading.first_sources)
-    for observation in reading.observations:
-        first_sources[observation.machine] = min(first_sources.get(observation.machine, observation.at), observation.at)
     for contribution in reading.contributions:
         position = bisect.bisect_right(stamps, contribution.at)-1
         if 0 <= position < count:
@@ -117,29 +201,37 @@ def build_series(reading: costs.CostReading, start: datetime, end: datetime, zon
         full_low = datetime.combine(day, time(), zone).astimezone(UTC)
         full_high = datetime.combine(day+timedelta(days=1), time(), zone).astimezone(UTC)
         daily = costs.CostReading(tuple(contributions[position]), tuple(observations[position]),
-                                  tuple(spans[position]), tuple(phases[position]))
-        buckets.append(DailyBucket(low, high, low != full_low or high != full_high,
-                                  costs.aggregate_costs(daily, low, high),
-                                  frozenset(item.machine for item in observations[position])
-                                  | frozenset(item.machine for item in reading.coverage
-                                              if item.start <= low.timestamp() and item.end >= high.timestamp()),
-                                  first_sources))
-    machines = sorted(set(configured) | set(first_sources))
+                                  tuple(spans[position]), tuple(phases[position]), reading.coverage, reading.first_sources)
+        buckets.append(build_bucket(daily, low, high, thin=low != full_low or high != full_high))
+    machines = sorted(set(configured) | set(reading.first_sources))
     if reading.idle_spans and "mac" not in machines:
         machines.append("mac")
     return ChartSet(start, end, str(zone), tuple(buckets), tuple(sorted(machines)), moments.MOMENTS)
 
 
-def collect_charts(connection: sqlite3.Connection, start: datetime, end: datetime, zone: ZoneInfo) -> ChartSet:
-    """Keep one transaction and one shared read for the whole chart set."""
+def read_snapshot(connection: sqlite3.Connection, start: datetime, end: datetime) -> costs.CostReading:
+    """Read costs in one transaction before any chart calculation."""
     _ = connection.execute("BEGIN")
     try:
-        reading = costs.read_costs(connection, start, end, boundary_context=True)
-        import record
-
-        return build_series(reading, start, end, zone, record.configured_targets())
+        return costs.read_costs(connection, start, end, boundary_context=True)
     finally:
         _ = connection.execute("ROLLBACK")
+
+
+def collect_charts(connection: sqlite3.Connection, start: datetime, end: datetime, zone: ZoneInfo) -> ChartSet:
+    """Keep one transaction and one shared read for the whole chart set."""
+    import record
+
+    return build_series(read_snapshot(connection, start, end), start, end, zone, record.configured_targets())
+
+
+def read_index[T](read: Callable[[sqlite3.Connection], T]) -> T | IndexUnavailable:
+    """Close the index after the read and preserve an index error as data."""
+    try:
+        with closing(index.read_only()) as connection:
+            return read(connection)
+    except sqlite3.Error as error:
+        return IndexUnavailable(str(error))
 
 
 def cost_value(bucket: DailyBucket, machine: str, cause: costs.Cause, *, per_phase: bool = False) -> ChartCost:
@@ -160,6 +252,63 @@ def cost_value(bucket: DailyBucket, machine: str, cause: costs.Cause, *, per_pha
     if missing:
         return CostUnavailable(f"{missing} applicable waits missing")
     return MeasuredCost(sum(row.seconds for row in bucket.costs.ranked if row.machine == machine and row.cause == cause))
+
+
+def known_seconds(value: ChartCost) -> float | None:
+    """Return the measured part of a cost when that part is available."""
+    if isinstance(value, MeasuredCost):
+        return value.seconds
+    if isinstance(value, MacIdleUpperBound):
+        return value.known_seconds
+    return None
+
+
+def window_value(recent: ChartCost, window: ChartCost, recent_days: int, days: int) -> WindowValue:
+    """Compare daily costs and preserve unavailable comparison values."""
+    recent_seconds = known_seconds(recent)
+    if recent_seconds is None:
+        return WindowMatchesRecent()
+    window_seconds = known_seconds(window)
+    if window_seconds is None:
+        return WindowDiffers(window)
+    recent_seconds /= recent_days
+    window_seconds /= days
+    if abs(window_seconds - recent_seconds) <= 0.5 * recent_seconds:
+        return WindowMatchesRecent()
+    value = (MacIdleUpperBound(window_seconds, window.unknown_seconds / days)
+             if isinstance(window, MacIdleUpperBound) else MeasuredCost(window_seconds))
+    return WindowDiffers(value)
+
+
+def page_data(days: int, n: int = 3) -> PageData | IndexUnavailable:
+    """Read the charts and recent costs from one index snapshot."""
+    import record
+
+    settings = conf.read("buildlog")
+    recent_days = settings.whole("TOP_COST_RECENT_DAYS")
+    if recent_days > days:
+        raise conf.Unusable(f"TOP_COST_RECENT_DAYS={recent_days} exceeds the page days ({days})")
+    actions = {cause: CostAction(settings.text("COST_ACTION_" + key), settings.text("COST_OWNER_" + key))
+               for cause, key in COST_KEYS.items()}
+    zone = user_zone()
+    end = datetime.now(zone)
+    start = end - timedelta(days=days)
+    recent_start = end - timedelta(days=recent_days)
+
+    def collect(connection: sqlite3.Connection) -> PageData:
+        reading = with_first_sources(read_snapshot(connection, start, end))
+        series = chart_series(reading, start, end, zone, record.configured_targets())
+        recent = build_bucket(reading, recent_start, end)
+        window = build_bucket(reading, start, end)
+        rows: list[TopCost] = []
+        for row in recent.costs.ranked[:max(0, n)]:
+            value = cost_value(recent, row.machine, row.cause)
+            comparison = window_value(value, cost_value(window, row.machine, row.cause), recent_days, days)
+            rows.append(TopCost(row.machine, row.cause, value, comparison, actions[row.cause]))
+        top = TopCosts(recent_start, end, recent_days, tuple(rows) if rows else NoDataYet.VALUE)
+        return PageData(series, top)
+
+    return read_index(collect)
 
 
 def cost_json(value: ChartCost, divisor: float, *, machine: str = "") -> dict[str, object]:
@@ -233,6 +382,27 @@ def publish(series: ChartSet, path: Path) -> None:
     _ = temporary.replace(path)
 
 
+def local_display(environ: Mapping[str, str], platform: str) -> bool:
+    if "SSH_CONNECTION" in environ:
+        return False
+    return platform == "darwin" or bool(environ.get("DISPLAY") or environ.get("WAYLAND_DISPLAY"))
+
+
+def present_page(series: ChartSet, path: Path, no_open: bool) -> int:
+    try:
+        publish(series, path)
+        url = review_link.snapshot([path])[0]
+    except review_link.SNAPSHOT_ERRORS as error:
+        reason = " ".join(str(error).splitlines())
+        print(f"buildlog charts: publication failed: {reason}", file=sys.stderr)
+        return 1
+    print(url)
+    if not no_open and local_display(os.environ, sys.platform):
+        with suppress(OSError, webbrowser.Error):
+            _ = webbrowser.open(url)
+    return 0
+
+
 def main(args: list[str]) -> int:
     from number_option import positive_window
 
@@ -245,23 +415,12 @@ def main(args: list[str]) -> int:
     if window is None:
         return 2
     start, end = window[:2]
-    connection = index.read_only()
-    try:
-        series = collect_charts(connection, start, end, user_zone())
-    except sqlite3.Error as error:
-        print(f"buildlog charts: index unavailable: {error}", file=sys.stderr)
+    series = read_index(lambda connection: collect_charts(connection, start, end, user_zone()))
+    if isinstance(series, IndexUnavailable):
+        print(f"buildlog charts: index unavailable: {series.reason}", file=sys.stderr)
         return 1
-    finally:
-        connection.close()
     path = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home()/".cache")))/"buildlog/charts/latest.html"
-    publish(series, path)
-    print(path)
-    if not no_open:
-        try:
-            _ = webbrowser.open(path.resolve().as_uri())
-        except webbrowser.Error:
-            pass
-    return 0
+    return present_page(series, path, no_open)
 
 
 PAGE = r'''<!doctype html>

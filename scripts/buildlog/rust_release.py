@@ -19,12 +19,7 @@ from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import store
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-if TYPE_CHECKING:
-    from ..message import send_budget
-else:
-    import send_budget
+from scripts.message import send_budget
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import process_group
 
@@ -193,7 +188,6 @@ def send_release_text(push: RenderedPush) -> bool:
         from push_texts import user_send_argv
 
     command = user_send_argv(push)
-    command[1] = str(Path(__file__).resolve().parents[1] / "message/send.py")
     result = subprocess.run(command, capture_output=True, text=True,
                             timeout=send_budget.user_seconds(review.user_send_seconds()), stdin=subprocess.DEVNULL)
     return result.returncode == 0

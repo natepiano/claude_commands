@@ -8,15 +8,15 @@ from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import showrunners, staff
+from scripts.production import showrunners, staff, unit_names
 from scripts.shutdown import remote
 import unit_lookup
 
 
 class LiveUnit(NamedTuple):
     unit: str
-    # None when no herdr session carries the unit's mark.
-    session: unit_lookup.MarkedUnit | None
+    # None when no observed herdr session has the unit identity.
+    session: unit_lookup.LabeledSession | None
 
     @property
     def name(self) -> str:
@@ -41,22 +41,21 @@ def units_of_doc(doc: Path) -> list[LiveUnit]:
     metadata = unit_lookup.unit_metadata(record, sources, slug=slug)
     for problem in metadata.problems:
         print(f"live_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
-    return _joined(slug, unit_lookup.every_marked_unit(record=record, sources=sources))
+    return _joined(slug, unit_lookup.every_labeled_session(record=record, sources=sources))
 
 
-def units_in(doc: Path, every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
+def units_in(doc: Path, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
     """Join a production through its recorded document and the caller's pane snapshot."""
     record = staff.snapshot()
     sources = unit_lookup.member_sources()
     return _joined(_production_slug(doc, record, sources), every)
 
 
-def _joined(slug: str, every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
+def _joined(slug: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
     """Units in staff row order, each with its pane."""
-    if fault := every.production_fault(slug):
-        raise OSError(fault)
-    marked = every.units.get(slug, {})
-    return [LiveUnit(unit, marked.get(unit)) for unit in every.members.get(slug, ())]
+    marked = every.status_units(slug)
+    return [LiveUnit(unit if unit in marked else unit_names.unit_id(unit), marked.get(unit))
+            for unit in every.members.get(slug, ())]
 
 
 def units_of(runner: showrunners.Showrunner) -> list[LiveUnit]:
@@ -78,6 +77,9 @@ def live_unit_names(runner: showrunners.Showrunner) -> list[str]:
 
 def main(arguments: list[str]) -> int:
     """Print one line per unit: unit id, pane, whether Claude runs (live, stopped, unknown, gone), name."""
+    status = arguments[:1] == ["--status"]
+    if status:
+        arguments = arguments[1:]
     try:
         match arguments:
             case ["--production", doc]:
@@ -95,8 +97,10 @@ def main(arguments: list[str]) -> int:
         claude = unit.session.claude if unit.session is not None else None
         running = ("gone" if unit.session is None else "live" if isinstance(claude, unit_lookup.LiveClaude)
                    else "unknown" if isinstance(claude, unit_lookup.ClaudeUnknown) else "stopped")
-        print("\t".join((unit.unit, unit_lookup.place_text(unit.session.place) if unit.session is not None else "",
-                         running, unit.name)))
+        columns = (unit.unit, unit_lookup.place_text(unit.session.place) if unit.session is not None else "", running, unit.name)
+        if status:
+            columns += (claude.session_id if isinstance(claude, unit_lookup.LiveClaude) else "",)
+        print("\t".join(columns))
     return 0
 
 
