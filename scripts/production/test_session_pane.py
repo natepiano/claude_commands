@@ -95,6 +95,7 @@ class SessionPaneTests(unittest.TestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "responses.json"),
             "HERDR_PROC": str(self.root / "proc"), "NOTIFIER_SESSIONS_DIR": str(self.records),
+            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
