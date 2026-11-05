@@ -1292,13 +1292,66 @@ class ReclamationTests(SweepCase):
                 self.exercise(caller, "partial removal")
 
 
+def cut_stamp(seconds: float) -> str:
+    return store.utc_iso(sweep.TARGET_OVERRIDE_RECORDER_CUT.timestamp() + seconds)
+
+
 class FloorTests(SweepCase):
     def root_row(self, workspace: str | Path, target: str | Path, build: str | Path, *,
                  cwd: str | Path = "", step: str = "build", call_id: str = "attempt", host: str = "",
-                 argv: Sequence[str] = (), target_folder: str | Path = "") -> None:
+                 argv: Sequence[str] = (), target_folder: str | Path = "", started_at: str | None = None) -> None:
         record_root_attempt(build_index.index_path(), str(workspace), str(target), str(build),
                             cwd=str(cwd), step=step, call_id=call_id, host=host or store.host_name(),
-                            argv=argv, target_folder=str(target_folder))
+                            argv=argv, target_folder=str(target_folder), started_at=started_at)
+
+    def override_outputs(self, started_at: str | None) -> tuple[Path, Path, sweep.CargoOutputIndex]:
+        base = self.base()
+        tree, payload = cargo_target(base, "workspace", APP, time.time() - DAY)
+        target = tree.parent
+        self.root_row(tree.parent.parent, target, target, argv=["cargo", "build", "--target-dir", str(target)],
+                      target_folder=target, started_at=started_at)
+        _, outputs = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
+        return tree, payload, outputs
+
+    def test_matching_override_outputs_supply_evidence_only_after_the_recorder_cut(self) -> None:
+        for offset in (-1, 0, 1):
+            with self.subTest(offset=offset):
+                tree, _, outputs = self.override_outputs(cut_stamp(offset))
+                target = tree.parent
+                expected = (CargoOutputRoots(tree.parent.parent, target, target),) if offset > 0 else ()
+                self.assertEqual(outputs.workspaces, expected)
+                self.assertEqual(outputs.no_recorded_evidence,
+                                 () if offset > 0 else (sweep.NoRecordedEvidence(str(target)),))
+
+    def test_mismatched_target_folders_supply_no_evidence_on_either_side_of_the_cut(self) -> None:
+        for offset in (-1, 1):
+            with self.subTest(offset=offset):
+                base = self.base()
+                tree, _ = cargo_target(base, "workspace", APP, time.time() - DAY)
+                actual, _ = cargo_target(base, "actual", DEMO, time.time() - DAY)
+                self.root_row(tree.parent.parent, tree.parent, tree.parent,
+                              argv=["cargo", "build", "--target-dir", str(actual.parent)],
+                              target_folder=actual.parent, started_at=cut_stamp(offset))
+                _, outputs = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
+                self.assertEqual(outputs.workspaces, ())
+                self.assertCountEqual(outputs.no_recorded_evidence,
+                                      (sweep.NoRecordedEvidence(str(tree.parent)),
+                                       sweep.NoRecordedEvidence(str(actual.parent))))
+
+    def test_override_outputs_with_an_unknown_start_remain_protected(self) -> None:
+        for stamp in (None, "", "not-a-time"):
+            with self.subTest(started_at=stamp):
+                tree, _, outputs = self.override_outputs(stamp)
+                self.assertEqual(outputs.workspaces, ())
+                self.assertEqual(outputs.no_recorded_evidence, (sweep.NoRecordedEvidence(str(tree.parent)),))
+
+    def test_override_started_before_the_cut_stays_protected_when_published_after_it(self) -> None:
+        tree, _, _ = self.override_outputs(cut_stamp(-1))
+        with closing(sqlite3.connect(build_index.index_path())) as connection, connection:
+            _ = connection.execute("UPDATE steps SET ended_at = ?", (cut_stamp(3600),))
+        _, outputs = sweep.discover_cargo_outputs([str(tree.parent.parent.parent)], lint_settings=conf.read("lint"))
+        self.assertEqual(outputs.workspaces, ())
+        self.assertEqual(outputs.no_recorded_evidence, (sweep.NoRecordedEvidence(str(tree.parent)),))
 
     def test_recorded_outputs_use_the_cwd_when_the_worktree_is_unknown(self) -> None:
         base = self.base()

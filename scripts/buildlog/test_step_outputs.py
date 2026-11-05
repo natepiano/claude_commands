@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, final, override
 
@@ -15,27 +16,30 @@ use_test_log()
 
 if TYPE_CHECKING:
     from .step_outputs import (
-        AbsoluteRecordedRoot, RecordedRoot, RecordedStepOutputs, RecordedRootsUnavailable,
-        RecordedStepOutput, RelativeRecordedRoot, TargetFolderOverride, UnknownRecordedRoot,
+        AbsoluteRecordedRoot, KnownStepStart, RecordedRoot, RecordedStepOutputs, RecordedRootsUnavailable,
+        RecordedStepOutput, RelativeRecordedRoot, StepStart, TargetFolderOverride, UnknownRecordedRoot, UnknownStepStart,
         recorded_output_roots,
     )
     from .step_outputs_test_support import create_step_index, record_root_attempt
 else:
     from scripts.buildlog.step_outputs import (
-        AbsoluteRecordedRoot, RecordedRoot, RecordedStepOutputs, RecordedRootsUnavailable,
-        RecordedStepOutput, RelativeRecordedRoot, TargetFolderOverride, UnknownRecordedRoot,
+        AbsoluteRecordedRoot, KnownStepStart, RecordedRoot, RecordedStepOutputs, RecordedRootsUnavailable,
+        RecordedStepOutput, RelativeRecordedRoot, StepStart, TargetFolderOverride, UnknownRecordedRoot, UnknownStepStart,
         recorded_output_roots,
     )
     from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
 
 
 UNKNOWN_ROOT = UnknownRecordedRoot()
+UNKNOWN_START = UnknownStepStart()
 
 
 def output_row(worktree: RecordedRoot, target_directory: RecordedRoot, build_directory: RecordedRoot, *,
                cwd: RecordedRoot = UNKNOWN_ROOT, target_folder: RecordedRoot = UNKNOWN_ROOT,
-               target_folder_override: TargetFolderOverride = TargetFolderOverride.ABSENT) -> RecordedStepOutput:
-    return RecordedStepOutput(worktree, cwd, target_directory, build_directory, target_folder, target_folder_override)
+               target_folder_override: TargetFolderOverride = TargetFolderOverride.ABSENT,
+               newest_start: StepStart = UNKNOWN_START) -> RecordedStepOutput:
+    return RecordedStepOutput(worktree, cwd, target_directory, build_directory, target_folder, target_folder_override,
+                              newest_start)
 
 
 @final
@@ -117,6 +121,54 @@ class RecordedOutputRootsTests(unittest.TestCase):
             output_row(
                 worktree=UnknownRecordedRoot(), cwd=AbsoluteRecordedRoot(fallback),
                 target_directory=RelativeRecordedRoot(), build_directory=UnknownRecordedRoot()),
+        ))
+
+    def test_distinct_facts_keep_the_newest_start_without_adding_rows(self) -> None:
+        workspace, target = self.root / "workspace", self.root / "target"
+        build = self.root / "build"
+        for stamp, argv in (
+            ("2026-11-05T08:31:37Z", ("cargo", "build")),
+            ("2026-11-05T08:31:35Z", ("cargo", "check")),
+            ("2026-11-05T08:31:37Z", ("cargo", "build", "--release")),
+        ):
+            record_root_attempt(self.index, str(workspace), str(target), str(build), argv=argv, started_at=stamp)
+        for stamp in ("2026-11-05T08:31:36Z", "2026-11-05T08:31:34Z"):
+            record_root_attempt(self.index, str(workspace), str(target), str(build),
+                                argv=("cargo", "build", "--target-dir", str(target)), started_at=stamp)
+        self.assertCountEqual(self.rows(), (
+            output_row(AbsoluteRecordedRoot(workspace), AbsoluteRecordedRoot(target), AbsoluteRecordedRoot(build),
+                       newest_start=KnownStepStart(datetime(2026, 11, 5, 8, 31, 37, tzinfo=UTC))),
+            output_row(AbsoluteRecordedRoot(workspace), AbsoluteRecordedRoot(target), AbsoluteRecordedRoot(build),
+                       target_folder_override=TargetFolderOverride.PRESENT,
+                       newest_start=KnownStepStart(datetime(2026, 11, 5, 8, 31, 36, tzinfo=UTC))),
+        ))
+
+    def test_row_start_has_a_known_instant_or_an_unknown_state(self) -> None:
+        workspace = self.root / "workspace"
+        starts = (
+            (None, UNKNOWN_START),
+            ("", UNKNOWN_START),
+            ("not-a-time", UNKNOWN_START),
+            ("2026-11-05T08:31:37", KnownStepStart(datetime(2026, 11, 5, 8, 31, 37, tzinfo=UTC))),
+            ("2026-11-05T03:31:37-05:00", KnownStepStart(datetime(2026, 11, 5, 8, 31, 37, tzinfo=UTC))),
+        )
+        for number, (stamp, _) in enumerate(starts):
+            target = self.root / f"target-{number}"
+            record_root_attempt(self.index, str(workspace), str(target), str(target), started_at=stamp)
+        self.assertCountEqual(self.rows(), (
+            output_row(AbsoluteRecordedRoot(workspace), AbsoluteRecordedRoot(self.root / f"target-{number}"),
+                       AbsoluteRecordedRoot(self.root / f"target-{number}"),
+                       newest_start=expected_start)
+            for number, (_, expected_start) in enumerate(starts)
+        ))
+
+    def test_newest_start_orders_fractional_seconds_after_the_whole_second(self) -> None:
+        workspace, target = self.root / "workspace", self.root / "target"
+        for stamp in ("2026-11-05T08:31:36Z", "2026-11-05T08:31:36.001Z"):
+            record_root_attempt(self.index, str(workspace), str(target), str(target), started_at=stamp)
+        self.assertEqual(self.rows(), (
+            output_row(AbsoluteRecordedRoot(workspace), AbsoluteRecordedRoot(target), AbsoluteRecordedRoot(target),
+                       newest_start=KnownStepStart(datetime(2026, 11, 5, 8, 31, 36, 1000, tzinfo=UTC))),
         ))
 
     def test_unavailable_index_has_a_named_state_and_creates_no_index(self) -> None:

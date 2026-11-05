@@ -200,7 +200,7 @@ if TYPE_CHECKING:
     from ..lib import scratch
     from ..lib.atomic_file import write_text_atomic
     from ..buildlog import index as build_index, record, store
-    from ..buildlog.step_outputs import (AbsoluteRecordedRoot, RecordedStepOutput, RecordedStepOutputs,
+    from ..buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
                                         TargetFolderOverride, recorded_output_roots)
     from ..notify.push_texts import RenderedPush
     from ..notify import review
@@ -214,7 +214,7 @@ else:
     import index as build_index
     import record
     import store
-    from step_outputs import (AbsoluteRecordedRoot, RecordedStepOutput, RecordedStepOutputs,
+    from step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
                               TargetFolderOverride, recorded_output_roots)
 
 from scripts.lib.conf import UseConfiguredValue
@@ -237,6 +237,9 @@ DOC_LOCK_NAME = ".lock"
 # The cross-crate stores every rustdoc run reads and rewrites at its end.
 MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
 TARGET_DIR_FLAG = "--target-dir"
+# natedev's installed ~/.claude reflog first contains 2ae242c18 at this time:
+# 1548db836 HEAD@{2026-11-05T03:31:36-05:00}: merge 1548db8365b32844fb8543dcaa73cfa14a2b8d20: Fast-forward
+TARGET_OVERRIDE_RECORDER_CUT = datetime(2026, 11, 5, 8, 31, 36, tzinfo=UTC)
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
@@ -384,8 +387,11 @@ def _recorded_mapping_rows(rows: Iterable[RecordedStepOutput]) -> tuple[CargoOut
     mappings: list[CargoOutputRoots] = []
     for row in rows:
         target, build, folder = row.target_directory, row.build_directory, row.target_folder
-        if (row.target_folder_override is TargetFolderOverride.PRESENT
-                or (isinstance(folder, AbsoluteRecordedRoot) and folder != target)):
+        if isinstance(folder, AbsoluteRecordedRoot) and folder != target:
+            continue
+        fixed_recorder = (isinstance(row.newest_start, KnownStepStart)
+                          and row.newest_start.instant > TARGET_OVERRIDE_RECORDER_CUT)
+        if row.target_folder_override is TargetFolderOverride.PRESENT and not fixed_recorder:
             continue
         workspace = row.worktree if isinstance(row.worktree, AbsoluteRecordedRoot) else row.cwd
         if (isinstance(workspace, AbsoluteRecordedRoot) and isinstance(target, AbsoluteRecordedRoot)

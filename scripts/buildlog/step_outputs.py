@@ -6,6 +6,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -49,6 +50,21 @@ class TargetFolderOverride(Enum):
 
 
 @dataclass(frozen=True)
+class KnownStepStart:
+    """The newest row has a known start time."""
+
+    instant: datetime
+
+
+@dataclass(frozen=True)
+class UnknownStepStart:
+    """The newest row has no usable start time."""
+
+
+StepStart = KnownStepStart | UnknownStepStart
+
+
+@dataclass(frozen=True)
 class RecordedStepOutput:
     """One distinct row preserves its output paths and workspace facts."""
 
@@ -58,6 +74,7 @@ class RecordedStepOutput:
     build_directory: RecordedRoot
     target_folder: RecordedRoot
     target_folder_override: TargetFolderOverride
+    newest_start: StepStart
 
 
 @dataclass(frozen=True)
@@ -80,6 +97,17 @@ def _recorded_root(raw: object) -> RecordedRoot:
         return UnknownRecordedRoot()
     path = Path(raw)
     return AbsoluteRecordedRoot(path) if path.is_absolute() else RelativeRecordedRoot()
+
+
+def _step_start(raw: object) -> StepStart:
+    """Read UTC epoch microseconds without losing precision."""
+    if isinstance(raw, int):
+        try:
+            instant = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=raw)
+            return KnownStepStart(instant)
+        except OverflowError:
+            pass
+    return UnknownStepStart()
 
 
 def indexed_argv(raw: object) -> list[str]:
@@ -109,9 +137,11 @@ def recorded_output_roots(index_path: Path, host: str) -> RecordedStepOutputs | 
         with closing(sqlite3.connect(index_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             connection.create_function("sets_target_folder", 1, _sets_target_folder, deterministic=True)
             rows = cast(list[tuple[object, ...]], connection.execute(
-                """SELECT DISTINCT worktree, cwd, target_directory, build_directory, target_folder,
-                       CASE WHEN instr(argv, 'target-dir') > 0 THEN sets_target_folder(argv) ELSE 0 END
-                   FROM steps WHERE host = ?""",
+                """SELECT worktree, cwd, target_directory, build_directory, target_folder,
+                       CASE WHEN instr(argv, 'target-dir') > 0 THEN sets_target_folder(argv) ELSE 0 END AS override,
+                       MAX(started_at_us)
+                   FROM steps WHERE host = ?
+                   GROUP BY worktree, cwd, target_directory, build_directory, target_folder, override""",
                 (host,),
             ).fetchall())
     except (OSError, sqlite3.Error) as error:
@@ -123,4 +153,5 @@ def recorded_output_roots(index_path: Path, host: str) -> RecordedStepOutputs | 
         build_directory=_recorded_root(build_path),
         target_folder=_recorded_root(target_folder),
         target_folder_override=TargetFolderOverride.PRESENT if override_value else TargetFolderOverride.ABSENT,
-    ) for worktree, cwd, target_path, build_path, target_folder, override_value in rows))
+        newest_start=_step_start(started_at_us),
+    ) for worktree, cwd, target_path, build_path, target_folder, override_value, started_at_us in rows))
