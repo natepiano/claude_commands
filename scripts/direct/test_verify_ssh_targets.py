@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from contextlib import redirect_stdout
 import io
-from typing import override
+from typing import TYPE_CHECKING, override
 import unittest
 from unittest import mock
 
@@ -14,6 +14,11 @@ from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixtu
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.lint.memory_test_support import write_config_fixture
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
 
 build_targets = eligibility_support.build_targets
 mac_test = eligibility_support.mac_test
@@ -101,7 +106,7 @@ class SshReservationTests(unittest.TestCase):
         self.assertEqual(self.reserve(71)[0], 0)
         state = mac_test.state_paths("aws")
         claim, = mac_test.read_claims(state)
-        with mock.patch.object(mac_test, "process_start_time", return_value="reused-start"):
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("reused-start")):
             self.assertEqual(build_targets.command_release_wait(71), 0)
         self.assertTrue(claim.path.exists())
         self.assertEqual(mac_test.read_claims(state)[0].record, claim.record)

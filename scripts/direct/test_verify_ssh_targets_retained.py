@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest import mock
 
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
@@ -15,6 +16,12 @@ from scripts.build_queue.admission_service import Connection
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib.process_start_test_support import process_reader
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
 
 
 mac_test = eligibility_support.mac_test
@@ -29,7 +36,7 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         paths: list[Path] = []
         with mock.patch.dict(os.environ, self.environment), \
              mock.patch.object(Path, "home", return_value=self.home), \
-             mock.patch.object(mac_test, "process_start_time", side_effect=eligibility_support.SshEligibilityTests().process_start), \
+             mock.patch.object(process_identity, "process_start", side_effect=process_reader(eligibility_support.SshEligibilityTests().process_start)), \
              mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.RepositoryScope(
                  "hana", "https://example.com/team/hana")):
             state = mac_test.state_paths("aws")
@@ -116,7 +123,7 @@ steps_path.write_text(json.dumps(steps))
         self.configure("natedev,mac")
         self.enable_mac()
         with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(mac_test, "process_start_time", return_value="old-owner"):
+             mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("old-owner")):
             paths = mac_test.state_paths("mac")
             args = mac_test.CliArguments()
             args.target, args.worktree, args.pid = "mac", str(self.root), 2147483000

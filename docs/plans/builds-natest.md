@@ -66,7 +66,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
   1. Baseline: before the edit, run the module three times with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` and keep the median `wall_s` and `cpu_s`. These runs find the cost (step 2); they are not the before number of the gain (step 5). Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
   2. Find the cost from the JSON: the slowest tests, and `wall_s - tests_s` (import and module or class fixtures). Name the expensive operations before any edit; do not apply a cut the module already has.
   3. Cut it, in this order:
-     - Find each fixed wait first: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. A fixed wait often also causes flakes, so a flaky module is a speed target too (fastest-unit, Phases 5i and 6: 64 to 35 s, 58 to 24 s).
+     - Find each fixed wait first: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. A fixed wait often also causes flakes, so a flaky module is a speed target too (fastest-unit, Phases 5i and 6: 64 to 35 s, 58 to 24 s). A server fixture that runs `serve_forever` pays its 0.5 s poll interval on each stop; stop it on an event (Phase 20: 62 to 21 s).
      - Remove trivial tests (Invariants above) only when step 2 shows tests that read as repeats: tests with the same setup and the same assertion target. Then run `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` and compare each candidate's assertions with its covering tests; a candidate whose result a covering test also checks is a trivial test. Skip the sweep in a module whose time is in process starts: Phase 13 found no repeat in five such modules.
      - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does.
      - Call code in-process in place of a subprocess when the test does not check the process boundary; keep one process test for each boundary.
@@ -456,108 +456,166 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - A 1-day window: a checkout that only reads its index could lose a file it uses each hour.
 
-### Phase 18 — Mac and Linux mirror steps record the repository identity that natedev sends  · status: todo
+### Phase 18 — Mac and Linux mirror steps record the repository identity that natedev sends  · status: done
 **Depends on:** Phase 16
 
 #### Work Order
 
-**Goal:** A new Mac or Linux mirror step records the repository identity of its natedev source checkout, so the index does not need to derive it.
+**Goal:** natedev sends the repository identity of its source checkout to each Mac and Linux mirror step, in `BUILDLOG_REPO_IDENTITY`. The step environment records it; Phase 22 stores it in the step row.
 
-**Spec:** The builds showrunner accepted this architecture proposal from the Phase 16 review on 2026-11-04. This unit owns it. Edits to other units' files are allowed: `scripts/mac_test/offload.py` and `scripts/mac_test/linux_runner.py` (verify-unit), `scripts/buildlog/record.py` (report-unit).
+**Spec:** The builds showrunner accepted this architecture proposal from the Phase 16 review on 2026-11-04. This unit owns it. Edits to verify-unit's files are allowed: `scripts/mac_test/offload.py` and `scripts/mac_test/linux_runner.py`. Phase 22 records the sent value.
 
-1. Send: the natedev side computes the repository key of the source checkout with `record.recorded_repository_key` (no copy). It passes the key as `BUILDLOG_REPO_IDENTITY` in the mirror command, beside `BUILDLOG_CALL_ID` and `BUILDLOG_SENT_TREE_KEY`: in `offload.py` (the ssh command, about line 1500) and in `linux_runner.py` (the `environment` mapping, about line 720). An `unknown` key is not sent.
-2. Record: in `record.py` `step()`, when `recorded_repository_key` gives `store.UNKNOWN_IDENTITY` for a mirror caller (`verify-mac`, `verify-linux`) and `BUILDLOG_REPO_IDENTITY` is set, record that value. Read it through one typed reader beside `sent_tree_key()`. A known local key always wins.
-3. Index: keep the Phase 16 index rule for old rows. A step with a recorded identity has `identity_derived = 0`, so the resolver never changes it.
-4. The Mac gets the new `record.py` through the normal main promotion. Until then, Mac rows stay `unknown` and the index rule resolves them.
-5. Split `repository_key(directory)` out of `record.recorded_repository_key`. Callers that only need the key of a directory call it directly. Remove the `["git"]` argument vector that exists only to pass the empty-argv check (`record.py` about line 541, `show.py` top, four test call sites).
-6. Import `conf` under one module name in `parse.py` and `record.sync_config`. Today one step process loads `conf.py` twice (+1.8 ms).
-7. Move `recorded_repository_key`, `repository_key` and `remote_identity` into one light module that does not import the rest of `record.py`. `show.py` imports it in place of `record` (importing `record` costs 49.7 ms cold; `show.py` imports `record` inside `main()`, about line 427). `record` keeps the three names as imports from the light module, so `scripts/lint/memory_admit.py` (about line 3284, `record.remote_identity`) needs no change. Measure the cold start of `show.py top` before and after.
+1. Send: `remote_test_command` in `offload.py` (about line 1454) already receives the source checkout's `KnownRepository`, whose `key` comes from `repository_identity` (about line 898), the same key that `ssh_attempts.repo_identity` records and that the Phase 16 resolver reads. Send that key; compute no new key and do not import `record`. In the Mac ssh command, add `BUILDLOG_REPO_IDENTITY=<key>` beside `BUILDLOG_CALL_ID` (about line 1502). For Linux, pass the key to `linux_runner.command_script` (about line 496) as a new `--repo-identity` argument, and put it in the `environment` mapping (about line 720) beside `BUILDLOG_SENT_TREE_KEY`. An empty key is not sent, in both commands.
 
 **Files:**
 - `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py` — send the key (verify-unit's files)
-- `scripts/buildlog/record.py` — record the sent key (report-unit's file)
-- `scripts/buildlog/parse.py` — one `conf` import name (report-unit's file)
-- `scripts/buildlog/repository.py` — the new light module for the repository key
-- `scripts/test_times/show.py` — import the light module
-- `scripts/buildlog/test_step_row.py` — its repository-key test patches `record.output`; move the patch target with the code
-- `scripts/mac_test/test_offload.py`, `scripts/mac_test/test_linux_runner.py`, `scripts/buildlog/test_record.py`, `scripts/buildlog/test_parse.py`, `scripts/test_times/test_show.py` — the regression tests
+- `scripts/mac_test/test_offload.py`, `scripts/mac_test/test_linux_runner.py` — the regression tests
 
 **Workers:** 1 writer + 1 tester
-- `impl` — `offload.py`, `linux_runner.py`, `record.py`, `parse.py`, `repository.py`, `show.py`
-- `test` — `test_step_row.py` and the tests: a mirror step with no origin records the identity sent from natedev; a known local key wins over a sent key; the Mac ssh command and the Linux environment carry the key, and omit it when it is unknown; `repository_key` of a directory with and without an origin; one step process loads `conf.py` once
+- `impl` — `offload.py`, `linux_runner.py`
+- `test` — the Mac ssh command and the Linux environment carry the key, and omit it when it is empty
 
 **Constraints from prior phases:**
-- Phase 16: the index derives the identity of an `unknown` step from its call and marks it `identity_derived = 1`. Keep that rule for old rows.
-- Before work starts, read the open verify-unit and report-unit branches for edits to these three files. Claim the outside files on the berth board, and name them in the notice's also-touches line.
-- report-unit Phase 20 (`be35f2d2b`) changes `record.py` `step()`. Never merge report's unlanded branch. Start the `record.py` edits only after report Phase 20 is merged into builds; then merge origin/builds. Until then, work only on `offload.py`, `linux_runner.py` and their tests (showrunner, 2026-11-04).
-- Items 5-7 came from the Phase 16 review. The showrunner put them in this phase on 2026-11-04. They also wait for report Phase 20 on builds. Test `parse.py` against report's tip and name it in also-touches.
+- Before work starts, read the open verify-unit and report-unit branches for edits to these two files. Claim the outside files on the berth board, and name them in the notice's also-touches line.
+- verify-unit's unlanded `verify-remake-1-24` also changes `remote_test_command`. Claim after verify's lines; this unit does the one-line merge resolve (showrunner, 2026-11-05).
 
 **Acceptance gate:**
-- the changed test modules green on a tree with origin/builds merged after report Phase 20 lands
-- a mirror step test records the identity sent from natedev
-- the cold start of `show.py top` (a fresh process, a scratch `BUILDLOG_DIR`, under `timeout 600`) before and after item 7, measured in same-load pairs, in the checkpoint notice
-- the existing evidence-order and recorded-identity tests in `test_index.py` stay green
+- `test_offload.py` and `test_linux_runner.py` green
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 19 — The coverage tool runs under a mocked `subprocess.Popen` and its git child test passes at high load  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `coverage_overlap.py` collects a module whose fixture replaces `subprocess.Popen` with a mock, and `test_git_child_keeps_coverage_known` passes at load 60.
-
-**Spec:** Both defects are in this unit's own Phase 15 code. The showrunner ruled the flaky test a bounded fix after Phase 13 (2026-11-04).
-
-1. Mocked Popen: `line_collector.py` checks `isinstance(process, subprocess.Popen)` at the time of the call (`stack_popen`, about line 150, and the audit hook, about line 226). A fixture that sets `subprocess.Popen` to a mock makes the second argument a non-type, and the test fails with `TypeError: isinstance() arg 2 must be a type`. Seen on `scripts/direct/test_verify_ssh_targets_routing.py` `test_held_local_target_does_not_block_linux_check` (fixture `verify_mac_offload_test_support.py` about line 980). Keep the real class at import, beside `POPEN_INIT`, and check against it.
-2. Flaky test: `test_coverage_overlap.py` `test_git_child_keeps_coverage_known` failed once at load 60 and passed on rerun; 0 of 25 repeats failed at load 54. Find the cause from the failure text. Fix the cause in the collector or the fixture; do not add a retry or a longer wait. A probe found the likely cause: candidate selection drops the slower test first, so the test assumes git ends before the fixture's computation. When git is slower, the candidate reverses, although both tests stay known.
-3. Import failure: in ~/.claude main, `coverage_overlap.py scripts/production test_fast_track.py` cannot import the module (`memory_test_support` refuses installed scripts). `unittest` then makes one `_FailedTest`, and the tool prints `No removal candidates. Known tests: 1/1` and exits 1. When a selected module does not import (`TestLoader.errors` after `discover`), print one line per module to stderr, `coverage overlap: <file> does not import: <last line of the error>`, print no table and no summary, and exit 2. Do not run the suite. The builds showrunner asked for this on 2026-11-04 (change-review rows C1056 and C1058 returned).
+- `line_collector.py` keeps `POPEN_CLASS = subprocess.Popen` at import, beside `POPEN_INIT`. `stack_popen` and the audit hook check `isinstance` against it, so a fixture that replaces `subprocess.Popen` with a mock collects with no error. `test_verify_ssh_targets_routing.py` runs all 13 tests under the collector.
+- The flaky git test was not a collector defect. Both tests stay known; candidate selection takes the slower of two tests with equal coverage, so the candidate reverses when git is slower. `test_git_child_keeps_coverage_known` asserts the slower row as the candidate, covered by the faster one. A deterministic `select_candidates` test checks both duration orders. The git test passed 25 of 25 repeats at load about 66.
+- `coverage_overlap.py`: `load_suite` reads the new `TestLoader.errors` after each selected module's discovery and raises `ModuleImportsFailed`. `main` prints `coverage overlap: <file> does not import: <last error line>` for each failed module to stderr, prints no table and no summary, runs no test, and returns 2.
 
 **Files:**
 - `scripts/test_times/line_collector.py` — the Popen class kept at import
 - `scripts/test_times/coverage_overlap.py` — the import-failure line and exit 2
-- `scripts/test_times/test_coverage_overlap.py` — a regression test with a mocked `subprocess.Popen`; the flaky test fix
+- `scripts/test_times/test_coverage_overlap.py` — the mocked Popen, both-order and import-failure tests
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `line_collector.py`, `coverage_overlap.py`; the import-failure test in `test_coverage_overlap.py` (follow-up, after the tester finished)
-- `test` — `test_coverage_overlap.py`: a fixture module that patches `subprocess.Popen` with a mock collects without an error; the git child test under parallel load
-
-**Constraints from prior phases:**
-- Phase 15: an unknown test names its cause and is never a removal candidate. Keep every cause and its tests.
-- Phase 13: the five slowest modules gave no removal (see its As-built). Most of their tests are unknown through unverified launches of bash, git, rustc, ssh and rsync.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/test_times -p 'test_coverage_overlap.py'` green
-- `python3 scripts/test_times/coverage_overlap.py scripts/direct test_verify_ssh_targets_routing.py` runs all 13 tests with no collector error
-- a deterministic test with fixed durations in both orders (git slower, git faster) keeps both tests known and asserts the candidate for each order
-- the git child test passes 25 of 25 repeats at a load of 55 or more
-- a fixture module that raises at import gives the one stderr line, no summary, and exit 2
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+**Binds later work:**
+- Read a process class at import, never at call time: a fixture can replace it.
 
 ### Phase 20 — The hana_shot test module stops its fixture servers at once  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/hana_shot/test_hana_shot.py` runs faster in same-load pairs, with every test and assertion kept.
-
-**Spec:** The builds showrunner approved this on 2026-11-04 from the Phase 13 proposals. Edit only the fixtures of `test_hana_shot.py` (the hana_shot owner's file). Gate median 66 s; 74 s in the Phase 15 gate.
-
-1. Fixture stop: `HanaShotTest.setUp` (about line 350) and `restart_fake_listener` (about line 981) run `server.serve_forever` with the default poll interval of 0.5 s. `server.shutdown()` can wait up to that interval. 95 tests use the fixture, so the upper bound is 47.5 s. Make the stop return at once: pass a short `poll_interval` to `serve_forever`, or stop the loop on an event. Measure both and keep the faster; a short interval must not add measurable CPU.
-2. Resend deadline: `test_screenshot_busy_past_the_resend_limit_fails` (about line 1896) waits for the production `resend_seconds` (2.0 s, read through `hana_shot_settings` in `hana_shot.py` about line 1353). Give this test a private, shorter `resend_seconds` through the fixture config, with no change to `hana_shot.py`. Keep `test_busy_screenshot_is_resent_once`, which checks the successful resend.
-3. Measure the module in same-load pairs before and after, and report the medians.
+- `FixtureServer` (a `ThreadingHTTPServer`) serves until a `stopping` event is set. `shutdown` sets the event, opens one wake connection, and waits for the loop to finish, with `TEST_HANG_GUARD_SECS` as the limit. `HanaShotTest.setUp` and `restart_fake_listener` use `FixtureServer.serve` in place of `serve_forever`, so no stop waits for the 0.5 s poll interval.
+- `test_screenshot_busy_past_the_resend_limit_fails` gets `resend_seconds=0.05` through the `BuildLogIsolatedTest` fixture config. `hana_shot.py` is unchanged.
+- All 113 tests and their assertions stay. Same-load pair medians (3 rounds, load 28-37): wall 62.3 s to 20.9 s, CPU 17.3 s to 19.3 s. In single runs the event stop (30.5 s) beat a short poll interval (32.8 s).
 
 **Files:**
 - `scripts/hana_shot/test_hana_shot.py` — the fixture stop and the private resend deadline (the hana_shot owner's file; fixtures only)
 
-**Workers:** 1 writer
-- `impl` — `test_hana_shot.py`; one file, so no second writer
+**Gotchas:**
+- `serve_forever` pays its poll interval on each `shutdown()`. A fixture that starts a server for each test pays it for each test.
+
+### Phase 21 — The merge gate fails a test module that starts the real `send.py`  · status: todo
+**Depends on:** none
+**Blocked by:** builds-queue Phase 10z on builds — the audit-hook guard and its patch point in `scripts/message/session_send.py`
+
+#### Work Order
+
+**Goal:** In the merge gate, a test module that starts the real `scripts/message/send.py` fails with one line that names the module, and the gate time cost is measured in same-load pairs.
+
+**Spec:** The builds showrunner asked for this on 2026-11-05. That night a builds-queue 10z test reached the real `send.py` and sent natedev two live messages. builds-queue Phase 10z adds an audit-hook guard for the sender modules (sweep, admission service, disk) through one patch point in `scripts/message/session_send.py`.
+
+1. The gate runs each module through `scripts/test_times/module_run.py` (`RUNNER` in `merge_gate.py`, about line 110). Install the 10z guard in `module_run.py` `main()` before discovery, through 10z's patch point. Make no copy of its hook. Read the hook and the patch point from builds after 10z lands. Name them, the sender test modules and the scan test in this Spec and Files before dispatch.
+2. A module that starts the real `send.py` fails. The gate prints one line for it: `<module>: started the real scripts/message/send.py`. Other modules run as before.
+3. A test that needs `send.py` uses the fake sender that 10z names. Do not add an allow list.
+4. One guard remains: 10z puts `forbid_real_sender()` into each sender test module, with a scan test that requires it. Once the gate-wide guard covers every module, remove those per-module installs and the scan test in this phase. Keep `session_send.SEND_SCRIPT` as the one patch point (showrunner, 2026-11-05).
+5. Measure the gate time cost: run a group of modules with and without the guard in same-load pairs (`pairs.sh`), and report the medians.
+
+**Files:**
+- `scripts/test_times/module_run.py` — install the guard through the patch point
+- `scripts/test_times/test_module_run.py` — a fixture module that starts the real `send.py` fails with the one line; a module that does not passes
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `module_run.py`
+- `test` — `test_module_run.py`: the failing fixture module and its one line; a clean module stays green
 
 **Constraints from prior phases:**
-- Phase 13: no test in this module is a proved repeat; keep all 113 tests and their assertions.
-- Name `test_hana_shot.py` in the notice's also-touches line, tested against its owner's tip (showrunner, 2026-11-04).
+- Phase 1: `module_run.py` matches the import path of `python -m unittest` and writes each test's time to `TEST_TIMES_OUT`. Keep both.
+- Phase 15: `line_collector.py` uses an audit hook in coverage runs. The guard must not change what the collector records.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `/tmp/claude`.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/hana_shot -p 'test_hana_shot.py'` green, 113 tests
-- same-load pair medians before and after, in the checkpoint notice
-- `basedpyright scripts/hana_shot/test_hana_shot.py` prints `0 errors, 0 warnings, 0 notes`
+- `python3 -m unittest discover -s scripts/test_times -p 'test_module_run.py'` green
+- a fixture module that starts the real `send.py` fails in a gate run with the one line; no message is sent
+- same-load pair medians with and without the guard, in the checkpoint notice
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 22 — Mirror step rows store the sent repository identity, and `show.py` loads a light repository module  · status: todo
+**Depends on:** Phase 18
+**Blocked by:** report-unit Phase 20 (`be35f2d2b`) on builds — it changes `record.py` `step()`
+
+#### Work Order
+
+**Goal:** A new Mac or Linux mirror step records the repository identity of its natedev source checkout, so the index does not need to derive it.
+
+**Spec:** The builds showrunner accepted this architecture proposal from the Phase 16 review on 2026-11-04. This unit owns it. Edits to report-unit's files are allowed: `scripts/buildlog/record.py` and `scripts/buildlog/parse.py`. Phase 18 sends the key in `BUILDLOG_REPO_IDENTITY`.
+
+1. Record: in `record.py` `step()`, when `recorded_repository_key` gives `store.UNKNOWN_IDENTITY` for a mirror caller (`verify-mac`, `verify-linux`) and `BUILDLOG_REPO_IDENTITY` is set, record that value. Read it through one typed reader beside `sent_tree_key()`. A known local key always wins.
+2. Index: keep the Phase 16 index rule for old rows. A step with a recorded identity has `identity_derived = 0`, so the resolver never changes it.
+3. The Mac gets the new `record.py` through the normal main promotion. Until then, Mac rows stay `unknown` and the index rule resolves them.
+4. Split `repository_key(directory)` out of `record.recorded_repository_key`. Callers that only need the key of a directory call it directly. Remove the `["git"]` argument vector that exists only to pass the empty-argv check (`record.py` about line 541, `show.py` top, four test call sites).
+5. Import `conf` under one module name in `parse.py` and `record.sync_config`. Today one step process loads `conf.py` twice (+1.8 ms).
+6. Move `recorded_repository_key`, `repository_key` and `remote_identity` into one light module that does not import the rest of `record.py`. `show.py` imports it in place of `record` (importing `record` costs 49.7 ms cold; `show.py` imports `record` inside `main()`, about line 427). `record` keeps the three names as imports from the light module, so `scripts/lint/memory_admit.py` (about line 3284, `record.remote_identity`) needs no change. Measure the cold start of `show.py top` before and after.
+
+**Files:**
+- `scripts/buildlog/record.py` — record the sent key (report-unit's file)
+- `scripts/buildlog/parse.py` — one `conf` import name (report-unit's file)
+- `scripts/buildlog/repository.py` — the new light module for the repository key
+- `scripts/test_times/show.py` — import the light module
+- `scripts/buildlog/test_step_row.py` — its repository-key test patches `record.output`; move the patch target with the code
+- `scripts/buildlog/test_record.py`, `scripts/buildlog/test_parse.py`, `scripts/test_times/test_show.py` — the regression tests
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `record.py`, `parse.py`, `repository.py`, `show.py`
+- `test` — `test_step_row.py` and the tests: a mirror step with no origin records the identity sent from natedev; a known local key wins over a sent key; `repository_key` of a directory with and without an origin; one step process loads `conf.py` once
+
+**Constraints from prior phases:**
+- Phase 16: the index derives the identity of an `unknown` step from its call and marks it `identity_derived = 1`. Keep that rule for old rows.
+- Phase 18: `offload.py` and `linux_runner.py` send `KnownRepository.key` as `BUILDLOG_REPO_IDENTITY` to Mac and Linux mirror steps, and send nothing when the key is empty.
+- Before work starts, read the open verify-unit and report-unit branches for edits to these files. Claim the outside files on the berth board, and name them in the notice's also-touches line.
+- report-unit Phase 20 (`be35f2d2b`) changes `record.py` `step()`. Never merge report's unlanded branch. Start the `record.py` edits only after report Phase 20 is merged into builds; then merge origin/builds. (showrunner, 2026-11-04).
+- Items 4-6 came from the Phase 16 review. The showrunner put them in this phase on 2026-11-04. They also wait for report Phase 20 on builds. Test `parse.py` against report's tip and name it in also-touches.
+
+**Acceptance gate:**
+- the changed test modules green on a tree with origin/builds merged after report Phase 20 lands
+- a mirror step test records the identity sent from natedev
+- the cold start of `show.py top` (a fresh process, a scratch `BUILDLOG_DIR`, under `timeout 600`) before and after item 6, measured in same-load pairs, in the checkpoint notice
+- the existing evidence-order and recorded-identity tests in `test_index.py` stay green
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 23 — `test_show.py` passes in a checkout with no origin  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/test_times/test_show.py` reads nothing from the real checkout's remote, and passes in a clone with an origin and in a clone with no origin.
+
+**Spec:** The builds showrunner asked for this on 2026-11-05 (reported by devtools-unit through sdlc). In a clone with no origin, `test_show.py` has 10 failures.
+
+1. Cause: `test_show.py:48` sets `TOOL_IDENTITY = record.recorded_repository_key(["git"], <real checkout root>)` at import. `setUp` (about line 112) sets the fixture repository's origin to that value, and `test_top_keeps_the_module_view_from_the_claude_working_directory` (about line 297) records steps under it. `show.py` `main()` (about line 438) picks the module view when the identity of `--repo` equals the identity of `show.TOOL_REPOSITORY`, the real checkout. With no origin, the real key is `git-root:<real root>`, and the fixture repository cannot match it.
+2. Fix: in `setUp`, patch `show.TOOL_REPOSITORY` to the fixture repository `self.repo` with `mock.patch.object`. Remove `TOOL_IDENTITY` and the `remote set-url` call. The fixture repository keeps the origin that `initialize_repository` gives it. Where a test needs the tool identity, use `record.recorded_repository_key(["git"], str(self.repo))`, computed once in `setUp`.
+3. Change no production file. Keep every test and assertion.
+
+**Files:**
+- `scripts/test_times/test_show.py` — the fixture tool repository
+
+**Workers:** 1 writer (one test file; there is nothing to split)
+- `impl` — `test_show.py`
+
+**Constraints from prior phases:**
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `/tmp/claude`.
+- Phase 22 later changes `show.py` `main()` to call `repository_key(directory)` from a light module. The patch target stays `show.TOOL_REPOSITORY`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/test_times -p 'test_show.py'` green in a `copies.py` clone with an origin, and in a clone with its origin removed (`git remote remove origin`)
+- `basedpyright scripts/test_times/test_show.py` prints `0 errors, 0 warnings, 0 notes`
