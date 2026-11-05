@@ -177,12 +177,10 @@ def _director_line(marked: unit_lookup.LabeledSession, level: str, check: bool) 
 
 
 def director_lines(every: unit_lookup.LabeledProductions, level: str, check: bool) -> list[str]:
-    """One line per running unit director, every production's, then each production left out."""
+    """Return one line per running unit director in every production."""
     lines = [_director_line(marked, level, check)
              for slug in sorted(every.units) for _, marked in sorted(every.units[slug].items())
              if not isinstance(marked.claude, unit_lookup.ClaudeNotRunning)]
-    lines.extend(f"{slug}: skipped {fault}" for slug, units in sorted(every.faults.items())
-                 for _, fault in sorted(units.items()))
     return lines or ["no unit director is running"]
 
 
