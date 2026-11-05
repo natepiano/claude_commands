@@ -53,7 +53,6 @@ import fcntl
 import json
 import math
 import os
-import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -80,10 +79,22 @@ from test_phase import (
 
 if __package__:
     from . import cgroup_capture, store, step_context
+    from .repository import (
+        GIT_TIMEOUT_S as GIT_TIMEOUT_S,
+        output as output,
+        remote_identity as remote_identity,
+        repository_key as repository_key,
+    )
 else:
     import cgroup_capture
     import store
     import step_context
+    from repository import (
+        GIT_TIMEOUT_S as GIT_TIMEOUT_S,
+        output as output,
+        remote_identity as remote_identity,
+        repository_key as repository_key,
+    )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -101,7 +112,6 @@ __all__ = ["_target_hosts"]
 
 RECORD_VERSION = 1
 TARGET_DIR_UNSET = "unset"
-GIT_TIMEOUT_S = 5
 RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
 LAUNCH_LOCK_NAME = "launches.lock"
@@ -132,7 +142,7 @@ def transcript_target_folder(metadata: Mapping[str, object], parameters: Mapping
 
 def sync_config() -> dict[str, str]:
     """Read peer settings when a sync or report needs them."""
-    import conf
+    from scripts.lib import conf
 
     path = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(Path(__file__).resolve().parents[2]
                                                          / "config/build_targets.conf"))).expanduser()
@@ -472,16 +482,6 @@ def detach() -> None:
                 pass
 
 
-def output(args: list[str], cwd: str, timeout: float) -> str | None:
-    try:
-        result = subprocess.run(
-            args, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout if result.returncode == 0 else None
-
-
 def git_facts(directory: str) -> GitFacts:
     facts: GitFacts = {"repo_path": None, "worktree": None, "branch": None, "sha": None}
     base = ["git", "-C", directory, "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"]
@@ -502,41 +502,6 @@ def git_facts(directory: str) -> GitFacts:
         sha = output(["git", "-C", directory, "rev-parse", "--short", "HEAD"], directory, GIT_TIMEOUT_S)
         facts["sha"] = sha.strip() if sha else None
     return facts
-
-
-def remote_identity(remote: str, directory: str) -> str:
-    """Normalize a remote URL or path to the repository key."""
-    if "://" not in remote and ":" in remote and not remote.startswith(("/", ".")):
-        host, path = remote.split(":", 1)
-        hostname = host.rsplit("@", 1)[-1]
-        if (hostname and (host == hostname or host == f"git@{hostname}")
-                and hostname.isascii() and all(letter.isalnum() or letter in ".-" for letter in hostname)
-                and not any(letter in path for letter in "?#\r\n\t")):
-            return f"https://{hostname.lower()}{('/' + path).rstrip('/').removesuffix('.git')}"
-        remote = f"ssh://{host}/{path}"
-    from urllib.parse import urlsplit, urlunsplit
-
-    parsed = urlsplit(remote)
-    if parsed.hostname:
-        path = parsed.path.rstrip("/").removesuffix(".git")
-        port = f":{parsed.port}" if parsed.port and parsed.port not in (22, 443) else ""
-        return urlunsplit(("https", parsed.hostname.lower() + port, path, "", ""))
-    path = Path(parsed.path if parsed.scheme == "file" else remote).expanduser()
-    if not path.is_absolute():
-        path = Path(directory) / path
-    return str(path.resolve()).rstrip("/").removesuffix(".git")
-
-
-def recorded_repository_key(argv: list[str], directory: str) -> str:
-    """Read the repository key without loading admission scheduling types."""
-    if not argv:
-        return store.UNKNOWN_IDENTITY
-    remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
-    if remote and remote.strip():
-        return remote_identity(remote.strip(), directory)
-    roots = output(["git", "-C", directory, "rev-list", "--max-parents=0", "--reverse", "HEAD"],
-                   directory, GIT_TIMEOUT_S)
-    return "git-root:" + roots.strip().splitlines()[0] if roots and roots.strip() else store.UNKNOWN_IDENTITY
 
 
 def caller(tty: bool) -> str:
@@ -625,6 +590,22 @@ def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
     if key := os.environ.get("BUILDLOG_SENT_TREE_KEY"):
         return SentTreeKey(key)
     return NoSentTreeKey()
+
+
+@dataclass(frozen=True)
+class SentRepositoryIdentity:
+    value: str
+
+
+@dataclass(frozen=True)
+class NoSentRepositoryIdentity:
+    pass
+
+
+def sent_repository_identity() -> SentRepositoryIdentity | NoSentRepositoryIdentity:
+    """Read the source repository identity sent to a mirror step."""
+    value = os.environ.get("BUILDLOG_REPO_IDENTITY", "").strip()
+    return SentRepositoryIdentity(value) if value else NoSentRepositoryIdentity()
 
 
 def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
@@ -1003,9 +984,13 @@ def step(args: list[str]) -> None:
             return
         tty = tty_text == "1"
         directory = git_directory(argv, cwd)
-        repository_key = recorded_repository_key(argv, directory)
+        repo_identity = repository_key(directory) if argv else store.UNKNOWN_IDENTITY
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
+        sent_identity = sent_repository_identity()
+        if (repo_identity == store.UNKNOWN_IDENTITY and step_caller in ("verify-mac", "verify-linux")
+                and isinstance(sent_identity, SentRepositoryIdentity)):
+            repo_identity = sent_identity.value
         sent_key = sent_tree_key()
         if step_caller in ("verify-mac", "verify-linux") and tree["tree_changed"] is None and isinstance(sent_key, SentTreeKey):
             tree["tree_key"] = sent_key.value
@@ -1055,7 +1040,7 @@ def step(args: list[str]) -> None:
             **({"target_directory": str(output_roots.target_directory),
                 "build_directory": str(output_roots.build_directory)}
                if isinstance(output_roots, CargoOutputRoots) else {}),
-            "repo_identity": repository_key,
+            "repo_identity": repo_identity,
             **git_facts(directory),
             **tree,
             # A reusable test build needs verify's Cargo inputs as well as
