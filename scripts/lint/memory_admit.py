@@ -56,12 +56,14 @@ from test_phase import (
 if TYPE_CHECKING:
     from ..buildlog import parse
     from ..buildlog import record as record
+    from ..buildlog import repository as repository
     from ..buildlog import store as store
     from ..buildlog import index
     file_marks = index
 else:
     import parse
     import record
+    import repository
     import store
     import index as file_marks
 
@@ -3215,7 +3217,7 @@ def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     directory = record.git_directory(argv, cwd)
     facts = record.git_facts(directory)
     worktree = Path(facts["worktree"] or cwd).name
-    key = record.recorded_repository_key(argv, directory)
+    key = repository.repository_key(directory)
     if key == store.UNKNOWN_IDENTITY:
         return UnknownRepository(), worktree
     checkout_name = Path(facts["repo_path"] or cwd).name

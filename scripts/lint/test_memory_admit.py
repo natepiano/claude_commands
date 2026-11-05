@@ -1486,7 +1486,7 @@ class RepositoryHistoryTests(unittest.TestCase):
 
     def test_repository_identity_uses_the_recorders_remote_rule(self) -> None:
         directory = self.checkout("project", "git@example.org:owner/project.git")
-        with patch.object(gate.record, "remote_identity", return_value="https://example.org/owner/project") as normalize:
+        with patch.object(gate.repository, "remote_identity", return_value="https://example.org/owner/project") as normalize:
             identity = self.identity(directory)
         self.assertEqual(identity.key, "https://example.org/owner/project")
         normalize.assert_called_once_with("git@example.org:owner/project.git", str(directory))

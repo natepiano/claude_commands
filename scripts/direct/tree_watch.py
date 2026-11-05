@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Shared verify cache key and conservative workspace-input watcher.
 
---key [--watch-start FILE] [tree_key args] prints the existing cache key.
+--key [--with-tree-content] [--watch-start FILE] [tree_key args] prints the cache key.
+--with-tree-content also prints the key without script files.
 --watch-key [tree_key args] prints only the watched input key.
 START FIRED PARENT [--signal-parent] [tree_key args] watches until changed (0)
 or the parent exits (3). Cargo metadata is supplied once on stdin.
@@ -109,6 +110,7 @@ class TreeInputs:
 
     def __init__(self, args: list[str], metadata: str) -> None:
         split = args.index("--")
+        self.tree_content_key: str = ""
         self.files: list[str] = args[:split]
         self.words: list[str] = args[split + 1:]
         self.package: str = self.files[1] if self.files[:1] == ["--package"] else ""
@@ -168,6 +170,7 @@ class TreeInputs:
         return self.counts(path) and (cargo_root or any(full.startswith(root + b"/") for root in self.members))
 
     def keys(self, *, cache: bool = True, watch: bool = True, lint_versions: bool = True) -> tuple[str, str]:
+        self.tree_content_key = ""
         # status never refreshes the index; diff does, even with no-optional-locks.
         status = run("git", "--no-optional-locks", "-C", self.top, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
         changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3 and not entry[3:].startswith(self.own)})
@@ -215,6 +218,7 @@ class TreeInputs:
                 # Unknown tool versions prevent cache reuse and publication.
                 return "", watch_key
             key.update(versions)
+        tree_content = key.copy()
         for name in self.files:
             key.update(content(os.fsencode(name)))
         build_key = key.copy()
@@ -226,9 +230,11 @@ class TreeInputs:
                 build_key.update(b"\0" + word.encode())
         for word in self.words:
             key.update(b"\0" + word.encode())
+            tree_content.update(b"\0" + word.encode())
         for name, value in sorted(os.environ.items()):
             if name.startswith(("RUST", "CARGO_", "NEXTEST_")) and name != "CARGO_MAKEFLAGS":
                 key.update(("\0" + name + "=" + value).encode())
+                tree_content.update(("\0" + name + "=" + value).encode())
                 if not name.startswith("NEXTEST_") or name == "NEXTEST_CARGO_PROFILE":
                     build_key.update(("\0" + name + "=" + value).encode())
         if self.package and os.environ.get("VERIFY_COMPUTE_TEST_BUILD") == "1":
@@ -242,6 +248,7 @@ class TreeInputs:
                     build_key.update(b"\0build=" + os.fsencode(roots.build_directory))
                     _ = Path(output).write_text("\n".join((build_key.hexdigest(),
                         str(roots.target_directory), str(roots.build_directory), "")))
+        self.tree_content_key = tree_content.hexdigest()
         return key.hexdigest(), watch_key
 
 
@@ -260,6 +267,9 @@ def main(args: list[str]) -> int:
     metadata = sys.stdin.read()
     if args[0] in ("--key", "--watch-key"):
         mode, args = args[0], args[1:]
+        paired = mode == "--key" and args[:1] == ["--with-tree-content"]
+        if paired:
+            args = args[1:]
         start = ""
         if args[:1] == ["--watch-start"]:
             start, args = args[1], args[2:]
@@ -273,6 +283,8 @@ def main(args: list[str]) -> int:
             _ = Path(start + ".paths").write_text(json.dumps(inputs.watch_entries))
             _ = Path(start).write_text(watched + "\n")
         print(cache if mode == "--key" else watched)
+        if paired:
+            print(inputs.tree_content_key)
         return 0
     start_file, fired_file, parent = args[:3]
     args = args[3:]

@@ -29,7 +29,7 @@ from scripts.production import showrunners
 from scripts.accounts import accounts
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import staff
+from scripts.production import staff, fake_unit_host
 from scripts.message import sessions as runtime_sessions
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 
@@ -37,6 +37,23 @@ from scripts.production.staff_test_support import isolated_staff_file, showrunne
 class SessionListReply(TypedDict):
     ok: bool
     result: herdr.SessionListResult
+
+
+def pane_process_reply(session_id: str = "") -> CommandResponse:
+    """Publish an agent registry record when the pane scan first observes it."""
+    pid = 998041 if session_id else 998040
+    response = CommandResponse(code=0, stdout=json.dumps({"result": {"process_info": {
+        "shell_pid": 998040, "foreground_process_group_id": pid,
+        "foreground_processes": [{"pid": pid, "name": "claude" if session_id else "zsh",
+                                  "argv": ["claude" if session_id else "zsh"]}]}}}))
+    if session_id:
+        fake_unit_host.process(os.environ, pid, 998040, ["claude"], {})
+        registry = runtime_sessions.sessions_dir() / f"{pid}.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        response["write_files"] = {str(registry): json.dumps({
+            "pid": pid, "procStart": "1", "name": "solo", "sessionId": session_id,
+            "updatedAt": 1, "messagingSocketPath": ""})}
+    return response
 
 
 def setUpModule() -> None:
@@ -110,6 +127,8 @@ class HerdrSessionsTests(unittest.TestCase):
             "--session default session list --json": response,
             **{f"--session {name} pane list": {"stdout": json.dumps({"result": {"panes": panes}}), "code": 0}
                for name in names},
+            **{f"--session {name} pane process-info --pane {pane['pane_id']}": pane_process_reply()
+               for name in names for pane in panes},
         }))
 
     def process(self, pid: int, parent: int, argv: list[str], environment: dict[str, str]) -> None:
@@ -317,7 +336,8 @@ class HerdrSessionsTests(unittest.TestCase):
             name="boss", seen=100.0, tabs=[herdr.SavedName(name=members[pane["label"]].id, seen=100.0)
                                          for pane in client.tabs[:4]])])))
         running = herdr.live_sessions()
-        with patch.object(herdr, "Herdr", return_value=client), patch.object(herdr, "live_sessions", return_value=running):
+        with (fake_unit_host.private_process_registry(), patch.object(herdr, "Herdr", return_value=client),
+              patch.object(herdr, "live_sessions", return_value=running)):
             self.assertEqual(self.call("sort-tabs"), (0, "", ""))
         self.assertEqual(client.commands, [("tab.move", before["p8"], "1"), ("tab.move", before["p14"], "1")])
         self.assertEqual({pane["pane_id"]: pane["tab_id"] for pane in client.tabs}, before)
@@ -545,6 +565,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         home = self.root / "home"
         home.mkdir()
         (home / ".claude/sessions").mkdir(parents=True)
+        (self.root / "sessions").mkdir()
         self.enterContext(patch.dict(os.environ, {
             "HOME": str(home), "XDG_CONFIG_HOME": str(self.root / "config"), "PATH": os.environ.get("PATH", os.defpath),
             "HERDR_BIN": str(Path(__file__).with_name("fake_herdr.py")),
@@ -552,7 +573,9 @@ class StandaloneLaunchTests(unittest.TestCase):
             "SYSTEMCTL": str(Path(__file__).with_name("fake_herdr.py")),
             "HERDR_PROC": str(self.proc), "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.responses_path),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         }, clear=True))
+        _ = self.enterContext(fake_unit_host.private_process_registry())
         configuration = self.enterContext(scratch_accounts_config())
         _ = (configuration / "script_prompts.conf").write_text(
             (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
@@ -584,6 +607,8 @@ class StandaloneLaunchTests(unittest.TestCase):
         opened = {"pane_id": "w1:p1", "label": "opened", "workspace_id": "w1", "tab_id": "w1:t1"}
         self.responses[f"--session {name} pane list"] = [
             {"stdout": json.dumps({"result": {"panes": panes}}), "code": 0} for panes in (before, [*before, opened])]
+        for pane in [*before, opened]:
+            self.responses[f"--session {name} pane process-info --pane {pane['pane_id']}"] = pane_process_reply()
         self.save()
         pid = len(list(self.proc.glob("[0-9]*"))) + 100
         process = self.proc / str(pid)
@@ -679,6 +704,7 @@ class StandaloneLaunchTests(unittest.TestCase):
                 self.responses["--session agents pane list"] = [
                     CommandResponse(code=0, stdout=json.dumps({"result": {"panes": panes}}))
                     for panes in pane_lists]
+                self.responses["--session agents pane process-info --pane w1:p1"] = pane_process_reply(member.current_session)
                 self.save()
                 arguments = (("start", "--name", title, "--cwd", str(self.root)) if verb == "start" else
                              ("resume", title, "--session-id", member.current_session, "--cwd", str(self.root)))

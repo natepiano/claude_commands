@@ -301,7 +301,7 @@ def _parse(line: str | bytes, variants: dict[str, type]) -> object:
         if variants[name] is AdmitRequest and isinstance(data, dict) and "run" not in data:
             data = {**cast(dict[str, object], data), "run": gate.snapshot_value(NO_RUN)}
         return gate.parse_snapshot_value(cast(object, data), variants[name])
-    except (KeyError, TypeError, UnicodeError) as error:
+    except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
 

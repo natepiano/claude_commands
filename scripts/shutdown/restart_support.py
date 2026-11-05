@@ -95,6 +95,8 @@ def _deliver_message(
                 return MessageReplaced(kind="replaced", reason=detail)
             case "queued":
                 return MessageQueued(kind="queued", reason=detail)
+            case "retry":
+                raise RuntimeError(f"send to {recipient} needs a retry: {detail}")
             case "failed" | "refused" | "held" | "pending":
                 pass
     if isinstance(outcome, send_result.UnconfirmedSendOutcome):

@@ -334,7 +334,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 #### As-built
 
 - `record.py` loads config, target, hash, gzip, json, store and url parsing only on the paths that use them. The pending writer uses `os.open(O_EXCL, 0o600)` and `os.replace`; ids come from `os.urandom`.
-- One owner for each rule: `record.remote_identity` (repository key; admission's `git_identity` calls it), `record.recorded_repository_key` (origin remote, else `git-root:<first root>`), `parse.test_threads` (admission keeps the name `memory_admit.test_threads`), `record._target_hosts` (one `sync_config()` read for all targets).
+- One owner for each rule: `repository.remote_identity` (repository key), `repository.repository_key` (origin remote, else `git-root:<first root>`; admission's `git_identity` calls it), `parse.test_threads` (admission keeps the name `memory_admit.test_threads`), `record._target_hosts` (one `sync_config()` read for all targets).
 - `remote_identity` has an SCP shortcut that skips `urllib.parse`; it builds the path as the urlsplit path does, so keys are unchanged. `test_step_row.py` pins the keys in a table and uses a temporary build log.
 - CPU ms per call, bevy_brp with a real Cargo.toml, before -> after (merged tree 08397569e): terminal 294.8 -> 150.3, tee 289.3 -> 151.4, call 118.2 -> 86.3, step-context 77.2 -> 60.0, test-phase-context 208.2 -> 80.9. The driver is in the phase 18 folder (`cpu_driver.py`).
 
@@ -486,7 +486,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 #### As-built
 
-- `offload.repository_identity` reads `record.recorded_repository_key(["git"], str(source.parent))`: the normalized origin URL, else `git-root:<root commit>`, else `store.UNKNOWN_IDENTITY`, which maps to `KnownRepository(name)` with no key. A lookup runs 1 git process in place of 3. Keys are unchanged; offload CPU per lookup drops by about 75 ms.
+- `offload.repository_identity` reads `repository.repository_key(str(source.parent))`: the normalized origin URL, else `git-root:<root commit>`, else `store.UNKNOWN_IDENTITY`, which maps to `KnownRepository(name)` with no key. A lookup runs 1 git process in place of 3. Keys are unchanged; offload CPU per lookup drops by about 75 ms.
 - `persist_attempt` writes `repository.key`, else `store.UNKNOWN_IDENTITY`. A keyless repository no longer writes an empty `repo_identity` that `index.py` reads as a real identity.
 - `memory_admit.git_identity` reads the same function and keeps only its name and legacy-name rules, so one place holds the key rule. `git_output` is gone.
 - `offload.py` imports `record` and `store` at module top; it calls no `memory_admit` function.
@@ -503,7 +503,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 - Importing `offload` still loads `scripts.lint.memory_admit` through `sweep` -> `build_hold` -> the admission modules. resources-unit owns that chain.
 - Check "no `memory_admit` code runs" by the files a call executes, not by `sys.modules` names: the chain loads `scripts.lint.memory_admit`, not the bare name.
 
-**Ruled out:** passing the eligibility `KnownRepository` into `persist_attempt` (about 4 ms per offload run); deleting `git_reply` fixture branches that other `record` paths still reach. The `argv` parameter of `recorded_repository_key` goes away in natest-unit's move of that function, which switches every caller.
+**Ruled out:** passing the eligibility `KnownRepository` into `persist_attempt` (about 4 ms per offload run); deleting `git_reply` fixture branches that other `record` paths still reach. natest-unit moved the key to `repository.repository_key(directory)` with no `argv`; the merge of builds 5493dfa93 switched `offload.py` and `memory_admit.git_identity` to it.
 
 ### Phase 25 — A kill counts as a build when its program is under a Cargo target folder  · status: done
 

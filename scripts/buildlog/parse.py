@@ -17,7 +17,7 @@ import re
 import shlex
 from collections.abc import Mapping
 from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, TypedDict
+from typing import TypedDict
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 
@@ -263,10 +263,7 @@ def result_status(word: str) -> str:
 
 def nextest_slow_test_s() -> float:
     """Read the nextest recording threshold at use."""
-    if TYPE_CHECKING:
-        from ..lib import conf
-    else:
-        from scripts.lib import conf
+    from scripts.lib import conf
 
     return conf.read("test_times").number("NEXTEST_SLOW_TEST_S")
 

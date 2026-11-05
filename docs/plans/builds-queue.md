@@ -81,7 +81,7 @@ only I can bump
 7. **Constraints from 10r (checkpoint 64615a2c5).** Measured memory is resident only (cgroup memory.current minus inactive_file; RSS for processes); `swap_bytes` is kept apart and is never charged. Service rows (hana CI, compiler cache) are tagged in `scripts/build_queue/scope_activity.py`. An empty service row (no live process, zero RAM) is not a running step (`scripts/lint/memory_admit.py:1816`); idle CI with RAM still charges it. The design and rulings are in the session file phases/10t/design.md; ruling 8 adds `build_free_check_calm`.
 ### Phase 10u — Gate copies belong to a staff row  · status: todo
 
-**Depends on:** none (fences from 10t: `scripts/copies/*` and its callers; runs beside 10t).
+**Depends on:** none. It touches `scripts/copies/*` and its callers only, so it can run beside the admission phases.
 
 1. **The ask (user, 2026-11-04; sdlc ruling as staff owner; builds assigned copies.py to queue-unit).** Everything tracks back to the staff file.
 2. **The change.** `copies.py --owner` takes a staff row and refuses a name or id that staff.json does not hold. The copies registry stores the owner's staff id. Readers show the current staff short name, looked up from the id at read time. No reader parses the owner from a folder name.
@@ -89,7 +89,7 @@ only I can bump
 4. **Existing records.** `GateRecord.owner` stores a name today, and `tree_paths` puts that name in folder paths. Convert each existing record to the staff id with no lost copy; the folder path does not change when the unit is renamed.
 5. **Proof.** Tests: an unknown owner is refused; the registry holds the id; an old name record converts; a renamed unit shows its new name with no copy change, and its copy is then reused and removed. The staff accessor test passes.
 
-**Workers:** `1 writer + 1 tester`.
+**Workers:** `1 writer + 1 tester` — `impl` owns `scripts/copies/copies.py`, each caller's `--owner` call (outside owners named in the notice) and `docs/as-built/staff-accessors.md`; `test` owns `scripts/copies/test_copies.py`, the staff accessor test and each changed caller's suite.
 ### Phase 10w — A copy's origin is the source's GitHub remote  · status: done
 
 **Depends on:** none (split from 10u by builds, 2026-11-04; `scripts/copies/copies.py` only; runs beside 10t and before 10u).
@@ -149,19 +149,56 @@ only I can bump
 
 **Ruled out:** a budget that follows measured use (10t); time windows that let younger runs pass the first in line (10y); slot fields in state.json; a cancel command.
 
-### Phase 10ab — One sweep process loads store.py once  · status: todo
+### Phase 10q — One sweep process loads store.py once  · status: done (bbae0f7eb)
 
-**Depends on:** 10z. A small checkpoint before 10x. Source: resources Phase 64 review, sent by builds 2026-11-05.
+#### As-built
 
-1. **Defect.** `scripts/build_queue/head_facts.py:17` imports `from scripts.buildlog import store`. The lint graph imports the bare `store`. So `import sweep` loads `store` and `scripts.buildlog.store`: two module objects, two copies of its state (proved on resources 1a7ce52ce).
-2. **Fix.** One runtime module identity for store in each process. Copying record.py's `__package__` check does not do it: head_facts keeps a set `__package__` when sweep imports it, so it keeps the package import beside the bare `store` (architect review, 2026-11-05). Pick the one name every importer uses, and check the other build_queue modules for the same import.
-3. **Proof.** Tests for both import orders (`import sweep` first, and the package import first): each leaves exactly one store module in `sys.modules`. Queue and memory suites green; basedpyright 0/0/0.
+- One process holds one `store` module object, whichever name imports it first. The buildlog and lint modules import the bare `store`; `head_facts.py`, `admission_service.py`, `admission_client.py` and `merge_gate.py` import `scripts.buildlog.store`.
+- `scripts/buildlog/store.py` registers itself as `sys.modules["store"]` when it loads. It registers `scripts.buildlog.store` and sets the package attribute `store` only when `scripts.buildlog` is already loaded. It searches for and imports nothing at load.
+- `scripts/buildlog/__init__.py` makes `scripts.buildlog` a regular package. At load it adopts a bare `store` module from its own directory: it registers it as `scripts.buildlog.store` and sets the package attribute. A `store` from another checkout is not adopted.
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `head_facts.py` and any importer it changes; `test` owns the import-order tests.
+**Files:**
+- `scripts/buildlog/store.py` — registers its module under both names.
+- `scripts/buildlog/__init__.py` — adopts a bare-first store from the same directory.
+- `scripts/buildlog/test_store_identity.py` — six fresh-interpreter cases: bare first, package first, `import sweep`, bare then dotted attribute, the index import order from a cwd outside the repository, and an unrelated raising `scripts/__init__.py`.
+
+**Binds later work:** packaging or import changes in `scripts/buildlog` keep `__init__.py` and both import forms (`import store` and `from scripts.buildlog import store`).
+
+**Gotchas:** a namespace package runs no code at load. A dotted child already in `sys.modules` makes `import scripts.buildlog.store` skip the parent's initializer, so store.py adds the dotted name only after the package exists. Deleting an alias from `sys.modules` and importing again makes a new module (a reload); no caller does that.
+
+**Ruled out:** record.py's `__package__` check (head_facts keeps a set `__package__` under sweep); a `find_spec` search or package import from store.py (it shadows modules through `sys.path` and runs an unrelated `scripts/__init__.py` from the cwd).
+
+### Phase 10s — A run with no scope reads its anonymous use from its processes  · status: todo
+
+**Depends on:** 10q. Runs before 10x. Source: builds live check of main 66a34ca16, 2026-11-05 02:05 EST.
+
+#### Work Order
+
+**Goal:** The cap shows a value while a merge gate runs, and a merge gate keeps aside only its need less its use.
+
+**Spec:**
+1. **Cause (live, 02:05 EST).** The service runs the 10z code (started 01:55:30, after the 01:55:26 files). The devtools merge gate (pid 2678865) holds a reservation with no `sidecar`: `merge_gate.py:343` takes `queue_place("merge-gate")` in its own process and makes no scope. `reservation_memory` then sets `RunUseUnavailable("step has no scope")`, so `memory_room` sets the cap to `CapUnavailable`, and the run keeps aside its full 6 GiB need for its life. Room and starts are correct; the cap text and the keep-aside are not as 10z intends.
+2. **Fix, use (builds approval, 02:3x EST).** One reading per step kind, in one function in `process_memory` that picks by what the step has. A step with a scope reads its scope's `memory.stat` anon. An in-process holder with no scope (`queue_place` used as a context manager, as `merge_gate.py:343` does) reads `RssAnon` summed over its process tree. Both give `AnonymousRunUse`. One process table read per pass, as today. No second copy in `queue_evidence.py`.
+3. **Fix, text.** When the cap is unavailable, `room_text` names the runs whose use is unavailable and prints no use sum: today it prints "anonymous use 0.0 GiB" beside "unavailable".
+4. **Keep the resident reading (architect review, 2026-11-05).** `process_memory` (`memory_admit.py:2827`) returns resident bytes today; `queue_place.py:352` and `unowned_slice_memory` (`memory_admit.py:4612`) read them. Keep resident bytes and swap as separate values, and add the anonymous reading beside them. A missing or invalid `RssAnon` line makes that run's use `RunUseUnavailable`; today the reader skips status errors with no trace.
+5. **One count per process (architect review).** `run_memories` (`memory_admit.py:3688`) removes duplicate scope readings; process trees have no such rule. Two reservations that cover the same process tree count its use once, and a tree inside a scope that another reservation reads counts once. `memory_admit.py` owns that rule.
+6. **The memory page.** The page feed (`/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/memory_feed.py:291`) rejects the whole reading when the cap alone is unavailable, so the page goes blank. Keep the rows, the room and the cap text, and draw no cap line. 10m adds the named page types.
+7. **Proof.** Tests: a step with no scope gets its anonymous use from a fixture process tree, the cap is a value and its keep-aside is need less use; a merge gate holder (`queue_place("merge-gate")` as a context manager) gets a cap value; a step with a scope still reads `memory.stat`; an unreadable status file or a missing `RssAnon` line leaves that run unavailable and the text names it with no sum; two reservations over one tree, and a tree inside a read scope, count its use once; `queue_place.py` and `unowned_slice_memory` still get resident bytes and swap.
+8. **Out of scope.** The merge gate's 6 GiB need against its 4.6 GiB peak stays with 10e (grant from the recorded peak).
+
+**Files:**
+- `scripts/lint/memory_admit.py` — `process_memory`, `tree_memory`, `reservation_memory`, `run_memories`.
+- `scripts/build_queue/queue_evidence.py` — `room_text`.
+- `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/memory_feed.py` — the page feed (outside the repository).
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py` — the tests.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns `memory_admit.py`, `queue_evidence.py` and `memory_feed.py`; `test` owns the two test files.
+
+**Acceptance gate:** memory, queue and caller suites pass; basedpyright 0/0/0 on the changed files. Change-Review: during a merge gate, `/build:queue` shows a cap value and the gate keeps aside its need less its use.
 
 ### Phase 10x — The admission code keeps one way to do each thing  · status: todo
 
-**Depends on:** 10z. Runs before 10h, 10k and 10v, which change the same admission files.
+**Depends on:** 10z and 10s. Runs before 10d, 10h, 10k and 10v, which change the same admission files. **Order after 10x (architect review, 2026-11-05):** 10d, 10h, 10k, 10v, then 10e, one at a time; 10e runs after 10v because both change the merge gate caller and its history identity.
 
 1. **Source.** The 10z simplify review, items 1-8, 10, 11, 14, 16, 19-34 and 40 (saved in the 10z phase folder as `simplify_result_1.md`). 10z fixed the items that change behavior or shown numbers. This phase deletes and merges code; behavior does not change.
 2. **Dead code.** Delete `AdmissionServer.launches`, the unused charge and peak code with `peak_hold_seconds`, `AdmissionLimits`, `decide`, `HeadPriority`, `HeadPolicy.recovery`, `MemoryRoom.now`, `countdown`, `Span.until` and the dead `BUILDLOG_BUILD_BUDGET_GIB` setters in outside test support (one owner switches all callers).
@@ -197,8 +234,8 @@ only I can bump
 3. **The profile.** Each group 1 run records its highest use in each 5% of each phase, under the key history already uses for the step's need, with the same retention. Failed runs and the existing margins keep their current treatment.
 4. **The keep-aside.** While a run runs, keep aside max(0, the highest recorded use from its phase and percent now to the end of its last phase − its use now). With no counter, or no matching profile, the run keeps its full 10z keep-aside.
 5. **Shown.** Hovering a running run shows its phase, its percent done, what it keeps aside and why.
-6. **Test phase contract (architect review, 2026-11-05).** A nextest test phase keeps 10z's rule: need = max(test peak, N) × `test_phase_margin`, frozen when the test phase starts. Progress data may lower the remaining need only from measured anonymous use, never from an estimate. A phase reset, a missing counter or an unmatched profile falls back to the frozen need.
-7. **Proof.** Unit tests for the profile, each counter parser, each transition in item 6 and the fallback. Measured runs after landing show lower keep-aside late in a build and no OOM kill.
+6. **Test phase contract (architect reviews, 2026-11-05).** A nextest test phase keeps 10z's rule: need = max(test peak, N) × `test_phase_margin`. Freeze the baseline N and the margin when the test phase starts. Do not freeze the test peak: `test_phase_charge` (`memory_admit.py:3666`) reads the current test peak at each pass, and that stays. Progress data may lower the remaining need only from measured anonymous use, never from an estimate. A phase reset, a missing counter or an unmatched profile falls back to the frozen N and margin.
+7. **Proof.** Unit tests for the profile, each counter parser, each transition in item 6 and the fallback. One test grows the observed test peak past N after the test phase starts; the need follows the peak with the frozen margin. Measured runs after landing show lower keep-aside late in a build and no OOM kill.
 
 **Workers:** `1 writer + 1 tester` — `impl` owns the counter parsers, the profile writer and `memory_admit.py`; `test` owns the parser fixtures, the transition tests and the caller suites.
 
@@ -214,7 +251,10 @@ only I can bump
 6. **Wait states.** The page shows the three wait states the service records: unreadable pressure (with its path), start spacing, and head protection. 10z keeps the pressure text and `ReadingAlertTests`; 10h owns holder names.
 7. **Proof.** The feed's tests pass, with feed and page tests for each of the three wait states. A pixel check of the page shows the cap, the room, the leftover ages and report-unit's sections. Each item returns as its own Change-Review row.
 
-**Workers:** `impl` owns the page and the feed; `test` owns the feed and page tests. report-unit owns its section data functions in `scripts/buildlog`.
+8. **Partial readings (architect review of 10q, 2026-11-05).** The feed reads each part of the page on its own. When one part is unavailable (the cap, pressure, a run's use), the page keeps the other parts and names the missing one. Use named availability states, not a bare `None` (today `memory_feed.py:109` stores missing pressure as `None`). Acceptance tests: with the cap alone unavailable, the page keeps its rows, the room and the reason text.
+9. **Sources.** The prototype is in `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/` (`memory_live.html`, `memory_feed.py`). It moves to `scripts/build_page/` (page, feed and tests). report-unit's sections reuse the typed collectors `charts.collect_charts` (`scripts/buildlog/charts.py:133`) and `costs.collect_costs` (`scripts/buildlog/costs.py:389`).
+
+**Workers:** `impl` owns `scripts/build_page/` (the page and the feed); `test` owns `scripts/build_page/test_*.py`. report-unit owns, as a separate lane, its section adapters over `collect_charts` and `collect_costs` in `scripts/buildlog` and their tests.
 
 ### Phase 10n — /build:queue retires when the build page covers it  · status: todo
 
@@ -224,7 +264,7 @@ only I can bump
 2. **The change.** List what /build:queue shows and confirm the page shows each item, the 10m wait states included. Then remove the command and the view code that only it uses. Shared formatters stay: `admission_service.py` imports `queue_view.reason_phrase`, and the card uses other queue_view formatters. The queue card and the unit-board queue pane stay unless the user says otherwise.
 3. **Proof.** No caller of the removed code remains; the suites pass.
 
-**Workers:** `1 writer + 1 tester`.
+**Workers:** `1 writer + 1 tester` — `impl` owns `commands/build/queue.md`, `scripts/build_queue/build_queue.py` and the view code that only it uses; `test` owns `scripts/build_queue/test_build_queue.py`, the golden files it alone reads and the suites of the shared formatters.
 
 ### Phase 10v — Every run in builds.slice asks the queue before it starts  · status: todo
 
@@ -716,7 +756,15 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - Service estimate request: `AdmitRequest` requires an estimated profile (`admission_protocol.py:67`), and build admission refuses a missing or stale generation (`admission_service.py:762`). Add a named request variant for a service-made estimate, not an optional profile. State its refresh, generation, replay and `NoRun` behavior. `impl` owns `admission_protocol.py`; `test` owns protocol compatibility tests, including a client from the pinned store package.
 - Deployment order: the socket exists already, so "after the socket" is no gate. The runner group gets socket access, and the slice cap rises, only after the service with authorization and a compatible protocol is on main and live. natedev owns the NixOS activation and the account-level acceptance.
 
-**Pending decision:** the `hana-ci.slice` cap. 10z deleted the admission budget, so "raise `MemoryMax` to the admission budget (24G)" (nixos item 3) has no value to copy. State a slice policy, and how registered CI reservations replace the CI keep-aside (`ci_memory_margin_gib=7`) with no double charge. Sent to builds, 2026-11-05.
+**Slice cap (builds ruling, 2026-11-05).** 10z deleted the admission budget, so nixos item 3 has no 24G value to copy. The `hana-ci.slice` cap is host RAM less the 3 GiB safety, and admission alone decides. Registered CI reservations replace the CI keep-aside, so CI is not charged twice. Order: 10d runs after 10q and 10x. **Last step, held for the user's go (builds filed the question):** delete `ci_memory_margin_gib` and send natedev the slice note with the new `MemoryMax`. If the user says keep, that step keeps `MemoryMax=34G` and the keep-aside.
+
+**CI accounting transition (architect review of 10q, 2026-11-05).** Today `ci_keep_aside` (`memory_admit.py:1967`) adds the configured margin whenever any CI job runs, and it does not look at reservations. Before any key deletion or `MemoryMax` change:
+1. A running CI job with a registered reservation is charged only through its reservation.
+2. The CI keep-aside applies only while a running CI job has no registered reservation.
+3. Tests: registered jobs only (no keep-aside), unregistered jobs only (keep-aside as today), and a mix (the keep-aside once, plus each registered reservation).
+This rule holds under both answers to the held last step; the answer changes only whether the key stays for unregistered jobs.
+
+**Current references (architect review of 10q).** `CleanupTiming` exists (`admission_protocol.py:177`), and `admission_client.py:502` accepts it for release with no config read. Authorization targets today: `_run_place()` (`admission_service.py:847`), replay lookup (`admission_service.py:1311`) and peer credentials (`admission_service.py:1519`, where the UID is read and then discarded). These replace the older line numbers in the constraints above. Keep the tests that deny every local config and history read through the whole runner acquisition.
 
 **Workers:** `1 writer + 1 tester` (natedev owns the NixOS activation)
 - `impl` — the CI cargo front, the service authorization and estimate path, the client package entry; hub: `scripts/build_queue/admission_service.py`
@@ -731,9 +779,15 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 1. F014: `_read_need_record` in `scripts/lint/memory_admit.py` keeps three identical rejection returns. Make one.
 2. F044: move the `struct` import in `admission_service.py` `_record_caller_version` to the module imports.
 
-**Existing path (architect review, 2026-11-05).** `HistoryPeakSizing`, `program_peak_estimate` and the program refresh path exist; `merge_gate.py:343` still picks `FixedCapSizing`. The change is the caller switch and its evidence. Agree history handling with 10v's `full-tests` split.
+**Existing path (architect review, 2026-11-05).** `HistoryPeakSizing`, `program_peak_estimate` and the program refresh path exist; `merge_gate.py:343` still picks `FixedCapSizing`. The change is the caller switch and its evidence. Agree history handling with 10v's `full-tests` split. 10e runs after 10v (see 10x's order line).
 
-**Workers:** `1 writer + 1 tester`.
+**Anonymous peak evidence (architect review of 10q, 2026-11-05).** `merge_gate.py:485` measures resident memory plus swap, and `merge_gate.py:1028` sends that peak to the reservation sampler. `program_peak_estimate` (`memory_admit.py:1736`) reads those records as `anon_peak_bytes`. Before the caller switch:
+1. Define valid anonymous peak evidence for a merge gate: the 10s anonymous reading of the gate's process tree.
+2. Mark records written before the change as legacy. A legacy record does not size a grant. With no valid record, the gate keeps today's fixed grant.
+3. Keep the gate's own internal memory limit apart from its grant.
+4. Tests: a valid record sizes the grant; a legacy record and no record keep the fixed grant; the internal limit does not change.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns `memory_admit.py`, `admission_service.py` (F044) and `scripts/production/merge_gate.py` (sdlc devtools-unit's file: name it in the notice's also-touches line); `test` owns the history tests in `scripts/lint/test_memory_admit.py`, `scripts/production/test_merge_gate.py` and the merge gate admission suites.
 
 ### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
 **Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The naming map is a design call that the builds showrunner settles. The showrunner approved it on 2026-11-03 (map and rulings: the 10f design in the unit's phase folder), with one change: a remote mirror ends when its copies.py remote lease from verify P35 ends.
@@ -744,9 +798,9 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Progress (2026-11-04):** checkpoint A is on main, with the test fixes for a `CONF_DIR` that lacks `build_folders.conf` (`build_folders._settings` then reads the repository file) and config read at use in `tmp_sweep`, `style_sync` and `folder_audit`. Checkpoint B is open.
 
-**Removal record (aws-unit ask via the builds showrunner, 2026-11-03):** each folder removal writes one record with: time, target, host, repository key, slot, folder path, bytes freed, free GiB before and after, and the reason (`floor` or `trim`). Source today: `scripts/mac_test/linux_runner.py:601-658` removes or trims a slot build folder after each step and prints only `mac_cleanup=0|1|kept` (`offload.py:765` parses it); no record names the folder or the bytes freed. aws-unit's weekly report (cold steps after a floor removal, time lost) reads this record.
+**Removal record (aws-unit ask via the builds showrunner, 2026-11-03):** each folder removal writes one record with: time, target, host, repository key, slot, folder path, bytes freed, free GiB before and after, and the reason: `floor`, `trim`, or `owner-ended` for a folder that the sweep removes after its owner is gone (architect review of 10q, 2026-11-05). Source today: `scripts/mac_test/linux_runner.py:775-788` removes or trims a slot build folder after each step and prints only `mac_cleanup=0|1|kept` (`offload.py:797` parses it); no record names the folder or the bytes freed. aws-unit's weekly report (cold steps after a floor removal, time lost) reads this record. Test: an owner-ended removal writes one record with reason `owner-ended`, and a standing copy is never removed.
 
-**Workers (checkpoint B):** `1 writer + 1 tester`. B keeps the standing-copy exclusion and the remote-lease ownership.
+**Workers (checkpoint B):** `1 writer + 1 tester` — `impl` owns `scripts/lib/build_folders.py` (sweep and the record writer), the `tmp_sweep` call and the `linux_runner.py` record call (aws-unit reads the record: name it in the notice); `test` owns `scripts/lib/test_build_folders.py`, the `tmp_sweep` tests and the `linux_runner` record tests. B keeps the standing-copy exclusion and the remote-lease ownership.
 
 ### Phase 10g — The queue decides where every step runs  · status: todo
 **Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` picks the host once at start and the queue admits memory only on natedev; at 14:04-14:17 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
@@ -785,7 +839,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 7. Separate defect, sent to verify-unit: the call's own cargo token stayed held for 1 h after its sweep. verify Phase 36 fixes it; 10i builds on Phase 36 after it lands on builds.
 8. Design: `design.md` in the 10i session folder, with the director rulings at its end. Showrunner approved it 2026-11-03.
 9. **Removal, temporary path (showrunner condition, 2026-11-03).** The service keeps serving main's old two-pass shell only until 10i reaches main. **Trigger:** the first queue checkpoint after 10i is on origin/main. That checkpoint deletes `admission_client.token_wait` and the `token-wait` command, `TokenWaitRequest` and its codec and fixture row, the service `TokenWaiting` end and handler, `AdmitRequest.token_back_at` and the token-gap writer, and their tests. After it, one way remains. **Status (2026-11-05):** the behavior is done (`verify.sh:2968` takes the token before memory admission). This removal is still owed: origin/main does not yet hold `e539c2906`.
-10. **True wait cause (cargo-liner defect, 2026-11-03).** `token_wait_note` in `scripts/direct/verify.sh` reads `locks/cargo.d/holder` with `read -r ... || holder=""`. board.sh writes that file with no newline, so `read` fails and the holder is cleared; every token wait then says "it came free just now". Run 20261103T220514-274283-ecf4 (handler-unit) printed that for 35 min while its own call held the token from 22:12:06 to 22:50:14. Read the whole file, name the holder agent and pid, and say "this call holds it" when `holder_pid` is the call. A memory wait prints the memory line, never a token line. Test: a holder file with no newline names its holder.
+10. **True wait cause (cargo-liner defect, 2026-11-03). Done (architect review of 10q, 2026-11-05):** `verify.sh:2692` reads the holder file with no newline, and `verify.sh:2698` names this call as the holder. No work remains; the text below is the record. `token_wait_note` in `scripts/direct/verify.sh` reads `locks/cargo.d/holder` with `read -r ... || holder=""`. board.sh writes that file with no newline, so `read` fails and the holder is cleared; every token wait then says "it came free just now". Run 20261103T220514-274283-ecf4 (handler-unit) printed that for 35 min while its own call held the token from 22:12:06 to 22:50:14. Read the whole file, name the holder agent and pid, and say "this call holds it" when `holder_pid` is the call. A memory wait prints the memory line, never a token line. Test: a holder file with no newline names its holder.
 
 ### Phase 11 — Every later step of one verify.sh run keeps the queue place of the run's first step  · status: done
 
