@@ -103,7 +103,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         _ = recorded_showrunner('parent', parent_doc)
         _ = recorded_showrunner('child', child_doc, 'parent')
         folder = self.root / 'parent-unit'
-        _ = recorded_unit('parent', 'held', folder, parent_doc)
+        held = recorded_unit('parent', 'held', folder, parent_doc)
         _ = subprocess.run(['git', '-C', str(folder), 'branch', 'main'], check=True)
         _ = (folder / 'held.py').write_text('private change\n')
         parent_doc.unlink()
@@ -111,7 +111,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
               mock.patch.object(ledger, 'ticket_open', return_value=({'files': ['ticket.py']},)) as tickets,
               redirect_stderr(io.StringIO()) as errors):
             holders = unit_files.unit_file_holders(folder, child_doc, ledger)
-        tickets.assert_called_once_with('held-unit')
+        tickets.assert_called_once_with(str(held.id))
         self.assertEqual(holders['held-unit'], frozenset({'held.py', 'ticket.py', '.unit.toml'}))
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn('style: held-unit:', errors.getvalue())
@@ -148,12 +148,12 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         doc = self.source_root / 'production.md'
         _ = doc.write_text('# Production\n')
         owner = recorded_showrunner('style', doc)
-        _ = fixture_member('unit', name='standby', parent=owner.id)
+        standby = fixture_member('unit', name='standby', parent=owner.id)
         with (style_ledger.open_ledger(self.source_root) as ledger,
               mock.patch.object(ledger, 'ticket_open', return_value=({'files': ['ticket.py']},)) as tickets,
               redirect_stderr(io.StringIO()) as errors):
             holders = unit_files.unit_file_holders(self.source_root, doc, ledger)
-        tickets.assert_called_once_with('standby-unit')
+        tickets.assert_called_once_with(str(standby.id))
         self.assertEqual(holders, {'standby-unit': frozenset({'ticket.py'})})
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn('staff worktree is unfilled', errors.getvalue())
@@ -164,12 +164,12 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         owner = recorded_showrunner('style', doc)
         _ = fixture_member('unit', name='standby', parent=owner.id)
         live_folder = self.root / 'live'
-        _ = recorded_unit('style', 'live', live_folder, doc)
+        live = recorded_unit('style', 'live', live_folder, doc)
         _ = subprocess.run(['git', '-C', str(live_folder), 'checkout', '-q', '-b', 'live-branch'], check=True)
         errors = io.StringIO()
         with redirect_stderr(errors):
             result = unit_files.unit_worktrees(doc)
-        self.assertEqual(result, (unit_files.UnitWorktree('live-unit', 'live-branch', live_folder, 'main'),))
+        self.assertEqual(result, (unit_files.UnitWorktree(live.id, 'live-unit', 'live-branch', live_folder, 'main'),))
         messages = errors.getvalue().splitlines()
         self.assertEqual(len(messages), 1)
         self.assertIn('standby-unit', messages[0])

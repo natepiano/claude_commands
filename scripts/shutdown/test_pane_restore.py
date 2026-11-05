@@ -816,6 +816,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         moved = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments,
                            dict(os.environ), self.checkout)
         self.assertEqual(moved.returncode, 0, moved.stderr)
+        self.assertEqual(backend.stops, [self.owner.current_session])
+        self.assertEqual(len(backend.starts), 1)
         self.assertEqual(pane_record.resume_launch(pane_record.read("agents")["w1:p1"])["cwd"], str(self.new_folder))
         backend.live = False
         backend.publish_process_state()
@@ -850,8 +852,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                   timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
             nonlocal published, publishing
             self.assertEqual(kind, "codex")
-            self.assertEqual(agent_arguments, ["-c", 'projects={' + json.dumps(str(self.new_folder))
-                + '={trust_level="trusted"}}', "resume", self.owner.current_session, "--model", "fixture-model"])
+            self.assertEqual(agent_arguments, ["-C", str(self.new_folder), "-c", 'projects={' + json.dumps(str(self.new_folder))
+                + '={trust_level="trusted"}}', "resume", self.owner.current_session])
             self.assertIsInstance(opening, herdr.NoOpeningPrompt)
             self.assertGreater(timeout_ms, 0)
             (proc / str(backend.pid) / "fd").mkdir(parents=True, exist_ok=True)

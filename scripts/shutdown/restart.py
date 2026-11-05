@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ for dependency in ("herdr", "message", "lib", "shutdown"):
 
 import herdr
 import sessions
-from scripts.production import staff
+from scripts.production import staff, session_staff
 from scripts.lib import nix_env
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.shutdown.codex_trust import trust_arguments
@@ -43,21 +44,6 @@ def wait_for_confirmation(session_ids: frozenset[str], timeout: float) -> Regist
         time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
-def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[str, Path]:
-    member = row
-    while True:
-        if isinstance(member.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):
-            return member.worktree.machine, member.worktree.path
-        if member.kind == "unit":
-            raise ValueError(f"{row.name}: the staff worktree is unavailable")
-        if isinstance(member.doc, staff.LiveDoc):
-            return member.doc.machine, member.doc.path.parent
-        parent = record.parent_of(member)
-        if parent is None:
-            raise ValueError(f"{row.name}: no worktree in staff")
-        member = parent
-
-
 def _anomaly(row: staff.StaffRow, error: object) -> None:
     reason = str(error).splitlines()
     print(f"{row.name}: restart anomaly: {reason[0] if reason else type(error).__name__}", file=sys.stderr)
@@ -73,6 +59,10 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr) -> bool:
                 place=herdr.HerdrPlace(client.session, panes[0]["pane_id"]),
                 terminal=panes[0].get("terminal_id", ""), client=client):
             return False
+        if panes:
+            # End the restore entry before the signal, so no restore revives the stopped session.
+            pane_record.end(client.session, panes[0]["pane_id"], str(row.current_session),
+                            record=staff.StaffSnapshot((row,)))
     except (herdr.HerdrFailure, OSError, ValueError) as error:
         _anomaly(row, error)
         return False
@@ -111,14 +101,15 @@ def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str,
 
 
 def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
-              present: bool = False, target_account: str = "") -> str:
+              present: bool = False, target_account: str = "",
+              resolver: session_staff.RowResolver | None = None) -> str:
     live = herdr.read_conversation(str(row.current_session))
     if isinstance(live, herdr.LiveConversation):
         print(f"{row.name}: unchanged")
         return ""
     if isinstance(live, herdr.UnknownConversation):
         herdr.conversation_note(live)
-    machine, folder = row_folder(row, record)
+    machine, folder = shutdown_record.row_folder(row, record, resolver=resolver)
     import remote
     if machine != remote.local_machine():
         raise ValueError(f"{row.name}: session is on {machine}")
@@ -184,10 +175,31 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
         return []
 
 
-def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False) -> list[staff.StaffRow]:
+def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
+                 resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
+    """Read only the supplied rows and return their live local conversations."""
     import remote
 
     selected: list[staff.StaffRow] = []
+    resolver = session_staff.RowResolver(record) if resolver is None else resolver
+    for row in rows:
+        try:
+            machine, _folder = shutdown_record.row_folder(row, record, resolver=resolver)
+            if machine != remote.local_machine():
+                continue
+            observed = herdr.read_conversation(str(row.current_session))
+            if isinstance(observed, herdr.LiveConversation):
+                selected.append(row)
+            elif isinstance(observed, herdr.UnknownConversation):
+                herdr.conversation_note(observed)
+        except (OSError, ValueError) as error:
+            _anomaly(row, error)
+    return selected
+
+
+def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
+              resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
+    resolver = session_staff.RowResolver(record) if resolver is None else resolver
     # The registry supplies candidate names; the reader proves each conversation.
     try:
         candidates = {session["sessionId"]: (session["name"] or session["sessionId"]) +
@@ -201,18 +213,7 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     for identity in sorted(candidates.keys() - owned):
         if isinstance(herdr.read_conversation(identity), herdr.LiveConversation):
             print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
-    for row in record.rows:
-        try:
-            machine, _folder = row_folder(row, record)
-            if machine != remote.local_machine():
-                continue
-            observed = herdr.read_conversation(str(row.current_session))
-            if isinstance(observed, herdr.LiveConversation):
-                selected.append(row)
-            elif isinstance(observed, herdr.UnknownConversation):
-                herdr.conversation_note(observed)
-        except (OSError, ValueError) as error:
-            _anomaly(row, error)
+    selected = live_members(record.rows, record, resolver=resolver)
     if save_tabs:
         try:
             client.save_layout()
@@ -227,28 +228,33 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
 
 
 def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = ()) -> int:
-    record = staff.initial_snapshot()
+    try:
+        record = staff.initial_snapshot()
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        print(f"restart: staff anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+        return 0
+    resolver = session_staff.RowResolver(record)
     client = herdr.Herdr(herdr.shared_session())
     selected: list[staff.StaffRow] = []
     if stop_all:
-        selected = live_rows(record, client, save_tabs=not dry_run)
+        selected = live_rows(record, client, save_tabs=not dry_run, resolver=resolver)
     else:
         pending_ids = list(only) if only else shutdown_record.read()
         if dry_run and not only:
             path = shutdown_record.record_path()
             saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
             print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
-            for row in live_rows(record, client):
+            for row in live_rows(record, client, resolver=resolver):
                 if str(row.id) not in pending_ids:
                     print(f"{row.name}: live, not in the restart record")
         for reference in pending_ids:
-            row = record.by_member_reference(reference)
-            if row is None:
+            row = record.by_member_reference(reference) if only else record.by_id(staff.StaffId(reference))
+            if only and row is None:
                 matches = [item for item in record.rows if item.name == reference]
                 row = matches[0] if len(matches) == 1 else None
             if row is None:
-                print(f"{reference}: in the restart record, no staff row" if dry_run and not only else
-                      f"{reference}: unknown or ambiguous staff row", file=sys.stderr)
+                print(f"{reference}: unknown or ambiguous staff row" if only else
+                      f"{' '.join(reference.split())}: restart anomaly: in the restart record, no fixed staff id", file=sys.stderr)
                 continue
             selected.append(row)
     if dry_run:
@@ -297,7 +303,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 current = record.by_id(row.id)
                 if current is None:
                     raise ValueError("staff row no longer exists")
-                _ = start_row(current, record, client, present=present)
+                resolver.record = record
+                _ = start_row(current, record, client, present=present, resolver=resolver)
                 started.append(str(row.id))
                 present = False
             except errors as error:

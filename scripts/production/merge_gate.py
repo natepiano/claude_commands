@@ -878,11 +878,12 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
                     aborted: bool) -> None:
     """Build one gate record without changing the gate verdict."""
     try:
+        slow_test_s = gate_record.slow_test_s()
         modules = gate_record.module_runs([
             gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds,
                                   job.peak_mib, job.returncode, job.restart, job.times)
             for job in executions
-        ])
+        ], slow_test_s)
         suites: list[gate_record.SuiteRun] = [
             {"suite": suite, "wall_s": suite_finished.get(suite, began) - began,
              "status": int(any(job.returncode for job in results
@@ -899,7 +900,7 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             "checkout": str(ledger.repo), "branch": branch, "sha": sha,
             "tree": ledger.tree.tree if isinstance(ledger.tree, CleanTestTree) else "",
             "source": ledger.source, "aborted": aborted, "dirty": isinstance(ledger.tree, UnrecordableTestTree),
-            "suites": suites, "modules": modules,
+            "suites": suites, "modules": modules, "slow_test_s": slow_test_s,
         }
     except Exception as error:
         gate_record.report_not_written(error)

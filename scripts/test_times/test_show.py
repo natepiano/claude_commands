@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import closing, redirect_stderr, redirect_stdout
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 import io
 import os
 from pathlib import Path
@@ -14,7 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Self, override
 import unittest
 from unittest import mock
 
@@ -24,25 +24,34 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 if TYPE_CHECKING:
     from ..buildlog import record, store
     from ..buildlog.index import index_path_in
+    from ..buildlog.test_index import encode
     from ..lint.memory_test_support import write_config_fixture
     from ..production.gate_modules import discover_test_modules
     from . import gate_record, show
     from .gate_record import GateRun, ModuleRun, TestTime
-    from .gate_record_test_support import gate_run
+    from .gate_record_test_support import gate_run, remove_run_measurements
 else:
     # Import show first because it adds the build log folder to the import path.
     from scripts.test_times import gate_record, show
     from scripts.buildlog import record, store
     from index import index_path_in
+    from test_index import encode
     from scripts.lint.memory_test_support import write_config_fixture
     from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
-    from scripts.test_times.gate_record_test_support import gate_run
+    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
 
 EPOCH = datetime(2026, 11, 3, 14, 30, tzinfo=UTC).timestamp()
 HOST = store.host_name()
 REPORT_COMMANDS = (("top",), ("suites",), ("suite", "tools"),
                    ("module", "tools/test_alpha.py"), ("test", "target"))
+
+
+class ReportTime(datetime):
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> Self:
+        return cls.fromtimestamp(EPOCH + 300, tz)
 
 
 def run(*arguments: str) -> tuple[int, str, str]:
@@ -88,14 +97,16 @@ class TestTimesTests(unittest.TestCase):
             "BUILDLOG_DIR": str(self.log), "CONF_DIR": str(self.config),
             "HOME": str(self.root / "home"), "USER_ZONE": "America/New_York",
         }))
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3")
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7")
+        _ = self.enterContext(mock.patch.object(show, "datetime", ReportTime))
         for name in ("test_alpha.py", "test_beta.py", "test_missing.py"):
             path = self.repo / "scripts" / "tools" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_text("# A live fixture module.\n", encoding="utf-8")
 
     def write_run(self, modules: list[ModuleRun], *, epoch: float = EPOCH,
-                  host: str = HOST, aborted: bool = False, status: int = 0) -> None:
+                  host: str = HOST, aborted: bool = False, status: int = 0,
+                  checkout: str = "") -> None:
         self.next_id += 1
         suites: list[gate_record.SuiteRun] = [
             {"suite": suite, "wall_s": sum(row["wall_s"] for row in modules if row["suite"] == suite),
@@ -106,6 +117,8 @@ class TestTimesTests(unittest.TestCase):
             **gate_run(), "started_at": store.utc_iso(epoch), "ended_at": store.utc_iso(epoch + 30),
             "wall_s": 30.0, "hold_wait_s": 2.0, "selection": "full", "reason": "fixture run",
             "status": status, "aborted": aborted, "suites": suites, "modules": modules,
+            "checkout": checkout or str(self.repo),
+            "slow_test_s": gate_record.slow_test_s(),
         }
         with mock.patch.object(record, "new_id", return_value=f"history-{self.next_id}"), \
                 mock.patch.object(socket, "gethostname", return_value=host):
@@ -146,7 +159,7 @@ class TestTimesTests(unittest.TestCase):
         types = type_job(3.0)
         self.write_run([
             module_run("test_alpha.py", 1000.0, restart="hold", status=-15),
-            module_run("test_alpha.py", 2.0, attempt=2, status=1, tests=[slow]),
+            module_run("test_alpha.py", 2.0, attempt=2, tests=[slow]),
             module_run("test_alpha.py", 0.01, attempt=3),
             module_run("test_beta.py", 7.0), module_run("test_removed.py", 999.0), types,
         ], epoch=EPOCH + 180)
@@ -163,7 +176,7 @@ class TestTimesTests(unittest.TestCase):
         self.assertIn("Alpha.test_slow", alpha)
         numbers = [float(match.group()) for match in re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", alpha)]
         self.assertEqual(numbers, [2, 4, 2, 2, 13, 1.25, 3], alpha)
-        self.assertRegex(output.splitlines()[-1], r"3 modules; sum of medians 14(?:\.0+)? s")
+        self.assertRegex(self.line(output, "sum of medians"), r"3 modules; sum of medians 14(?:\.0+)? s")
         self.assertEqual(self.report(), output)
         limited = self.report("top", "--limit", "1", "--repo", str(self.repo))
         self.assertIn("tools/test_beta.py", limited)
@@ -171,6 +184,58 @@ class TestTimesTests(unittest.TestCase):
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
         changed = self.report("top", "--repo", str(self.repo))
         self.assertLess(changed.index("types/basedpyright"), changed.index("tools/test_alpha.py"))
+
+    def test_top_excludes_failed_aborted_old_and_other_checkout_rows_before_the_run_limit(self) -> None:
+        self.write_run([module_run("test_alpha.py", 4.0), module_run("test_beta.py", 6.0)])
+        rejected = (
+            (module_run("test_alpha.py", 900.0, status=1), EPOCH + 60, False, str(self.repo)),
+            (module_run("test_alpha.py", 800.0), EPOCH + 120, True, str(self.repo)),
+            (module_run("test_alpha.py", 700.0), EPOCH + 300 - 7 * 86400 - 1, False, str(self.repo)),
+            (module_run("test_alpha.py", 600.0), EPOCH + 180, False, str(self.root / "other")),
+        )
+        for module, epoch, aborted, checkout in rejected:
+            self.write_run([module], epoch=epoch, aborted=aborted, checkout=checkout)
+        output = self.report("top", "--repo", str(self.repo))
+        alpha = self.line(output, "tools/test_alpha.py")
+        beta = self.line(output, "tools/test_beta.py")
+        self.assertLess(output.index(beta), output.index(alpha), output)
+        for header, expected in (("median s", "4.000"), ("last s", "4.000"),
+                                 ("median CPU s", "2.000"), ("runs counted", "1")):
+            self.assertEqual(self.cell(output, alpha, header), expected, output)
+
+    def test_top_reads_history_when_the_configured_checkout_is_a_symlink(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)], checkout=str(self.repo.resolve()))
+        alias = self.repo.with_name("checkout-alias")
+        alias.symlink_to(self.repo, target_is_directory=True)
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_CHECKOUT=~/checkout-alias")
+        output = self.report("top", "--repo", str(self.repo))
+        alpha = self.line(output, "tools/test_alpha.py")
+        self.assertEqual(self.cell(output, alpha, "median s"), "8.000")
+        self.assertEqual(self.cell(output, alpha, "runs counted"), "1")
+
+    def test_top_reads_checkout_and_age_settings_at_each_report(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)], epoch=EPOCH - 2 * 86400)
+        self.write_run([module_run("test_beta.py", 9.0)], checkout=str(self.root / "other"))
+        output = self.report("top", "--repo", str(self.repo))
+        self.assertEqual(self.cell(output, self.line(output, "tools/test_alpha.py"), "median s"), "8.000")
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_MAX_AGE_DAYS=1")
+        output = self.report("top", "--repo", str(self.repo))
+        self.assertIn("no modules recorded yet", output)
+        _ = write_config_fixture(self.config / "test_times.conf", f"TOP_CHECKOUT={self.root / 'other'}")
+        output = self.report("top", "--repo", str(self.repo))
+        self.assertEqual(self.cell(output, self.line(output, "tools/test_beta.py"), "median s"), "9.000")
+
+    def test_top_names_unmeasured_live_modules_without_counting_the_display_limit(self) -> None:
+        nested = self.repo / "scripts" / "tools" / "nested" / "test_deep.py"
+        nested.parent.mkdir()
+        _ = nested.write_text("# A live fixture module.\n", encoding="utf-8")
+        self.write_run([module_run("test_alpha.py", 4.0), module_run("test_beta.py", 6.0),
+                        module_run("nested/test_deep.py", 10.0, status=1)])
+        output = self.report("top", "--limit", "1", "--repo", str(self.repo))
+        self.assertEqual(self.line(output, "unmeasured:"),
+                         "unmeasured: 2 live modules: tools/nested/test_deep.py, tools/test_missing.py")
+        self.write_run([module_run("nested/test_deep.py", 3.0), module_run("test_missing.py", 2.0)])
+        self.assertNotIn("unmeasured:", self.report("top", "--limit", "1", "--repo", str(self.repo)))
 
     def test_missing_times_and_type_jobs_do_not_show_test_measurements(self) -> None:
         types = type_job(37.0)
@@ -212,6 +277,8 @@ class TestTimesTests(unittest.TestCase):
         latest_run = self.line(suites, "11-03 09:32")
         self.assertEqual(self.cell(suites, latest_run, "selection"), "full")
         self.assertEqual(self.cell(suites, latest_run, "modules run"), "1")
+        self.assertEqual(self.cell(suites, latest_run, "tests run"), "26")
+        self.assertEqual(self.cell(suites, self.line(suites, "11-03 09:31"), "tests run"), "0")
         self.assertEqual(float(self.cell(suites, latest_run, "wall s")), 30.0)
         suite = self.report("suite", "tools", "--days", "100000")
         self.assertIn("aborted", self.line(suite, "11-03 09:32"))
@@ -233,7 +300,7 @@ class TestTimesTests(unittest.TestCase):
         self.assertLess(latest_module.index("Case.test_slow"), latest_module.index("Case.test_middle"))
         self.assertLess(latest_module.index("Case.test_middle"), latest_module.index("Case.test_last"))
         top = self.report("top", "--repo", str(self.repo))
-        self.assertRegex(self.line(top, "tools/test_alpha.py"), r"\b10\.0+\b")
+        self.assertEqual(self.cell(top, self.line(top, "tools/test_alpha.py"), "median s"), "8.000")
         history = self.report("test", "test_slow", "--runs", "2")
         self.assertIn("aborted", history)
         self.assertNotIn("other-host", history)
@@ -254,12 +321,14 @@ class TestTimesTests(unittest.TestCase):
         self.write_run([missing], epoch=EPOCH + 180)
         self.write_run([module_run("test_alpha.py", 999.0, tests=[kept])],
                        host="other-host", epoch=EPOCH + 240)
+        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=2.0")
         output = self.report("test", "target")
         self.assertIn("0.75", self.line(output, "11-03 09:30"))
         for when in ("11-03 09:31", "11-03 09:32"):
             line = self.line(output, when)
             self.assertIn("not kept", line)
-            self.assertNotRegex(line, r"\b\d+\.\d+\b")
+            self.assertEqual(self.cell(output, line, "duration s"), "")
+            self.assertIn("not kept (faster than 1.000 s or did not run)", self.cell(output, line, "status"))
         line = self.line(output, "11-03 09:33")
         self.assertIn("times missing", line)
         self.assertNotRegex(line, r"\b\d+\.\d+\b")
@@ -282,6 +351,27 @@ class TestTimesTests(unittest.TestCase):
                 self.assertEqual(sum(test["test"] in line for line in matches), 1, output)
         self.assertLess(output.index("11-03 09:32"), output.index("11-03 09:31"))
 
+    def test_legacy_histories_leave_counts_blank_and_name_the_unknown_threshold(self) -> None:
+        kept: TestTime = {"test": "Example.test_target", "s": 0.75, "status": "pass"}
+        self.write_run([module_run("test_alpha.py", 8.0, tests=[kept])])
+        self.write_run([module_run("test_alpha.py", 7.0)], epoch=EPOCH + 60)
+        path = next(self.log.glob("*/*.jsonl"))
+        entries = list(store.locked_rows(path))
+        for entry in entries:
+            remove_run_measurements(entry)
+        _ = path.write_bytes(b"".join(encode(entry) for entry in entries))
+        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=9.0")
+        suites = self.report("suites", "--days", "100000")
+        for when in ("11-03 09:30", "11-03 09:31"):
+            self.assertEqual(self.cell(suites, self.line(suites, when), "tests run"), "")
+        output = self.report("test", "target")
+        absent = self.line(output, "11-03 09:31")
+        self.assertEqual(self.cell(output, absent, "duration s"), "")
+        self.assertIn("not kept", self.cell(output, absent, "status"))
+        self.assertIn("unknown", self.cell(output, absent, "status"))
+        self.assertNotIn("9.000", absent)
+        self.assertEqual(self.cell(output, self.line(output, "11-03 09:30"), "duration s"), "0.750")
+
     def test_day_limits_and_suite_filters_exclude_old_and_other_suite_rows(self) -> None:
         now = datetime.now(UTC).timestamp()
         self.write_run([module_run("test_alpha.py", 8.0)], epoch=now)
@@ -298,7 +388,8 @@ class TestTimesTests(unittest.TestCase):
 
     def test_empty_reports_return_success_with_the_subject(self) -> None:
         for arguments, expected in zip(REPORT_COMMANDS, (
-            "no modules recorded yet", "no gate runs recorded yet", "no gate runs recorded for suite tools",
+            "no modules recorded yet\nunmeasured: 3 live modules: tools/test_alpha.py, tools/test_beta.py, tools/test_missing.py",
+            "no gate runs recorded yet", "no gate runs recorded for suite tools",
             "no gate runs recorded for module tools/test_alpha.py", "no tests recorded matching target",
         ), strict=True):
             with self.subTest(arguments=arguments):
