@@ -13,7 +13,6 @@ import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from scripts.usage import agents_log
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
@@ -30,6 +29,7 @@ if TYPE_CHECKING:
 from scripts.agents import worker_lifecycle
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.usage import agents_log
 
 ROSTER = "mesh_roster.json"
 STATE = "progress_history_state.json"

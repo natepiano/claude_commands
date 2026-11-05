@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import record
+import repository
 import step_context
 import treekey
 import store
@@ -58,6 +59,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, environment, clear=True),
                 mock.patch.object(record, "output", return_value=None),
+                mock.patch.object(repository, "output", return_value=None),
                 mock.patch.object(treekey, "tree_key", return_value=None),
                 fake_cargo_output_roots(roots),
                 contextlib.chdir(checkout),
@@ -72,9 +74,10 @@ class RecorderCompatibilityTests(unittest.TestCase):
 
     def test_scp_remote_identity_does_not_load_url_parsing(self) -> None:
         source = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import record; "
-            "assert record.remote_identity('git@EXAMPLE.com:owner/project.git', '/fixture') "
-            "== 'https://example.com/owner/project'; assert 'urllib.parse' not in sys.modules"
+            "import sys; sys.path.insert(0, sys.argv[1]); import repository; "
+            "assert repository.remote_identity('git@EXAMPLE.com:owner/project.git', '/fixture') "
+            "== 'https://example.com/owner/project'; assert 'urllib.parse' not in sys.modules; "
+            "assert 'record' not in sys.modules; assert 'scripts.buildlog.record' not in sys.modules"
         )
         result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent)],
                                 capture_output=True, text=True, env={
@@ -173,10 +176,9 @@ class RecorderCompatibilityTests(unittest.TestCase):
         ]
         for remote, roots, expected in cases:
             with self.subTest(remote=remote, roots=roots), mock.patch.object(
-                record, "output", side_effect=[remote, roots] if not remote else [remote],
+                repository, "output", side_effect=[remote, roots] if not remote else [remote],
             ):
-                self.assertEqual(record.recorded_repository_key(NEXTEST, "/fixture/project"), expected)
-        self.assertEqual(record.recorded_repository_key([], "/fixture/project"), store.UNKNOWN_IDENTITY)
+                self.assertEqual(repository.repository_key("/fixture/project"), expected)
 
     def test_target_lookup_reads_configuration_once(self) -> None:
         with mock.patch.object(record, "sync_config", return_value={
@@ -539,6 +541,7 @@ class StepOutputFolderTests(unittest.TestCase):
                             "PATH": str(binaries) + os.pathsep + environment.get("PATH", "")})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
         _ = cast(object, self.enterContext(mock.patch.object(record, "output", return_value=None)))
+        _ = cast(object, self.enterContext(mock.patch.object(repository, "output", return_value=None)))
         _ = cast(object, self.enterContext(mock.patch.object(treekey, "tree_key", return_value=None)))
 
     def write_step(self, argv: list[str], target: Path, *, cwd: Path) -> dict[str, object]:
