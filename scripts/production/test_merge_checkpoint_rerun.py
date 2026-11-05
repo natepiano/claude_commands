@@ -15,6 +15,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
 import change_review
+from scripts.production import staff, unit_lookup
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
 
 
@@ -172,13 +174,16 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         self.assertIn("the production doc has no Change review line; no rows written", result.stdout)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), self.git("rev-parse", "HEAD"))
 
-    def test_a_successful_publication_notes_an_unregistered_unit_once(self) -> None:
+    def test_a_merge_keeps_its_units_producer_after_the_staff_row_goes(self) -> None:
         review = self.root / "change-review.md"
         self.production_doc(change_review=review)
         checkpoint = self.dated_checkpoint(
             "checkpoint(alpha): two changes\n\n"
             + "Change-Review: First change | Open first | First result\n"
             + "Change-Review: Second change | Open second | Second result")
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            unit_staff_id = unit_lookup.unit_row("alpha", staff.snapshot()).id
+
         def unregister(staff_file: Path) -> None:
             document = cast(dict[str, list[dict[str, object]]], json.loads(staff_file.read_text(encoding="utf-8")))
             document["rows"] = [row for row in document["rows"] if row["name"] != "alpha"]
@@ -188,8 +193,8 @@ class CheckpointRerunTests(MergeCheckpointFixture):
             result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         notes = [line for line in result.stdout.splitlines() if line.startswith("change review: no staff row for unit")]
-        self.assertEqual(notes, ["change review: no staff row for unit alpha; Producer stays empty"])
-        self.assertEqual([row["Producer"] for row in change_review.pending(review)], ["", ""])
+        self.assertEqual(notes, [])
+        self.assertEqual([row["Producer"] for row in change_review.pending(review)], [unit_staff_id, unit_staff_id])
 
     def test_an_already_pushed_merge_keeps_the_row_failure_report_for_an_unreadable_staff_record(self) -> None:
         review = self.root / "change-review.md"

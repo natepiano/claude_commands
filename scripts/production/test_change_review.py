@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 from scripts.lib import copy_record
-from scripts.production import showrunners, staff, change_routing, merge_checkpoint
+from scripts.production import showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc
 from scripts.shutdown import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
@@ -240,6 +240,22 @@ class ProducerWriterTests(ProducerFixture):
             merge_checkpoint.record_publication_changes(production, commits, merge)
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
         self.assertNotIn(self.unit.name, change_review.pending(self.listing)[0]["Producer"])
+
+    def test_unit_merge_with_an_unmatched_slug_writes_the_units_staff_id(self) -> None:
+        merged = self.merge("unmatched-checkpoint-slug")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        unit = merge_checkpoint.unit_from_row(
+            self.unit, session_staff.RowResolver(staff.snapshot()))
+        assert isinstance(unit, merge_checkpoint.Unit)
+        request = merge_checkpoint.MergeRequest(
+            production, unit, "1", merged, (), merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
+            (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
+        )
+        with mock.patch.object(change_review, "drift", return_value=[]):
+            merge_checkpoint.record_changes(request, change_review.merge_commits(self.repo, merged), merged,
+                                            merge_checkpoint.ReadChangesWhenWriting())
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
 
     def test_an_unregistered_unit_writes_an_empty_producer_and_one_named_note(self) -> None:
         merge = self.merge()

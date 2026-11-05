@@ -186,6 +186,7 @@ class Unit(NamedTuple):
     worktree: Path
     branch: str
     owns: tuple[str, ...]
+    staff_id: staff.StaffId
 
 
 class UnitUnavailable(NamedTuple):
@@ -309,7 +310,7 @@ def unit_from_row(row: staff.StaffRow, resolver: session_staff.RowResolver) -> U
         return UnitUnavailable(name, config.reason)
     plan = (config.plan.path if isinstance(config.plan, unit_config.PlanFile)
             else Path("standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"))
-    return Unit(name, plan, location.path, branch.name, config.responsibilities)
+    return Unit(name, plan, location.path, branch.name, config.responsibilities, row.id)
 
 
 def parse_merge_tests(lines: list[str], checkout: Path) -> tuple[tuple[str, ...], ...]:
@@ -534,12 +535,14 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
 
 def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str,
                    changes: ChangesReadBeforePush | ReadChangesWhenWriting) -> None:
-    record_publication_changes(request.production, commits, merge_head, changes=changes)
+    record_publication_changes(request.production, commits, merge_head, changes=changes,
+                               known_producer=request.unit.staff_id)
 
 
 def record_publication_changes(production: Production, commits: list[change_review.Commit], merge_head: str,
                                *, changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING,
-                               report_unchanged: bool = True) -> None:
+                               report_unchanged: bool = True,
+                               known_producer: staff.StaffId | change_review.UnknownProducer = change_review.UNKNOWN_PRODUCER) -> None:
     """Register each visible change and report merges with missing rows."""
     doc = change_review.list_path(production.doc)
     if doc is None:
@@ -555,7 +558,7 @@ def record_publication_changes(production: Production, commits: list[change_revi
     try:
         # A stop after the list write but before the receipt must not add it twice.
         publication = (changes.changes if isinstance(changes, ChangesReadBeforePush)
-                       else change_review.publication_changes(commits, production.doc))
+                       else change_review.publication_changes(commits, production.doc, known_producer=known_producer))
         existing = change_review.pending(doc) if doc.exists() else []
         held = {row["Change"] for row in existing
                 if any(sha.startswith(merged) or merged.startswith(sha)
@@ -1541,7 +1544,8 @@ def run(request: MergeRequest) -> int:
         changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING
         if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc) is not None:
             try:
-                changes = ChangesReadBeforePush(change_review.publication_changes(commits, request.production.doc))
+                changes = ChangesReadBeforePush(change_review.publication_changes(
+                    commits, request.production.doc, known_producer=request.unit.staff_id))
             except (change_review.ChangeReviewError, OSError) as error:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("change review", "failed", f"{error}: the staff record is read before the push",

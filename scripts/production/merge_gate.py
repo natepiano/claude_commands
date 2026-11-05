@@ -1442,7 +1442,8 @@ def merge_checkpoint(args: GateArguments) -> int:
     changes: list[change_review.PublicationChange] = []
     if review_list is not None:
         try:
-            changes = change_review.publication_changes(commits, production)
+            changes = change_review.publication_changes(
+                commits, production, known_producer=change_review.unit_producer(production, args.unit))
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"

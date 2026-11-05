@@ -806,7 +806,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - An `__init__.py` in each of the 17 folders that appends its folder to `sys.path` (sdlc, 2026-11-05): the folders then share one bare-name space, and `inventory` (`feature_log`, `shutdown`) and `report` (`buildlog`, `model_study`) clash.
 - Qualified imports in every folder: a runtime change in 17 folders of many units.
 
-### Phase 35 — A checkpoint merge writes its unit as the Producer of each change-review row  · status: todo
+### Phase 35 — A checkpoint merge writes its unit as the Producer of each change-review row  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -818,13 +818,16 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Fix at the source: `merge_checkpoint.py` already knows the unit it merges. `unit_from_row` reads the unit's staff row, so `Unit` carries the row's `staff.StaffId`. Pass that id to `publication_changes` for every merge of a unit. Each row of that merge then gets that id as Producer. The slug lookup stays only for callers that do not know the unit (the child hand-off path, `change_review.py` command line).
 - Keep the row owner (production doc) as it is today.
 - Test (asked by the showrunner for this defect): a unit merge whose checkpoint subject slug matches no alias writes the unit's staff id in Producer.
-- `merge_gate.py` also writes rows from `publication_changes` (line ~1445, `args.unit`). It is outside this phase's files. Report whether it has the same fault; do not edit it.
+- `merge_gate.py:1445` has the same fault: it calls `publication_changes` with no unit, although it has `args.unit`. Pass that unit's staff id in the same call (showrunner hold for this one call, 2026-11-05), through `change_review.unit_producer`. It searches only the merging production's units; with no unique match the slug lookup runs as before, so the gate gains no refusal (F001). Queue Phase 12 also edits `merge_gate.py`; merge `origin/builds` before the gate if it lands first.
 - Add no other guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
 - `scripts/production/merge_checkpoint.py` — `Unit` gains the staff id; `unit_from_row`; `record_changes`, `record_publication_changes` and the `ChangesReadBeforePush` call pass it (owner outside builds; the showrunner holds it for this fix)
 - `scripts/production/change_review.py` — `publication_changes` takes the known producer (owner outside builds; the showrunner holds it for this fix)
 - `scripts/production/test_merge_checkpoint*.py`, `scripts/production/test_change_review.py` — the new test and each `Unit(...)` fixture that needs the new field
+- `scripts/production/test_waiting.py` — the `producer_merge_line` fixture builds `merge_checkpoint.Unit` (line 354)
+- `scripts/production/merge_gate.py` — the `publication_changes` call at line ~1445 (devtools-owned; the showrunner holds it for this one call)
+- `scripts/production/test_merge_checkpoint_rerun.py` — `test_a_successful_publication_notes_an_unregistered_unit_once` expects the old slug-only Producer; it changes to the merged unit's id
 
 **Workers:** 1 writer (two files and their tests; too small to split)
 - `impl` — all files above

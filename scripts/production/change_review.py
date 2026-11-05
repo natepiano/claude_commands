@@ -870,6 +870,9 @@ class UnknownProducer:
     """The change has no known staff producer."""
 
 
+UNKNOWN_PRODUCER = UnknownProducer()
+
+
 @dataclass(frozen=True)
 class UnitSource:
     """The production document and branch worktree of a unit."""
@@ -959,7 +962,19 @@ def producer_at(directory: Path) -> staff.StaffId | UnknownProducer:
     return member.id if member is not None and member.kind == "unit" else UnknownProducer()
 
 
-def publication_changes(commits: list[Commit], production: Path) -> list[PublicationChange]:
+def unit_producer(production: Path, unit: str) -> staff.StaffId | UnknownProducer:
+    """Read the producer of one unit in the requested production."""
+    try:
+        record = staff.snapshot()
+        rows = [row for row in unit_lookup.doc_units(production, record)
+                if unit_names.unit_id(row.name) == unit]
+    except staff.StaffUnreadable:
+        return UNKNOWN_PRODUCER
+    return rows[0].id if len(rows) == 1 else UNKNOWN_PRODUCER
+
+
+def publication_changes(commits: list[Commit], production: Path, *,
+                        known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER) -> list[PublicationChange]:
     """Resolve each visible change's unit and producer in one pass."""
     record = staff.snapshot()
     branches = _unit_branches(owner_docs(production), record)
@@ -969,7 +984,9 @@ def publication_changes(commits: list[Commit], production: Path) -> list[Publica
     for commit, item in _checkpoint_entries(commits):
         match = _CHECKPOINT.match(commit.subject)
         source = branches.get(match["branch"]) if match is not None else None
-        producer = producer_for(source, record, machine) if source is not None else UnknownProducer()
+        producer = known_producer
+        if isinstance(producer, UnknownProducer) and source is not None:
+            producer = producer_for(source, record, machine)
         if isinstance(producer, UnknownProducer) and match is not None:
             unit = source if source is not None else match["branch"]
             if unit not in noted:

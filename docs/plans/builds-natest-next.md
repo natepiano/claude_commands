@@ -31,7 +31,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **Select the next speed target after Phases 24 and 27.**
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
-  - Candidate: `direct/test_verify_mac_only.py`, rank 1 at 358.7 s (CPU 339.3 s, 17 tests) in `top --repo ~/.claude` on 2026-11-05 08:15 EST. It waits until verify's load hang fix in `verify_mac_offload_test_support.py` is on builds; the showrunner sends word (2026-11-05).
+  - Candidate: `direct/test_verify_mac_only.py`, rank 1 at 358.7 s (CPU 339.3 s, 17 tests) in `top --repo ~/.claude` on 2026-11-05 08:15 EST. Free since verify's Mac retry hang fix landed on builds at 0380fb6ea (showrunner, 2026-11-05). Merge builds first and take a new baseline.
   - Taken: `direct/test_verify_lint_judgment.py`, rank 3 at 210.4 s (CPU 172.2 s), was Phase 31 (floor below). `production/test_fast_track.py`, rank 4 at 216.9 s on 2026-11-05, is Phase 33 (showrunner, 2026-11-05). Rank 2 is `agents/test_codex_mesh.py`, still excluded.
   - Candidate: `direct/test_verify_lint_cache_versions.py`, rank 8, median 135.1 s wall and 89.3 s CPU. Start with a profile inside the test module. The verify unit owns it; confirm the holder with the showrunner before an edit.
   - Held: `style/test_style_sync.py`; sdlc-devtools has open edits.
