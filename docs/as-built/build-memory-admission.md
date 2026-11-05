@@ -310,7 +310,7 @@ With one to four own rows, a non-build estimate uses their largest peak or a low
 A repository without own history keeps the pool and fallback order.
 A full test estimate with a package keeps only rows whose package and scope match.
 Other steps, and requests with no package, keep the recorded scope rule.
-A filtered compile estimate (`filtered_peak`) takes the larger of two anonymous p90 values:
+A filtered compile estimate (`filtered_history_peak`) takes the larger of two anonymous p90 values:
 the exact filter set's rows and the package's filtered rows.
 Indexed peaks times `ANON_SHARE` come next, exact filter first. Check or build compile peaks come last.
 A full-suite estimate does not cap a filtered compile estimate.
@@ -319,6 +319,106 @@ Fresh nextest estimates retain `fresh_test_peak` and its 1 GiB floor.
 Freshness still requires both Cargo output roots to survive.
 
 The Phase 18 replay found no gain, so no estimate splits its history by build feature or commit.
+
+#### Phase 19 source shares
+
+Run date: 2026-11-05.
+The snapshot ends at 2026-11-05 13:07:40 UTC.
+The requested window starts at 2026-10-29 13:07:40 UTC.
+The lifecycle file retains 571 events across 4.92 days, including older token-gap records.
+The 220 admissions cover 2026-11-04 20:45:52 through 2026-11-05 13:03:36 UTC: 16.30 hours.
+The anonymous file retains 46,262 rows from 2026-10-07 through 2026-11-05.
+The requested window contains 5,205 anonymous rows.
+Replay reconstructs 4,267 estimates and keeps 815 merge-gate cap rows separate.
+Another 123 rows lack their own dated index match.
+Recorded intervals and reconstructed estimates are separate populations. Do not add their counts.
+
+| Population | Step kind | measured | pooled | buildlog | fallback | shape | cap |
+|---|---|---:|---:|---:|---:|---:|---:|
+| before Phase 60 | full nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | filtered nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | clippy | 6 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | check | 0 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | build | 0 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | doc | 2 | 0 | 0 | 0 | 0 | 0 |
+| before Phase 60 | other | 6 | 0 | 0 | 0 | 0 | 9 |
+| before Phase 60 | **Total** | 14 | 0 | 0 | 0 | 0 | 9 |
+| after Phase 60 | full nextest | 6 | 0 | 0 | 1 | 0 | 0 |
+| after Phase 60 | filtered nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| after Phase 60 | clippy | 20 | 0 | 0 | 0 | 0 | 0 |
+| after Phase 60 | check | 0 | 0 | 0 | 0 | 0 | 0 |
+| after Phase 60 | build | 0 | 0 | 0 | 0 | 2 | 0 |
+| after Phase 60 | doc | 4 | 0 | 0 | 0 | 0 | 0 |
+| after Phase 60 | other | 19 | 0 | 0 | 0 | 0 | 145 |
+| after Phase 60 | **Total** | 49 | 0 | 0 | 1 | 2 | 145 |
+| before queue 10z | full nextest | 6 | 0 | 0 | 1 | 0 | 0 |
+| before queue 10z | filtered nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| before queue 10z | clippy | 26 | 0 | 0 | 0 | 0 | 0 |
+| before queue 10z | check | 0 | 0 | 0 | 0 | 0 | 0 |
+| before queue 10z | build | 0 | 0 | 0 | 0 | 2 | 0 |
+| before queue 10z | doc | 6 | 0 | 0 | 0 | 0 | 0 |
+| before queue 10z | other | 25 | 0 | 0 | 0 | 0 | 86 |
+| before queue 10z | **Total** | 63 | 0 | 0 | 1 | 2 | 86 |
+| after queue 10z | full nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | filtered nextest | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | clippy | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | check | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | build | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | doc | 0 | 0 | 0 | 0 | 0 | 0 |
+| after queue 10z | other | 0 | 0 | 0 | 0 | 0 | 68 |
+| after queue 10z | **Total** | 0 | 0 | 0 | 0 | 0 | 68 |
+| Replay | full nextest | 655 | 23 | 0 | 3 | 0 | 0 |
+| Replay | filtered nextest | 475 | 0 | 10 | 49 | 0 | 0 |
+| Replay | clippy | 1429 | 20 | 0 | 0 | 0 | 0 |
+| Replay | check | 426 | 13 | 0 | 0 | 0 | 0 |
+| Replay | build | 0 | 0 | 0 | 0 | 149 | 0 |
+| Replay | doc | 215 | 7 | 0 | 0 | 0 | 0 |
+| Replay | other | 765 | 28 | 0 | 0 | 0 | 815 |
+| Replay | **Total** | 3965 | 91 | 10 | 52 | 149 | 815 |
+
+The Phase 60 boundary is its first origin/main ancestor at 2026-11-04 21:52:05 UTC.
+The queue 10z boundary is its first origin/main ancestor at 2026-11-05 07:24:57 UTC.
+Git merge times delimit cohorts. The records contain no process version, so these boundaries do not prove deployment times.
+
+| Fresh tier | Full nextest | Filtered nextest |
+|---|---:|---:|
+| measured | 162 | 49 |
+| buildlog | 0 | 0 |
+| NoFreshHistory | 14 | 7 |
+
+The fresh table contains replay subsets, not extra estimates. Recorded events contain no fresh-tier field.
+A zero indexed compile count selects a fresh scenario; the records cannot prove that both output roots survived.
+The 21 NoFreshHistory cases take the compile estimate. Fresh buildlog includes the fresh floor.
+
+No recorded admission uses ANON_SHARE: 0 of 220, and 0 of 66 without caps.
+Reconstructed ANON_SHARE share: 10/5,082 (0.20%); without caps: 10/4,267 (0.23%).
+The 10 ANON_SHARE promises have 0 under-half cases and 1 over-three cases against their measured anonymous peaks.
+
+| Replay step kind | ANON_SHARE share | Share without caps |
+|---|---:|---:|
+| full nextest | 0/681 (0.00%) | 0/681 (0.00%) |
+| filtered nextest | 10/534 (1.87%) | 10/534 (1.87%) |
+| clippy | 0/1,449 (0.00%) | 0/1,449 (0.00%) |
+| check | 0/439 (0.00%) | 0/439 (0.00%) |
+| build | 0/149 (0.00%) | 0/149 (0.00%) |
+| doc | 0/222 (0.00%) | 0/222 (0.00%) |
+| other | 0/1,608 (0.00%) | 0/793 (0.00%) |
+
+Request selection evidence: 11 recovered legacy test rows and 1,204 rows with recorded fields.
+Available fourteen-day test history: 3,655 recovered legacy rows, 1,250 recorded rows, and 39 rows with unknown selection.
+All 149 replayed builds have shape evidence. ShapeFallback supplies 31 promises; these remain shape sources, not ordinary fallback sources.
+Observed waits: 225 logical steps have recorded totals of 1,162.98 minutes.
+3 steps have incomplete waits and contribute no value.
+4 intervals remain open. No ended recorded interval has NoPositiveSample.
+Phase 18 and Phase 68 are absent from origin/main at this snapshot, so their deployed cohorts are unavailable.
+No evidence reaches 2026-11-12, when the legacy rows leave the window. An after-expiry share is unavailable.
+The current estimator and configuration reconstruct earlier requests using only evidence available before each request.
+The replay assigns each indexed attempt to at most one sample, including samples before the requested window.
+Eight samples without their own indexed attempt are unresolved. The replay excludes them instead of using another attempt’s request time.
+The earlier repairs corrected retry times and used the production repository identity rule.
+Queue 10s changes no estimator function or configuration value in this comparison.
+The showrunner stopped this phase at Spec 2 because the overall ANON_SHARE share is under 5%.
+This measurement changes no estimator tier.
 
 #### Phase 11 replay comparison
 
@@ -357,7 +457,6 @@ The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 to
 A filtered compile run takes its estimate from compile history, and the full-run estimate no longer caps it.
 The showrunner accepted the miss (2026-11-04): an under-promise risks an out-of-memory kill; an over-promise only delays parallel starts.
 Phase 60 found the promise source of these over-three runs and fixed it there; see the Phase 60 replay below.
-Run `phases/11/replay.py before` and `after` in the session folder to regenerate the full grouped data for `replay_groups.md`.
 
 #### Phase 60 replay comparison
 
@@ -386,7 +485,6 @@ and takes the larger of the exact-filter and package p90 before any indexed tier
 Bar met: cargo-liner nextest compile runs at 21 GiB go from under-half 7 to 0 and over-three 166 to 65 (bar: 101 or lower, under-half 7 or lower).
 At 24 GiB, the same group goes from over-three 6 to 2.
 Hana over-three rises 595 to 607 while its under-half falls 31 to 23. Six other repositories rise by one or two runs in one count.
-Run `phases/60/run_after.py` in the session folder to regenerate `after.json`.
 
 #### Phase 17 compile-band measurement (not adopted)
 

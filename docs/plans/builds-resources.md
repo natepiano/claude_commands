@@ -553,10 +553,12 @@ A memory promise keeps only history rows from the same side of each listed build
 **Binds later work:** the replay shows no gain. With the split, nextest steps above their promise went from 106 to 108 and below half their peak from 6 to 9; the feature split alone gave the same result. "Memory estimates use all same-shape history again" deletes both splits, the change list, the build-marks cache and the commit states.
 **Gotchas:** after the dylib change the feature side has only 676 rows. Queue 10z removed the build budget cap; promises are uncapped.
 
-### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: todo
+### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: done
 **Depends on:** Phases 18, 20, 68 and 69. Phase 20 records the lifecycle events and supplies their reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29, rescoped (no ETA given).
+
+**Stopped at Spec 2:** builds showrunner 2026-11-05 ruled the `ANON_SHARE` share small: 10/4,267 (0.23%) of reconstructed estimates without caps, and 0/220 recorded admissions. Specs 3-5 are not built.
 
 #### Work Order
 
@@ -1753,3 +1755,48 @@ One function finds the Cargo target folder that holds a path, and both parent wa
 **Gotchas:** the function includes the path itself; a caller that classifies a file passes its parent folder.
 
 **Ruled out:** moving the memory cache-tag and symlink tests to `test_sweep.py` (they pin memory's classification).
+
+### Phase 71 — The phone low-disk push carries only the free space, the alert line and one folder  · status: todo
+**Depends on:** none. Phase 63 built the push. Phase 70's held hash carries it; this phase lands before the user reviews the text.
+
+**Approved:** builds showrunner 2026-11-05 09:20 EST, relaying the user: "the body will be too long."
+
+#### Work Order
+
+**Goal:** the `sweep.disk_floor` phone push is short. The natedev session message carries the full folder list.
+
+**Measured:**
+1. The push body has the free space, the alert line, the cleanup result, up to `sweep_page_paths` (4) folder lines with effects, a recommendation, a closing line and a safety line. `fit_disk_floor_push` trims folders until the text is under `sweep_push_text_limit` (500).
+2. The natedev session message on a crossing has the alert line, `page_paths(measurement)` and `protected_folder_lines`. It has no choices, effects or recommendation.
+3. `page_paths` has one caller (`sweep.py:3816`) and one test (`test_sweep.py:4629`).
+
+**Spec:**
+1. The push keeps its title and its action line, unchanged.
+2. The push body template is `natedev has {free} free. Alerts start below {floor}. {recommendation}`. The `{cleanup}` and `{choices}` fields and the closing safety sentence leave the push.
+3. `{recommendation}` has one sentence per state:
+   - available, trash or protected: `Recommended: delete <folder> (<size>). It covers the <shortfall> shortfall.`
+   - available, scratch or other: `Recommended: review <folder> (<size>) first. It covers the <shortfall> shortfall.`
+   - insufficient: `Largest folder: <folder> (<size>). It covers only part of the <shortfall> shortfall.`
+   - unavailable: `Folder sizes are unknown, so no folder is recommended yet.`
+4. On a crossing, the natedev session message has, in order: the alert line, the cleanup line, each folder line with its effect, the recommendation sentence, the closing line (`Delete nothing…` or `Keep it…`), and `natedev checks your choice before it deletes anything.` These lines replace `page_paths` and `protected_folder_lines` in that message. The unavailable state keeps its measure-first lines.
+5. One function writes the recommendation sentence. The push and the session message both use it. `folder_choices` runs once per crossing, and both channels use its result.
+6. `fit_disk_floor_push` renders the push. When the text is at or over the limit, it renders the unavailable form. When that is also over the limit, it sends no push. The folder-trim loop goes.
+7. Delete `page_paths` and its test. `protected_folder_lines` keeps its other caller (the out-of-reach report).
+8. Update the four catalog examples (available, unavailable, insufficient, protected) to the new fields.
+9. Add no guard, refusal or check this Work Order does not ask for.
+
+**Constraints from prior phases:**
+- Phase 63: the phone stays off until the user approves the text (`disk_floor_channels`). Only the user records that approval.
+- The session message still goes through `fit_alert_text`, so folder labels shorten with its path widths.
+
+**Files:**
+- `scripts/lint/sweep.py` — the recommendation sentence, the session message lines, `fit_disk_floor_push`, `page_paths` removed.
+- `scripts/notify/push_catalog.py` — the `sweep.disk_floor` template and its four examples.
+- `scripts/lint/test_sweep.py` — the push text, the session message, the fit fallback and the removed `page_paths` test.
+
+**Workers:** `1 writer + 1 tester`
+
+**Acceptance gate:**
+- `test_sweep.py` and `scripts/notify/test_push_texts.py` pass, except the one known red: the missing `sweep.disk_floor` approval.
+- `review.py texts --id sweep.disk_floor` (without `--approve`) reports each example. The report to builds gives the title, the action, the body and the longest example's character count.
+- Basedpyright reports `0 errors, 0 warnings, 0 notes` over the three files.

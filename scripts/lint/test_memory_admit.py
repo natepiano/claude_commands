@@ -2181,6 +2181,45 @@ class QueueLifetimeReaderTests(unittest.TestCase):
             self.assertIsInstance(step.end.end_kind, gate.StepEnd)
             self.assertEqual(step.end, step.intervals[-1].end)
 
+    def test_source_counts_separate_admissions_logical_waits_and_missing_evidence(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(since=fixture.clock.now() - 5)
+            assert isinstance(request.profile, gate.StepProfile)
+            first = only_admitted(fixture.server.handle_request(request))
+            fixture.clock.advance(10)
+            _ = fixture.server.handle_request(wire.TokenWaitRequest("token-return", first.reservation))
+            expected = gate.QueueSourceCounts(
+                admissions={"measured": 1}, memory_waits=(5,), incomplete_memory_waits=0,
+                unsampled_intervals=1, open_intervals=0, completed_steps=0)
+            self.assertEqual(gate.count_queue_sources(gate.read_queue_lifetimes(fixture.state_dir)), expected)
+
+            fixture.clock.advance(20)
+            fixture.free(0)
+            fixture.hold_starts()
+            returned = replace(request, episode="after-token", token_back_at=fixture.clock.now(),
+                sidecar=str(fixture.scope(request.owner)),
+                profile=replace(request.profile, peak=gate.ExpectedPeak(request.profile.peak.bytes, "buildlog", 5)))
+            self.assertIsInstance(fixture.server.handle_request(returned)[0], wire.Wait)
+            fixture.clock.advance(7)
+            fixture.free(60 * GIB)
+            _ = fixture.server.run_pass()
+            second = only_admitted([fixture.server.ledger[returned.episode].reply])
+            expected = replace(expected, admissions={"measured": 1, "buildlog": 1},
+                memory_waits=(12,), open_intervals=1)
+            self.assertEqual(gate.count_queue_sources(gate.read_queue_lifetimes(fixture.state_dir)), expected)
+
+            fixture.scoped_peak(second, GIB)
+            fixture.clock.advance(2)
+            _ = fixture.server.handle_request(wire.ReleaseRequest("finished", second.reservation, 0))
+            expected = replace(expected, open_intervals=0, completed_steps=1)
+            self.assertEqual(gate.count_queue_sources(gate.read_queue_lifetimes(fixture.state_dir)), expected)
+
+            path = fixture.state_dir / "queue_times.jsonl"
+            events = [event for event in gate.anonymous_history_rows(path) if event.get("kind") != "token_gap"]
+            _ = path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            expected = replace(expected, memory_waits=(), incomplete_memory_waits=1)
+            self.assertEqual(gate.count_queue_sources(gate.read_queue_lifetimes(fixture.state_dir)), expected)
+
     def test_cancellation_and_owner_exit_during_token_wait_leave_no_completed_step(self) -> None:
         for reason in ("cancelled", "owner_gone"):
             with self.subTest(reason=reason), AdmissionFixture() as fixture:
