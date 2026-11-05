@@ -903,37 +903,65 @@ def unit_branches(docs: Iterable[Path]) -> dict[str, UnitSource]:
 
 def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot) -> dict[str, UnitSource]:
     """Resolve branch names and aliases from the unit staff rows of each document."""
-    found: dict[str, UnitSource] = {}
-    aliases: list[tuple[UnitSource, tuple[str, ...]]] = []
-    resolver = session_staff.RowResolver(record)
-    machine = remote.local_machine()
+    return _branches_from_units(_document_units(docs, record), record)
+
+
+def _document_units(docs: Iterable[Path], record: staff.StaffSnapshot) -> list[tuple[Path, staff.StaffRow]]:
+    """Collect each document's units and report unreadable staff records."""
+    pairs: list[tuple[Path, staff.StaffRow]] = []
     for doc in docs:
         try:
             rows = unit_lookup.doc_units(doc, record)
         except staff.StaffUnreadable as error:
             print(f"change review: {error}", file=sys.stderr)
             continue
-        for row in rows:
-            tree = row.worktree
-            worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
-                        else MissingUnitWorktree())
-            source = UnitSource(doc, worktree, unit_names.unit_id(row.name), row.id)
-            branch = resolver.unit_branch(row)
-            if isinstance(branch, session_staff.Branch):
-                _ = found.setdefault(branch.name, source)
-            try:
-                config = resolver.unit_config(row)
-            except unit_config.ConfigRefused as error:
-                print(f"change review: {source.name}: {error}", file=sys.stderr)
-                config = unit_config.ConfigMissing(str(error))
-            plan = (config.plan.path.stem if isinstance(config, unit_config.UnitConfig)
-                    and isinstance(config.plan, unit_config.PlanFile) else "")
-            aliases.append((source, (plan, source.name, worktree.name if isinstance(worktree, Path) else "")))
+        pairs.extend((doc, row) for row in rows)
+    return pairs
+
+
+def _branches_from_units(pairs: Iterable[tuple[Path, staff.StaffRow]],
+                         record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve exact branches before aliases, in the supplied unit order."""
+    found: dict[str, UnitSource] = {}
+    aliases: list[tuple[UnitSource, tuple[str, ...]]] = []
+    resolver = session_staff.RowResolver(record)
+    machine = remote.local_machine()
+    for doc, row in pairs:
+        tree = row.worktree
+        worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
+                    else MissingUnitWorktree())
+        source = UnitSource(doc, worktree, unit_names.unit_id(row.name), row.id)
+        branch = resolver.unit_branch(row)
+        if isinstance(branch, session_staff.Branch):
+            _ = found.setdefault(branch.name, source)
+        try:
+            config = resolver.unit_config(row)
+        except unit_config.ConfigRefused as error:
+            print(f"change review: {source.name}: {error}", file=sys.stderr)
+            config = unit_config.ConfigMissing(str(error))
+        plan = (config.plan.path.stem if isinstance(config, unit_config.UnitConfig)
+                and isinstance(config.plan, unit_config.PlanFile) else "")
+        aliases.append((source, (plan, source.name, worktree.name if isinstance(worktree, Path) else "")))
     for source, names in aliases:
         for name in names:
             if name:
                 _ = found.setdefault(name, source)
     return found
+
+
+def _publication_branches(production: Path, record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve live units before retired units, with scoped units first in each group."""
+    pairs = _document_units(owner_docs(production), record)
+    scoped = {pair[1].id for pair in pairs}
+    machine = remote.local_machine()
+    resolver = session_staff.RowResolver(record)
+    for row in record.find(kind="unit"):
+        if row.id in scoped or isinstance(row.worktree, staff.WorktreeUnfilled) or row.worktree.machine != machine:
+            continue
+        doc = resolver.production_doc(row)
+        pairs.append((doc.path if isinstance(doc, session_staff.ProductionDoc) else production, row))
+    pairs.sort(key=lambda pair: isinstance(pair[1].worktree, staff.RemovedWorktree))
+    return _branches_from_units(pairs, record)
 
 
 def _owner_of(commit: Commit, branches: dict[str, UnitSource]) -> Path | None:
@@ -970,22 +998,19 @@ def producer_at(directory: Path) -> staff.StaffId | UnknownProducer:
     return member.id if member is not None and member.kind == "unit" else UnknownProducer()
 
 
-def unit_producer(production: Path, unit: str) -> staff.StaffId | UnknownProducer:
-    """Read the producer of one unit in the requested production."""
+def unit_producer(unit: str) -> staff.StaffId | UnknownProducer:
+    """Read the producer of one unit across the staff record."""
     try:
-        record = staff.snapshot()
-        rows = [row for row in unit_lookup.doc_units(production, record)
-                if unit_names.unit_id(row.name) == unit]
+        return unit_lookup.unit_row(unit, staff.snapshot()).id
     except staff.StaffUnreadable:
         return UNKNOWN_PRODUCER
-    return rows[0].id if len(rows) == 1 else UNKNOWN_PRODUCER
 
 
 def publication_changes(commits: list[Commit], production: Path, *,
                         known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER) -> list[PublicationChange]:
     """Resolve each visible change's unit and producer in one pass."""
     record = staff.snapshot()
-    branches = _unit_branches(owner_docs(production), record)
+    branches = _publication_branches(production, record)
     machine = remote.local_machine()
     changes: list[PublicationChange] = []
     noted: set[UnitSource | str] = set()

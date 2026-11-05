@@ -12,7 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from datetime import date, datetime
 from pathlib import Path
 from typing import cast, override
@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 from scripts.lib import copy_record
-from scripts.production import showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc
+from scripts.production import showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config
 from scripts.shutdown import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
@@ -176,6 +176,14 @@ class ProducerWriterTests(ProducerFixture):
         _ = self.branch_unit("new-unit", "unit", "branch-a", "branch-b.md")
         return self.branch_unit("second-unit", "second", "branch-b", "second.md")
 
+    def unrelated_unit(self, name: str = "external-unit", plan: str = "external-plan.md") -> staff.StaffRow:
+        doc = self.root / "other.md"
+        _ = doc.write_text("# Other\n")
+        row = recorded_unit("other", name, self.root / "external", doc, plan=plan)
+        _ = subprocess.run(["git", "-C", str(self.root / "external"), "checkout", "-q", "-B", "external-branch"],
+                           check=True)
+        return row
+
     def test_an_exact_branch_wins_over_an_earlier_unit_alias(self) -> None:
         _ = self.colliding_units()
         source = change_review.unit_branches([self.doc])["branch-b"]
@@ -189,6 +197,78 @@ class ProducerWriterTests(ProducerFixture):
         with mock.patch.object(change_review, "drift", return_value=[]):
             merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], second.id)
+
+    def test_publication_writes_an_unrelated_units_producer_and_production(self) -> None:
+        other = self.unrelated_unit()
+        merged = self.merge("external-branch")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        with mock.patch.object(change_review, "drift", return_value=[]):
+            merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
+        row = change_review.pending(self.listing)[0]
+        self.assertEqual(row["Producer"], other.id)
+        self.assertEqual(row["Production"], "other")
+
+    def test_publication_uses_the_live_unit_before_a_retired_unit_with_the_same_branch(self) -> None:
+        retired = self.unrelated_unit(name="retired-unit")
+        live_doc = self.root / "live.md"
+        _ = live_doc.write_text("# Live\n")
+        live = recorded_unit("live", "live-unit", self.root / "live", live_doc)
+        _ = subprocess.run(["git", "-C", str(self.root / "live"), "checkout", "-q", "-B", "external-branch"],
+                           check=True)
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}))
+        parked = unit_config.parked_path(retired.id)
+        parked.parent.mkdir(parents=True)
+        _ = parked.write_text((self.root / "external/.unit.toml").read_text()
+            + f'\n[retired]\ndate = "2026-11-05"\nsession = "{retired.current_session}"\nbranch = "external-branch"\n')
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "external"),
+                              expected=retired.worktree)
+        merged = self.merge("external-branch")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        with mock.patch.object(change_review, "drift", return_value=[]):
+            merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
+        row = change_review.pending(self.listing)[0]
+        self.assertEqual(row["Producer"], live.id)
+        self.assertEqual(row["Production"], "live")
+
+    def test_publication_finds_the_producer_with_a_different_relative_production_path(self) -> None:
+        directory = self.root / "another-checkout"
+        relative = Path("docs/plans/top.md")
+        (directory / relative).parent.mkdir(parents=True)
+        _ = (directory / relative).write_text(self.doc.read_text())
+        merged = self.merge()
+        production = Production(relative, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        with chdir(directory), mock.patch.object(change_review, "drift", return_value=[]):
+            merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
+
+    def test_unit_producer_resolves_bare_and_canonical_names_across_productions(self) -> None:
+        other = self.unrelated_unit()
+        for name, expected in (("new", self.unit.id), ("new-unit", self.unit.id),
+                               ("external", other.id), ("external-unit", other.id)):
+            with self.subTest(name=name):
+                self.assertEqual(change_review.unit_producer(name), expected)
+
+    def test_unit_producer_returns_unknown_for_duplicate_and_absent_names(self) -> None:
+        _ = self.unrelated_unit(name="new-unit")
+        for name in ("new", "new-unit", "absent"):
+            with self.subTest(name=name):
+                self.assertIs(change_review.unit_producer(name), change_review.UNKNOWN_PRODUCER)
+
+    def test_publication_keeps_the_scoped_alias_when_another_production_has_it(self) -> None:
+        other = self.unrelated_unit(plan="old-plan.md")
+        _ = self.git("checkout", "-b", "checkpoints")
+        for name in ("external-branch", "old-plan"):
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({name}): change\n\nChange-Review: {name} | Read | Proof")
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", "checkpoints", "-m", "Merge checkpoints")
+        merged = self.git("rev-parse", "HEAD")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        with mock.patch.object(change_review, "drift", return_value=[]):
+            merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
+        rows = change_review.pending(self.listing)
+        self.assertEqual([row["Producer"] for row in rows], [other.id, self.unit.id])
+        self.assertEqual([row["Production"] for row in rows], ["other", "top"])
 
     def test_a_checkpoint_with_an_unmatched_branch_pattern_keeps_the_row_values_aligned(self) -> None:
         _ = self.git("checkout", "-b", "old-branch")
