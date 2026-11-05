@@ -788,42 +788,31 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - Deleting `GIT_HANG_GUARD` and the blocked-hook test (simplify F009): the Work Order keeps every test name, and the test proves the guard stops a blocked hook.
 
-### Phase 34 — Every test module imports from the repo root with no PYTHONPATH  · status: todo
+### Phase 34 — Every test module imports from the repo root with no PYTHONPATH  · status: done
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** every `scripts/**/test_*.py` module passes when it runs from the repo root with PYTHONPATH unset, with one layout fix for every folder and every checked behavior kept.
+**Goal:** every documented way to run a test module uses the gate's form, `discover -s scripts/<folder> -p <module>.py` from the repo root, with no PYTHONPATH and no new package file.
 
-**Spec:** natedev found these modules fail with an import error unless PYTHONPATH names their folder (via the showrunner, 2026-11-05). The showrunner made this the next phase after Phase 33. Claim each file with cargo-berth before the first edit; send any holder to the showrunner.
+**Spec:** natedev found modules that fail with an import error unless PYTHONPATH names their folder (via the showrunner, 2026-11-05).
 
-1. Reproduce before any edit, in a `copies.py` clone with PYTHONPATH unset. Run each named module from the repo root as `python3 -m unittest scripts/<folder>/<module>.py`. Record each import error and the import line that causes it. The named modules: `scripts/production/test_next_item.py`; two `scripts/notify` test modules (`pushover`); `scripts/lib` tests (no package file; needs a module list); `scripts/production/test_production_lifecycle.py` (`fake_unit_host`); `scripts/mac_test/test_offload.py` (`offload`); `scripts/build_hold` tests; `scripts/buildlog/test_width_trial.py` (`store`); `scripts/shutdown` tests (`test_support`).
-2. Run the same form for every other `test_*.py` under `scripts/`, and list each module with the same fault.
-3. Name the one cause and the one layout fix for every folder. Write both into this Spec, with the files to change, before the code step. Fix at the cause. A `sys.path` insert in each module is not one fix.
-4. Keep the gate's form green: `module_run.py` runs `unittest discover -s <folder> -p <module>` from the repo root.
-5. Add no guard, refusal or check, and no test that scans imports (user rule, 2026-11-05).
-6. Do not edit `folder_audit.py`, `build_hold.py`, `mac_idle.py`, `rust_release.py` or `aws_target/ledger.py` until the showrunner sends natedev messaging's main hash. A fix that needs one of them waits; name it in the report.
+1. Survey result (2026-11-05, 708 modules on 58dbae565): the path form, `python3 -m unittest scripts/<folder>/<module>.py` with PYTHONPATH unset, fails on import for 143 modules in 17 folders. They import siblings by bare name, and the path form puts only the repo root on `sys.path`. The gate's form (`scripts/test_times/module_run.py` → `discover -s <folder>`) puts the folder first, and every module passes that way.
+2. Fix at the caller (showrunner, 2026-11-05): no code runs the path form. `module_run.py`, `fast_track.py` and `coverage_overlap.py` already use discover. `docs/as-built/herdr-adoption.md:343` runs Mac suites with `PYTHONPATH=<clone>`; drop it and run from the clone root, where `-m` puts the clone first on `sys.path`. Proof: the herdr suite in that form with PYTHONPATH unset, in a `copies.py` clone.
+3. `docs/plans/builds-report.md:76` carries a Test line with `PYTHONPATH=scripts/buildlog`. The report unit owns that plan and changes the line (showrunner, 2026-11-05).
+4. Add no `__init__.py`, no `sys.path` change and no check.
+5. Ruled out:
+   - An `__init__.py` in each of the 17 folders that appends its folder to `sys.path` (sdlc, 2026-11-05). The 17 folders then share one bare-name space: `inventory` is in `feature_log` and `shutdown`, and `report` is in `buildlog` and `model_study`.
+   - Qualified imports in every folder: a runtime change in 17 folders of many units.
 
 **Files:**
-- `scripts/production/test_next_item.py`, `scripts/production/test_production_lifecycle.py`
-- `scripts/notify/` — its test modules
-- `scripts/lib/` — its test modules and any package file the fix names
-- `scripts/mac_test/test_offload.py`
-- `scripts/build_hold/` — its test modules
-- `scripts/buildlog/test_width_trial.py`
-- `scripts/shutdown/` — its test modules
-- `scripts/` — any other test module that step 2 lists
+- `docs/as-built/herdr-adoption.md` — the Mac suite command at line 343
 
-**Workers:** 1 writer (one layout fix; step 3 names the files, then they can split by folder)
-- `impl` — all files above
-- `test` — opens as impl
+**Workers:** none (one doc line; the director makes it)
 
 **Constraints from prior phases:**
-- Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- each module from steps 1 and 2 green with `env -u PYTHONPATH python3 -m unittest scripts/<folder>/<module>.py` from the repo root of a `copies.py` clone
-- each changed module green in the gate form `python3 -m unittest discover -s scripts/<folder> -p '<module>'`
-- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+- `env -u PYTHONPATH scripts/lib/py -m unittest discover -s scripts/herdr -p 'test_*.py'` green from the root of a `copies.py` clone
+- no `__init__.py` or `folder_imports.py` added

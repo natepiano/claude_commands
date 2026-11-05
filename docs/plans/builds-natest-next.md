@@ -97,6 +97,12 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Ownership: `scripts/build_hold/cargo` is in builds; natest takes it. Before an edit to the hook or `scripts/lint/lint`, send the file to the showrunner, who checks the holder.
   - Completion condition: the three scripts start Python through `scripts/lib/py`; the notice carries the Mac result. Add no new check.
   - Revealed by: Phase 32 simplify review, 2026-11-05.
+- [ ] **Three `scripts/lib` helpers named like tests hold no tests.**
+  - Target: `scripts/lib/test_hang_guard.py` (286 importing files), `scripts/lib/test_models_registry.py` (30), `scripts/lib/test_phase.py` (5)
+  - Why needed: each name matches `test_*.py`, so a run of the module alone reports "NO TESTS RAN" and exits 5. It reads as a failed test module (Phase 34 survey).
+  - Proposal: rename each to a `*_test_support.py` name and switch every importer in one change. Do not rename until the showrunner places it (showrunner, 2026-11-05).
+  - Completion condition: no `test_*.py` file under `scripts/lib` is without tests; every importer passes. Add no new check.
+  - Revealed by: Phase 34 survey, 2026-11-05.
 - [ ] **Architecture proposal: the build target commands import less**
   - Target: `scripts/build_hold/build_hold.py` (owner resources; queue-unit takes the cut), `scripts/build_targets/build_targets.py` `eligible` answer (owner verify-unit)
   - Why needed: after Phase 24, `eligible` and `reserve` set the floor of `test_verify_ssh_targets_routing.py`: they import `build_hold`, which imports `admission_service` and `memory_admit` at once (`build_hold.py:40-46`). `eligible` runs 24 times (23.4 traced s).
