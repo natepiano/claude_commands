@@ -45,9 +45,9 @@ its own.
 
 `stop-direct-continue.py` has a separate Stop entry with `asyncRewake: true` and a 10 s timeout.
 It runs after the turn ends.
-Exit 2 sends its stderr reason to the agent in a system-reminder and starts a new request for compaction.
+Exit 2 sends its stderr reason to the agent in a system-reminder.
 The user sees only "Continuing the unit run".
-The next Stop payload sets `stop_hook_active`, so the hook wakes once only.
+The hook repeats the wake above the threshold until compaction reduces the context.
 The existing guards and declared wait records stay the same.
 
 These hooks stay outside the dispatcher, as their own entries:
