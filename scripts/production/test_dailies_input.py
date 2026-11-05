@@ -14,6 +14,8 @@ from typing import TextIO, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import dailies_input
 import dailies_render
 from scripts.production.production_doc import read_production
@@ -25,7 +27,7 @@ from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr.herdr import HerdrPlace
 from scripts.shutdown.remote import local_machine
-from scripts.production.staff_test_support import StaffTestCase, fixture_showrunner_name, unit_membership, showrunner_relationship
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_showrunner_name, unit_membership, showrunner_relationship
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
@@ -38,10 +40,10 @@ class RowDailiesTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         for label in ("writer", "writer-unit"):
             with self.subTest(label=label):
-                live = unit_lookup.MarkedUnit(label, unit_lookup.LiveClaude(
+                live = unit_lookup.LabeledSession(label, unit_lookup.LiveClaude(
                     "live-writer", unit.current_session, "", os.getpid()), HerdrPlace("writer", "w1:p1"),
-                    staff_id=unit.id)
-                with mock.patch.object(unit_lookup, "marked_units", return_value={label: live}):
+                    identity=unit_lookup.LiveSession(unit.current_session))
+                with mock.patch.object(unit_lookup, "labeled_sessions", return_value={label: live}):
                     units = dailies_input.report_units(fixture.doc, fixture.slug, staff.snapshot())
                 self.assertEqual([(item.name, item.session) for item in units], [("writer-unit", "live-writer")])
                 self.assertEqual(self.staff_file.read_bytes(), before)
@@ -68,6 +70,37 @@ class DailiesInputTests(DailiesInputFixture):
         conf = self.root / "notifier-state" / f"showrunner-{slug}" / "conf"
         write_text_atomic(conf, f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
 
+    def test_fixed_judgment_id_survives_clear_and_unit_rename(self) -> None:
+        from scripts.production.staff_test_support import fixture_runtime_id
+
+        fixed_id = self.unit_id()
+        row = staff.by_id(fixed_id)
+        assert row is not None
+        _ = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("judgment-clear")))
+        self.rename_unit("renamed-unit")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.unit()["unit"], fixed_id)
+        self.assertEqual(self.unit()["name"], "renamed-unit")
+        current = staff.by_id(fixed_id)
+        assert current is not None
+        self.assertNotEqual(fixed_id, current.current_session)
+
+    def test_judgment_refuses_unknown_non_unit_foreign_and_duplicate_ids(self) -> None:
+        from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
+        original = cast(dict[str, object], json.loads(self.judgment.read_text()))
+        entry = cast(list[dict[str, object]], original["units"])[0]
+        other_owner = fixture_member("showrunner", name="other-production")
+        foreign = fixture_member("unit", name="foreign", parent=other_owner.id)
+        wrong_ids = (fixture_runtime_id("unknown-judgment"), other_owner.id, foreign.id)
+        for value in wrong_ids:
+            with self.subTest(value=value):
+                _ = self.judgment.write_text(json.dumps({**original, "units": [{**entry, "unit": value}]}))
+                _ = self.assert_refused_without_output(mention="no unit with this fixed id belongs to this production")
+        _ = self.judgment.write_text(json.dumps({**original, "units": [entry, entry]}))
+        _ = self.assert_refused_without_output(mention="duplicate unit")
+
     def test_a_unit_whose_run_is_finished_needs_no_entry_and_is_left_out(self) -> None:
         self.production_doc(beta=True)
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", f"== {BETA}", "● Standing by")
@@ -76,17 +109,18 @@ class DailiesInputTests(DailiesInputFixture):
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         units = cast(list[dict[str, object]], self.report()["units"])
-        self.assertEqual([unit["unit"] for unit in units], [ALPHA])
+        self.assertEqual([unit["unit"] for unit in units], [self.unit_id()])
         self.assertIn(f"left out, run finished and nothing waiting on the user: {BETA}", result.stdout)
 
     def test_report_units_reads_run_records_once_for_several_units(self) -> None:
         self.production_doc(beta=True)
         self.finished_run(self.root / "beta")
         with (mock.patch.dict(os.environ, self.env),
-              mock.patch.object(unit_lookup, "marked_units", return_value={}),
+              mock.patch.object(unit_lookup, "labeled_sessions", return_value={}),
               mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
-            units = dailies_input.report_units(self.doc, "example", staff.snapshot())
-            reads.assert_called_once_with()
+            record = staff.snapshot()
+            units = dailies_input.report_units(self.doc, "example", record)
+            reads.assert_called_once_with(record=record)
         self.assertEqual([(unit.name, unit.run) for unit in units],
                          [(ALPHA, UnitState.STANDING_BY), (BETA, UnitState.RUN_FINISHED)])
 
@@ -120,7 +154,8 @@ class DailiesInputTests(DailiesInputFixture):
                 report = self.report()
                 self.assertEqual(report["length"], length)
                 self.assertEqual(report["zone"], "America/Los_Angeles")
-                self.assertEqual(self.unit()["unit"], ALPHA)
+                self.assertEqual(self.unit()["unit"], self.unit_id())
+                self.assertEqual(self.unit()["name"], ALPHA)
                 self.assertNotIn("label", self.unit())
                 self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
                 rendered = subprocess.run([sys.executable, str(RENDERER), str(self.output),
@@ -415,7 +450,7 @@ class DailiesInputTests(DailiesInputFixture):
             "source": "stated", "stated_at": "2026-10-06T22:30:00+00:00",
             "basis": "the panel pass remains", "as_of": None,
         })
-        key = f"{ALPHA}|Phase 2 of 3: panel labels stay clear"
+        key = f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"
         old = {key: {"text": "ETA 18:40", "first_seen": "2026-10-06T14:00", "requested": False}}
         _ = (self.state / "eta_seen.json").write_text(json.dumps(old), encoding="utf-8")
         self.status_lines(f"== {ALPHA}", "● Checking panel labels")
@@ -455,7 +490,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertNotIn("tomorrow", rendered.stdout)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T16:00:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-06T16:00:00")
 
     def test_held_record_target_from_an_earlier_day_stays_on_that_day(self) -> None:
         self.open_phase_record(
@@ -486,7 +521,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertNotIn("tomorrow", rendered.stdout)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-05T16:00:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-05T16:00:00")
 
     def test_record_range_that_resolves_to_its_own_minutes_is_kept(self) -> None:
         self.open_phase_record(eta={
@@ -507,7 +542,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertIn("range 15:50–16:10", rendered.stdout)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T16:00:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-06T16:00:00")
 
     def test_record_range_more_than_a_day_from_eta_is_omitted(self) -> None:
         self.open_phase_record(eta={
@@ -545,7 +580,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-07T17:40:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-07T17:40:00")
 
     def test_record_target_far_after_its_source_uses_target_as_renderer_anchor(self) -> None:
         self.open_phase_record(eta={
@@ -563,7 +598,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T17:00:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-06T17:00:00")
 
     def test_record_backed_session_flags_stay_first(self) -> None:
         self.open_phase_record()
@@ -698,7 +733,7 @@ class DailiesInputTests(DailiesInputFixture):
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         units = cast(list[dict[str, object]], self.report()["units"])
-        self.assertEqual([unit["unit"] for unit in units], [ALPHA])
+        self.assertEqual([unit["unit"] for unit in units], [self.unit_id()])
 
     def test_all_retired_units_report_no_live_units(self) -> None:
         _ = staff.set_worktree(
@@ -1189,7 +1224,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         seen_path = self.state / "eta_seen.json"
         seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text(encoding="utf-8")))
-        key = f"{ALPHA}|Phase 2 of 3: panel labels stay clear"
+        key = f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"
         old = datetime.fromisoformat(AT) - timedelta(hours=2)
         seen[key]["first_seen"] = old.replace(tzinfo=None).isoformat()
         _ = seen_path.write_text(json.dumps(seen) + "\n", encoding="utf-8")
@@ -1202,6 +1237,28 @@ class DailiesInputTests(DailiesInputFixture):
         repeated = self.run_builder()
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertNotIn("request /unit:eta:", repeated.stdout)
+
+    def test_screen_eta_keeps_its_fixed_key_after_rename_and_clear(self) -> None:
+        first = self.run_builder()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        identity = self.unit_id()
+        seen_path = self.state / "eta_seen.json"
+        before = seen_path.read_bytes()
+        seen = cast(dict[str, object], json.loads(before))
+        self.assertEqual(set(seen), {f"{identity}|Phase 2 of 3: panel labels stay clear"})
+        row = staff.rename(identity, "renamed")
+        self.status_lines("== renamed-unit", "● Checking panel labels", "ETA 23:40")
+        renamed = self.run_builder("--at", "2026-10-06T17:20")
+        self.assertEqual(renamed.returncode, 0, renamed.stdout + renamed.stderr)
+        self.assertEqual((self.unit()["unit"], self.unit()["name"]), (identity, "renamed-unit"))
+        self.assertEqual(seen_path.read_bytes(), before)
+        _ = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("screen-eta-cleared")))
+        cleared = self.run_builder("--at", "2026-10-06T17:40")
+        self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
+        self.assertEqual((self.unit()["unit"], self.unit()["name"]), (identity, "renamed-unit"))
+        self.assertEqual(seen_path.read_bytes(), before)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
+        self.assertNotIn("request /unit:eta:", renamed.stdout + cleared.stdout)
 
     def test_passed_eta_is_hidden_and_requests_once_for_phase(self) -> None:
         old = datetime.fromisoformat(AT) - timedelta(minutes=10)
@@ -1283,8 +1340,8 @@ class DailiesInputTests(DailiesInputFixture):
                 self.assertNotIn("19:35 PDT tomorrow", rendered.stdout)
                 saved = cast(dict[str, dict[str, object]], json.loads(
                     (self.root / "render-state.json").read_text(encoding="utf-8")))
-                self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T19:35:00")
-                self.assertEqual(saved[ALPHA]["eta_text"], "19:35")
+                self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-06T19:35:00")
+                self.assertEqual(saved[self.unit_id()]["eta_text"], "19:35")
                 log_line = (self.root / "dailies.log").read_text(encoding="utf-8").splitlines()[-1]
                 self.assertIn(f"{ALPHA} Phase 2 of 3 19:35 PDT, 60% done", log_line)
                 self.assertNotIn("tomorrow", log_line)
@@ -1434,7 +1491,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(requested.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
         seen_path = self.state / "eta_seen.json"
         seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text(encoding="utf-8")))
-        self.assertEqual(seen[f"{ALPHA}|Phase 2 of 3: panel labels stay clear"], {"requested": True})
+        self.assertEqual(seen[f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"], {"requested": True})
         report = self.run_builder()
         self.assertEqual(report.returncode, 0, report.stdout + report.stderr)
         self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
@@ -1466,7 +1523,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn(f"request /unit:eta: {BETA}", result.stdout)
         seen = cast(dict[str, dict[str, object]], json.loads((self.state / "eta_seen.json").read_text()))
-        record = seen[f"{BETA}|{beta_phase}"]
+        record = seen[f"{self.unit_id(BETA)}|{beta_phase}"]
         self.assertIs(record["requested"], True)
         self.assertEqual(record["text"], "ETA 16:40")
 
@@ -1519,7 +1576,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", retried.stdout)
         seen = cast(dict[str, dict[str, object]], json.loads((self.state / "eta_seen.json").read_text()))
-        record = seen[f"{ALPHA}|Phase 2 of 3: panel labels stay clear"]
+        record = seen[f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"]
         self.assertEqual(record["first_seen"], AT)
         self.assertIs(record["requested"], True)
 
@@ -1555,7 +1612,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
         seen_path = self.state / "eta_seen.json"
         seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text(encoding="utf-8")))
-        key = f"{ALPHA}|Phase 2 of 3: panel labels stay clear"
+        key = f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"
         seen[key]["first_seen"] = "2026-10-06T14:00"
         seen[key]["requested"] = False
         _ = seen_path.write_text(json.dumps(seen, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -1565,7 +1622,7 @@ class DailiesInputTests(DailiesInputFixture):
         old = {"phase": "Phase 2 of 3: panel labels stay clear", "eta": "2026-10-06T20:00:00",
                "eta_text": "20:00",
                "held": None, "first": "2026-10-06T20:00:00"}
-        _ = render_state.write_text(json.dumps({ALPHA: old}), encoding="utf-8")
+        _ = render_state.write_text(json.dumps({self.unit_id(): old}), encoding="utf-8")
         self.events.unlink()
 
         refused = self.run_builder("--user-run", "--render-state", str(render_state))
@@ -1831,7 +1888,7 @@ class DailiesInputTests(DailiesInputFixture):
 
     def test_a_saved_report_that_cannot_be_written_never_fails_the_run(self) -> None:
         self.showrunner_state.mkdir(parents=True)
-        _ = (self.showrunner_state / "example").write_text("a file where the folder goes\n", encoding="utf-8")
+        _ = (self.showrunner_state / showrunner_relationship(fixture_showrunner_name("example", self.doc)).id).write_text("a file where the folder goes\n", encoding="utf-8")
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("saved report: unavailable — ", result.stdout)

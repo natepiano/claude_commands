@@ -207,7 +207,7 @@ def mac_processes(output: str, environment_reader: Callable[[int], dict[str, str
 
 def is_test_hana(row: HanaProcess, config: HanaInstancesConfig) -> bool:
     return bool(row.owner or row.purpose or (row.port != 0 and row.port not in config.exempt_ports)
-                or any(key in row.environment for key in ("CLAUDECODE", "SSH_CONNECTION", "SHOWRUNNER_UNIT_ID")))
+                or any(key in row.environment for key in ("CLAUDECODE", "SSH_CONNECTION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")))
 
 
 def over_limit(row: HanaProcess, config: HanaInstancesConfig) -> bool:

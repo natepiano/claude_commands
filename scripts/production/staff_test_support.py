@@ -468,7 +468,7 @@ def isolated_source_readers() -> Generator[None]:
         for name in ("unit_lookup", "scripts.production.unit_lookup"):
             module = sys.modules.get(name)
             if module is not None:
-                _ = contexts.enter_context(mock.patch.object(module, "marked_units", return_value={}))
+                _ = contexts.enter_context(mock.patch.object(module, "labeled_sessions", return_value={}))
         yield
 
 
@@ -662,7 +662,7 @@ class StaffTestCase(unittest.TestCase):
             if staff.initial_snapshot().by_id(staff.StaffId(identity)) is None:
                 _ = unit_membership(workspace or slug, unit)
             self.pane(f"fixture:{slug}/{unit}", session_id=identity,
-                      environment={"SHOWRUNNER_UNIT": slug, "SHOWRUNNER_UNIT_ID": unit},
+                      environment={"CLAUDE_CODE_SESSION_ID": identity},
                       written_at="2026-10-01T00:00:00+00:00")
         if parent:
             parent_file = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / slug / "parent"

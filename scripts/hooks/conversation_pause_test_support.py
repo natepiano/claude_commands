@@ -155,6 +155,8 @@ class ConversationPauseFixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.root = self.fixture_root
         self.bind_environment()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        self.record_showrunner("showrunner-demo")
 
     def build_fixture(self) -> None:
         self.root.mkdir()
@@ -296,6 +298,7 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
+            "HERDR_BIN": "/nonexistent/herdr",
             "CLAUDE_CODE_SESSION_ID": SESSION,
             "NOTIFIER_STATE_DIR": str(self.notifier_root),
             "SHOWRUNNER_STATE_DIR": str(self.showrunner_root),
@@ -318,9 +321,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
             "AUTO_SILENCE_LOG": str(self.activity_log),
             "UNIT_ACTIVE_DIR": str(self.unit_active_root),
         }
-
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        self.record_showrunner("showrunner-demo")
 
     def record_showrunner(self, name: str) -> None:
         """Record the production owner that review checks require."""

@@ -24,18 +24,18 @@ When `PRODUCTION_DOC` carries `**Kind:** style`, read
 
 State:
 
-- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG` — from the production doc.
-  After a `/showrunner:rename apply` succeeds, read them again from the
-  renamed doc, along with `UPDATES` and `PROMPT_FILE`, which come from its
-  slug: apply moves the doc, the update timer and the state directory, and
-  switches `CHECKOUT` to the new merge branch.
+- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG` — read these from the production document.
+  After a rename, read these values again.
+- `STAFF_ID` — the fixed showrunner id from staff.
+  Read the row through `session_staff.RowResolver` or `staff.snapshot()`.
+  Keep this id after a rename or a new current session.
 - `UNITS` — the production's staff rows with a present worktree. A retired row has a `RemovedWorktree`.
 - `ZONE` — the user's zone setting, which
   `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.
 - `CHECKOUT` — this session's checkout, which must be on `MERGE_BRANCH`.
 - `SCRATCH` — this session's scratchpad directory, for files that only this session needs.
-- `STATE_DIR` — `~/.local/state/showrunner/<slug>/session`, the showrunner's own state.
+- `STATE_DIR` — `~/.local/state/showrunner/<staff id>/session`, the showrunner's own state.
   It lasts across a new session id, a restart and a reboot, which a scratchpad does not.
 - `DAILIES_STATE_DIR` — `<STATE_DIR>/dailies_input_state`, the dailies builder's
   `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
@@ -46,9 +46,9 @@ State:
   `<old>` before it over to `<new>`.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
 - `UPDATES` — `showrunner-<staff id>`, where `<staff id>` is the showrunner row id.
-- `PROMPT_FILE` — `~/.local/state/showrunner/<slug>/prompt.txt`.
+- `PROMPT_FILE` — `~/.local/state/showrunner/<staff id>/prompt.txt`.
 - `SHOWRUNNER_STATE` — `<STATE_DIR>/showrunner_state.json`, one JSON object with
-  optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
+  optional `units` rows (`{"unit": "<unit staff id>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
   (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`; an
   object may add `urgency`: `blocks`, `soon` with `due`, or `later`, and
@@ -57,12 +57,12 @@ State:
   the user asked to be told about, such as "tell me when hanadocs is back";
   remove an item once it is reported; it needs no review), and `next` (a list
   of one-line text: each action you owe and what sets it off; see Compaction). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that asks it carries the printed `reviewed question` text.
-- `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
+- `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<staff id>.json`, written
   by `update_registration.py questions --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
   `report_to_user` is kept the same way in
-  `~/.local/state/showrunner/reports/<slug>.json`.
-- `LOG` backups — `~/.local/state/showrunner/<slug>/log-backups/log-<YYYYmmddTHHMM>.md`,
+  `~/.local/state/showrunner/reports/<staff id>.json`.
+- `LOG` backups — `~/.local/state/showrunner/<staff id>/log-backups/log-<YYYYmmddTHHMM>.md`,
   one copy per update tick, the newest 48 kept (`log_backup.py`). To restore
   `LOG`, copy the wanted file back over it.
 

@@ -512,7 +512,7 @@ def main(arguments: list[str]) -> int:
         for row in staff.active(subtree.record, "showrunner"):
             timer = showrunners.timer_for(row, subtree.record)
             if isinstance(timer, showrunners.TimerRegistration):
-                watch_sources.add(showrunners.SHOWRUNNER_STATE_DIR / timer.slug)
+                watch_sources.add(showrunners.SHOWRUNNER_STATE_DIR / row.id)
     watch = existing_sources(watch_sources)
     print(json.dumps({"files": files, "watch": watch}))
     return 0

@@ -121,7 +121,8 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
             found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
         except OSError:
             pass
-    from update_registration import QuestionFolder, QuestionStaff, question_folder, question_records_for_document
+    from update_registration import (QuestionFolder, QuestionStaff, RegistrationFailure,
+                                     question_folder, question_records_for_document)
 
     try:
         if identities is None:
@@ -132,11 +133,8 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
                 found.append(questions.path)
             found.extend(record.path for record in question_records_for_document(doc, identities)
                          if record.status == "open")
-    except staff.StaffRefused as error:
-        print(f"questions: refused — {error}", file=sys.stderr)
-        raise SystemExit(2) from error
-    except OSError:
-        pass
+    except (staff.StaffRefused, RegistrationFailure, OSError) as error:
+        print(f"questions: unavailable — {error}", file=sys.stderr)
     return found
 
 

@@ -20,6 +20,7 @@ from unittest import mock
 import index
 from cgroup_test_support import CPU, GIB, slice_reading
 import parse
+import store
 import report
 import record as recorder
 if TYPE_CHECKING:
@@ -37,6 +38,7 @@ CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")
 STAMP = "2026-10-02T12:00:00.000Z"
 FIXTURE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS fixture_index ON steps (status)"
+SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
 Record = dict[str, object]
 _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
@@ -286,6 +288,7 @@ class IndexTests(unittest.TestCase):
 
     def test_cleanup_reads_the_unused_schema_age_from_config_at_use(self) -> None:
         config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=30")
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
         active_path = index.index_path()
@@ -297,20 +300,117 @@ class IndexTests(unittest.TestCase):
             self.assertEqual(index.update(), 1)
             recent_path = index.index_path()
         now = time.time()
-        old = now - 10 * 86400
+        old = now - 2 * 86400
+        recent = now - 23 * 3600
+        sidecars = [old_path.with_name(old_path.name + suffix) for suffix in SQLITE_SIDECARS]
+        for path in sidecars:
+            _ = path.write_bytes(b"old schema sidecar")
         os.utime(old_path, (old, old))
-        os.utime(recent_path, (old, now))
+        os.utime(recent_path, (old, recent))
         self.assertEqual(index.update(), 0)
         self.assertTrue(old_path.is_file())
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=7")
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
         os.utime(active_path, (old, old))
         self.assertEqual(index.update(), 0)
         self.assertFalse(old_path.exists())
+        for path in sidecars:
+            self.assertFalse(path.exists(), path.name)
         self.assertTrue(recent_path.is_file())
-        os.utime(recent_path, (now, old))
+        os.utime(recent_path, (recent, old))
         self.assertEqual(index.update(), 0)
         self.assertTrue(recent_path.is_file())
         self.assertEqual(self.ids(), ["retained"])
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=0")
+        self.assertEqual(index.update(), 0)
+        self.assertTrue(active_path.is_file())
+
+    def test_update_removes_a_fresh_legacy_index_and_its_sidecars(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        legacy = self.root / "index.sqlite"
+        paths = [legacy, *(legacy.with_name(legacy.name + suffix) for suffix in SQLITE_SIDECARS)]
+        for path in paths:
+            _ = path.write_bytes(b"legacy index")
+        self.assertEqual(index.update(), 0)
+        for path in paths:
+            self.assertFalse(path.exists(), path.name)
+        self.assertEqual(self.ids(), ["retained"])
+
+    def test_update_finishes_interrupted_index_cleanup_and_removes_orphan_sidecars(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        old = time.time() - 2 * 86400
+        unlink = Path.unlink
+        for name in ("index.sqlite", "index-" + "a" * 64 + ".sqlite"):
+            with self.subTest(name=name):
+                obsolete = self.root / name
+                paths = [obsolete, *(obsolete.with_name(name + suffix) for suffix in SQLITE_SIDECARS)]
+                for path in paths:
+                    _ = path.write_bytes(b"obsolete index")
+                    os.utime(path, (old, old))
+                removals = 0
+
+                def interrupt_cleanup(path: Path, missing_ok: bool = False) -> None:
+                    nonlocal removals
+                    if path in paths and path.exists():
+                        if removals == 1:
+                            raise PermissionError("cleanup interrupted")
+                        removals += 1
+                    unlink(path, missing_ok=missing_ok)
+
+                with mock.patch.object(Path, "unlink", interrupt_cleanup):
+                    with self.assertRaisesRegex(PermissionError, "cleanup interrupted"):
+                        _ = index.update()
+                self.assertEqual(index.update(), 0)
+                for path in paths:
+                    self.assertFalse(path.exists(), path.name)
+        orphan = self.root / ("index-" + "b" * 64 + ".sqlite-wal")
+        _ = orphan.write_bytes(b"orphan sidecar")
+        os.utime(orphan, (old, old))
+        self.assertEqual(index.update(), 0)
+        self.assertFalse(orphan.exists())
+        self.assertEqual(self.ids(), ["retained"])
+
+    def test_reindex_removes_current_index_sidecars_before_rebuilding(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        current = index.index_path()
+        sidecars = [current.with_name(current.name + suffix) for suffix in SQLITE_SIDECARS]
+        for path in sidecars:
+            _ = path.write_bytes(b"stale sidecar")
+        open_for_update = index.open_for_update
+
+        def open_after_cleanup(path: Path) -> sqlite3.Connection:
+            for sidecar in sidecars:
+                self.assertFalse(sidecar.exists(), sidecar.name)
+            return open_for_update(path)
+
+        with mock.patch.object(index, "open_for_update", side_effect=open_after_cleanup):
+            self.assertEqual(index.reindex(), 1)
+        self.assertEqual(self.ids(), ["retained"])
+        self.assertEqual(index.update(), 0)
+
+    def test_update_reads_the_current_index_touch_interval_from_config_at_use(self) -> None:
+        config = configure_cleanup(self, self.root)
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        current = index.index_path()
+        now = time.time()
+        for minutes, age, touches in ((120, 61, False), (60, 59, False), (60, 61, True)):
+            with self.subTest(minutes=minutes, age=age):
+                _ = write_config_fixture(config / "buildlog.conf", f"INDEX_TOUCH_MINUTES={minutes}")
+                stamp = now - age * 60
+                os.utime(current, (stamp, stamp))
+                self.assertEqual(index.update(), 0)
+                if touches:
+                    self.assertGreater(current.stat().st_mtime, stamp)
+                else:
+                    self.assertEqual(current.stat().st_mtime, stamp)
+                self.assertEqual(self.ids(), ["retained"])
 
     def test_missing_tables_rebuild_records_before_the_saved_offsets(self) -> None:
         self.write(self.host_file, step("retained"), call("retained-call"))
@@ -410,6 +510,147 @@ class IndexTests(unittest.TestCase):
         _ = index.update()
         self.assertEqual(self.rows("SELECT id, target, mac FROM calls"), [("legacy", "mac", "passed_full")])
         self.assertEqual(self.rows("SELECT count(*) FROM ssh_attempts"), [(0,)])
+
+    def test_mac_nextest_rows_use_the_call_repository_from_local_steps_or_ssh_attempts(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        identity = "https://github.com/example/hana"
+        facts = parse.log_facts("nextest", "        PASS [ 2.000s] hana tests::slow\n")
+        mac_file = self.root / "Mac" / "2026-10.jsonl"
+        mirrors = [step(f"mac-{name}", host="Nates-MacBook-Pro-2023", caller="verify-mac",
+                        step="nextest", call_id=f"{name}-call", repo_path=None,
+                        repo_identity=UNKNOWN_IDENTITY, **facts)
+                   for name in ("local", "ssh", "unrelated")]
+        self.write(mac_file, *mirrors)
+        self.write(self.host_file,
+                   call("local-call"), call("ssh-call"), call("unrelated-call"),
+                   step("local-evidence", call_id="local-call", repo_identity=identity))
+        recorder.ssh_attempt({
+            "call_id": "ssh-call", "target": "mac", "repo_identity": identity,
+            "queued_at": 100.0, "departed_at": 140.0, "slot": 1, "outcome": "passed",
+            "completion": "confirmed", "cleanup": "confirmed", "unresolved_count": 0,
+            "evidence_at": 150.0,
+        })
+        original = mac_file.read_bytes()
+        _ = index.update()
+        expected = [("mac-local", identity), ("mac-ssh", identity), ("mac-unrelated", UNKNOWN_IDENTITY)]
+        step_query = ("SELECT id, repo_identity FROM steps WHERE host = 'Nates-MacBook-Pro-2023'"
+                      + " ORDER BY id")
+        test_query = ("SELECT t.step_id, s.repo_identity FROM tests t JOIN steps s ON s.id = t.step_id"
+                      + " WHERE t.host = 'Nates-MacBook-Pro-2023' ORDER BY t.step_id")
+        for rebuild in (False, True):
+            with self.subTest(rebuild=rebuild):
+                if rebuild:
+                    _ = index.reindex()
+                self.assertEqual(self.rows(step_query), expected)
+                self.assertEqual(self.rows(test_query), expected)
+                self.assertEqual(index.update(), 0)
+        self.assertEqual(mac_file.read_bytes(), original)
+
+    def test_derived_repository_identity_matches_rebuild_in_either_evidence_order(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        local_identity = "https://example.org/local"
+        ssh_identity = "https://example.org/ssh"
+        local = step("evidence", call_id="served", repo_identity=local_identity)
+        ssh: Record = {"kind": "ssh_attempt", "id": "attempt", "call_id": "served",
+                       "repo_identity": ssh_identity, "at": STAMP}
+        for first, second, initial in ((ssh, local, ssh_identity), (local, ssh, local_identity)):
+            with self.subTest(first=first["kind"]):
+                mirror = step("mirror", call_id="served", host="Nates-MacBook-Pro-2023",
+                              caller="verify-mac", repo_path=None, repo_identity=UNKNOWN_IDENTITY)
+                self.write(self.host_file, call("served"), mirror, first)
+                _ = index.update()
+                self.assertEqual(self.rows("SELECT repo_identity FROM steps WHERE id = 'mirror'"),
+                                 [(initial,)])
+                store.append_line(self.host_file, second)
+                _ = index.update()
+                query = "SELECT repo_identity, identity_derived FROM steps WHERE id = 'mirror'"
+                incremental = self.rows(query)
+                self.assertEqual(incremental, [(local_identity, 1)])
+                _ = index.reindex()
+                self.assertEqual(self.rows(query), incremental)
+
+    def test_call_identity_changes_preserve_recorder_written_step_identity(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        identity = "https://example.org/recorded"
+        self.write(self.host_file, call("served", host="other-gate"),
+                   step("recorded", call_id="served", repo_identity=identity),
+                   step("unknown", call_id="served", host="other-builder", caller="verify-linux",
+                        repo_path=None, repo_identity=UNKNOWN_IDENTITY))
+        _ = index.update()
+        store.append_line(self.host_file, step("later", call_id="served", host="other-builder",
+                                              started_at="2026-10-02T12:01:00.000Z", repo_identity="https://example.org/later"))
+        _ = index.update()
+        query = "SELECT repo_identity, identity_derived FROM steps WHERE id = 'recorded'"
+        expected = [(identity, 0)]
+        self.assertEqual(self.rows(query), expected)
+        self.assertEqual(self.rows("SELECT repo_identity FROM steps WHERE id = 'unknown'"),
+                         [("https://example.org/later",)])
+        _ = index.reindex()
+        self.assertEqual(self.rows(query), expected)
+
+    def test_identity_resolution_skips_samples_and_steps_of_untouched_calls(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, call("served"), call("untouched"),
+                   step("evidence", call_id="served", repo_identity="https://example.org/known"),
+                   step("mirror", call_id="served", repo_identity=UNKNOWN_IDENTITY),
+                   step("other", call_id="untouched", repo_identity=UNKNOWN_IDENTITY))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as database, database:
+            _ = database.execute("UPDATE steps SET repo_identity = ?, identity_derived = 1 WHERE id IN ('mirror', 'other')",
+                                 ("https://example.org/unchanged",))
+        for entry in (sample(STAMP), {"kind": "memory_snapshot", "id": "snapshot", "host": "natedev", "at": STAMP}):
+            store.append_line(self.host_file, entry)
+            _ = index.update()
+            self.assertEqual(self.rows("SELECT id, repo_identity FROM steps WHERE identity_derived = 1 ORDER BY id"),
+                             [("mirror", "https://example.org/unchanged"), ("other", "https://example.org/unchanged")])
+        store.append_line(self.host_file, call("served"))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT id, repo_identity FROM steps WHERE identity_derived = 1 ORDER BY id"),
+                         [("mirror", "https://example.org/known"), ("other", "https://example.org/unchanged")])
+
+    def test_update_restores_a_missing_call_index_before_reading_new_steps(self) -> None:
+        _ = configure_cleanup(self, self.root)
+        self.write(self.host_file, call("served"), step("evidence", call_id="served", repo_identity="https://example.org/known"))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as database, database:
+            _ = database.execute("DROP INDEX steps_call")
+        store.append_line(self.host_file, step("mirror", call_id="served", repo_identity=UNKNOWN_IDENTITY,
+                                              tests=[{"binary": "hana", "test": "slow", "status": "passed", "duration_s": 2.0}]))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT repo_identity FROM steps WHERE id = 'mirror'"), [("https://example.org/known",)])
+        join = ("SELECT t.test FROM steps s JOIN tests t ON t.step_id = s.id"
+                + " WHERE s.repo_identity = ? AND s.host = ? AND s.started_at >= ?")
+        parameters = ("https://example.org/known", "natedev", STAMP)
+        self.assertEqual(self.rows(join, *parameters), [("slow",)])
+        plan = self.rows("EXPLAIN QUERY PLAN " + join, *parameters)
+        self.assertTrue(any("SEARCH t USING" in str(row[3]) and "step_id=?" in str(row[3]) for row in plan), plan)
+
+    def test_nextest_recording_reads_the_threshold_at_use_and_keeps_only_durations_above_it(self) -> None:
+        config = configure_cleanup(self, self.root)
+        lines = [
+            "        PASS [ 0.749s] hana tests::below",
+            "        PASS [ 0.750s] hana tests::boundary",
+            "        PASS [ 0.751s] hana tests::above_boundary",
+            "        PASS [ 1.250s] hana tests::higher_boundary",
+            "        PASS [ 1.251s] hana tests::above_higher_boundary",
+            "        FAIL [ 0.010s] hana tests::failed",
+            "  TRY 2 PASS [ 0.020s] hana tests::retried",
+            "        SLOW [> 0.030s] hana tests::reported_slow",
+            "        PASS [ 0.040s] hana tests::reported_slow",
+        ]
+        for threshold, expected in (
+            (0.75, {"tests::above_boundary", "tests::higher_boundary", "tests::above_higher_boundary",
+                    "tests::failed", "tests::retried", "tests::reported_slow"}),
+            (1.25, {"tests::above_higher_boundary", "tests::failed", "tests::retried", "tests::reported_slow"}),
+        ):
+            with self.subTest(threshold=threshold):
+                _ = write_config_fixture(config / "test_times.conf", f"NEXTEST_SLOW_TEST_S={threshold}")
+                tests = parse.test_results(lines)[0]
+                self.assertEqual({test["test"] for test in tests}, expected)
+                self.write(self.host_file, step("threshold", step="nextest", tests=tests))
+                _ = index.update()
+                self.assertEqual({row[0] for row in self.rows("SELECT test FROM tests")}, expected)
 
     def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:
         self.write(self.host_file, *(step(f"build-{number:03}", argv=argv) for number, argv in enumerate(commands)))

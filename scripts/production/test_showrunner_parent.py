@@ -42,7 +42,7 @@ class ShowrunnerParentTests(StaffTestCase):
         script = Path(showrunners.__file__)
         _ = self.script(script, "attach", "sdlc", "parent")
         self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", staff.ReportsTo(parent.id), current_session=child.id, doc=child.doc))
-        source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "sdlc/parent"
+        source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / child.id / "parent"
         self.assertFalse(source.exists())
         _ = self.script(script, "detach", "sdlc")
         self.assertEqual(staff.snapshot().by_id(child.id), child)
@@ -100,8 +100,8 @@ class ShowrunnerParentTests(StaffTestCase):
         self.assertEqual(self.source_files(), before)
 
     def test_notice_recovery_uses_delivery_status_instead_of_output_wording(self) -> None:
-        _ = self.members()
-        pending = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "sdlc/parent_notice.json"
+        child, _ = self.members()
+        pending = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / child.id / "parent_notice.json"
         with mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery(
                 ("delivery deferred",), failed=("sdlc",))), \
                 redirect_stdout(io.StringIO()):
@@ -114,7 +114,7 @@ class ShowrunnerParentTests(StaffTestCase):
 
     def test_parent_change_retries_notices_after_the_source_step(self) -> None:
         child, parent = self.members()
-        source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "sdlc/parent"
+        source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / child.id / "parent"
         pending = source.with_name("parent_notice.json")
         for action in ("attach", "detach"):
             with self.subTest(action=action), redirect_stdout(io.StringIO()):

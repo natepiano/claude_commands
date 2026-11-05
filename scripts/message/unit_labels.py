@@ -281,13 +281,13 @@ def showrunner_ids(
     return found
 
 
-def every_marked_unit(record: staff.StaffSnapshot | None = None, *,
-                      running: list[SessionRecord] | None = None) -> session_staff.MarkedProductions | OSError:
+def every_labeled_session(record: staff.StaffSnapshot | None = None, *,
+                      running: list[SessionRecord] | None = None) -> session_staff.LabeledProductions | OSError:
     """Every production's observed units, joined to one staff snapshot."""
     import unit_lookup as process_units
 
     try:
-        return process_units.every_marked_unit(record=record, running=running)
+        return process_units.every_labeled_session(record=record, running=running)
     except OSError as error:
         return error
 

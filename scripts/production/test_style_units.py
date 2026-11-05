@@ -37,7 +37,7 @@ def live_unit(name: str, session: str = "") -> live_units.LiveUnit:
     if not session:
         return live_units.LiveUnit(name, None)
     claude = unit_lookup.LiveClaude(session, session + "-id", "test.sock", 1)
-    marked = unit_lookup.MarkedUnit(name, claude, HerdrPlace("test", "w1:p1"))
+    marked = unit_lookup.LabeledSession(name, claude, HerdrPlace("test", "w1:p1"))
     return live_units.LiveUnit(name, marked)
 
 

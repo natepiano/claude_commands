@@ -55,7 +55,7 @@ Resume restores the folder from the merge branch and resumes `current_session`.
 
 - **Launch.** `launch_session` starts the shared herdr server and opens the unit's tab in its production workspace.
   The tab title uses the unit name. The agent name uses the production and unit names.
-  The environment uses the selected account and the unit marks.
+  The environment uses the selected account and the session labels.
   New work uses the plan, brief, or standby prompt. A normal unit resume keeps its existing admission path.
   Shutdown restart bypasses this path and sends no work prompt.
 
@@ -238,16 +238,15 @@ The pass shares one absolute monotonic deadline across discovery, pane text and 
 
 - **A hold with a stated end (2026-10-17).** A `holding:` turn-end that names a future time is silent in the stall watch until that time, like a waiting kind, unless its context is at the compaction wake point; an explicit pause or external-owner wait remains quiet at that point too. The idle clock starts once the hold passes. The outside-party rule then decides whether the unit receives a bump. `stated_hold_end(line, now, zone)` takes the latest `HH:MM` in the line, with an optional `YYYY-MM-DD` or `MM-DD` before it, in the production's zone unless followed by `UTC` or `GMT`; a time without a date, or a date without a year, is the occurrence nearest now (`hold_days`), so `until 01:00` read at 23:00 is tomorrow, `since 23:50` read at 00:10 is yesterday, and `Thu 10-22 11:47 EDT` is the nearest 22 October. A hold has no upper limit: real holds run for days. Seen on mul_add, bumped at 05:32 during a re-measure window its hold said ends at 16:09.
 
-### Manager tree: staff record
+### Staff relationships
 
-Cargo-handler reads `~/.local/state/staff/staff.json` directly through its `[census] staff_file` setting.
-The default path uses the local staff record.
-Staff schema 2 records each member's `id`, `kind`, `name`, `parent`, and `current_session`.
-The handler uses these rows for manager relationships and staff names.
-It reads the file again when the file changes.
-A missing staff file supplies no staff names and causes no error.
-The handler no longer runs a command to read the manager tree.
-The old `[census] hierarchy_command` setting has no effect.
+The staff record stores showrunners, unit directors, and workers as rows.
+Each row has a fixed staff id, a name, a kind, and its current native runtime id.
+The native runtime id is a Claude session id or a Codex thread id.
+A row's parent identifies its manager by staff id.
+Readers join runtime observations to rows through the current native runtime id.
+They read names and manager relationships from the selected rows.
+Copied pane marks do not select rows.
 
 ## Invariants
 
@@ -381,23 +380,23 @@ The old `[census] hierarchy_command` setting has no effect.
 ## Session hosting
 
 Unit lookup reads only herdr. `Place` is `HerdrPlace(session, pane)`;
-`MarkedUnit(unit, claude, place, pid, command)` exposes the server name as `place.session`.
-`every_marked_unit()` raises `OSError` when herdr cannot be read, and
-`marked_units(slug)` selects one production. A live Claude joins only marks on
-its exact PID. A marked shell or other non-Claude process retains its stopped
-pane as `ClaudeNotRunning`, for recovery, resume and status. Live or unknown
+`LabeledSession(unit, claude, place, process, identity)` exposes the server name as `place.session`.
+`every_labeled_session()` raises `OSError` when herdr cannot be read, and
+`labeled_sessions(slug)` selects one production. A live Claude joins native identity evidence from
+its exact PID. Other processes retain their panes as `ClaudeNotRunning` for recovery, resume, and status. Live or unknown
 Claude holders take precedence over stopped panes; only those holders count
 toward duplicate faults. With only stopped holders, the first pane is retained.
-Duplicate live or unknown marks refuse that production and name each holder's
-PID, command and pane. Transfer and rename verification reject former marks
-only for live or unknown holders, ignoring leftover non-Claude processes. Registry records join by pid through `herdr_processes` and
-`herdr_place_of`; unreadable cwd preserves placement. An unreadable registry
-keeps an unresolved Claude as `ClaudeUnknown(reason)`; a registered running Claude without its messaging socket is also unknown, never absent.
+Duplicate live or unknown processes produce a fault with each PID, command, and pane.
+Registry records join by PID through `herdr_processes` and `herdr_place_of`.
+An unreadable directory preserves placement.
+An unreadable registry preserves `ClaudeUnknown(reason)`.
+A registered Claude without its messaging socket also remains unknown.
 
-Units launch exclusively in herdr and restore through `add_unit.py --host-session`.
-Resume models come from transcripts. Existing Units rows can be reused;
-running sessions acquire marks only at launch. Promotion waits for Claude
-to exit before stopping its herdr server and launching the replacement.
+Units launch in herdr and restore through `add_unit.py --host-session`.
+Resume models come from transcripts.
+Native runtime ids select staff rows.
+New launches carry no copied staff identity.
+Promotion waits for Claude to exit before it starts the replacement.
 Registration creates the showrunner update and the run-only stall-watch job.
 
 ### Rerun recovery (2026-10-29)

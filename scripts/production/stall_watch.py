@@ -127,7 +127,7 @@ class PaneInspection(NamedTuple):
     zone: ZoneInfo
     members: tuple[str, ...]
     name: str
-    unit: unit_lookup.MarkedUnit
+    unit: unit_lookup.LabeledSession
     row: staff.StaffRow
 
 
@@ -293,37 +293,32 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
     return found
 
 
-def staff_marks(pid: int) -> tuple[str, str] | None:
-    """The production and unit a process's environment marks it with, inherited from its unit's session."""
+def process_session(pid: int) -> str:
+    """Read the native session identity inherited by a process."""
     if sys.platform == "darwin":
         # The Mac has no /proc; herdr reads the environment from ps.
         try:
             values = herdr.darwin_process_environment(pid)
         except (HerdrFailure, subprocess.SubprocessError, OSError):
-            return None
+            return ""
     else:
         try:
             environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         except OSError:
-            return None
+            return ""
         values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
-    slug, unit = values.get(unit_lookup.PRODUCTION_MARK, ""), values.get(unit_lookup.UNIT_MARK, "")
-    return (slug, unit) if slug and unit else None
+    return values.get("CODEX_THREAD_ID", "") or values.get("CLAUDE_CODE_SESSION_ID", "")
 
 
-def work_running(pid: int, rows: list[Process], marks: tuple[str, str] | None = None) -> bool:
-    """A shell or launcher under the unit's Claude, or any process the unit started that left its tree.
-
-    A process carrying the unit's marks counts wherever it sits, except the Claude, the pane around
-    it, and the long-lived helpers the Claude starts itself (its MCP servers).
-    """
+def work_running(pid: int, rows: list[Process], session_id: str = "") -> bool:
+    """Find work through descendants or a shared native session identity."""
     for row in descendants(pid, rows):
         if row.command.endswith(" <defunct>"):
             continue
         word = row.command.split(" ", 1)[0]
         if Path(word).name in WORK:
             return True
-    if marks is None:
+    if not session_id:
         return False
     parents = {row.pid: row.parent for row in rows}
     ancestors: set[int] = set()
@@ -333,17 +328,10 @@ def work_running(pid: int, rows: list[Process], marks: tuple[str, str] | None = 
         current = parents[current]
     helpers = {row.pid for row in rows if row.parent == pid}
     helpers.update(child.pid for helper in tuple(helpers) for child in descendants(helper, rows))
-    current_slugs: dict[str, str] = {}
     for row in rows:
         if row.pid in ancestors or row.pid in helpers or row.command.endswith(" <defunct>"):
             continue
-        inherited = staff_marks(row.pid)
-        if inherited is None or inherited[1] != marks[1]:
-            continue
-        slug = inherited[0]
-        if slug not in current_slugs:
-            current_slugs[slug] = showrunners.canonical_slug(slug)
-        if (current_slugs[slug], inherited[1]) == marks:
+        if process_session(row.pid) == session_id:
             return True
     return False
 
@@ -519,12 +507,18 @@ class WatchedUnit(NamedTuple):
     prompt_key: str
 
 
+def _watched_staff_unit(slug: str, unit: str, row: staff.StaffRow) -> WatchedUnit:
+    path = STATE_DIR / f"{row.id}.json"
+    return WatchedUnit(slug, unit, path, path.with_suffix(".prompt.json"), f"stall-watch:prompt:{row.id}")
+
+
 def watched_unit(slug: str, unit: str, record: staff.StaffSnapshot) -> WatchedUnit:
-    found = record.by_path(f"{slug}/{unit_names.name(unit)}")
+    found = record.by_path(f"{slug}/{unit}")
+    if found is None:
+        found = record.by_path(f"{slug}/{unit_names.name(unit)}")
     if found is None:
         raise ValueError(f"{slug}/{unit}: no unique staff row")
-    path = STATE_DIR / f"{found.id}.json"
-    return WatchedUnit(slug, unit, path, path.with_suffix(".prompt.json"), f"stall-watch:prompt:{found.id}")
+    return _watched_staff_unit(slug, unit, found)
 
 
 def stretch_path(slug: str, unit: str) -> Path:
@@ -1251,11 +1245,11 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             continue
         try:
             slug = configured["slug"]
-            marked = unit_lookup.marked_units(slug, record=record)
+            marked = unit_lookup.labeled_sessions(slug, record=record)
             for name, unit in marked.items():
-                reference = (session_staff.StoredReference(unit.staff_id) if unit.staff_id
-                             else session_staff.BY_NAME)
-                row = unit_lookup.unit_row(name, record, reference=reference)
+                if isinstance(unit.identity, session_staff.NoSession):
+                    raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
+                row = unit_lookup.unit_row(name, record, reference=unit.identity)
                 if row.parent not in members_by_parent:
                     members_by_parent[row.parent] = tuple(alias
                         for member in (record.find(kind="unit", parent=row.parent.id) if isinstance(row.parent, staff.ReportsTo) else ())
@@ -1272,7 +1266,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
         if isinstance(rows, ProcessSnapshotFailure):
             continue
         showrunner_socket = configured["socket"]
-        watch = watched_unit(slug, name, record)
+        watch = _watched_staff_unit(slug, name, row)
         if any(item.state_path == watch.prompt_path for item in pending):
             continue
         if not pane_budget_left(name, inspection_deadline):
@@ -1384,7 +1378,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 save_stretch(path, stretch)
                 report.decision = "waiting"
                 continue
-            running_work = work_running(pid, rows, (slug, unit.unit))
+            running_work = work_running(pid, rows, session_id)
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
@@ -1454,7 +1448,7 @@ def migrate_staff_ids() -> int:
             retire = retire_key(target, prompt["key"])
             _ = subprocess.run(retire.command, check=True, timeout=30)
             if not prompt["retiring"]:
-                alert = prompt_alert(watched_unit(slug, unit_names.unit_id(row.name), record), "", prompt["since"], ZoneInfo("UTC"))
+                alert = prompt_alert(_watched_staff_unit(slug, unit_names.unit_id(row.name), row), "", prompt["since"], ZoneInfo("UTC"))
                 _ = subprocess.run(alert.command, check=True, timeout=30)
         prompt["key"] = key
         if "case_pending" in prompt:

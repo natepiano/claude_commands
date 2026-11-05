@@ -1477,7 +1477,7 @@ def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
     unit_address = ""
     showrunner_address = ""
     try:
-        found = unit_lookup.marked_unit(slug, unit)
+        found = unit_lookup.labeled_session(slug, unit)
         if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
             unit_address = f"session:{found.claude.session_id}"
     except OSError as error:

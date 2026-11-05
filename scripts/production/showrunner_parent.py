@@ -10,6 +10,7 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.production.store_owner import showrunner_id
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff, staff_sources
@@ -28,7 +29,7 @@ class NoPendingParentNotice:
 
 
 def _notice_file(child: str) -> Path:
-    return showrunners.SHOWRUNNER_STATE_DIR / child / "parent_notice.json"
+    return showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(child) / "parent_notice.json"
 
 
 def _pending_notice(child: str) -> PendingParentNotice | NoPendingParentNotice:

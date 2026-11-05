@@ -31,7 +31,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier)):
             with self.assertRaisesRegex(OSError, "kid lookup failed"):
                 showrunner_tree.check_attach("kid", "top")
-        self.assertFalse((self.state / "kid/parent").exists())
+        self.assertFalse(self.parent_receipt("kid").exists())
 
     def test_wrapped_showrunner_keeps_its_raw_parent_but_leaves_the_active_tree_despite_a_stale_timer(self) -> None:
         self.showrunner("top", running=False)
@@ -57,7 +57,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
                 mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("before notices")), \
                 redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
             _ = showrunners.main(["attach", "mid", "top"])
-        self.assertFalse((self.state / "mid/parent").exists())
+        self.assertFalse(self.parent_receipt("mid").exists())
         self.assertEqual(self.successful("attach", "mid", "top").splitlines(),
                          ["mid now reports to top", "told mid", "told top"])
         notices = self.messages()
@@ -103,7 +103,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.showrunner("mid", name="mid-name")
         stderr = self.refused("attach", "mid", "top")
         self.assertIn("production mid has showrunner mid-name", stderr)
-        self.assertFalse((self.state / "mid/parent").exists())
+        self.assertFalse(self.parent_receipt("mid").exists())
 
     def test_attach_stores_the_parent_and_every_lookup_reads_it(self) -> None:
         self.showrunner("top")
@@ -111,7 +111,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.showrunner("leaf", running=False)
         attached = self.successful("attach", "mid", "top")
         self.assertEqual(attached.splitlines(), ["mid now reports to top", "told mid", "told top"])
-        self.assertFalse((self.state / "mid" / "parent").exists())
+        self.assertFalse(self.parent_receipt("mid").exists())
         deeper = self.successful("attach", "leaf", "mid")
         self.assertEqual(deeper.splitlines(),
                          ["leaf now reports to mid", "leaf is not running: tell it when it starts", "told mid"])
@@ -148,10 +148,10 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
               redirect_stdout(io.StringIO())):
             showrunner_parent.attach_parent("leaf", "top")
             self.assertEqual(showrunner_tree.parent_of("leaf"), "top")
-            self.assertFalse((self.state / "leaf" / "parent").exists())
+            self.assertFalse(self.parent_receipt("leaf").exists())
             showrunner_parent.detach_parent("leaf")
             self.assertEqual(showrunner_tree.parent_of("leaf"), "")
-            self.assertFalse((self.state / "leaf" / "parent").exists())
+            self.assertFalse(self.parent_receipt("leaf").exists())
 
     def test_attach_with_no_parent_named_takes_the_callers_production_and_sends_the_caller_nothing(self) -> None:
         self.showrunner("top")
@@ -185,7 +185,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         _ = self.successful("attach", "mid", "top")
         detached = self.successful("detach", "mid")
         self.assertEqual(detached.splitlines(), ["mid no longer reports to top", "told mid", "told top"])
-        self.assertFalse((self.state / "mid" / "parent").exists())
+        self.assertFalse(self.parent_receipt("mid").exists())
         self.assertEqual(self.successful("root", "mid"), "mid\n")
         self.assertIn("mid is a root again", self.messages()[-1][1])
         self.assertIn("mid reports to no one", self.successful("detach", "mid"))

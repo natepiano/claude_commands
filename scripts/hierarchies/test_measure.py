@@ -2252,7 +2252,12 @@ class ComparisonTest(unittest.TestCase):
     def load_fixture_home(
         self, home: Path, windows: tuple[log_records.Window, log_records.Window],
     ) -> tuple[m.ComparisonWindow, m.ComparisonWindow]:
-        with patch.object(Path, "home", return_value=home), \
+        environment = {"HOME": str(home), **source_environment(home / "sources")}
+        with patch.dict(os.environ, environment), \
+                patch.object(Path, "home", return_value=home), \
+                production_paths(environment), \
+                isolated_source_readers(), \
+                isolated_staff_file(home / "staff.json", environment), \
                 patch.object(audit, "SESSION_CONFIG", home / "config/hierarchies/sessions.toml"), \
                 patch.object(m, "COVERAGE_CONFIG", home / "config/hierarchies/coverage.toml"), \
                 patch.object(audit, "read_owners", return_value=audit.ProductionOwnership({}, {})), \

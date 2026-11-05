@@ -458,8 +458,12 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             except (OSError, ValueError) as error:
                 print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         if isinstance(tab, SessionNotFound):
+            workspace = row
+            while workspace is not None and workspace.kind != "showrunner":
+                workspace = names.tab_record.parent_of(workspace)
+            space = workspace.name if workspace is not None else entry["name"] or "agents"
             with herdr.restore_staff(names.tab_record, labels=names.labels):
-                pane = client.open_tab(entry["environment"].get("SHOWRUNNER_UNIT", "agents"),
+                pane = client.open_tab(space,
                     entry["name"] or identity, entry["cwd"], entry["environment"])
             entry = entry.copy()
             entry["pane_id"] = pane
@@ -574,7 +578,7 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
 def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, requester: str = "",
                 why: str = "") -> str:
     """Build one actionable outcome for the showrunner, user push and stay log."""
-    from scripts.production import showrunners, staff_sources
+    from scripts.production import showrunners, staff, staff_sources
     from scripts.accounts import unit_watchdog
     from scripts.notify.push_texts import render
     from datetime import datetime, timezone
@@ -582,8 +586,15 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     from probe_session import PROBE_ENV
     import remote
 
+    try:
+        record = staff.snapshot()
+    except (staff.StaffUnreadable, ValueError) as error:
+        print(f"{identity}: staff anomaly: {error}", file=sys.stderr)
+        record = staff.StaffSnapshot(())
+    row = record.by_current_session(identity)
     entry = pane_record.read(herdr.shared_session()).get(pane)
-    entry = entry if entry and entry["session_id"] == identity else None
+    entry = entry if entry and (entry["session_id"] == identity
+        or row is not None and record.by_member_reference(entry["session_id"]) == row) else None
     environment = entry["environment"] if entry else {}
     name = entry["name"] if entry else ""
     try:
@@ -593,7 +604,7 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     except (OSError, ValueError, herdr.HerdrFailure):
         pass  # The saved launch name still identifies a session whose pane is gone.
     name = name or identity
-    unit = environment.get("SHOWRUNNER_UNIT_ID", "")
+    unit = row.name if row is not None and row.kind == "unit" else ""
     if unit:
         try:
             recovery = unit_watchdog.run(datetime.now(timezone.utc), dry_run=False)
