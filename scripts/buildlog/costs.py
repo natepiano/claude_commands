@@ -75,10 +75,11 @@ def machine_name(target: str | None, host: str | None, legacy_hosts: dict[str, s
     if not legacy_hosts:
         import record
 
+        values = record.sync_config()
         targets = set(record.configured_targets()) | {
-            key.removeprefix("sync.hosts.") for key in record.sync_config() if key.startswith("sync.hosts.")
+            key.removeprefix("sync.hosts.") for key in values if key.startswith("sync.hosts.")
         }
-        legacy_hosts.update((name, target) for target in targets for name in record.target_hosts(target))
+        legacy_hosts.update((name, target) for target in targets for name in record._target_hosts(values, target))
     return legacy_hosts.get(host or "", host or "unknown")
 
 

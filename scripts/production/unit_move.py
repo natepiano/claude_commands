@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 import re
-import signal
 import shlex
 import subprocess
 import sys
@@ -397,42 +396,37 @@ def folder_launch(row: staff.StaffRow) -> FolderLaunch | NoFolderLaunch:
                 (current or matches)[-1])
 
 
-def _folder_resume_notice(row: staff.StaffRow, launch: FolderLaunch) -> str:
-    entry = launch.entry.copy()
-    entry["session_id"] = row.current_session
-    return shlex.join([agent_kind(entry), *pane_record.resume_arguments(entry)])
-
-
-def stop_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> bool:
+def stop_folder_session(row: staff.StaffRow, launch: FolderLaunch, *, reported_unknown: str = "") -> bool:
     """Signal only the registered session process in the retained pane."""
     client = herdr.Herdr(launch.session)
     pane = launch.entry["pane_id"]
-    live = sessions.session_liveness(row.current_session)
-    if isinstance(live, sessions.SessionNotLive):
+    live = herdr.read_conversation(row.current_session, agent_kind(launch.entry))
+    if isinstance(live, herdr.StoppedConversation):
         return False
-    if agent_kind(launch.entry) != "claude":
-        raise ValueError(f"{row.id}: target process is not proved; resume with {_folder_resume_notice(row, launch)}")
-    if not isinstance(live, sessions.LiveSessionProcess):
-        raise ValueError(f"{row.id}: target process is not proved; resume with {_folder_resume_notice(row, launch)}")
-    if not any(current["pane_id"] == pane for current in client.panes()):
-        raise ValueError(f"{row.id}: target pane is absent; no signal sent")
-    info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
-                             "folder move process info")
-    if not any(herdr.json_object(raw, "foreground process").get("pid") == live.pid
-               for raw in herdr.json_items(info.get("foreground_processes"), "foreground processes")):
-        raise ValueError(f"{row.id}: target process is outside the retained pane; no signal sent")
+    if isinstance(live, herdr.UnknownConversation):
+        if live.reason != reported_unknown:
+            herdr.conversation_note(live)
+        return False
+    try:
+        if not herdr.check_target(row.current_session, action="signal",
+                                  place=herdr.HerdrPlace(launch.session, pane), client=client):
+            return False
+    except herdr.HerdrFailure as error:
+        print(f"unit_move: {row.name}: {error}; target retained", file=sys.stderr)
+        return False
+    from scripts.shutdown import stop_resume
+
     pane_record.end(launch.session, pane, row.current_session, record=staff.StaffSnapshot((row,)))
-    os.kill(live.pid, signal.SIGTERM)
-    deadline = time.monotonic() + 5
-    while not isinstance(sessions.session_liveness(row.current_session), sessions.SessionNotLive):
-        if time.monotonic() >= deadline:
-            raise ValueError(f"{row.id}: session stop is incomplete; resume with {_folder_resume_notice(row, launch)}")
-        time.sleep(0.05)
-    return True
+    result = stop_resume.stop(row.current_session)
+    if isinstance(result, stop_resume.Stopped):
+        return True
+    if isinstance(result, stop_resume.NotRunning):
+        return False
+    raise ValueError(f"{row.id}: stop failed: {result}")
 
 
 def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch,
-                          old: Path, new: Path, runs: tuple[Path, ...]) -> None:
+                          old: Path, new: Path, runs: tuple[Path, ...], *, reported_unknown: str = "") -> None:
     """Resume the unit with the commands for its existing workers."""
     from scripts.lib.resume_message import resume_message
 
@@ -449,11 +443,19 @@ def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch,
                "exec", Path(entry["config_dir"]).name.removeprefix("."),
                *pane_record.resume_arguments(projected), message]
     client = herdr.Herdr(launch.session)
-    if (agent_kind(entry) != "claude"
-            or not any(pane["pane_id"] == entry["pane_id"] for pane in client.panes())
-            or not isinstance(sessions.session_liveness(row.current_session), sessions.SessionNotLive)
-            or not isinstance(client.pane_activity(entry["pane_id"]), herdr.PaneAtShell)):
-        print(f"unit_move: {row.id}: {_folder_resume_notice(row, launch)}: resume is not safe; run {shlex.join(command)}", file=sys.stderr)
+    live = herdr.read_conversation(row.current_session, agent_kind(entry))
+    if isinstance(live, herdr.UnknownConversation) and live.reason != reported_unknown:
+        herdr.conversation_note(live)
+    if isinstance(live, herdr.LiveConversation):
+        print(f"unit_move: {row.name}: conversation already runs; resume retained", file=sys.stderr)
+        return
+    try:
+        safe = herdr.check_target("", action="keys",
+                                  place=herdr.HerdrPlace(launch.session, entry["pane_id"]), client=client)
+    except herdr.HerdrFailure as error:
+        print(f"unit_move: {row.name}: {error}; target retained", file=sys.stderr)
+        return
+    if not safe:
         return
     resume_folder_workers(row, runs, old, new)
     client.run_in_pane(entry["pane_id"], command)
@@ -535,7 +537,6 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
             resumed = False
             launch = folder_launch(row)
             if (isinstance(launch, FolderLaunch)
-                    and isinstance(sessions.session_liveness(row.current_session), sessions.SessionNotLive)
                     and isinstance(herdr.Herdr(launch.session).pane_activity(launch.entry["pane_id"]), herdr.PaneAtShell)):
                 resume_folder_session(row, launch, old, destination, ())
                 resumed = True
@@ -552,12 +553,16 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                 except RenameRefused:
                     pass
         runs = folder_runs(row)
-        was_live = isinstance(sessions.session_liveness(row.current_session), sessions.LiveSessionProcess)
+        observed = herdr.read_conversation(row.current_session)
+        reported_unknown = observed.reason if isinstance(observed, herdr.UnknownConversation) else ""
+        if isinstance(observed, herdr.UnknownConversation):
+            herdr.conversation_note(observed)
+        was_live = isinstance(observed, herdr.LiveConversation)
         launch: FolderLaunch | NoFolderLaunch = NoFolderLaunch()
         try:
             launch = folder_launch(row)
             if isinstance(launch, FolderLaunch):
-                _ = stop_folder_session(row, launch)
+                _ = stop_folder_session(row, launch, reported_unknown=reported_unknown)
         except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
             print(f"unit_move: {error}", file=sys.stderr)
         pause_folder_workers(runs)
@@ -568,7 +573,7 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
             except RenameRefused:
                 if was_live and isinstance(launch, FolderLaunch):
                     try:
-                        resume_folder_session(row, launch, old, old, runs)
+                        resume_folder_session(row, launch, old, old, runs, reported_unknown=reported_unknown)
                     except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
                         print(f"unit_move: {error}", file=sys.stderr)
                 raise
@@ -583,7 +588,7 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
         _ = staff.set_worktree(unit, staff.PresentWorktree(row.worktree.machine, destination), expected=row.worktree)
         if isinstance(launch, FolderLaunch):
             try:
-                resume_folder_session(row, launch, old, destination, runs)
+                resume_folder_session(row, launch, old, destination, runs, reported_unknown=reported_unknown)
             except (OSError, ValueError, herdr.HerdrFailure, RenameRefused) as error:
                 print(f"unit_move: {error}", file=sys.stderr)
         else:

@@ -24,6 +24,7 @@ import herdr
 import restart_support
 import shutdown
 import sessions
+from scripts.message import sessions as runtime_sessions
 from unit_staff_test_support import isolated_parents
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship
 
@@ -48,6 +49,16 @@ def registry_confirmation(ids: frozenset[str]) -> restart.RegistryConfirmation:
     return restart.RegistryConfirmation(tuple(sessions.SessionRecord(pid=index + 1,
         sessionId=identity, name=identity, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
         for index, identity in enumerate(sorted(ids))))
+
+
+def conversation_liveness(identity: str) -> runtime_sessions.LiveSessionProcess | runtime_sessions.SessionNotLive | runtime_sessions.SessionLivenessUnknown:
+    """Translate the legacy session fixture at the shared reader boundary."""
+    observed = sessions.session_liveness(identity)
+    if isinstance(observed, sessions.LiveSessionProcess):
+        return runtime_sessions.LiveSessionProcess(observed.pid)
+    if isinstance(observed, sessions.SessionLivenessUnknown):
+        return runtime_sessions.SessionLivenessUnknown(observed.reason)
+    return runtime_sessions.SessionNotLive()
 
 
 def empty_session_registry(test: unittest.TestCase, directory: Path) -> None:
@@ -86,6 +97,7 @@ class ShutdownTestCase(unittest.TestCase):
         with patch.object(sys, "platform", "linux"):
             _ = showrunner_relationship("fixture")
         empty_session_registry(self, registry)
+        _ = self.enterContext(patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness))
         # Records and reports in these fixtures belong to natedev.
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
         # Launch limits stay as written on a loaded machine.

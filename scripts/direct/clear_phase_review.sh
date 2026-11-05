@@ -39,6 +39,30 @@ FILES=(
   "${SESSION_DIR}/phases/${PHASE_ID}"/ux_shots_*
 )
 
+
+# Select named reviewers from the roster before removing their phase artifacts.
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+while IFS= read -r worker; do
+  FILES+=(
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_status"*
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_pid"*
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_summary"*
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_reply"*
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_agent"*.log
+  )
+done < <("${SCRIPT_DIR}/../lib/py" - "${SESSION_DIR}/mesh_roster.json" <<'PYTHON'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if path.exists():
+    for name, record in json.loads(path.read_text()).items():
+        if record.get("role") == "review":
+            print(name)
+PYTHON
+)
+
 if ((${#FILES[@]})); then
   rm -f -- "${FILES[@]}"
 fi
