@@ -882,39 +882,43 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 #### Work Order
 
-**Goal:** a unit's full test selects only the modules its change reaches, and natedev spends less CPU on gates. The user asked for this through the queue unit, 2026-11-05.
+**Goal:** a unit's full test selects the modules its change touches directly, and natedev spends less CPU on gates. The user asked for this through the queue unit, 2026-11-05.
 
-**Spec:** a missed module now costs one red merge, not a red branch, because Phase 36 makes the merge gate run all modules. In the 24 hours to 2026-11-05 17:00 EST, 194 of 207 gate runs were full suites, at about 25 minutes and 13 CPU cores all day. Reasons: 73 more than 40% of modules, 58 shared gate input, 31 Python file deleted, 20 tree not clean, 7 no certified base, 4 `--full`, 1 last nightly red. Replay on main's graph: the median test module has 404 input files, and 168 with imports only. 320 of 673 non-test files reach more than 40% of modules.
-1. Replay first, and change no code. Use the gate records in `~/.local/state/buildlog` and the certified bases in `~/.local/state/merge-gate/passed-trees.jsonl`. For each full run whose commit exists, count the modules selected under each variant:
-   - filename mentions match only a path-shaped token, so `unit`, `py`, `cargo`, `lint` and `resume` match no ordinary word;
-   - `staff_test_support.py` no longer imports `unit_move.py`;
-   - both together;
-   - the next imports, ranked by fan-in times fan-out.
-2. In the same replay, test a deleted Python file: select its dependents from the graph at the base instead of a full run. Report whether this is sound: every module that imported the file at the base is in the selection. Also test dropping the full-run triggers for `scripts/lib/`, for a renamed Python file and for the 40% limit: each path selects its dependents. For each variant, count the red modules of the red unit runs that the selection would have missed.
-3. Find why a gate tree is not clean in the 20 `tree not clean` runs, and name the cause. Fix it in the phase if it is in this repository.
-4. The director sends the replay numbers to the showrunner before any cut. The cuts below follow what the replay proves.
-5. Make the proved cuts in `scripts/production/affected_modules.py` and the support files. Add each support file the replay names to the phase's files list. If the tree-not-clean cause is in `merge_gate.py`, fix it after the Phase 36 checkpoint. Bump `EXTRACTOR_VERSION` if source facts change. Move only an import that the support file does not need at import time.
-6. Do not target `scripts/agents/test_codex_mesh.py`: the user removes it within 48 hours.
-7. Add no guard, refusal or check (user rule, 2026-11-05). The nightly full run stays.
-8. If closures fall enough, send the showrunner a pass cache proposal with a new estimate. It saves 13% of CPU at today's closures.
+**Spec:** a missed module now costs one red merge, not a red branch, because Phase 36 makes the merge gate run all modules. Replay of 104 unit runs (estimates, run folder, `phases/37/replay/report.md`): today's selection has a mean of 6285 CPU s per run, a clean-run median of 650 modules and 4 runs at most 40%. This selection has a mean of about 3600 CPU s, a clean-run median of about 146 modules, 44 runs at most 40%, 25 module misses and 8 red merges. The next-narrower variant has 157 misses and 19 red merges, and it leads only while a red merge costs under about 8000 CPU s; a red merge also stalls the chain. Showrunner, 2026-11-05: replay first, this set, Phase 36 stands.
+1. `select_affected` selects a test module when any of these holds:
+   - the module itself changed;
+   - its source imports a changed Python file directly, one import step, with no further search;
+   - its source names a changed repository-relative path as a complete token, with a leading `./` allowed;
+   - it sits in the folder of a changed non-test Python file.
+2. A changed non-Python file reaches a test only through the "names it" rule.
+3. A deleted or renamed Python file uses the import facts at the base for the same one step. Its surviving direct importers are selected.
+4. The changed set is the diff from the base to `HEAD` plus the dirty paths of the tree. A dirty tree no longer means a full run.
+5. Delete the full-run triggers: `tree not clean`, renamed Python file, deleted Python file, `full_suite_trigger`, the 40% limit, the orphan-folder rule and the tree-scanning always-selected set. Delete the filename-mention edges, the transitive search and the code they leave unused. Bump `EXTRACTOR_VERSION` if source facts change.
+6. A full run comes only from `--full`, `no certified base` or a graph error. The nightly-red marker no longer widens a full test; it stays for the merge and the nightly run.
+7. Do not target `scripts/agents/test_codex_mesh.py`: the user removes it within 48 hours.
+8. Add no guard, refusal or check (user rule, 2026-11-05). The nightly full run stays.
+9. Land after Phase 36: until the merge gate runs all modules, this selection must not reach a merge. The worker first changes `affected_modules.py` and its tests. After the Phase 36 checkpoint, a second step changes `merge_gate.py` and `full_test.py` for the removed `tree_scanners` field and the nightly-red marker.
+10. If selections fall as the replay says, send the showrunner a pass cache proposal with a new estimate. It saved 13% of CPU at the old closures.
 
 **Files:**
-- `scripts/production/affected_modules.py` — filename match, deleted-file selection
+- `scripts/production/affected_modules.py` — the selection
 - `scripts/production/test_affected_modules.py` — tests
-- `scripts/production/staff_test_support.py` — imports
+- `scripts/production/merge_gate.py`, `scripts/production/full_test.py` — after the Phase 36 checkpoint: the removed field and the nightly-red marker
 
-**Workers:** 1 writer (the replay decides the edits, and they share one graph)
+**Workers:** 1 writer on slot `impl` (one selection function and its tests)
 - `impl` — all files above
-- `test` — opens as impl
 
 **Constraints from prior phases:**
+- Phase 36: `full_test.py` selects and `merge_gate.py` runs all modules. Its checkpoint comes first.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- Speed work keeps coverage: a module that a change breaks must stay selected.
 
 **Acceptance gate:**
-- Replay of the same unit runs on the final code: the count of `more than 40%` runs, the count of all full runs, the median modules selected and the missed red modules, before and after, in the checkpoint notice.
-- For each filename edge removed, a test shows that a path-shaped mention still selects its dependents.
-- `python3 -m unittest discover -s scripts/production -p 'test_affected_modules.py'` and `test_merge_gate.py` green in the gate form, and the full gate green.
+- Replay of the same 104 unit runs on the final code gives the K row of the report, within its ranges: full runs, median modules, misses, red merges. Quote before and after in the checkpoint notice, and mark them as estimates.
+- Measured CPU per unit run, before and after, in the checkpoint notice. Before: the mean CPU of the unit runs in the merge-gate records of the 24 hours to the Phase 37 start. After: the final `full_test.py` on 5 recent unit commits, in clones, with the sample size stated. These numbers go to the user.
+- Each of the four selection rules has a test with a real scratch repository. A deleted Python file selects its surviving direct importers, and a dirty path selects as a changed path.
+- A clean tree with no reach selects no module and passes.
+- `test_affected_modules.py`, `test_full_test.py` and each `test_merge_gate*.py` green in the gate form, and `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`.
+- After landing, the checkpoint's Change-Review line: the user reads `full test` runs on the queue page and sees fewer modules.
 
 ### Phase 38 — Three scripts start Python through `scripts/lib/py`  · status: todo
 **Depends on:** none
@@ -935,9 +939,8 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — lines 5, 12 and 35
 - `scripts/lint/lint` — line 75
 
-**Workers:** 1 writer (five lines in three scripts; too small to split)
-- `impl` — all files above
-- `test` — opens as impl
+**Workers:** 1 writer on slot `review3` (five lines in three scripts; slots `impl` and `impl3` hold other phases)
+- `review3` — all files above, role impl
 
 **Constraints from prior phases:**
 - Phase 32: `conf.sh` starts its reader through `scripts/lib/py`.
@@ -949,34 +952,104 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - the Mac result of step 2 and of the same routes after the edit, in the checkpoint notice
 - `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
 
-### Phase 39 — `test_verify_mac_only.py` runs in half its time  · status: todo
+### Phase 39 — `test_verify_mac_only.py` runs in half its time  · status: done
+**Depends on:** none
+
+#### As-built
+
+- No repository change. The phase ended at a measured floor, with every test name and assertion kept.
+- Three clean rounds at base f43735e60: median 156.5 s wall, 144.4 CPU s, 17 tests. Load changed during the rounds, so they find the cost and do not measure a gain.
+- The 84 `verify.sh` calls take 131.7 s of a 134.7 s traced run (97.8%). The parent spends 3.0 s outside those calls. The module has no large fixed wait: the four wait tests use a stub or a signal.
+- Floor: process starts. `build_targets.py` has 366 starts and 51.5 CPU s. `mac_idle.py` has 82 starts and 25.9 CPU s. Both import the coordination stack at start (`build_targets.py:137-153`, `mac_idle.py:25-53`).
+- Proposal, sent to the showrunner 2026-11-05: lighter imports for each command in those two files, and fewer starts where read-only queries can share one. Estimate: 54-62 CPU s in this module at a 70-80% cut. The same cause limits Phases 24 and 31.
+
+**Ruled out:**
+- Another seed in `verify_mac_offload_test_support.py`: the fixture already builds one seed per class and copies it for each test, and the cost is not there.
+
+### Phase 40 — `style/test_crate_run.py` runs in half its time  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** `scripts/direct/test_verify_mac_only.py` (rank 3 in `test_times top` at 263.4 s median, 188.0 CPU s, 17 tests, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+**Goal:** `scripts/style/test_crate_run.py` (rank 7 in `test_times top` at 154.1 s median, 62.6 CPU s, 97 tests, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
 
-**Spec:** Follow the Speed method. The module is free since verify's Mac retry hang fix landed on builds at 0380fb6ea (showrunner, 2026-11-05). Ranks 1 and 2 are `agents/test_codex_mesh.py` (excluded) and `direct/test_verify_lint_judgment.py` (Phase 31 floor).
-1. Merge `origin/builds` first. Profile before any edit, and take a new baseline: the hang fix may change the cost.
-2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
-3. A cut in `verify.sh`, `verify_mac_offload_test_support.py` or another file the verify unit owns goes to the showrunner first, with the measured gain. A support-file change keeps every importer green; name each one in the final run.
+**Spec:** Follow the Speed method. Ranks 1 and 5 are excluded. Ranks 2, 3 and 4 are floors whose CPU has not risen. Rank 6, `direct/test_simplify_lens.py`, is above its floor, but sdlc devtools is changing its launcher now.
+1. Profile before any edit. Gate wall time ranges from 69 s to 265 s while CPU stays near 58 s, so name what each slow test waits on and what is only host load.
+2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts. A per-class seed gave no gain in an earlier phase (128 s to 126 s), so do not repeat it.
+3. A cut in a production file or a support file goes to the director first, with the measured gain.
 4. Keep every test name and assertion. Add no guard, refusal or check that this Work Order does not name (user rule, 2026-11-05).
 
 **Files:**
-- `scripts/direct/test_verify_mac_only.py` — the module
-- `scripts/direct/verify_mac_offload_test_support.py` — only for a shared cut the profile names, after the showrunner's answer
+- `scripts/style/test_crate_run.py` — the module
 
-**Workers:** 1 writer (one module and its fixture; the files do not split)
-- `impl` — all files above
-- `test` — opens as impl
+**Workers:** 1 writer on slot `test` (one module; the file does not split)
+- `test` — all files above, role impl
 
 **Constraints from prior phases:**
-- Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_verify_mac_only.py'` green, with the same test names and assertions
-- each importer in Spec step 3 green when a support file changes, with its before and after time in same-load pairs
+- `python3 -m unittest discover -s scripts/style -p 'test_crate_run.py'` green, with the same test names and assertions
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
 - `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 41 — `build_targets.py` loads only what its command needs  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a `verify.sh` run spends less CPU in `build_targets.py` starts, with the same behavior. Phase 39 measured 366 starts and 51.5 CPU s in `test_verify_mac_only.py`, and Phases 24 and 31 report the same floor. The showrunner approved this on 2026-11-05.
+
+**Spec:**
+1. Before any edit, measure each `build_targets.py` command: its start count in a real `test_verify_mac_only.py` run (the `VERIFY_PY_TRACE` feature), and its import cost (`python3 -X importtime`).
+2. Each command imports only what it uses. Start with the commands that have the most starts. `platform` already has an early path at `build_targets.py:104`, so do not count it as a gain. A command that reads `build_hold`, `offload`, `mac_test` or the `aws_target` modules keeps that import.
+3. Do not edit `scripts/build_hold/build_hold.py`. Its import chain goes to the showrunner as a follow-up, with the measured cost.
+4. Where `verify.sh` makes read-only queries back to back, one start answers them. Change `verify.sh` only for that, and only when the measure shows a gain. Keep each state read, claim, release and signal behavior.
+5. Behavior does not change: same output, exit status and arguments for each command. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — imports for each command
+- `scripts/direct/verify.sh` — only for spec item 4; owner verify-unit, told in one line before the edit
+
+**Workers:** 1 writer on slot `review3` (one script and one call site; the files do not split)
+- `review3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 34: test modules import from the repo root with no PYTHONPATH.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- Measured CPU before and after in the checkpoint notice: `test_verify_mac_only.py` in same-load pairs (`pairs.sh`), and one real `verify.sh` run.
+- Each `scripts/build_targets/test_*.py`, `scripts/build_hold/test_build_hold.py`, `scripts/build_hold/test_hold_applies.py`, `scripts/build_hold/test_override_guard.py` and each `scripts/direct/test_verify_*.py` that starts `build_targets.py` green, with the same test names and assertions.
+- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`.
+- `basedpyright` on the changed Python file prints `0 errors, 0 warnings, 0 notes`.
+
+### Phase 42 — `mac_idle.py` loads only what its command needs  · status: todo
+**Depends on:** Phase 41
+**Blocked by:** the `send.py` freeze end; the showrunner says when.
+
+#### Work Order
+
+**Goal:** a `verify.sh` run spends less CPU in `mac_idle.py` starts, with the same behavior. Phase 39 measured 82 starts and 25.9 CPU s in `test_verify_mac_only.py`.
+
+**Spec:**
+1. Apply the method of Phase 41 to `scripts/buildlog/mac_idle.py`: measure each command, then each command imports only what it uses (`mac_idle.py:25-53`).
+2. Behavior does not change. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/buildlog/mac_idle.py` — imports for each command
+
+**Workers:** 1 writer on slot `review3` (one script; the file does not split)
+- `review3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 41: the same method for `build_targets.py`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- Measured CPU before and after in the checkpoint notice: `test_verify_mac_only.py` in same-load pairs (`pairs.sh`), and one real `verify.sh` run.
+- Each caller module of `mac_idle.py` green, with the same test names and assertions.
+- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`.
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`.
+
