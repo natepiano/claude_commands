@@ -562,3 +562,36 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 - `buildlog costs` prints the CLI's unknown-command usage and exits 2.
 - `scripts.buildlog.test_charts`, `test_costs`, `test_report`, `test_cli` (if present) green with and without `PYTHONPATH`.
 - `basedpyright` on the changed Python files: 0 errors, 0 warnings, 0 notes.
+
+### Phase 27 — A step whose Cargo folders are unknown records them as unknown  · status: todo
+**Depends on:** Phase 24, Phase 25; resources-unit's Phase 66 on builds (its recorded-root reader)
+
+From the builds showrunner (not the user), 2026-11-05, defect from resources-unit: `index.add_step` does not keep the output pair unknown when the recorder left it out. After resources' Phase 66, an override row whose metadata failed gives sweep `(workspace, folder, folder)`, so `build_directory` is wrong when Cargo's build-dir differs. No natedev row has it today. Ruling: store unknown, not a made-up pair; put it in a phase after 24-25.
+
+Director decision: a record with no pair is unknown for both columns, old records too. Records from before the pair and records whose metadata failed carry the same fields (`v` is 1 for both), so a fallback for one is a made-up pair for the other.
+
+#### Work Order
+
+**Goal:** A step row has a real Cargo output pair or `unknown` for both folders. The index never builds the pair from `target_dir`.
+
+**Spec:**
+- `scripts/buildlog/index.py` `add_step` (about line 834): `target_directory` and `build_directory` come only from the record. When the record lacks either one, store `store.UNKNOWN_IDENTITY` in both. Keep `target_dir`, `target_folder` and `build_history_group` as they are: they read `target_dir`, not the pair.
+- Column text (about line 164): `target_directory` — "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` — "resolved Cargo intermediate root; unknown when the record has no output pair".
+- The existing index must not keep made-up pairs. Confirm that the changed column text (or a `SCHEMA_VERSION` bump) makes `index.update()` rebuild every step row. Report the rebuild time on the live index.
+- Readers: `scripts/lint/build_shape.py` `recorded_root` reads `unknown` as `UnknownRecordedRoot`, and `recorded_output_roots` skips a row whose `target_folder` differs from `target_directory`. Find every other reader of the two columns with LSP `findReferences` and `grep -rn "target_directory\|build_directory" scripts --include=*.py`; name each one in the summary with how it reads `unknown`. Do not edit another unit's file; report a reader that misreads `unknown`.
+
+**Files:**
+- `scripts/buildlog/index.py` — `add_step` and the column text.
+- `scripts/buildlog/test_index.py` — pair tests.
+
+**Workers:** 1 writer — `rowcpu` owns both files.
+
+**State:** none.
+
+**Constraints from prior phases:** Do not edit `scripts/buildlog/store.py` until queue 10q merges; this phase reads only `store.UNKNOWN_IDENTITY`. Do not edit `scripts/lint/build_shape.py` or `scripts/lint/sweep.py` (resources-unit). Merge builds before dispatch so resources' Phase 66 reader is in the tree.
+
+**Acceptance gate:**
+- `test_index` `test_output_roots_survive_indexing_and_legacy_steps_stay_readable` changes its `legacy` row to `(unknown, unknown)` (approved by this phase's goal) and adds a row with `target_dir` set to an absolute folder, an override `argv`, and no pair: it indexes as `(unknown, unknown)`.
+- A test through `build_shape.recorded_output_roots` on an index built by `index.update()` proves that such a row adds no `(folder, folder)` pair.
+- `scripts.buildlog.test_index`, `test_step_row`, `test_record`, `test_disk` and `scripts.lint.test_build_shape` green with and without `PYTHONPATH`.
+- `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py`: 0 errors, 0 warnings, 0 notes.
