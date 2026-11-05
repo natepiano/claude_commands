@@ -982,17 +982,14 @@ def registry_remote_control(claude: unit_lookup.Claude) -> bool:
 
 
 def wait_for_remote_control(request: UnitLaunch) -> unit_lookup.LabeledSession:
-    from session_pane import HerdrFailure, read_place
-
     found = launched_unit(request)
     if isinstance(found, NoLabeledSession):
         raise RuntimeError(f"{request.identity.unit}: no session has its native runtime identity")
     launched = found.unit
     deadline = time.monotonic() + request.timeout
-    pane = ""
     while True:
         if not isinstance(launched.claude, unit_lookup.LiveClaude):
-            # The session record can lag the pane; look again until the native identity has a live Claude.
+            # Read the session again until its native identity has a live Claude.
             try:
                 again = launched_unit(request)
             except OSError:
@@ -1001,16 +998,10 @@ def wait_for_remote_control(request: UnitLaunch) -> unit_lookup.LabeledSession:
                 launched = again.unit
         if registry_remote_control(launched.claude):
             return launched
-        try:
-            pane = read_place(launched.place)
-        except (OSError, HerdrFailure) as error:
-            pane = str(error)
-        if "/remote-control is active" in pane:
-            return launched
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            tail = "\n".join(pane.splitlines()[-15:])
-            raise RuntimeError(f"{request.identity.unit} (herdr {launched.place.session}:{launched.place.pane}): /remote-control did not become active\n{tail}")
+            print(f"anomaly: {request.identity.unit}: registry has no remote-control evidence", file=sys.stderr)
+            raise RuntimeError(f"{request.identity.unit} (herdr {launched.place.session}:{launched.place.pane}): /remote-control did not become active")
         time.sleep(min(0.5, remaining))
 
 
@@ -1160,7 +1151,7 @@ def set_autocompact(request: RequestedUnitLaunch, session_id: str, value: str, c
 
 
 def configuration_for(request: UnitLaunch) -> unit_config.UnitConfig:
-    """Read a resume's file unchanged, or check the requested publication by key."""
+    """Keep saved responsibilities or use explicit launch responsibilities."""
     existing = unit_config.read(request.worktree, cleanup=False)
     if isinstance(request.session, ResumedSession) and isinstance(existing, unit_config.UnitConfig):
         return existing
@@ -1171,7 +1162,9 @@ def configuration_for(request: UnitLaunch) -> unit_config.UnitConfig:
                 else existing.port if isinstance(existing, unit_config.UnitConfig) else unit_config.NoAppPort())
     except unit_config.ConfigRefused as error:
         raise Refusal(f"unit {request.unit_id}: {error}") from error
-    config = unit_config.UnitConfig(plan, port, request.responsibilities)
+    responsibilities = (existing.responsibilities if isinstance(existing, unit_config.UnitConfig) else
+                        tuple(dict.fromkeys(request.responsibilities)))
+    config = unit_config.UnitConfig(plan, port, responsibilities)
     if isinstance(existing, unit_config.UnitConfig):
         comparable = existing
         stub = stub_plan(request.production, request.branch)

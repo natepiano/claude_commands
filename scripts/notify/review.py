@@ -1340,20 +1340,21 @@ class QuestionRegistration(TypedDict):
     question: NotRequired[str]
 
 
-def registered_questions(since: datetime) -> list[str]:
+@dataclass(frozen=True)
+class QuestionRegistrationsIncomplete:
+    reason: str
+
+
+def registered_questions(since: datetime) -> list[str] | QuestionRegistrationsIncomplete:
     """Read outstanding questions and registrations made within the sample window."""
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-    questions: list[str] = []
     sys.path.insert(0, str(ROOT))
     question_store = importlib.import_module("scripts.production.update_registration")
     read_fields = cast(Callable[[], Sequence[Mapping[str, str]]], question_store.read_all_open_fields)
-    for fields in read_fields():
-        for field in ("text", "reviewed", "question"):
-            text = fields.get(field)
-            if isinstance(text, str) and text.strip():
-                prose = reply_asks.question_prose(text)
-                if prose:
-                    questions.append(prose)
+    try:
+        records: list[Mapping[str, object]] = list(read_fields())
+    except OSError as error:
+        return QuestionRegistrationsIncomplete(str(error))
     for path in (root / "outstanding").glob("*.history.jsonl"):
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
@@ -1362,18 +1363,14 @@ def registered_questions(since: datetime) -> list[str]:
         for line in lines:
             try:
                 record = _object(cast(object, json.loads(line)))
-                registration = QuestionRegistration(time=_text(record, "time"), text=_text(record, "text"))
-                stamp = datetime.fromisoformat(registration["time"].replace("Z", "+00:00"))
-                if stamp.tzinfo is not None and stamp >= since and registration["text"].strip():
-                    for field in ("text", "reviewed", "question"):
-                        text = record.get(field)
-                        if isinstance(text, str) and text.strip():
-                            prose = reply_asks.question_prose(text)
-                            if prose:
-                                questions.append(prose)
+                stamp = datetime.fromisoformat(_text(record, "time").replace("Z", "+00:00"))
+                if stamp.tzinfo is not None and stamp >= since and _text(record, "text").strip():
+                    records.append(record)
             except ValueError:
                 continue
-    return questions
+    return [prose for fields in records for field in ("text", "reviewed", "question")
+            if isinstance(text := fields.get(field), str) and text.strip()
+            and (prose := reply_asks.question_prose(text))]
 
 
 def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
@@ -1389,14 +1386,18 @@ def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
             print(f"review: cannot read transcript {path}: {error}", file=sys.stderr)
             unreadable += 1
     registered = registered_questions(cutoff)
+    if isinstance(registered, QuestionRegistrationsIncomplete):
+        print(f"review: question registrations incomplete: {registered.reason}", file=sys.stderr)
     eligible: list[TranscriptReply] = []
     unregistered = 0
     for reply in replies:
         asks = reply_asks.reply_questions(reply.text)
-        if asks.sentences:
+        if (asks.sentences or asks.has_choices) and isinstance(registered, QuestionRegistrationsIncomplete):
+            continue
+        if asks.sentences and isinstance(registered, list):
             unregistered += int(any(not any(question in item or item in question for item in registered)
                                     for question in asks.sentences))
-        elif asks.has_choices:
+        elif asks.has_choices and isinstance(registered, list):
             unregistered += int(not any(item in reply_asks.question_prose(reply.text) for item in registered))
         else:
             eligible.append(reply)

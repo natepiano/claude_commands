@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff
 
 import os
@@ -133,7 +133,48 @@ class ReviewNumbersTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
-    def test_checkpoint_ignores_unavailable_worktrees_of_other_units(self) -> None:
+    def test_checkpoint_refuses_another_staff_parent_without_changes_on_retry(self) -> None:
+        checkpoint = self.checkpoint()
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            parent = recorded_showrunner("receiving", self.root / "receiving-production.md")
+            unit = unit_membership("example", "alpha-unit")
+            _ = staff.move(unit.id, staff.ReportsTo(parent.id))
+        before = self.git("show-ref"), self.git("status", "--porcelain")
+        origin = self.git("show-ref", cwd=self.origin)
+        document = self.doc.read_bytes()
+        record = Path(self.env["STAFF_FILE"]).read_bytes()
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.run_checkpoint(checkpoint).process
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("alpha-unit: staff parent is", result.stdout)
+                self.assertIn("receiving", result.stdout)
+                self.assertEqual((self.git("show-ref"), self.git("status", "--porcelain")), before)
+                self.assertEqual(self.git("show-ref", cwd=self.origin), origin)
+                self.assertEqual(self.doc.read_bytes(), document)
+                self.assertEqual(Path(self.env["STAFF_FILE"]).read_bytes(), record)
+                self.assertEqual(self.events("checkpoint-test"), [])
+
+    def test_as_built_merges_after_code_checkpoint_reaches_branch_through_second_parent(self) -> None:
+        first = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        code_merge = self.git("rev-parse", "HEAD")
+        _ = self.git("checkout", "-b", "integration", "HEAD^1")
+        _ = self.git("commit", "--allow-empty", "-m", "Independent integration")
+        _ = self.git("merge", "--no-ff", "-m", "Integrate production", "production")
+        _ = self.git("branch", "-f", "production", "HEAD")
+        _ = self.git("checkout", "production")
+        self.assertNotIn(code_merge, self.git("rev-list", "--first-parent", "HEAD").splitlines())
+        self.assertTrue(merge_checkpoint.merge_branch_history(self.checkout, "production").has_code_merge("alpha-unit", "2"))
+        result = self.run_checkpoint(self.as_built_commit(), "--as-built", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("test: ok — as-built has no package tests", result.process.stdout)
+        tree = self.git("ls-tree", "-r", "--name-only", "HEAD")
+        self.assertIn("docs/as-built/alpha.md", tree)
+        self.assertNotIn("docs/plans/alpha.md", tree)
+        self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha-unit phase \S+ as-built \(")
+
+    def test_checkpoint_merges_into_its_staff_parent_and_ignores_unavailable_worktrees(self) -> None:
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             row = unit_membership("example", "retired-unit")
@@ -187,18 +228,13 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = doc.write_text("\n".join(lines) + "\n")
         return doc
 
-    def test_scope_rerun_leaves_out_another_productions_paths(self) -> None:
-        import change_review
-
+    def test_scope_leaves_out_another_productions_paths(self) -> None:
         doc = self.import_production_paths()
         sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            with mock.patch.object(change_review, "reviewed_merge_refs", return_value=[]):
-                held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt, outside/second.txt")
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths; 2 came from origin merge branches", accepted.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
         self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "other production\n")
 
@@ -206,21 +242,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         doc = self.import_production_paths()
         sha = self.checkpoint("outside/imported.txt", "unit changed this\n")
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            held = self.run_checkpoint(sha)
-        self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt\n")
-        self.assertNotIn("outside/second.txt", held.process.stdout)
-
-    def test_scope_holds_only_unit_outside_paths_then_allows_also(self) -> None:
-        doc = self.import_production_paths()
-        sha = self.checkpoint("outside/unit.txt", "unit's outside work\n")
-        with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/unit.txt\n")
-            self.assertNotIn("outside/imported.txt", held.process.stdout)
-            self.assertNotIn("outside/second.txt", held.process.stdout)
-            accepted = self.run_checkpoint(sha, "--also", "outside/unit.txt")
+            accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths; 1 came from origin merge branches", accepted.process.stdout)
+        self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "unit changed this\n")
 
     def test_scope_leaves_out_own_origin_paths_not_in_local_merge_branch(self) -> None:
         self.write(self.other, "outside/own-production.txt", "already on own origin branch\n")
@@ -232,19 +257,17 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         with mock.patch.object(showrunners, "timer_docs", return_value={}):
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths are allowed; 1 came from origin merge branches", accepted.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths; 1 came from origin merge branches", accepted.process.stdout)
         self.assertEqual((self.checkout / "outside/own-production.txt").read_text(), "already on own origin branch\n")
 
-    def test_scope_checks_paths_from_production_without_review_rows(self) -> None:
+    def test_scope_leaves_out_paths_after_production_review_rows_are_added(self) -> None:
         doc = self.import_production_paths(review_rows=False)
         sha = self.checkpoint()
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt, outside/second.txt")
             _ = doc.write_text(doc.read_text() + f"- **Change review:** `{self.root / 'other-review.md'}`\n")
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths; 2 came from origin merge branches", accepted.process.stdout)
 
     def test_same_checkpoint_rerun_skips_another_productions_reviewed_commits(self) -> None:
         import change_review
@@ -343,13 +366,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(result, "failed", "ancestry: failed")
         self.assertIn("send alpha-unit: the showrunner will inspect the failed command", result.process.stdout)
-    def test_scope_holds_unowned_path_and_allows_explicit_also(self) -> None:
-        sha = self.checkpoint("outside.txt", "unowned\n")
-        held = self.run_checkpoint(sha)
-        self.assert_stopped_before_merge(held, "held", "outside.txt")
-        accepted = self.run_checkpoint(sha, "--also", "outside.txt")
-        self.assertEqual(accepted.process.returncode, 0, accepted.process.stderr + accepted.process.stdout)
-        self.assertIn("scope: ok", accepted.process.stdout)
     def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
         plan = self.root / "scratch-plan.md"
         _ = plan.write_text("### Phase 2 — Checkpoint\n\n### Phase 3 — Later work\n")
@@ -501,10 +517,11 @@ class TestPassedTests(unittest.TestCase):
 
     def judge(self, status: int, stdout: str, stderr: str = "") -> bool:
         result = subprocess.CompletedProcess(["basedpyright"], status, stdout, stderr)
-        return merge_checkpoint.test_passed(["/nix/bin/basedpyright", "scripts/buildlog"], result)
+        return merge_checkpoint.test_passed(result)
 
-    def test_clean_basedpyright_passes_with_trailing_venv_line_on_stderr(self) -> None:
-        self.assertTrue(self.judge(3, "0 errors, 0 warnings, 0 notes\n", self.VENV))
+    def test_clean_basedpyright_requires_status_zero(self) -> None:
+        self.assertTrue(self.judge(0, "0 errors, 0 warnings, 0 notes\n", self.VENV))
+        self.assertFalse(self.judge(3, "0 errors, 0 warnings, 0 notes\n", self.VENV))
 
     def test_basedpyright_with_errors_fails(self) -> None:
         self.assertFalse(self.judge(1, "/checkout/a.py:1:1 - error: x\n2 errors, 0 warnings, 0 notes\n", self.VENV))
@@ -512,8 +529,8 @@ class TestPassedTests(unittest.TestCase):
 
     def test_other_commands_pass_only_on_status_zero(self) -> None:
         result = subprocess.CompletedProcess(["python3"], 3, "0 errors, 0 warnings, 0 notes\n", "")
-        self.assertFalse(merge_checkpoint.test_passed(["python3", "-m", "unittest"], result))
-        self.assertTrue(merge_checkpoint.test_passed(["python3"], subprocess.CompletedProcess(["python3"], 0, "", "")))
+        self.assertFalse(merge_checkpoint.test_passed(result))
+        self.assertTrue(merge_checkpoint.test_passed(subprocess.CompletedProcess(["python3"], 0, "", "")))
 
 
 @final

@@ -377,7 +377,9 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
   - An awaiting-facts or failed outcome fails the whole registration with `question held for review: …`. Nothing is written: outstanding and history stay unchanged.
   - Such a question is held in `~/.local/state/notify/questions/<sha256(slug+text)[:16]>.json` (`QuestionHoldRecord`). Running the same item again counts as its revision. Question holds never reach the post path.
 - **Stored fields:** an outstanding item carries `question` plus either `reviewed` or `review_unavailable`. Items that were already outstanding keep their fields and are not reviewed again. Accepted text is printed as `reviewed question: <text>`, and the reply must carry that text. `commands/showrunner/produce.md` (under `open_for_user`) tells the showrunner to register before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices.
-- **History:** `record_question_history()` appends each newly outstanding item's `text`, `question` and `reviewed` to `~/.local/state/showrunner/outstanding/<slug>.history.jsonl`. History is kept for 48 h.
+- **History:** `record_question_history()` records each new open item's `text`, `question` and `reviewed` in `~/.local/state/showrunner/outstanding/<slug>.history.jsonl`.
+  `withdraw` sets `withdrawn` to the withdrawal time on the item's history record.
+  History remains for 48 h.
 - **No Stop hook checks a reply** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). The hook file was deleted after `settings.json` stopped naming it. Registering a question and carrying its reviewed text is the showrunner's rule in `commands/showrunner/produce.md`; the nightly count still reads the history.
 - **Question detection** (in `review.py`):
   - `question_prose(text)` removes inline code and collapses whitespace.

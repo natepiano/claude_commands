@@ -18,6 +18,7 @@ from unittest import mock
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import change_review
 import footer_counts
@@ -84,7 +85,7 @@ class NextItemTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**source_environment(self.root / "sources"),
                 "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_source_readers())
-        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc("natedev", PRODUCTION))
+        _ = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", PRODUCTION))
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
@@ -120,9 +121,9 @@ class NextItemTests(unittest.TestCase):
         directory = self.root / "next"
         directory.mkdir()
         values: dict[str, dict[str, object]] = {
-            "next-fixture": {"source": "question-fixture", "current": "fixture: Choose", "ended": {}},
-            "question-fixture-all-below": {"current": "fixture: Choose", "ended": {"fixture: Later": 1}},
-            "proposal-fixture": {"current": "P2", "ended": {"P1": 1}},
+            "next-demo": {"source": "question-demo", "current": "demo: Choose", "ended": {}},
+            "question-demo-all-below": {"current": "demo: Choose", "ended": {"demo: Later": 1}},
+            "proposal-demo": {"current": "P2", "ended": {"P1": 1}},
         }
         for name, fields in values.items():
             _ = (directory / f"{name}.json").write_text(json.dumps(fields))
@@ -166,7 +167,11 @@ class NextItemTests(unittest.TestCase):
         }
         for name, fields in values.items():
             _ = (directory / f"{name}.json").write_text(json.dumps(fields))
-        with mock.patch.object(session_staff, "member_sources", return_value=sources):
+        journal = self.root / "showrunner/new/rename.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "old", "new": "new"}))
+        with (mock.patch.object(session_staff, "member_sources", return_value=sources),
+              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.root / "showrunner")):
             self.assertEqual(migrate_next_pins.migrate(stop_after=1), 75)
             self.assertEqual(migrate_next_pins.migrate(), 0)
             expected: dict[str, dict[str, object]] = {
@@ -371,7 +376,7 @@ class NextItemTests(unittest.TestCase):
                          "no efficiency is waiting for you\n")
         path = self.root / "change-review" / "change-review - natedev.md"
         _ = change_review.append_rows(path, [Visible("Panels keep shields", "Run `hana`", "Each panel has its shield")],
-                                      date(2026, 10, 15), "", PRODUCTION)
+                                      date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())
         def the_list(production: str) -> Path:
             del production
             return path
@@ -379,7 +384,7 @@ class NextItemTests(unittest.TestCase):
         _ = fixture_member("showrunner", name="natedev", doc=staff.LiveDoc("natedev", PRODUCTION))
         with mock.patch.object(change_review, "production_list", the_list):
             self.assertEqual(run("show", "--kind", "change", "--production", str(PRODUCTION)), (0, "\n".join([
-                "change", "C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
+                "change", "natedev/C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
                 "  Merged: 2026-10-15", "  Production: demo", ""]), ""))
 
     def test_each_kind_shows_its_own_production_and_with_all_below_each_lower_one_never_above(self) -> None:
@@ -395,14 +400,15 @@ class NextItemTests(unittest.TestCase):
             _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug}-item gain — proposed\n")
             _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n"
                                + f"- **Proposals:** {issues_folder}\n")
+            owner = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", doc))
             _ = (issues_folder / f"{slug}-item.md").write_text(
-                f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {slug}\ndate_created: 2026-10-01\n---\n")
+                f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {owner.id}\ndate_created: 2026-10-01\n---\n")
         path = self.root / "change-review" / "change-review - natedev.md"
         # The side production is a root of its own, with its own list.
         side_list = path.with_name("change-review - side.md")
         for slug in (*slugs, "gone"):
             _ = change_review.append_rows(side_list if slug == "side" else path, [Visible(f"{slug}-item change", "Run it", "It works")], date(2026, 10, 15),
-                                          "", plans / f"{slug}-production.md")
+                                          "", plans / f"{slug}-production.md", record=staff.snapshot())
         # A row written before the Production column belongs to the list's root.
         _ = path.write_text(path.read_text(encoding="utf-8").replace(" gone |", "  |"), encoding="utf-8")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -470,7 +476,7 @@ class NextItemTests(unittest.TestCase):
     def test_a_child_with_no_change_review_line_reads_its_roots_list(self) -> None:
         path = self.root / "change-review - top.md"
         _ = change_review.append_rows(path, [Visible("kid change", "Run it", "It works")], date(2026, 10, 15), "",
-                                      self.root / "kid-production.md")
+                                      self.root / "kid-production.md", record=staff.snapshot())
         top, kid = self.root / "top-production.md", self.root / "kid-production.md"
 
         def the_list(production: str) -> Path:

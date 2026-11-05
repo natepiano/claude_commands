@@ -79,23 +79,13 @@ class BoardClock:
     def trail(self, row: phase_table.PhaseHistory) -> list[list[dict[str, object]]]:
         return [[self.time(target), self.time(stated)] for target, stated in row.eta_trail]
 
-    def gate(self, gate: phase_table.NoGate | phase_table.TimedGate | phase_table.UntimedGate) -> dict[str, object]:
-        if isinstance(gate, phase_table.NoGate):
-            return {"kind": "none"}
-        result: dict[str, object] = {"kind": "untimed", "gate": gate.gate, "waits_on": gate.waits_on}
-        if isinstance(gate, phase_table.TimedGate):
-            result.update(kind="timed", until=self.time(gate.until))
-        return result
-
     def phase(self, row: phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase) -> dict[str, object]:
         status = "done" if isinstance(row, phase_table.DonePhase) else "open"
-        gate: phase_table.NoGate | phase_table.TimedGate | phase_table.UntimedGate = phase_table.NoGate()
         start: object = None
         finish: object = None
         took: object = None
         if isinstance(row, phase_table.TodoPhase):
-            gate = row.gate
-            status = "todo" if isinstance(gate, phase_table.NoGate) else "gated"
+            status = "todo"
         if isinstance(row, phase_table.DonePhase | phase_table.TodoPhase):
             if isinstance(row.times, phase_table.CompletedPhaseTiming | phase_table.PredictedPhaseTiming):
                 start, finish = self.time(row.times.start), self.time(row.times.finish)
@@ -106,7 +96,7 @@ class BoardClock:
             took = max(0, self.now - row.started.timestamp())
         return {
             "id": row.phase, "title": row.title, "status": status, "took": took,
-            "start": start, "finish": finish, "gate": self.gate(gate),
+            "start": start, "finish": finish, "gate": {"kind": "none"},
             "fix_done": row.fix_done, "fix_running": row.fix_running, "findings": row.findings,
             "eta": {"first": self.time(row.first_eta) if isinstance(row.first_eta, datetime) else None,
                     "trail": self.trail(row),
@@ -126,9 +116,7 @@ class BoardClock:
             "fix_done": row.fix_done, "fix_running": row.fix_running,
         }
 
-    def finish(self, finish: phase_table.FinishedAt | phase_table.PredictedFinish | phase_table.UnknownFinish | phase_table.GateBlockedFinish) -> dict[str, object]:
-        if isinstance(finish, phase_table.GateBlockedFinish):
-            return {"kind": "after_gate", "gate": finish.gate, "waits_on": finish.waits_on}
+    def finish(self, finish: phase_table.FinishedAt | phase_table.PredictedFinish | phase_table.UnknownFinish) -> dict[str, object]:
         if isinstance(finish, phase_table.FinishedAt | phase_table.PredictedFinish):
             return {"kind": "finished" if isinstance(finish, phase_table.FinishedAt) else "predicted", "at": self.time(finish.at)}
         return {"kind": "unknown"}
@@ -231,7 +219,7 @@ def phase_steps(events: list[dict[str, object]], clock: BoardClock, current: pha
     return result
 
 
-def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase], current: phase_table.OpenPhase | phase_table.NoOpenPhase, ticket: TicketInProgress | NoTicketInProgress) -> str:
+def stage(events: list[dict[str, object]], state: str, current: phase_table.OpenPhase | phase_table.NoOpenPhase, ticket: TicketInProgress | NoTicketInProgress) -> str:
     events = [event for event in events if isinstance(current, phase_table.OpenPhase)
               and event.get("phase_instance_id") == current.instance_id]
     open_passes: dict[str, dict[str, object]] = {}
@@ -268,11 +256,6 @@ def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.Do
         return f"Ticket {ticket.id} running" if isinstance(ticket, TicketInProgress) else f"Phase {current.phase} running"
     if state == "run-finished":
         return "Run done"
-    for row in rows:
-        if isinstance(row, phase_table.TodoPhase) and not isinstance(row.gate, phase_table.NoGate):
-            return f"Waiting on {row.gate.gate}"
-        if not isinstance(row, phase_table.DonePhase):
-            break
     return "Standing by"
 
 
@@ -338,7 +321,7 @@ def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str,
     except phase_table.NoPlan:
         record = phase_table.PhaseRecord(record_plan, datetime.fromtimestamp(clock.now, clock.zone), phase_table.NoOpenPhase(), [], phase_table.UnknownFinish(), phase_table.NothingToStart("no plan"))
     if not record.phases:
-        record = phase_table.build_run(record_plan, events, resolver=resolver)
+        record = phase_table.build_run(record_plan, events)
     state = "standing-by"
     if isinstance(found, unit_run.RunFound):
         state = "run-finished" if events and events[-1].get("event_type") == "run_finished" else "running"
@@ -348,7 +331,7 @@ def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str,
     tickets = unit_ticket_progress(worktree, unit_id, sources) if standing else UnitTicketProgress()
     ticket = tickets.open_ticket
     if isinstance(ticket, TicketInProgress) and isinstance(current, phase_table.OpenPhase):
-        current = next((row for row in phase_table.build_run(record.plan, events, resolver=resolver).phases if isinstance(row, phase_table.OpenPhase)
+        current = next((row for row in phase_table.build_run(record.plan, events).phases if isinstance(row, phase_table.OpenPhase)
                         and (row.phase == ticket.id or re.match(
                             rf"{re.escape(ticket.id)}(?=\s|$)", row.title))), current)
     current_phase: dict[str, object] | None = None
@@ -365,14 +348,20 @@ def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str,
     return {"key": unit_name.removesuffix("-unit"), "plan": plan_text if plan.is_file() else "", "state": state,
             "phase": current_phase,
             "phases": [clock.phase(row) for row in record.phases], "finish": clock.finish(record.plan_finish),
-            "stage": stage(events, state, record.phases, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
+            "stage": stage(events, state, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
             "summary": summary, "steps": phase_steps(events, clock, current), "workers": worker_rows}
+
+
+@dataclass(frozen=True)
+class BoardProduction:
+    owner: staff.StaffRow
+    runner: showrunners.Showrunner
 
 
 @dataclass(frozen=True)
 class BoardSubtree:
     record: staff.StaffSnapshot
-    runners: tuple[showrunners.Showrunner, ...]
+    runners: tuple[BoardProduction, ...]
 
 
 @dataclass(frozen=True)
@@ -391,7 +380,8 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
                 continue
             members[timer.slug] = owner
             by_slug[timer.slug] = showrunners.Showrunner(
-                slug=timer.slug, session=owner.name, socket="", doc=str(timer.doc), zone=timer.zone)
+                slug=timer.slug, session=owner.name, socket="", doc=(str(owner.doc.path) if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""),
+                zone=timer.zone)
         if production:
             root = members.get(production)
         else:
@@ -404,13 +394,13 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
     slugs = {row.id: slug for slug, row in members.items()}
     if root is None or root.id not in slugs:
         return NoBoardSubtree()
-    boards: list[showrunners.Showrunner] = []
+    boards: list[BoardProduction] = []
     level = [root]
     while level:
         for row in level:
             slug = slugs.get(row.id, "")
             if slug in by_slug:
-                boards.append(by_slug[slug])
+                boards.append(BoardProduction(row, by_slug[slug]))
         level = sorted((child for row in level for child in staff.active(record, "showrunner")
                         if child.parent == staff.ReportsTo(row.id) and child.id in slugs),
                        key=lambda row: slugs.get(row.id, row.name))
@@ -469,28 +459,59 @@ def write_board(path: Path, board: dict[str, object]) -> None:
             Path(temporary).unlink(missing_ok=True)
 
 
+def migrate_cache(root: Path, record: staff.StaffSnapshot) -> int:
+    """Move exact timer slugs to staff ids. Retain files without a recorded owner."""
+    owners: dict[str, staff.StaffId] = {}
+    for row in record.find(kind="showrunner"):
+        timer = showrunners.timer_for(row, record)
+        if isinstance(timer, showrunners.TimerRegistration):
+            owners[timer.slug] = row.id
+    ids = {row.id for row in record.find(kind="showrunner")}
+    unknown: list[str] = []
+    for source in sorted(root.glob("*.json")):
+        if source.stem in ids:
+            continue
+        owner = owners.get(source.stem)
+        if owner is None:
+            unknown.append(str(source))
+            continue
+        target = root / f"{owner}.json"
+        try:
+            target.hardlink_to(source)
+        except FileExistsError:
+            if source.read_bytes() != target.read_bytes():
+                raise FileExistsError(f"{source}: staff cache already differs: {target}") from None
+        source.unlink()
+    for path in unknown:
+        print(f"board_json: no recorded cache owner: {path}", file=sys.stderr)
+    return int(bool(unknown))
+
+
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    _ = parser.add_argument("--migrate-cache", action="store_true", help="Move cache files to staff ids.")
     _ = parser.add_argument("--session", default="")
     _ = parser.add_argument("--production", default="")
     args = parser.parse_args(arguments)
     session, production = cast(str, args.session), cast(str, args.production)
+    root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
+    if cast(bool, args.migrate_cache):
+        return migrate_cache(root, staff.snapshot())
     if not session and not production:
         parser.error("--session or --production is required")
     subtree = resolve(production, session)
-    root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
     files: list[str] = []
     if isinstance(subtree, BoardSubtree):
         resolver = session_staff.RowResolver(subtree.record)
-        for runner in subtree.runners:
-            path = root / f"{runner['slug']}.json"
-            write_board(path, build(runner, record=subtree.record, resolver=resolver))
+        for production_board in subtree.runners:
+            path = root / f"{production_board.owner.id}.json"
+            write_board(path, build(production_board.runner, record=subtree.record, resolver=resolver))
             files.append(str(path))
     watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
     if isinstance(subtree, BoardSubtree):
         for row in staff.active(subtree.record, "showrunner"):
             timer = showrunners.timer_for(row, subtree.record)
-            if isinstance(timer, showrunners.Timer):
+            if isinstance(timer, showrunners.TimerRegistration):
                 watch_sources.add(showrunners.SHOWRUNNER_STATE_DIR / row.id)
     watch = existing_sources(watch_sources)
     print(json.dumps({"files": files, "watch": watch}))

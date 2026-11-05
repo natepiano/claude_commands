@@ -29,9 +29,7 @@ setUpModule = support.setUpModule
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_claude_reminder_pushes_once_at_two_percent_without_session_repeat_or_restore(self) -> None:
-        config = quota_alert.load_config()
-        config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        _ = quota_alert.CONFIG.write_text(quota_alert.CONFIG.read_text().replace("threshold_percent=1", "threshold_percent=2"))
         _ = self.alert([self.note("claude2.md", "active", "3")], self.now)
         self.assertEqual(self.noted, [])
         _ = self.alert([self.note("claude2.md", "active", "2")], self.now + timedelta(minutes=2))
@@ -53,9 +51,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(self.sent, [])
 
     def test_self_targeting_entry_does_not_silence_the_two_percent_claude_reminder(self) -> None:
-        config = quota_alert.load_config()
-        config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        _ = quota_alert.CONFIG.write_text(quota_alert.CONFIG.read_text().replace("threshold_percent=1", "threshold_percent=2"))
         entry = next_moves.add_next_move("units", 1, "claude2")
         note = self.note("claude2.md", "active", "2")
         for minute in (0, 2, 32):
