@@ -136,11 +136,12 @@ def publish_fixture_roster(entries: dict[str, object], home: Path) -> dict[str, 
     session_staff.inbox_path(parent.id).parent.mkdir(parents=True, exist_ok=True)
     roles = {name: _as_test_dict(raw).get("role") for name, raw in entries.items()}
     stored = fixture_roster(entries, parent.id, home)
+    assignments = codex_mesh.task_assignments()
     for name, raw in stored.items():
         role = roles[name]
         if role in codex_mesh.WORKER_ROLES:
             identity = session_staff.worker_session(_as_test_dict(raw))
-            current = codex_mesh.task_role(identity)
+            current = codex_mesh.task_role(identity, assignments)
             if not isinstance(current, codex_mesh.AssignedWorkerRole) or current.role != role:
                 codex_mesh._record_assignment(identity, cast(codex_mesh.WorkerRole, role), None)  # pyright: ignore[reportPrivateUsage]
     membership = staff.local_snapshot()
@@ -13854,9 +13855,10 @@ class WorkerAdoptionTests(MeshCommandFixture):
             return {}
         content = path.read_text()
         records = fixture_worker_records(_as_test_dict(cast(object, json.loads(content))), staff.local_snapshot()) if content.strip() else {}
+        assignments = codex_mesh.task_assignments()
         for value in records.values():
             entry = _as_test_dict(value)
-            role = codex_mesh.task_role(str(entry.get("thread_id", "")))
+            role = codex_mesh.task_role(str(entry.get("thread_id", "")), assignments)
             if isinstance(role, codex_mesh.AssignedWorkerRole):
                 entry["role"] = role.role
         return records

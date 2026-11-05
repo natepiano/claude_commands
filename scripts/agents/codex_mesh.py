@@ -8803,9 +8803,9 @@ class WorkersRunMove:
     workers: tuple[SwitchingWorker | InterruptedWorkerMove, ...]
 
 
-def _account_move_command(session_dir: str, name: str) -> str:
+def _account_move_command(session_dir: str, name: str, assignments: agents_log.RoleLog) -> str:
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    assignment = task_role(session_staff.worker_session(record))
+    assignment = task_role(session_staff.worker_session(record), assignments)
     role = assignment.role if isinstance(assignment, AssignedWorkerRole) else ""
     return shlex.join(["bash", str(Path(__file__).resolve().parents[1] / "direct/assign.sh"),
                        "--role", "implement" if role == "impl" else role, "--operation", "resume-account-move",
@@ -8891,6 +8891,7 @@ def _wait_account_move_resumes(
     """Await every dispatched move against one deadline, without serial worker waits."""
     pending = {(move.session_dir, move.name): move for move in moves}
     outcomes: dict[tuple[str, str], WorkerSwitchOutcome] = {}
+    assignments = task_assignments()
     deadline = time.monotonic() + ACCOUNT_MOVE_RESUME_TIMEOUT_SECS
     while pending:
         for key, move in tuple(pending.items()):
@@ -8900,23 +8901,23 @@ def _wait_account_move_resumes(
                     if result.get("resumed") is True:
                         outcomes[key] = WorkerMoveResumed()
                     elif reason := _as_str(result.get("error")):
-                        outcomes[key] = WorkerMoveFailed(reason, _account_move_command(*key))
+                        outcomes[key] = WorkerMoveFailed(reason, _account_move_command(*key, assignments))
                 if key in outcomes:
                     del pending[key]
                     continue
                 if move.launcher_pid <= 0 or not _pid_alive(move.launcher_pid):
                     outcomes[key] = WorkerMoveFailed("the director must resume this worker through assign.sh",
-                                                     _account_move_command(*key))
+                                                     _account_move_command(*key, assignments))
                     del pending[key]
             except (ConnectionError, OSError, SystemExit) as error:
-                outcomes[key] = WorkerMoveFailed(f"resume failed: {error}", _account_move_command(*key))
+                outcomes[key] = WorkerMoveFailed(f"resume failed: {error}", _account_move_command(*key, assignments))
                 del pending[key]
         if not pending:
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             for key in pending:
-                outcomes[key] = WorkerMoveFailed("resume not confirmed before timeout", _account_move_command(*key))
+                outcomes[key] = WorkerMoveFailed("resume not confirmed before timeout", _account_move_command(*key, assignments))
             break
         # The last poll ends at the deadline: summed 0.05 s steps can fall one rounding short of it.
         time.sleep(min(0.05, remaining))
@@ -8996,7 +8997,7 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
             raise RuntimeError("account move requires its passed bulk ownership")
         current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         if current != entry or current.get("status") != "running":
-            return SwitchingWorker(name, False, WorkerMoveFailed("worker ownership changed before account move", _account_move_command(session_dir, name)))
+            return SwitchingWorker(name, False, WorkerMoveFailed("worker ownership changed before account move", _account_move_command(session_dir, name, task_assignments())))
         thread_id = _as_str(session_staff.worker_session(entry))
         marker: AccountMoveMarker | NoAccountMove = NoAccountMove()
         client: Client | None = None
@@ -9040,7 +9041,7 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
             if isinstance(marker, AccountMoveMarker):
                 with contextlib.suppress(OSError):
                     _fail_account_move(session_dir, name, marker, reason)
-            return SwitchingWorker(name, True, WorkerMoveFailed(reason, _account_move_command(session_dir, name)))
+            return SwitchingWorker(name, True, WorkerMoveFailed(reason, _account_move_command(session_dir, name, task_assignments())))
         finally:
             if client is not None:
                 client.close()

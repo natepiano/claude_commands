@@ -56,10 +56,11 @@ def adopt_unit_worker(source: Path, destination: Path, name: str) -> str:
                 raise registry.WorkerUnavailable(f"{name}: destination already has a worker")
             worker = ledger.workers.get(name)
             paused = worker is not None and isinstance(worker.ownership, registry.Paused)
-            reason = codex_mesh.worker_idle_reason(str(source), name, before, paused=paused, adopting=True)
+            membership = staff.local_snapshot()
+            reason = codex_mesh.worker_idle_reason(str(source), name, before, paused=paused, adopting=True,
+                                                   membership=membership)
             if reason:
                 raise registry.WorkerUnavailable(f"{name}: {reason}")
-            membership = staff.local_snapshot()
             row = membership.by_id(reference)
             if row is None or row.parent != staff.ReportsTo(allowed.parent):
                 raise registry.WorkerUnavailable(f"{name}: worker staff owner changed")
@@ -87,7 +88,7 @@ def adopt_unit_worker(source: Path, destination: Path, name: str) -> str:
             move = (source / f"{name}.account-move.json")
             if move.exists():
                 write_text_atomic((destination / f"{name}.account-move.json"), move.read_text())
-            role = codex_mesh.task_role(thread_id)
+            role = codex_mesh.task_role(thread_id, codex_mesh.task_assignments())
             task = role.role if isinstance(role, codex_mesh.AssignedWorkerRole) else "impl"
             if worker is None:
                 worker = registry.UnitWorker(name, task, "codex", text_field(before.get("model")),
