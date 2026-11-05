@@ -6,11 +6,11 @@ Show whether build changes reduce Hana phase time and recorded build costs.
 Phase time remains the score.
 The user approved this view on 2026-11-03 with “go”.
 
-`buildlog charts` writes a standalone page and opens the default browser.
+`buildlog charts` writes a standalone page, publishes it with `review_link.py`, and prints the tailnet link.
 The default window covers seven days; `--days 30` selects thirty days.
 The page uses `~/.cache/buildlog/charts/latest.html`.
-The command prints this path, including when the browser cannot open.
-`--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` keep the browser closed.
+The command prints the link and no file path. A failed publish prints one stderr line and exits non-zero.
+A browser opens only with a local display and no ssh session. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` keep the browser closed.
 The page needs no server, network request, or external library.
 `/build:report` remains retired. `buildlog report` remains available.
 
