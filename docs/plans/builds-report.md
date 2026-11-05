@@ -395,57 +395,42 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 ### Phase 20 — memory.py reads recorded output folders through one reader  · status: todo
 **Depends on:** resources' Phase 62 lands on builds (it adds `build_shape.recorded_output_roots`).
 
-Routed from resources' Phase 62 review (F021), through the builds showrunner (2026-11-04). `scripts/buildlog/memory.py` `build_output_roots` (line 87) reads the steps output pairs with its own SQL. Make it read them through `build_shape.recorded_output_roots`, so one reader remains. Write the Work Order when Phase 62 lands and the function's signature is known.
+Routed from resources' Phase 62 review (F021), through the builds showrunner (2026-11-04). `scripts/buildlog/memory.py` `build_output_roots` (line 84) reads the steps output pairs with its own SQL. Make it read them through `build_shape.recorded_output_roots`, so one reader remains. Write the Work Order when Phase 62 lands and the function's signature is known.
 
 **Constraints from prior phases:**
 - On origin/builds-resources, `recorded_output_roots(index_path, host) -> RecordedOutputRoots | RecordedRootsUnavailable` (scripts/lint/build_shape.py:268) skips every row whose argv sets `--target-dir` or a `--config` target-dir. It also skips rows whose absolute `target_folder` differs from `target_directory`. Since Phase 19 a new row with such an override has a pair that equals its `target_dir`. resources owns that rule; the change was sent to resources and builds on 2026-11-04.
 - The Work Order must name the outcomes: missing pair, `RecordedRootsUnavailable`, host filter, process cache, and the current `cargo metadata` fallback. Each gets a test. The kill classification stays the same.
 - Files: `scripts/buildlog/memory.py`, `scripts/buildlog/test_memory_window.py`.
-- The "Each memory tick writes one row" next item also changes `memory.py`; do not run the two at the same time.
+- Phase 21 (one row per memory tick) is done. It did not change `build_output_roots`.
 
 **Workers:** 1 writer (rowcpu).
 
 
 ### Phase 21 — Each memory tick writes one row  · status: done
-**Depends on:** none (from next items; showrunner 2026-11-04: open it now; natest P10 is on builds and the index.py freeze has ended)
 
-#### Work Order
+#### As-built
 
-**Goal:** Each `buildlog sample` tick writes one row: the sample row carries zram, and the tick writes no `memory_snapshot` row.
-
-**Spec:**
-Source: Phase 17 simplify item 1. Each tick now writes `kind`, `at` and `host` twice through two writers (`sample.sample()` and `memory.write_snapshot`, called from `cli.py` `sample`); the tick `memory_snapshot` row holds only zram.
-
-1. `sample.sample()` adds `zram` to the sample record, read with `memory.zram_state` (path from `BUILDLOG_ZRAM`, default `/sys/block/zram0`). Keep imports lazy where they are lazy now.
-2. `index.py`: add a `zram` TEXT column to `SAMPLE_COLUMNS` ("JSON zram storage at the sample time") and bump `SCHEMA_VERSION` from 32 to 33.
-3. Delete the tick writer: `memory.write_snapshot`, `memory.tick_snapshot`, `TickMemorySnapshot`, and the `memory.write_snapshot` call and its error line in `cli.py` `sample`. `MemorySnapshot` (the standalone `buildlog snapshot` row with slices and zram) stays and becomes a TypedDict of its own.
-4. `memory.nearest_snapshot` reads the nearest zram from `samples` UNION ALL `memory_snapshots`, the same way it reads slices (snapshot row first on equal distance). Old logs (zram only in `memory_snapshots`), new ticks (zram only in `samples`) and standalone snapshots give the same report.
-5. Update the as-built docs that name the tick snapshot row: `docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`.
-
-Acceptance:
-- Tests: a tick writes one row with zram and no `memory_snapshot` row; the memory window report gives the same zram line for an old-log fixture (zram in `memory_snapshots`), a new-log fixture (zram in `samples`) and a standalone snapshot; zram absent reads `zram: unavailable` as now. The index test covers the new column and schema 33.
-- Log size per day for 1,440 ticks, before and after (Phase 17 after: 4,808,160 bytes/day); about 105 KB/day less.
-- CPU per `buildlog sample` tick: an interleaved A/B (10 samples per tree) against a shared clone of the Phase 19 shrink c5d618d86, from the same run. The tick must not cost more.
+- Each `buildlog sample` tick writes one sample row, and that row carries `zram`. The tick writes no `memory_snapshot` row, and `cli.py` `sample` has no second writer.
+- `memory.read_zram() -> ZramPresent | ZramAbsent` reads `BUILDLOG_ZRAM` (default `/sys/block/zram0`). `sample.sample()` (lazy import) and `memory.snapshot()` call it. `zram_state` reads an unreadable path as absent, so the sample is kept.
+- `MemorySnapshot` is one TypedDict (`kind`, `at`, `host`, `zram`, `slices`): the standalone `buildlog snapshot` row.
+- `index.py`: `samples.zram` TEXT column; `SCHEMA_VERSION = 33`.
+- `memory.nearest_snapshot` uses one local `nearest_value(column)` over `samples` UNION ALL `memory_snapshots`, key (distance, snapshot row first, `at`). It takes the nearest slices, then the nearest zram. No slices in range reads as unavailable.
+- CPU per tick 313.0 → 297.1 ms (interleaved A/B against c5d618d86); log size 4,808,160 → 4,698,720 bytes/day.
 
 **Files:**
 - `scripts/buildlog/sample.py` — zram in the sample record.
-- `scripts/buildlog/index.py` — the column and schema bump.
-- `scripts/buildlog/memory.py` — delete the tick writer; zram reader over both tables.
-- `scripts/buildlog/cli.py` — the `sample` command.
-- `scripts/buildlog/test_sample.py` — tick tests.
-- `scripts/buildlog/test_memory_window.py` — report tests.
-- `scripts/buildlog/test_index.py` — the column and schema test.
-- `scripts/buildlog/test_mac_idle.py` — it patches `memory.write_snapshot`.
-- `docs/as-built/buildlog-memory-stalls.md` — the tick row text.
-- `docs/as-built/build-memory-admission.md` — the tick row text.
-- `scripts/buildlog/cgroup_test_support.py` — the shared zram fixture writer and reading.
+- `scripts/buildlog/index.py` — the `zram` column and schema 33.
+- `scripts/buildlog/memory.py` — `read_zram`, `MemorySnapshot`, `nearest_snapshot`.
+- `scripts/buildlog/cli.py` — the `sample` command writes one row.
+- `scripts/buildlog/cgroup_test_support.py` — `write_zram` and `ZRAM_READING`.
+- `scripts/buildlog/test_sample.py`, `test_memory_window.py`, `test_index.py`, `test_mac_idle.py` — tests.
+- `docs/as-built/build-memory-admission.md` — owns "Slice snapshots" and the schema number; `docs/as-built/buildlog-memory-stalls.md` points to it.
 
-**Constraints from prior phases:** Phase 17: the reader reads both tables, because old logs keep slices in `memory_snapshots`; a join on equal `at` text between two writers failed. Phase 19: measure CPU only as an interleaved A/B against the prior commit, in one run. natest may change `index.py` for /test_times at the same time; keep the index change to the one column and the schema bump.
+**Gotchas:**
+- Old logs keep zram and old slices in `memory_snapshots`, so the reader reads both tables.
+- An equal-distance test needs different `at` text forms (`…00.000Z` sorts before `…00Z`), or text order alone picks the winner.
 
-**Workers:** 1 writer (rowcpu): one small file set with `memory.py` as the hub.
-
-**State:** sample rows in the build log (new rows only) and the index schema (33).
-
+**Ruled out:** moving the zram reader to `cgroup_capture.py` — it removes no copy and gives no CPU gain.
 
 ### Phase 22 — buildlog charts prints a tailnet link  · status: done
 
