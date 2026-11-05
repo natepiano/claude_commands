@@ -36,3 +36,10 @@ def final_files(root: Path) -> dict[str, bytes]:
             and path.relative_to(root).parts[:2] != ("state", "sessions")
             and path.name not in ("herdr.jsonl", "shutdown-calls.jsonl")
             and not path.name.endswith(".lock")}
+
+
+def file_versions(root: Path) -> dict[str, tuple[bytes, int]]:
+    """Read each durable file and its modification time, including Git state."""
+    return {str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in root.rglob("*") if path.is_file() and not path.is_socket()
+            and "__pycache__" not in path.parts and not path.name.endswith(".lock")}

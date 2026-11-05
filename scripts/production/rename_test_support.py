@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
@@ -175,15 +176,41 @@ class FolderMoveBackend:
                                  "foreground_process_group_id": self.pid if self.live else self.shell_pid,
                                  "foreground_processes": foreground}}
 
-    def run_in_pane(self, pane: str, command: list[str]) -> None:
+    def saved_row_tab(self, row_id: str, title: str) -> herdr.ExistingPane:
+        self.fixture.assertEqual((row_id, title), (str(self.fixture.owner.id), self.fixture.owner.name))
+        return herdr.ExistingPane("w1:p1", "kept-terminal")
+
+    def remember_row_tab(self, row_id: str, pane: str) -> None:
+        self.fixture.assertEqual((row_id, pane), (str(self.fixture.owner.id), "w1:p1"))
+
+    def focus_tab_of(self, pane: str) -> None:
         self.fixture.assertEqual(pane, "w1:p1")
+
+    def run_in_pane(self, pane: str, command: list[str], *, terminal: str = "") -> None:
+        self.fixture.assertEqual((pane, terminal), ("w1:p1", "kept-terminal"))
         self.fixture.assertFalse(self.live, "a live session must not start again")
         self.fixture.assertEqual(self.agents(), [])
-        self.cwd = Path(command[command.index("sh") + 4])
+        self.fixture.assertEqual(command[0], "eval")
+        words = shlex.split(command[1])
+        self.cwd = Path(words[words.index("cd") + 2])
         self.fixture.assertTrue(self.cwd.is_dir())
-        self.starts.append((pane, command.copy()))
+
+    def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
+                    timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
+        self.fixture.assertFalse(self.live, "a live session must not start again")
+        self.fixture.assertEqual((name, pane, kind), (self.fixture.owner.name, "w1:p1", self.kind))
+        self.fixture.assertIn(self.fixture.owner.current_session, agent_arguments)
+        self.fixture.assertIsInstance(opening, herdr.NoOpeningPrompt)
+        self.fixture.assertGreater(timeout_ms, 0)
+        self.starts.append((pane, agent_arguments.copy()))
+        entry = pane_record.launch(pane, self.fixture.owner.current_session, str(self.cwd),
+            self.environment(self.pid), [kind, *agent_arguments], kind=self.kind)
+        entry["name"] = name
+        pane_record.write(self.session, entry)
         self.live = True
         self.publish_process_state()
+        return herdr.PromptSubmissionNotRequired()
 
     def close_tab_confirmed(self, pane: str) -> None:
         raise AssertionError(f"a folder resume must keep its pane: {pane}")
@@ -462,7 +489,7 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
         _ = scope.enter_context(mock.patch.object(subprocess, "run", side_effect=run))
-        _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback)))
+        _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback, monotonic=time.monotonic)))
         # Failure injection scripts assign these names just as they do in a CLI
         # subprocess. Each call restores them before another test can observe it.
         for module, names in ((os, ("rename", "replace")),
