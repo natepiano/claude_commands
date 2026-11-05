@@ -314,6 +314,7 @@ def document(content: str) -> bytes:
 body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
 .id,h2{opacity:.7;font-size:14px}.kind{font-weight:600}
 h1{font-size:26px;line-height:1.25}h2{margin:28px 0 6px}p{white-space:pre-wrap}
+ul,ol{margin:8px 0;padding-left:28px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
 section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
 form{margin-top:28px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:6px 0 12px;resize:vertical}
@@ -357,12 +358,43 @@ def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
 
 
+def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
+    """Render review text as escaped text blocks and consecutive list runs."""
+    lines = text.splitlines()
+    if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
+        return f"<{block}>{html.escape(text)}</{block}>"
+    content: list[str] = []
+    current = ""
+    for line in lines:
+        line = line.lstrip()
+        numbered = re.match(r"([0-9]+)\. (.*)", line)
+        tag = "ul" if line.startswith("- ") else "ol" if numbered else block if line else ""
+        if tag != current:
+            if current:
+                content.append(f"</{current}>")
+            if tag:
+                start = (numbered[1].lstrip("0") or "0") if numbered else "1"
+                attribute = f' start="{start}"' if tag == "ol" and start != "1" else ""
+                content.append(f"<{tag}{attribute}>")
+        elif tag == block:
+            content.append("\n")
+        if tag in ("ul", "ol"):
+            item = numbered[2] if numbered else line[2:]
+            content.append(f"<li>{html.escape(item)}</li>")
+        elif tag:
+            content.append(html.escape(line))
+        current = tag
+    if current:
+        content.append(f"</{current}>")
+    return "".join(content)
+
+
 def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str:
     if isinstance(question, NoQuestion):
         return ""
-    content = f'<h2>Question</h2><p>{html.escape(question.text)}</p>'
+    content = '<h2>Question</h2>' + review_text_html(question.text)
     if isinstance(question, AnsweredQuestion):
-        content += f'<h2>Answer</h2><p>{html.escape(question.answer)}</p>'
+        content += '<h2>Answer</h2>' + review_text_html(question.answer)
     else:
         content += '<p>The showrunner will answer this</p>'
     return content
@@ -451,7 +483,7 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
 <p class="kind">{html.escape(row[change_review.KIND])}</p>
 <div class="id">{row_id} · {html.escape(row.get("Merged", ""))}</div>
 <h1>{html.escape(row["Change"])}</h1>
-<h2>{proof_title}</h2><pre>{html.escape(row[change_review.CHECK])}</pre>
+<h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
 {question_html(question)}{answer}</section>''')
     if notice.reason and not notice.row:
         sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')

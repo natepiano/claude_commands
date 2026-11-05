@@ -789,6 +789,57 @@ class ActionTest(unittest.TestCase):
             "| C76 | Panels \\| shields stay | 2026-10-14 | not yet | Run `hana` in a natedev terminal. "
             + "You see: Each panel keeps its shield |"))
 
+    def test_edit_keeps_check_line_breaks_and_pipes_in_one_table_row(self) -> None:
+        check = 'Steps:\r\n- Run A | B\r\n- Run C'
+        see = 'Results:\n1. One\n2. Two | three'
+        code, output, error = run('edit', '--production', DOC, '--list', str(self.path), '--row', 'C76',
+                                  '--change', 'Panels keep shields', '--check', check, '--see', see)
+        self.assertEqual((code, error), (0, ''))
+        expected = 'Steps:\n- Run A | B\n- Run C. You see: Results:\n1. One\n2. Two | three'
+        row = next(row for row in change_review.pending(self.path) if row['#'] == 'C76')
+        self.assertEqual(row[change_review.CHECK], expected)
+        lines = [line for line in self.path.read_text().splitlines() if line.startswith('| C76 |')]
+        self.assertEqual(lines, [output.rstrip('\n')])
+        self.assertIn('Steps:<br>- Run A \\| B<br>- Run C.', lines[0])
+        self.assertIn('2. Two \\| three', lines[0])
+
+    def test_edit_stores_each_line_separator_in_one_table_row(self) -> None:
+        for separator in ('\n', '\r\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\x85', '\u2028', '\u2029'):
+            with self.subTest(separator=repr(separator)):
+                _ = self.path.write_text(LIST, encoding='utf-8')
+                code, output, error = run('edit', '--production', DOC, '--list', str(self.path), '--row', 'C76',
+                                          '--change', 'Panels keep shields', '--check', f'First{separator}- Second',
+                                          '--see', 'Both remain')
+                self.assertEqual((code, error), (0, ''))
+                text = self.path.read_text(encoding='utf-8')
+                self.assertIn('| First<br>- Second. You see: Both remain |', text)
+                self.assertEqual([line for line in text.splitlines() if line.startswith('| C76 |')],
+                                 [output.rstrip('\n')])
+                row = next(row for row in change_review.pending(self.path) if row['#'] == 'C76')
+                self.assertEqual(row[change_review.CHECK], 'First\n- Second. You see: Both remain')
+
+    def test_saved_verdicts_keep_typed_break_tags_and_line_breaks_unchanged(self) -> None:
+        for verdict in ('The <br> tag is visible', r'The <\br> tag is visible',
+                        r'The <\\br> tag is visible', 'a <br> b | c', 'x\n<br>y', 'x\\\ny'):
+            with self.subTest(verdict=verdict):
+                _ = self.path.write_text(LIST, encoding='utf-8')
+                _ = change_review.record_verdict(self.path, 'C76', verdict, date(2026, 11, 5), PRODUCTION)
+                row = next(row for row in change_review.review_rows(self.path) if row['#'] == 'C76')
+                self.assertEqual(row['Verdict'], verdict)
+                before = self.path.read_bytes()
+                repeated = change_review.record_verdict(self.path, 'C76', verdict, date(2026, 11, 5), PRODUCTION)
+                self.assertIsInstance(repeated, change_review.VerdictAlreadyRecorded)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_a_multiline_check_stays_with_a_classified_row_after_a_verdict(self) -> None:
+        item = Visible('Panels keep shields', '- Run A\n- Run B', 'Both remain')
+        _ = change_review.edit_row(self.path, 'C76', item, date(2026, 11, 5), PRODUCTION)
+        _ = change_review.set_row_kind(self.path, 'C76', 'See in action', PRODUCTION)
+        _ = change_review.record_verdict(self.path, 'C76', 'not works', date(2026, 11, 5), PRODUCTION)
+        saved = next(row for row in change_review.review_rows(self.path) if row['#'] == 'C76')
+        self.assertEqual(saved[change_review.CHECK], item.how())
+        self.assertEqual(saved['Verdict'], 'not works')
+
     def test_edit_refuses_a_row_not_to_review_and_a_missing_part(self) -> None:
         for row in ("C70", "C99", "76"):
             code, output, error = run("edit", "--production", DOC, "--list", str(self.path), "--row", row,
