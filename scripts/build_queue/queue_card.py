@@ -5,6 +5,7 @@ from collections.abc import Sequence
 
 from scripts.build_queue import head_facts, queue_evidence
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
+from scripts.build_queue.scope_activity import NotServiceSlice
 from scripts.build_queue.queue_view import (QueueModel, check_line, check_lines, clock, estimate_minutes,
     eligible_head_position, has_move_priority, is_moved, name_spans, name_text, pressure_check, shown_waiters, reason_phrase, running_matches_selector, start_text, step_checks, same_waiter, HostLoad)
 from scripts.lint import memory_admit as gate
@@ -141,7 +142,8 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
     running_steps = page_running_steps(model)
     for running in running_steps:
         selected = running in selected_running
-        if isinstance(running.step.measured, gate.UnownedSliceMemory):
+        if (isinstance(running.step.measured, gate.UnownedSliceMemory)
+                and isinstance(running.step.measured.job_state, NotServiceSlice)):
             continue
         prefix = "Selected running step: " if selected else ""
         add(prefix + queue_evidence.running_text(running, explanation, model.labels, model.zone))

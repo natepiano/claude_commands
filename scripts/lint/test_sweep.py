@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import TYPE_CHECKING, Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -31,7 +31,7 @@ import sweep
 import cargo_target_config
 from scripts.lib import file_lock
 import conf
-from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.mac_test import floor_claims
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
@@ -474,6 +474,43 @@ class SweepTests(SweepCase):
 
 
 class RebuildTests(SweepCase):
+    def test_rebuild_report_fails_when_an_enumerated_month_disappears(self) -> None:
+        path = Path(os.environ["BUILDLOG_DIR"]) / "natedev" / "2026-10.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("{}\n")
+        locked_rows = store.locked_rows
+
+        def remove_before_read(month: Path, start: int = 0) -> Generator[dict[str, object]]:
+            if month == path:
+                month.unlink()
+            yield from locked_rows(month, start)
+
+        output, errors = io.StringIO(), io.StringIO()
+        with (mock.patch.object(store, "locked_rows", side_effect=remove_before_read),
+              mock.patch.object(sweep, "read_sweep_journal", return_value=[]),
+              redirect_stdout(output), redirect_stderr(errors)):
+            status = sweep.main(["rebuilds", "--days", "7"])
+        self.assertEqual(status, 2)
+        self.assertIn("cannot read rebuild evidence", errors.getvalue())
+        self.assertEqual(output.getvalue(), "")
+
+    def test_trim_lookup_returns_false_for_an_absent_month_without_an_existence_check(self) -> None:
+        path = Path(os.environ["BUILDLOG_DIR"]) / "natedev" / "2026-10.jsonl"
+        take = sweep.TrimTake("/fixture/target", "floor take", 0)
+        with (mock.patch.object(store, "host_file", return_value=path),
+              mock.patch.object(Path, "exists", side_effect=AssertionError("trim lookup checked existence"))):
+            self.assertFalse(sweep.trim_row_recorded(take))
+
+    def test_legacy_removals_skip_invalid_rows_and_partial_tail(self) -> None:
+        path = sweep.sweep_removals_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"at": 10, "path": "/fixture/target", "cause": "floor take"}
+        complete = json.dumps(row).encode() + b"\n"
+        invalid = [b"\xff\n", b"not json\n", b"[]\n", b"{}\n",
+                   b'{"at": 10, "path": "relative", "cause": "floor take"}\n']
+        _ = path.write_bytes(complete + b"".join(invalid) + json.dumps(row).encode())
+        self.assertEqual(sweep.read_sweep_removals(), [sweep.SweepRemoval(10, "/fixture/target", "floor take")])
+
     def test_legacy_removal_file_still_explains_rebuild_without_trim_rows(self) -> None:
         folder = "/tmp/gate-check.legacy"
         self.step(folder, 2 * DAY)
@@ -695,7 +732,9 @@ class TargetDirTests(SweepCase):
         config = target.root.parent / "lint.conf"
         _ = write_config_fixture(config)
         environ = {sweep.BUDGET_ENV: "1024", "CONF_DIR": str(config.parent)}
-        with mock.patch.dict(os.environ, environ), redirect_stdout(output):
+        # The machine's real disk floor is not this test's subject; its scan reads every real root.
+        with (mock.patch.dict(os.environ, environ), redirect_stdout(output),
+              mock.patch.object(sweep, "hold_floor", return_value=0)):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root), "--dry-run"])
         self.assertEqual(status, 0)
         self.assertIn(f"lint sweep: {target.root} is ", output.getvalue())
@@ -710,7 +749,7 @@ class TargetDirTests(SweepCase):
         output = io.StringIO()
         config = target.root.parent / "lint.conf"
         _ = write_config_fixture(config)
-        environ = {sweep.BUDGET_ENV: "0", "CONF_DIR": str(config.parent)}
+        environ = {**config_environment(config.parent), sweep.BUDGET_ENV: "0"}
         # The machine's real disk floor is not this test's subject; below it, main would page.
         with (mock.patch.dict(os.environ, environ), redirect_stdout(output),
               mock.patch.object(sweep, "hold_floor", return_value=0)):
@@ -1117,6 +1156,185 @@ class ReclamationTests(SweepCase):
 
 
 class FloorTests(SweepCase):
+    def test_nested_workspace_members_share_one_metadata_read(self) -> None:
+        base = self.base()
+        workspace = base / "workspace"
+        _ = write(workspace / "Cargo.toml", 0)
+        for name in ("member", "member/nested", "second"):
+            _ = write(workspace / name / "Cargo.toml", 0)
+        mapping = CargoOutputRoots(workspace, workspace / "target", base / "intermediates")
+        mapping.target_directory.mkdir()
+        mapping.build_directory.mkdir()
+        with (mock.patch.object(Path, "cwd", return_value=workspace),
+              mock.patch.object(sweep, "read_cargo_output_roots", return_value=mapping) as metadata):
+            roots, index = sweep.discover_cargo_outputs([str(workspace)], True, lint_settings=conf.read("lint"))
+        metadata.assert_called_once_with(workspace)
+        self.assertEqual(set(roots), {str(mapping.target_directory), str(mapping.build_directory)})
+        self.assertEqual(index.workspaces, (mapping,))
+        self.assertEqual(index.unresolved, frozenset())
+        self.assertEqual(index.history, ())
+
+    def test_workspace_skip_cost_does_not_grow_with_the_number_of_roots(self) -> None:
+        base = self.base()
+        mappings: dict[Path, CargoOutputRoots] = {}
+        for number in range(32):
+            workspace = base / f"workspace-{number:02}"
+            _ = write(workspace / "Cargo.toml", 0)
+            _ = write(workspace / "member" / "Cargo.toml", 0)
+            mappings[workspace] = CargoOutputRoots(workspace, workspace / "target", workspace / "target")
+        original = Path.is_relative_to
+        comparisons = 0
+
+        def compare(path: Path, other: Path) -> bool:
+            nonlocal comparisons
+            comparisons += 1
+            return original(path, other)
+
+        def read(path: Path) -> CargoOutputRoots:
+            return mappings[path]
+
+        with (mock.patch.object(Path, "cwd", return_value=base),
+              mock.patch.object(Path, "is_relative_to", compare),
+              mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read) as metadata):
+            _, index = sweep.discover_cargo_outputs([str(base)], True, lint_settings=conf.read("lint"))
+        self.assertEqual(metadata.call_count, len(mappings))
+        self.assertEqual(set(index.workspaces), set(mappings.values()))
+        self.assertLessEqual(comparisons, 4 * len(mappings))
+
+    def test_independent_workspaces_resolve_together_with_a_bounded_reader_count(self) -> None:
+        base = self.base()
+        workspaces = [base / f"workspace-{number}" for number in range(4)]
+        for workspace in workspaces:
+            _ = write(workspace / "Cargo.toml", 0)
+        lock = Lock()
+        together = Event()
+        active = 0
+        maximum = 0
+
+        def read(workspace: Path) -> CargoOutputRoots:
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                if active == 2:
+                    together.set()
+            try:
+                self.assertTrue(together.wait(3), "independent metadata reads did not overlap")
+                return CargoOutputRoots(workspace, workspace / "target", workspace / "target")
+            finally:
+                with lock:
+                    active -= 1
+
+        with (mock.patch.object(Path, "cwd", return_value=base),
+              mock.patch.object(os, "cpu_count", return_value=2),
+              mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read) as metadata):
+            _, index = sweep.discover_cargo_outputs([str(base)], True, lint_settings=conf.read("lint"))
+        self.assertEqual(metadata.call_count, len(workspaces))
+        self.assertEqual(maximum, 2)
+        self.assertEqual({item.workspace_root for item in index.workspaces}, set(workspaces))
+
+    def test_changed_cargo_config_refreshes_cached_roots_and_keeps_history(self) -> None:
+        base = self.base()
+        workspace = base / "workspace"
+        _ = write(workspace / "Cargo.toml", 0)
+        old = CargoOutputRoots(workspace, workspace / "target", base / "old-build")
+        new = CargoOutputRoots(workspace, workspace / "target", base / "new-build")
+        unavailable = base / "unavailable"
+        _ = write(unavailable / "Cargo.toml", 0)
+        for path in (old.target_directory, old.build_directory, new.build_directory):
+            path.mkdir()
+        results = iter((old, new))
+
+        def read(checkout: Path) -> CargoOutputRoots | CargoOutputUnavailable:
+            if checkout == unavailable:
+                return CargoOutputUnavailable("the fixture manifest cannot be read")
+            return next(results)
+
+        with (mock.patch.object(Path, "cwd", return_value=workspace),
+              mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read) as metadata):
+            _, first = sweep.discover_cargo_outputs([str(base)], False, lint_settings=conf.read("lint"))
+            config = workspace / ".cargo" / "config.toml"
+            config.parent.mkdir()
+            _ = config.write_text('[build]\nbuild-dir = "' + str(new.build_directory) + '"\n')
+            roots, index = sweep.discover_cargo_outputs([str(base)], True, lint_settings=conf.read("lint"))
+        self.assertEqual(metadata.call_count, 4)
+        self.assertEqual(index.workspaces, (new,))
+        self.assertEqual(index.unresolved, frozenset({str(unavailable)}))
+        self.assertEqual(index.unresolved, first.unresolved)
+        self.assertEqual(index.history, (old,))
+        self.assertEqual(set(roots), {str(old.target_directory), str(old.build_directory), str(new.build_directory)})
+
+    def test_parallel_workspace_reads_keep_the_first_sorted_mapping_without_extra_history(self) -> None:
+        for first_member in ("a", "a/deeper"):
+            with self.subTest(first_member=first_member):
+                base = self.base()
+                workspace = base / "workspace"
+                first = workspace / first_member
+                second = workspace / "z"
+                for path in (first, second):
+                    _ = write(path / "Cargo.toml", 0)
+                first_mapping = CargoOutputRoots(workspace, base / "first-target", base / "first-build")
+                second_mapping = CargoOutputRoots(workspace, base / "second-target", base / "second-build")
+                for mapping in (first_mapping, second_mapping):
+                    mapping.target_directory.mkdir()
+                    mapping.build_directory.mkdir()
+
+                def read(checkout: Path) -> CargoOutputRoots:
+                    return first_mapping if checkout == first else second_mapping
+
+                with (mock.patch.object(Path, "cwd", return_value=base),
+                      mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read)):
+                    roots, index = sweep.discover_cargo_outputs(
+                        [str(first), str(second)], True, lint_settings=conf.read("lint"))
+                self.assertEqual(index.workspaces, (first_mapping,))
+                self.assertEqual(index.history, ())
+                self.assertEqual(index.unresolved, frozenset())
+                self.assertEqual(set(roots), {str(first_mapping.target_directory), str(first_mapping.build_directory)})
+
+    def test_unresolved_workspace_protection_does_not_compare_every_workspace_and_checkout(self) -> None:
+        base = self.base()
+        tree, _ = cargo_target(base, "idle", APP, time.time() - DAY)
+        target = str(tree.parent)
+        mappings = tuple(CargoOutputRoots(base / f"workspace-{number}", base / f"target-{number}",
+                                         base / f"build-{number}") for number in range(32))
+        unresolved = frozenset(str(base / f"unresolved-{number}") for number in range(32))
+        index = sweep.CargoOutputIndex(mappings, unresolved)
+        compared_paths = {item.workspace_root for item in mappings} | {Path(path) for path in unresolved}
+        original = Path.is_relative_to
+        comparisons = 0
+
+        def compare(path: Path, other: Path) -> bool:
+            nonlocal comparisons
+            if other in compared_paths:
+                comparisons += 1
+            return original(path, other)
+
+        with (mock.patch.object(sweep, "discover_cargo_outputs", return_value=([target], index)),
+              mock.patch.object(Path, "is_relative_to", compare),
+              mock.patch.object(sweep, "scan_floor_roots", wraps=sweep.scan_floor_roots) as scan):
+            status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], dry_run=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(list(cast(sweep.DiscoveredTargetRoots, scan.call_args.args[0])), [target])
+        self.assertLessEqual(comparisons, 4 * (len(mappings) + len(unresolved) + 1))
+
+    def test_unresolved_workspace_keeps_its_outputs_busy_and_unrelated_output_idle(self) -> None:
+        base = self.base()
+        tree, _ = cargo_target(base, "workspace", APP, time.time() - DAY)
+        member_tree, _ = cargo_target(base / "workspace", "member", DEMO, time.time() - DAY)
+        build = base / "intermediates"
+        _ = unit(build / "debug", "deps", "app", APP, time.time() - DAY)
+        _ = write(build / sweep.RUSTC_INFO, 0)
+        idle_tree, _ = cargo_target(base, "idle", TOOL, time.time() - DAY)
+        mapping = CargoOutputRoots(base / "workspace", tree.parent, build)
+        targets = [str(path) for path in (tree.parent, member_tree.parent, build, idle_tree.parent)]
+        index = sweep.CargoOutputIndex((mapping,), frozenset({str(base / "workspace" / "member")}))
+        with (mock.patch.object(sweep, "discover_cargo_outputs", return_value=(targets, index)),
+              mock.patch.object(sweep, "scan_floor_roots", wraps=sweep.scan_floor_roots) as scan):
+            status, printed = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], dry_run=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(list(cast(sweep.DiscoveredTargetRoots, scan.call_args.args[0])), [str(idle_tree.parent)])
+        self.assertIn("3 left alone", printed)
+
     def test_floor_fixture_supports_repeated_capacity_reads_during_the_scan(self) -> None:
         base = self.base()
         _, output = cargo_target(base, "repo", APP, time.time() - DAY)
@@ -2638,17 +2856,23 @@ class FloorTests(SweepCase):
 
     def base(self) -> Path:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        config = base / "copies.conf"
+        configured = (Path(__file__).resolve().parents[2] / "config/copies.conf").read_text()
+        _ = config.write_text("\n".join(f"root={base / 'gates'}" if line.startswith("root=") else line
+                                           for line in configured.splitlines()) + "\n")
         self.enterContext(mock.patch.dict(os.environ, {
             sweep.tmp_sweep.STATE_ENV: str(base),
             "BUILDLOG_DIR": str(base / "buildlog"),
             "BUILD_HOLD_DIR": str(base / "build-hold"),
+            "COPIES_CONFIG": str(config),
         }))
         _ = self.enterContext(mock.patch.object(sweep, "output_device", return_value=base.stat().st_dev))
         _ = self.enterContext(mock.patch.object(build_hold, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", return_value={}))
         _ = write_config_fixture(conf.path("lint"),
-                                 f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n")
+                                 f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n"
+                                 + f"sweep_floor_roots={base}\n")
         _ = self.enterContext(mock.patch.object(
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         _ = self.enterContext(mock.patch.object(
@@ -3629,7 +3853,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertIn(f"from {outer}, last used", output)
 
     def locked_floor(self, base: Path, started: float, *, pid: int = 321,
-                     name: str = "floor.lock") -> Path:
+                     name: str = "floor.lock",
+                     command: tuple[str, ...] = ("python3", "sweep.py", "--floor-only")) -> Path:
         """An actual contended flock, with its holder's private process record and config."""
         path = base / name
         guard = sweep.try_lock(str(path))
@@ -3637,24 +3862,43 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.addCleanup(os.close, guard)
         _ = path.write_text(json.dumps({"pid": pid, "started_at": started}))
         proc = base / "proc"
-        fake_process(proc, pid, argv=("python3", "sweep.py", "--floor-only"))
+        fake_process(proc, pid, argv=command)
         config = conf.path("lint")
         _ = write_config_fixture(config, "floor_lock_alert_minutes=7\n")
         _ = self.enterContext(mock.patch.object(sweep, "PROC_DIR", str(proc)))
         _ = self.enterContext(mock.patch.object(sweep, "lock_holder", return_value=pid))
         return path
 
-    def test_overdue_floor_lock_alert_is_once_per_hold_and_repeats_for_a_new_hold_by_the_same_pid(self) -> None:
+    def test_live_sweep_holder_past_the_alert_delay_sends_no_alert(self) -> None:
         base = self.base()
         now = time.time()
         path = self.locked_floor(base, now - 8 * 60)
+        with mock.patch.object(time, "time", return_value=now), mock.patch.object(
+                sweep, "send_floor_alert", return_value=True) as send:
+            sweep.alert_floor_lock(str(path), 2 * GIB, 300 * GIB)
+            send.assert_not_called()
+
+    def test_sweep_script_argument_does_not_suppress_another_holders_alert(self) -> None:
+        base = self.base()
+        now = time.time()
+        path = self.locked_floor(base, now - 8 * 60,
+                                 command=("python3", "other_tool.py", "sweep.py"))
+        with mock.patch.object(time, "time", return_value=now), mock.patch.object(
+                sweep, "send_floor_alert", return_value=True) as send:
+            sweep.alert_floor_lock(str(path), 2 * GIB, 300 * GIB)
+            self.assertEqual(send.call_count, 1)
+
+    def test_overdue_floor_lock_alert_is_once_per_hold_and_repeats_for_a_new_hold_by_the_same_pid(self) -> None:
+        base = self.base()
+        now = time.time()
+        path = self.locked_floor(base, now - 8 * 60, command=("python3", "other_tool.py"))
         with mock.patch.object(time, "time", return_value=now), mock.patch.object(
                 sweep, "send_floor_alert", return_value=True) as send:
             for _ in range(2):
                 self.assertEqual(self.hold(base, 300 * GIB, [2 * GIB])[0], 0)
             self.assertEqual(send.call_count, 1)
             message = cast(str, send.call_args.args[0])
-            for text in ("321", "python3 sweep.py --floor-only", "2.0 GiB", "300.0 GiB"):
+            for text in ("321", "python3 other_tool.py", "2.0 GiB", "300.0 GiB"):
                 self.assertIn(text, message)
             self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
             _ = path.write_text(json.dumps({"pid": 321, "started_at": now - 9 * 60}))
@@ -3698,7 +3942,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
 
     def test_overlapping_waiters_deliver_one_alert_for_the_same_hold(self) -> None:
         base = self.base()
-        path = self.locked_floor(base, time.time() - DAY)
+        path = self.locked_floor(base, time.time() - DAY, command=("python3", "other_tool.py"))
 
         messages = self.overlap_floor_alert(path, lambda: sweep.alert_floor_lock(str(path), 2 * GIB, 300 * GIB))
 
@@ -3712,7 +3956,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_delayed_lock_alert_and_new_measurement_preserve_each_others_records(self) -> None:
         base = self.base()
         now = time.time()
-        path = self.locked_floor(base, now - DAY, name="alert.lock")
+        path = self.locked_floor(base, now - DAY, name="alert.lock", command=("python3", "other_tool.py"))
         record_path = sweep.floor_record_path()
         sweep.write_floor_record(record_path, sweep.FloorRecord(
             now - 100, GIB, 3 * GIB, sweep.DeliveredAlert(now - 80), sweep.DeliveredAlert(now - 70)))
@@ -3737,7 +3981,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_delayed_lock_alert_does_not_replace_a_newer_holds_receipt(self) -> None:
         base = self.base()
         now = time.time()
-        path = self.locked_floor(base, now - 2 * DAY)
+        path = self.locked_floor(base, now - 2 * DAY, command=("python3", "other_tool.py"))
 
         def newer_hold() -> None:
             _ = path.write_text(json.dumps({"pid": 321, "started_at": now - DAY}))
@@ -3753,7 +3997,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_recent_floor_lock_uses_its_start_time_and_the_configured_delay(self) -> None:
         base = self.base()
         now = time.time()
-        path = self.locked_floor(base, now - 6 * 60)
+        path = self.locked_floor(base, now - 6 * 60, command=("python3", "other_tool.py"))
         os.utime(path, (now - 10 * DAY, now - 10 * DAY))
         with mock.patch.object(time, "time", return_value=now), mock.patch.object(
                 sweep, "send_floor_alert", return_value=True) as send:
@@ -3767,7 +4011,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_failed_floor_lock_alert_is_retried_and_unreadable_holders_do_not_alert(self) -> None:
         base = self.base()
         now = time.time()
-        path = self.locked_floor(base, now - DAY)
+        path = self.locked_floor(base, now - DAY, command=("python3", "other_tool.py"))
         with mock.patch.object(time, "time", return_value=now), mock.patch.object(
                 sweep, "send_floor_alert", side_effect=[False, True]) as send:
             self.assertEqual(self.hold(base, 300 * GIB, [2 * GIB])[0], 0)
@@ -3785,7 +4029,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
 
     def test_lock_contention_above_the_floor_and_dry_runs_send_no_lock_alert(self) -> None:
         base = self.base()
-        _ = self.locked_floor(base, time.time() - DAY)
+        _ = self.locked_floor(base, time.time() - DAY, command=("python3", "other_tool.py"))
         with mock.patch.object(sweep, "send_floor_alert") as send:
             self.assertEqual(self.hold(base, 300 * GIB, [301 * GIB])[0], 0)
             self.assertEqual(self.hold(base, 300 * GIB, [2 * GIB, 2 * GIB], dry_run=True)[0], 0)

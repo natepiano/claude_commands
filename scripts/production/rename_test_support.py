@@ -20,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.astra import design_roles
 from scripts.direct import workers
-from scripts.production import staff, unit_config
+from scripts.astra.design_role_test_support import designer_fixture
+from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
 import fake_herdr
@@ -28,6 +29,7 @@ import herdr
 from scripts.shutdown import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
+import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 import merge_checkpoint
 from scripts.production.production_doc import Production, read_production
@@ -42,6 +44,72 @@ from cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
+
+
+class RenameDisplays:
+    """Keep private display state while the real retitle methods run."""
+
+    def __init__(self, row: staff.StaffRow, *, live: bool = True, backend: str = "claude") -> None:
+        self.row: staff.StaffRow = row
+        self.live: bool = live
+        self.backend: str = backend
+        self.pane: str = "previous"
+        self.tab: str = "previous"
+        self.workspace: str = "previous"
+        self.commands: list[tuple[str, ...]] = []
+
+    def listed(self, kind: str, *_arguments: str, **_keywords: object) -> list[dict[str, object]]:
+        if kind == "pane":
+            return ([{"pane_id": "probe-pane", "tab_id": "probe-tab", "workspace_id": "probe-space",
+                      "terminal_id": "probe-terminal", "label": self.pane,
+                      "agent_session": {"value": self.row.current_session}}] if self.live else [])
+        if kind == "tab":
+            return [{"tab_id": "probe-tab", "workspace_id": "probe-space", "label": self.tab}]
+        if kind == "workspace":
+            return [{"workspace_id": "probe-space", "label": self.workspace}]
+        raise AssertionError(f"unexpected listing: {kind}")
+
+    def run(self, *arguments: str, **_keywords: object) -> str:
+        self.commands.append(arguments)
+        if len(arguments) == 4 and arguments[1] == "rename":
+            if arguments[0] == "pane":
+                self.pane = arguments[3]
+            elif arguments[0] == "tab":
+                self.tab = arguments[3]
+            elif arguments[0] == "workspace":
+                self.workspace = arguments[3]
+            else:
+                raise AssertionError(arguments)
+            return ""
+        raise AssertionError(arguments)
+
+    def result(self, *arguments: str, **_keywords: object) -> dict[str, object]:
+        if arguments[:2] != ("pane", "process-info"):
+            raise AssertionError(arguments)
+        return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": 998041,
+                "foreground_processes": [{"pid": 998041, "name": self.backend, "argv": [self.backend]}]}}
+
+    def native_result(self, arguments: list[str], **_keywords: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(arguments, 0, json.dumps({"result": self.result(*arguments[3:])}), "")
+
+    @contextmanager
+    def installed(self) -> Generator[None]:
+        """Replace backend reads and writes, and retain the real retitle behavior."""
+        from scripts.herdr import herdr
+
+        with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              mock.patch.object(herdr.Herdr, "listed", side_effect=self.listed),
+              mock.patch.object(herdr.Herdr, "run", side_effect=self.run),
+              mock.patch.object(herdr.Herdr, "result", side_effect=self.result),
+              mock.patch.object(herdr, "run_program", side_effect=self.native_result),
+              mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.RolloutThread(self.row.current_session) if self.backend == "codex" else
+                  herdr.EnvironmentThread(self.row.current_session), "probe-generation", {})),
+              mock.patch.object(herdr, "_LayoutLock"),
+              mock.patch.object(herdr.Herdr, "order_tabs", return_value=False),
+              mock.patch.object(herdr.Herdr, "save_layout")):
+            yield
+
 
 
 class FolderMoveBackend:
@@ -60,11 +128,21 @@ class FolderMoveBackend:
         self.config: Path = fixture.root / "home" / (".claude4" if kind == "claude" else ".codex2")
 
     def publish_process_state(self) -> None:
-        """Expose the private process and an empty rollout descriptor directory."""
-        process = self.fixture.root / "folder-processes" / str(self.pid)
-        (process / "fd").mkdir(parents=True, exist_ok=True)
+        """Expose the process generation and its current Codex rollout."""
+        environment = {"HERDR_PROC": str(self.fixture.root / "folder-processes")}
+        fake_unit_host.process(environment, self.shell_pid, 1, ["zsh"], {}, cwd=self.cwd)
         arguments = [self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]
-        _ = (process / "cmdline").write_bytes("\0".join(arguments).encode() + b"\0" if self.live else b"")
+        fake_unit_host.process(environment, self.pid, self.shell_pid if self.live else 1, arguments if self.live else [],
+                               self.environment(self.pid), cwd=self.cwd)
+        process = Path(environment["HERDR_PROC"]) / str(self.pid)
+        descriptors = process / "fd"
+        descriptors.mkdir(exist_ok=True)
+        descriptor = descriptors / "4"
+        descriptor.unlink(missing_ok=True)
+        if self.live and self.kind == "codex":
+            record = self.fixture.root / "rollout-folder-current.jsonl"
+            _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.fixture.owner.current_session}}) + "\n")
+            descriptor.symlink_to(record)
 
     def panes(self) -> list[herdr.PaneIdentity]:
         return [
@@ -91,9 +169,10 @@ class FolderMoveBackend:
 
     def result(self, *arguments: str) -> dict[str, object]:
         self.fixture.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
-        argv = [self.kind] if self.live else [sys.executable, "/fixture/accounts.py", "exec", self.config.name]
-        foreground: list[dict[str, object]] = [{"pid": self.pid, "argv": argv, "cwd": str(self.cwd)}]
+        argv = ([self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]) if self.live else ["zsh"]
+        foreground: list[dict[str, object]] = [{"pid": self.pid if self.live else self.shell_pid, "argv": argv, "cwd": str(self.cwd)}]
         return {"process_info": {"shell_pid": self.shell_pid, "cwd": str(self.cwd),
+                                 "foreground_process_group_id": self.pid if self.live else self.shell_pid,
                                  "foreground_processes": foreground}}
 
     def run_in_pane(self, pane: str, command: list[str]) -> None:
@@ -125,7 +204,7 @@ class FolderMoveFixture(StaffTestCase):
     history: Path = Path()
     records: Path = Path()
     owner: staff.StaffRow = staff.StaffRow(
-        staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "unit", "fixture", None,
+        staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "unit", "fixture", staff.StaffRoot(),
         current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
 
     @override
@@ -174,14 +253,12 @@ class FolderMoveFixture(StaffTestCase):
             str(self.root / "neighbour"), {}, ["claude", "-n", "neighbour"])
         pane_record.write("agents", sibling)
         fields: dict[str, object] = {
-            "run_id": "move-run", "working_dir": str(self.old_folder), "worktree": self.old_folder.name,
-            "branch": "unit-branch", "plan_doc": str(self.old_folder / "plan.md"),
+            "run_id": "move-run", "main_agent": {"session_id": self.owner.current_session},
+            "branch": "unit-branch", "plan_doc": "plan.md",
             "history_file": str(self.history), "status": "active", "production": "production", "unit": "kept-name",
         }
         write_text_atomic(self.history, json.dumps({**fields, "event_type": "run_started", "run_started_at": 1}) + "\n")
         write_text_atomic(self.run_dir / STATE_FILENAME, json.dumps(fields) + "\n")
-        write_text_atomic(self.run_dir / "working_dir", str(self.old_folder) + "\n")
-        write_text_atomic(self.run_dir / "director", self.owner.current_session + "\n")
 
     def folder_git(self, checkout: Path, *arguments: str) -> str:
         result = subprocess.run(["git", "-C", str(checkout), *arguments],
@@ -193,7 +270,7 @@ class FolderMoveFixture(StaffTestCase):
         backend = FolderMoveBackend(self, kind, live)
         backend.publish_process_state()
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(
-            os.environ, {"HERDR_PROC": str(self.root / "folder-processes")})))
+            os.environ, {"HERDR_PROC": str(self.root / "folder-processes"), "SHUTDOWN_PROOF_WORKSPACE": "w1"})))
         account_key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
         launch = pane_record.launch("w1:p1", self.owner.id, str(self.old_folder),
             {account_key: str(backend.config)}, [kind, "-n", "kept-name", "--model", "opus"], kind=kind)
@@ -209,6 +286,11 @@ class FolderMoveFixture(StaffTestCase):
             self.assertEqual((pid, started), (backend.pid, "fixture-start"))
             return sessions.LiveSessionProcess(pid) if backend.live else sessions.SessionNotLive()
 
+        def stop_process_liveness(pid: int, started: str) -> stop_sessions.LiveSessionProcess | stop_sessions.SessionNotLive:
+            self.assertEqual((pid, started), (backend.pid, "fixture-start"))
+            return (stop_sessions.LiveSessionProcess(pid) if backend.live
+                    else stop_sessions.SessionNotLive())
+
         def signal_process(pid: int, signal: int) -> None:
             import signal as signals
 
@@ -221,11 +303,15 @@ class FolderMoveFixture(StaffTestCase):
 
         for target, attribute, replacement in (
             (herdr, "Herdr", mock.Mock(return_value=backend)),
+            (herdr, "shared_session", mock.Mock(return_value="agents")),
+            (pane_record, "seed", mock.Mock(return_value=0)),
             (herdr, "herdr_processes", backend.observed_processes),
             (herdr, "process_environment", backend.environment),
             (sessions, "session_liveness", session_liveness),
             (sessions, "process_liveness", process_liveness),
             (sessions, "process_start", mock.Mock(return_value="fixture-start")),
+            (stop_sessions, "process_liveness", stop_process_liveness),
+            (stop_sessions, "process_start", mock.Mock(return_value="fixture-start")),
             (staff, "runtime_id", mock.Mock(return_value=self.owner.current_session)),
             (os, "kill", signal_process),
         ):
@@ -380,7 +466,7 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
         # Failure injection scripts assign these names just as they do in a CLI
         # subprocess. Each call restores them before another test can observe it.
         for module, names in ((os, ("rename", "replace")),
-                              (workers, ("move_unit", "rename_unit", "end_unit", "repoint_unit_worktree"))):
+                              (workers, ("end_unit",))):
             for name in names:
                 _ = scope.enter_context(mock.patch.object(module, name, cast(object, getattr(module, name))))
 
@@ -419,6 +505,10 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     environment.update(STAFF_FILE=str(case.staff_file), STAFF_TEST_OWNER_FILE=str(case.staff_file))
     _ = case.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
     _ = case.enterContext(isolated_source_readers())
+    roots = tuple(Path(root) for root in environment.get(
+        "PROGRESS_SESSION_ROOTS", environment.get("UNIT_RUN_ROOT", str(case.root / "runs"))).split(":"))
+    _ = case.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", roots))
+    _ = case.enterContext(mock.patch("progress_history.SESSION_ROOTS", roots))
     for name, attribute, reader in (
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
         ("unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),
@@ -714,26 +804,28 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
 
-    def held_design(self, repository_id: str, checkout: Path, holder: design_roles.Holder) -> design_roles.HeldDesign:
-        """A design `holder` holds, with an open designer whose roster entry runs in `checkout`."""
+    def held_design(self, repository_id: str, checkout: Path) -> design_roles.HeldDesign:
+        """Save an open design with a private checkout."""
         with mock.patch.dict(os.environ, self.env):
-            design_roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
+            design_roles.register_repository(repository_id, {"fixture-host": str(checkout)})
             placement = design_roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
                                                             "host": "fixture-host", "request_id": repository_id})
+            parent = staff.snapshot().by_worktree("natedev", checkout) or staff.by_path(OLD)
+            assert parent is not None
+            row = designer_fixture(parent.id, f"old-{repository_id}-astra-designer", self.root / "codex-home")
+            self.env["CODEX_HOME"] = str(self.root / "codex-home")
             design = design_roles.HeldDesign(
                 design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
-                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", holder, design_roles.DesignUnbound(),
-                (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen("designer-thread")),
+                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", design_roles.DesignUnbound(),
+                (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen(row.id)),
                  design_roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", design_roles.RoleNotOpened())))
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             self.write(design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json", json.dumps(
-                {design.roles[0].name: {"thread_id": "designer-thread", "status": "done", "cwd": str(checkout)}}))
+                {design.roles[0].name: {"staff_id": row.id, "status": "done"}}))
         return design
 
     def read_held(self, design: design_roles.HeldDesign) -> tuple[design_roles.HeldDesign, str]:
-        """The design as saved now, and its designer's launch directory."""
+        """Read the current design and its repository."""
         with mock.patch.dict(os.environ, self.env):
             current = design_roles.read_design(design.placement.design_id)
-            roster = cast(dict[str, dict[str, str]], json.loads(
-                (design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
-        return current, roster[design.roles[0].name]["cwd"]
+        return current, current.repository

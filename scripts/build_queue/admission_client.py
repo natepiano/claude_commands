@@ -27,6 +27,11 @@ from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit as gate
 
 if TYPE_CHECKING:
+    from scripts.buildlog import store
+else:
+    import store
+
+if TYPE_CHECKING:
     from scripts.lib import conf
 else:
     import conf
@@ -49,6 +54,10 @@ class TransportUnavailable(ConnectionError):
 
 
 class CheckerFailure(ValueError):
+    pass
+
+
+class _QueueUnreachable(Exception):
     pass
 
 
@@ -193,6 +202,7 @@ class AcquisitionRetry:
     next_leave: float = float("inf")
     last_outage_line: float = float("-inf")
     leave_interval: float = float("inf")
+    unreachable_deadline: float = float("inf")
 
     def start_leave_schedule(self, interval: float) -> None:
         self.leave_interval = interval
@@ -203,11 +213,13 @@ class AcquisitionRetry:
     def left_queue(self) -> bool:
         if CLOCK.monotonic() < self.next_leave:
             return False
+        left = _leave_queue()
         self.next_leave = CLOCK.monotonic() + self.leave_interval
-        return _leave_queue()
+        return left
 
     def bound(self, seconds: float) -> float:
-        return max(0.0, min(seconds, self.deadline - CLOCK.monotonic(), self.next_leave - CLOCK.monotonic()))
+        return max(0.0, min(seconds, self.deadline - CLOCK.monotonic(),
+                            self.next_leave - CLOCK.monotonic(), self.unreachable_deadline - CLOCK.monotonic()))
 
 
 _ACQUISITION_RETRY: ContextVar[AcquisitionRetry | None] = ContextVar("acquisition_retry", default=None)
@@ -245,6 +257,7 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
     acquisition = isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
+    owns_retry = retry is None
     if retry is None:
         limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
         launch = isinstance(request, wire.LaunchRequest)
@@ -261,6 +274,10 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         return reply
     except _QueueLeft:
         return LeftQueue()
+    except _QueueUnreachable as error:
+        if not owns_retry:
+            raise
+        return _refused(str(error))
     except conf.Unusable as error:
         return _refused(str(error), checker=True)
     finally:
@@ -277,7 +294,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     leave_interval = (configuration.running_pass_seconds if isinstance(configuration, gate.MemoryConfig)
                       else configuration.reconnect_seconds)
     generation_query = isinstance(first, wire.BuildHistoryRequest)
-    if generation_query:
+    # The caller can hold a lease before the service accepts a connection.
+    if isinstance(first, (wire.AdmitRequest, wire.LaunchRequest, wire.BuildHistoryRequest)):
         retry.start_leave_schedule(leave_interval)
     launch = isinstance(first, wire.LaunchRequest)
     failure_limit = _whole_seconds("BUILDLOG_MEM_CHECK_RETRY_S", 60)
@@ -292,6 +310,11 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
             return LeftQueue()
         if CLOCK.monotonic() >= retry.deadline:
             return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+        if CLOCK.monotonic() >= retry.unreachable_deadline:
+            assert isinstance(configuration, gate.MemoryConfig)
+            duration = _unreachable_duration(configuration.unreachable_limit_seconds)
+            reason = f"build queue unreachable for {duration}; step stopped; cargo token given back"
+            raise _QueueUnreachable(reason)
         attempt()
         try:
             timeout = configuration.silence_seconds
@@ -300,6 +323,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
             timeout = retry.bound(timeout)
             active_channel, channel = channel, None
             with nullcontext(active_channel.connection) if active_channel is not None else _connect(timeout) as connection:
+                retry.unreachable_deadline = float("inf")
                 send_timeout = retry.bound(timeout)
                 if active_channel is not None or send_timeout < timeout:
                     connection.settimeout(send_timeout)
@@ -375,7 +399,6 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         raise CheckerFailure(reply.reason.reason)
                     if launch and retry.launch_without_wait:
                         return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
-                    retry.start_leave_schedule(leave_interval)
                     had_wait = True
                     failed_since = None
                     last_valid = CLOCK.monotonic()
@@ -393,7 +416,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                             request = replace(_refreshed(first, refresh, channel=EstimateConnection(connection, pending)),
                                               code_version=LOADED_ADMISSION_CODE_VERSION)
                             refresh_pending = False
-                        except (_QueueLeft, OSError, TransportUnavailable):
+                        except (_QueueLeft, _QueueUnreachable, OSError, TransportUnavailable):
                             raise
                         except Exception as error:
                             raise CheckerFailure(str(error)) from error
@@ -424,7 +447,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     request = replace(_refreshed(first, refresh), code_version=LOADED_ADMISSION_CODE_VERSION)
                     refresh_pending = False
                     break
-                except _QueueLeft:
+                except (_QueueLeft, _QueueUnreachable):
                     raise
                 except Exception as refresh_error:
                     reason = str(refresh_error) or "checker returned an error"
@@ -436,11 +459,22 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     print("admission service restarted; waiting again", file=sys.stderr)
                     restarted = True
                 continue
+            if (isinstance(first, (wire.AdmitRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
+                    and isinstance(configuration, gate.MemoryConfig)
+                    and isinstance(error, (FileNotFoundError, ConnectionRefusedError))
+                    and retry.unreachable_deadline == float("inf")):
+                retry.unreachable_deadline = CLOCK.monotonic() + configuration.unreachable_limit_seconds
+                duration = _unreachable_duration(configuration.unreachable_limit_seconds)
+                print(f"build queue not reachable; trying for {duration}", file=sys.stderr)
             if CLOCK.monotonic() - retry.last_outage_line >= (configuration.outage_notice_seconds if isinstance(configuration, gate.MemoryConfig) else configuration.silence_seconds):
                 reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused" if isinstance(error, ConnectionRefusedError) else str(error)
                 print(f"admission service unavailable: {reason}; waiting again", file=sys.stderr)
                 retry.last_outage_line = CLOCK.monotonic()
             CLOCK.sleep(retry.bound(configuration.reconnect_seconds))
+
+
+def _unreachable_duration(seconds: float) -> str:
+    return f"{seconds / 60:g} min" if seconds % 60 == 0 else f"{seconds:g} s"
 
 
 def admit(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None],
@@ -601,7 +635,7 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
                  ) -> wire.AdmitRequest:
     config = gate.read_memory_config()
     estimate = gate.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
-                                  gate.store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
+                                  store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
                                   budget=gate.resolve_admission_limits(gate.UnknownHostTotal(), config).budget,
                                   build_history_generation=lambda: build_history_generation(config))
     width_value = gate.test_threads(argv)
@@ -728,7 +762,7 @@ def main(argv: list[str] | None = None) -> int:
             def refresh() -> wire.AdmitRequest:
                 try:
                     request = step_request(step_argv, os.getcwd(), owner, since, args.sidecar, episode, run=run)
-                except _QueueLeft:
+                except (_QueueLeft, _QueueUnreachable):
                     raise
                 except Exception as error:
                     raise CheckerFailure(str(error)) from error
@@ -774,6 +808,9 @@ def main(argv: list[str] | None = None) -> int:
             _ = args.shell_state.write_text("BUILDLOG_MEM_OUTCOME=LeftQueue\nBUILDLOG_MEM_WAIT_S="
                 + str(output.elapsed_seconds()) + "\n")
         return 75
+    except _QueueUnreachable as error:
+        _ = _refused(str(error))
+        return 2
     except wire.AdmissionUnavailable as error:
         print(f"admission service unavailable: {error.reason}", file=sys.stderr)
         return 2

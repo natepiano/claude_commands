@@ -292,12 +292,16 @@ def _open_session_guidance(style: StyleProduction, reason: str) -> str:
     )
 
 
-def _attach(style: StyleProduction) -> None:
+def _attach_parent(style: StyleProduction) -> None:
     current_parent = showrunner_tree.parent_of(style.slug)
     if current_parent != style.parent.slug:
         if current_parent:
             _run_script(SHOWRUNNERS, "detach", style.slug)
         _run_script(SHOWRUNNERS, "attach", style.slug, style.parent.slug)
+
+
+def _attach(style: StyleProduction) -> None:
+    _attach_parent(style)
     _update_destination(style)
     _run_script(SCRIPTS / "style/style_sync.py", "resume", "--repo", str(style.checkout),
                 "--slug", style.slug, "--branch-point", style.branch_point,
@@ -401,6 +405,7 @@ def main(argv: list[str]) -> int:
             return result.returncode
         if result.returncode:
             raise Refusal(f"{LAUNCHER.name} exited {result.returncode}; rerun add_style to continue")
+        _attach_parent(style)
         return 0
     except (Refusal, rules.RuleValidationError, style_ledger.LedgerError, OSError, ValueError, sqlite3.Error) as error:
         print("add_style: " + " ".join(str(error).splitlines()), file=sys.stderr)

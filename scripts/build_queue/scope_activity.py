@@ -33,6 +33,21 @@ class EmptyBuildScope:
 
 
 @dataclass(frozen=True)
+class NotServiceSlice:
+    pass
+
+
+@dataclass(frozen=True)
+class IdleService:
+    pass
+
+
+@dataclass(frozen=True)
+class RunningServiceJob:
+    started_at: float
+
+
+@dataclass(frozen=True)
 class ScopeProcesses:
     count: int
     session_id: str

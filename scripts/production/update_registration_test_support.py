@@ -129,7 +129,7 @@ class RegistrationFixture(unittest.TestCase):
         self.config = self.root / "showrunners.json"
         self.doc = self.checkout / "docs/plans/example-production.md"
         bin_dir = self.root / "bin"
-        self.env = {**os.environ, "HOME": str(self.home), "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        self.env = {**os.environ, "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles", "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),

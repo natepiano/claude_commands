@@ -112,8 +112,10 @@ class MacIdleTests(unittest.TestCase):
         cwd.symlink_to(self.root)
 
     def rows(self) -> list[dict[str, object]]:
-        return [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
-                for line in path.read_text().splitlines()]
+        """Read Mac idle cases from the shared build log."""
+        records = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
+                   for line in path.read_text().splitlines()]
+        return [row for row in records if row.get("kind") == "mac_idle"]
 
     def two_passes(self) -> None:
         mac_idle.watch_once(self.paths, 1180, 100)

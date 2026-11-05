@@ -92,19 +92,22 @@ class UnitStatusFixture(unittest.TestCase):
         copy_session_modules(message)
         (root / "config").mkdir()
         _ = shutil.copy2(SCRIPT.parents[2] / "config/session_retries.toml", root / "config/session_retries.toml")
+        _ = shutil.copy2(SCRIPT.parents[2] / "config/staff.conf", root / "config/staff.conf")
         _write_executable(message / "notifier.sh", 'print -r -- "$*" >> "$NOTIFIER_CALL_LOG"\nprint -r -- "$NOTIFIER_HEALTH_TEXT"\nexit "$NOTIFIER_HEALTH_EXIT"\n')
         hooks = root / "scripts/hooks"
         hooks.mkdir()
         _ = (hooks / "direct_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
         for name in ("production_doc.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py", "unit_config.py"):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
+        (root / "scripts/agents").mkdir()
+        _ = shutil.copy2(SCRIPT.parents[1] / "agents/worker_lifecycle.py", root / "scripts/agents/worker_lifecycle.py")
         (root / "scripts/herdr").mkdir()
         for name in ("herdr.py", "place.py", "pane_launch.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
         (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
-        for name in ("atomic_file.py", "git_exclude.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py", "script_envelope.py"):
+        for name in ("agent_scope.py", "script_envelope.py", "atomic_file.py", "conf.py", "git_exclude.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, root / "scripts/lib" / name)
         for name in ("active", "sessions"):
             (root / name).mkdir()
@@ -221,8 +224,9 @@ class UnitStatusFixture(unittest.TestCase):
                         fake_unit_host.place_process(environment, pids[unit.session], unit.pane)
                 result = subprocess.run(
                     [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", str(production_doc)],
-                    check=True, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
+                    check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
                 )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "")
                 outputs.append(result.stdout)
             calls = call_log.read_text(encoding="utf-8") if call_log.exists() else None

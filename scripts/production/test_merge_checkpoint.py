@@ -8,10 +8,12 @@ from scripts.production import staff
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
 from typing import cast, final
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -30,6 +32,82 @@ from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixt
 
 def setUpModule() -> None:
     configure_test_environment()
+
+
+class CheckpointTestFolderTests(unittest.TestCase):
+    def test_package_step_uses_the_manifest_name_and_package_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            package = checkout / "scripts/aws_target/proof_crate"
+            package.mkdir(parents=True)
+            _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
+            production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+                                                  checkout / "production.log", ZoneInfo("UTC"))
+            steps = merge_checkpoint.test_steps(production, ("scripts/aws_target/proof_crate/src/lib.rs",), ())
+            self.assertEqual(len(steps), 1)
+            self.assertEqual(steps[0].label, "package aws-routing-proof")
+            self.assertEqual(steps[0].command[-2:], ["test", "aws-routing-proof"])
+            self.assertEqual(steps[0].folder, package)
+
+    def test_example_step_uses_the_manifest_name_and_checkout_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            package = checkout / "crates/proof_crate"
+            package.mkdir(parents=True)
+            _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
+            production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+                                                  checkout / "production.log", ZoneInfo("UTC"))
+            steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
+            self.assertEqual(len(steps), 2)
+            self.assertEqual(steps[1].label, "example aws-routing-proof/demo")
+            self.assertEqual(steps[1].command[-3:], ["example", "aws-routing-proof", "demo"])
+            self.assertEqual(steps[1].folder, checkout)
+
+    def test_example_without_a_manifest_has_no_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            _ = (checkout / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
+            production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+                                                  checkout / "production.log", ZoneInfo("UTC"))
+            steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
+            self.assertEqual(steps, [])
+
+    def test_package_commands_and_retries_use_the_package_folder(self) -> None:
+        for workspace in (False, True):
+            for retry in (False, True):
+                with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory() as temporary:
+                    checkout = Path(temporary)
+                    relative = ("crates/proof_crate/examples/demo.rs" if workspace
+                                else "scripts/aws_target/proof_crate/src/lib.rs")
+                    package = checkout / Path(relative).parents[1]
+                    source = checkout / relative
+                    source.parent.mkdir(parents=True)
+                    _ = source.write_text("fn main() {}\n" if workspace else "pub fn proof() {}\n")
+                    _ = (package / "Cargo.toml").write_text('[package]\nname = "proof_crate"\nversion = "0.1.0"\n')
+                    if workspace:
+                        _ = (checkout / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/proof_crate"]\n')
+                    verify = checkout / "verify.sh"
+                    _ = verify.write_text(
+                        f"#!{sys.executable}\nfrom pathlib import Path\nimport sys\n"
+                        + "print(f'{sys.argv[1]}={Path.cwd()}')\n"
+                        + ("if sys.argv[1] == 'test' and not Path('retried').exists():\n"
+                           + "    Path('retried').touch()\n    sys.exit(1)\n" if retry else ""))
+                    verify.chmod(0o755)
+                    production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+                                                          checkout / "production.log", ZoneInfo("UTC"))
+                    log = checkout / "test.log"
+                    merge_tests = ((sys.executable, "-c", "from pathlib import Path; print(f'merge={Path.cwd()}')"),)
+                    with mock.patch.dict(os.environ, {"MERGE_CHECKPOINT_VERIFY": str(verify)}):
+                        _ = merge_checkpoint.run_checkpoint_test_steps(
+                            production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log)
+                    output = log.read_text()
+                    self.assertEqual(output.count(f"test={package}\n"), 2 if retry else 1)
+                    self.assertIn("package_proof_crate_EXIT=" + ("1" if retry else "0"), output)
+                    if retry:
+                        self.assertIn("package_proof_crate_RERUN_EXIT=0", output)
+                    if workspace:
+                        self.assertIn(f"example={checkout}\n", output)
+                    self.assertIn(f"merge={checkout}\n", output)
 
 
 class ReviewNumbersTests(unittest.TestCase):

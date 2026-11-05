@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.lib import build_folders
 from scripts.production import change_review  # noqa: E402
+from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
@@ -261,10 +262,6 @@ class SampledRSSAdmission:
         # include this finished job, which conservatively delays admission.
         _ = self.job_memory_mib.pop(pid, 0.0)
         _ = self.reservations_mib.pop(pid, 0.0)
-
-
-class GateRefused(Exception):
-    """A gate precondition or operation failed; no later step may run."""
 
 
 @dataclass(frozen=True)
@@ -634,12 +631,6 @@ def one_minute_load() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
 
-def test_module_name(repo: Path, suite: str, path: Path) -> str:
-    """Name a module by its path within its suite; standalone jobs keep their file name."""
-    root = repo / "scripts" / suite
-    return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
-
-
 def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
                  repo: Path) -> list[tuple[str, Path]]:
     """`modules` in start order: modules with no recorded time first, then the slowest recorded first."""
@@ -877,20 +868,6 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
     if len(selection.modules) <= 10:
         print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
     print(f"Tree-scanning modules: {len(selection.tree_scanners)} (always affected)", flush=True)
-
-
-def discover_test_modules(repo: Path) -> list[tuple[str, Path]]:
-    """Find modules in path order; each suite is the first folder under scripts."""
-    scripts = repo / "scripts"
-    modules: list[tuple[str, Path]] = []
-    for path in sorted(scripts.rglob("test_*.py")):
-        relative = path.relative_to(scripts)
-        if not path.is_file() or "__pycache__" in relative.parts:
-            continue
-        if len(relative.parts) == 1:
-            raise GateRefused(f"test module must be in a suite folder under scripts/: {relative}")
-        modules.append((relative.parts[0], path))
-    return modules
 
 
 def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult],

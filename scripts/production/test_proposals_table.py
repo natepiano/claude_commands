@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import issues
 import proposals_folder
 import proposals_table
-from scripts.production import session_staff, showrunners, staff
+from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner
 import showrunner_tree
 from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
@@ -44,7 +44,7 @@ class ProposalsTableTests(StaffTestCase):
     def runs_of(self, runs: dict[Path, list[Path]]) -> Generator[None]:
         """Give each plan path the run files named for it, and every other path none."""
         def plan_runs(plan: Path, *,
-                      record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> list[Path]:
+                      record: staff.StaffSnapshot | None = None) -> list[Path]:
             del record
             return runs.get(plan, [])
         with mock.patch.object(plan_history, "plan_runs", side_effect=plan_runs):
@@ -118,6 +118,7 @@ class ProposalsTableTests(StaffTestCase):
                          ["unscored", "blocking", "high score", "low score"])
         self.assertEqual(proposals_table.issue_rows(found)[1].state, f"{REVIEW_STATE} · blocks")
         doc = self.write("trunk/docs/plans/demo-production.md", f"- **Proposals:** `{self.root / 'issues'}`\n")
+        _ = recorded_showrunner("demo", doc)
         with mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")}), \
                 mock.patch.object(proposals_table, "owners", return_value=frozenset({"organon-unit"})):
             self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines()[0], "unscored")
@@ -300,6 +301,7 @@ class ProposalsTableTests(StaffTestCase):
 
     def test_main_says_so_when_nothing_is_open(self) -> None:
         doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n")
+        _ = recorded_showrunner("footers", doc)
         with mock.patch.object(phase_table, "show_production", return_value="{}"):
             self.assertEqual(self.run_main(["--production", str(doc)]), (0, "no open proposals\n", ""))
 

@@ -245,6 +245,9 @@ class HerdrSessionsTests(unittest.TestCase):
         self.process(101, 100, ["codex", "resume", unit.id], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build",
                                                 "SHOWRUNNER_UNIT_ID": "one", "CODEX_THREAD_ID": unit.id})
         (self.proc / "101" / "fd").mkdir()
+        rollout = self.root / ("rollout-" + str(unit.current_session) + ".jsonl")
+        _ = rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": unit.current_session}}) + "\n")
+        (self.proc / "101/fd/4").symlink_to(rollout)
         with patch.object(runtime_sessions, "process_start", return_value="fixture-codex-start"):
             self.assertEqual(self.call("list"), (0, "unit\tunit build/one\t\n", ""))
 
@@ -541,6 +544,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.responses_path = self.root / "responses"
         home = self.root / "home"
         home.mkdir()
+        (home / ".claude/sessions").mkdir(parents=True)
         self.enterContext(patch.dict(os.environ, {
             "HOME": str(home), "XDG_CONFIG_HOME": str(self.root / "config"), "PATH": os.environ.get("PATH", os.defpath),
             "HERDR_BIN": str(Path(__file__).with_name("fake_herdr.py")),
@@ -552,7 +556,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         configuration = self.enterContext(scratch_accounts_config())
         _ = (configuration / "script_prompts.conf").write_text(
             (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {"CLAUDE_CONFIG_DIR": ""}))
         self.responses = {"default": {"stdout": json.dumps({"result": {
             "workspaces": [], "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": [], "panes": [],
         }}), "code": 0}}
@@ -724,7 +728,7 @@ class StandaloneLaunchTests(unittest.TestCase):
                                         "foreground_processes": [{"pid": 101, "name": "claude", "argv": ["claude"]}]}}}))
         def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (101, "claude"))
-            return herdr.NativeAgentProcess("recorded-id", "fixture-start", {})
+            return herdr.NativeAgentProcess(herdr.RolloutThread("recorded-id"), "fixture-start", {})
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=native_process))
         self.responses["--session agents agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
             "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))

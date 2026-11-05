@@ -186,7 +186,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def move_parent(self, child: str, parent: str = "") -> None:
         rows = {row.name: row.id for row in staff.find(kind="showrunner")}
-        _ = staff.move(rows[child], rows[parent] if parent else None)
+        _ = staff.move(rows[child], staff.ReportsTo(rows[parent]) if parent else staff.StaffRoot())
 
     def staff_launch(self, row: staff.StaffRow, session: str, *,
                      pane: str = "unit", at: str = "2026-10-31T10:00:00+00:00") -> None:
@@ -496,7 +496,7 @@ class BoardJsonTests(unittest.TestCase):
         other = self.unit_member(second.slug)
         _ = staff.rename(other.id, "unrelated")
         _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", second.worktree), expected=other.worktree)
-        moved = staff.move(unit.id, second_parent.id)
+        moved = staff.move(unit.id, staff.ReportsTo(second_parent.id))
         self.staff_launch(moved, moved.id, pane="newer")
 
         _, documents = self.generate("--session", moved.id)
@@ -521,7 +521,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_missing_staff_id_and_launch_records_have_no_showrunner_board(self) -> None:
         _ = self.production(running=False)
-        missing = staff.StaffRow(staff.native_id(fixture_runtime_id("absent-board-unit")), "unit", "alpha", None, current_session=staff.native_id(fixture_runtime_id("absent-board-unit")))
+        missing = staff.StaffRow(staff.native_id(fixture_runtime_id("absent-board-unit")), "unit", "alpha", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("absent-board-unit")))
         self.staff_launch(missing, missing.id, pane="missing")
 
         for session in ("no-launch-session", missing.id):
@@ -532,7 +532,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_unit_without_a_showrunner_ancestor_has_no_board(self) -> None:
         _ = self.production(running=False)
-        orphan = staff.StaffRow(staff.native_id(fixture_runtime_id("orphan-board-unit")), "unit", "orphan", None, current_session=staff.native_id(fixture_runtime_id("orphan-board-unit")))
+        orphan = staff.StaffRow(staff.native_id(fixture_runtime_id("orphan-board-unit")), "unit", "orphan", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("orphan-board-unit")))
         self.staff_launch(orphan, orphan.id)
         # The writer forbids orphan units; pin the reader's defensive boundary
         # with the same snapshot shape should an incomplete ancestry reach it.

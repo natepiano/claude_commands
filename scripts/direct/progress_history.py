@@ -442,7 +442,7 @@ def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> di
         record = staff.initial_snapshot()
         row = record.by_member_reference(session_id)
         if row is not None and row.kind == "worker":
-            row = record.by_id(row.parent) if row.parent else None
+            row = record.parent_of(row)
         unit_owned = row is not None and row.kind == "unit"
     result: dict[str, object] = {}
     directory = _string(fields.get("working_dir"))
@@ -497,7 +497,7 @@ SESSION_ROOTS = tuple(
 
 
 def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: str) -> bool:
-    if fields.get("working_dir") not in (str(old), str(new)):
+    if fields.get("worktree") not in (old.name, new.name):
         return False
     fields["branch"] = new_branch
     fields.update(_stored_fields(fields))
@@ -1780,6 +1780,7 @@ def _arm_review(args: argparse.Namespace) -> None:
     called_task = _arg_string(args, "called_task", "direct.review") or "direct.review"
     lens = _arg_string(args, "lens")
     suffix = f"_{lens}" if lens else ""
+    worker = _arg_string(args, "worker") or "review"
     # `review.sh --phase` writes its files in the phase's directory, so the marker names the same one.
     artifact_dir = phase_reservation.phase_directory(session_dir, phase_id) if phase_id else session_dir
     armed: dict[str, object] = {
@@ -1790,11 +1791,9 @@ def _arm_review(args: argparse.Namespace) -> None:
         "started_at": now,
         "called_task": called_task,
         "called_agent": _resolve_worker_agent(called_task),
-        # `review.sh` suffixes both files with its lens, so an armed reviewer
-        # must name the same pair the launcher it precedes will write. Empty is
-        # the single-reviewer layout and the unsuffixed names.
-        "status_file": str(artifact_dir / f"review_status{suffix}"),
-        "pid_file": str(artifact_dir / f"review_pid{suffix}"),
+        # Named reviewers use their worker prefix. Legacy reviewers use review.
+        "status_file": str(artifact_dir / f"{worker}_status{suffix}"),
+        "pid_file": str(artifact_dir / f"{worker}_pid{suffix}"),
         "status": "armed",
     }
     state[ARMED_REVIEW_KEY] = armed
@@ -5097,7 +5096,7 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
                 except (OSError, UnicodeError) as error:
                     return ProductionNotRecorded(f"phase plan cannot be read: {error}")
             return ProductionNotRecorded("the run has no matching unit staff row")
-        parent = record.by_id(row.parent) if row.parent is not None else None
+        parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
         if parent is None:
             return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
         timer = showrunners.timer_for(parent, record)
@@ -5238,11 +5237,12 @@ def resolve_worker_pass(session_dir: Path, state: dict[str, object],
     if not candidates:
         candidates = [_phase_identity(state, phase) for phase in phases if phase.get("status") == "active"]
     try:
-        roster = _json_object((session_dir / "mesh_roster.json").read_text(encoding="utf-8"))
+        roster = session_staff.read_worker_roster(session_dir / "mesh_roster.json")
     except (OSError, ValueError) as error:
         return UnresolvedWaitAttribution(f"worker roster unavailable: {error}", tuple(candidates))
-    names = [name for name, value in (roster or {}).items()
-             if thread_id and (_object_dict(value) or {}).get("thread_id") == thread_id]
+    membership = staff.local_snapshot()
+    names = [name for name, value in roster.items()
+             if thread_id and session_staff.worker_session(_object_dict(value) or {}, membership) == thread_id]
     if len(names) != 1:
         return UnresolvedWaitAttribution(f"worker thread has {len(names)} roster matches", tuple(candidates))
     matching = [candidate for candidate in candidates if candidate.get("worker_name") == names[0]]
@@ -5554,10 +5554,11 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
         if not separator or run_id in ("", ".", "..") or "/" in name:
             return NoNamedSupplier("worker alias has no run and worker identity")
         threads: set[str] = set()
+        membership = staff.local_snapshot()
         for root in unit_runs.run_roots(os.environ.get("UNIT_RUN_ROOT")):
             try:
-                roster = _json_object((root / run_id / "mesh_roster.json").read_text(encoding="utf-8")) or {}
-                thread = _string((_object_dict(roster.get(name)) or {}).get("thread_id"))
+                roster = session_staff.read_worker_roster(root / run_id / "mesh_roster.json")
+                thread = session_staff.worker_session(_object_dict(roster.get(name)) or {}, membership)
                 if thread:
                     threads.add(thread)
             except (OSError, ValueError):
@@ -6496,6 +6497,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = arm_review.add_argument("--activity", required=True)
     _ = arm_review.add_argument("--called-task", default="direct.review")
     _ = arm_review.add_argument("--lens", default="")
+    _ = arm_review.add_argument("--worker", default="", help="the named assign.sh reviewer; omit for review.sh")
     _ = arm_review.add_argument("--phase-id", default="", help="the open phase the review belongs to, as review.sh --phase names it")
     arm_review.set_defaults(handler=_arm_review)
 

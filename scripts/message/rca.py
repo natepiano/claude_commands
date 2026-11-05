@@ -224,7 +224,7 @@ def production_of(report: Report) -> str:
     identity = known["sessionId"] if known is not None else ""
     row = record.by_current_session(identity)
     while row is not None and row.kind != "showrunner":
-        row = record.by_id(row.parent) if row.parent is not None else None
+        row = record.parent_of(row)
     if row is None:
         return ""
     timer = showrunners.timer_for(row, record)

@@ -497,7 +497,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         assert git is not None
         self.executable(self.bin / "git", "#!/usr/bin/env python3\nimport os, sys\n"
                         + "arguments = sys.argv[1:]\n"
-                        + "if arguments[:1] == ['-C']: arguments = arguments[2:]\n"
+                        + "while arguments[:1] in (['-c'], ['-C']): arguments = arguments[2:]\n"
                         + "if arguments[:1] == ['clone']:\n"
                         + "    print('fixture clone refused', file=sys.stderr)\n    raise SystemExit(1)\n"
                         + f"os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n")

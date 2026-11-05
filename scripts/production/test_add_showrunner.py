@@ -77,7 +77,7 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         self.assertIsInstance(outcome, runtime.PromptSubmitted)
         row = backend.before_opening.by_id(staff.StaffId(identity))
         assert row is not None
-        self.assertEqual((row.id, row.name, row.parent), (identity, "demo", None))
+        self.assertEqual((row.id, row.name, row.parent), (identity, "demo", staff.StaffRoot()))
         self.assertNotIn("--session-id", backend.arguments)
         self.assertNotIn("--resume", backend.arguments)
         self.assertNotIn("STAFF_ID", backend.environment)
@@ -93,7 +93,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         assert child is not None and parent is not None
         self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
         self.assertEqual(parent.doc, staff.LiveDoc("natedev", self.doc("top")))
-        self.assertEqual(child.parent, parent.id)
+        self.assertEqual(child.parent, staff.ReportsTo(parent.id))
 
     @override
     def setUp(self) -> None:
@@ -135,7 +135,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                     worktree=staff.PresentWorktree("natedev", self.root / "probe"),
                     runtime_id=fixture_runtime_id("probe-unit-backend"))
             unit_admit.assert_called_once()
-        self.assertEqual(unit.parent, child.id)
+        self.assertEqual(unit.parent, staff.ReportsTo(child.id))
         self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
         self.assertEqual(len([row for row in staff.find(kind="showrunner") if row.id == child.id]), 1)
@@ -244,7 +244,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         child = staff.by_path("kid")
         parent = staff.by_path("top")
         assert child is not None and parent is not None
-        self.assertEqual(child.parent, parent.id)
+        self.assertEqual(child.parent, staff.ReportsTo(parent.id))
 
     def test_open_showrunner_recovers_before_its_timer_registers_without_second_launch(self) -> None:
         self.assert_open_launch_recovers(True)
@@ -309,7 +309,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual([row.id for row in staff.find(kind="showrunner") if row.name == "kid"], [native])
         child, parent = staff.by_path("kid"), staff.by_path("top")
         assert child is not None and parent is not None
-        self.assertEqual(child.parent, parent.id)
+        self.assertEqual(child.parent, staff.ReportsTo(parent.id))
 
     def test_observed_native_launch_recovers_before_staff_publication_without_a_second_backend(self) -> None:
         self.assert_observed_callback_recovers(False)
@@ -334,7 +334,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         rows = staff.snapshot().rows
         child = next(row for row in rows if row.name == "kid")
         parent = next(row for row in rows if row.name == "top")
-        self.assertEqual(child.parent, parent.id)
+        self.assertEqual(child.parent, staff.ReportsTo(parent.id))
         data, edge = self.staff.staff_file.read_bytes(), self.parent_of("kid")
         calls = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         with patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1")):
@@ -444,7 +444,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
               patch.object(runtime, "start_server"),
               patch.object(runtime, "open_tab", return_value="destination:p1") as tab,
               patch.object(runtime, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
-              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "workspace_id": "destination", "label": "kid"}]),
+              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "terminal_id": "destination-terminal", "workspace_id": "destination", "label": "kid"}]),
               patch.object(runtime.Herdr, "start_command", side_effect=started),
               patch.object(runtime.Herdr, "readiness", return_value={"agent_status": "idle", "interactive_ready": True}) as readiness,
               patch.object(runtime.Herdr, "_prompt", autospec=True, side_effect=typed) as prompt,
@@ -856,7 +856,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         grand = fixture_member("showrunner", name="grand")
         middle = fixture_member("showrunner", name="middle", parent=grand.id)
         top = next(row for row in staff.find(kind="showrunner") if row.name == "top")
-        _ = staff.move(top.id, middle.id)
+        _ = staff.move(top.id, staff.ReportsTo(middle.id))
         for child, parent in (("top", "middle"), ("middle", "grand")):
             edge = self.root / "showrunner" / child / "parent"
             edge.parent.mkdir(parents=True)
