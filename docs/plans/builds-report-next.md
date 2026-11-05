@@ -20,3 +20,10 @@
 - **Need:** add `target_directory` (absolute) to the launch result. The buildlog side is done: `record.transcript_target_folder` (`scripts/buildlog/record.py:120`) uses an absolute `target_directory` first, else `binary_path` with `profile`. Launches without either record `unresolved`.
 - **Completion:** a bevy_brp launch on natedev shows its absolute target folder in the build log index.
 - **Source phase:** 11 (simplify item 24).
+
+## A vault sync that works again closes its open question by itself
+- **Starts when:** sdlc's public `withdraw` verb is on main. Showrunner disposition 2026-11-05: next.
+- **Target:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.
+- **Need:** a successful sync clears the local outage but leaves its question open on the builds questions list. natedev clears it by hand.
+- **Completion:** a successful sync withdraws its filed question through the public command. Tests cover recovery, cause changes and a later outage.
+- **Source phase:** 29 (phase review).

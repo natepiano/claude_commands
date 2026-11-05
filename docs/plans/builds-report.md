@@ -73,7 +73,7 @@ The build report is too long for the user and is not used for analysis. Retire i
 - **Layout:** `scripts/buildlog/` (index, report, cli).
 - **Key files:** `scripts/buildlog/report.py` — `power_profile_section`, `profile_changes` and `profile_step_durations` hold today's one before-and-after comparison; `scripts/buildlog/index.py` — the `steps` and `samples` tables; `scripts/buildlog/cli.py` — commands; `~/.local/state/plan-delegate/runs/*.jsonl` — progress history (`event_type` `phase_finished`, `status` `completed`, `timestamp_epoch`, `phase_instance_id`, `working_dir`).
 - **Test lanes:** `scripts/buildlog/test_*.py`.
-- **Test:** `PYTHONPATH=scripts/buildlog env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD python3 -m unittest <module>` from the worktree root.
+- **Test:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD python3 -m unittest discover -s scripts/buildlog -p '<module>.py'` from the worktree root.
 - **Lint:** `basedpyright <the slot's own Python files>`; the footer must read `0 errors, 0 warnings, 0 notes`.
 - **Invariants:** build-log `.jsonl` files are appended and never edited. The report reads the index read-only. Never write the live build log or the live progress history.
 
@@ -542,8 +542,10 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 - Move the `FOOTER` definitions into `docs/as-built/buildlog-memory-stalls.md` as plain sentences, in Simplified Technical English.
 - `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It asks queue 10m's page command for the page's tailnet link (10m names it; read its as-built before the Work Order is used) and prints it, or opens it when a local display exists and `--no-open` is absent. With no link, it prints `buildlog charts: <reason>` to stderr and exits 1.
 - Delete `render_html`, `publish`, `PAGE` and `chart_data` when no caller remains.
+- Replace each `buildlog costs` instruction in the three as-built docs below with `buildlog charts`.
 
 **Files:**
+- `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md` — `buildlog charts` in place of `buildlog costs`.
 - `scripts/buildlog/cli.py` — no `costs` command.
 - `scripts/buildlog/costs.py` — no text output.
 - `scripts/buildlog/charts.py` — `main` prints the shared page link; page code removed.
@@ -564,7 +566,7 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 - `basedpyright` on the changed Python files: 0 errors, 0 warnings, 0 notes.
 
 ### Phase 27 — A step whose Cargo folders are unknown records them as unknown  · status: todo
-**Depends on:** Phase 24, Phase 25; resources-unit's Phase 66 on builds (its recorded-root reader)
+**Depends on:** Phase 24, Phase 25; resources-unit's Phase 66 merged into builds (done on `builds-resources`, not yet on `builds` at 2026-11-05)
 
 From the builds showrunner (not the user), 2026-11-05, defect from resources-unit: `index.add_step` does not keep the output pair unknown when the recorder left it out. After resources' Phase 66, an override row whose metadata failed gives sweep `(workspace, folder, folder)`, so `build_directory` is wrong when Cargo's build-dir differs. No natedev row has it today. Ruling: store unknown, not a made-up pair; put it in a phase after 24-25.
 
@@ -578,7 +580,7 @@ Director decision: a record with no pair is unknown for both columns, old record
 - `scripts/buildlog/index.py` `add_step` (about line 834): `target_directory` and `build_directory` come only from the record. When the record lacks either one, store `store.UNKNOWN_IDENTITY` in both. Keep `target_dir`, `target_folder` and `build_history_group` as they are: they read `target_dir`, not the pair.
 - Column text (about line 164): `target_directory` — "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` — "resolved Cargo intermediate root; unknown when the record has no output pair".
 - The existing index must not keep made-up pairs. Confirm that the changed column text (or a `SCHEMA_VERSION` bump) makes `index.update()` rebuild every step row. Report the rebuild time on the live index.
-- Readers: `scripts/lint/build_shape.py` `recorded_root` reads `unknown` as `UnknownRecordedRoot`, and `recorded_output_roots` skips a row whose `target_folder` differs from `target_directory`. Find every other reader of the two columns with LSP `findReferences` and `grep -rn "target_directory\|build_directory" scripts --include=*.py`; name each one in the summary with how it reads `unknown`. Do not edit another unit's file; report a reader that misreads `unknown`.
+- Readers after resources' Phases 64 and 66: `scripts/buildlog/step_outputs.py` `recorded_output_roots` returns one `RecordedStepOutput` for each distinct row, and `scripts/lint/sweep.py` `_recorded_mapping_rows()` skips a target-folder mismatch and takes an override row only when its newest start is after `TARGET_OVERRIDE_RECORDER_CUT`. Find every other reader of the two columns with LSP `findReferences` and `grep -rn "target_directory\|build_directory" scripts --include=*.py`; name each one in the summary with how it reads `unknown`. Do not edit another unit's file; report a reader that misreads `unknown`.
 
 **Files:**
 - `scripts/buildlog/index.py` — `add_step` and the column text.
@@ -588,12 +590,12 @@ Director decision: a record with no pair is unknown for both columns, old record
 
 **State:** none.
 
-**Constraints from prior phases:** Do not edit `scripts/buildlog/store.py` until queue 10q merges; this phase reads only `store.UNKNOWN_IDENTITY`. Do not edit `scripts/lint/build_shape.py` or `scripts/lint/sweep.py` (resources-unit). Merge builds before dispatch so resources' Phase 66 reader is in the tree.
+**Constraints from prior phases:** Do not edit `scripts/buildlog/store.py` until queue 10q merges; this phase reads only `store.UNKNOWN_IDENTITY`. Do not edit `scripts/buildlog/step_outputs.py`, `scripts/lint/build_shape.py` or `scripts/lint/sweep.py` (resources-unit). Merge builds before dispatch so resources' Phase 66 reader is in the tree. Resources' Phase 66 binds later work: keep both guards in `_recorded_mapping_rows()` and its cut tests unchanged.
 
 **Acceptance gate:**
 - `test_index` `test_output_roots_survive_indexing_and_legacy_steps_stay_readable` changes its `legacy` row to `(unknown, unknown)` (approved by this phase's goal) and adds a row with `target_dir` set to an absolute folder, an override `argv`, and no pair: it indexes as `(unknown, unknown)`.
-- A test through `build_shape.recorded_output_roots` on an index built by `index.update()` proves that such a row adds no `(folder, folder)` pair.
-- `scripts.buildlog.test_index`, `test_step_row`, `test_record`, `test_disk` and `scripts.lint.test_build_shape` green with and without `PYTHONPATH`.
+- A test through `step_outputs.recorded_output_roots` and `sweep._recorded_mapping_rows()` on an index built by `index.update()` proves that no row adds a `(folder, folder)` pair. It has two rows with no pair: an override row whose start is after `TARGET_OVERRIDE_RECORDER_CUT`, and a plain Cargo row with an absolute `target_dir`. Without the `add_step` change, the test fails on each row.
+- `scripts.buildlog.test_index`, `test_step_row`, `test_record`, `test_disk`, `test_step_outputs`, `scripts.lint.test_sweep` and `scripts.lint.test_build_shape` green with and without `PYTHONPATH`.
 - `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py`: 0 errors, 0 warnings, 0 notes.
 
 ### Phase 28 — A verify.sh step takes its output folders from verify.sh's Cargo metadata  · status: done
@@ -620,107 +622,51 @@ Director decision: a record with no pair is unknown for both columns, old record
 - Reading the test-path metadata without an export, and an export through a `verify_metadata.py` request: routed to verify-unit, which owns `verify.sh`.
 
 ### Phase 29 — The Mac's hanadocs vault syncs both ways and asks a question only on a conflict  · status: done
-**Depends on:** none (urgent, from the user via natedev and the builds showrunner, 2026-11-05)
 
-The Mac copy of `~/rust/hanadocs` stopped at 2026-11-04 17:58 EST, 233 commits behind. Obsidian on the Mac saved column widths in `home-base/vault map.base`, and the hourly fast-forward stops on any uncommitted change.
+#### As-built
 
-From the user (via natedev and the showrunner), 2026-11-05: "hanadocs not working should just be an issue you raise as a question with me - it should not be a message sent via pushover." And: "we need a permanent fix for handling synchronization of hanadocs across mac and natedev." And: "it should be just an issue of managing merges and conflicts".
-
-Director decisions:
-- From natedev (not the user), 2026-11-05: design approved as written, with three notes. (a) When the Mac's main is not a fast-forward of GitHub's main, natedev merges it in the same run, with the same rules. (b) The first run commits the Mac's current change in `home-base/vault map.base`; that is the wanted result. (c) The conflict question names the files and says where the user acts (machine and session).
-- natedev merges in the object store (`git merge-tree --write-tree`, then `git commit-tree`), so no uncommitted edit in natedev's vault changes. `hanadocs-push` brings the result into natedev's main, as today.
-- natedev's `hanadocs-push` does not change.
-- From the builds showrunner (from natedev, not the user), 2026-11-05: change row C927 (the Mac's hanadocs vault updates itself each hour, ddf835c4) came back with the user's words "this is an issue that is happening right now". This phase closes it; no separate fix. The checkpoint carries a new Change-Review line for it.
-- The Mac needs no GitHub credentials: natedev carries the Mac's commits to GitHub.
-- From natedev (not the user), 2026-11-05: a good run clears the question with a separate `withdraw` verb that sdlc adds to `update_registration.py`. Do not import its internals; file with the public `ask` command. If this phase lands before `withdraw` is on main, leave the clear out; natedev clears the question by hand until then.
-- Director, 2026-11-05 (review round 1): a natedev `merge-tree` conflict defers to the next hour's Mac merge. Reason: no working tree holds natedev's merge, so a question there sends the user to a tree with no conflict. This changes natedev's note (a) for the conflict case only.
-- From the user (via the showrunner), 2026-11-05: "a) — add check." An open merge on the Mac (`MERGE_HEAD`, an interrupted conflict) stops the Mac script before staging. It prints the unmerged file names (or, when none is unmerged, the files that differ from HEAD) as the conflict outcome. It runs no abort, add or commit. natedev files the Mac conflict question.
-
-#### Work Order
-
-**Goal:** Each hour, the Mac commits its local vault changes and merges natedev's copy of GitHub's main. natedev carries the Mac's main to GitHub. Only a true conflict (or a Mac that is not on main, unreachable for 24 h, or an unknown git error) stops the sync. A stop files one question on natedev's open-questions list and sends no phone push. The next good run clears that question.
-
-**Spec:**
-- `scripts/buildlog/vault_pull.py`:
-  1. natedev pushes its `refs/remotes/origin/main` to the Mac's `refs/remotes/origin/main`, as today.
-  2. The ssh script on the Mac:
-     1. Stops with `branch` when the vault is not on main.
-     2. Runs `git add -A`. When the index differs from HEAD, it commits once with the message `vault: Mac edits`.
-     3. Runs `git merge --no-edit --no-overwrite-ignore refs/remotes/origin/main` (a real merge, not `--ff-only`; an incoming file never replaces an ignored Mac file).
-     4. On a conflict, it reads `git diff --name-only --diff-filter=U`, runs `git merge --abort`, and prints the conflict outcome with the file names.
-     5. Keeps the `index.lock` retries (`vault.lock_retries`, `vault.lock_retry_delay_s`) for the commit and the merge.
-     6. Prints the merged count and the Mac's main commit in the `VAULT_OUTCOME=` marker.
-  3. natedev fetches the Mac's main into `refs/remotes/mac/main`. It then runs `git fetch origin main`, after `github-warm-status` exits 0.
-     - Cold credentials: one printed line, exit 0; the next hour tries again. No question.
-  4. When `mac/main` is already in `origin/main`: nothing to push.
-  5. When `mac/main` is a fast-forward of `origin/main`: push it to GitHub `main`.
-  6. Else: `git merge-tree --write-tree origin/main mac/main`. With no conflict, `git commit-tree` with both parents, then push that commit to GitHub `main`. A conflict is a deferral (one printed line, exit 0): the next hour the Mac merges that GitHub main, finds the same conflict in its working tree and files the Mac conflict question (director decision, review round 1).
-  7. A rejected push (`git push --porcelain` reports `[rejected]`) is not a stop: the next hour tries again.
-  8. Every Mac contact (the first push, the ssh script, the `mac/main` fetch) uses one unreachable rule. The Mac ssh options apply to Mac contacts only; GitHub calls use the default ssh.
-  9. A deferral after a Mac merge records the Mac contact time in `last_good`; the open outage stays.
-- Stop causes after this phase: `conflict` (files; always on the Mac), `not_on_main`, `mac_unreachable` (after 24 h), `vault_locked`, `command_failed`. Remove `tracked_files_changed`, `untracked_would_be_overwritten` and `history_diverged`.
-- A stop files one question with `python3 ~/.claude/scripts/production/update_registration.py ask --production ~/.claude/docs/plans/natedev-production.md --text <one line> --question <full text> --urgency soon --due <one day after the outage start>`, run as a subprocess with a timeout (`soon` requires `--due`). It is filed once per outage; the state file keeps that it was filed. The run saves `asked` before it runs `ask`, as the old push did; a failed or held `ask` saves it as not filed, and the next hour tries again. The question names the cause, the files (for a conflict), the machine, where the user acts, and the choices.
-- A good run closes the outage. `withdraw` is not on main at dispatch (2026-11-05 12:50 EST), so the clear is left out; natedev clears the question by hand.
-- Remove the `vault.stopped` push: `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, its test in `scripts/notify/test_push_texts.py`, and the push call in `vault_pull.py`.
-- `scripts/buildlog/cli.py`: the usage line says the job syncs the Mac's vault.
+`buildlog vault` syncs the Mac's `~/rust/hanadocs` with GitHub each hour, from natedev. A stop files one question on natedev's open-questions list and sends no phone push (user, 2026-11-05).
+- natedev pushes its `refs/remotes/origin/main` to the Mac. The Mac script (`REMOTE_PULL`) stops with `branch` off main, and stops with the conflict outcome on an open merge (`MERGE_HEAD`: the unmerged files, else the files that differ from HEAD; no abort, add or commit; the user chose this check, 2026-11-05). It then runs `git add -A`, commits once (`vault: Mac edits`) and runs `git merge --no-edit --no-overwrite-ignore refs/remotes/origin/main`. A conflict prints the `--diff-filter=U` files and runs `git merge --abort`. The commit and the merge retry a busy `index.lock` (`vault.lock_retries`, `vault.lock_retry_delay_s`). The `VAULT_OUTCOME=` marker gives the outcome, because Mac login can hide the exit status.
+- natedev fetches the Mac's main into `refs/remotes/mac/main`, then `origin main` after `ci.warm()`. It pushes a fast-forward, or a `git merge-tree --write-tree` plus `git commit-tree` merge made in the object store, to GitHub `main`. A natedev merge-tree conflict, cold credentials and a rejected push (`git push --porcelain`) are deferrals: one printed line, exit 0. The next hour's Mac merge files the conflict question.
+- `mac_git` alone applies the Mac ssh options. A nonzero exit 255, or connection text on a nonzero exit, is `MacUnreachable`; a timeout is too.
+- `PullOutcome = Pulled | Current | DeferredSync | PullStop`; `PullStop = VaultConflict | NotOnMain | MacUnreachable | VaultLocked | VaultCommandFailed`; `StopCause` is the `Literal` of `conflict`, `not_on_main`, `mac_unreachable`, `vault_locked`, `command_failed`.
+- State (`store.root()/vault_pull.json`): `VaultState(last_good: LastGoodPull | NeverPulled, outage: OpenOutage | NoOutage)`, `OpenOutage(cause, since, asked, detail)`, written with `write_text_atomic` under `file_lock.exclusive`. An outage files one question with `update_registration.py ask --urgency soon --due <since + 1 day>`; `asked` is saved before `ask` and reset when `ask` fails. `MacUnreachable` files only after `UNREACHABLE_GRACE_S` (24 h) from `last_good`; a deferral after a Mac contact refreshes `last_good` and keeps the outage. A good run deletes the local outage; the question stays open until natedev clears it by hand.
+- The `vault.stopped` push is gone from `push_catalog.py`, `push_texts_reviewed.json` and `test_push_texts.py`.
 
 **Files:**
-- `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`
-- `scripts/buildlog/cli.py`
-- `scripts/buildlog/test_target_sync.py` — its vault stand-in uses the new marker and transport calls; every assertion stays.
-- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py`
-- `config/build_targets.conf`, `config/README.md` — the retry text says "tries after a busy vault index lock".
+- `scripts/buildlog/vault_pull.py` — the job, the Mac script, the state and the question.
+- `scripts/buildlog/test_vault_pull.py` — real-git tests (a GitHub bare repo, a natedev clone and a Mac clone, built once per class and copied for each test).
+- `scripts/buildlog/test_target_sync.py` — the vault stand-in uses the marker and the Mac transport calls.
+- `scripts/buildlog/cli.py` — the usage line.
+- `config/build_targets.conf`, `config/README.md` — the lock retry text.
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py` — no `vault.stopped`.
 
-**Workers:** 1 writer owns all files.
+**Gotchas:**
+- A successful git transfer can print connection text on stderr (hooks). The unreachable rule applies only to a nonzero exit.
+- The Mac needs no GitHub credentials: natedev carries the Mac's commits to GitHub.
+- The first run committed the Mac's `home-base/vault map.base` change; that was the wanted result.
 
-**State:** the vault state file (`store.root()/<STATE_NAME>`) keeps `last_good` and the open outage; `alerted` becomes `asked`. Read an old file with `alerted` as not asked.
-
-**Acceptance gate:**
-- Tests with real git repositories in a temporary folder (a GitHub bare repo, a natedev clone, a Mac clone; ssh replaced at the `run` boundary):
-  1. A Mac with an uncommitted tracked change and an untracked note: the run commits both, merges, and GitHub gets them.
-  2. Both sides changed different files: the run merges on the Mac or on natedev, and GitHub gets both.
-  3. Both sides changed the same lines: no commit is lost, the merge is aborted, one question is filed with the file names, and no push is sent.
-  4. A second stop in the same outage files no second question.
-  5. The next good run closes the outage; a later stop files a new question.
-  6. Not on main and Mac unreachable for 24 h each file one question; unreachable for less than 24 h files none.
-- `scripts.buildlog.test_vault_pull`, `scripts.notify.test_push_texts`, and each module that imports `vault_pull`, with and without `PYTHONPATH`.
-- `basedpyright` over each changed Python file: 0 errors, 0 warnings, 0 notes.
-- After landing: one `buildlog vault` run on natedev commits the Mac's `vault map.base` change and brings the Mac to GitHub's main.
+**Ruled out:**
+- A phone push for a vault stop (user, 2026-11-05).
+- A natedev question for a merge-tree conflict: no working tree holds natedev's merge.
+- Importing `update_registration.py` internals: the job runs the public `ask` command.
 
 ### Phase 30 — The Mac idle watch sends one alert per idle episode  · status: done
-**Depends on:** none (urgent, from the builds showrunner, 2026-11-05; runs beside Phase 29, no shared files)
 
-From the builds showrunner (from natedev, not the user), 2026-11-05: between 12:50 and 13:09 EST the watch sent the same text 3 times: "MAC IDLE 3 min: 3 steps wait for the Mac. Claim of port (clippy cargo-port) runs no build or test on the Mac." send-repeat-guard held the copies. "Send one alert per idle episode. A new alert goes only when the episode ends and a new one starts, or when its cause changes. Add a test."
+#### As-built
 
-Cause (director, 2026-11-05): `watch_once` (scripts/buildlog/mac_idle.py:466-467) moves the episode start to the `claims` folder time. Any claim file written or removed changes that time, also another repository's claim (`cargo-liner.json` at 13:05 moved the start to 13:05:56). A new start is a new key, so 3 minutes later the same alert goes again.
-
-#### Work Order
-
-**Goal:** One idle episode sends one showrunner message and at most one phone push. A new episode starts only when the Mac did work. A changed cause or holder in the same episode sends one new message.
-
-**Spec:**
-- `scripts/buildlog/mac_idle.py` `watch_once`:
-  1. Remove the `claims` folder time from the episode start.
-  2. The episode ends when the Mac runs natedev work (`NatedevJobOnMac`, as today), or when the Mac did work between two passes: a live claim that started before the episode start has a `work_idle_since` later than the episode start. `mac_test` checks Mac activity once for each host and writes it into every live claim, so this holds for every cause, blocked included. No claim path is saved.
-  3. A change of `cause` or holder in the same episode keeps `since` and sends one new showrunner message. The alert record saves `changed`, the time the current cause and holder started. `changed` is a required `SavedAlert` field that `read_alert` validates like `since`; a record without it is unreadable, so the first pass after deploy starts clean (no old-record reader). One `outage_key` gives the message key `mac-idle-showrunner-<since>-<changed>`, so a cause that returns to an earlier value also sends. The phone push stays once per episode (key `mac-idle-<since>`, as today).
-  4. Another repository's claim record that is written or removed does not change the episode.
-- Keep the `cleared --since` command and the push `--clears-when` as they are.
-
-Director decisions:
-- Director, 2026-11-05 (review round 1): spec items 2 and 3 changed. Reason: a saved claim path missed work in a blocked episode and took another repository's claim; a cause-and-holder key repeated when a cause came back.
+One idle episode sends one showrunner message and at most one phone push. A changed cause or holder in the same episode sends one new message.
+- `mac_idle.mac_work` reads `run.json` first, then `mac_test.read_claims(mac_test.StatePaths(paths.mac_state))`, filtered by `run_is_live`. The claims folder time no longer moves the episode start.
+- `watch_once` ends the episode when the Mac runs natedev work, or when a live claim that started before the episode start has a `work_idle_since` later than that start. `mac_test` writes one activity answer for each host into every live claim, so this holds for every cause, blocked included, and another repository's claim does not restart the episode. No claim path is saved.
+- The alert record saves `changed`, the time the current cause and holder started. `SavedAlert.changed: float` is required, and `read_alert` validates it like `since`; a record without it is unreadable, so the next pass starts clean.
+- `outage_key(saved)` gives the message key `mac-idle-showrunner-<since>-<changed>`, so a cause that returns to an earlier value also sends. `messaged` is kept when the key does not change. The phone push stays once per episode (`mac-idle-<since>`).
+- `cleared --since` and the push `--clears-when` are unchanged.
 
 **Files:**
-- `scripts/buildlog/mac_idle.py`, `scripts/buildlog/test_mac_idle.py`
-- `scripts/buildlog/mac_idle_alert.py`, `scripts/buildlog/test_mac_idle_alert.py`, `scripts/buildlog/mac_idle_test_support.py`
+- `scripts/buildlog/mac_idle.py` — `mac_work`, `watch_once`, `outage_key`; `OutageMessage` carries `key`.
+- `scripts/buildlog/mac_idle_alert.py` — `SavedAlert.changed`.
+- `scripts/buildlog/test_mac_idle.py`, `scripts/buildlog/test_mac_idle_alert.py`, `scripts/buildlog/mac_idle_test_support.py` — the 12:50-13:09 repeat case, cause changes, a returning cause, a blocked episode that ends on Mac work, another repository's claim that sorts first, `test_own_claim_work_restarts_the_idle_interval`.
 
-**Workers:** 1 writer owns all five files.
-
-**Acceptance gate:**
-- Tests in `scripts/buildlog/test_mac_idle.py`:
-  1. The 12:50-13:09 case: one idle claim, another repository's claim file written and removed during the episode; three watch passes past 3 minutes send one message.
-  2. A cause change in one episode (claim idle, then blocked) sends one new message, then no repeat.
-  3. The Mac runs work, then goes idle again: a new episode sends a new message.
-  4. `test_claim_folder_change_restarts_the_idle_interval` changes to the new rule (Mac work ends the episode) and is renamed `test_own_claim_work_restarts_the_idle_interval`; list the changed expected values.
-  5. Review round 1: a blocked episode ends on Mac work between passes; a live claim of another repository that sorts first does not restart the episode; the cause sequence claim idle, blocked, claim idle sends three messages.
-- `scripts.buildlog.test_mac_idle`, `scripts.buildlog.test_mac_idle_alert` and each module that imports `mac_idle`, with and without `PYTHONPATH`.
-- `basedpyright` over each changed Python file: 0 errors, 0 warnings, 0 notes.
+**Ruled out:**
+- Saving the episode's claim path: it missed work in a blocked episode and took another repository's claim.
+- A cause-and-holder message key: it did not send when a cause came back.
