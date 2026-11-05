@@ -14,12 +14,16 @@ from dataclasses import dataclass, field, replace
 from datetime import date as CalendarDate
 from pathlib import Path
 from threading import RLock
-from typing import cast
+from typing import Final, cast
 
 from scripts.lib import atomic_file, git_exclude
 from scripts.production.staff import StaffId
 from scripts.production import staff
 from scripts.production.production_doc import cell_value
+
+
+# The responsibility of a unit that takes the paths the berth board leaves free; the board is its scope guard.
+BOARD_FREE: Final = "board-free"
 
 
 class ConfigRefused(ValueError):
@@ -150,9 +154,47 @@ class UnitConfig:
 
     def __post_init__(self) -> None:
         # A responsibility is a short name (`nightly-review`) or an owned repository path (the old Owns cell).
+        # Responsibilities are a set; sorted order matches taplo's reorder_arrays in a repository config.
+        object.__setattr__(self, "responsibilities", tuple(sorted(self.responsibilities)))
         for name in self.responsibilities:
             if re.fullmatch(r"[A-Za-z0-9._-][A-Za-z0-9._/-]*", name) is None or ".." in name.split("/"):
                 raise ConfigRefused(f"responsibilities: invalid name or repository path {name!r}")
+
+
+def responsibilities_from_owns(cell: str) -> tuple[str, ...]:
+    """Read repository paths from an Owns cell and refuse prose."""
+    head, _, note = cell.partition(" — ")
+    head = head.strip()
+    if head.casefold() == "none" and re.search(r"\bboard\b", note, re.IGNORECASE):
+        return (BOARD_FREE,)
+    refused = ConfigRefused(f"Owns cell is not a path list: {cell!r}")
+    if not head or head.casefold() in ("none", "—"):
+        raise refused
+    if "`" in head:
+        paths = cast(list[str], re.findall(r"`([^`]+)`", head))
+        if re.sub(r"`[^`]+`", "", head).strip(",; "):
+            raise refused
+        owned: list[str] = []
+        sibling_directory = ""
+        for path in paths:
+            if "/" in path:
+                owned.append(path)
+                sibling_directory = path.rstrip("/") if path.endswith("/") else str(Path(path).parent)
+            elif sibling_directory:
+                # A bare name after a path is that path's sibling.
+                owned.append((Path(sibling_directory) / path).as_posix())
+            else:
+                # A bare name with no path before it is a root file (`settings.json`).
+                owned.append(path)
+    else:
+        owned = [part.strip() for part in re.split(r"[,;]", head)]
+    if not owned:
+        raise refused
+    try:
+        _ = UnitConfig(StandbyPlan(), NoAppPort(), tuple(owned))
+    except ConfigRefused as error:
+        raise refused from error
+    return tuple(owned)
 
 
 @dataclass(frozen=True)
@@ -390,6 +432,15 @@ def write(worktree: Path, config: UnitConfig) -> Published | AlreadyCurrent:
         formatted = _formatted(desired, worktree, repository_formatting(worktree))
         git_exclude.ensure_excluded(worktree, "/.unit.toml")
         return _publish(worktree / ".unit.toml", desired, formatted)
+
+
+def set_plan(worktree: Path, plan: Path) -> None:
+    """Change only the plan in the existing unit configuration."""
+    with writer_lock():
+        config = read(worktree, cleanup=False)
+        if isinstance(config, ConfigMissing):
+            raise staff.StaffUnreadable(config.reason)
+        _ = write(worktree, replace(config, plan=PlanFile(plan)))
 
 
 def first_difference(left: UnitConfig, right: UnitConfig) -> str:

@@ -60,7 +60,7 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.lib import build_folders
-from scripts.production import change_review  # noqa: E402
+from scripts.production import change_review, staff  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -1516,7 +1516,7 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
     """Add a row per visible change to the list, then name any landed merge still missing its rows."""
     merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
     try:
-        rows = change_review.append_rows(review_list, changes, change_review.today(), merged, production)
+        rows = change_review.append_rows(review_list, changes, change_review.today(), merged, production, record=staff.snapshot())
         drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED,
                                       change_review.foreign_units(production))
     except (change_review.ChangeReviewError, OSError) as error:
@@ -1532,19 +1532,18 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
 
 
 def nightly_owner(args: GateArguments) -> str:
-    from scripts.production import showrunners
-    from scripts.production.production_units import Refusal, production_field
+    from scripts.production import session_staff, showrunners, staff
+    from scripts.shutdown import remote
 
     try:
         doc = change_review.production_doc(args.production)
     except change_review.ChangeReviewError:
         matching: list[Path] = []
+        record = staff.initial_snapshot()
+        resolver = session_staff.RowResolver(record)
         for candidate in showrunners.timer_docs().values():
-            try:
-                branch = production_field(candidate.read_text().splitlines(), "Merge branch")
-            except Refusal:
-                continue
-            if branch == args.merge_branch:
+            row = record.by_doc(remote.local_machine(), candidate)
+            if row is not None and resolver.merge_branch(row) == session_staff.Branch(args.merge_branch):
                 matching.append(candidate)
         if len(matching) != 1:
             return copies.fallback_owner("nightly")

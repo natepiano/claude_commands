@@ -343,6 +343,8 @@ def _main(argv: list[str]) -> int:
         new_member = staff_sources.MemberFound(staff.promote_unit(
             retained.id if retained is not None else native, name=name, parent=parent_row.id, doc=document))
     try:
+        import showrunner_parent
+        showrunner_parent.save_notice(slug, showrunner_parent.PendingParentNotice("attach", promotion.parent.slug))
         if was_pending and showrunners.current_name(slug):
             started = showrunners.main(["attach", slug, promotion.parent.slug])
         else:

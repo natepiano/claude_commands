@@ -559,6 +559,27 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIn("passed: 0; failed: 1; unreviewed: 1", output.getvalue())
         self.assertIn("sample failed rules: reader-starts-cold=1", output.getvalue())
 
+    def test_sample_keeps_question_registration_unknown_when_staff_is_unreadable(self) -> None:
+        question = "Would you retry the build?"
+        path = self.transcript("question.jsonl", [("2026-10-13T10:00:00Z", question, "end_turn")])
+        record = self.question_record({"since": "2026-10-13T10:00", "text": question,
+                                       "question": question}, slug="demo")
+        before = record.read_bytes(), record.stat().st_mtime_ns
+        staff_path = Path(os.environ["STAFF_FILE"])
+        _ = staff_path.write_text("{invalid")
+        cutoff = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            _ = review.sample([path], since=cutoff, runner=FakeReviewer(verdict(self.draft)))
+        self.assertIn("incomplete", output.getvalue() + errors.getvalue())
+        self.assertIn(str(staff_path), output.getvalue() + errors.getvalue())
+        self.assertNotIn("replies with unregistered questions: 1", output.getvalue())
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), before)
+        staff_path.unlink()
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(review.sample([path], since=cutoff, runner=FakeReviewer(verdict(self.draft))), 0)
+        self.assertIn("replies with unregistered questions: 1", output.getvalue())
+        self.assertNotIn("incomplete", output.getvalue() + errors.getvalue())
+
     def test_sample_registered_questions_and_quoted_examples_are_not_unregistered(self) -> None:
         path = self.transcript("session.jsonl", [
             ("2026-10-13T10:00:00Z", "Would you retry the build?", "end_turn"),
@@ -733,13 +754,17 @@ class LocalReviewTests(unittest.TestCase):
         _ = current.write_text("[]")
         record = self.question_record(item, slug="demo")
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory.parent)}):
-            self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(accepted.split()), questions)
             record.unlink()
             _ = current.write_text("[]")
             history = review.QuestionRegistration(time=datetime.now(timezone.utc).isoformat(),
                 text=item["text"], question=item["question"], reviewed=accepted)
             _ = current.with_suffix(".history.jsonl").write_text(json.dumps(history) + "\n")
-            self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(accepted.split()), questions)
 
     def test_sample_matches_registered_asks_without_matching_their_choice_lines(self) -> None:
         question = "Would you retry the build?"
@@ -1861,6 +1886,7 @@ class MigratedQuestionTests(RegistrationFixture):
         cutoff = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             questions = review.registered_questions(cutoff)
+        assert isinstance(questions, list)
         self.assertIn("Which compiler should we use?", questions)
         self.assertFalse(self.outstanding().exists())
 

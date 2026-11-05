@@ -9,8 +9,8 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from typing import cast, override
 from unittest import mock
-from typing import override
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -157,6 +157,21 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         self.assertEqual(holders, {'standby-unit': frozenset({'ticket.py'})})
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn('staff worktree is unfilled', errors.getvalue())
+
+    def test_file_holders_use_the_staff_parent_document(self) -> None:
+        parent_doc = self.source_root / 'parent-production.md'
+        _ = parent_doc.write_text('# Parent\n')
+        parent = recorded_showrunner('parent', parent_doc)
+        doc = self.source_root / 'style-production.md'
+        _ = doc.write_text('# Style\n')
+        owner = recorded_showrunner('style', doc)
+        owner = staff.move(owner.id, staff.ReportsTo(parent.id))
+        with mock.patch.object(unit_files, '_unit_file_sources', return_value=()) as sources:
+            ledger = cast(style_ledger.Ledger, mock.create_autospec(style_ledger.Ledger, instance=True))
+            resolver = session_staff.RowResolver(staff.snapshot())
+            with mock.patch.object(ledger, 'staff_resolver', return_value=resolver):
+                self.assertEqual(unit_files.unit_file_holders(self.source_root, doc, ledger), {})
+        self.assertEqual(sources.call_args_list, [mock.call(owner, mock.ANY), mock.call(parent, mock.ANY)])
 
     def test_unavailable_rows_keep_the_live_unit_and_report_each_skipped_row(self) -> None:
         doc = self.source_root / 'style-production.md'

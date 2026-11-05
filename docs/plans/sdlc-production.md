@@ -41,14 +41,6 @@ State is in `~/.local/state/astra/design-roles/` and `~/.local/state/astra/desig
 
 These three files are also hub files in build-followups. An edit to one of them goes through cargo-berth's normal flow, and the checkpoint notice names the build-followups owner.
 
-## Gates
-
-| Gate | Waiting | Waits on | Clears when |
-| --- | --- | --- | --- |
-| G1 | hierarchies-unit Phase 4 (measure.py reads wait records and merge receipts) | phases-unit Phase 6 (HI7 wait records and merge receipts; depends on its phase 3) | That checkpoint is on origin/sdlc and ~/.claude main, its notice names the record file and commit, and the file holds at least one wait record and one receipt from a real phase. |
-
-When a plan needs another unit's checkpoint, the gate goes here.
-
 ## Close-out
 
 - Send cargo-liner the final guild design and the role names the user chose, so its handler unit shows them. `astra-designer` and `astra-reviewer` stay as the per-design role and census IDs (`docs/as-built/guilds.md`).

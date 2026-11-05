@@ -15,11 +15,10 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NoReturn, cast, override
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.whoami.account_test_support import write_claude_account
-from scripts.direct import assign
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
@@ -30,7 +29,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id, fixture_member, isolated_staff_file
-from scripts.production.cli_fixture import invoke_cli
 
 
 class SimplifyDispatchTests(NixFixture):
@@ -71,6 +69,22 @@ class SimplifyDispatchTests(NixFixture):
                          "UNIT_SYNC_WRITES": "0", "PYTHONPATH": str(ROOT),
                          "CODEX_THREAD_ID": fixture_runtime_id("simplify-director"),
                          "TZ": "UTC", "USER_ZONE": "UTC"})
+        # Call the function with a review runner that preserves the assign parent.
+        startup = self.root / "assignment-startup"
+        startup.mkdir()
+        _ = (startup / "sitecustomize.py").write_text("\n".join((
+            "import os, subprocess, sys",
+            "def enter(frame, event, argument):",
+            f"    if event == 'call' and frame.f_code.co_filename == {str(ROOT / 'scripts/direct/assign.py')!r} and frame.f_code.co_name == 'main':",
+            "        sys.setprofile(None)",
+            f"        os.environ['PYTHONPATH'] = {str(ROOT)!r}",
+            "        frame.f_globals['require_live_director'] = lambda: None",
+            "        def review(file, command, environment):",
+            "            raise SystemExit(subprocess.call(command, env=environment))",
+            "        raise SystemExit(frame.f_globals['main'](exec_review=review))",
+            f"if sys.argv[0] == {str(ROOT / 'scripts/direct/assign.py')!r}: sys.setprofile(enter)",
+        )) + "\n")
+        self.env["PYTHONPATH"] = os.pathsep.join((str(startup), str(ROOT)))
         self.env["AGENT_NOTES_DIR"] = str(self.root / "notes")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
         owner = fixture_member("showrunner", name="simplify-owner")
@@ -138,23 +152,15 @@ raise SystemExit(int(os.environ.get("SIMPLIFY_TEST_EXIT", "0")))
         return ["bash", str(ROOT / "scripts/direct/assign.sh"), *self.arguments(*options)]
 
     def launch(self, *options: str) -> subprocess.CompletedProcess[str]:
-        def run_review(executable: str, arguments: list[str], environment: dict[str, str]) -> NoReturn:
-            result = subprocess.run(arguments, executable=executable, env=environment,
-                                    capture_output=True, text=True, check=False,
-                                    timeout=TEST_HANG_GUARD_SECS)
-            print(result.stdout, end="")
-            print(result.stderr, file=sys.stderr, end="")
-            raise SystemExit(result.returncode)
-
-        # assign.main ends in os.execvpe; run review.sh as a child so this test process continues.
-        with patch.object(os, "execvpe", run_review):
-            result = invoke_cli(assign, assign.main, self.arguments(*options), self.env, self.work)
+        # The fixture passes exec_review explicitly and preserves the assignment parent.
+        result = subprocess.run(self.command(*options), env=self.env, capture_output=True, text=True,
+                                check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
     def stop_review(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is None:
-            process.terminate()
+            send_process_group(process.pid, signal.SIGTERM)
         _ = communicate_launcher(process)
 
     def stop_orphan_review(self, pid: int) -> None:
@@ -578,8 +584,9 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
 
     def test_stopping_the_launcher_stops_claude_and_closes_its_pass(self) -> None:
         process, _ = self.start_blocked_review()
-        self.assertEqual(int(self.phase_file("review_pid_simplify").read_text()), process.pid)
-        process.terminate()
+        review_pid = int(self.phase_file("review_pid_simplify").read_text())
+        self.assertEqual(os.getpgid(review_pid), process.pid)
+        os.kill(review_pid, signal.SIGTERM)
         _ = communicate_launcher(process)
         self.assertEqual(process.returncode, 143)
         self.assertEqual(self.status(), "error")
@@ -593,7 +600,8 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         process, gate = self.start_blocked_review()
         child_pid = cast(int, self.claude_calls()[0]["pid"])
         self.addCleanup(self.stop_orphan_review, child_pid)
-        process.kill()
+        review_pid = int(self.phase_file("review_pid_simplify").read_text())
+        os.kill(review_pid, signal.SIGKILL)
         _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         retry = self.launch()
         self.assertIn("busy", retry.stderr)

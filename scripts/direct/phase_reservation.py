@@ -30,12 +30,12 @@ state file and no berth mapping of its own was never enrolled, as FinalGate's `f
 no lost record: its edits check under the bare session id. The hook reads the recorder's
 state in process. `progress_history.py finish-phase` clears an inactive state when the
 phase completes. `start-phase` restores a finished phase's enrolled state from the kept board answer and removes the release marker.
-It removes the old worktree and baselines, so the next claim records the new dispatch root and baselines.
+It removes the worktree override and baselines before the next claim.
 With one
 open phase in the edit's worktree every edited path is that phase's. With several, a path is the phase's whose `files`
 list covers it: one repository-relative path per line, a trailing `/` covering the tree below.
-Before workers open, `claim --repo` writes the repository root in the phase directory's `worktree` file.
-A legacy phase with no file still matches every worktree.
+The staff row supplies the home folder.
+`claim --repo` writes a `worktree` file only when the phase uses another checkout.
 
 `enrolled_awaiting_first_touch` turns `Active`, and an `Active` record follows a new
 reservation of its own phase: once cargo-berth releases the recorded one, as a shrink's
@@ -58,6 +58,8 @@ from typing import NamedTuple, cast, overload
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import unit_runs
+from scripts.production import staff
 from scripts.agents import worker_lifecycle
 
 if not __package__:
@@ -125,13 +127,9 @@ class CheckAnswer(NamedTuple):
 
 
 class KnownPhaseWorktree(NamedTuple):
-    """The repository root recorded when this phase claimed its files."""
+    """The phase folder from staff or an explicit checkout override."""
 
     root: Path
-
-
-class LegacyPhaseWorktree(NamedTuple):
-    """No worktree was recorded; this phase still matches every root."""
 
 
 class AllPhaseWorktrees(NamedTuple):
@@ -146,7 +144,7 @@ class OpenPhase(NamedTuple):
 
     phase: str
     directory: Path
-    worktree: KnownPhaseWorktree | LegacyPhaseWorktree = LegacyPhaseWorktree()
+    worktree: KnownPhaseWorktree
 
 
 class PhaseMissingRecord(NamedTuple):
@@ -339,27 +337,34 @@ def _adopt_session_level_files(session_dir: Path) -> None:
             os.replace(session_dir / name, target / name)
 
 
-def phase_worktree(directory: Path) -> KnownPhaseWorktree | LegacyPhaseWorktree:
-    """Read the repository root kept by claim, or keep legacy global matching."""
-    try:
-        root = (directory / WORKTREE_FILE).read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return LegacyPhaseWorktree()
-    if not root:
-        raise ValueError(f"Empty phase worktree record: {directory / WORKTREE_FILE}")
-    return KnownPhaseWorktree(Path(root))
+def home_worktree(directory: Path) -> Path:
+    """Read the unit folder from its staff row."""
+    run = directory.parent.parent
+    owner = unit_runs.director(run)
+    if not owner:
+        raise StateRefused(f"{run}: run owner is unavailable")
+    row = staff.snapshot().by_member_reference(owner)
+    if row is None or row.kind != "unit":
+        raise StateRefused(f"run owner {owner!r}: unit staff row is unavailable")
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise StateRefused(f"run owner {owner!r}: unit staff row has no home folder")
+    return row.worktree.path
+
+
+def phase_worktree(directory: Path) -> KnownPhaseWorktree:
+    """Read the explicit checkout override or the unit folder from staff."""
+    path = directory / WORKTREE_FILE
+    root = Path(path.read_text(encoding="utf-8").strip()) if path.is_file() else home_worktree(directory)
+    return KnownPhaseWorktree(root)
 
 
 def _record_worktree(directory: Path, root: Path) -> None:
-    """Keep one live worktree per phase, before claim checks its reservation state."""
-    previous = phase_worktree(directory)
-    if isinstance(previous, KnownPhaseWorktree):
-        if previous.root.resolve() == root:
-            return
-        if previous.root.is_dir():
-            raise StateRefused(f"phase worktree is {previous.root}; cannot claim it in {root}")
+    """Store only a checkout that differs from the unit folder."""
     directory.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
+    if root == home_worktree(directory).resolve():
+        (directory / WORKTREE_FILE).unlink(missing_ok=True)
+    else:
+        write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
 
 
 def _record_baselines(directory: Path, root: Path) -> None:
@@ -441,8 +446,7 @@ def attribute(phases: list[OpenPhase], scopes: list[str],
               root: Path | AllPhaseWorktrees = ALL_PHASE_WORKTREES) -> Attribution | NoOpenPhaseHere:
     """Group scopes in the edit root; callers without one keep the original attribution."""
     if isinstance(root, Path):
-        phases = [phase for phase in phases if isinstance(phase.worktree, LegacyPhaseWorktree)
-                  or (phase.worktree.root.is_dir() and phase.worktree.root.resolve() == root.resolve())]
+        phases = [phase for phase in phases if phase.worktree.root.resolve() == root.resolve()]
         if not phases:
             return NoOpenPhaseHere()
     if len(phases) == 1:

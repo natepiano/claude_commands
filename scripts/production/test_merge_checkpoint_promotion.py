@@ -690,7 +690,7 @@ with lock.open("a") as held:
                          set(self.git("rev-list", "--first-parent", "--merges", "HEAD").splitlines()))
         integration, = [row for row in receipts if row["merge_commit"] == tip]
         self.assertEqual(integration["source_checkpoint"], self.git("rev-parse", "HEAD^2"))
-        self.assertRegex(result.process.stdout, re.escape(f"into: {self.checkout} (production) — ") + ".*unblocks: G1: beta-unit Phase 4")
+        self.assertRegex(result.process.stdout, re.escape(f"into: {self.checkout} (production) — ") + ".*unblocks: the unit’s next checkpoint")
         self.assertRegex(result.process.stdout, re.escape(f"into: {self.promote} (main) — ") + ".*unblocks: the live gate of alpha-unit phase 2")
         self.assertIn("the merge branch collects every unit's checkpoints", result.process.stdout)
         self.assertIn("sessions on", result.process.stdout)
@@ -711,7 +711,6 @@ with lock.open("a") as held:
         self.assertIn("send alpha-unit:", result.process.stdout)
     def test_promotion_refusal_keeps_pushed_merge_and_resume_reaches_only_missing_place(self) -> None:
         self.promotions = str(self.promote)
-        self.gate = False
         self.production_doc()
         sha = self.checkpoint()
         self.write(self.promote, "src/beta.txt", "staged local edit\n")
@@ -725,14 +724,13 @@ with lock.open("a") as held:
         self.assertEqual(self.git("rev-parse", "HEAD"), pushed)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), failed.before)
         self.assertIn(f"into: {self.checkout} (production)", failed.process.stdout)
-        self.assertIn("unblocks: no gate", failed.process.stdout)
+        self.assertIn("unblocks: the unit’s next checkpoint", failed.process.stdout)
         self.assertNotIn(f"into: {self.promote} (main)", failed.process.stdout)
         _ = self.git("restore", "src/alpha.txt", cwd=self.promote)
         resumed = self.run_checkpoint(sha)
         self.assertEqual(resumed.process.returncode, 0, resumed.process.stderr + resumed.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), pushed)
         self.assertIn(f"into: {self.promote} (main)", resumed.process.stdout)
-        self.assertNotIn("unblocks: G1", resumed.process.stdout)
         self.assertEqual((self.promote / "src/beta.txt").read_text(), "local edit\n")
         self.assertEqual(self.git("show", ":src/beta.txt", cwd=self.promote), "staged local edit")
     def test_mac_rc_failure_is_reported_after_local_promotion(self) -> None:
@@ -798,7 +796,7 @@ with lock.open("a") as held:
         self.assertEqual(self.git("rev-parse", "HEAD"), pushed)
         self.assertEqual(len(self.events("checkpoint-test")), 1)
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
-        self.assertIn("unblocks: no gate", resumed.process.stdout)
+        self.assertIn("unblocks: the unit’s next checkpoint", resumed.process.stdout)
     def test_a_merge_killed_before_its_push_is_tested_before_a_rerun_pushes_it(self) -> None:
         # Killed after the merge and before its tests finished: nothing proves the merge green.
         sha = self.checkpoint()

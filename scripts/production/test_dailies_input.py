@@ -14,6 +14,8 @@ from typing import TextIO, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import dailies_input
 import dailies_render
 from scripts.production.production_doc import read_production
@@ -116,8 +118,9 @@ class DailiesInputTests(DailiesInputFixture):
         with (mock.patch.dict(os.environ, self.env),
               mock.patch.object(unit_lookup, "labeled_sessions", return_value={}),
               mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
-            units = dailies_input.report_units(self.doc, "example", staff.snapshot())
-            reads.assert_called_once_with()
+            record = staff.snapshot()
+            units = dailies_input.report_units(self.doc, "example", record)
+            reads.assert_called_once_with(record=record)
         self.assertEqual([(unit.name, unit.run) for unit in units],
                          [(ALPHA, UnitState.STANDING_BY), (BETA, UnitState.RUN_FINISHED)])
 
