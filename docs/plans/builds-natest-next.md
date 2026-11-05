@@ -22,11 +22,11 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 
 ## Items to consider
 
-- [ ] **Speed phases for ranks 7-10**
-  - Target: `scripts/shutdown/test_restart.py`, `scripts/hana_shot/test_hana_shot.py`, `scripts/direct/test_workers.py`, `scripts/direct/test_review_launcher_pool.py`
-  - Why needed: the user's mission takes the next module when the longest one is shorter (2026-11-03).
-  - Completion condition: each module's median wall time is at most half its baseline, with the speed method in the plan's Delegation Context.
-  - Revealed by: the 2026-11-03 sort.
+- [ ] **Select the next speed targets after Phase 14.**
+  - Target: the highest ranked live modules in `test_times top` that no phase owns, subject to the plan's floor rule.
+  - Why needed: the user's mission takes the next module when the longest one is shorter (2026-11-03). The 2026-11-03 list named `scripts/direct/test_review_launcher_pool.py`, which no longer exists.
+  - Completion condition: each selected module goes through the Speed method with its current path and a measured baseline.
+  - Revealed by: the 2026-11-03 sort; the Phase 11 architect review.
 - [ ] **Architecture proposal: the type-check job**
   - Target: `scripts/production/merge_gate.py` (owner sdlc devtools-unit)
   - Why needed: report-unit names `types/basedpyright` among the three highest-CPU gate jobs (2-4 min). One basedpyright job checks every listed folder in each gate.
@@ -42,11 +42,11 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: the test starts one Python process for each of the 33 `test_*.py` modules in `scripts/buildlog`: 24.5 s of the 34.8 s suite run at load 70 (11:24 EST, 2026-11-03). It is the slowest test in the index suite, and each new module adds one more process.
   - Completion condition: one process imports every module and reports each module's log root; the test keeps one assertion per module and takes under 3 s on an idle natedev.
   - Revealed by: Phase 3
-- [ ] **The simplify-lens report validation test runs its parse in-process.**
-  - Target: `scripts/direct/test_simplify_lens.py` — `test_report_validation` (25 s, 8 review-launcher runs)
-  - Why needed: Phase 6 left this test as the module's largest cost. Seven of the 8 launches check only the report parse, not the launcher boundary.
-  - Completion condition: one launch keeps the process boundary; the other cases call the parse in-process; same-load pairs show the gain (estimated 20 s, not measured).
-  - Revealed by: Phase 6; showrunner ruling 2026-11-04 (measured follow-up).
+- [ ] **The simplify-lens report validation test starts fewer processes and keeps its recorder checks.**
+  - Target: `scripts/direct/test_simplify_lens.py` — `test_report_validation_trims_whitespace_and_requires_pass_or_a_numbered_item` (25 s, 8 review-launcher runs)
+  - Why needed: Phase 6 left this test as the module's largest cost. Each of the 8 runs checks the report result, the saved status and the review record's `status` and `raised` fields, so a parse-only call cannot replace them.
+  - Completion condition: every existing check stays; the needed process boundaries stay; same-load pairs show the gain.
+  - Revealed by: Phase 6; showrunner ruling 2026-11-04; the Phase 11 architect review.
 - [ ] **Each improved module keeps a reference time.**
   - Target: `scripts/test_times/show.py`, `config/test_times.conf`
   - Why needed: the gate's slowdown warning compares with a rolling median, which slowly accepts a slowdown as normal (Astra plan review, 2026-11-04).
