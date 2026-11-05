@@ -485,12 +485,14 @@ class MemberSources:
     launches: tuple[PaneLaunch, ...]
 
     def canonical_slug(self, slug: str) -> str:
-        """Resolve a former slug from the documents already read for this snapshot."""
+        """Resolve a former slug from loaded documents, then recorded journals."""
         if slug in self.productions:
             return slug
         matches = [name for name, source in self.productions.items()
                    if slug in showrunners.former_slugs(source.document)]
-        return matches[0] if len(matches) == 1 else slug
+        if matches:
+            return matches[0] if len(matches) == 1 else slug
+        return showrunners.rename_history().get(slug, slug)
 
     def member(self, selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
         if isinstance(selector, FolderMember):
@@ -510,9 +512,7 @@ class MemberSources:
             return MemberFound(row) if row is not None and row.kind == "showrunner" else NoSuchMember(selector)
         owner = record.by_doc(remote.local_machine(), source.timer.doc)
         if owner is not None:
-            timer = showrunners.timer_for(owner, record, sources=self.productions.values())
-            return (MemberFound(owner) if owner.kind == "showrunner" and isinstance(timer, showrunners.Timer)
-                    else NoSuchMember(selector))
+            return MemberFound(owner) if owner.kind == "showrunner" else NoSuchMember(selector)
         return NoSuchMember(selector)
 
     def showrunner_members(self, record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
@@ -525,6 +525,7 @@ class MemberSources:
 
 
 def member_sources(*, dependencies: Callable[[Path], None] | None = None,
+                   record: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
                    unreadable: showrunners.UnreadableTimerPolicy = showrunners.UnreadableTimerPolicy.SKIP) -> MemberSources:
     import herdr
     from scripts.shutdown import pane_record
@@ -537,7 +538,7 @@ def member_sources(*, dependencies: Callable[[Path], None] | None = None,
     except ValueError as error:
         raise staff.StaffUnreadable(str(error)) from error
     sources = showrunners.read_sources(unreadable=unreadable,
-                                       dependencies=dependencies)
+                                       dependencies=dependencies, record=record)
     return MemberSources({source.timer.slug: source for source in sources}, tuple(launches.values()))
 
 
@@ -608,11 +609,12 @@ class LabeledProductions:
         return dict(self.units.get(slug, {}))
 
 
-def lookup_slug(slug: str) -> str:
-    # A current notifier name needs no scan of Formerly entries or reread of its doc.
-    if (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}").is_dir():
+def lookup_slug(slug: str, *, record: staff.StaffSnapshot | None = None) -> str:
+    if record is None:
+        return canonical_slug(slug)
+    if any(showrunners.owner_slug(row) == slug for row in record.find(kind="showrunner")):
         return slug
-    return canonical_slug(slug)
+    return showrunners.rename_history().get(slug, slug)
 
 
 def production_members(record: staff.StaffSnapshot, sources: MemberSources) -> dict[str, tuple[staff.StaffRow, ...]]:
@@ -632,7 +634,7 @@ def group_labeled_sessions(marked: Iterable[LabeledSession], *,
                        sources: MemberSources | None = None) -> LabeledProductions:
     """Join native runtime identities to their recorded parents."""
     record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources()
+    sources = sources if sources is not None else member_sources(record=record)
     return _group_labeled_sessions(marked, record, production_members(record, sources), sources.launches)
 
 
@@ -712,7 +714,7 @@ def session_staff_and_directors(
     known = {session["sessionId"] for session in records}
     proc = Path(environment.get("HERDR_PROC", "/proc"))
     record = record if record is not None else staff.snapshot()
-    sources = member_sources()
+    sources = member_sources(record=record)
     for session in records:
         try:
             # Herdr's Linux environment reader is private; keep this PID-only IO here.
@@ -746,7 +748,8 @@ class LaunchMembership:
 
     @classmethod
     def read(cls) -> LaunchMembership:
-        return cls(staff.snapshot(), member_sources())
+        record = staff.snapshot()
+        return cls(record, member_sources(record=record))
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
         labels = StaffLabels(self.record, self.sources.productions, self.sources.showrunner_members(self.record))

@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff, staff_sources
 from scripts.production import showrunners
-from scripts.production.store_owner import showrunner_id
 
 
 def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
@@ -166,24 +165,6 @@ def edges_to_release(slug: str, *, record: staff.StaffSnapshot | None = None) ->
     parent = tree.get(slug, "")
     children = tuple(sorted(child for child, above in tree.items() if above == slug))
     return WrapRelease(ReportedTo(parent) if parent else Root(), children, ())
-
-
-def release_edges(slug: str, released: WrapRelease, *, record: staff.StaffSnapshot | None = None) -> None:
-    """Remove captured legacy files unless the record has a subsequent attachment."""
-    record = record if record is not None else staff.snapshot()
-    tree = edges(record=record)
-    captured = [(child, slug) for child in released.former_children]
-    if isinstance(released.former_parent, ReportedTo):
-        captured.insert(0, (slug, released.former_parent.parent))
-    for child, parent in captured:
-        identity = showrunner_id(child, record=record)
-        row = record.by_id(identity)
-        assert row is not None
-        current = tree.get(child, "")
-        if not current or current == parent:
-            (showrunners.SHOWRUNNER_STATE_DIR / identity / showrunners.PARENT_FILE).unlink(missing_ok=True)
-        else:
-            print(f"showrunners: keep {row.name} -> {current}; captured parent was {parent}", file=sys.stderr)
 
 
 def main(action: str, slug: str) -> int:

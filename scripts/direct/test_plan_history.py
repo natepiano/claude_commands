@@ -91,15 +91,15 @@ class PlanDependencyTests(unittest.TestCase):
                     ["3", "4"],
                 )
 
-    def read_unit_dependencies(self, header: str, depends: str) -> list[str] | None:
+    def read_unit_dependencies(self, in_staff: bool, depends: str) -> list[str] | None:
         with tempfile.TemporaryDirectory(dir="/tmp/claude") as directory:
             plan = Path(directory) / "plan.md"
             _ = plan.write_text(
-                "# Plan\n" + header + "\n### Phase 100 — Delivery · status: todo\n"
+                "# Plan\n\n### Phase 100 — Delivery · status: todo\n"
                 + "**Depends on:** " + depends + "\n",
                 encoding="utf-8",
             )
-            if header:
+            if in_staff:
                 document = plan.parent / "production.md"
                 _ = document.write_text("# Production\n")
                 _ = recorded_unit("sdlc-owner", "phases", plan.parent, document, plan=plan.name)
@@ -108,29 +108,23 @@ class PlanDependencyTests(unittest.TestCase):
         return phases[0]["depends_on"]
 
     def test_own_unit_qualified_phases_are_local_dependencies(self) -> None:
-        for header in (
-            "> **Production: sdlc** — unit `phases-unit`",
-            "> **Production:** sdlc — unit `phases-unit`",
-        ):
-            with self.subTest(header=header):
-                self.assertEqual(
-                    self.read_unit_dependencies(
-                        header, "phases-unit Phase 15; models-unit's Phase 4; phases-unit's Phase 16"
-                    ),
-                    ["15", "16"],
-                )
         self.assertEqual(
-            self.read_unit_dependencies("", "phases-unit Phase 15; Phase 7"), ["7"]
+            self.read_unit_dependencies(
+                True, "phases-unit Phase 15; models-unit's Phase 4; phases-unit's Phase 16"
+            ),
+            ["15", "16"],
+        )
+        self.assertEqual(
+            self.read_unit_dependencies(False, "phases-unit Phase 15; Phase 7"), ["7"]
         )
 
     def test_quoted_unit_qualifiers_preserve_dependency_ownership(self) -> None:
-        header = "> **Production: sdlc** — unit `phases-unit`"
         for quote in ("`", "'", '"', "**"):
             for possessive in ("", "'s", "’s"):
                 with self.subTest(quote=quote, possessive=possessive):
                     self.assertEqual(
                         self.read_unit_dependencies(
-                            header,
+                            True,
                             f"{quote}models-unit{quote}{possessive} Phases 11 and 12; "
                             + f"{quote}phases-unit{quote}{possessive} Phase 15; Phase 7",
                         ),
@@ -138,7 +132,7 @@ class PlanDependencyTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         self.read_unit_dependencies(
-                            "", f"{quote}models-unit{quote}{possessive} Phase 11"
+                            False, f"{quote}models-unit{quote}{possessive} Phase 11"
                         ),
                         [],
                     )
