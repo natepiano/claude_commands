@@ -9,9 +9,7 @@ Run this in the showrunner session. Run
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's update timer. Print its total line too, when present.
 Both tables show only the production's staff units. **Status** is `paused` or `active`, including stopped units.
-**Unit** is the session name now, or
-`gone` (no herdr session carries its mark), `not running` (Claude has stopped)
-or `unknown`.
+**Unit** is the unit's staff name, including stopped units and units without a session.
 
 For a production without `Kind: style`, the table is `| Unit | Status | Phase | Task |`:
 

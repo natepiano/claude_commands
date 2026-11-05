@@ -74,10 +74,11 @@ def task_cell(record: object) -> str:
 
 
 def table(units: list[live_units.LiveUnit], records: dict[str, object]) -> str:
+    names = {unit_names.unit_id(row.name): row.name for row in staff.snapshot().find(kind="unit")}
     lines = ["| Unit | Status | Phase | Task |", "| --- | --- | --- | --- |"]
     for unit in units:
         record = records.get(unit.unit)
-        cells = (display_cells.session_cell(unit), unit.status, phase_cell(record), task_cell(record))
+        cells = (names.get(unit.unit, unit.unit), unit.status, phase_cell(record), task_cell(record))
         lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")
     return "\n".join(lines)
 

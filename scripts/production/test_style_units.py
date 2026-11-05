@@ -21,7 +21,6 @@ import proposal_issue
 import style_units
 import style_ledger
 import unit_lookup
-import display_cells
 from herdr import HerdrPlace
 from scripts.direct import plan_history
 from scripts.production import staff
@@ -219,11 +218,11 @@ class StyleUnitsTests(unittest.TestCase):
 
         initial = render_status()
         self.assertIn("| names | active | idle |", initial)
-        self.assertIn("| gone | active | idle |", initial)
+        self.assertIn("| types | active | idle |", initial)
         _ = staff.pause(self.owners["types"].id, "review the change")
         paused = render_status()
         self.assertIn("| names | active | idle |", paused)
-        self.assertIn("| gone | paused | idle |", paused)
+        self.assertIn("| types | paused | idle |", paused)
         _ = staff.resume(self.owners["types"].id)
         self.assertEqual(render_status(), initial)
 
@@ -540,7 +539,7 @@ class StyleUnitsTests(unittest.TestCase):
                 before = database.read_bytes()
                 output = style_units.table([live_unit("names-unit")], {}, doc=self.doc, now=NOW, zone=ZONE,
                                            ledger_paths={"names-unit": database})
-                self.assertIn("| gone | active | idle | idle | — | 0 | 0 | 0 |", output)
+                self.assertIn("| names | active | idle | idle | — | 0 | 0 | 0 |", output)
                 self.assertEqual(database.read_bytes(), before)
         database = self.root / "absent" / "ledger.sqlite"
         output = style_units.table([live_unit("names-unit")], {}, doc=self.doc, now=NOW, zone=ZONE,
@@ -583,13 +582,13 @@ class StyleUnitsTests(unittest.TestCase):
             output = self.render(records=records)
         self.assertIn("| names | active | #42 · comments-name-code-constructs · cargo-liner · 3 findings | starting 3 findings | — | 0 | 0 | 7 |", output)
 
-    def test_session_cells_and_pipes_keep_the_phase_table_meaning(self) -> None:
-        units = [live_unit("names-unit", "names|worker"), live_unit("types-unit")]
+    def test_unit_names_come_from_staff_and_ticket_cells_escape_pipes(self) -> None:
+        _ = self.ticket(rule="global:rust/a|b.md")
+        units = [live_unit("names-unit", "another-session"), live_unit("types-unit")]
         output = self.render(units)
-        self.assertIn("| names\\|worker | active | idle |", output)
-        self.assertIn("| gone | active | idle |", output)
-        self.assertNotIn("| names-unit |", output)
-        self.assertEqual(display_cells.session_cell(units[0]), "names|worker")
+        self.assertIn("| names | active | #42 · a\\|b · cargo-liner ·", output)
+        self.assertIn("| types | active | idle |", output)
+        self.assertNotIn("another-session", output)
 
 
 if __name__ == "__main__":

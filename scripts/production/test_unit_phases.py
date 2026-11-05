@@ -1,4 +1,4 @@
-"""Tests for the showrunner's unit phases: session, current phase and task of each live unit."""
+"""Tests for each unit's staff name, phase and task."""
 from __future__ import annotations
 
 import contextlib
@@ -28,7 +28,6 @@ from herdr import HerdrPlace
 import unit_phases
 import style_units
 import style_ledger
-import display_cells
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id
 
@@ -83,11 +82,14 @@ class UnitPhasesTests(unittest.TestCase):
         with patch.object(plan_history, "plan_runs", return_value=[self.run_file(*events)]):
             return unit_phases.task_cell(record)
 
-    def test_session_names_the_live_claude_or_says_why_there_is_none(self) -> None:
-        self.assertEqual(display_cells.session_cell(unit("a", live("alpha"))), "alpha")
-        self.assertEqual(display_cells.session_cell(unit("a", None)), "gone")
-        self.assertEqual(display_cells.session_cell(unit("a", unit_lookup.ClaudeNotRunning())), "not running")
-        self.assertEqual(display_cells.session_cell(unit("a", unit_lookup.ClaudeUnknown("no records"))), "unknown")
+    def test_unit_name_comes_from_staff_for_every_session_state(self) -> None:
+        owner = fixture_member("showrunner", name="table-owner")
+        _ = fixture_member("unit", name="namecheck", parent=owner.id)
+        for session in (None, live("another-session"), unit_lookup.ClaudeNotRunning(),
+                        unit_lookup.ClaudeUnknown("no records")):
+            with self.subTest(session=session):
+                rendered = unit_phases.table([unit("namecheck-unit", session)], {})
+                self.assertEqual(rendered.splitlines()[2], "| namecheck | active | — | — |")
 
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
         cases: list[tuple[object, str]] = [
@@ -147,12 +149,15 @@ class UnitPhasesTests(unittest.TestCase):
         runs.assert_not_called()
 
     def test_table_has_one_row_per_unit_and_escapes_pipes(self) -> None:
-        records: dict[str, object] = {"one-unit": {"current": None, "phases": phase_rows("todo")}}
+        owner = fixture_member("showrunner", name="table-owner")
+        for name in ("one", "two"):
+            _ = fixture_member("unit", name=name, parent=owner.id)
+        records: dict[str, object] = {"one-unit": {"current": {"phase": "1", "of": 2, "title": "a|b"}}}
         self.assertEqual(unit_phases.table([unit("one-unit", live("a|b")), unit("two-unit", None)], records), "\n".join([
             "| Unit | Status | Phase | Task |",
             "| --- | --- | --- | --- |",
-            "| a\\|b | active | not started | — |",
-            "| gone | active | — | — |",
+            "| one | active | 1 of 2 · a\\|b | — |",
+            "| two | active | — | — |",
         ]))
 
     def test_plain_table_reads_active_and_paused_status_from_staff_even_when_gone(self) -> None:
@@ -179,10 +184,10 @@ class UnitPhasesTests(unittest.TestCase):
         _ = staff.pause(second.id, "review the change")
         paused = render()
         self.assertIn("| first | active | — | — |", paused)
-        self.assertIn("| gone | paused | — | — |", paused)
+        self.assertIn("| second | paused | — | — |", paused)
         _ = staff.resume(second.id)
         resumed = render()
-        self.assertIn("| gone | active | — | — |", resumed)
+        self.assertIn("| second | active | — | — |", resumed)
         self.assertEqual(staff.by_id(first.id), first)
 
     def test_unplaced_processes_print_below_the_table_and_send_one_configured_message(self) -> None:
@@ -219,7 +224,7 @@ class UnitPhasesTests(unittest.TestCase):
             result = unit_phases.main(["--production", str(doc)])
         self.assertEqual(result, 0, errors.getvalue())
         lines = output.getvalue().splitlines()
-        table_end = next(index for index, line in enumerate(lines) if line.startswith("| gone |"))
+        table_end = next(index for index, line in enumerate(lines) if line.startswith("| member |"))
         anomalies = [line for line in lines if line.startswith("anomaly:")
                      and ("unplaced-codex" in line or "unplaced-claude" in line)]
         self.assertEqual(len(anomalies), 2, output.getvalue())
@@ -255,7 +260,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
             result = unit_phases.main(["--production", str(doc)])
         self.assertEqual(result, 0)
-        self.assertIn("| gone | active |", output.getvalue())
+        self.assertIn("| member | active |", output.getvalue())
         self.assertNotIn("anomaly:", output.getvalue())
         sender.assert_not_called()
         self.assertEqual(staff.by_id(member.id), member)
@@ -288,7 +293,7 @@ class UnitPhasesTests(unittest.TestCase):
 
         self.assertEqual(result, 0, errors.getvalue())
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(output.getvalue().splitlines()[-2:], ["| gone | active | — | — |", line])
+        self.assertEqual(output.getvalue().splitlines()[-2:], ["| member | active | — | — |", line])
         scanner.assert_called_once()
         sender.assert_called_once()
         call = sender.call_args
@@ -331,6 +336,8 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIs(plan_history.plan_runs, scans)
 
     def test_without_a_production_the_callers_timer_names_it(self) -> None:
+        owner = fixture_member("showrunner", name="table-owner")
+        _ = fixture_member("unit", name="a", parent=owner.id)
         doc = self.root / "show-production.md"
         _ = doc.write_text("# Production\n", encoding="utf-8")
         out = io.StringIO()
@@ -375,6 +382,8 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "ticket table\n")
 
     def test_other_or_absent_kind_keeps_the_phase_table(self) -> None:
+        owner = fixture_member("showrunner", name="table-owner")
+        _ = fixture_member("unit", name="a", parent=owner.id)
         for kind in ("", "- **Kind:** feature\n"):
             with self.subTest(kind=kind):
                 doc = self.root / "phase-production.md"
