@@ -30,6 +30,13 @@ class VerifyTokenOwnershipTests(VerifyTokenOwnershipFixture):
             self.assertIsNone(first.poll(), "holder exited before its lock expired")
 
             _ = (lock / "expires").write_text("0")
+            refused = subprocess.run(["bash", str(BOARD), "acquire", str(board), "second",
+                                      "cargo", "--wait", "0"], capture_output=True, text=True,
+                                     check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
+            step_record["start"] = "not-the-running-group"
+            _ = (lock / "owned").write_text(json.dumps(step_record))
             second = subprocess.run(["bash", str(BOARD), "acquire", str(board), "second",
                                      "cargo", "--wait", "0"], capture_output=True, text=True,
                                     check=False, timeout=TEST_HANG_GUARD_SECS)

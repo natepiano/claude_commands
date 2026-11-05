@@ -9,14 +9,42 @@ import tempfile
 import socket
 import subprocess
 import sys
+import time
 from typing import cast
 import unittest
 from unittest.mock import patch
 
 from scripts.direct import step_record as steps
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class StepRecordTests(unittest.TestCase):
+    def test_write_can_supply_the_shell_clock_offset_without_changing_the_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = {**os.environ, "VERIFY_STEPS_DIR": directory}
+            arguments = [sys.executable, str(Path(steps.__file__)), "write", "--call-id", "clock",
+                         "--pid", str(os.getpid()), "--repo", directory, "--kind", "test",
+                         "--runs-on", "ssh_allowed", "--eligible-targets", "mac,aws", "--mac-targets", "mac",
+                         "--pinned-target", "mac", "--package", "sample", "--state", "waiting_hold"]
+            before = (time.time_ns() - time.monotonic_ns()) // 1000
+            result = subprocess.run([*arguments, "--clock-offset"], env=environment,
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            after = (time.time_ns() - time.monotonic_ns()) // 1000
+            self.assertEqual(result.returncode, 0, result.stderr)
+            offset = int(result.stdout)
+            # Separate clock reads can cross a microsecond boundary.
+            self.assertLessEqual(min(before, after) - 1, offset)
+            self.assertLessEqual(offset, max(before, after) + 1)
+            with patch.dict(os.environ, environment):
+                record = steps.read("clock")
+            self.assertIsInstance(record, steps.StepRecord)
+            assert isinstance(record, steps.StepRecord)
+            self.assertEqual(record.runs_on, steps.SshAllowed(("mac", "aws"), ("mac",)))
+            self.assertEqual(record.selection, steps.Pinned("mac"))
+            self.assertEqual((record.kind, record.package), ("test", steps.NamedPackage("sample")))
+            self.assertTrue((root / "clock.json").is_file())
+
     def test_start_command_prints_the_process_start_field_as_text(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             process = Path(folder) / "42"
