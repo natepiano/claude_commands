@@ -23,7 +23,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
-from enum import Enum
 from functools import lru_cache
 from itertools import chain
 from types import UnionType, MappingProxyType
@@ -37,8 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 from build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
-                         StepEvidence, KnownStepCommit, step_commit,
-                         TEST_STEPS, build_shape, index_step_evidence, recorded_build_shape)
+                         StepEvidence, TEST_STEPS, build_shape, index_step_evidence, recorded_build_shape, step_index)
 from atomic_file import write_text_atomic
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 import conf
@@ -265,271 +263,6 @@ class UnknownRepository:
 
 
 Repository = RepositoryIdentity | UnknownRepository
-
-
-@dataclass(frozen=True)
-class ArgvFeatureChange:
-    repository: str
-    feature: str
-    note: str
-
-
-@dataclass(frozen=True)
-class CommitChange:
-    repository: str
-    sha: str
-    note: str
-
-
-BuildChange = ArgvFeatureChange | CommitChange
-
-
-class AncestryOutcome(Enum):
-    """Only a resolved commit places a row before or after a change."""
-
-    AFTER_CHANGE = "after_change"
-    BEFORE_CHANGE = "before_change"
-    AMBIGUOUS_SHORT_SHA = "ambiguous_short_sha"
-    UNAVAILABLE = "unavailable"
-
-
-@dataclass(frozen=True)
-class NoHistorySplit:
-    """No enabled change applies to the admitted repository and profile."""
-
-
-NO_HISTORY_SPLIT = NoHistorySplit()
-BUILD_CHANGES_PATH = Path(__file__).resolve().parents[2] / "config/build_changes.json"
-
-
-@dataclass(frozen=True)
-class HistorySplit:
-    repository: RepositoryIdentity
-    changes: tuple[BuildChange, ...]
-    shape: BuildShape
-    marks: Mapping[str, AncestryOutcome]
-    evidence: Mapping[tuple[str, str], StepEvidence]
-    admitted_sides: Mapping[str, AncestryOutcome]
-    marks_added: bool
-
-
-@dataclass(frozen=True)
-class UnusableBuildChanges:
-    reason: str
-
-
-def read_build_changes(path: Path) -> tuple[BuildChange, ...] | UnusableBuildChanges:
-    """Read the shared change list or explain why it is unusable."""
-    try:
-        raw = cast(object, json.loads(path.read_text()))
-        if not isinstance(raw, list):
-            raise ValueError("build changes must be a list")
-        changes: list[BuildChange] = []
-        for entry in cast(list[object], raw):
-            if not isinstance(entry, dict):
-                raise ValueError("a build change must be an object")
-            row = cast(dict[str, object], entry)
-            enabled = row.get("enabled", True)
-            if not isinstance(enabled, bool):
-                raise ValueError("build change enabled must be true or false")
-            repository, kind, note = row.get("repository"), row.get("kind"), row.get("note")
-            value = row.get("feature" if kind == "argv_feature" else "sha")
-            if (not all(isinstance(part, str) and part for part in (repository, note, value))
-                    or kind not in ("argv_feature", "commit")):
-                raise ValueError("a build change needs a repository, kind, value and note")
-            repository, value, note = cast(str, repository), cast(str, value), cast(str, note)
-            if kind == "commit" and re.fullmatch(r"[0-9a-f]{40}", value) is None:
-                raise ValueError("a commit change needs a full sha")
-            if enabled:
-                constructor = ArgvFeatureChange if kind == "argv_feature" else CommitChange
-                changes.append(constructor(repository, value, note))
-        return tuple(changes)
-    except (OSError, ValueError) as error:
-        return UnusableBuildChanges(str(error))
-
-
-def build_mark_key(repository: str, change: str, sha: str) -> str:
-    return json.dumps((repository, change, sha), separators=(",", ":"))
-
-
-def read_build_marks(root: Path) -> dict[str, AncestryOutcome]:
-    """Read cached ancestry without changing coordination state."""
-    try:
-        raw = cast(object, json.loads((root / "admission/build_marks.json").read_text()))
-        if isinstance(raw, dict):
-            record = cast(dict[str, object], raw)
-            marks = record.get("marks")
-            if record.get("version") == 1 and isinstance(marks, dict):
-                return {key: AncestryOutcome(value) for key, value in cast(dict[str, object], marks).items()
-                        if isinstance(value, str) and value in {answer.value for answer in AncestryOutcome
-                                                              if answer is not AncestryOutcome.UNAVAILABLE}}
-    except (OSError, ValueError):
-        pass
-    return {}
-
-
-def ancestry_outcomes(directory: str, commit: KnownStepCommit,
-                      changes: Sequence[CommitChange]) -> dict[str, AncestryOutcome]:
-    """Run one git query for a commit and classify every applicable change."""
-    try:
-        result = subprocess.run(["git", "-C", directory, "rev-list", "--end-of-options",
-                                 *(change.sha for change in changes), f"^{commit.sha}", "--"],
-                                capture_output=True, text=True, timeout=10, check=False)
-        if result.returncode:
-            outcome = (AncestryOutcome.AMBIGUOUS_SHORT_SHA if "short object ID" in result.stderr
-                       else AncestryOutcome.UNAVAILABLE)
-            return {change.sha: outcome for change in changes}
-        missing = set(result.stdout.splitlines())
-        return {change.sha: (AncestryOutcome.BEFORE_CHANGE if change.sha in missing
-                             else AncestryOutcome.AFTER_CHANGE) for change in changes}
-    except (OSError, subprocess.TimeoutExpired):
-        return {change.sha: AncestryOutcome.UNAVAILABLE for change in changes}
-
-
-def estimate_evidence(root: Path, host: str, step: str, now: datetime,
-                      split: HistorySplit | NoHistorySplit) -> Mapping[tuple[str, str], StepEvidence]:
-    """Reuse the evidence loaded for this estimate."""
-    if isinstance(split, HistorySplit):
-        return split.evidence
-    return index_step_evidence(file_marks.index_path_in(root), host, step,
-                               datetime.min.replace(tzinfo=now.tzinfo), now)
-
-
-def repository_history_calls(repository: RepositoryIdentity, host: str, names: tuple[str, ...],
-                             now: datetime, root: Path) -> set[tuple[str, str]]:
-    """Select calls from the anonymous history and indexed fallback window."""
-    cutoff = now - timedelta(days=HISTORY_DAYS)
-    calls: set[tuple[str, str]] = set()
-    try:
-        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
-            call, step = item.get("call_id"), item.get("step")
-            if (not isinstance(call, str) or not call or not isinstance(step, str)
-                    or step not in names or item.get("host") != host
-                    or not history_matches_repository(item, repository)):
-                continue
-            try:
-                ended = datetime.fromisoformat(str(item.get("ended_at", "")))
-                if cutoff <= ended <= now:
-                    calls.add((call, step))
-            except (ValueError, TypeError):
-                continue
-    except OSError:
-        pass
-    if repository.legacy_name:
-        try:
-            with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
-                rows = cast(list[tuple[object, object]], connection.execute(
-                    "SELECT call_id, step FROM steps WHERE host=? AND repo=? "
-                    + "AND started_at>=? AND started_at<? AND peak_mem_bytes>0",
-                    (host, repository.legacy_name, store.utc_iso(cutoff.timestamp()), store.utc_iso(now.timestamp())),
-                ).fetchall())
-            calls.update((call, step) for call, step in rows
-                         if isinstance(call, str) and call and isinstance(step, str) and step in names)
-        except (OSError, sqlite3.Error):
-            pass
-    return calls
-
-
-def prepare_history_split(repository: Repository, argv: list[str], cwd: str,
-                          now: datetime, root: Path, *, step: str, host: str,
-                          shape: BuildShape, scope: TestScope, package: str) -> HistorySplit | NoHistorySplit:
-    """Resolve sides before admission connects, without holding a service lock."""
-    if not isinstance(repository, RepositoryIdentity):
-        return NO_HISTORY_SPLIT
-    configured = read_build_changes(BUILD_CHANGES_PATH)
-    if isinstance(configured, UnusableBuildChanges):
-        print(f"memory admit: build changes unusable: {configured.reason}", file=sys.stderr)
-        return NO_HISTORY_SPLIT
-    changes = tuple(change for change in configured
-                    if change.repository == repository.key
-                    and (not isinstance(change, CommitChange) or shape.profile in ("dev", "test")))
-    if not changes:
-        return NO_HISTORY_SPLIT
-    names = tuple(dict.fromkeys((step, "check", "build"))) if scope == "filtered" and package else (step,)
-    evidence: dict[tuple[str, str], StepEvidence] = {}
-    for name in names:
-        evidence.update(index_step_evidence(file_marks.index_path_in(root), host, name,
-                                            datetime.min.replace(tzinfo=now.tzinfo), now))
-    commit_changes = tuple(change for change in changes if isinstance(change, CommitChange))
-    marks = read_build_marks(root) if commit_changes else {}
-    marks_added = False
-    admitted_sides: dict[str, AncestryOutcome] = {}
-    if commit_changes:
-        directory = record.git_directory(argv, cwd)
-        commit = step_commit(git_output(directory, "rev-parse", "HEAD"))
-        commits: set[KnownStepCommit] = {commit} if isinstance(commit, KnownStepCommit) else set()
-        calls = repository_history_calls(repository, host, names, now, root)
-        commits.update(value.commit for key, value in evidence.items()
-                       if key in calls and isinstance(value.commit, KnownStepCommit))
-        for candidate in sorted(commits, key=lambda value: value.sha):
-            pending = tuple(change for change in commit_changes
-                            if build_mark_key(repository.key, change.sha, candidate.sha) not in marks)
-            if pending:
-                for change_sha, outcome in ancestry_outcomes(directory, candidate, pending).items():
-                    if outcome is not AncestryOutcome.UNAVAILABLE:
-                        marks[build_mark_key(repository.key, change_sha, candidate.sha)] = outcome
-                        marks_added = True
-        admitted_sides = {
-            change.sha: (marks.get(build_mark_key(repository.key, change.sha, commit.sha), AncestryOutcome.UNAVAILABLE)
-                         if isinstance(commit, KnownStepCommit) else AncestryOutcome.UNAVAILABLE)
-            for change in commit_changes
-        }
-    return HistorySplit(repository, changes, shape, marks, evidence, admitted_sides, marks_added)
-
-
-def write_build_marks(root: Path, marks: Mapping[str, AncestryOutcome]) -> None:
-    """Persist new ancestry answers only from the client estimation path."""
-    path = root / "admission/build_marks.json"
-    # The estimate-cache guard belongs here, before this path can change.
-    write_text_atomic(path, json.dumps({"version": 1, "marks": {key: value.value for key, value in marks.items()}}) + "\n")
-
-
-@dataclass(frozen=True)
-class UnindexedFailedPeak:
-    """A failed peak has a shape but awaits its indexed commit."""
-
-    shape: BuildShape | NoBuildShape
-
-
-def history_shape(item: Mapping[str, object], evidence: StepEvidence) -> BuildShape | NoBuildShape:
-    """Keep a recorded shape and recover only a missing shape from the index."""
-    return recorded_build_shape(item.get("shape")) if "shape" in item else evidence.shape
-
-
-def on_admitted_side(evidence: StepEvidence | UnindexedFailedPeak,
-                     split: HistorySplit | NoHistorySplit) -> bool:
-    """Compare each change with the admitted side without reading history."""
-    if isinstance(split, NoHistorySplit):
-        return True
-    for change in split.changes:
-        if isinstance(change, ArgvFeatureChange):
-            if (not isinstance(evidence.shape, BuildShape)
-                    or (change.feature in evidence.shape.features) != (change.feature in split.shape.features)):
-                return False
-        elif not isinstance(evidence, UnindexedFailedPeak):
-            if not isinstance(evidence.commit, KnownStepCommit):
-                return False
-            own = split.admitted_sides[change.sha]
-            sample = split.marks.get(build_mark_key(split.repository.key, change.sha, evidence.commit.sha))
-            if own not in (AncestryOutcome.AFTER_CHANGE, AncestryOutcome.BEFORE_CHANGE) or own != sample:
-                return False
-    return True
-
-
-def same_history_side(item: Mapping[str, object], evidence: StepEvidence,
-                      split: HistorySplit | NoHistorySplit) -> bool:
-    """Keep a failed publication until its indexed commit arrives."""
-    if isinstance(split, NoHistorySplit):
-        return True
-    if not history_matches_repository(item, split.repository):
-        return False
-    shape = history_shape(item, evidence)
-    if evidence is NO_STEP_EVIDENCE:
-        return (isinstance(history_outcome(item.get("outcome")), (Failed, Killed, OwnerGone))
-                and on_admitted_side(UnindexedFailedPeak(shape), split))
-    return on_admitted_side(replace(evidence, shape=shape), split)
-
-
 LegacyNeedSource = Literal["measured", "buildlog", "pooled", "fallback"]
 NeedSource = str
 
@@ -680,7 +413,7 @@ class OutcomeNotRecorded:
 FinalOutcome = Completed | Failed | Killed | OwnerGone
 HistoryOutcome = FinalOutcome | OutcomeNotRecorded
 NO_BUILD_SHAPE = NoBuildShape()
-NO_STEP_EVIDENCE = StepEvidence(NoBuildShape(), CompileCountUnknown())
+NO_STEP_EVIDENCE = StepEvidence(NO_BUILD_SHAPE, CompileCountUnknown())
 OUTCOME_NOT_RECORDED = OutcomeNotRecorded()
 
 
@@ -2292,8 +2025,7 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
                   filters: tuple[str, ...] = (), package: str = "",
                   fresh: bool = False,
                   shape: BuildShape | NoBuildShape = NO_BUILD_SHAPE,
-                  first_peak_bytes: int,
-                  history_split: HistorySplit | NoHistorySplit) -> ExpectedPeak:
+                  first_peak_bytes: int) -> ExpectedPeak:
     """Estimate a compile promise from HISTORY_DAYS of earlier peaks.
 
     Full test requests with a package recover missing selection fields from
@@ -2301,26 +2033,25 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
     The gate pools test widths. `test_threads` selects one width for reports.
     """
     if step == "build":
-        return build_expected_peak(repository, shape, host, now, root, first_peak_bytes, history_split=history_split)
+        return build_expected_peak(repository, shape, host, now, root, first_peak_bytes)
     if isinstance(repository, UnknownRepository):
         return ExpectedPeak(first_peak_bytes, "fallback", 0)
     filters = filter_set(filters)
     if fresh and step == "nextest" and package:
         compile_peak = expected_peak(repository, step, host, now, root, test_threads,
                                      scope=scope, filters=filters, package=package,
-                                     first_peak_bytes=first_peak_bytes, history_split=history_split)
+                                     first_peak_bytes=first_peak_bytes)
         return fresh_test_peak(repository, step, host, now, root, test_threads,
-                               scope, filters, package, compile_peak, history_split=history_split)
+                               scope, filters, package, compile_peak)
     if scope == "filtered" and package:
         return filtered_peak(repository, step, host, now, root, test_threads,
-                             filters, package, history_split=history_split)
+                             filters, package)
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     rows: list[dict[str, object]] = []
-    for sample in compiling_history(root, host, step, now, history_split=history_split):
-        item = sample.item
+    for item, evidence in compiling_history(root, host, step, now):
         if package and step in TEST_STEPS:
-            selection = sample.selection
+            selection = history_selection(item, evidence)
             if selection.package != package or selection.scope != scope:
                 continue
         elif item.get("test_scope", "full") != scope:
@@ -2334,31 +2065,24 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
     if len(measured) >= 5:
         return ExpectedPeak(percentile(measured), "measured", len(measured))
     peaks: list[int] = []
-    indexed_evidence: Mapping[tuple[str, str], StepEvidence] = (estimate_evidence(root, host, step, now, history_split)
-                        if isinstance(history_split, HistorySplit) else {})
-    try:
-        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
-            if repository.legacy_name:
-                columns = {row[1] for row in cast(list[tuple[object, ...]],
-                           connection.execute("PRAGMA table_info(steps)").fetchall())}
+    if repository.legacy_name:
+        try:
+            with step_index(file_marks.index_path_in(root)) as (connection, columns):
                 argv_column = "argv" if "argv" in columns else "NULL"
-                call_column = "call_id" if "call_id" in columns else "NULL"
                 compile_clause = " AND crates_compiled > 0" if "crates_compiled" in columns else ""
-                indexed = cast(list[tuple[int, str | None, str]], connection.execute(
-                    f"SELECT peak_mem_bytes, {argv_column}, {call_column} FROM steps WHERE host=? AND repo=? AND step=? "
+                indexed = cast(list[tuple[int, str | None]], connection.execute(
+                    f"SELECT peak_mem_bytes, {argv_column} FROM steps WHERE host=? AND repo=? AND step=? "
                     + "AND started_at>=? AND started_at<? AND peak_mem_bytes>0" + compile_clause,
                     (host, repository.legacy_name, step, cutoff, before),
                 ).fetchall())
-                for value, raw_argv, call_id in indexed:
+                for value, raw_argv in indexed:
                     arguments = history_arguments(raw_argv)
                     selection = test_selection(arguments)
-                    if not on_admitted_side(indexed_evidence.get((call_id, step), NO_STEP_EVIDENCE), history_split):
-                        continue
                     if (selection.scope == scope
                             and (step not in TEST_STEPS or not package or selection.package == package)):
                         peaks.append(value)
-    except (OSError, sqlite3.Error):
-        pass
+        except (OSError, sqlite3.Error):
+            pass
     if len(peaks) >= 5:
         return ExpectedPeak(int(percentile(peaks) * ANON_SHARE), "buildlog", len(peaks))
     if measured:
@@ -2407,21 +2131,13 @@ def history_selection(item: Mapping[str, object], evidence: StepEvidence) -> His
                             "filtered" if scope == "filtered" else "full", filters)
 
 
-@dataclass(frozen=True)
-class CompilePeakSample:
-    item: dict[str, object]
-    evidence: StepEvidence
-    selection: HistorySelection
-
-
 def compiling_history(root: Path, host: str, step: str,
-                      now: datetime, *, include_current_end: bool = False,
-                      history_split: HistorySplit | NoHistorySplit = NO_HISTORY_SPLIT
-                      ) -> list[CompilePeakSample]:
-    """Resolve test selections and keep compile peaks on the admitted side."""
+                      now: datetime, *, include_current_end: bool = False) -> list[tuple[dict[str, object], StepEvidence]]:
+    """Exclude only peaks whose known attempts compiled no crates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
-    evidence = estimate_evidence(root, host, step, now, history_split)
-    peaks: list[CompilePeakSample] = []
+    evidence = index_step_evidence(file_marks.index_path_in(root), host, step,
+                                   datetime.min.replace(tzinfo=now.tzinfo), now)
+    peaks: list[tuple[dict[str, object], StepEvidence]] = []
     try:
         for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
             if item.get("host") != host or item.get("step") != step:
@@ -2436,10 +2152,7 @@ def compiling_history(root: Path, host: str, step: str,
                 if (cutoff <= ended_at and (ended_at <= now if include_current_end else ended_at < now)
                         and isinstance(peak, int)
                         and not isinstance(peak, bool) and peak > 0):
-                    selection = (history_selection(item, joined) if step in TEST_STEPS
-                                 else HistorySelection(cast(str, item.get("package", "")), "full", ()))
-                    if same_history_side(item, joined, history_split):
-                        peaks.append(CompilePeakSample(item, joined, selection))
+                    peaks.append((item, joined))
             except (ValueError, TypeError):
                 continue
     except OSError:
@@ -2477,14 +2190,12 @@ def history_matches_repository(row: Mapping[str, object], repository: Repository
             and row.get("repo") == repository.legacy_name))
 
 
-def build_peaks(repository: RepositoryIdentity, host: str, now: datetime, root: Path, *,
-                history_split: HistorySplit | NoHistorySplit) -> list[BuildPeak]:
+def build_peaks(repository: RepositoryIdentity, host: str, now: datetime, root: Path) -> list[BuildPeak]:
     """Keep compile peaks and resolve each shape from its recorded evidence."""
-    history = compiling_history(root, host, "build", now, include_current_end=True, history_split=history_split)
+    history = compiling_history(root, host, "build", now, include_current_end=True)
     shaped: dict[BuildShape, list[dict[str, object]]] = {}
-    for sample in history:
-        item = sample.item
-        shape = history_shape(item, sample.evidence)
+    for item, evidence in history:
+        shape = recorded_build_shape(item["shape"]) if "shape" in item else evidence.shape
         if isinstance(shape, BuildShape):
             shaped.setdefault(shape, []).append(item)
     peaks: list[BuildPeak] = []
@@ -2508,9 +2219,8 @@ def shape_headroom_bytes(base: int, rule: HeadroomRule) -> int:
 
 
 def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape,
-                        host: str, now: datetime, root: Path, first_peak_bytes: int, *,
-                        history_split: HistorySplit | NoHistorySplit) -> ExpectedPeak:
-    rows = build_peaks(repository, host, now, root, history_split=history_split) if isinstance(repository, RepositoryIdentity) else []
+                        host: str, now: datetime, root: Path, first_peak_bytes: int) -> ExpectedPeak:
+    rows = build_peaks(repository, host, now, root) if isinstance(repository, RepositoryIdentity) else []
     same = [row for row in rows if row.shape == shape]
     floor: FailedPeakFloor | NoFloor = NoFloor()
     failures = [row for row in same if not isinstance(row.outcome, OutcomeNotRecorded)
@@ -2781,8 +2491,7 @@ def history_arguments(raw: object) -> list[str]:
 
 def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
                   root: Path, width: int | None, filters: tuple[str, ...],
-                  package: str, *,
-                  history_split: HistorySplit | NoHistorySplit) -> ExpectedPeak:
+                  package: str) -> ExpectedPeak:
     """Use the larger exact-filter and package anonymous p90.
 
     Recorded selection fields take priority. The shared resolver reads indexed
@@ -2795,17 +2504,17 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
     exact: list[int] = []
     compile_peaks: list[int] = []
     compile_index: list[int] = []
-    histories = {name: compiling_history(root, host, name, now, history_split=history_split)
+    histories = {name: compiling_history(root, host, name, now)
                  for name in dict.fromkeys((step, "check", "build"))}
     for sample_step, history in histories.items():
-        selected = repository_history([sample.item for sample in history], repository)
+        selected = repository_history([entry[0] for entry in history], repository)
         selected_ids = {id(item) for item in selected}
-        for sample in history:
-            item = sample.item
+        for item, evidence in history:
             if id(item) not in selected_ids:
                 continue
             peak = cast(int, item["anon_peak_bytes"])
-            selection = sample.selection
+            selection = history_selection(item, evidence) if sample_step in TEST_STEPS else HistorySelection(
+                cast(str, item.get("package", "")), "full", ())
             sample_package = selection.package
             if (sample_step in ("check", "build")
                     and (sample_package == package
@@ -2826,28 +2535,20 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
     indexed: list[int] = []
     indexed_exact: list[int] = []
     if repository.legacy_name:
-        indexed_evidence: Mapping[tuple[str, str], StepEvidence] = (
-            history_split.evidence if isinstance(history_split, HistorySplit) else {})
         try:
-            connection = sqlite3.connect(file_marks.read_only_uri(root), uri=True)
-            try:
-                columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
-                           connection.execute("PRAGMA table_info(steps)").fetchall())}
+            with step_index(file_marks.index_path_in(root)) as (connection, columns):
                 argv_column = "argv" if "argv" in columns else "NULL"
-                call_column = "call_id" if "call_id" in columns else "NULL"
                 compile_clause = " AND crates_compiled > 0" if "crates_compiled" in columns else ""
-                rows = cast(list[tuple[int, str | None, str, str]], connection.execute(
-                    f"SELECT peak_mem_bytes, {argv_column}, step, {call_column} FROM steps "
+                rows = cast(list[tuple[int, str | None, str]], connection.execute(
+                    f"SELECT peak_mem_bytes, {argv_column}, step FROM steps "
                     + "WHERE host = ? AND repo = ? AND step IN (?, 'check', 'build') "
                     + "AND started_at >= ? AND started_at < ? AND peak_mem_bytes > 0" + compile_clause,
                     (host, repository.legacy_name, step, cutoff, before),
                 ).fetchall())
-                for value, raw_argv, sample_step, call_id in rows:
+                for value, raw_argv, sample_step in rows:
                     arguments = history_arguments(raw_argv)
                     selection = test_selection(arguments)
                     sample_package = selection.package
-                    if not on_admitted_side(indexed_evidence.get((call_id, sample_step), NO_STEP_EVIDENCE), history_split):
-                        continue
                     if sample_step in ("check", "build"):
                         if (sample_package == package
                                 or (not sample_package and package == repository.name)):
@@ -2857,8 +2558,6 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
                         indexed.append(int(value))
                         if filters and selection.filters == filters:
                             indexed_exact.append(int(value))
-            finally:
-                connection.close()
         except (OSError, sqlite3.Error):
             pass
     for values in (indexed_exact, indexed):
@@ -2994,8 +2693,7 @@ def is_fresh_test(root: Path, host: str, worktree: str, package: str,
 def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
                     root: Path, width: int | None, scope: TestScope,
                     filters: tuple[str, ...], package: str,
-                    compile_peak: ExpectedPeak, *,
-                    history_split: HistorySplit | NoHistorySplit) -> ExpectedPeak:
+                    compile_peak: ExpectedPeak) -> ExpectedPeak:
     """Use only completed zero-compile measurements of this package and scope."""
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
@@ -3009,8 +2707,6 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
             ).fetchall())
     except (OSError, sqlite3.Error):
         return compile_peak
-    indexed_evidence: Mapping[tuple[str, str], StepEvidence] = (estimate_evidence(root, host, step, now, history_split)
-                        if isinstance(history_split, HistorySplit) else {})
     calls: dict[str, bool] = {}
     indexed: list[int] = []
     indexed_exact: list[int] = []
@@ -3018,8 +2714,6 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
         arguments = history_arguments(raw_argv)
         if (test_package(arguments) != package or test_scope(arguments) != scope
                 or (width is not None and test_threads(arguments) != width)):
-            continue
-        if not on_admitted_side(indexed_evidence.get((str(call_id), step), NO_STEP_EVIDENCE), history_split):
             continue
         exact = bool(filters) and test_filters(arguments) == filters
         if call_id:
@@ -3035,9 +2729,7 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
         for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
             try:
                 call_id = item.get("call_id")
-                own = (item.get("repo_identity") == repository.key
-                       or (not item.get("repo_identity") and repository.legacy_name
-                           and item.get("repo") == repository.legacy_name))
+                own = history_matches_repository(item, repository)
                 if (not own or item.get("host") != host or item.get("step") != step
                         or not cutoff <= str(item.get("ended_at", "")) < before
                         or not isinstance(call_id, str) or call_id not in calls
@@ -3797,15 +3489,10 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
         generation = build_history_generation() if step == "build" else NoBuildHistoryGeneration()
         if step == "build" and callable(now):
             estimate_time = now()
-        shape = build_shape(argv)
-        history_split = prepare_history_split(repository, argv, cwd, estimate_time, root,
-                                              step=step, host=host, shape=shape, scope=scope, package=package)
-        if isinstance(history_split, HistorySplit) and history_split.marks_added:
-            write_build_marks(root, history_split.marks)
         peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
                              package=package, filters=filters, fresh=fresh,
-                             shape=shape if step == "build" else NoBuildShape(),
-                             first_peak_bytes=first_peak_bytes, history_split=history_split)
+                             shape=build_shape(argv) if step == "build" else NO_BUILD_SHAPE,
+                             first_peak_bytes=first_peak_bytes)
         profile = StepProfile(repo, step, worktree, peak, repository, scope, estimate_time.timestamp(),
                               generation)
     elif isinstance(profile, StepProfile) and not profile.estimated_at:

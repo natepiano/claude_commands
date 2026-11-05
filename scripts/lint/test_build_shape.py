@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import final, override
 
 from build_shape import (CompileCountUnknown, CompiledCrates, NoBuildShape, NoCratesCompiled,
-                         KnownStepCommit, StepEvidence, build_shape, index_step_evidence)
+                         StepEvidence, build_shape, index_step_evidence)
 
 from scripts.buildlog.step_outputs_test_support import create_step_index
 
@@ -89,22 +89,12 @@ class IndexStepEvidenceTests(unittest.TestCase):
         create_step_index(self.index)
 
     def row(self, call_id: str | None, argv: object, *, host: str = "natedev", repo: str = "hana",
-            step: str = "build", at: datetime | None = None, crates: int | None = 3,
-            sha: str = "") -> None:
+            step: str = "build", at: datetime | None = None, crates: int | None = 3) -> None:
         with closing(sqlite3.connect(self.index)) as connection, connection:
-            _ = connection.execute("INSERT INTO steps(host, repo, step, started_at, call_id, argv, crates_compiled, sha) "
-                                   + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            _ = connection.execute("INSERT INTO steps(host, repo, step, started_at, call_id, argv, crates_compiled) "
+                                   + "VALUES (?, ?, ?, ?, ?, ?, ?)",
                                    (host, repo, step, (at or self.cutoff).isoformat(), call_id,
-                                    json.dumps(argv) if argv is not None else None, crates, sha))
-
-    def test_join_carries_each_steps_full_or_short_commit(self) -> None:
-        arguments = ["cargo", "build"]
-        commits = {"full": "a" * 40, "short": "b123456789"}
-        for call, sha in commits.items():
-            self.row(call, arguments, sha=sha)
-        evidence = index_step_evidence(self.index, "natedev", "build", self.cutoff, self.before)
-        self.assertEqual({call: evidence[call, "build"].commit for call in commits},
-                         {call: KnownStepCommit(sha) for call, sha in commits.items()})
+                                    json.dumps(argv) if argv is not None else None, crates))
 
     def test_join_uses_call_and_step_and_filters_host_and_window(self) -> None:
         arguments = ["cargo", "build", "--release", "--features=bevy/trace_chrome", "--bin", "hana"]
