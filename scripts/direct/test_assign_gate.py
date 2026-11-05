@@ -183,6 +183,14 @@ class AssignmentFormsTests(AssignLauncherFixture):
         self.assertEqual(operation['resident'], 'True')
         self.assertEqual(operation['task'], 'ask_a_friend.consultation')
 
+    def test_apostrophe_in_launch_argument_passes_the_gate(self) -> None:
+        trace = self.capture_operation('command_start')
+        _ = write_registry(self.registry, {'ask_a_friend.codex': {'consultation': 'gpt-kept-sol:high'}}, update=True)
+        result = self.launch('review', '--operation', 'resident', '--new-worker', 'consultation',
+                             '--family', 'codex', '--fix-cause', "it's the launch argument")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(read_object(trace)['task'], 'ask_a_friend.consultation')
+
     def recovery_record(self) -> dict[str, object]:
         owner = staff.by_current_session(os.environ['CODEX_THREAD_ID'])
         assert owner is not None
