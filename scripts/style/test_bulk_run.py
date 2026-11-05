@@ -1,8 +1,6 @@
 """Workspace bulk runs use temporary Git repos and a fake command runner; never build Rust."""
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
-
 import json
 import os
 import signal
@@ -29,11 +27,10 @@ import bulk_rename as bulk
 import fake_fmt
 from style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import queue_place
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner
 from style_plan_test_support import unit_staff_id
 import berth_board
 import rules
-from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER
+from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER, ticket_owner_id
 import style_ledger as ledger_api
 from approved_renames import AppliedInCode, BindingRename, NoBindingScope, rename_declaration
 from test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
@@ -348,9 +345,6 @@ class WorkspaceRunTests(CargoProjectTests):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        owner = recorded_showrunner("sample-style", self.repo / "docs/sample-style-production.md")
-        _ = fixture_member("unit", name="names", parent=owner.id)
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root / "gate-home"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
