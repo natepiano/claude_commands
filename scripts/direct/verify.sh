@@ -2884,13 +2884,14 @@ command = sys.argv[3:]
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
+sys.path.insert(0, str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]).resolve().parents[1]))
+from scripts.lib.process_start import Started, process_start, process_start_format
+
 def identity(pid):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
-        return fields[19]
-    except (OSError, IndexError):
-        return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="],
-                                       text=True, stderr=subprocess.DEVNULL).strip()
+    result = process_start(pid)
+    if not isinstance(result, Started):
+        raise RuntimeError("cannot read the step owner start")
+    return result.start
 
 child = os.fork()
 if child:
@@ -2923,7 +2924,7 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
               file=sys.stderr)
         sys.exit(125)
     record = lock / f"owned.{os.getpid()}.tmp"
-    record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))
+    record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
     os.replace(record, lock / "owned")
     fcntl.flock(guard, fcntl.LOCK_UN)
 
