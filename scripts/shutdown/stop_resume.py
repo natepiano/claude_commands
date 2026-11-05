@@ -289,10 +289,13 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     pane = next((pane for pane in client.panes() if pane["pane_id"] == tab.pane_id), None)
     if pane is None:
         raise herdr.HerdrFailure(f"no pane {tab.pane_id!r}")
-    environment = {**entry["environment"], "HERDR_PANE_ID": tab.pane_id,
+    unset = ["HERDR_TAB_ID", "STAFF_ID", "STAFF_OPERATION_FD", "PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY",
+             *sorted(key for key in os.environ.keys() | entry["environment"].keys() if key.startswith("STAFF_ROW_FD_"))]
+    environment = {key: value for key, value in entry["environment"].items() if key not in unset}
+    environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
-    _ = environment.pop("STAFF_ID", None)
-    return ["env", "-u", "HERDR_TAB_ID", "-u", "STAFF_ID", *(f"{key}={value}" for key, value in environment.items()),
+    return ["env", *(argument for key in unset for argument in ("-u", key)),
+            *(f"{key}={value}" for key, value in environment.items()),
             "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
             sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
             *trust_arguments(pane_launch.agent_kind(entry), entry["cwd"], pane_record.resume_arguments(entry))]
