@@ -98,6 +98,7 @@ class TestTimesTests(unittest.TestCase):
             "HOME": str(self.root / "home"), "USER_ZONE": "America/New_York",
         }))
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7")
+        _ = write_config_fixture(self.config / "buildlog.conf")
         _ = self.enterContext(mock.patch.object(show, "datetime", ReportTime))
         for name in ("test_alpha.py", "test_beta.py", "test_missing.py"):
             path = self.repo / "scripts" / "tools" / name

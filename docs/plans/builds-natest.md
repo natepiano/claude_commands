@@ -386,7 +386,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Gotchas:**
 - A file in the `files` list of two open phases blocks the edit hook. Give each file to one phase when the plan is written.
 
-### Phase 15 — The coverage tool checks which children and threads are alive at each test boundary  · status: todo
+### Phase 15 — The coverage tool checks which children and threads are alive at each test boundary  · status: done
 **Depends on:** Phase 12
 
 #### Work Order
@@ -447,20 +447,82 @@ The recording exists: `buildlog/parse.test_results` keeps each nextest test that
 - `scripts/buildlog/index.py`, `scripts/buildlog/test_index.py` — the Mac identity and the query index
 - `config/test_times.conf` — `NEXTEST_SLOW_TEST_S`
 - `scripts/buildlog/parse.py` — the threshold read (report-unit's file; see the showrunner answer)
+- `scripts/buildlog/test_parse.py` — the parser tests, with a private threshold config
 - `commands/test_times.md` — the doc line
 
 **Workers:** 1 writer + 1 tester
 - `impl` — `show.py`, `index.py`, `parse.py`, `config/test_times.conf`, `commands/test_times.md`
-- `test` — `test_show.py`, `test_index.py`, from the Spec: a fixture index with steps of two repositories ranks only the calling repository; a ~/.claude working directory keeps the module view; a Mac step whose call came from a hana natedev call ranks under hana; a test with only failed runs ranks last
+- `test` — `test_show.py`, `test_index.py`, `scripts/buildlog/test_parse.py` (a private config fixture for `NEXTEST_SLOW_TEST_S`), from the Spec: a fixture index with steps of two repositories ranks only the calling repository; a ~/.claude working directory keeps the module view; a Mac step whose call came from a hana natedev call ranks under hana; a test with only failed runs ranks last
 
 **State:** `steps.repo_identity` for Mac rows changes from `unknown` to the served call's identity. The `tests` table gains what the query needs. A schema change makes a new index file (Phase 10), so the first command after the merge rebuilds the index.
 
 **Constraints from prior phases:**
 - Phase 10: each schema keeps its own index file.
 - Phase 14: `top` ranks gate modules by the median of valid runs; `TOP_RUNS`, `TOP_CHECKOUT` and `TOP_MAX_AGE_DAYS` are in `config/test_times.conf`.
+- Phase 17: keep `remove_index()` (sidecars first, main file last), `LEGACY_INDEX_NAME`, `cleanup_unused_indexes(root, current, settings)` and the hourly mtime stamp in `update()`. The cleanup, sidecar and interrupted-removal tests in `test_index.py` stay green.
+- A live `show.py top` that rebuilds or updates the index holds the live `index.lock`. A run on 2026-11-04 held it 35 minutes. Acceptance runs never use the live root without a timeout.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/test_times -p 'test_show.py'` green
 - `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` green
-- in a hana worktree, `python3 ~/.claude/scripts/test_times/show.py top` lists hana nextest tests, in under 0.5 s warm
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_parse.py'` green
+- from `~/rust/hana`, the candidate checkout's `show.py top` against a scratch `BUILDLOG_DIR` with copied logs, under `timeout 600`: measure the rebuild once, then the warm query lists hana nextest tests in under 0.5 s
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 17 — The build log keeps only the index files that a checkout used in the last day  · status: done
+
+#### As-built
+
+- `cleanup_unused_indexes(root, current, settings)` runs at the end of each `update()`, under `update_lock()`. It deletes the legacy `index.sqlite` (`LEGACY_INDEX_NAME`) at any age, and each other `index-<hash>.sqlite` whose `max(st_atime, st_mtime)` is older than `INDEX_UNUSED_DAYS` (2). The current file always stays.
+- `update()` reads `config/buildlog.conf` once and sets the current file's mtime when it is older than `INDEX_TOUCH_MINUTES` (60).
+- `remove_index(path)` deletes the `INDEX_SIDECAR_SUFFIXES` files (`-journal`, `-wal`, `-shm`) first and the main file last. Cleanup, `reindex()` and `open_for_update()` use it. Cleanup also deletes orphan sidecars, so the next `update()` finishes an interrupted removal.
+- A removed file costs its next reader one rebuild. Report commands rebuild through `update()`; memory admission uses its fallback while the index is absent.
+
+**Files:**
+- `scripts/buildlog/index.py` — `remove_index`, `INDEX_SIDECAR_SUFFIXES`, `LEGACY_INDEX_NAME`, cleanup, the hourly stamp
+- `config/buildlog.conf` — `INDEX_UNUSED_DAYS=2`, `INDEX_TOUCH_MINUTES=60`
+- `scripts/buildlog/test_index.py` — cleanup, sidecar, legacy, age and stamp tests
+
+**Binds later work:**
+- A change to `index.py` keeps `remove_index()`, `LEGACY_INDEX_NAME`, the `settings` argument of `cleanup_unused_indexes`, and the hourly stamp in `update()`.
+
+**Gotchas:**
+- Read-only paths (`index.read_only()`, the four `read_only_uri()` connects in `scripts/lint/memory_admit.py`) never stamp mtime, and relatime moves atime at most once a day. Keep `INDEX_UNUSED_DAYS` at 2 or more and `INDEX_TOUCH_MINUTES` well below it.
+- One full rebuild costs 61 s wall, 43 s CPU, 1.0 GB peak memory and a 1.5 GB file (natedev, 2026-11-04).
+- A live `show.py top` can hold `index.lock` for a long time; a test or acceptance run uses a scratch `BUILDLOG_DIR` and a timeout.
+
+**Ruled out:**
+- A 1-day window: a checkout that only reads its index could lose a file it uses each hour.
+
+### Phase 18 — Mac and Linux mirror steps record the repository identity that natedev sends  · status: todo
+**Depends on:** Phase 16
+
+#### Work Order
+
+**Goal:** A new Mac or Linux mirror step records the repository identity of its natedev source checkout, so the index does not need to derive it.
+
+**Spec:** The builds showrunner accepted this architecture proposal from the Phase 16 review on 2026-11-04. This unit owns it. Edits to other units' files are allowed: `scripts/mac_test/offload.py` and `scripts/mac_test/linux_runner.py` (verify-unit), `scripts/buildlog/record.py` (report-unit).
+
+1. Send: the natedev side computes the repository key of the source checkout with `record.recorded_repository_key` (no copy). It passes the key as `BUILDLOG_REPO_IDENTITY` in the mirror command, beside `BUILDLOG_CALL_ID` and `BUILDLOG_SENT_TREE_KEY`: in `offload.py` (the ssh command, about line 1500) and in `linux_runner.py` (the `environment` mapping, about line 720). An `unknown` key is not sent.
+2. Record: in `record.py` `step()`, when `recorded_repository_key` gives `store.UNKNOWN_IDENTITY` for a mirror caller (`verify-mac`, `verify-linux`) and `BUILDLOG_REPO_IDENTITY` is set, record that value. Read it through one typed reader beside `sent_tree_key()`. A known local key always wins.
+3. Index: keep the Phase 16 index rule for old rows. A step with a recorded identity has `identity_derived = 0`, so the resolver never changes it.
+4. The Mac gets the new `record.py` through the normal main promotion. Until then, Mac rows stay `unknown` and the index rule resolves them.
+
+**Files:**
+- `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py` — send the key (verify-unit's files)
+- `scripts/buildlog/record.py` — record the sent key (report-unit's file)
+- the test modules of these three files — the regression tests
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `offload.py`, `linux_runner.py`, `record.py`
+- `test` — the tests: a mirror step with no origin records the identity sent from natedev; a known local key wins over a sent key; the Mac ssh command and the Linux environment carry the key, and omit it when it is unknown
+
+**Constraints from prior phases:**
+- Phase 16: the index derives the identity of an `unknown` step from its call and marks it `identity_derived = 1`. Keep that rule for old rows.
+- Before work starts, read the open verify-unit and report-unit branches for edits to these three files. Claim the files on the berth board, and name them in the notice's also-touches line.
+- report-unit Phase 20 (`be35f2d2b`) changes `record.py` `step()`. Never merge report's unlanded branch. Start the `record.py` edits only after report Phase 20 is merged into builds; then merge origin/builds. Until then, work only on `offload.py`, `linux_runner.py` and their tests (showrunner, 2026-11-04).
+
+**Acceptance gate:**
+- the three test modules green on a tree with origin/builds merged after report Phase 20 lands
+- a mirror step test records the identity sent from natedev
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`

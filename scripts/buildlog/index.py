@@ -20,7 +20,7 @@ import sqlite3
 import time
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -60,6 +60,9 @@ LOCK_NAME = "index.lock"
 INDEX_PREFIX = "index"
 INDEX_SUFFIX = ".sqlite"
 INDEX_PATTERN = re.compile(rf"{INDEX_PREFIX}(-[0-9a-f]{{64}})?{re.escape(INDEX_SUFFIX)}")
+# No code opens this name since Phase 10. Remove this rule when no host holds the file.
+LEGACY_INDEX_NAME = f"{INDEX_PREFIX}{INDEX_SUFFIX}"
+INDEX_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 BOOKKEEPING_TABLES = {
     "meta": "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)",
     "files": "CREATE TABLE files (path TEXT PRIMARY KEY, offset INTEGER, marks TEXT)",
@@ -642,6 +645,13 @@ def create_schema(connection: sqlite3.Connection) -> None:
     _ = connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
+def remove_index(path: Path) -> None:
+    """Remove the SQLite sidecars before the index file."""
+    for suffix in INDEX_SIDECAR_SUFFIXES:
+        Path(str(path) + suffix).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+
+
 def open_for_update(path: Path) -> sqlite3.Connection:
     """Open the current schema file and rebuild it when its version or tables differ."""
     connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
@@ -651,7 +661,7 @@ def open_for_update(path: Path) -> sqlite3.Connection:
     ).fetchall())}
     if version != SCHEMA_VERSION or not (set(TABLES) | set(BOOKKEEPING_TABLES)).issubset(tables):
         connection.close()
-        path.unlink(missing_ok=True)
+        remove_index(path)
         connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
         _ = connection.execute("BEGIN IMMEDIATE")
         create_schema(connection)
@@ -1044,19 +1054,31 @@ def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple
     return lines
 
 
-def cleanup_unused_indexes(root: Path, current: Path) -> None:
-    """Delete old schema files; deletion between stat and unlink costs only one rebuild."""
-    candidates = [path for path in root.iterdir()
-                  if path != current and INDEX_PATTERN.fullmatch(path.name)]
+def cleanup_unused_indexes(root: Path, current: Path, settings: conf.ConfigRead) -> None:
+    """Remove unused indexes and orphan sidecars.
+
+    A file removed between a peer's stat and open costs that peer one rebuild.
+    """
+    candidates: set[Path] = set()
+    for path in root.iterdir():
+        for suffix in INDEX_SIDECAR_SUFFIXES:
+            if path.name.endswith(suffix):
+                path = path.with_name(path.name.removesuffix(suffix))
+                break
+        if path != current and INDEX_PATTERN.fullmatch(path.name):
+            candidates.add(path)
     if not candidates:
         return
-    unused_days = conf.read("buildlog").number("INDEX_UNUSED_DAYS")
+    unused_days = settings.number("INDEX_UNUSED_DAYS")
     cutoff = time.time() - unused_days * 24 * 60 * 60
     for path in candidates:
-        with suppress(FileNotFoundError):
+        try:
             changed = path.stat()
-            if max(changed.st_atime, changed.st_mtime) < cutoff:
-                path.unlink()
+        except FileNotFoundError:
+            remove_index(path)
+        else:
+            if path.name == LEGACY_INDEX_NAME or max(changed.st_atime, changed.st_mtime) < cutoff:
+                remove_index(path)
 
 
 def update() -> int:
@@ -1068,7 +1090,9 @@ def update() -> int:
         connection = open_for_update(current)
         try:
             now = time.time()
-            if now - current.stat().st_mtime > 86400:
+            settings = conf.read("buildlog")
+            touch_minutes = settings.number("INDEX_TOUCH_MINUTES")
+            if now - current.stat().st_mtime > touch_minutes * 60:
                 os.utime(current, (now, now))
             _ = connection.execute("BEGIN IMMEDIATE")
             known = {
@@ -1095,13 +1119,13 @@ def update() -> int:
             raise
         finally:
             connection.close()
-        cleanup_unused_indexes(root, current)
+        cleanup_unused_indexes(root, current, settings)
     return lines
 
 
 def reindex() -> int:
     with update_lock():
-        index_path().unlink(missing_ok=True)
+        remove_index(index_path())
     return update()
 
 
