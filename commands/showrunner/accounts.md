@@ -3,5 +3,7 @@ description: Show the accounts board.
 argument-hint: "[close]"
 ---
 
+- No arguments: show actual role counts on each account, mark selected accounts with `✓`, and show upcoming moves below.
+
 Reply with exactly this one line and do nothing else:
 The accounts board needs unit-board@nate-local. Enable the plugin, then run /reload-plugins.
