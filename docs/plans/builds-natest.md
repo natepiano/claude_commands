@@ -684,10 +684,14 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
 3. A cut in `merge_gate.py` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase.
 4. A change to `merge_gate_test_support.py` keeps every `test_merge_gate*.py` module green; name each one in the final run.
+5. The two files belong to the sdlc production. sdlc devtools-unit holds them on an unmerged branch while it repairs a `merge_gate.py` guard (showrunner, 2026-11-05). The code step starts only after the builds showrunner sends the go with sdlc's main hash; merge that hash first. The profile in step 1 runs now.
+6. Profile result (2026-11-05, baseline median 118.2 s wall, 11.1 CPU s, 17 tests): 110.0 s is 22 admission start waits of about 5 s each. After each admission, `memory_admit.py:3716` publishes `NextStartAt(now + recovery_start_seconds)` (`build_admission.conf`: 5 s). The private server keeps that deadline between the gates of one test, and `admission_test_support.py:357-365` moves its fake clock with real time. So each later gate in a test waits 5 real seconds. Seed builds (0.3 s), type environment builds (0.9 s) and scheduler polls (3.7 s, `merge_gate.py:1144`) are small.
+7. Code step, at the cause (showrunner, 2026-11-05): one advance in `merge_gate_test_support.run_gate` (and the shared path that the direct `run_suites` calls use) takes `self.admission.loop_turn()` and calls the existing `self.admission.allow_next_start()` before each gate. No call in each test. Leave the mocked nightly calls. Keep every test name, assertion, gate order, module job and type job in all 12 `test_merge_gate*.py` modules. Do not set the spacing to zero or mock the admission result. A test that checks the admission spacing itself keeps the real wait; name each one. Projected ledger result: 8-12 s.
+8. Later proposal, not this phase: `merge_gate.py` could wake on child exit in place of 0.05 s polls (at most 3.7 s here; owner sdlc devtools-unit).
 
 **Files:**
-- `scripts/production/test_merge_gate_ledger.py` — the target module
-- `scripts/production/merge_gate_test_support.py` — only if the profile puts the cost in the shared fixture
+- `scripts/production/merge_gate_test_support.py` — the admission clock advance before each gate
+- `scripts/production/test_merge_gate_ledger.py` — only for the direct `run_suites` calls, if the shared path does not reach them
 
 **Workers:** 1 writer (one module and its fixture; the files do not split)
 - `impl` — all files above
@@ -699,6 +703,67 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/production -p 'test_merge_gate_ledger.py'` green, with the same test names and assertions
-- every `scripts/production/test_merge_gate*.py` module green when `merge_gate_test_support.py` changes
+- all 12 `scripts/production/test_merge_gate*.py` modules green, with the same test names and assertions; each module's before and after time in same-load pairs
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 28 — The build log isolation test checks every module in parallel  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `LogIsolationTests.test_each_module_uses_a_temporary_log` in `scripts/buildlog/test_index.py` drops from about 24.5 s to under 4 s, with one check for each module kept.
+
+**Spec:** Follow the Speed method. This phase runs while Phase 24 waits on the verify-unit remake and Phase 27 waits on sdlc (showrunner, 2026-11-05: start another phase if one can run). The higher ranked modules are held or have a measured floor.
+
+1. Today the test starts one Python process for each of the 37 `test_*.py` modules in `scripts/buildlog`, one after another. Each process imports one module and prints `store.root()`.
+2. Keep one process for each module. One process that imports every module is not correct: the first module's `BUILDLOG_DIR` and the `store` state stay set, so a later module with no isolation passes.
+3. Start the processes in parallel with a bounded pool (`concurrent.futures.ThreadPoolExecutor`). Use a named constant for the pool size and say why in one comment line.
+4. Keep the `subTest(module=...)` for each module, the return code check with stderr, and the check that the root is not `~/.local/state/buildlog`. A new module is still found by the glob.
+5. Keep the process command, the environment without `BUILDLOG_DIR` and `cwd` as they are.
+
+**Files:**
+- `scripts/buildlog/test_index.py` — the parallel starts in `LogIsolationTests`
+
+**Workers:** 1 writer (one test in one file)
+- `impl3` — all files above
+
+**Constraints from prior phases:**
+- Phase 3 found this cost (24.5 s of the 34.8 s suite at load 70, 2026-11-03).
+- `test_index.py` is report-unit's file. Report's Phase 15 works in `charts.py`; the second unit to land resolves any merge (showrunner, 2026-11-05).
+- Tests never read or write live state: `~/.local/state/buildlog`, `~/.claude` main, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` green, with the same test names and assertions
+- the test's wall time before and after in same-load pairs (`pairs.sh`), in the checkpoint notice
+- `basedpyright scripts/buildlog/test_index.py` prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 29 — `test_mac_run.py` runs in half its time  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/production/test_mac_run.py` (gate median 45.3 s, 43.5 CPU s, 17 tests) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method. The builds showrunner asked for the next unheld module below the held style and herdr modules (2026-11-05). Ranks 20-26 are held on open branches; on 2026-11-05 no open branch changed `test_mac_run.py` or `mac_run.sh` outside main and builds.
+
+1. Profile before any edit. Wall time is close to CPU time, so look first at process starts and repeated setup: `mac_run.sh` starts, `state_command` starts, git calls and fixture builds for each test. The three slowest tests take 6-13 s, 4-8 s and 3-6 s.
+2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
+3. A cut in `mac_run.sh` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase.
+4. Write the profile result and the chosen cuts into the summary before the edit.
+
+**Files:**
+- `scripts/production/test_mac_run.py` — the target module
+
+**Workers:** 1 writer (one module; the file does not split)
+- `test` — all files above
+
+**Constraints from prior phases:**
+- Phase 25: the gate runs the tested tree's own `module_run.py`.
+- Phase 26: a test that starts the real `send.py` fails through the `TEST_SENDER_GUARD` marker.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. A test never reaches the real Mac.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/production -p 'test_mac_run.py'` green, with the same test names and assertions
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- `basedpyright scripts/production/test_mac_run.py` prints `0 errors, 0 warnings, 0 notes`
