@@ -33,6 +33,41 @@ class SettingsMigrationTest(StaffTestCase):
             self.assertTrue(source.exists())
             self.assertFalse(destination.exists())
 
+    def test_equal_destination_values_preserve_its_comments(self) -> None:
+        row = fixture_member("showrunner", name="director")
+        with tempfile.TemporaryDirectory() as folder:
+            source, destination = Path(folder) / "legacy", Path(folder) / "settings.conf"
+            _ = source.write_text(json.dumps(dict(threshold_percent=2, repeat_minutes=30,
+                stall_minutes=5, faults_to="director", always=["director"])))
+            text = ("# Keep the promoted comments.\n# range: 0..100\nthreshold_percent=2.0\n"
+                    "# range: 0..\nrepeat_minutes=30\n# range: 0..\nstall_minutes=5\n"
+                    f"# Use staff ids.\nfaults_to={row.id}\nalways={row.id}\n")
+            _ = destination.write_text(text)
+            before = destination.read_bytes(), destination.stat().st_mtime_ns
+            migration.migrate(source, destination, staff.StaffSnapshot((row,)))
+            self.assertFalse(source.exists())
+            self.assertEqual((destination.read_bytes(), destination.stat().st_mtime_ns), before)
+
+    def test_different_destination_values_preserve_both_files(self) -> None:
+        row = fixture_member("showrunner", name="director")
+        other = fixture_member("showrunner", name="other-director")
+        values = dict(threshold_percent="2", repeat_minutes="30", stall_minutes="5",
+                      faults_to=str(row.id), always=str(row.id))
+        for key, value in (("threshold_percent", "3"), ("repeat_minutes", "31"), ("stall_minutes", "6"),
+                           ("faults_to", str(other.id)), ("always", str(other.id))):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as folder:
+                source, destination = Path(folder) / "legacy", Path(folder) / "settings.conf"
+                _ = source.write_text(json.dumps(dict(threshold_percent=2, repeat_minutes=30,
+                    stall_minutes=5, faults_to="director", always=["director"])))
+                changed = {**values, key: value}
+                _ = destination.write_text("".join(
+                    ("# range: 0..\n" if name.endswith(("_percent", "_minutes")) else "") + f"{name}={setting}\n"
+                    for name, setting in changed.items()))
+                before = source.read_bytes(), destination.read_bytes()
+                with self.assertRaisesRegex(ValueError, "settings differ; retain the source"):
+                    migration.migrate(source, destination, staff.StaffSnapshot((row, other)))
+                self.assertEqual((source.read_bytes(), destination.read_bytes()), before)
+
     def test_conflicting_destination_preserves_both_files(self) -> None:
         row = fixture_member("showrunner", name="director")
         with tempfile.TemporaryDirectory() as folder:

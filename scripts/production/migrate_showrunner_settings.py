@@ -29,16 +29,26 @@ def migrate(source: Path, destination: Path, membership: staff.StaffSnapshot) ->
             raise ValueError(f"{reference}: expected one staff row")
         return str(matches[0].id)
 
-    text = "".join(f"# range: 0..\n{key}={data[key]}\n"
+    settings = showrunners.ShowrunnerSettings(
+        threshold_percent=cast(float, data["threshold_percent"]),
+        repeat_minutes=cast(float, data["repeat_minutes"]),
+        stall_minutes=cast(float, data["stall_minutes"]),
+        faults_to=identity(cast(str, data["faults_to"])),
+        always=[identity(name) for name in cast(list[str], data["always"])])
+    text = "".join(f"# range: 0..\n{key}={settings[key]}\n"
                    for key in ("threshold_percent", "repeat_minutes", "stall_minutes"))
-    text += "faults_to=" + identity(cast(str, data["faults_to"])) + "\n"
-    text += "always=" + " ".join(identity(name) for name in cast(list[str], data["always"])) + "\n"
+    text += "faults_to=" + settings["faults_to"] + "\n"
+    text += "always=" + " ".join(settings["always"]) + "\n"
     if destination.exists():
-        if destination.read_text(encoding="utf-8") != text:
+        try:
+            current = showrunners.load_settings_from(destination)
+        except ValueError as error:
+            raise ValueError(f"{destination}: settings differ; retain the source") from error
+        if current != settings:
             raise ValueError(f"{destination}: settings differ; retain the source")
     else:
         write_text_atomic(destination, text)
-    _ = showrunners.load_settings_from(destination)
+        _ = showrunners.load_settings_from(destination)
     source.unlink()
 
 

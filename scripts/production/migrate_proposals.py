@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert proposal references to fixed staff ids without changing unresolved files."""
+"""Convert known proposal references to staff ids and preserve historical names."""
 from __future__ import annotations
 
 import argparse
@@ -12,33 +12,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from issues import Issue, frontmatter
-from scripts.production import staff
+from scripts.production import session_staff, staff
 from proposal_issue import REMOVED_FIELDS, issue_lock, read_issue, write_issue, remove_fields, set_fields
 
 
 class UnresolvedReference(ValueError):
-    """The staff file has no unique row for a stored reference."""
+    """Several staff rows match a stored reference."""
 
 
-def reference(record: staff.StaffSnapshot, value: str, kinds: tuple[staff.Kind, ...], parent: str = "") -> str:
+def reference(record: staff.StaffSnapshot, value: str, kinds: tuple[staff.Kind, ...], parent: str = "", *,
+              sources: session_staff.MemberSources) -> str:
     row = record.by_id(staff.StaffId(value))
     if row is not None and row.kind in kinds:
         return row.id
+    original = value
     named = re.fullmatch(r"(.+?)\s*\(([^()]+)\)", value)
     if named:
-        parent = reference(record, named[2].strip(), ("showrunner",))
+        parent = reference(record, named[2].strip(), ("showrunner",), sources=sources)
         value = named[1].strip()
     rows = [row for row in record.rows if row.kind in kinds and row.name == value
             and (not parent or row.reports_to(staff.StaffId(parent)))]
-    if len(rows) != 1:
+    if not rows and "showrunner" in kinds:
+        slug = sources.canonical_slug(value)
+        found = sources.member(session_staff.ShowrunnerMember(slug), record)
+        if isinstance(found, session_staff.MemberFound) and (not parent or found.row.reports_to(staff.StaffId(parent))):
+            rows = [found.row]
+    if len(rows) > 1:
         raise UnresolvedReference(f"{value}: no unique staff row")
-    return rows[0].id
+    return rows[0].id if rows else original
 
 
 def migrate(folder: Path, *, limit: int = 0) -> tuple[int, list[str]]:
     """Convert complete files atomically. Stop after the requested number of changed files."""
     changed = 0
     problems: list[str] = []
+    sources = session_staff.member_sources(record=staff.snapshot())
     for path in sorted(folder.rglob("*.md")):
         with issue_lock(path):
             issue = Issue(path, frontmatter(path))
@@ -53,7 +61,7 @@ def migrate(folder: Path, *, limit: int = 0) -> tuple[int, list[str]]:
                     value = issue.value(key)
                     if value:
                         parent = fields.get("approved_in", "") if key == "unit" else ""
-                        fields[key] = reference(record, value, kinds, parent)
+                        fields[key] = reference(record, value, kinds, parent, sources=sources)
             except UnresolvedReference as error:
                 problems.append(f"{path}: {error}")
                 continue
