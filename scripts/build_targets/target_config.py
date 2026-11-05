@@ -58,7 +58,7 @@ def uses_legacy_mac_layout(platform: Platform) -> bool:
 
 
 def read_targets(path: Path | None = None) -> tuple[Target, ...]:
-    config = conf.path("build_targets") if path is None or os.environ.get("CONF_DIR") else path
+    config = conf.path("build_targets") if path is None else path
     values = conf.read(config).values()
     names = tuple(name.strip() for name in values.get("targets", "").split(","))
     if not all(names) or len(set(names)) != len(names):

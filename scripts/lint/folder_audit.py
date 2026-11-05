@@ -61,6 +61,7 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lint import sweep, tmp_sweep
+from scripts.message import session_send
 from scripts.lint.tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
 from scripts.lib import cargo_output, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue
@@ -85,7 +86,6 @@ REMOVED_LOG = "removed.jsonl"
 COMMAND_START = r'"command":"(?:[^"\\]|\\.)*?'
 COMMAND_REST = r'(?:(?:[^A-Za-z0-9_.\-"\\]|\\.)(?:[^"\\]|\\.)*)?"'
 TRANSCRIPT_TIME = re.compile(rb'"timestamp":"([^"]+)"')
-SEND = Path(__file__).resolve().parents[1] / "message" / "send.py"
 
 REMOVED = "removed"
 WOULD_REMOVE = "would remove"
@@ -729,8 +729,8 @@ def main(argv: list[str]) -> int:
     if send:
         for maker, folders in by_maker.items():
             if maker:
-                _ = subprocess.run([sys.executable, str(SEND), "--to", f"session:{maker}", "--from", "folder-audit",
-                                    "--text", message(folders, lint_settings=lint_settings)], check=False)
+                _ = subprocess.run(session_send.send_argv("--to", f"session:{maker}", "--from", "folder-audit",
+                                    "--text", message(folders, lint_settings=lint_settings)), check=False)
     return 0
 
 

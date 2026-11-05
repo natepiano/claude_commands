@@ -13,6 +13,7 @@ from collections.abc import Callable
 import json
 import os
 import signal
+import shlex
 import shutil
 import sys
 import select
@@ -186,13 +187,11 @@ esac
             + f"timeout={TEST_HANG_GUARD_SECS})\n")
         # Memory changes are events. Token retry tests may replace this stub
         # with their own acquisition marker or clock advancement.
-        _ = (stubs / "sleep").write_text(
-            '#!/bin/sh\n'
-            + 'if [ "$1" = "${BUILDLOG_MEM_POLL_S:-5}" ]; then\n'
+        self.write_wait_sleep(
+            'if [ "$1" = "${BUILDLOG_MEM_POLL_S:-5}" ]; then\n'
             + '    read -r label available unit < "$BUILDLOG_MEMINFO"\n'
             + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
             + 'fi\nexit 0\n')
-        (stubs / "sleep").chmod(0o755)
         self.environment = {
             **{name: value for name, value in os.environ.items()
                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
@@ -248,6 +247,19 @@ esac
             "TEST_CARGO_PID": str(self.root / "cargo-pid"),
             "TEST_MEMORY_EVENT": str(memory_event),
         }
+
+    def write_wait_sleep(self, body: str) -> None:
+        """Fake queue delays. Keep renewal and other delays on the real clock."""
+        real_sleep = shutil.which("sleep")
+        if real_sleep is None:
+            self.fail("the token fixture requires sleep on PATH")
+        path = self.root / "stubs" / "sleep"
+        _ = path.write_text(
+            '#!/bin/sh\n'
+            + 'case "$1" in "${BUILDLOG_MEM_POLL_S:-5}"|3) ;;\n'
+            + f'    *) exec {shlex.quote(real_sleep)} "$@" ;;\nesac\n'
+            + body)
+        path.chmod(0o755)
 
     @override
     def tearDown(self) -> None:

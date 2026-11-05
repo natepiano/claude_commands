@@ -58,7 +58,11 @@ def literal_delivery_calls(source: str) -> list[int]:
     for node in ast.walk(tree):
         if isinstance(node, (ast.List, ast.Tuple, ast.Call)):
             arguments = node.args if isinstance(node, ast.Call) else node.elts
-            if len(arguments) > 2 and literal_path(arguments[2]) == "retire":
+            uses_builder = (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and isinstance(node.func.value, ast.Name) and node.func.value.id == "session_send"
+                            and node.func.attr == "send_argv")
+            command_index = 0 if uses_builder else 2
+            if len(arguments) > command_index and literal_path(arguments[command_index]) == "retire":
                 continue
             for left, right in zip(arguments, arguments[1:]):
                 if literal_path(left) == "--to" and literal_path(right) == "user":
@@ -543,6 +547,14 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual(literal_delivery_calls(imported + "\n" + call), [2])
         self.assertEqual(literal_delivery_calls('run(user_send_argv(render("good")))'), [])
         self.assertEqual(literal_delivery_calls('other.send("user", "text")'), [])
+
+    def test_shared_sender_builder_exempts_retirement_but_checks_delivery(self) -> None:
+        self.assertEqual(literal_delivery_calls(
+            'session_send.send_argv("retire", "--to", "user", "--key", "held")'), [])
+        self.assertEqual(literal_delivery_calls(
+            'session_send.send_argv("--to", "user", "--text", "literal")'), [1])
+        self.assertEqual(literal_delivery_calls(
+            'other.send_argv("retire", "--to", "user")'), [1])
 
     def test_rendered_binding_cannot_excuse_a_later_string_or_conditional_string(self) -> None:
         self.assertEqual(literal_delivery_calls('push = render("good")\npush = "literal"\nbroadcast.send("user", "script", push)'), [3])

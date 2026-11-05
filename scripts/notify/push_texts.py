@@ -10,7 +10,13 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
+else:
+    from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
 from user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
                          NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)

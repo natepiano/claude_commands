@@ -22,15 +22,12 @@ class VerifyTokenHistoryTests(VerifyTokenWaitFixture):
         second_clock = self.root / "second-clock"
         _ = first_clock.write_text("1000\n")
         _ = second_clock.write_text("1000\n")
-        sleep = self.root / "stubs" / "sleep"
-        _ = sleep.write_text('''#!/bin/sh
-if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then
+        self.write_wait_sleep('''if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then
     : > "$TEST_WAITING"
     exec python3 "$TEST_WAIT_HELPER" "$TEST_WAIT_GATE"
 fi
 exit 0
 ''')
-        sleep.chmod(0o755)
         first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
                              "UNIT_TEAM_ROLE": "first", "CODEX_THREAD_ID": fixture_runtime_id("thread-first"), "TEST_BLOCK": "1",
                              "UNIT_TOKEN_CLOCK_FILE": str(first_clock)}
