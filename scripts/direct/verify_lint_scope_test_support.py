@@ -5,7 +5,7 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import cache_file_name
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
 import json
 import os
@@ -248,7 +248,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         interpreter_cache.parent.mkdir()
         _ = interpreter_cache.write_text(sys.executable + "\n", encoding="utf-8")
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
         _ = (self.root / "Cargo.toml").write_text(

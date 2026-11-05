@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, final, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_index import use_test_log
+
+use_test_log()
 
 if TYPE_CHECKING:
     from .step_outputs import (

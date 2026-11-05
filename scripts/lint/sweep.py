@@ -181,7 +181,8 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.message import send_budget, send_result
+from scripts.message import send_budget, send_result, session_send
+from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 import conf
@@ -3309,16 +3310,6 @@ def fit_disk_floor_push(free: int, floor: int, removed: int, choices: FolderChoi
             return NO_PHONE_ALERT
 
 
-def session_send_argv(to: str, *,
-    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> list[str]:
-    """Build the session command; its message goes through stdin."""
-    if isinstance(lint_settings, UseConfiguredValue):
-        lint_settings = conf.read("lint")
-    return [sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
-            "--to", to, "--from", "disk_floor", "--timeout", f"{lint_settings.number("sweep_sender_timeout_seconds"):g}"]
-
-
 def crossing_send_argv(repeat: CrossingSendKey | NoCrossingSend) -> list[str]:
     """Give each channel its delivery key and repeat window."""
     return (["--key", repeat.key, "--repeat-minutes", f"{repeat.repeat_minutes:g}"]
@@ -3378,7 +3369,7 @@ def send_phone_push(phone: RenderedPush, *,
         from push_texts import user_send_argv
         import review
     command = user_send_argv(phone)
-    command[1] = str(Path(__file__).resolve().parents[1] / "message/send.py")
+    command[1] = str(session_send.SEND_SCRIPT)
     command.extend(crossing_send_argv(repeat))
     return run_send(command, "phone alert", input=None,
                     timeout=send_budget.user_seconds(review.user_send_seconds()))

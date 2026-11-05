@@ -24,6 +24,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
 
     def test_local_memory_wait_to_mac_preserves_existing_watcher(self) -> None:
         environment = self.mac_environment(local_first=True)
+        _ = self.admission.occupy_host()
         low_memory = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = low_memory.write_text("MemAvailable: 1024 kB\n")
         free_now = self.root / "free-now.py"

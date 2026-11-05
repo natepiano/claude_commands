@@ -103,10 +103,8 @@ class HeadFacts:
     now: float
     joined_at: float
     bumps: BumpsUnavailable | BumpHistory
-    order: gate.StrictUntil | gate.BackfillUntil | gate.WindowNotStarted
     has_priority: bool
     token_waits: TokenWaitsNotRecorded | RecordedTokenWaits
-    budget: int
     head_need: int
     bump_records: tuple[BumpRecord, ...] = ()
     priority: gate.QueuePriority | gate.NoQueuePriority = gate.NoQueuePriority()
@@ -367,8 +365,8 @@ def read_head_facts(reading: gate.QueueRead) -> HeadFacts | gate.TokenWaitersOnl
     bumps = (group_bumps(tuple(record for record in records if record.at >= head.waiter.since))
              if isinstance(history, BumpHistory) else history)
     return HeadFacts(now, head.waiter.since, bumps,
-                     head.order, head.has_priority, _read_token_waits(reading),
-                     budget=reading.explanation.limits.budget, head_need=head.waiter.need, bump_records=records, priority=reading.explanation.priority)
+                     head.has_priority, _read_token_waits(reading),
+                     head_need=head.waiter.need, bump_records=records, priority=reading.explanation.priority)
 
 
 def clock(instant: float, zone: ZoneInfo, *, seconds: bool = True, zone_name: bool = False) -> str:
@@ -415,21 +413,12 @@ def priority_text(priority: gate.QueuePriority | gate.NoQueuePriority) -> str:
             f"queue priority: {priority['unit']} ({priority['why']})")
 
 
-def order_rule(facts: HeadFacts, zone: ZoneInfo) -> str:
-    if not facts.has_priority:
-        text = "no head priority: younger steps that fit may start"
-    elif isinstance(facts.order, gate.WindowNotStarted):
-        text = "head priority: window start not recorded; younger steps wait"
-    else:
-        remaining = max(0, int(facts.order.deadline - facts.now))
-        minutes, seconds = divmod(remaining, 60)
-        text = gate.window_clause(facts.order, facts.budget, facts.head_need, zone)
-        text += f" ({minutes} min {seconds} s left)"
-    return text
+def order_rule(facts: HeadFacts) -> str:
+    return (f"younger runs start only if room still covers the first run's need of {facts.head_need / gate.GIB:.1f} GiB")
 
 
-def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
-    return "; ".join(filter(None, [priority_text(facts.priority), order_rule(facts, zone)]))
+def order_text(facts: HeadFacts) -> str:
+    return "; ".join(filter(None, [priority_text(facts.priority), order_rule(facts)]))
 
 
 def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[str]:
