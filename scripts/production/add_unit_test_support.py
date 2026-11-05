@@ -116,7 +116,8 @@ def fixture_agent_started(arguments: list[str]) -> None:
     directory = Path(os.environ["HERDR_PROC"]) / str(shell) / "cwd"
     write_process(os.environ, FAKE_CLAUDE_PID, shell, ["claude"], marks, cwd=directory.resolve())
     with patch.object(runtime_sessions, "process_start", side_effect=fixture_process_start):
-        record_fixture_claude_start(arguments)
+        record_fixture_claude_start(arguments, remote_control=(Path(os.environ["STUB_STATE"]) / "ready").exists(),
+                                   messaging_socket=os.environ["FAKE_CLAUDE_SOCKET"])
     registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{FAKE_CLAUDE_PID}.json"
     record = cast(dict[str, str], json.loads(registry.read_text()))
     identity = record["sessionId"]
@@ -177,7 +178,7 @@ def configure_test_zone() -> None:
 
 
 from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, unit_membership,
+    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, recorded_showrunner, unit_membership,
 )
 
 
@@ -289,6 +290,8 @@ class AddUnitTestCase(ShutdownTestCase):
         )
         registry = home / ".claude/sessions"
         registry.mkdir()
+        listener = self.enterContext(socket.socket(socket.AF_UNIX))
+        listener.bind(str(self.root / "claude.sock"))
         self.state = self.root / "stub-state"
         _ = self.state.mkdir()
         _ = (self.state / "ready").touch()
@@ -308,6 +311,7 @@ class AddUnitTestCase(ShutdownTestCase):
         self.env = {**os.environ, "HOME": str(self.root / "home"),
                     "HERDR_PLATFORM": "linux",
                     "NOTIFIER_SESSIONS_DIR": str(registry),
+                    "FAKE_CLAUDE_SOCKET": str(self.root / "claude.sock"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "STUB_STATE": str(self.state),
                     "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak",
@@ -325,6 +329,7 @@ class AddUnitTestCase(ShutdownTestCase):
         messaging.bind(str(socket_path))
         self.env["FAKE_CLAUDE_SOCKET"] = str(socket_path)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
+        _ = recorded_showrunner("director", self.doc)
         _ = self.staff.record_production("build-followups", self.doc)
         self.herdr_overrides = {}
         fake_path = self.bin / "fake-herdr"
@@ -465,13 +470,17 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = write_registry(self.agent_config, overrides)
 
     def production_doc(self, merge_branch: str = "build-followups") -> str:
+        units = "".join(f"| {name}-unit | none — board-free |\n" for name in
+                        ("alpha", "beta", "review", "lfo", "mul_add", "mul-add", "nightly-review", "trunk"))
         return ("# Production\n\n"
                 f"- **Merge branch:** `{merge_branch}` — unit checkpoints merge here\n"
                 f"- **Showrunner checkout:** `{self.checkout}`\n"
                 "- **Showrunner session:** director\n"
                 "- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n"
                 "- **User zone:** America/Los_Angeles — reports use PDT\n\n"
-                "## Gates\n")
+                "## Units\n\n"
+                "| Unit | Owns |\n| --- | --- |\n"
+                f"{units}")
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
@@ -510,6 +519,11 @@ class AddUnitTestCase(ShutdownTestCase):
         if isinstance(request, add_unit.UnitLaunch):
             self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
             self.env["FAKE_CLAUDE_PID"] = str(FAKE_CLAUDE_PID)
+            registry = Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{FAKE_CLAUDE_PID}.json"
+            if registry.exists():
+                record = cast(dict[str, object], json.loads(registry.read_text()))
+                record["bridgeSessionId"] = "session_bridge" if (self.state / "ready").exists() else ""
+                _ = registry.write_text(json.dumps(record))
             parent = fixture_runtime_id("showrunner::" + fixture_showrunner_name(request.production.slug, request.production.doc))
             self.env["FAKE_CLAUDE_SESSION_ID"] = fixture_runtime_id("unit:" + parent + ":" + request.identity.session)
             name = SHARED
@@ -522,9 +536,6 @@ class AddUnitTestCase(ShutdownTestCase):
                 code=0, stdout=json.dumps({"result": {"workspaces": []}}))
             responses[f"--session {name} pane list"] = CommandResponse(code=0, stdout=json.dumps({
                 "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": title}]}}))
-            screen = "/remote-control is active" if (self.state / "ready").exists() else "Waiting for remote control"
-            responses[f"--session {name} pane read w1:p1 --source recent --lines 60"] = CommandResponse(
-                code=0, stdout=screen)
             responses[f"--session {name} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
                 code=0, stdout="────────\n❯ \n────────")
             process = self.root / "proc/102"
@@ -778,7 +789,8 @@ class AddUnitTestCase(ShutdownTestCase):
         registry = Path(self.env["NOTIFIER_SESSIONS_DIR"])
         _ = (registry / f"{os.getpid()}.json").write_text(json.dumps({
             "pid": os.getpid(), "sessionId": "62ccbd64-f22e-5647-b20e-7899aa39d766", "name": "postmaster",
-            "messagingSocketPath": "", "updatedAt": 1, "procStart": proc_start,
+            "messagingSocketPath": self.env["FAKE_CLAUDE_SOCKET"], "updatedAt": 1, "procStart": proc_start,
+            "bridgeSessionId": "session_bridge",
         }))
 
     def prepare_attach(self, *, after_stop: tuple[int, ...] = (), after_launch: tuple[int, ...] = (202,),

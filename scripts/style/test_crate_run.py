@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bulk_rename as bulk
 import berth_board
 import bulk_run as run
@@ -32,6 +35,7 @@ from style_child_test_support import install_refusal_tools
 from scripts.build_queue import queue_place
 from scripts.copies import copies
 from scripts.lib import copy_record, scratch
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 
 class Commands:
@@ -97,6 +101,8 @@ class CrateRunTests(CargoProjectTests):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("showrunner", name="style-fixture")
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root / "gate-home"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),

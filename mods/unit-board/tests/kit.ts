@@ -5,7 +5,7 @@ import type { PaneState } from "../types";
 import type { BoardData, BoardPhase, BoardTime } from "../types/board";
 
 export const NOW = Date.UTC(2026, 9, 16, 18, 0);
-export const BOARD = "/test-state/unit-board/show.json";
+export const BOARD = "/test-state/unit-board/00000000-0000-4000-8000-000000000001.json";
 export const RUN = "/history/runs/current.jsonl";
 export const DISCOVERY = "/history/runs";
 export const REGISTRY = "/test-home/.local/state/notifier";
@@ -95,7 +95,7 @@ export function engineFiles(on: On) {
       return { value: { exitCode: 1, stdout: "", stderr, isStdoutTruncated: false, isStderrTruncated: false } };
     }
     const paths = boards.map((board, index) => {
-      const path = index === 0 ? BOARD : `/test-state/unit-board/${board.production}.json`;
+      const path = index === 0 ? BOARD : `/test-state/unit-board/00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}.json`;
       files.set(path, JSON.stringify(board));
       mtimes.set(path, clock.now());
       return path;

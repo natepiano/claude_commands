@@ -591,13 +591,17 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
         return f"queued for held role {name}; its holder controls the next assignment"
     durable = Path(session_dir).resolve() in {path.resolve() for path in design_roles.durable_meshes()}
     held = codex_mesh.hold_message(session_dir, name, text, without_launcher=durable, sender="mesh-runs")
-    if isinstance(held, codex_mesh.RepeatHeld):
-        return f"held repeated run result: copy {held.copies}"
-    if isinstance(held, codex_mesh.HeldForLauncher):
-        return f"held for {name}'s attached launcher on thread {held.thread_id}"
-    if isinstance(held, codex_mesh.HeldForNextDispatch):
-        return f"held for {name}'s next dispatch on thread {held.thread_id}"
-    state = held.reason if isinstance(held, codex_mesh.WorkerEnded) else f"{name} is {held.status or 'unknown'}"
+    match held:
+        case codex_mesh.RepeatHeld(copies):
+            return f"held repeated run result: copy {copies}"
+        case codex_mesh.HeldForLauncher(thread_id):
+            return f"held for {name}'s attached launcher on thread {thread_id}"
+        case codex_mesh.HeldForNextDispatch(thread_id):
+            return f"held for {name}'s next dispatch on thread {thread_id}"
+        case codex_mesh.WorkerEnded(reason):
+            state = reason
+        case codex_mesh.NoLauncherAttached(status=status):
+            state = f"{name} is {status or 'unknown'}"
     note = (f"Worker {name}'s run {record['label']} finished ({_exit_words(exit_code)}); no launcher is attached "
             + f"({state}), so the result comes to you. Dispatch the worker (implement.sh --to {name}) "
             + "when it should act on it.")

@@ -26,7 +26,7 @@ class UnitTransfer:
 
 
 def _production(slug: str) -> Production:
-    checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
+    checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / showrunners.timer_name(slug))
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise ValueError(f"{slug}: {checked.reason}")
     return read_production(checked.path)
@@ -51,6 +51,11 @@ def apply(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
         changed = request.member.parent != staff.ReportsTo(request.parent.id)
         if changed:
             _ = staff.move(request.member.id, staff.ReportsTo(request.parent.id))
+            notice = showrunners.send_to_address(
+                f"staff:{request.member.id}", f"transfer:{request.member.id}:{request.parent.id}",
+                f"Your unit now belongs to production {request.receiving.slug}.", recipient=request.unit)
+            for line in notice.lines:
+                print(line)
         _ = staff_move.move_unit(from_slug, request.unit, request.receiving.slug,
                                  identity=staff_move.PinnedUnit(request.member.id, request.parent.id))
         print("done" if changed else "unchanged")

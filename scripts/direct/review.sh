@@ -54,6 +54,7 @@
 #                                        open phase (review_tree.py).
 
 set -euo pipefail
+"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 LAUNCHER_COMMAND=(bash "${BASH_SOURCE[0]}" "$@")
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
@@ -782,7 +783,12 @@ if [[ "${PASS_INDEX}" == 1 && "${LENS}" != ux && -f "${PROGRESS_STATE}" ]]; then
 import json
 import sys
 from pathlib import Path
-print(json.loads(Path(sys.argv[1]).read_text()).get("unit", ""))
+from scripts.lib import unit_runs
+from scripts.production import staff
+
+state = json.loads(Path(sys.argv[1]).read_text())
+owner = unit_runs.run_owner(state, staff.local_snapshot())
+print(owner.name if isinstance(owner, staff.StaffRow) else "")
 PY
 )"
   if [[ -n "${FAST_TRACK_UNIT}" ]]; then

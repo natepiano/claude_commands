@@ -8,7 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.note_file import note_name
 
-from scripts.production import staff_sources
+from scripts.production import staff_sources, staff
+from scripts.message import sessions as status_sessions
 import io
 import fcntl
 import json
@@ -37,6 +38,8 @@ from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.whoami import usage_store
 import quota_alert
+
+local_staff_snapshot = staff.local_snapshot
 
 send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPrivateUsage]
 deliver_notice_jobs = quota_alert.deliver_and_record
@@ -140,6 +143,8 @@ class RefusalWatchTests(unittest.TestCase):
         # Readings are stored at NOW; status re-reads a login live once its reading is older than STALE_AFTER.
         _ = self.enterContext(patch.object(accounts, "datetime", WatchTime))
         _ = self.enterContext(patch.object(sessions, "live_sessions", side_effect=lambda: self.live))
+        _ = self.enterContext(patch.object(status_sessions, "running_sessions", side_effect=lambda: self.live))
+        _ = self.enterContext(patch.object(staff, "local_snapshot", side_effect=self.membership))
         _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.process_dir))
         _ = self.enterContext(patch.object(account, "account_of", side_effect=self.process_account))
         _ = self.enterContext(patch.object(inventory, "inventory", side_effect=self.inventory_for))
@@ -159,6 +164,18 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading("main@example.invalid", 80, reset=NOW + timedelta(days=6))
         self.reading(SOURCE_LOGIN, 0)
         self.reading(TARGET_LOGIN, 1, reset=NOW + timedelta(days=1))
+
+    def membership(self) -> staff.StaffSnapshot:
+        try:
+            record = local_staff_snapshot()
+        except staff.StaffUnreadable:
+            record = staff.StaffSnapshot(())
+        if record.rows:
+            return record
+        return staff.StaffSnapshot(tuple(staff.StaffRow(
+            staff.StaffId(owner["session_id"]), owner["kind"], owner["name"], staff.StaffRoot(),
+            current_session=staff.StaffId(owner["session_id"]))
+            for owner in self.owners if owner["kind"] in ("unit", "showrunner")))
 
     def process_dir(self, pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
         found = next((owner for owner in self.owners if owner["pid"] == pid), None)
@@ -1047,12 +1064,11 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(SOURCE_LOGIN, 1)
         fresh = herdr.HerdrProcess(1000, herdr.HerdrPlace("agents", "new-pane"),
             {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "new-unit"}, "claude", str(self.home))
-        def observed(login: str | None = None, *,
-                     registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
-            return self.listing(login, registrations=registrations) if herdr.herdr_processes() else []
+        def observed() -> list[sessions.SessionRecord]:
+            return self.live if herdr.herdr_processes() else []
         processes: list[herdr.HerdrProcess] = []
         with (patch.object(herdr, "_scan_herdr_processes", side_effect=lambda: list(processes)),
-              patch.object(inventory, "listing", side_effect=observed),
+              patch.object(status_sessions, "running_sessions", side_effect=observed),
               herdr.process_snapshot()):
             self.assertEqual(herdr.herdr_processes(), [])
             processes.append(fresh)
@@ -1069,12 +1085,11 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.groups(units="claude3")
         processes: list[herdr.HerdrProcess] = []
 
-        def observed(login: str | None = None, *,
-                     registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
-            return self.listing(login, registrations=registrations) if herdr.herdr_processes() else []
+        def observed() -> list[sessions.SessionRecord]:
+            return self.live if herdr.herdr_processes() else []
 
         with (patch.object(herdr, "_scan_herdr_processes", side_effect=lambda: list(processes)) as scans,
-              patch.object(inventory, "listing", side_effect=observed),
+              patch.object(status_sessions, "running_sessions", side_effect=observed),
               refusal_watch.session_observation(), herdr.process_snapshot()):
             self.assertEqual(herdr.herdr_processes(), [])
             owner = self.owner("new-unit", host="unit")
@@ -1095,13 +1110,12 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.groups(units="claude1")
         _ = self.owner("unit", host="unit")
 
-        def observed(login: str | None = None, *,
-                     registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
+        def observed() -> list[sessions.SessionRecord]:
             _ = herdr.herdr_processes()
-            return self.listing(login, registrations=registrations)
+            return self.live
 
         with (patch.object(herdr, "_scan_herdr_processes", return_value=[]) as scans,
-              patch.object(inventory, "listing", side_effect=observed),
+              patch.object(status_sessions, "running_sessions", side_effect=observed),
               refusal_watch.session_observation(), herdr.process_snapshot()):
             _ = herdr.herdr_processes()
             _ = herdr.herdr_processes()
@@ -1118,14 +1132,13 @@ class RefusalWatchTests(unittest.TestCase):
             herdr = import_module("herdr")
         _ = self.groups(units="claude1")
         _ = self.owner("unit", host="unit")
-        def observed(login: str | None = None, *,
-                     registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
+        def observed() -> list[sessions.SessionRecord]:
             _ = herdr.herdr_processes()
-            return self.listing(login, registrations=registrations)
+            return self.live
         for changed in ("pid", "procStart"):
             with (self.subTest(identity_field=changed),
                   patch.object(herdr, "_scan_herdr_processes", return_value=[]) as scans,
-                  patch.object(inventory, "listing", side_effect=observed),
+                  patch.object(status_sessions, "running_sessions", side_effect=observed),
                   refusal_watch.session_observation(), herdr.process_snapshot()):
                 _ = herdr.herdr_processes()
                 if changed == "pid":
@@ -2369,8 +2382,10 @@ class RefusalWatchTests(unittest.TestCase):
                 f"{group}: not configured; the role map selects no account; run accounts.py move {group} <claudeN>"), 1)
         rows = [line for line in output.splitlines() if line.startswith("|")][2:]
         self.assertTrue(rows)
-        for row in rows:
-            self.assertEqual(row.split("|")[3].strip(), "")
+        roles = [row.split("|")[3].strip() for row in rows]
+        self.assertIn("units 1 (busy 0, shell 0, idle 1)", roles)
+        self.assertIn("showrunners 1 (busy 0, shell 0, idle 1)", roles)
+        self.assertFalse(any("✓" in role for role in roles))
         self.assertEqual(self.snapshot(), before)
 
     def test_refused_unconfigured_groups_report_setup_and_move_no_members(self) -> None:

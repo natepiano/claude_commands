@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from scripts.lib import test_hang_guard
-from scripts.production import staff, session_staff
+from scripts.production import staff, session_staff, unit_config
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file
 
 import json
@@ -222,12 +222,17 @@ class ReviewLauncherFixture(LauncherFixture):
         super().setUp()
         self.prompt_file: Path = self.root / "review_prompt.md"
         self.review_script = self.root / "scripts" / "direct" / "review.sh"
+        _ = unit_config.write(self.working_dir, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
 
     @cached_property
     def staff_parent(self) -> str:
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         with isolated_staff_file(self.root / "staff.json", {}):
-            return unit_membership("fixture", "fixture-unit").id
+            member = unit_membership("fixture", "fixture-unit")
+            return staff.ensure("unit", name=member.name, parent=member.parent,
+                                runtime_id=member.current_session,
+                                worktree=staff.PresentWorktree("natedev", self.working_dir)).current_session
 
     @override
     def prepare_fixture(self) -> None:
@@ -295,6 +300,8 @@ class ReviewLauncherFixture(LauncherFixture):
         for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")
+        # Test the wrapper after admission in this private fixture.
+        _ = (direct_dir / "assign_gate.py").write_text("# Admission succeeds in this private fixture.\n")
         lint = self.root / "scripts/lint"
         lint.mkdir()
         for name in ("style_review.py", "lint_config.sh"):
@@ -355,6 +362,14 @@ class ReviewLauncherFixture(LauncherFixture):
         ready.touch()
         finish.touch()
         return communicate_launcher(process, timeout)
+
+    @override
+    def recorder(self, *arguments: str) -> None:
+        if arguments[0] == "start-run":
+            values = list(arguments)
+            values[values.index("--main-session-id") + 1] = self.staff_parent
+            arguments = tuple(values)
+        super().recorder(*arguments)
 
     def start_implementation(self, name: str) -> Path:
         session_dir = self.start_phase(name)

@@ -1,8 +1,6 @@
 """Workspace bulk runs use temporary Git repos and a fake command runner; never build Rust."""
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
-
 import json
 import os
 import signal
@@ -29,9 +27,10 @@ import bulk_rename as bulk
 import fake_fmt
 from style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import queue_place
+from style_plan_test_support import unit_staff_id
 import berth_board
 import rules
-from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER
+from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER, ticket_owner_id
 import style_ledger as ledger_api
 from approved_renames import AppliedInCode, BindingRename, NoBindingScope, rename_declaration
 from test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
@@ -484,7 +483,7 @@ class WorkspaceRunTests(CargoProjectTests):
         findings: list[ledger_api.HeldFinding] = []
         for index, path in enumerate(paths):
             issue = self.root / ("decision.md" if shared_proposal else f"decision-{index}.md")
-            _ = issue.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved rename\n')
+            _ = issue.write_text(f'---\nunit: {unit_staff_id("names-unit")}\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved rename\n')
             finding = ledger.hold(definition.rule_id, path, 2, (self.repo / path).read_text().splitlines()[1],
                                   "rename", "old", "number", definition.blob, "1001")
             ledger.file_held(finding.finding_id, issue)
@@ -905,7 +904,7 @@ class WorkspaceRunTests(CargoProjectTests):
                               (self.repo / path).read_text().splitlines()[line - 1],
                               'rename', old, new, definition.blob, '14001')
         proposal = self.root / 'decision-extra.md'
-        _ = proposal.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved extra rename\n')
+        _ = proposal.write_text(f'---\nunit: {unit_staff_id("names-unit")}\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved extra rename\n')
         ledger.file_held(finding.finding_id, proposal)
         ledger.ticket_drop('14001')
         return finding

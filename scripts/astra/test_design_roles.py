@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from scripts.production import staff, worker_admission
-from scripts.production.staff_test_support import fixture_member, unit_membership, fixture_runtime_id, fixture_session, fixture_worker
+from scripts.production.staff_test_support import (
+    fixture_member, fixture_runtime_id, fixture_unit_location, fixture_session,
+    fixture_worker, showrunner_relationship, unit_membership,
+)
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.test_models_registry import write_registry
@@ -191,11 +194,12 @@ class DurableRolesTests(unittest.TestCase):
         directory = self.root / name
         phase = directory / "phases/1"
         phase.mkdir(parents=True)
+        owner = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repository)
         _ = (phase / "delegated_phase_reservation_state.json").write_text(json.dumps({
             "kind": "enrolled_awaiting_first_touch", "phase": "1"}))
         _ = (phase / "files").write_text("design.md\n")
         _ = (directory / "progress_history_state.json").write_text(json.dumps({
-            "run_id": name, "history_file": str(self.root / (name + ".jsonl")),
+            "run_id": name, "owner_staff_id": owner.id, "history_file": str(self.root / (name + ".jsonl")),
             "phase": {"id": "1", "instance_id": instance, "status": "open"},
             "open_phases": [{"id": "1", "instance_id": instance, "status": "open"}],
         }))
@@ -354,9 +358,7 @@ class DurableRolesTests(unittest.TestCase):
         self.addCleanup(backend.tearDown)
         _ = recorded_showrunner("demo", document)
         production_membership("demo", "design-unit")
-        unit = staff.by_path("demo/design")
-        assert unit is not None
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.repository), expected=unit.worktree)
+        _ = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repository)
         parent = staff.by_path(parent_path)
         assert parent is not None
         os.environ["CODEX_THREAD_ID"] = parent.current_session
@@ -368,13 +370,16 @@ class DurableRolesTests(unittest.TestCase):
         def prime(arguments: list[str], *, capture_output: bool, text: bool,
                   check: bool, timeout: float | None = None,
                   env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-            if arguments[0] == "bash":
+            if arguments[1] != str(design_roles.ROOT / "scripts/direct/assign.sh"):
                 self.assertTrue(text)
                 return subprocess.run(arguments, capture_output=capture_output, text=True,
                                       check=check, timeout=timeout, env=env)
             self.assertTrue(capture_output and text)
             self.assertFalse(check)
-            self.assertEqual(arguments[2], "prime")
+            self.assertEqual(arguments[:6], ["bash", str(design_roles.ROOT / "scripts/direct/assign.sh"),
+                                           "--role", "implement", "--operation", "prime"])
+            self.assertNotIn("--sandbox", arguments)
+            self.assertNotIn("--paths", arguments)
             commands.append(arguments)
             mesh = Path(arguments[arguments.index("--session-dir") + 1])
             mesh.mkdir(parents=True, exist_ok=True)
@@ -383,7 +388,15 @@ class DurableRolesTests(unittest.TestCase):
             server["design_context"] = codex_mesh._design_context(str(mesh))  # pyright: ignore[reportPrivateUsage]
             _ = (mesh / "mesh_server.json").write_text(json.dumps(server))
             with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
-                code = codex_mesh.main(arguments[2:])
+                options = dict(zip(arguments[6::2], arguments[7::2]))
+                self.assertEqual(options["--held-role"], "designer")
+                code = codex_mesh.main([
+                    "prime", "--session-dir", str(mesh), "--name", options["--new-worker"],
+                    "--cwd", options["--cwd"], "--instructions-file", options["--prompt"],
+                    "--model", options["--model"], "--effort", options["--effort"],
+                    "--sandbox", "danger-full-access", "--held-design", options["--held-design"],
+                    "--held-role", options["--held-role"],
+                ])
             return subprocess.CompletedProcess(arguments, code, output.getvalue(), errors.getvalue())
 
         signal_process = os.kill
@@ -413,6 +426,31 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual(len(backend.methods("thread/start")), 1)
         self.assertEqual(backend.methods("turn/start"), [])
         self.assertEqual(self.dispatches, [])
+
+    def test_a_phase_binding_without_a_run_owner_names_the_run_directory(self) -> None:
+        from scripts.direct import phase_reservation
+
+        path = self.run_a / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        _ = state.pop("owner_staff_id")
+        _ = path.write_text(json.dumps(state))
+        for contents in (None, "", "\n"):
+            with self.subTest(director=contents):
+                if contents is not None:
+                    _ = (self.run_a / "director").write_text(contents)
+                with self.assertRaises(phase_reservation.StateRefused) as refusal:
+                    _ = self.open_designer()
+                self.assertEqual(str(refusal.exception), f"{self.run_a}: run owner is unavailable")
+                self.assertEqual(self.launches, [])
+
+    def test_staff_refusal_does_not_claim_or_launch_an_astra_role(self) -> None:
+        with patch.object(worker_admission, "admit", side_effect=worker_admission.AdmissionRefused("staff: demo-design-astra-designer: not opened: write refused")):
+            with self.assertRaisesRegex(ValueError, "staff: demo-design-astra-designer: not opened: write refused"):
+                _ = self.open_designer()
+        self.assertEqual(self.launches, [])
+        self.assertTrue(all(isinstance(role.lifecycle, design_roles.RoleNotOpened) and not role.lifecycle.claim
+                            for path in design_roles.state_root().glob("*/design.json")
+                            for role in design_roles.read_design(path.parent.name).roles))
 
     def test_damaged_design_roster_refuses_publication_without_erasing_ownership(self) -> None:
         design = self.open_designer()
@@ -509,6 +547,42 @@ class DurableRolesTests(unittest.TestCase):
                     self.assertEqual(bad.read_bytes(), before)
                     bad.unlink()
 
+    def test_run_cleanup_skips_another_runs_damaged_record_and_a_retry_writes_nothing(self) -> None:
+        design = self.open_designer()
+        bad = write_empty_binding_record(self.repository,
+                                        lifecycle=design_roles.RoleOpen(staff.StaffId('other-thread')), run_directory=str(self.run_b))
+        for attempt in range(2):
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in self.root.rglob('*.json')}
+            output, error = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), redirect_stderr(error):
+                code = design_roles.main(['unbind-run', str(self.run_a)])
+            self.assertEqual(code, 0, error.getvalue())
+            self.assertEqual(output.getvalue(), '')
+            self.assertEqual(error.getvalue().splitlines(), [f'warning: {bad}: missing or invalid repository'])
+            current = design_roles.read_design(design.placement.design_id)
+            self.assertIsInstance(current.binding, design_roles.DesignUnbound)
+            self.assertEqual(current.placement.generation, 2)
+            self.assertEqual(current.roles, design.roles)
+            self.assertEqual((bad.read_bytes(), bad.stat().st_mtime_ns), before[bad])
+            if attempt:
+                self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in self.root.rglob('*.json')}, before)
+        self.assertEqual(self.releases, [design.placement.design_id])
+
+    def test_run_cleanup_refuses_matching_damage_without_a_live_role(self) -> None:
+        for lifecycle in (design_roles.RoleNotOpened(), design_roles.RoleEnded(staff.StaffId('ended-thread'))):
+            with self.subTest(lifecycle=lifecycle):
+                bad = write_empty_binding_record(self.repository,
+                                                lifecycle=lifecycle, run_directory=str(self.run_a))
+                before = bad.read_bytes(), bad.stat().st_mtime_ns
+                error = io.StringIO()
+                with redirect_stderr(error):
+                    code = design_roles.main(['unbind-run', str(self.run_a)])
+                self.assertEqual(code, 2)
+                self.assertEqual(error.getvalue().splitlines(), [f'design_roles: {bad}: missing or invalid repository'])
+                self.assertEqual((bad.read_bytes(), bad.stat().st_mtime_ns), before)
+                bad.unlink()
+        self.assertEqual(self.releases, [])
 
     def test_document_lookup_warns_once_for_invalid_json_and_keeps_the_valid_design(self) -> None:
         design = self.open_designer()
@@ -861,6 +935,34 @@ class DurableRolesTests(unittest.TestCase):
         self.assert_interrupted_repair_finishes_publication("design_context.json")
 
 
+    def test_markerless_repair_retry_finishes_census_before_reporting_success(self) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        command = ['rebind', design.placement.design_id, '--expected-generation', '1',
+                   '--unbind', '--reason', 'finish census publication']
+        def interrupt(design: design_roles.HeldDesign, role: Role, record: staff.StaffSnapshot) -> None:
+            del design, role, record
+            raise OSError('census publication interrupted')
+
+        with patch.object(design_roles, '_project_hold', side_effect=interrupt), \
+                redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            self.assertEqual(design_roles.main(command), 2)
+        (path.parent / 'transition.json').unlink()
+        hold = self.root / 'holds/9309c903-5894-501a-8aa7-f33ea912e074.json'
+        hold.unlink()
+        output = io.StringIO()
+        with patch.object(design_roles, '_project_hold', side_effect=interrupt), \
+                redirect_stderr(io.StringIO()), redirect_stdout(output):
+            self.assertEqual(design_roles.main(command), 2)
+        self.assertEqual(output.getvalue(), '')
+        with redirect_stdout(output):
+            self.assertEqual(design_roles.main(command), 0)
+        self.assertEqual(output.getvalue().splitlines(), [f'{design.placement.design_id} rebound at generation 2'])
+        self.assertEqual(design_roles.read_design(design.placement.design_id).roles, design.roles)
+        self.assertEqual([role['thread_id'] for role in astra_roles.live_roles()],
+                         ['9309c903-5894-501a-8aa7-f33ea912e074'])
+        self.assertEqual(self.releases, [design.placement.design_id])
+
     def test_binding_repair_does_not_accept_other_record_damage(self) -> None:
         design = self.open_designer()
         path = damage_binding_repository(design)
@@ -1158,11 +1260,22 @@ class DurableRolesTests(unittest.TestCase):
         bad = self.root / "roles/00000000-0000-4000-8000-000000000001/design.json"
         bad.parent.mkdir(parents=True)
         _ = bad.write_text('{"schema": 999}')
-        lines = self.list_output().splitlines()
-        self.assertEqual(lines[0], "no held roles")
+        error = io.StringIO()
+        with redirect_stderr(error):
+            self.assertEqual(self.list_output(), "no held roles\n")
+        lines = error.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(f"problem: {bad}: "), lines)
+        self.assertGreater(len(lines[0]), len(f"problem: {bad}: "))
+        with redirect_stderr(io.StringIO()):
+            design = self.open_designer()
+        error = io.StringIO()
+        with redirect_stderr(error):
+            lines = self.list_output().splitlines()
         self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[1].startswith(f"problem: {bad}: "), lines)
-        self.assertGreater(len(lines[1]), len(f"problem: {bad}: "))
+        self.assertTrue(all(line.startswith(design.placement.design_id + '/') for line in lines), lines)
+        self.assertEqual(len(error.getvalue().splitlines()), 1)
+        self.assertIn(f"problem: {bad}: ", error.getvalue())
 
     def test_list_json_preserves_full_inventory_and_problems(self) -> None:
         _ = self.open_designer()

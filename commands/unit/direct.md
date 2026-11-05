@@ -1,3 +1,7 @@
+Run every worker through `bash ~/.claude/scripts/direct/assign.sh` as a background shell of the director session.
+This rule covers all roles and both Claude and Codex.
+Direct calls to worker launchers refuse with one line that names `assign.sh`.
+
 ---
 description: Direct phases, reviews, and checkpoints.
 ---
@@ -191,10 +195,10 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 </CoreContract>
 
 <ProductionUnit>
-When the plan header carries a `> **Production:**` line, this run is a unit of
-that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/>
-in full at <PrepareSession/> and after every compaction, and apply it
-throughout. It changes six things in this command:
+Your staff row identifies your unit and its parent showrunner.
+The parent row identifies your production and its document.
+Read `~/.claude/docs/production_format.md` → <ProductionUnit/> at <PrepareSession/> and after every compaction.
+Apply it throughout the run when your staff row has a parent showrunner. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
   branch into this branch, at every phase start and when asked;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
@@ -329,7 +333,7 @@ Wait for a run's result as the next message, or put more files in one run.
 Exit 3 means the caller is not a mesh worker; only that exit permits attached execution.
 A message from a worker's run saying no
 launcher is attached carries the result to you: dispatch that worker
-(`implement.sh --to <full worker name>`) when it should act on it.
+(`assign.sh --role implement --to <full worker name>`) when it should act on it.
 
 When a decision makes a running or queued test, lint or build run useless,
 cancel it in the same turn to free its memory and its place in the queue.
@@ -619,7 +623,7 @@ re-open a decision the user has already made about this run, or edit
 **Dispatching a repair fixes nothing.** `dispatch` leaves its batch
 `repair_in_flight`, and `gate` and `verdict` both refuse a finding still in
 flight, so a repair that never finished cannot reach a reviewer pre-labelled as
-fixed and be confirmed on that label alone. `implement.sh` resolves that state
+fixed and be confirmed on that label alone. `assign.sh` resolves that state
 itself: `landed` when its worker exits cleanly, `abandon --edits-landed` when
 the worker errors. The unit director owns it only when the launcher is gone — the
 user stopped it, the process was killed, the session was interrupted. Then run
@@ -631,8 +635,7 @@ when this phase stops.
 </FindingsLedger>
 
 <PassOwnership>
-Every pass is recorded by the launcher that runs it: `implement.sh` and
-`review.sh` call `start-pass` and `finish-pass` around the worker they wait on,
+Every pass is recorded by the launcher that runs it: `assign.sh` call `start-pass` and `finish-pass` around the worker they wait on,
 for completion and for error alike. The unit director never calls either by hand —
 a hand-written call forges a pass that never ran, and `findings.py gate` counts
 passes when it decides whether a phase is converging. The recorder rejects an
@@ -655,7 +658,7 @@ phase's work to the finished one — its title, its elapsed clock, and its pass
 counts all describe the wrong phase. A phase opened beside one still running
 leaves that one open: `start-phase` parks it, and `finish-phase --phase-id <id>`
 closes each at its own end. Name the phase on every launch,
-`implement.sh --phase <id>` and `review.sh --phase <id>`: the pass is stamped
+`assign.sh --role implement --phase <id>` and `assign.sh --role review --phase <id>`: the pass is stamped
 with it, and the launcher writes its files to that phase's `${PHASE_DIR}`.
 A launch without a phase is refused (the user, 2026-10-28).
 When a park makes a run useless, apply <WorkerRuns/>.
@@ -663,11 +666,10 @@ When a park makes a run useless, apply <WorkerRuns/>.
 Before each launch, check the prompt's phase against its active instance and title. Run start-phase and finish-phase at the real boundaries and keep parallel phases separately identified. Do not launch against a stale or absent instance. Classify planned implementation/deployment as implementation and command-only verification as an activity. A fix launch names its defect, failed gate or ledger batch. Correct active state only through supported recorder operations, preserving old evidence; never fabricate starts/finishes or rewrite historic records. Missing historic boundaries stay uncertain in analysis. (the user, 2026-10-28)
 
 For the 30-phase accuracy trial, launchers check before any worker starts.
-`review.sh` runs `check-launch` in every mode, including UX and early reviews;
-`implement.sh` runs `start-pass` first. Both commands share the launch check:
-they refuse a missing or closed phase, a first identity line
+`assign.sh` checks each launch before it records the pass.
+It refuses a missing or closed phase, a first identity line
 `Phase <id> — <title>` that differs from the open phase, and a fix without an
-authorized ledger round unless `implement.sh --fix-cause "<failed gate or defect>"`
+authorized ledger round unless `assign.sh --role fix --fix-cause "<failed gate or defect>"`
 names its cause. The newest round authorizes its workers while in flight and,
 after its resolver lands, while covered findings await closure verdicts; its
 companion can still launch. A prompt with no identity line passes; later phase
@@ -787,7 +789,7 @@ Execute in order:
 
 Apply <CoreContract/>, <TurnEndGate/>, <CompactionContract/>,
 <UserFacingText/>, and <VerificationNarration/> throughout, and
-<ProductionUnit/> when the plan header names a production.
+<ProductionUnit/> when your staff parent is a showrunner.
 
 The numbered steps below carry no turn boundaries. Consecutive steps run in one
 turn unless <TurnEndGate/> authorizes a stop between them. Steps 1–8 apply to
@@ -1222,7 +1224,7 @@ without `none:` records P5 exposure (the user, 2026-10-28).
 
 For `herdr`, dispatch repairs through `assign.sh --role fix --prompt <path> --cwd <worktree> --fix-cause "<defect>"`.
 The worker command selects the worker and keeps its native session.
-For `mesh`, dispatch every open worker with `implement.sh --to <full-worker-name>` before the
+For `mesh`, dispatch every open worker with `assign.sh --role implement --to <full-worker-name>` before the
 usual positional arguments; the prompt file is the follow-up message. Omit
 `--to` only for a new worker allowed by <LongLivedWorkers/>. Messages without the
 launcher are for questions only.
@@ -1262,10 +1264,11 @@ Apply <PassOwnership/>'s phase and cause check before each launch
 before launching, then:
 
 ```sh
-UNIT_RESOLVES_ROUND=1 implement.sh --to "<full-worker-name>" --phase "<phase id>" \
-  "${SESSION_DIR}" "${WORKING_DIR}" \
-  "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" fix \
-  "<responsibility>" fix "<activity>" "${FIX_ROUND}" <slot>
+UNIT_RESOLVES_ROUND=1 bash ~/.claude/scripts/direct/assign.sh --role fix \
+  --to "<full-worker-name>" --phase "<phase id>" --session-dir "${SESSION_DIR}" \
+  --cwd "${WORKING_DIR}" --prompt "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" \
+  --paths "${SESSION_DIR}/fix_paths_${FIX_ROUND}.txt" \
+  --fix-cause "<failed gate or defect>" --pass "${FIX_ROUND}" &
 ```
 
 **`UNIT_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:

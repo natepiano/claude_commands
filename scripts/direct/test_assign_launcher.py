@@ -60,6 +60,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
             return run_process(command, **options)
 
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=run_worker_command))
+        _ = self.enterContext(patch.object(assign, "require_live_director"))
 
     def launch_review(self) -> subprocess.CompletedProcess[str]:
         arguments = ["--role", "review", "--to", "review", "--cwd", str(self.fixture.fixture.root),
@@ -209,6 +210,19 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(self.prompt.read_bytes(), prompt)
         self.assertEqual((self.session_dir / "phases/7/impl_status").read_text(), "error\n")
 
+    def test_only_a_live_claude_or_codex_ancestor_permits_assignment(self) -> None:
+        for family in ("claude", "codex"):
+            with self.subTest(family=family):
+                result = self.run_launcher(["bash", str(ASSIGN), "--help"], family=family)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for family in ("systemd", "bash", "codex-helper"):
+            with self.subTest(parent=family):
+                result = self.run_launcher(["bash", str(ASSIGN), "--help"], family=family,
+                                           isolate_ancestors=True)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("requires a live Claude or Codex ancestor", result.stderr)
+        self.assertEqual(self.methods("thread/start"), [])
+
     def test_dispatch_has_a_durable_worker_row_before_submitting_work(self) -> None:
         from scripts.production import staff
         _ = self.successful()
@@ -270,7 +284,7 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_missing_required_options_and_positionals_refuse_before_opening_a_thread(self) -> None:
         for options in ([], ["--prompt", str(self.prompt)], ["--role", "test"], ["test", str(self.prompt)]):
             with self.subTest(options=options):
-                result = invoke_cli(assign, assign.main, options, os.environ.copy(), ROOT)
+                result = self.run_launcher(["bash", str(ASSIGN), *options])
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("usage", (result.stdout + result.stderr).lower())
         self.assertEqual(self.methods("thread/start"), [])
@@ -415,12 +429,12 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertIn(f"- Range: {baseline}..{end}", (directory / "prompt.md").read_text())
 
     def test_missing_run_calls_prepare_and_prints_the_prepared_folder(self) -> None:
-        script, prepared = self.prepare_launcher()
+        prepared = self.prepare_launcher()
         environment = os.environ.copy()
         for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR"):
             _ = environment.pop(key, None)
         with patch.dict(os.environ, environment, clear=True):
-            result = self.launch(session=False, execution=LauncherScript(script))
+            result = self.launch(session=False, execution=LauncherScript(ASSIGN))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(prepared.exists())
         self.assertIn(str(self.session_dir), result.stdout)
@@ -430,7 +444,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         (self.session_dir / "progress_history_state.json").unlink()
         shutil.rmtree(self.history)
         shutil.rmtree(self.session_dir / "phases", ignore_errors=True)
-        script, prepared = self.prepare_launcher()
+        prepared = self.prepare_launcher()
         director = os.environ["CODEX_THREAD_ID"]
         transcript = Path.home() / ".codex/sessions" / f"rollout-{director}.jsonl"
         transcript.parent.mkdir(parents=True, exist_ok=True)
@@ -444,7 +458,7 @@ class AssignLauncherTests(AssignLauncherFixture):
             _ = environment.pop(key, None)
         environment["CODEX_THREAD_ID"] = director
         with patch.dict(os.environ, environment, clear=True):
-            result = self.launch(session=False, execution=LauncherScript(script))
+            result = self.launch(session=False, execution=LauncherScript(ASSIGN))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(prepared.exists())
         phase = cast(dict[str, object], read_object(self.session_dir / "progress_history_state.json")["phase"])

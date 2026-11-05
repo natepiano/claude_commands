@@ -26,6 +26,7 @@ import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import CodexHomeSource, Quota, Report
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
+from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib import models_registry
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker
@@ -75,9 +76,16 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
-        config = self.root / "showrunners.json"
-        _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
-            "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
+        config = self.root / "showrunners.conf"
+        _ = config.write_text(("""# range: 0..
+threshold_percent=1
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=director
+always=director
+"""))
         registry = self.root / "models.conf"
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(patch.object(quota_alert, "CONFIG", config))
@@ -102,6 +110,23 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.pushes.append(push)
         self.sent.append(push.body)
         return quota_alert.PushSent()
+
+    def test_selected_codex_reading_uses_the_account_usage_age(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        original = config.read_text()
+        identity = agent_accounts.KnownCodexAccount(self.root / ".codex2", "fixture", "codex2")
+        report = Report("Codex", email=identity.login)
+        readings = quota_alert.CodexAlertPassReadings(
+            accounts.CodexWorkersAccount(identity.label, identity.home), identity,
+            (quota_alert.CodexHomeReading(identity.home, report, self.now - timedelta(minutes=6)),))
+        for age in (5, 7):
+            _ = config.write_text(original.replace("usage_stale_minutes=10", f"usage_stale_minutes={age}"))
+            with self.subTest(age=age):
+                selected = quota_alert.selected_codex_report(readings, self.now)
+                if age == 5:
+                    self.assertEqual(selected.problem, "the selected account's current reading is unknown")
+                else:
+                    self.assertIs(selected, report)
 
     def test_fresh_room_after_a_weekly_refusal_is_picked_without_a_later_reset(self) -> None:
         target, source = self.account(1), self.account(2)
