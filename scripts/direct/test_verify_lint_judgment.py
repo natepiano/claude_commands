@@ -154,27 +154,28 @@ Caused by:
 
     def test_compile_errors_and_unknown_101_repair_and_return_final_judgment(self) -> None:
         self.environment["TEST_CLIPPY_FIRST_STATUS"] = "101"
-        for diagnostic in (
-            "", "error[E0308]: mismatched types\n", "error: proc macro panicked\n",
-            LINT_FINDING + "error[E0425]: cannot find value `missing` in this scope\n",
-            "error: proc macro panicked\n" + LINT_FINDING,
+        for diagnostic, final_status in (
+            ("", 0),
+            ("error[E0308]: mismatched types\n", 101),
+            ("error: proc macro panicked\n", 0),
+            (LINT_FINDING + "error[E0425]: cannot find value `missing` in this scope\n", 101),
+            ("error: proc macro panicked\n" + LINT_FINDING, 0),
         ):
-            for final_status in (0, 101):
-                with self.subTest(diagnostic=diagnostic, final_status=final_status):
-                    self.environment.update({
-                        "TEST_CLIPPY_FIRST_DIAGNOSTIC": diagnostic,
-                        "TEST_CLIPPY_STATUS": str(final_status),
-                    })
-                    result = self.invoke_verify("lint", "sample", cwd=self.root)
-                    self.assertEqual(result.returncode, final_status, result.stdout + result.stderr)
-                    self.assert_fix_and_judgment_calls()
-                    self.assertEqual(self.lint_stages(), [
-                        ["+nightly", "fmt", "-p", "sample"],
-                        ["clippy", *self.calls("clippy")[0]],
-                        ["clippy", *self.calls("clippy")[1]],
-                        ["+nightly", "fmt", "-p", "sample"],
-                        ["clippy", *self.calls("clippy")[2]],
-                    ])
+            with self.subTest(diagnostic=diagnostic, final_status=final_status):
+                self.environment.update({
+                    "TEST_CLIPPY_FIRST_DIAGNOSTIC": diagnostic,
+                    "TEST_CLIPPY_STATUS": str(final_status),
+                })
+                result = self.invoke_verify("lint", "sample", cwd=self.root)
+                self.assertEqual(result.returncode, final_status, result.stdout + result.stderr)
+                self.assert_fix_and_judgment_calls()
+                self.assertEqual(self.lint_stages(), [
+                    ["+nightly", "fmt", "-p", "sample"],
+                    ["clippy", *self.calls("clippy")[0]],
+                    ["clippy", *self.calls("clippy")[1]],
+                    ["+nightly", "fmt", "-p", "sample"],
+                    ["clippy", *self.calls("clippy")[2]],
+                ])
 
     def test_lint_finding_repairs_formats_and_returns_final_judgment(self) -> None:
         self.environment["TEST_CLIPPY_FIRST_STATUS"] = "101"

@@ -266,6 +266,7 @@ The SSH rule permits `autogroup:member` as `natepiano`; the network rule still l
 HTTP refusals include the status and validation details without user fields; network refusals include the failure reason.
 It preserves unrelated rules and refuses a broad outbound rule that needs policy review.
 The join stage waits for SSM and sends one short-lived auth key through SSM stdin.
+`box-join` writes the box host keys from Tailscale to `~/.ssh/known_hosts` for the host name and address; box setup refusals show the last stderr line.
 The key never enters a command argument or a disk file.
 The configuration stage uses substitutes during closure transfer.
 It holds idle shutdown during the copy and detached switch.
