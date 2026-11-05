@@ -31,6 +31,36 @@ class BoxRefused(ValueError):
     """A live box check does not permit the next stage."""
 
 
+def policy_source() -> dict[str, object]:
+    return json_record((Path(__file__).resolve().parents[2] / 'config/aws-build-tailscale.json').read_text())
+
+
+def policy_device_bindings(source: dict[str, object], status: dict[str, object]) -> dict[str, str]:
+    """Resolve every policy device and report all invalid names together."""
+    nodes = [ledger.mapping(status.get('Self')), *[ledger.mapping(peer) for peer in ledger.mapping(status.get('Peer')).values()]]
+    machine_nodes = [(dns.rstrip('.').split('.', 1)[0], node) for node in nodes
+                     if isinstance(dns := node.get('DNSName'), str) and dns.rstrip('.')]
+    bindings: dict[str, str] = {}
+    problems: list[str] = []
+    for placeholder, machine_name in ledger.mapping(source.get('devices')).items():
+        matches = [node for name, node in machine_nodes if name == machine_name]
+        if not matches:
+            problems.append(f'{machine_name}: no match')
+        elif len(matches) > 1:
+            problems.append(f'{machine_name}: more than one match')
+        else:
+            addresses = public_strings(matches[0].get('TailscaleIPs', []))
+            if not addresses:
+                problems.append(f'{machine_name}: no address')
+            else:
+                bindings[placeholder] = addresses[0]
+    if problems:
+        names = sorted({name for name, _node in machine_nodes})
+        raise BoxRefused('Tailscale policy devices: ' + '; '.join(problems)
+                         + '; machine names present: ' + (', '.join(names) or '<none>'))
+    return bindings
+
+
 @dataclass(frozen=True)
 class PolicyReply:
     value: dict[str, object]
@@ -220,18 +250,9 @@ class BoxSetup:
         return json_record(self._run(['tailscale', 'status', '--json']))
 
     def _policy(self) -> tuple[PolicyReply, dict[str, object], list[str]]:
-        source = json_record((Path(__file__).resolve().parents[2] / 'config/aws-build-tailscale.json').read_text())
-        status = self._status()
-        nodes = [ledger.mapping(status.get('Self')), *[ledger.mapping(p) for p in ledger.mapping(status.get('Peer')).values()]]
-        bindings: dict[str, str] = {}
-        for placeholder, hostname in ledger.mapping(source.pop('devices')).items():
-            matches = [node for node in nodes if node.get('HostName') == hostname]
-            if len(matches) != 1:
-                raise BoxRefused(f'Tailscale policy requires one device named {hostname}')
-            addresses = public_strings(matches[0].get('TailscaleIPs'))
-            if not addresses:
-                raise BoxRefused(f'Tailscale policy has no address for {hostname}')
-            bindings[placeholder] = str(addresses[0])
+        source = policy_source()
+        bindings = policy_device_bindings(source, self._status())
+        _ = source.pop('devices')
         for placeholder, address in bindings.items():
             source = json_record(json.dumps(source).replace(json.dumps(placeholder), json.dumps(address)))
         live = self.tailnet.call('GET', 'acl')

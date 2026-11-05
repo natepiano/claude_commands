@@ -12,7 +12,7 @@
 set -euo pipefail
 
 HANA_TEST_PURPOSE="${HANA_TEST_PURPOSE:-}"
-HANA_TEST_OWNER="${HANA_TEST_OWNER:-${SHOWRUNNER_UNIT_ID:-}}"
+HANA_TEST_OWNER="${HANA_TEST_OWNER:-${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}}"
 export HANA_TEST_PURPOSE HANA_TEST_OWNER
 
 CHECKOUT="${1:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"

@@ -324,7 +324,7 @@ class PaneRestoreTests(unittest.TestCase):
         entry = pane_record.read("agents")["w1:p2"]
         self.assertEqual((entry["session_id"], entry["config_dir"], entry["name"], entry["model"], entry["cwd"]),
                          ("019b3a40-4250-7000-8000-000000000102", str(self.config), "alpha", "opus", "/work/alpha"))
-        self.assertEqual(entry["environment"], {"SHOWRUNNER_UNIT": "demo"})
+        self.assertEqual(entry["environment"], {})
 
 
 @final

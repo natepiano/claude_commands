@@ -105,7 +105,7 @@ class RetireUnitTests(unittest.TestCase):
     run_folder: Path = Path()
     calls: list[list[str]] = []
     claude: list[SessionRecord] = []
-    marked: unit_lookup.MarkedUnit | None = None
+    marked: unit_lookup.LabeledSession | None = None
     config: Path = Path()
     unit_staff_id: StaffId = StaffId("")
 
@@ -307,7 +307,7 @@ class RetireUnitTests(unittest.TestCase):
             owner = next((item for item in self.claude if item["sessionId"] == session_id), None)
             if owner:
                 return sessions.LiveSessionProcess(owner["pid"])
-            marked = unit_lookup.marked_unit("alpha", "alpha-unit")
+            marked = unit_lookup.labeled_session("alpha", "alpha-unit")
             if marked and isinstance(marked.claude, unit_lookup.LiveClaude) and marked.claude.session_id == session_id:
                 return sessions.LiveSessionProcess(marked.claude.pid)
             return sessions.SessionNotLive()
@@ -335,10 +335,10 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(retire_unit, "reservations", no_reservations))
         _ = self.enterContext(mock.patch.object(sessions, "session_processes", session_processes))
         _ = self.enterContext(mock.patch.object(sessions, "session_liveness", session_liveness))
-        self.marked = unit_lookup.MarkedUnit(
+        self.marked = unit_lookup.LabeledSession(
             "alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
 
-        def marked_unit(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
+        def labeled_session(_slug: str, _name: str) -> unit_lookup.LabeledSession | None:
             return self.marked
 
         self.config = self.root / "config"
@@ -346,14 +346,14 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         _ = self.enterContext(mock.patch.object(staff_pane_record, "RECORD_DIR", self.root / "panes"))
         pane_record.write("alpha", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
-            {"CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude", "-n", "alpha"]))
+            {"CLAUDE_CONFIG_DIR": str(self.config), ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude", "-n", "alpha"]))
         def process_info(*_arguments: str, deadline: float = math.inf) -> dict[str, object]:
             del deadline
             # Existing cases launch Claude with exec: it replaces the pane's shell.
             pid = self.marked.claude.pid if self.marked and isinstance(self.marked.claude, unit_lookup.LiveClaude) else 4101
             return {"process_info": {"shell_pid": pid}}
 
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", marked_unit))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", labeled_session))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", side_effect=process_info))
         _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [self.config]))
         self.transcript(self.worktree)

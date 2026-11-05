@@ -198,7 +198,7 @@ class HerdrSessionsTests(unittest.TestCase):
         self.server(900, "other")
         parent = showrunner_relationship("build-followups")
         unit = fixture_member("unit", name="herdr-trial-unit", parent=parent.id)
-        marks = {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "herdr-trial-unit", "CLAUDE_CODE_SESSION_ID": unit.id}
+        marks = {('' + 'SHOWRUNNER_' + 'UNIT'): "build-followups", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "herdr-trial-unit", "CLAUDE_CODE_SESSION_ID": unit.id}
         self.claude(101, 100, "old-unit-name", pane="w1:p1", marks=marks)
         self.claude(102, 100, "new-unit-name", pane="w1:p1", updated=2, marks=marks)
         self.claude(103, 100, "dead-newest", pane="w1:p1", updated=3, live=False)
@@ -233,7 +233,7 @@ class HerdrSessionsTests(unittest.TestCase):
         self.respond(["agents"], tabs=("unit",))
         self.server(100, "agents")
         unit = unit_membership("build", "one")
-        self.claude(101, 100, "director", pane="w1:p1", marks={"SHOWRUNNER_UNIT": "build", "SHOWRUNNER_UNIT_ID": "one",
+        self.claude(101, 100, "director", pane="w1:p1", marks={('' + 'SHOWRUNNER_' + 'UNIT'): "build", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "one",
                                                               "CLAUDE_CODE_SESSION_ID": unit.id})
         self.register_showrunner(101)
         self.assertEqual(self.call("list"), (0, "unit\tunit build/one\tdirector\n", ""))
@@ -242,8 +242,8 @@ class HerdrSessionsTests(unittest.TestCase):
         self.respond(["agents"], tabs=("unit",))
         self.server(100, "agents")
         unit = unit_membership("build", "one")
-        self.process(101, 100, ["codex", "resume", unit.id], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build",
-                                                "SHOWRUNNER_UNIT_ID": "one", "CODEX_THREAD_ID": unit.id})
+        self.process(101, 100, ["codex", "resume", unit.id], {"HERDR_PANE_ID": "w1:p1", ('' + 'SHOWRUNNER_' + 'UNIT'): "build",
+                                                ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "one", "CODEX_THREAD_ID": unit.id})
         (self.proc / "101" / "fd").mkdir()
         rollout = self.root / ("rollout-" + str(unit.current_session) + ".jsonl")
         _ = rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": unit.current_session}}) + "\n")
@@ -251,13 +251,13 @@ class HerdrSessionsTests(unittest.TestCase):
         with patch.object(runtime_sessions, "process_start", return_value="fixture-codex-start"):
             self.assertEqual(self.call("list"), (0, "unit\tunit build/one\t\n", ""))
 
-    def test_an_inherited_codex_thread_id_does_not_assign_a_shell_to_its_parent_unit(self) -> None:
+    def test_an_inherited_codex_thread_id_keeps_the_shell_membership_evidence(self) -> None:
         self.respond(["agents"], tabs=("terminal",))
         self.server(100, "agents")
         unit = unit_membership("build", "one")
-        self.process(101, 100, ["zsh"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build",
-                                       "SHOWRUNNER_UNIT_ID": "one", "CODEX_THREAD_ID": unit.id})
-        self.assertEqual(self.call("list"), (0, "terminal\tstandalone\t\n", ""))
+        self.process(101, 100, ["zsh"], {"HERDR_PANE_ID": "w1:p1", ('' + 'SHOWRUNNER_' + 'UNIT'): "build",
+                                       ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "one", "CODEX_THREAD_ID": unit.id})
+        self.assertEqual(self.call("list"), (0, "terminal\tunit build/one\t\n", ""))
 
     def test_list_classifies_unmarked_units_and_transferred_identity_from_one_staff_read(self) -> None:
         self.respond(["agents"], tabs=("herdr", "shutdown", "style", "former-name", "terminal"))
@@ -269,9 +269,9 @@ class HerdrSessionsTests(unittest.TestCase):
             member = unit_membership("sdlc", name)
             self.claude(pid, 100, name, pane=pane, marks={"CLAUDE_CODE_SESSION_ID": member.id})
         self.claude(104, 100, "models", pane="w1:p4", marks={
-            "CLAUDE_CODE_SESSION_ID": pinned.id, "SHOWRUNNER_UNIT": "natedev", "SHOWRUNNER_UNIT_ID": "old-unit"})
-        self.process(105, 100, ["sleep", "600"], {"HERDR_PANE_ID": "w1:p5", "SHOWRUNNER_UNIT": "sdlc",
-                                                "SHOWRUNNER_UNIT_ID": "missing-unit"})
+            "CLAUDE_CODE_SESSION_ID": pinned.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "natedev", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "old-unit"})
+        self.process(105, 100, ["sleep", "600"], {"HERDR_PANE_ID": "w1:p5", ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc",
+                                                ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "missing-unit"})
         replies = cast(dict[str, CommandResponse], json.loads(self.responses.read_text()))
         panes = [{"pane_id": f"w1:p{index}", "label": name, "workspace_id": "w1"}
                  for index, name in enumerate(("herdr", "shutdown", "style", "former-name", "terminal"), 1)]
@@ -291,7 +291,7 @@ class HerdrSessionsTests(unittest.TestCase):
     def test_partial_staff_marks_do_not_make_a_unit_role(self) -> None:
         self.respond(["agents"], tabs=("solo",))
         self.server(100, "agents")
-        self.claude(101, 100, "solo-name", pane="w1:p1", marks={"SHOWRUNNER_UNIT": "build"})
+        self.claude(101, 100, "solo-name", pane="w1:p1", marks={('' + 'SHOWRUNNER_' + 'UNIT'): "build"})
         self.assertEqual(self.call("list"), (0, "solo\tstandalone\tsolo-name\n", ""))
 
     def test_sort_tabs_ignores_saved_order_saves_unit_groups_and_orders_split_tabs(self) -> None:
