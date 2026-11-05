@@ -193,6 +193,17 @@ class InventoryTests(ShutdownTestCase):
         self.assertEqual(seats["idle"], inventory.PausedSeat(run_dir=str(run), seat="idle", role="impl", staff_id="fe371221-a140-5ddf-8753-e906f9ce3519", turn_live=False, launcher_command=[]))
         self.assertEqual(seats["orphan"]["launcher_command"], [])
 
+        for launcher in ("assign.sh", "assign.py"):
+            with self.subTest(launcher=launcher):
+                command = ["bash" if launcher.endswith(".sh") else "python3",
+                           f"/config/scripts/direct/{launcher}", "--role", "review", "--to", "busy",
+                           "--session-dir", str(run), "--cwd", "/checkout with spaces",
+                           "--prompt", "/old/prompt.md", "--phase", "1", "--lens", "contract", "--pass", "2"]
+                self.herdr_process(811, 812, command, {})
+                with patch.object(inventory, "_pid_alive", side_effect=launcher_alive):
+                    seats = {seat["seat"]: seat for seat in inventory.codex_seats([run])}
+                self.assertEqual(seats["busy"]["launcher_command"], command)
+
     def test_codex_seats_leaves_out_a_run_its_director_left_after_an_earlier_stop_offered_it(self) -> None:
         def run_with(name: str, statuses: dict[str, str], *, board_at: int, offered_at: int | None) -> Path:
             run = self.root / name

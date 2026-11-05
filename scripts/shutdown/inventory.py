@@ -785,7 +785,7 @@ def _launcher_command(pid: int) -> list[str]:
                 argv = list(process.arguments.argv)
         except (OSError, ValueError, IndexError, UnicodeError, subprocess.SubprocessError):
             return []
-        if any(Path(arg).name in {"implement.sh", "review.sh"} for arg in argv):
+        if any(Path(arg).name in {"implement.sh", "review.sh", "assign.sh", "assign.py"} for arg in argv):
             return argv
         pid = parent
     return []

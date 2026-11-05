@@ -112,6 +112,7 @@ class StallWatchTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
+        self.watches: dict[str, stall_watch.WatchedUnit] = {}
         self.bin: Path = Path()
         self.notifier: Path = Path()
         self.sessions: Path = Path()
@@ -308,7 +309,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
                               for path in self.state.iterdir()}, before)
             self.assertEqual((self.state / f"{row.id}.json").read_text(), '{"since": 17}\n')
-            watch = stall_watch.watched_unit("showrunner", "unit-one", staff.snapshot())
+            watch = stall_watch.watched_staff_unit("showrunner", "unit-one", row)
             self.assertIsNotNone(stall_watch.end_prompt(watch))
             retire = stall_watch.end_prompt(watch)
             assert retire is not None
@@ -328,13 +329,12 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         row = unit_membership("showrunner", "unit-one")
         parent = showrunner_relationship("receiver")
         with mock.patch.object(stall_watch, "STATE_DIR", self.state):
-            before = (stall_watch.stretch_path("showrunner", "unit-one"),
-                      stall_watch.prompt_path("showrunner", "unit-one"), PROMPT_KEY)
+            watch = stall_watch.watched_staff_unit("showrunner", "unit-one", row)
+            before = (watch.stretch_path, watch.prompt_path, PROMPT_KEY)
             _ = staff.rename(row.id, "renamed")
-            _ = staff.move(row.id, staff.ReportsTo(parent.id))
-            self.assertEqual((stall_watch.stretch_path("receiver", "renamed-unit"),
-                              stall_watch.prompt_path("receiver", "renamed-unit"),
-                              stall_watch.prompt_key("receiver", "renamed-unit")), before)
+            moved = staff.move(row.id, staff.ReportsTo(parent.id))
+            watch = stall_watch.watched_staff_unit("receiver", "renamed-unit", moved)
+            self.assertEqual((watch.stretch_path, watch.prompt_path, watch.prompt_key), before)
 
     def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
         """Give each showrunner an update timer, a production doc and staff rows for its units. The slug is its name."""
@@ -350,9 +350,13 @@ always=natedev
         for session, units in runners.items():
             parent = showrunner_relationship(session)
             live_units = [unit for unit in units if unit not in self.retired]
-            intended = {fixture_member("unit", name=unit, parent=parent.id,
-                                       runtime_id=unit_session(unit), worktree=staff.PresentWorktree(
-                                           local_machine(), self.root / "worktrees" / unit)).id for unit in live_units}
+            rows = [fixture_member("unit", name=unit, parent=parent.id,
+                                   runtime_id=unit_session(unit), worktree=staff.PresentWorktree(
+                                       local_machine(), self.root / "worktrees" / unit)) for unit in live_units]
+            intended = {row.id for row in rows}
+            with mock.patch.object(stall_watch, "STATE_DIR", self.state):
+                self.watches.update((unit, stall_watch.watched_staff_unit(session, unit, row))
+                                    for unit, row in zip(live_units, rows))
             for row in staff.snapshot().find(kind="unit", parent=parent.id):
                 if row.id not in intended:
                     _ = staff.set_worktree(row.id, staff.RemovedWorktree(
@@ -599,7 +603,7 @@ always=natedev
         self.assertEqual(self.sent(), [])
         self.assertIn("inspected showrunner/unit-one: running", result.stdout)
         saved = cast(dict[str, object], json.loads(
-            (self.state / stall_watch.stretch_path("showrunner", "unit-one").name).read_text()))
+            self.watches["unit-one"].stretch_path.read_text()))
         self.assertEqual(saved["since"], START + 600)
         _ = self.process_rows.pop()
         self.assertEqual(self.tick(START + 601).returncode, 0)
@@ -612,7 +616,7 @@ always=natedev
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("inspected showrunner/unit-one:", result.stdout)
         self.assertEqual(self.sent(), [])
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+        self.assertFalse(self.watches["unit-one"].stretch_path.exists())
 
     def test_replacement_director_uses_the_recorded_director_of_the_held_run(self) -> None:
         _ = self.moved_director_run()
@@ -641,7 +645,7 @@ always=natedev
         _ = self.unit("unit-two")
         self.configure({"showrunner": ["unit-one", "unit-two"]})
         self.assertEqual(self.tick(START).returncode, 0)
-        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+        path = self.watches["unit-one"].stretch_path
         saved = path.read_bytes()
         scan = unit_runs.held_by_session
         damaged = self.root / "history/runs/unit-one.jsonl"
@@ -1240,7 +1244,7 @@ always=natedev
                 ["claude", "-n", "unit-one"])
             pane_record.write("agents", launch)
             self.state.mkdir()
-            path = stall_watch.prompt_path("receiver", "unit-one")
+            path = stall_watch.watched_staff_unit("receiver", "unit-one", row).prompt_path
             stall_watch.save_prompt(path, stall_watch.PromptWait(
                 session_id="204f532d-a97a-59e7-a6a7-caf86af3f5ee", created=START, key=PROMPT_KEY,
                 since=START, alerted=True, tool="tool", retiring=False))
@@ -1601,9 +1605,7 @@ always=natedev
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def prompt_state(self) -> Path:
-        import stall_watch
-        with mock.patch.object(stall_watch, "STATE_DIR", self.state):
-            return stall_watch.prompt_path("showrunner", "unit-one")
+        return self.watches["unit-one"].prompt_path
 
     def alerted_at_a_prompt(self) -> None:
         """A zero-grace fixture tells the owner and alerts at the same threshold."""
@@ -1867,7 +1869,7 @@ always=natedev
                 self.panes["unit-one"]["pane"] = pane
                 self.write_context_usage(tokens, window=window)
                 self.state.mkdir(exist_ok=True)
-                path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+                path = self.watches["unit-one"].stretch_path
                 stretch = stall_watch.Stretch(pane_hash=hashlib.sha256(pane.strip().encode()).hexdigest(), since=START - 601,
                     bump_sent=False, tell_sent=False, reported_status="")
                 _ = path.write_text(json.dumps(stretch))
@@ -2047,7 +2049,7 @@ always=natedev
         window = 283_800
         self.write_context_usage(context_usage.handoff_threshold(window) - 1, window=window)
         self.state.mkdir(exist_ok=True)
-        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+        path = self.watches["unit-one"].stretch_path
         stretch = stall_watch.Stretch(pane_hash=hashlib.sha256(pane.strip().encode()).hexdigest(), since=START - 601,
                                       bump_sent=False, tell_sent=False, reported_status="")
         _ = path.write_text(json.dumps(stretch))
@@ -2221,7 +2223,7 @@ always=natedev
                     if at >= START + 300:
                         self.assertIn("inspected showrunner/unit-one: holding", result.stdout)
                         self.assertEqual(self.sent(), [])
-                        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+                        path = self.watches["unit-one"].stretch_path
                         self.assertFalse(stall_watch.saved_stretch(path)["tell_sent"])
                         self.assertFalse(stall_watch.saved_stretch(path)["bump_sent"])
 
@@ -2398,7 +2400,7 @@ always=natedev
         for at in (START, START + 300, START + 600):
             result = self.tick(at)
             self.assertEqual(result.returncode, 0, result.stderr)
-        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+        path = self.watches["unit-one"].stretch_path
         held = stall_watch.saved_stretch(path)
         self.assertEqual(self.sent(), [])
         self.assertFalse(held["tell_sent"])
@@ -2665,8 +2667,7 @@ always=natedev
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
-        import stall_watch
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+        self.assertFalse(self.watches["unit-one"].stretch_path.exists())
         self.states["unit-one"] = "running"
         self.assertEqual(self.tick(START + 601).returncode, 0)
         self.assertEqual(self.sent(), [])
@@ -2676,15 +2677,13 @@ always=natedev
                          {"bump", "tell"})
 
     def test_finished_registry_unit_has_no_notice_or_stretch(self) -> None:
-        import stall_watch
         self.configure_registered({"showrunner": [("unit-one", "run-finished")]})
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+        self.assertFalse(self.watches["unit-one"].stretch_path.exists())
 
     def test_a_retired_unit_is_skipped(self) -> None:
-        import stall_watch
         self.retired.add("unit-one")
         self.configure({"showrunner": ["unit-one"]})
         first = self.tick(START)
@@ -2692,7 +2691,7 @@ always=natedev
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(self.sent(), [])
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+        self.assertFalse(self.watches["unit-one"].stretch_path.exists())
 
     def test_a_unit_named_review_unit_is_bumped(self) -> None:
         self.configure_registered({"showrunner": [("review-unit", "running")]})
@@ -2705,7 +2704,6 @@ always=natedev
         self.assertTrue(all(item["key"].startswith(f"stall-watch:{unit_session('review-unit')}:") for item in sent), sent)
 
     def test_finished_units_are_skipped_while_a_running_unit_is_bumped(self) -> None:
-        import stall_watch
         self.configure_registered({"showrunner": [
             ("build-report-unit", "run-finished"),
             ("hook-unit", "running"),
@@ -2721,7 +2719,7 @@ always=natedev
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
         self.assertTrue(all(item["key"].startswith(f"stall-watch:{unit_session('hook-unit')}:") for item in sent))
         for name in ("build-report-unit", "notifier-unit"):
-            self.assertFalse((self.state / stall_watch.stretch_path("showrunner", name).name).exists())
+            self.assertFalse(self.watches[name].stretch_path.exists())
 
     def test_a_marked_session_of_a_unit_the_doc_does_not_list_is_not_watched(self) -> None:
         _ = self.panes.pop("unit-one")

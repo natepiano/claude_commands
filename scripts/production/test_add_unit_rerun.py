@@ -200,8 +200,8 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
-        unit = resume_unit.RetiredUnit(read_production(self.doc), "alpha-unit", self.root / "project-alpha",
-            "build-followups-alpha", unit_config.PlanFile(Path("docs/plans/given.md")), "62ccbd64-f22e-5647-b20e-7899aa39d766", True)
+        unit = resume_unit.RetiredUnitRecovery(read_production(self.doc), "alpha-unit", self.root / "project-alpha",
+            "build-followups-alpha", unit_config.PlanFile(Path("docs/plans/given.md")), "62ccbd64-f22e-5647-b20e-7899aa39d766", "alpha-unit")
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         output = io.StringIO()
 

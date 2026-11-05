@@ -50,7 +50,6 @@ class Unit:
     name: str
     worktree: Path
     branch: str
-    retired: bool
     staff_member: staff.StaffRow
 
 
@@ -415,8 +414,7 @@ def find_unit(slug: str, given: str, *,
     if location.path.is_dir():
         result = run(["git", "-C", str(location.path), "branch", "--show-current"], settings=settings)
         branch = result.stdout.strip()
-    return Unit(production, unit_names.unit_id(member.name), location.path, branch,
-                isinstance(location, staff.RemovedWorktree), member)
+    return Unit(production, unit_names.unit_id(member.name), location.path, branch, member)
 
 
 def last_session(unit: Unit) -> str:
@@ -496,7 +494,7 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
            record: staff.StaffSnapshot | None = None) -> int:
     record = staff.snapshot() if record is None else record
     row = unit.staff_member
-    if unit.retired and not unit.worktree.exists():
+    if isinstance(row.worktree, staff.RemovedWorktree) and not unit.worktree.exists():
         print("unchanged")
         return 0
     refused = refusals(unit, settings=settings)

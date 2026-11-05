@@ -507,30 +507,9 @@ class WatchedUnit(NamedTuple):
     prompt_key: str
 
 
-def _watched_staff_unit(slug: str, unit: str, row: staff.StaffRow) -> WatchedUnit:
+def watched_staff_unit(slug: str, unit: str, row: staff.StaffRow) -> WatchedUnit:
     path = STATE_DIR / f"{row.id}.json"
     return WatchedUnit(slug, unit, path, path.with_suffix(".prompt.json"), f"stall-watch:prompt:{row.id}")
-
-
-def watched_unit(slug: str, unit: str, record: staff.StaffSnapshot) -> WatchedUnit:
-    found = record.by_path(f"{slug}/{unit}")
-    if found is None:
-        found = record.by_path(f"{slug}/{unit_names.name(unit)}")
-    if found is None:
-        raise ValueError(f"{slug}/{unit}: no unique staff row")
-    return _watched_staff_unit(slug, unit, found)
-
-
-def stretch_path(slug: str, unit: str) -> Path:
-    return watched_unit(slug, unit, staff.snapshot()).stretch_path
-
-
-def prompt_path(slug: str, unit: str) -> Path:
-    return watched_unit(slug, unit, staff.snapshot()).prompt_path
-
-
-def prompt_key(slug: str, unit: str) -> str:
-    return watched_unit(slug, unit, staff.snapshot()).prompt_key
 
 
 def prompt_alert_seconds() -> float:
@@ -1266,7 +1245,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
         if isinstance(rows, ProcessSnapshotFailure):
             continue
         showrunner_socket = configured["socket"]
-        watch = _watched_staff_unit(slug, name, row)
+        watch = watched_staff_unit(slug, name, row)
         if any(item.state_path == watch.prompt_path for item in pending):
             continue
         if not pane_budget_left(name, inspection_deadline):
@@ -1448,7 +1427,7 @@ def migrate_staff_ids() -> int:
             retire = retire_key(target, prompt["key"])
             _ = subprocess.run(retire.command, check=True, timeout=30)
             if not prompt["retiring"]:
-                alert = prompt_alert(_watched_staff_unit(slug, unit_names.unit_id(row.name), row), "", prompt["since"], ZoneInfo("UTC"))
+                alert = prompt_alert(watched_staff_unit(slug, unit_names.unit_id(row.name), row), "", prompt["since"], ZoneInfo("UTC"))
                 _ = subprocess.run(alert.command, check=True, timeout=30)
         prompt["key"] = key
         if "case_pending" in prompt:

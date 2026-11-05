@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
@@ -64,6 +64,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
         row = unit_membership("alpha", "alpha-unit")
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.worktree))
+        self.assertIsInstance(resume_unit.find_unit("alpha", "alpha"), resume_unit.NoRecoveryRequired)
 
 
     staff: StaffTestCase = StaffTestCase()
@@ -79,11 +80,21 @@ class ResumeUnitTests(unittest.TestCase):
         row = unit_membership("alpha", "alpha-unit")
         self.assertNotEqual(row.id, row.current_session)
         unit = resume_unit.find_unit("alpha", "alpha")
+        assert isinstance(unit, resume_unit.RetiredUnitRecovery)
         self.assertEqual(unit.display_name, row.name)
         command = resume_unit.launch_command(replace(unit, name="stale-table-unit"))
         self.assertEqual(command[command.index("--production") + 2], row.name)
         self.assertEqual(command[command.index("--resume") + 1], row.current_session)
         self.assertNotIn("STAFF_ID", " ".join(command))
+
+    def test_recovery_requires_each_retirement_fact(self) -> None:
+        unit = resume_unit.find_unit("alpha", "alpha")
+        assert isinstance(unit, resume_unit.RetiredUnitRecovery)
+        for fact in ("branch", "session_id", "plan"):
+            fields = dict(vars(unit))
+            del fields[fact]
+            with self.subTest(fact=fact), self.assertRaises(TypeError):
+                _ = cast(Callable[..., object], resume_unit.RetiredUnitRecovery)(**fields)
 
     def test_neither_config_refuses_with_the_backfill_instruction_before_any_change(self) -> None:
         _ = self.staff.record_production("alpha", self.doc)
@@ -590,6 +601,7 @@ class ResumeUnitTests(unittest.TestCase):
         destination = self.root / "changed-staff-folder"
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", destination), expected=row.worktree)
         unit = resume_unit.find_unit("alpha", "alpha-unit")
+        assert isinstance(unit, resume_unit.RetiredUnitRecovery)
         command = resume_unit.launch_command(unit)
         self.assertEqual(command[command.index("--cwd") + 1], str(destination))
         self.assertTrue(resume_unit.has_transcript(unit))

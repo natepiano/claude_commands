@@ -63,8 +63,7 @@ class DailiesInputTests(DailiesInputFixture):
         super().timer(slug)
         doc = self.doc if slug == "example" else self.root / f"{slug}-production.md"
         if doc != self.doc:
-            write_text_atomic(doc, self.doc.read_text().replace(
-                "- **Showrunner session:** test-showrunner", f"- **Showrunner session:** {slug}"))
+            write_text_atomic(doc, self.doc.read_text())
         row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
         _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
         conf = self.root / "notifier-state" / f"showrunner-{slug}" / "conf"

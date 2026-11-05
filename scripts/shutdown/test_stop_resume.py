@@ -505,8 +505,10 @@ class StopResumeTests(unittest.TestCase):
         seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="019b3a40-4250-7000-8000-000000000104",
                           turn_live=True, launcher_command=command)
         rebuilt = shlex.split(stop_resume.resume_worker_command(seat, current))
-        self.assertEqual(rebuilt, [*command[:6], "--to", "review2", run, current,
-                                  str(Path(run) / "review2.resume-prompt.md"), *command[9:]])
+        self.assertEqual(rebuilt, ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"),
+                                  "--to", "review2", "--session-dir", run, "--cwd", current,
+                                  "--prompt", str(Path(run) / "review2.resume-prompt.md"),
+                                  "--lens", "contract", "--phase", "4w", "--role", "review", "--pass", "3"])
         self.assertEqual(seat["launcher_command"], command)
 
     def test_saved_review_resumes_without_retired_allocation_options(self) -> None:
@@ -517,8 +519,9 @@ class StopResumeTests(unittest.TestCase):
                    "--slot", "review", *task]
         seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="019b3a40-4250-7000-8000-000000000104",
                           turn_live=True, launcher_command=command)
-        expected = [*command[:2], "--phase", "3p", "--lens", "contract", "--to", "review2",
-                    run, cwd, str(Path(run) / "review2.resume-prompt.md"), *task[3:]]
+        expected = ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"), "--to", "review2",
+                    "--session-dir", run, "--cwd", cwd, "--prompt", str(Path(run) / "review2.resume-prompt.md"),
+                    "--phase", "3p", "--lens", "contract", "--role", "review", "--pass", "2"]
         rebuilt = stop_resume.resume_worker_command(seat, cwd)
         self.assertEqual(shlex.split(rebuilt), expected)
         self.assertNotIn("--pool", shlex.split(rebuilt))
@@ -679,11 +682,11 @@ class StopResumeTests(unittest.TestCase):
         self.assertLessEqual(self.clock.elapsed, 0.1)
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
 
-    def prompt_retirement_fixture(self, *, alerted: bool) -> Path:
+    def prompt_retirement_fixture(self, *, alerted: bool) -> tuple[Path, staff.StaffRow]:
         """Publish cancellation requests for the watcher with an isolated send.py recorder."""
         from scripts.production.staff_test_support import unit_membership
 
-        _ = unit_membership("production", "alpha")
+        row = unit_membership("production", "alpha")
         self.entry["environment"].update({"SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "alpha"})
         pane_record.write("agents", self.entry)
         state = self.root / "stall-watch"
@@ -697,12 +700,12 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(showrunners, "canonical_slug", return_value="production"))
         prompt = stall_watch.PromptWait(session_id="019b3a40-4250-7000-8000-000000000102", created=0,
             key="stall-watch:prompt:production:alpha", since=0, alerted=alerted, tool="permission", retiring=False, told=60)
-        stall_watch.save_prompt(stall_watch.prompt_path("production", "alpha"), prompt)
-        return log
+        stall_watch.save_prompt(stall_watch.watched_staff_unit("production", "alpha", row).prompt_path, prompt)
+        return log, row
 
-    def assert_prompt_cancellation_requested(self, log: Path) -> None:
+    def assert_prompt_cancellation_requested(self, log: Path, row: staff.StaffRow) -> None:
         self.assertFalse(log.exists(), "stop and move must never send")
-        path = stall_watch.prompt_path("production", "alpha")
+        path = stall_watch.watched_staff_unit("production", "alpha", row).prompt_path
         self.assertTrue(path.exists())
         requests = list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json"))
         self.assertTrue(requests)
@@ -721,33 +724,33 @@ class StopResumeTests(unittest.TestCase):
             _ = stall_watch.tick(100)
 
     def test_stop_requests_prompt_cancellation_before_returning_without_sending(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
 
     def test_move_requests_prompt_cancellation_before_resuming_without_sending(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=False)
+        log, row = self.prompt_retirement_fixture(alerted=False)
         def start_after_request(*arguments: str) -> str:
             self.assertIn("exec", self._typed(arguments))
-            self.assert_prompt_cancellation_requested(log)
+            self.assert_prompt_cancellation_requested(log, row)
             return ""
         self.start.side_effect = start_after_request
         self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"),
                          stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude4"))
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
 
     def test_failed_prompt_retirement_stays_requested_until_the_watcher_confirms_it(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         sender = self.root / "retire.py"
         original = sender.read_text()
         _ = sender.write_text(original + "raise SystemExit(3)\n")
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
         errors = io.StringIO()
         with redirect_stderr(errors):
             self.drain_prompt_cancellations()
         self.assertIn("stall-watch: retire:", errors.getvalue())
-        path = stall_watch.prompt_path("production", "alpha")
+        path = stall_watch.watched_staff_unit("production", "alpha", row).prompt_path
         self.assertTrue(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")))
         _ = sender.write_text(original)
         self.drain_prompt_cancellations()
@@ -775,7 +778,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(errors.getvalue().count("prompt cancellation:"), 2)
 
     def test_stop_and_move_never_take_a_held_watcher_lock(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         real_flock = fcntl.flock
         forbidden_attempts: list[tuple[int, int]] = []
         with (stall_watch.STATE_DIR / "lock").open("a+") as lock:
@@ -796,12 +799,12 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
                 self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ClaudeUp)
         self.assertEqual(forbidden_attempts, [], "stop and move must never attempt the watcher lock")
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
 
     def test_a_delayed_cancellation_never_retires_a_resumed_sessions_new_prompt(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
-        path = stall_watch.prompt_path("production", "alpha")
+        path = stall_watch.watched_staff_unit("production", "alpha", row).prompt_path
         stall_watch.save_prompt(path, stall_watch.PromptWait(session_id="019b3a40-4250-7000-8000-000000000102", created=time.time() + 1,
             key="stall-watch:prompt:production:alpha", since=200, alerted=False, tool="new-request", retiring=False))
         self.drain_prompt_cancellations()
@@ -812,7 +815,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual((saved["since"], saved["retiring"]), (200, False))
 
     def test_a_malformed_cancellation_does_not_stop_valid_requests(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
         bad = stall_watch.STATE_DIR / "aaa.prompt.cancel.json"
         _ = bad.write_text("{")
@@ -822,10 +825,10 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn(str(bad), errors.getvalue())
         self.assertTrue(bad.exists())
         self.assertTrue(log.exists())
-        self.assertFalse(stall_watch.prompt_path("production", "alpha").exists())
+        self.assertFalse(stall_watch.watched_staff_unit("production", "alpha", row).prompt_path.exists())
 
     def test_a_mac_stop_publishes_cancellation_without_any_lookup(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         with (patch("platform.system", return_value="Darwin"),
               patch.object(pane_record, "launch_for_session", side_effect=AssertionError("no launch lookup")) as launch,
               patch.object(staff_sources, "unit_parent", side_effect=AssertionError("no remote lookup")) as parent,
@@ -834,17 +837,17 @@ class StopResumeTests(unittest.TestCase):
         launch.assert_not_called()
         parent.assert_not_called()
         socket.assert_not_called()
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
 
     def test_launch_deletion_after_stop_cannot_lose_the_old_alerts_cancellation(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
         # retire_unit removes launch records after stop and before the next watcher pass.
         pane_record.record_path("agents").unlink()
         self.drain_prompt_cancellations()
         self.assertEqual(json.loads(log.read_text()), ["retire", "--to", "user", "--from", "stall-watch",
                                                       "--key", "stall-watch:prompt:production:alpha"])
-        self.assertFalse(stall_watch.prompt_path("production", "alpha").exists())
+        self.assertFalse(stall_watch.watched_staff_unit("production", "alpha", row).prompt_path.exists())
         self.assertEqual(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")), [])
 
     def test_missing_pane_recovery_does_not_duplicate_a_live_session(self) -> None:

@@ -215,12 +215,13 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_plan_launch_admits_its_real_worktree_and_writes_port_and_repeatable_responsibilities(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
-                            "--responsibility", "nightly", "--responsibility", "build-check")
+                            "--responsibility", "nightly", "--responsibility", "build-check",
+                            "--responsibility", "nightly")
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         worktree = self.root / "project-alpha"
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", worktree))
         self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
-            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ("nightly", "build-check", unit_config.BOARD_FREE)))
+            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ("nightly", "build-check")))
         ignored = subprocess.run(["git", "-C", str(worktree), "check-ignore", "-q", ".unit.toml"], check=False)
         self.assertEqual(ignored.returncode, 0)
         tracked = subprocess.run(["git", "-C", str(worktree), "ls-files", "--error-unmatch", ".unit.toml"],
@@ -229,50 +230,50 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertNotIn("STAFF_ID", self.pane_environment())
         self.assert_observed_identity(row)
 
-    def test_owns_paths_and_named_responsibilities_are_written(self) -> None:
-        _ = self.doc.write_text(self.doc.read_text().replace(
-            "| alpha-unit | none — board-free |",
-            "| `alpha-unit` | `scripts/production/add_unit.py`, `owns_fill.py`, `settings.json` |"))
-        _ = self.successful("alpha-unit", "--standby", "--responsibility", "nightly-review")
+    def test_explicit_paths_and_named_responsibilities_ignore_document_owns(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text() +
+                               "## Units\n\n| Unit | Owns |\n| --- | --- |\n| alpha-unit | ignored/path |\n")
+        _ = self.successful("alpha-unit", "--standby", "--responsibility", "nightly-review",
+                            "--responsibility", "scripts/production/add_unit.py",
+                            "--responsibility", "scripts/production/unit_config.py",
+                            "--responsibility", "settings.json")
         config = unit_config.read(self.root / "project-alpha")
         assert isinstance(config, unit_config.UnitConfig)
         self.assertEqual(config.responsibilities, tuple(sorted((
-            "nightly-review", "scripts/production/add_unit.py", "scripts/production/owns_fill.py",
-            "scripts/production/settings.json"))))
+            "nightly-review", "scripts/production/add_unit.py", "scripts/production/unit_config.py",
+            "settings.json"))))
 
-    def test_invalid_owns_refuses_without_writes(self) -> None:
-        original = self.doc.read_text()
-        for cell in ("", "all production scripts"):
-            with self.subTest(cell=cell):
-                _ = self.doc.write_text(original.replace("| alpha-unit | none — board-free |",
-                                                        f"| alpha-unit | {cell} |"))
+    def test_invalid_explicit_responsibilities_refuse_without_writes(self) -> None:
+        for responsibility in ("", "all production scripts", "../outside"):
+            with self.subTest(responsibility=responsibility):
                 before = self.repository_state(), self.staff.staff_file.read_bytes(), self.doc.read_bytes()
-                result = self.cli("alpha", "--brief", "Repair the scripts", "--responsibility", "nightly-review")
+                result = self.cli("alpha", "--brief", "Repair the scripts", "--responsibility", responsibility)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("production build-followups, unit alpha-unit: fill the Owns cell", result.stderr)
+                self.assertIn("responsibilities: invalid name or repository path", result.stderr)
                 self.assertEqual((self.repository_state(), self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
                 self.assertFalse((self.root / "project-alpha").exists())
                 self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
                 self.assertFalse(self.log.exists())
 
-    def test_missing_units_table_refuses_without_admission(self) -> None:
-        _ = self.doc.write_text(self.doc.read_text().split("## Units")[0])
-        before = self.repository_state(), self.staff.staff_file.read_bytes()
+    def test_missing_units_table_allows_admission_without_responsibilities(self) -> None:
+        before = self.doc.read_bytes()
         result = self.cli("alpha", "--standby")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("fill the Owns cell", result.stderr)
-        self.assertEqual((self.repository_state(), self.staff.staff_file.read_bytes()), before)
-        self.assertFalse((self.root / "project-alpha").exists())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("alpha-unit", result.stdout)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue((self.root / "project-alpha").exists())
+        self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
+            unit_config.StandbyPlan(), unit_config.NoAppPort(), ()))
 
     def test_standby_launch_writes_the_standby_plan_in_its_unit_config(self) -> None:
         _ = self.successful("alpha", "--standby")
         self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
-            unit_config.StandbyPlan(), unit_config.NoAppPort(), (unit_config.BOARD_FREE,)))
+            unit_config.StandbyPlan(), unit_config.NoAppPort(), ()))
 
     def test_permanent_launch_writes_the_permanent_plan_in_its_unit_config(self) -> None:
         _ = self.successful("alpha", "--permanent")
         self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
-            unit_config.PermanentPlan(), unit_config.NoAppPort(), (unit_config.BOARD_FREE,)))
+            unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
 
     def test_brief_launch_writes_its_existing_relative_stub_plan_in_the_unit_config(self) -> None:
         _ = self.successful("alpha", "--brief", "Build the missing reader.")

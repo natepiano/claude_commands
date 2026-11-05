@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
-# review.sh — Invoke the configured worker agent for a review.
+# review.sh starts a fresh Claude reviewer.
 #
-# Usage: review.sh [--to <worker> | --slot <new-slot>]
-#                  [--phase <id>] [--style-since <commit> [--style-until <commit>]] <session_dir>
+# Usage: review.sh [--phase <id>] [--style-since <commit> [--style-until <commit>]] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
-#   --to reuses an open Codex worker. --slot opens a role-named Codex worker for
-#   this review and leaves its thread open for later `--to` dispatches.
-#   With no worker flags, a fresh read-only reviewer runs once.
 #   role_description — 1-2 lines describing this review's responsibility,
 #   written as a header block into the shared heartbeat log
 #   pass_activity — short user-facing description for the progress header
@@ -38,9 +34,7 @@
 #                                            reviewer that is still working from
 #                                            one that was killed
 #   <session_dir>/review_findings_<N>.txt  — review findings for pass N
-#   <session_dir>/review_agent_<N>.log     — full agent log for pass N; a worker's
-#                                            pass adds `-<slot>`, so
-#                                            two workers on one pass keep separate logs
+#   <session_dir>/review_agent_<N>.log     — full agent log for pass N
 #   <session_dir>/review_findings.txt      — symlink to the current pass's findings
 #   <session_dir>/review_agent.log         — symlink to the current pass's log
 #   <session_dir>/review_agent         — resolved task, family, agent, and effort
@@ -48,8 +42,7 @@
 #                                        start + [wrapper] beats every 60s, each
 #                                        carrying an activity digest decoded from
 #                                        the reviewer's streamed log. Fresh
-#                                        reviewers are read-only. Assigned reviewers
-#                                        and simplify reviews get a tree check.
+#                                        reviewers are read-only and get a tree check.
 #                                        The check excludes paths held by another
 #                                        open phase (review_tree.py).
 
@@ -58,8 +51,6 @@ set -euo pipefail
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
-FOLLOW_TO=""
-NEW_SLOT=""
 # A phase running beside the current one names itself, so start-pass stamps this pass with it.
 PHASE_ID=""
 STYLE_SINCE=""
@@ -70,8 +61,6 @@ SIMPLIFY_DIFF=""
 SIMPLIFY_SUMMARY=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
-    --to) FOLLOW_TO="${2:?--to requires a worker}" ;;
-    --slot) NEW_SLOT="${2:?--slot requires a slot}" ;;
     --lens) REQUESTED_LENS="${2:?--lens requires a lens}" ;;
     --style-since) STYLE_SINCE="${2:?--style-since requires a baseline}" ;;
     --style-until) STYLE_UNTIL="${2:?--style-until requires an end commit}" ;;
@@ -82,10 +71,6 @@ while [[ "${1:-}" == --* ]]; do
   esac
   shift 2
 done
-if [[ -n "${FOLLOW_TO}" && -n "${NEW_SLOT}" ]]; then
-  echo "ERROR: --to excludes --slot." >&2
-  exit 2
-fi
 SESSION_DIR="${1:?Usage: review.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
 # A named phase keeps its review files in its own directory, so two phases reviewing at once
 # never write the same pass's findings, status or log. Run-wide files stay in the session.
@@ -114,10 +99,6 @@ ROLE_DESC="${5:-blind review of the current diff against its spec}"
 PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
 PASS_INDEX="${7:-1}"
 LENS="${REQUESTED_LENS:-${8:-}}"
-LENS_ARGS=()
-if [[ -n "${LENS}" ]]; then
-  LENS_ARGS=(--lens "${LENS}")
-fi
 EARLY_READY_FILE="${9:-}"
 TASK="direct.${SUBTASK}"
 
@@ -140,58 +121,24 @@ print({"adversary": "test", "contract": "impl", "": ""}.get(lens, "review"))
 PYLENS
 )"
 
-# An explicit worker keeps its slot. A fresh reviewer uses the lens slot.
-if [[ -n "${FOLLOW_TO}" ]]; then
-  TEAM_SLOT="${FOLLOW_TO##*-}"
-  if [[ ! "${TEAM_SLOT}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; then
-    echo "ERROR: cannot derive a valid team slot from review worker '${FOLLOW_TO}'." >&2
-    exit 2
-  fi
-elif [[ -n "${NEW_SLOT}" ]]; then
-  TEAM_SLOT="${NEW_SLOT}"
-  if [[ ! "${TEAM_SLOT}" =~ ^[A-Za-z][A-Za-z0-9_]{0,31}$ ]]; then
-    echo "ERROR: new review slot must be role-named and use 1-32 alphanumeric/_ characters; got '${NEW_SLOT}'." >&2
-    exit 2
-  fi
-else
-  TEAM_SLOT="${LENS_SLOT}"
-  if [[ "${TASK}" == direct.simplify ]]; then
-    TEAM_SLOT="simplify-$$"
-  fi
-fi
-
 SUFFIX="${LENS:+_${LENS}}"
 # Give each lens a separate tag in the shared activity log.
 BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
-# The worker this pass records under, so concurrent reviewers key separate pass
-# records instead of closing another worker's pass. Replace any inherited slot;
-# ordinary allocation sets the selected review slot after the launch check.
+# Each lens records its pass in a separate slot.
+TEAM_SLOT="${LENS_SLOT}"
+if [[ "${TASK}" == direct.simplify ]]; then
+  TEAM_SLOT="simplify-$$"
+fi
 export UNIT_TEAM_ROLE="${TEAM_SLOT}"
 export UNIT_RUN_DIR="${SESSION_DIR}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -n "${FOLLOW_TO}" ]]; then
-  REVIEW_WORKER="${FOLLOW_TO}"
-elif [[ -n "${NEW_SLOT}" ]]; then
-  REVIEW_WORKER="$(bash "${SCRIPT_DIR}/worker_name.sh" "${WORKING_DIR}" "${NEW_SLOT}" review)"
-else
-  REVIEW_WORKER=""
-fi
-RECORDS_TURN=0
-if [[ -n "${REVIEW_WORKER}" || "${TASK}" == direct.simplify ]]; then
-  RECORDS_TURN=1
-fi
-REVIEWER_LABEL="review worker ${REVIEW_WORKER}"
-if [[ -z "${REVIEW_WORKER}" ]]; then
-  REVIEWER_LABEL="${LENS:-fresh} reviewer"
-fi
+REVIEWER_LABEL="${LENS:-fresh} reviewer"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.12.
 PY="${SCRIPT_DIR}/../lib/py"
-MESH_SESSION_DIR="${SESSION_DIR}"
-MESH_CLAIMED=0
 TURN_THREAD_ID=""
 TURN_FINDINGS_READY=0
 TURN_RAISED=0
@@ -205,15 +152,7 @@ FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
 SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"
 rm -f "${SLOT_FILE}"
-# Each worker logs on its own: a second worker taking the same pass and lens would
-# otherwise truncate the first one's log, and with it the reason that worker failed.
-if [[ -n "${REVIEW_WORKER}" ]]; then
-  SEAT_SUFFIX="-${TEAM_SLOT}"
-else
-  SEAT_SUFFIX=""
-fi
-LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log"
-REPLY_FILE="${ARTIFACT_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
+LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
 TREE_BASELINE_FILE="${ARTIFACT_DIR}/review_tree_${PASS_INDEX}${SUFFIX}.$$.json"
 
 AGENT_FILE="${ARTIFACT_DIR}/review_agent${SUFFIX}"
@@ -297,25 +236,14 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
 fi
 
 
-# Resolution can change the worker slot after the launch check.
-if [[ -n "${REVIEW_WORKER}" ]]; then
-  SEAT_SUFFIX="-${TEAM_SLOT}"
-else
-  SEAT_SUFFIX=""
-fi
-LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log"
-
 initialize_review_artifacts() {
   # Every reader of the unnumbered paths — the unit director's mid-run
   # preemption read, the heartbeat digest — keeps working while the per-pass
   # history is kept.
   ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${ARTIFACT_DIR}/review_findings${SUFFIX}.txt"
-  ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log" "${ARTIFACT_DIR}/review_agent${SUFFIX}.log"
-  rm -f "${REPLY_FILE}"
-  if [[ "${RECORDS_TURN}" -eq 1 ]]; then
-    : > "${FINDINGS_FILE}"
-    TURN_FINDINGS_READY=1
-  fi
+  ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${ARTIFACT_DIR}/review_agent${SUFFIX}.log"
+  : > "${FINDINGS_FILE}"
+  TURN_FINDINGS_READY=1
   write_review_status reviewing
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   # Only meaningful while an early launch is showing in the progress report,
@@ -329,88 +257,6 @@ board_post() {
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${TEAM_SLOT}" "$1" "$2" || true
 }
 
-claim_follow() {
-  "$PY" - "${MESH_SESSION_DIR}" "${FOLLOW_TO}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
-    "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${LENS}" "${SESSION_DIR}" "${TEAM_SLOT}" <<'PY'
-import fcntl
-import json
-import os
-import subprocess
-import sys
-from pathlib import Path
-
-root_text, name, mesh_script, board_helper, compact_above_text, lens, unit_dir, slot = sys.argv[1:]
-root = Path(root_text)
-compact_above = int(compact_above_text)
-
-def read_roster():
-    try:
-        value = json.loads((root / "mesh_roster.json").read_text())
-    except (OSError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
-
-def post(message):
-    subprocess.run(
-        ["bash", board_helper, "post", unit_dir, slot,
-         "status", message],
-        capture_output=True,
-        text=True,
-    )
-
-sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
-from worker_state import worker_claim_lock
-
-with worker_claim_lock(root):
-    entry = read_roster().get(name, {})
-    context_tokens = entry.get("context_tokens") if isinstance(entry, dict) else None
-    if isinstance(context_tokens, int) and context_tokens > compact_above:
-        compact = subprocess.run(
-            [sys.executable, mesh_script, "compact", "--session-dir", root_text,
-             "--to", name],
-            capture_output=True,
-            text=True,
-        )
-        if compact.returncode == 0:
-            post(f"launcher: {compact.stdout.strip() or f'compacted {name}'}")
-        else:
-            detail = (compact.stderr.strip() or compact.stdout.strip()
-                      or f"exit {compact.returncode}").splitlines()[-1]
-            # Exit 3: a turn is still live on the worker's thread, so a follow-up would be refused.
-            if compact.returncode == 3:
-                post(f"launcher: {name} still has a live turn after compaction: {detail}; "
-                     "follow-up not sent")
-                print(f"review.sh: {name} still has a live turn after compaction; end the worker "
-                      f"(codex_mesh.py end --to {name}) and start a fresh one", file=sys.stderr)
-                raise SystemExit(2)
-            if compact.returncode == 4:
-                post(f"launcher: {name}: {detail}; follow-up not sent")
-                print(f"review.sh: {name}: roster changed during compaction; follow-up not sent; "
-                      f"inspect the worker and use codex_mesh.py reopen --to {name} if idle", file=sys.stderr)
-                raise SystemExit(2)
-            post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
-    checked = subprocess.run(
-        [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
-         "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"],
-         "--role", "review", *(["--lens", lens] if lens else [])],
-        capture_output=True,
-        text=True,
-    )
-    if checked.returncode != 0:
-        print(checked.stderr.strip() or f"{name} is busy or not followable", file=sys.stderr)
-        raise SystemExit(checked.returncode)
-PY
-}
-
-cleanup_mesh_review() {
-  if [[ "${MESH_CLAIMED}" -eq 1 ]]; then
-    "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" release-follow \
-      --session-dir "${MESH_SESSION_DIR}" --to "${FOLLOW_TO}" \
-      --claim-pid "${FOLLOW_LAUNCHER_PID}" >/dev/null 2>&1 || true
-  fi
-  rm -f "${REPLY_FILE}" "${TREE_BASELINE_FILE}"
-}
-
 # The tree guard keeps per-path entries, so a phase writing beside this one changes only its
 # own paths and review_tree.py can leave them out (its docstring has the rule).
 capture_tree_baseline() {
@@ -420,34 +266,6 @@ capture_tree_baseline() {
   else
     TREE_BASELINE_READY=-1
   fi
-}
-
-record_new_worker_identity() {
-  "$PY" - "${SESSION_DIR}" "${TEAM_SLOT}" "${REVIEW_WORKER}" \
-    "${AGENT_FAMILY}" "${DURABLE_WORKER_MODEL}" "${SCRIPT_DIR}" <<'PY'
-import fcntl
-import json
-import sys
-from pathlib import Path
-
-root_text, slot, name, family, model, helper_dir = sys.argv[1:]
-sys.path.insert(0, str(Path(helper_dir).resolve().parents[1]))
-from scripts.production import worker_admission
-sys.path.insert(0, helper_dir)
-from worker_state import worker_claim_lock, worker_record_path
-root = Path(root_text)
-with worker_claim_lock(root):
-    member = worker_admission.member(root, name)
-    if member is None:
-        raise SystemExit(1)
-    worker_id = member.current_session
-    identity = {
-        "staff_id": member.id,
-        "slot": slot,
-        "model": model,
-    }
-    worker_record_path(root, name, slot).write_text(json.dumps(identity))
-PY
 }
 
 count_turn_findings() {
@@ -484,24 +302,9 @@ PY
   TURN_COUNT_READY=1
 }
 
-refresh_turn_thread_id() {
-  TURN_THREAD_ID="$("$PY" - "${MESH_SESSION_DIR}" "${REVIEW_WORKER}" \
-    "${TURN_THREAD_ID}" "${TURN_PROGRESS}" "${SCRIPT_DIR}" <<'PY'
-import json
-import sys
-from pathlib import Path
-root, reviewer, known, progress, helper_dir = sys.argv[1:]
-sys.path.insert(0, str(Path(helper_dir).resolve().parents[1]))
-from scripts.production import worker_admission
-member = worker_admission.member(Path(root), reviewer)
-print(member.current_session if member else known or json.loads(progress).get("thread_id", ""))
-PY
-)"
-}
-
 write_turn_record() {
   UNIT_LIB_DIR="${SCRIPT_DIR%/*}/lib" "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
-    "${REVIEW_WORKER}" "${TURN_THREAD_ID}" \
+    "${REVIEWER_LABEL}" "${TURN_THREAD_ID}" \
     "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" "${TURN_RAISED}" <<'PY'
 import itertools
 import json
@@ -513,7 +316,6 @@ from pathlib import Path
 (session, started, pid, status, reviewer, thread_id,
  progress, lens, number, raised) = sys.argv[1:]
 metadata = json.loads(progress)
-thread_id = thread_id or metadata.get("thread_id", "")
 unit, phase = metadata.get("unit", ""), metadata.get("phase", "")
 record = {
     "arm": "own",
@@ -547,13 +349,6 @@ finish_style_review() {
     --input-dir "${STYLE_INPUT_DIR}" --result "${FINDINGS_FILE}" --dispatch-code "$1"
 }
 
-finish_fresh_exit() {
-  local code=$?
-  trap - EXIT
-  finish_style_review "${code}" || code=1
-  exit "${code}"
-}
-
 finish_review_exit() {
   local code=$?
   trap - EXIT
@@ -561,21 +356,20 @@ finish_review_exit() {
   if [[ "${code}" -ne 0 && "${TURN_FINDINGS_READY}" -eq 1 ]]; then
     write_review_status error
   fi
-  if [[ "${TASK}" == direct.simplify && "${PASS_STARTED}" -eq 1 ]]; then
+  if [[ "${PASS_STARTED}" -eq 1 ]]; then
     UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       && PASS_STARTED=0 || code=1
   fi
   finish_style_review "${code}" || code=1
   count_turn_findings
-  refresh_turn_thread_id
   if ! write_turn_record; then
     review_error "unable to write review turn record"
     write_review_status error
     code=1
   fi
 
-  cleanup_mesh_review
+  rm -f "${TREE_BASELINE_FILE}"
   if [[ "${TASK}" == direct.simplify ]]; then
     finish_simplify "${code}"
   fi
@@ -584,8 +378,8 @@ finish_review_exit() {
 
 interrupt_review() {
   TURN_RECORD_STATUS="canceled"
-  # A fresh reviewer owns its process group. Persistent workers retain their turns.
-  if [[ -z "${REVIEW_WORKER}" && -n "${AGENT_PID:-}" ]]; then
+  # Stop the fresh reviewer and its child processes.
+  if [[ -n "${AGENT_PID:-}" ]]; then
     "$PY" "${SCRIPT_DIR}/../lib/process_group.py" "${AGENT_PID}" TERM || true
     wait "${AGENT_PID}" 2>/dev/null || true
   fi
@@ -597,38 +391,28 @@ interrupt_review() {
   exit "$1"
 }
 
-if [[ "${RECORDS_TURN}" -eq 1 ]]; then
-  TURN_STARTED_AT="$(date +%s)"
-  # The record joins to the phase --phase names, the same phase start-pass stamps:
-  # with phases open side by side, the newest open phase is often another one.
-  TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${SESSION_DIR}" "${FOLLOW_TO}" "${PHASE_ID}" "${SCRIPT_DIR}" <<'PY'
+TURN_STARTED_AT="$(date +%s)"
+TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${PHASE_ID}" <<'PYMETA'
 import json
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[5]).resolve().parents[1]))
-from scripts.production import worker_admission
 try:
     state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 except (OSError, ValueError):
     state = {}
 phase = state.get("phase") or {}
 named = [record for record in [phase, *(state.get("open_phases") or [])]
-         if sys.argv[4] and record.get("status") == "active" and record.get("id") == sys.argv[4]]
+         if sys.argv[2] and record.get("status") == "active" and record.get("id") == sys.argv[2]]
 phase = named[0] if named else phase
-member = worker_admission.member(Path(sys.argv[2]), sys.argv[3])
 print(json.dumps({"unit": state.get("unit", ""), "phase": phase.get("id", ""),
                   "phase_instance_id": phase.get("instance_id", ""),
-                  "history_file": state.get("history_file", ""),
-                  "thread_id": member.current_session if member else ""}))
-PY
+                  "history_file": state.get("history_file", "")}))
+PYMETA
 )"
-  trap finish_review_exit EXIT
-  trap 'interrupt_review 143' TERM
-  trap 'interrupt_review 130' INT
-  trap 'interrupt_review 129' HUP
-else
-  trap finish_fresh_exit EXIT
-fi
+trap finish_review_exit EXIT
+trap 'interrupt_review 143' TERM
+trap 'interrupt_review 130' INT
+trap 'interrupt_review 129' HUP
 
 if [[ -n "${STYLE_SINCE}" ]]; then
   STYLE_DIRECTORY_FILE="${ARTIFACT_DIR}/style_directory.$$.txt"
@@ -650,47 +434,17 @@ if [[ "${TASK}" == direct.simplify && "$(_agents_live_family direct simplify)" !
   exit 1
 fi
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
-  if [[ -z "${REVIEW_WORKER}" ]]; then
-    write_review_status error
-  fi
+  write_review_status error
   exit 1
 fi
 
-# implement.sh anchors a durable Codex identity to the implementation model
-# configured when that worker first opens. A worker opened by review.sh must use
-# the same anchor even though this turn runs the review model; otherwise the
-# first role switch back to implementation rejects its own retained thread.
-# shellcheck disable=SC2153  # agents_resolve sets AGENT_MODEL.
-DURABLE_WORKER_MODEL="${AGENT_MODEL}"
-if [[ -n "${NEW_SLOT}" ]]; then
-  IMPLEMENTATION_PAIR="$(_models_registry_get "direct.${AGENT_FAMILY}" implementation)"
-  if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
-    IMPLEMENTATION_PAIR="$(_models_registry_get "direct.${AGENT_FAMILY}" impl)"
-  fi
-  if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
-    echo "ERROR: cannot record review worker ${REVIEW_WORKER}: no implementation model is configured." >&2
-    exit 2
-  fi
-  DURABLE_WORKER_MODEL="${IMPLEMENTATION_PAIR%%:*}"
-fi
-
 TREE_BASELINE_READY=0
-TURN_IMAGE_ARGS=()
-
-if [[ -n "${REVIEW_WORKER}" ]]; then
-  if [[ "${AGENT_FAMILY}" != "codex" ]]; then
-    echo "ERROR: review worker ${REVIEW_WORKER} requires the Codex mesh." >&2
-    exit 2
-  fi
-  if [[ -n "${FOLLOW_TO}" ]]; then
-    source "${SCRIPT_DIR}/../lib/conf.sh"
-    COMPACT_ABOVE_TOKENS="$(conf_value direct UNIT_COMPACT_ABOVE_TOKENS)"
-    export FOLLOW_LAUNCHER_PID="$$"
-    claim_follow
-    MESH_CLAIMED=1
-  fi
+if [[ "${AGENT_FAMILY}" != claude ]]; then
+  review_error "Codex reviewers must use assign.sh"
+  write_review_status error
+  exit 2
 fi
-if [[ "${RECORDS_TURN}" -eq 1 && ( -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ) ]]; then
+if [[ -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ]]; then
   capture_tree_baseline
 fi
 initialize_review_artifacts
@@ -698,19 +452,8 @@ initialize_review_artifacts
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
-if [[ -n "${REVIEW_WORKER}" ]]; then
-  MESH_FIELD="mesh=${REVIEW_WORKER}; reach=codex_mesh.py"
-  if [[ -n "${FOLLOW_TO}" ]]; then
-    LAUNCH_NOTE="follow-up to ${REVIEW_WORKER}"
-  else
-    LAUNCH_NOTE="new worker ${REVIEW_WORKER}"
-  fi
-else
-  MESH_FIELD="mesh=none"
-  LAUNCH_NOTE="up"
-fi
 board_post register \
-  "${LENS} review ${LAUNCH_NOTE} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; role=review; status in review_status${SUFFIX}"
+  "${LENS} review up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); role=review; status in review_status${SUFFIX}"
 
 record_pass_start() {
   # UX time belongs to the director's activity, including early launches.
@@ -722,7 +465,6 @@ record_pass_start() {
     --prompt-file "${PROMPT_FILE}" \
     --activity "${PASS_ACTIVITY}" \
     --called-task "${TASK}" \
-    --worker-name "${REVIEW_WORKER}" \
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
     --called-effort "${AGENT_EFFORT:-unset}" \
@@ -741,26 +483,6 @@ if [[ -z "${EARLY_READY_FILE}" ]]; then
 fi
 
 bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
-
-# Early mode: the reviewer ends Stage 1 with provisional findings while the
-# implementation still runs. A detached run for the reviewer waits until the
-# sentinel exists, then sends Stage 2 as the reviewer's next message; the live
-# run keeps the reviewer's launcher attached until then. It exits 1, sending
-# nothing, if this script exits first.
-if [[ -n "${EARLY_READY_FILE}" && -n "${REVIEW_WORKER}" ]]; then
-  STAGE_TWO_FILE="${ARTIFACT_DIR}/review_stage2_${PASS_INDEX}${SUFFIX}.$$.txt"
-  printf 'Stage 2: the final diff is at %s; review it per your prompt'"'"'s Stage 2.\n' \
-    "${EARLY_READY_FILE%.ready}.diff" > "${STAGE_TWO_FILE}"
-  # The inner script reads its own $1..$3, so the single quotes are meant (SC2016).
-  # shellcheck disable=SC2016
-  if ! "$PY" "${MESH_RUNS_SCRIPT:-${SCRIPT_DIR}/../agents/mesh_runs.py}" start \
-    --session-dir "${MESH_SESSION_DIR}" --to "${REVIEW_WORKER}" --director-dir "${SESSION_DIR}" \
-    --label "final diff ready" --done-message-file "${STAGE_TWO_FILE}" -- \
-    bash -c 'while [[ ! -e "$1" ]]; do kill -0 "$2" 2>/dev/null || [[ -e "$1" ]] || exit 1; sleep "$3"; done' \
-    stage-two "${EARLY_READY_FILE}" "$$" "${UNIT_EARLY_POLL_SECS:-5}" >>"${LOG_FILE}" 2>&1; then
-    echo "ERROR: could not start the Stage 2 run for ${REVIEW_WORKER}; see ${LOG_FILE}." >&2
-  fi
-fi
 
 # A broad pass reviews the exact pending snapshot it receives. New pushes made
 # during this pass stay pending for the next pass.
@@ -805,33 +527,13 @@ PY
   fi
 fi
 
-TURN_WORKTREE_ARGS=(--cwd "${WORKING_DIR}" --read-only)
-if [[ -n "${FOLLOW_TO}" ]]; then
-  "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
-    --session-dir "${MESH_SESSION_DIR}" --to "${FOLLOW_TO}" \
-    --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review "${LENS_ARGS[@]}" "${TURN_WORKTREE_ARGS[@]}" "${TURN_IMAGE_ARGS[@]}" \
-    --message-file "${PROMPT_FILE}" --summary-file "${FINDINGS_FILE}" \
-    --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
-    --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
-elif [[ -n "${NEW_SLOT}" ]]; then
-  "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
-    --session-dir "${SESSION_DIR}" --name "${REVIEW_WORKER}" --role review "${LENS_ARGS[@]}" \
-    --sandbox read-only --prompt-file "${PROMPT_FILE}" \
-    --summary-file "${FINDINGS_FILE}" --reply-file "${REPLY_FILE}" \
-    --log-file "${LOG_FILE}" --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
-else
-  FRESH_REVIEW_PREFIX=()
-  FRESH_REVIEW_ARGS="${AGENT_EXEC_EXTRA_ARGS:-}"
-  if [[ "${TASK}" == direct.simplify ]]; then
-    TURN_THREAD_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
-    "$PY" "${SCRIPT_DIR}/../usage/agents_log.py" append \
-      --id "${TURN_THREAD_ID}" --role review --lens "${LENS}" || true
-    FRESH_REVIEW_ARGS+=" --session-id ${TURN_THREAD_ID}"
-    FRESH_REVIEW_PREFIX=("$PY" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
-  fi
-  AGENT_EXEC_EXTRA_ARGS="${FRESH_REVIEW_ARGS}" "${FRESH_REVIEW_PREFIX[@]}" bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
-    "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
-fi
+TURN_THREAD_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+"$PY" "${SCRIPT_DIR}/../usage/agents_log.py" append \
+  --id "${TURN_THREAD_ID}" --role review ${LENS:+--lens "${LENS}"} || true
+FRESH_REVIEW_ARGS="${AGENT_EXEC_EXTRA_ARGS:-} --session-id ${TURN_THREAD_ID}"
+AGENT_EXEC_EXTRA_ARGS="${FRESH_REVIEW_ARGS}" "$PY" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+  bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
+  "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
 AGENT_PID=$!
 
 # The wrapper beat carries an activity digest decoded from the reviewer's own
@@ -865,11 +567,6 @@ fi
 
 AGENT_CODE=0
 wait "${AGENT_PID}" || AGENT_CODE=$?
-
-if [[ -n "${NEW_SLOT}" ]] && ! record_new_worker_identity; then
-  echo "ERROR: review worker ${REVIEW_WORKER} has no durable worker identity." >&2
-  AGENT_CODE=1
-fi
 
 kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true

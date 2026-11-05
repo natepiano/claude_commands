@@ -799,8 +799,6 @@ def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Pa
                    env: dict[str, str]) -> int:
     """Use the Claude launcher under the same assign parent."""
     options = ["--phase", phase]
-    if args.to:
-        options += ["--to", args.to]
     role = "impl" if args.role == "implement" else args.role
     slot = args.to or args.new_worker or role
     if args.role == "review":
@@ -811,6 +809,8 @@ def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Pa
         command = ["bash", str(SCRIPTS / "review.sh"), *options, str(run), str(cwd), str(prompt),
                    "review", "review", "review", str(args.pass_number), args.lens, args.early_ready]
     else:
+        if args.to:
+            options += ["--to", args.to]
         if args.fix_cause:
             options += ["--fix-cause", args.fix_cause]
         command = ["bash", str(SCRIPTS / "implement.sh"), *options, str(run), str(cwd), str(prompt),

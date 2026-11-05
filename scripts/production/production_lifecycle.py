@@ -470,7 +470,7 @@ def release_edges(slug: str, *, record: staff.StaffSnapshot | None = None) -> No
 
 class PreparedWrapUnit(NamedTuple):
     unit: UnitRow
-    config: unit_config.UnitConfig
+    retirement: unit_config.RetiredSession
 
 
 def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tuple[PreparedWrapUnit, ...]:
@@ -488,15 +488,14 @@ def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tup
         if isinstance(saved, unit_config.UnitConfig):
             if not isinstance(saved.retired, unit_config.RetiredSession):
                 raise LifecycleStop("retire", "held", f"{unit.name}: parked retirement facts are incomplete")
-            config = saved
+            retirement = saved.retired
         elif isinstance(current, unit_config.ConfigMissing):
             raise LifecycleStop("retire", "held", current.reason)
         elif not unit.member.current_session:
             raise LifecycleStop("retire", "held", f"{unit.name}: the staff row has no director session for retirement")
         else:
-            config = replace(current, retired=unit_config.RetiredSession(
-                datetime.now(production.zone).date().isoformat(), unit.member.current_session,
-                unit_config.Branch(unit.branch)))
+            retirement = unit_config.RetiredSession(datetime.now(production.zone).date().isoformat(),
+                                                   unit.member.current_session, unit_config.Branch(unit.branch))
         if unit.worktree.exists():
             if isinstance(location, staff.RemovedWorktree):
                 raise LifecycleStop("retire", "held", f"{unit.name}: removed worktree path is occupied")
@@ -504,7 +503,7 @@ def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tup
             actual = checked(unit.worktree, "retire", "symbolic-ref", "--quiet", "--short", "HEAD")
             if actual != unit.branch:
                 raise LifecycleStop("retire", "held", f"{unit.name}: worktree branch {actual} conflicts with {unit.branch}")
-        prepared.append(PreparedWrapUnit(unit, config))
+        prepared.append(PreparedWrapUnit(unit, retirement))
     return tuple(prepared)
 
 
@@ -602,8 +601,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         _ = capture_release(production.slug, record=record)
     for item in prepared:
         unit = item.unit
-        assert isinstance(item.config.retired, unit_config.RetiredSession)
-        _ = unit_config.park(unit.member.id, unit.worktree, item.config.retired)
+        _ = unit_config.park(unit.member.id, unit.worktree, item.retirement)
         if unit.worktree.exists():
             retire_reservations(unit.worktree)
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))

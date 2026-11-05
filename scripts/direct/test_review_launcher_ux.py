@@ -28,7 +28,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             "| /tmp/a.png | cables-drape-smoothly | bad | 40x40+1+1 | one cable |\n\n"
             "1. Other text\n"
         )
-        result = subprocess.run(self.review_command(session, "ux", "", self.open_worker(session)), env=environment,
+        result = subprocess.run(self.review_command(session, "ux", ""), env=environment,
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.turn_records(session)[0]["raised"], 3)
@@ -39,7 +39,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
         environment = self.environment()
         environment["STUB_FINDINGS"] = "Verdict: pass\n\n| Shot | Rule | Defect | Fix |\n| --- | --- | --- | --- |\n"
-        result = subprocess.run(self.review_command(session, "ux", "", self.open_worker(session)), env=environment,
+        result = subprocess.run(self.review_command(session, "ux", ""), env=environment,
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.turn_records(session)[0]["raised"], 0)

@@ -205,7 +205,6 @@ class LifecycleFixture(unittest.TestCase):
             "", "## Production Context", "",
             "- **Merge branch:** `production`",
             f"- **Showrunner checkout:** `{self.checkout}`",
-            "- **Showrunner session:** old-showrunner",
             "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles",
             "- **Updates:** every 15 minutes",

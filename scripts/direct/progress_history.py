@@ -305,13 +305,12 @@ PASS_OWNER_ENV = "UNIT_PASS_OWNER"
 PASS_OWNER_TOKEN = "launcher"
 
 PASS_OWNERSHIP_RULE = (
-    "Pass lifecycle belongs to the launcher. implement.sh and review.sh already "
-    "record pass_started and pass_finished around the worker they wait on, so a "
-    "hand-written call forges a pass that never ran. findings.py gate counts "
-    "passes to decide whether a phase is converging, and forged passes stop a run "
-    "for a condition that never happened. Launch the work through implement.sh or "
-    "review.sh. The single exception is a launcher the unit director killed: close "
-    "its still-open pass with 'finish-pass --status canceled --orphaned-launcher'."
+    "Pass lifecycle belongs to the launchers. assign.sh and the implement.sh or "
+    "review.sh it runs record pass_started and pass_finished. findings.py gate "
+    "counts these passes for convergence. Manual pass records can falsely stop "
+    "a run. Launch the work through assign.sh. Exception: if the unit director "
+    "killed a launcher, close its open pass with "
+    "'finish-pass --status canceled --orphaned-launcher'."
 )
 
 
@@ -1792,9 +1791,8 @@ def _arm_review(args: argparse.Namespace) -> None:
         raise SystemExit(f"Phase {phase_id} is not open" if phase_id else "Start a phase before arming an early review")
     if _reporting_pass(state) is None:
         raise SystemExit(
-            "An early review is the reviewer that overlaps a running dispatch, so "
-            + "a pass must be open. With none open the review is not early -- "
-            + "launch it through review.sh and let it record its own pass."
+            "An early review overlaps a running dispatch, so a pass must be open. "
+            + "Without an open pass, launch it through assign.sh and let it record its own pass."
         )
     now = plan_history.now_epoch()
     called_task = _arg_string(args, "called_task", "direct.review") or "direct.review"

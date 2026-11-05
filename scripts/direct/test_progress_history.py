@@ -3369,6 +3369,7 @@ with patch.object(fcntl, "flock", admission):
         )
         self.assertNotEqual(failure.returncode, 0)
         self.assertIn("launcher", failure.stderr)
+        self.assertIn("Launch the work through assign.sh.", failure.stderr)
         history = self.history_dir / "runs" / "owned.jsonl"
         self.assertNotIn("pass_started", history.read_text(encoding="utf-8"))
 
@@ -5669,6 +5670,7 @@ with patch.object(fcntl, "flock", admission):
         )
         self.assertNotEqual(failure.returncode, 0)
         self.assertIn("a pass must be open", failure.stderr)
+        self.assertIn("launch it through assign.sh", failure.stderr)
 
     def test_an_activity_records_its_own_identity_not_the_finished_pass(self) -> None:
         """A finished pass stays in state; it used to stamp every later event."""

@@ -684,7 +684,8 @@ class StaffTestCase(unittest.TestCase):
         return row
 
     def write_production_doc(self, doc: Path, *, workspace: str) -> None:
-        write_text_atomic(doc, f"# Fixture production\n- **Showrunner session:** `{workspace}`\n")
+        del workspace
+        write_text_atomic(doc, "# Fixture production\n")
 
     def worktree(self, unit: str) -> Path:
         folder = self.source_root / "worktrees" / unit
@@ -745,7 +746,7 @@ class StaffTestCase(unittest.TestCase):
                           + 'port = 4317\nresponsibilities = ["shared-fixture"]\n')
         doc = repository / "docs" / "row-production.md"
         doc.parent.mkdir()
-        write_text_atomic(doc, "# Production\n- **Showrunner session:** `row-owner`\n")
+        write_text_atomic(doc, "# Production\n")
         runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc("natedev", doc))
         unit = fixture_member("unit", name="member", parent=runner.id,
                               worktree=staff.PresentWorktree("natedev", folder))

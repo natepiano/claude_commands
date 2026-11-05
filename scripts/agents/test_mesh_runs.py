@@ -859,7 +859,7 @@ sys.exit(1)
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0].session_id, self.unit.current_session)
         for part in (f"Worker {WORKER}'s run", f"Worker: {WORKER}",
-                     f"Dispatch the worker (implement.sh --to {WORKER})",
+                     f"Dispatch the worker (assign.sh --to {WORKER})",
                      "Command: ", "FAIL (exit 2)", "Log: "):
             self.assertIn(part, self.sent[0].text)
         self.assertEqual(self.pending(), {})

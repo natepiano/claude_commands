@@ -559,7 +559,7 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
         case codex_mesh.NoLauncherAttached(status=status):
             state = f"{name} is {status or 'unknown'}"
     note = (f"Worker {name}'s run {record['label']} finished ({_exit_words(exit_code)}); no launcher is attached "
-            + f"({state}), so the result comes to you. Dispatch the worker (implement.sh --to {name}) "
+            + f"({state}), so the result comes to you. Dispatch the worker (assign.sh --to {name}) "
             + "when it should act on it.")
     message = "\n".join([note, f"Worker: {name}", f"Command: {' '.join(record['command'])}", "", text])
     for session in _director_sessions(record):

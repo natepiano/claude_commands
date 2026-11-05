@@ -47,8 +47,7 @@ def resume_message(why: str, *, moved_from: str | None = None, moved_to: str | N
         lines.append("Each command resumes the worker's existing thread.")
         lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
     elif why:
-        lines.append("Codex workers keep their existing threads. Use implement.sh --to <worker> or "
-                     + "codex_mesh.py resume for a paused worker; do not open a replacement thread.")
+        lines.append("Codex workers keep their existing threads. Use assign.sh --to <worker> to resume a paused worker.")
     text = ("\n" if workers.seats else " ").join(lines)
     return script_prompt(text)
 
@@ -85,61 +84,71 @@ def _resume_phase_id(seat: PausedSeat) -> str:
 
 
 def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
-    """Build a complete launcher invocation that continues this worker's thread."""
-    from scripts.direct.worker_state import worker_slot
+    """Build an assignment command for the worker's existing thread."""
     from scripts.production import session_staff
 
-    launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
     prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
     if seat["turn_live"] and seat["launcher_command"]:
         try:
             return _resume_task(seat, cwd, prompt)
         except ValueError:
             pass
-    # Find the saved slot through staff_id, including identities from named fix workers.
-    recorded_slot = worker_slot(Path(seat["run_dir"]), seat["seat"]) or ""
-    team_role = recorded_slot or seat["role"]
-    phase_id = _resume_phase_id(seat)
-    # The launchers are not executable files: `bash` runs them as pasted.
-    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"]]
-    if phase_id:
-        start.extend(("--phase", phase_id))
-    if launcher == "review.sh":
+    options = {"--role": "implement" if seat["role"] == "impl" else seat["role"]}
+    phase = _resume_phase_id(seat)
+    if phase:
+        options["--phase"] = phase
+    if seat["role"] == "review":
         assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
                                        session_staff.worker_session(seat), datetime.now(timezone.utc))
         if isinstance(assignment, agents_log.Assignment) and assignment.role == "review" and assignment.lens:
-            start.extend(("--lens", assignment.lens))
-    kind = team_role if team_role in {"impl", "test", "fix"} else "impl"
-    if seat["role"] == "fix":
-        kind = "fix"
-    if launcher == "implement.sh" and kind == "fix":
-        start.extend(("--fix-cause", "resume after a move"))
-    start.extend((seat["run_dir"], cwd, prompt))
-    if launcher == "review.sh":
-        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
-    return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", team_role])
+            options["--lens"] = assignment.lens
+    return _assignment_command(seat, cwd, prompt, options)
 
+
+def _assignment_command(seat: PausedSeat, cwd: str, prompt: str, options: dict[str, str]) -> str:
+    """Supply the current worker, folder, prompt, and authorized phase paths."""
+    role = options["--role"]
+    if role == "fix":
+        _ = options.setdefault("--fix-cause", "resume after a move")
+    if role != "review" and "--paths" not in options:
+        directory = Path(seat["run_dir"])
+        if phase := options.get("--phase"):
+            directory = directory / "phases" / phase
+        options["--paths"] = str(directory / "files")
+    start = ["bash", str(SCRIPTS / "direct/assign.sh"), "--to", seat["seat"],
+             "--session-dir", seat["run_dir"], "--cwd", cwd, "--prompt", prompt]
+    return shlex.join([*start, *(value for pair in options.items() for value in pair)])
 
 
 def _resume_task(seat: PausedSeat, cwd: str, prompt: str) -> str:
-    """Keep task options and arguments with the current folder and resume prompt."""
+    """Convert a saved launcher command into an assignment command."""
     command = seat["launcher_command"]
-    index = next((i for i, value in enumerate(command) if Path(value).name in {"implement.sh", "review.sh"}), -1)
+    index = next((i for i, value in enumerate(command)
+                  if Path(value).name in {"implement.sh", "review.sh", "assign.sh", "assign.py"}), -1)
     if index < 0:
         raise ValueError("the saved command has no worker launcher")
-    review = Path(command[index]).name == "review.sh"
-    supported = {"--phase", "--lens"} if review else {"--phase", "--fix-cause"}
+    launcher = Path(command[index]).name
+    assignment = launcher in {"assign.sh", "assign.py"}
+    supported = {"--role", "--paths", "--phase", "--lens", "--pass", "--fix-cause", "--summary",
+                 "--style-since", "--style-until", "--early-ready", "--diff"}
     position = index + 1
-    options: list[str] = []
+    options: dict[str, str] = {}
     while position < len(command) and command[position].startswith("--"):
         if position + 1 >= len(command):
             raise ValueError("the saved command has an incomplete option")
         option, value = command[position:position + 2]
         if option in supported:
-            options.extend((option, value))
+            options[option] = value
         position += 2
-    arguments = command[position:]
-    if len(arguments) < (3 if review else 9):
-        raise ValueError("the saved command has incomplete task arguments")
-    arguments[:3] = [seat["run_dir"], cwd, prompt]
-    return shlex.join([*command[:index + 1], *options, "--to", seat["seat"], *arguments])
+    if not assignment:
+        review = launcher == "review.sh"
+        arguments = command[position:]
+        if len(arguments) < (3 if review else 9):
+            raise ValueError("the saved command has incomplete task arguments")
+        role = "review" if review else arguments[5]
+        options["--role"] = "implement" if role == "impl" else role
+        if review and len(arguments) > 6:
+            options["--pass"] = str(max(1, int(arguments[6])))
+    if "--role" not in options:
+        raise ValueError("the saved assignment has no role")
+    return _assignment_command(seat, cwd, prompt, options)

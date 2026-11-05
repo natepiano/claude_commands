@@ -623,7 +623,7 @@ def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...
 def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
     if isinstance(request.kind, CodeCheckpoint) and not request.unit.owns:
         raise Refusal(f"unit {request.unit.name}: .unit.toml has no responsibilities; "
-                      + "run python3 -m scripts.production.owns_fill, then rerun the checkpoint")
+                      + "edit the unit's .unit.toml responsibilities, then rerun the checkpoint")
     board_free = isinstance(request.kind, CodeCheckpoint) and unit_config.BOARD_FREE in request.unit.owns
     outside: list[str] = []
     staged = good(git(request.production.checkout, "diff", "--cached", "--name-only"), "scope")

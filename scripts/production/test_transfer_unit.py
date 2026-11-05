@@ -61,14 +61,16 @@ class UnitTransferTests(UnitTransferFixture):
         directory = self.root / "state/stall-watch"
         directory.mkdir(parents=True, exist_ok=True)
         with mock.patch.object(stall_watch, "STATE_DIR", directory):
-            stretch = stall_watch.stretch_path("demo", "alpha-unit")
-            prompt = stall_watch.prompt_path("demo", "alpha-unit")
+            watch = stall_watch.watched_staff_unit("demo", "alpha-unit", row)
+            stretch, prompt = watch.stretch_path, watch.prompt_path
             _ = stretch.write_text('{"since": 17}\n')
             _ = prompt.write_text('{"key": "stall-watch:prompt:' + row.id + '"}\n')
             before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (stretch, prompt)}
             self.assert_ok(self.transfer("apply"))
-            self.assertEqual(stall_watch.stretch_path("other", "alpha-unit"), stretch)
-            self.assertEqual(stall_watch.prompt_path("other", "alpha-unit"), prompt)
+            moved = unit_membership("other", "alpha-unit")
+            watch = stall_watch.watched_staff_unit("other", "alpha-unit", moved)
+            self.assertEqual(watch.stretch_path, stretch)
+            self.assertEqual(watch.prompt_path, prompt)
             self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before}, before)
 
     def test_plan_then_apply_finishes_source_updates_after_a_staff_move(self) -> None:

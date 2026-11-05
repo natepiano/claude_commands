@@ -10,8 +10,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast, final
+from unittest.mock import patch
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.direct import workers
+from scripts.direct import assign, workers
 from scripts.production import session_staff
 from scripts.direct.assign_launcher_test_support import ROOT, read_object
 from scripts.direct import assign_launcher_test_support as launcher_fixture
@@ -20,6 +21,17 @@ setUpModule = mesh_fixture.setUpModule
 
 @final
 class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
+    def test_a_claude_review_for_a_named_worker_omits_the_follow_option(self) -> None:
+        args = assign.Arguments(role="review", to="project-review", lens="contract", pass_number=2)
+        environment = os.environ.copy()
+        with patch("scripts.direct.assign.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as launched:
+            code = assign.execute_claude(args, self.session_dir, "7", self.project, self.prompt, environment)
+        self.assertEqual(code, 0)
+        launched.assert_called_once_with(
+            ["bash", str(assign.SCRIPTS / "review.sh"), "--phase", "7", str(self.session_dir),
+             str(self.project), str(self.prompt), "review", "review", "review", "2", "contract", ""],
+            env=environment, check=False)
+
     def watch(self, path: Path) -> codex_mesh.LinuxFileChanges | codex_mesh.KqueueFileChanges:
         if sys.platform.startswith("linux"):
             return codex_mesh.LinuxFileChanges({path})

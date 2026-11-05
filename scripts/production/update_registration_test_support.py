@@ -170,7 +170,7 @@ class RegistrationFixture(unittest.TestCase):
         _ = self.doc.write_text("\n".join((
             "# Production — example", "", "## Production Context", "",
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
-            "- **Showrunner session:** first-showrunner", "- **Log:** `production.log`",
+            "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes",
             f"- **Proposals:** `{self.root / 'issues'}`", "",
         )), encoding="utf-8")
@@ -285,8 +285,7 @@ class RegistrationFixture(unittest.TestCase):
             return self.doc
         document = self.doc.with_name(f"{slug}-production.md")
         if not document.exists():
-            write_text_atomic(document, self.doc.read_text().replace("example", slug).replace(
-                "- **Showrunner session:** first-showrunner", f"- **Showrunner session:** {slug}"))
+            write_text_atomic(document, self.doc.read_text().replace("example", slug))
         return document
 
     def fixture_staff_id(self, reference: str = "", slug: str = "example") -> staff.StaffId:

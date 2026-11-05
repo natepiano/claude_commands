@@ -1,11 +1,4 @@
-"""Integration tests for implement.sh's worker arguments.
-
-The failure these exist for left no error anywhere. A repair round went out with
-the pass kind on one worker, the other two launchers ran their agents normally,
-and the ledger kept describing the round before it -- two records closed `error`
-an hour earlier -- until the one live window closed and the recorder began
-refusing every progress call while two agents were still working.
-"""
+"""Test Claude launcher arguments, staff identity, and pass records."""
 
 from __future__ import annotations
 
@@ -23,7 +16,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, override
 
-from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
+from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
 
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment, write_config_fixture
@@ -36,133 +29,7 @@ AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
 
 
-STUB_MESH = "#!/usr/bin/env python3\n" + STUB_ATOMIC_JSON_WRITER + """
-import json
-import os
-import pathlib
-import sys
-import time
-import signal
-
-verb = sys.argv[1]
-def option(name):
-    return sys.argv[sys.argv.index(name) + 1]
-
-session = pathlib.Path(option('--session-dir'))
-roster_path = session / 'mesh_roster.json'
-roster = json.loads(roster_path.read_text()) if roster_path.exists() else {}
-if verb in ('compact', 'can-follow', 'follow'):
-    with (session / 'mesh_events.txt').open('a') as events:
-        events.write(verb + '\\n')
-if verb == 'follow':
-    from scripts.production import staff, session_staff, worker_admission
-    member = worker_admission.member(session, option('--to'))
-    (session / 'follow_cwd.txt').write_text(str(session_staff.worker_directory(staff.local_snapshot(), member.id)))
-if verb == 'start':
-    baseline = session / 'phases/3/phase_baseline'
-    if baseline.exists():
-        (session / 'baseline-at-worker-open').write_bytes(baseline.read_bytes())
-    name = option('--name')
-    roster[name] = {'thread_id': 'thread-for-' + name, 'turn_id': 'turn-1',
-                    'status': 'done', 'role': option('--role'), 'task': option('--task')}
-    from scripts.production.staff_test_support import fixture_worker, isolated_staff_file
-    from scripts.production import staff
-    with isolated_staff_file(pathlib.Path(os.environ['STAFF_FILE']), {}):
-        worker = fixture_worker(name, staff.native_id(os.environ['CODEX_THREAD_ID']), backend=staff.CodexBackend(pathlib.Path.home() / '.codex'))
-    roster[name]['staff_id'] = worker.id
-    pathlib.Path(option('--reply-file')).write_text('initial reply\\n')
-    if os.environ.get('TEST_WORKER_STARTED'):
-        pathlib.Path(os.environ['TEST_WORKER_STARTED']).touch()
-elif verb == 'compact':
-    name = option('--to')
-    if os.environ.get('STUB_COMPACT_FAIL') == '1':
-        print('stub compaction failed', file=sys.stderr)
-        sys.exit(1)
-    if os.environ.get('STUB_COMPACT_FAIL') == '3':
-        print('stub turn still live', file=sys.stderr)
-        sys.exit(3)
-    before = roster[name].get('context_tokens', 0)
-    after = int(os.environ.get('STUB_COMPACT_AFTER', '12000'))
-    roster[name]['context_tokens'] = ('not_measured_since_compaction'
-                                    if (session / 'compact_reports_zero').exists() else after)
-    write_json(roster_path, roster)
-    if (session / 'compact_reports_zero').exists():
-        print(f'compacted {name}: {before} tokens, size not measured until its next turn')
-    else:
-        print(f'compacted {name}: {before} -> {after} tokens')
-elif verb == 'can-follow':
-    status_file = session / 'impl_status_impl'
-    if status_file.exists():
-        (session / 'status_before_claim.txt').write_text(status_file.read_text())
-    name = option('--to')
-    entry = roster.get(name, {})
-    status = entry.get('status')
-    pid = entry.get('launcher_pid', 0)
-    alive = False
-    if isinstance(pid, int) and pid > 0:
-        try:
-            os.kill(pid, 0)
-            alive = True
-        except ProcessLookupError:
-            pass
-    if status not in ('done', 'failed', 'paused') and not (
-        status in ('running', 'starting') and pid and not alive
-    ):
-        sys.exit(2)
-    if entry.get('live_turn'):
-        sys.exit(2)
-    entry['previous_status'] = status if status in ('done', 'failed') else 'failed'
-    entry['status'] = 'starting'
-    entry['role'] = option('--role')
-    entry['launcher_pid'] = int(option('--claim-pid'))
-    write_json(roster_path, roster)
-    sys.exit(0)
-elif verb == 'follow':
-    name = option('--to')
-    if roster[name].get('status') != 'starting' or roster[name].get('launcher_pid') != int(option('--claim-pid')):
-        sys.exit(2)
-    if os.environ.get('STUB_FOLLOW_PEER_AFTER_CLAIM') == '1':
-        roster[name] = {'thread_id': roster[name]['thread_id'], 'turn_id': 'peer-turn',
-                        'status': 'running'}
-        write_json(roster_path, roster)
-        sys.exit(1)
-    if os.environ.get('STUB_FOLLOW_HOLD') == 'before':
-        signal.pause()
-    roster[name]['role'] = option('--role')
-    roster[name]['task'] = option('--task')
-    (session / 'follow_message.txt').write_text(pathlib.Path(option('--message-file')).read_text())
-    if os.environ.get('STUB_FOLLOW_FAIL') == '1':
-        roster[name]['status'] = 'failed'
-        write_json(roster_path, roster)
-        sys.exit(1)
-    roster[name]['turn_id'] = 'turn-2'
-    roster[name]['status'] = 'running' if os.environ.get('STUB_FOLLOW_HOLD') == 'after' else 'done'
-    if os.environ.get('STUB_FOLLOW_HOLD') == 'after':
-        roster[name]['launcher_pid'] = os.getpid()
-    write_json(roster_path, roster)
-    if os.environ.get('STUB_FOLLOW_HOLD') == 'after':
-        if os.environ.get('STUB_LAUNCH_RELEASE'):
-            import subprocess
-            subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['STUB_LAUNCH_RELEASE']], check=True)
-        else:
-            signal.pause()
-        roster[name]['status'] = 'done'
-    pathlib.Path(option('--summary-file')).write_text('follow-up summary\\n')
-elif verb == 'release-follow':
-    name = option('--to')
-    entry = roster.get(name, {})
-    if entry.get('status') == 'starting' and entry.get('launcher_pid') == int(option('--claim-pid')):
-        roster[name] = {'thread_id': entry['thread_id'],
-                        'status': entry.get('previous_status', 'failed')}
-else:
-    sys.exit(2)
-write_json(roster_path, roster)
-if verb == 'start' and os.environ.get('STUB_LAUNCH_RELEASE'):
-    import subprocess
-    subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['STUB_LAUNCH_RELEASE']], check=True)
-"""
-
-CLAUDE_REGISTRY = registry_text({'assignments': {'direct': 'claude'}, 'direct.claude': {'impl': 'opus:high', 'test': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
+CLAUDE_REGISTRY = registry_text({'assignments': {'direct': 'claude'}, 'direct.claude': {'impl': 'opus:high', 'test': 'opus:high', 'fix': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
 
 STUB_CLAUDE = """#!/usr/bin/env python3
 import json
@@ -172,6 +39,13 @@ import sys
 
 root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
 if sys.argv[1] == '--bg':
+    settings = json.loads(sys.argv[sys.argv.index('--settings') + 1])['env']
+    session = pathlib.Path(settings['UNIT_RUN_DIR'])
+    baseline = session / 'phases/3/phase_baseline'
+    if baseline.exists():
+        (session / 'baseline-at-worker-open').write_bytes(baseline.read_bytes())
+    if os.environ.get('TEST_WORKER_STARTED'):
+        pathlib.Path(os.environ['TEST_WORKER_STARTED']).touch()
     (root / 'launch_args.json').write_text(json.dumps(sys.argv[1:]))
     (root / 'launch_environment.json').write_text(json.dumps({
         key: os.environ.get(key, '')
@@ -225,12 +99,16 @@ import pathlib
 import sys
 
 root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
+transcript = pathlib.Path(os.environ['STUB_TRANSCRIPT'])
+from scripts.production import staff, session_staff
+rows = staff.local_snapshot()
+worker = rows.by_current_session(transcript.name.removesuffix('.jsonl'))
+(root / 'follow_cwd.txt').write_text(str(session_staff.worker_directory(rows, worker.id)))
 (root / 'delivered_message.txt').write_text(pathlib.Path(sys.argv[sys.argv.index('--file') + 1]).read_text())
 behavior = os.environ.get('STUB_SEND_BEHAVIOR', 'complete')
 if behavior == 'queued':
     print('QUEUED')
     sys.exit(0)
-transcript = pathlib.Path(os.environ['STUB_TRANSCRIPT'])
 with transcript.open('a') as output:
     output.write(json.dumps({'type': 'assistant', 'message': {'stop_reason': 'end_turn'}}) + '\\n')
 pathlib.Path(os.environ['STUB_SUMMARY']).write_text('Claude follow-up summary\\n')
@@ -288,7 +166,7 @@ class ImplementLauncherFixture(LauncherFixture):
                 "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
                 "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
                 "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2", "",
-            ), MODELS_REGISTRY,
+            ), CLAUDE_REGISTRY,
         )
         _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
         _ = config_environment(self.root)
@@ -326,9 +204,12 @@ class ImplementLauncherFixture(LauncherFixture):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/py", home_lib / "py")
         configure_launcher_fixture(direct_dir / "implement.sh")
         _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
-        mesh = agents / "codex_mesh.py"
-        _ = mesh.write_text(STUB_MESH, encoding="utf-8")
-        mesh.chmod(0o755)
+        claude = self.root / "claude-bin"
+        _ = claude.write_text(STUB_CLAUDE, encoding="utf-8")
+        claude.chmod(0o755)
+        sender = self.root / "send"
+        _ = sender.write_text(STUB_SEND, encoding="utf-8")
+        sender.chmod(0o755)
         _ = shutil.copy2(DIRECT_DIR.parent / "production/worker_fill.py", self.root / "scripts/production/worker_fill.py")
         opening_sender = self.root / "opening-send.py"
         _ = opening_sender.write_text("import json, os, pathlib, sys\n"
@@ -350,6 +231,9 @@ class ImplementLauncherFixture(LauncherFixture):
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
         environment["CONF_DIR"] = str(self.root)
+        environment["CLAUDE_BIN"] = str(self.root / "claude-bin")
+        environment["STUB_CLAUDE_ROOT"] = str(self.root)
+        environment["NOTIFIER_SESSIONS_DIR"] = str(self.root / "sessions")
         environment["STAFF_FILE"] = str(self.root / "staff.json")
         environment["CODEX_THREAD_ID"] = self.staff_parent
         _ = environment.pop("STAFF_ID", None)
@@ -371,6 +255,8 @@ class ImplementLauncherFixture(LauncherFixture):
     def launch(
         self, session_dir: Path, kind: str, slot: str
     ) -> subprocess.CompletedProcess[str]:
+        environment = self.environment()
+        environment["STUB_SUMMARY"] = str(session_dir / f"impl_summary_{slot}.txt")
         return subprocess.run(
             [
                 "bash", str(self.implement_script), str(session_dir), str(self.working_dir),
@@ -380,7 +266,7 @@ class ImplementLauncherFixture(LauncherFixture):
             check=False,
             capture_output=True,
             text=True,
-            env=self.environment(),
+            env=environment,
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
@@ -390,6 +276,7 @@ class ImplementLauncherFixture(LauncherFixture):
         environment = self.environment()
         _ = environment.pop("TEST_LEGACY_LAUNCH", None)
         environment["TEST_WORKER_STARTED"] = str(session / "worker-started")
+        environment["STUB_SUMMARY"] = str(session / "phases" / "3" / "impl_summary_impl.txt")
         return subprocess.run(
             ["bash", str(self.implement_script), *options, str(session), str(self.working_dir),
              str(self.prompt_file), kind, "the retry path", kind, "writing the retry path", "0", "impl"],
@@ -421,61 +308,35 @@ printf 'claim\\n' >> {session / "mesh_events.txt"}
 printf '%s\\n' '{answer}'
 """, encoding="utf-8")
         berth.chmod(0o755)
-        environment = self.mesh_environment()
+        environment = self.environment()
         environment["PATH"] = str(binaries) + os.pathsep + environment["PATH"]
         environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
         return environment, calls
 
-    def mesh_environment(self, fail: bool = False) -> dict[str, str]:
-        environment = self.environment()
-        if fail:
-            environment["STUB_FOLLOW_FAIL"] = "1"
-        return environment
-
-    def finish_default_launcher(self, process: subprocess.Popen[str], release: Path,
-                                mesh: Path, timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS) -> tuple[str, str]:
-        try:
-            release.touch()
-            return communicate_launcher(process, timeout)
-        finally:
-            # A timeout must also restore the fixture for the next subcase.
-            _ = mesh.write_text(STUB_MESH)
-
-    def mesh_launch(
+    def worker_launch(
         self, session_dir: Path, *, to: str = "", slot: str = "impl",
         kind: str = "impl", fail: bool = False, resolves_round: bool = False,
-        compact_fail: bool = False, subtask: str = "", compact_still_live: bool = False,
         fix_cause: str = "",
     ) -> subprocess.CompletedProcess[str]:
-        arguments = [
-            "bash", str(self.implement_script),
-            str(session_dir), str(self.working_dir), str(self.prompt_file),
-            subtask or kind, "the retry path", kind, "writing the retry path", "0", slot,
-        ]
-        if fix_cause:
-            arguments[2:2] = ["--fix-cause", fix_cause]
+        arguments = ["bash", str(self.implement_script)]
         if to:
-            arguments.insert(2, "--to")
-            arguments.insert(3, to)
-        environment = self.mesh_environment(fail=fail)
-        if compact_fail:
-            environment["STUB_COMPACT_FAIL"] = "1"
-        if compact_still_live:
-            environment["STUB_COMPACT_FAIL"] = "3"
+            arguments.extend(("--to", to))
+        if fix_cause:
+            arguments.extend(("--fix-cause", fix_cause))
+        arguments.extend((str(session_dir), str(self.working_dir), str(self.prompt_file),
+                          "impl", "the retry path", kind, "writing the retry path", "0", slot))
+        environment = self.environment()
+        environment["STUB_SUMMARY"] = str(session_dir / f"impl_summary_{slot}.txt")
+        if to:
+            member = self.recorded_worker(session_dir, slot)
+            transcript = next((self.root / ".claude/projects").rglob(f"{member.current_session}.jsonl"))
+            environment.update({"STUB_TRANSCRIPT": str(transcript),
+                                "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
+                                "STUB_SEND_BEHAVIOR": "queued" if fail else "complete"})
         if resolves_round:
             environment["UNIT_RESOLVES_ROUND"] = "1"
-        return subprocess.run(
-            arguments, check=False, capture_output=True, text=True,
-            env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-        )
-
-    def set_mesh_context(self, session_dir: Path, name: str, tokens: int) -> None:
-        roster_path = session_dir / "mesh_roster.json"
-        roster = cast("dict[str, dict[str, object]]", json.loads(
-            roster_path.read_text(encoding="utf-8")
-        ))
-        roster[name]["context_tokens"] = tokens
-        _ = roster_path.write_text(json.dumps(roster), encoding="utf-8")
+        return subprocess.run(arguments, check=False, capture_output=True, text=True,
+                              env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def open_repair_round(self, session_dir: Path) -> None:
         findings = self.root / "scripts" / "direct" / "findings.py"

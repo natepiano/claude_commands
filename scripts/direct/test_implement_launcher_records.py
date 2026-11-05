@@ -1,4 +1,4 @@
-"""test implement launcher records integration coverage."""
+"""Test Claude pass records and repair outcomes."""
 
 from __future__ import annotations
 
@@ -59,15 +59,12 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
 
     def test_failed_follow_up_abandons_round_and_posts_blocked(self) -> None:
         session_dir = self.start_phase("abandoned")
-        first = self.mesh_launch(session_dir)
+        first = self.worker_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
-        roster = cast("dict[str, object]", json.loads(
-            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
-        ))
-        name = next(iter(roster))
+        name = self.recorded_worker(session_dir).name
         self.open_repair_round(session_dir)
 
-        result = self.mesh_launch(
+        result = self.worker_launch(
             session_dir, to=name, kind="fix", fail=True, resolves_round=True
         )
 
@@ -84,16 +81,14 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
 
     def test_failed_landed_record_leaves_error_status(self) -> None:
         session_dir = self.start_phase("status-landed-fails")
-        first = self.mesh_launch(session_dir)
+        first = self.worker_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
-        roster = cast("dict[str, object]", json.loads(
-            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
-        ))
+        name = self.recorded_worker(session_dir).name
         self.open_repair_round(session_dir)
         self.observe_status_at_records(fail_landed=True)
 
-        result = self.mesh_launch(
-            session_dir, to=next(iter(roster)), kind="fix", resolves_round=True
+        result = self.worker_launch(
+            session_dir, to=name, kind="fix", resolves_round=True
         )
 
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -106,20 +101,17 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
 
     def test_failed_pass_write_posts_blocked_and_does_not_send(self) -> None:
         session_dir = self.start_phase("ledger-error")
-        first = self.mesh_launch(session_dir)
+        first = self.worker_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
-        roster = cast("dict[str, object]", json.loads(
-            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
-        ))
-        name = next(iter(roster))
+        name = self.recorded_worker(session_dir).name
         _ = (session_dir / "progress_history_state.json").write_text(
             "{}\n", encoding="utf-8"
         )
 
-        result = self.mesh_launch(session_dir, to=name)
+        result = self.worker_launch(session_dir, to=name)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((session_dir / "follow_message.txt").exists())
+        self.assertFalse((self.root / "delivered_message.txt").exists())
         self.assertEqual(
             (session_dir / "impl_status_impl").read_text(encoding="utf-8"),
             "error\n",
@@ -129,15 +121,12 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
 
     def test_follow_up_records_pass_and_lands_its_repair_round(self) -> None:
         session_dir = self.start_phase("landed")
-        first = self.mesh_launch(session_dir)
+        first = self.worker_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
-        roster = cast("dict[str, object]", json.loads(
-            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
-        ))
-        name = next(iter(roster))
+        name = self.recorded_worker(session_dir).name
         self.open_repair_round(session_dir)
 
-        result = self.mesh_launch(
+        result = self.worker_launch(
             session_dir, to=name, kind="fix", resolves_round=True
         )
 
@@ -147,8 +136,8 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "completed")
         self.assertEqual(self.open_passes(session_dir)["impl"]["worker_name"], name)
         # A renamed unit's seat works in the worktree the launcher names, not the one its thread began in.
-        self.assertEqual((session_dir / "follow_cwd.txt").read_text(encoding="utf-8"), str(self.working_dir))
-        message = (session_dir / "follow_message.txt").read_text(encoding="utf-8")
+        self.assertEqual((self.root / "follow_cwd.txt").read_text(encoding="utf-8"), str(self.working_dir))
+        message = (self.root / "delivered_message.txt").read_text(encoding="utf-8")
         self.assertIn("Write the retry path.", message)
         self.assertIn("impl_summary_impl.txt", message)
         self.assertIn("post", message)
@@ -168,16 +157,14 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
 
     def test_success_status_follows_pass_and_landed_records(self) -> None:
         session_dir = self.start_phase("status-after-landed")
-        first = self.mesh_launch(session_dir)
+        first = self.worker_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
-        roster = cast("dict[str, object]", json.loads(
-            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
-        ))
+        name = self.recorded_worker(session_dir).name
         self.open_repair_round(session_dir)
         self.observe_status_at_records()
 
-        result = self.mesh_launch(
-            session_dir, to=next(iter(roster)), kind="fix", resolves_round=True
+        result = self.worker_launch(
+            session_dir, to=name, kind="fix", resolves_round=True
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -190,16 +177,14 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
 
     def test_worker_error_status_follows_pass_and_abandon_records(self) -> None:
         session_dir = self.start_phase("status-after-abandon")
-        first = self.mesh_launch(session_dir)
+        first = self.worker_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
-        roster = cast("dict[str, object]", json.loads(
-            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
-        ))
+        name = self.recorded_worker(session_dir).name
         self.open_repair_round(session_dir)
         self.observe_status_at_records()
 
-        result = self.mesh_launch(
-            session_dir, to=next(iter(roster)), kind="fix", fail=True,
+        result = self.worker_launch(
+            session_dir, to=name, kind="fix", fail=True,
             resolves_round=True,
         )
 

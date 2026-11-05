@@ -174,13 +174,13 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertNotIn("docs/plans/alpha.md", tree)
         self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha-unit phase \S+ as-built \(")
 
-    def test_empty_responsibilities_refuse_before_merge_and_name_the_fill(self) -> None:
+    def test_empty_responsibilities_refuse_before_merge_and_name_the_repair(self) -> None:
         self.production_doc(owns=())
         result = self.run_checkpoint(self.checkpoint())
         self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
         self.assert_stopped_before_merge(
             result, "failed", "unit alpha-unit: .unit.toml has no responsibilities; "
-            + "run python3 -m scripts.production.owns_fill, then rerun the checkpoint")
+            + "edit the unit's .unit.toml responsibilities, then rerun the checkpoint")
         self.assertNotIn("outside responsibilities", result.process.stdout)
 
     def test_board_free_allows_an_unowned_path(self) -> None:
