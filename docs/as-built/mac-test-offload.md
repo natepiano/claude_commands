@@ -306,3 +306,22 @@ Both values use the existing configuration reader.
 - Build output is kept above the disk floor because a cold rebuild costs far more than natedev's run; deleting after every run and a size-capped trim were ruled out.
 - No revision counter on `block.json`: every writer holds a lock. The footer reads `block.json` directly, never `status`, which takes a lock and can call `gh`.
 - The Mac copy exists because the user decided on 2026-10-16, "yes - build it this way - and make sure that you can track on report on the times we were able to get a test done faster with the copy". A natedev test that waited for a busy Mac often still compiles when the Mac frees; a copy then turns the idle Mac into an earlier result, and giving way to any new test keeps Mac-first routing unchanged for the next call.
+
+## Registered remote mirrors
+
+`copies.py` owns mirror creation and refresh for Mac, Linux, and AWS targets.
+`OffloadRequest` carries the copy owner, repository scope, and holder session.
+The receiver excludes copy metadata during rsync deletion.
+The remote command inherits the mirror lease.
+The floor sweep acquires mirror leases before claim locks and skips busy mirrors.
+Owner cleanup names a busy holder and preserves its mirror metadata.
+`mac_run.sh` registers its task-owned remote clone with the same owner cleanup API.
+
+## Documentation copies
+
+`verify.sh doc` uses `copies.standing` with `StagedSource`.
+The copy owner holds the lease until the verify shell closes its input descriptor.
+Both routes use the staged copy and keep the existing target directory.
+The source index remains unchanged.
+A pass record still requires the original staged tree identity after the step.
+The token boundary, local repair rule, and step records remain in verify.sh.

@@ -905,11 +905,19 @@ class OffloadCommandTests(OffloadCommandFixture):
             for argument in copy["args"]
             if argument.startswith("--exclude-from=")
         )
+        session = (self.environment.get("CLAUDE_CODE_SESSION_ID")
+                   or self.environment.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}")
+        receiver_argument = (
+            "--rsync-path=~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-receive "
+            + shlex.join(["--path", ".local/state/mac-test/mirror/hana", "--owner", "verify",
+                          "--repository", "hana", "--session", session, "--", "rsync"])
+        )
         self.assertEqual(
             copy["args"],
             [
                 "-rlpc",
                 "--delete",
+                receiver_argument,
                 exclude_argument,
                 "-e",
                 "ssh -o BatchMode=yes -o ConnectTimeout=6 "
@@ -918,7 +926,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 "mac:.local/state/mac-test/mirror/hana/",
             ],
         )
-        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/.mac-test-mirror\n/generated/\n")
+        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/.mac-test-mirror\n/.copy-record.json\n/.copy-session\n/generated/\n")
 
         run = events[2]["args"]
         self.assertEqual(run[: len(ssh_arguments)], ssh_arguments)

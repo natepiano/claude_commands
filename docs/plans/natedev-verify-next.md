@@ -28,30 +28,3 @@
 3. Test one completed hold end to end: its start and its end are both recorded.
 
 **Order:** after Phases 24 and 27. Track this producer repair separately from the completed Phase 20 work. `mac_test.py` (near lines 1525 and 2491) already requests END events; find why they do not reach the recorded history, and add no second emission path.
-
-## Copy guard: refuse tree-making git calls through every import form
-
-**Source:** phase 18 review 6, finding F037 (blocker), routed under the round-3 landing rule. Astra review: `/tmp/claude/astra/20261103T220532Z-2445924/review.md` item 7.
-
-**Today:** `scripts/copies/copy_guard.py` finds `bulk_run.git(...)` and `copies.git(...)` calls only for some import forms. These forms give no finding:
-1. `import scripts.style.bulk_run`, then `scripts.style.bulk_run.git(repo, "clone", "a", "b")`.
-2. `from scripts.style import bulk_run as run`, then `run.git(...)`.
-3. An import inside a function.
-
-**Needed:** the guard refuses a tree-making git call through each form above, through alias reimports, and through `global` and `nonlocal` bindings. The local-shadowing rule from phase 18 stays.
-
-**Acceptance:** one regression test per binding form, each fails on the old guard; valid shadowed-name cases stay clean; the copies and guard suites pass.
-
-**Due:** Phase 35 item 3. Remove this item after its binding-form and valid-shadowing tests pass.
-
-## Name copies.py source and merge policies with semantic types
-
-**Source:** phase 20, 23 and 24 architect review, finding 11, routed out of phase 18 under the round-3 landing rule.
-
-**Today:** `copies.standing` (`scripts/copies/copies.py`) takes `apply_uncommitted=None` and `merge=None`. These values are a source policy and an integration policy, not missing input. Phase 35 adds a third source, the staged tree.
-
-**Needed:** Phase 35 item 7 introduces `CommittedSource`, `WorktreeSource`, `StagedSource`, `NoMerge` and `MergeRevision`. Convert the CLI flags at the boundary, and change callers and tests before queue-unit takes ownership.
-
-**Due:** Phase 35 item 7. Remove this item when that item lands.
-
-**Acceptance:** copies, copy guard and style suites pass; basedpyright 0/0/0; no bare `None` policy argument remains in the copies API.

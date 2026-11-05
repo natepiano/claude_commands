@@ -31,7 +31,7 @@
 # director's last command before a Rust checkpoint. Workers may run it too.
 # Unlike lint stages, this phase check cannot be switched off in lint.conf.
 # A pass is stored in ~/.local/state/verify/doc_pass/<tree>.json, keyed by a
-# staged index in a stable, locked checkout under the repo's target directory.
+# staged index in a stable checkout that copies.py owns.
 # Unstaged and untracked files are excluded. The real index is unchanged. A staged tree
 # changed during the run records nothing.
 # Records outlive worker sessions and are pruned after 14 days on each write.
@@ -1421,69 +1421,24 @@ finish_tree_watch() {
     TREE_WATCH_DIR=""
 }
 
-# Git's staged tree identity. A private copy avoids updating the real index's
-# cache-tree extension when write-tree runs.
+# Read the staged tree through the copy owner's private index.
 doc_tree() {
     VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
-import os
 from pathlib import Path
-import subprocess
 import sys
-import shutil
-
 sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
-from scripts.lib import build_folders
-
-with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-        build_folders.FOLDER_PREFIXES["verify-doc"], build_folders.SystemTemporaryParent())) as temporary:
-    top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
-    original = Path(subprocess.check_output(["git", "rev-parse", "--git-path", "index"], text=True).strip())
-    private_index = temporary / "index"
-    if original.exists():
-        shutil.copyfile(original, private_index)
-    environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
-    print(subprocess.check_output(["git", "-C", top, "write-tree"], env=environment, text=True).strip())
+from scripts.copies import copies
+print(copies.staged_tree(Path.cwd()))
 PYDOC
 }
 
-# The caller holds DOC_CHECKOUT/lock until rustdoc and its record are complete.
-# The private index and persistent path preserve unchanged source mtimes.
+# The copy owner holds the lease until this shell closes descriptor 8.
 doc_checkout() {
-    VERIFY_PY_HELPER=DOC_CHECKOUT_PY "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$DOC_CHECKOUT" <<'PYDOC'
-import os
-from pathlib import Path
-import shutil
-import subprocess
-import sys
-
-top, judged, checkout = sys.argv[1], sys.argv[2], Path(sys.argv[3])
-tree, index, previous = checkout / "tree", checkout / "index", checkout / "tree-id"
-git_dir = subprocess.check_output(["git", "-C", top, "rev-parse", "--absolute-git-dir"], text=True).strip()
-environment = {**os.environ, "GIT_DIR": git_dir, "GIT_WORK_TREE": str(tree), "GIT_INDEX_FILE": str(index)}
-
-def git(*arguments):
-    subprocess.run(["git", "-C", str(tree), *arguments], env=environment, check=True)
-
-try:
-    old = previous.read_text().strip()
-    if not index.is_file() or not tree.is_dir() or not old:
-        raise ValueError("checkout metadata missing")
-    # A timestamp-only change is clean after rehashing; a content change
-    # instead triggers the one full recovery below.
-    git("update-index", "--refresh")
-    git("clean", "-ffdqx")
-    git("read-tree", "-m", "-u", old, judged)
-except (OSError, ValueError, subprocess.CalledProcessError):
-    # A failed update or missing private index gets exactly one full recovery.
-    if tree.exists():
-        shutil.rmtree(tree)
-    index.unlink(missing_ok=True)
-    index.with_name(index.name + ".lock").unlink(missing_ok=True)
-    tree.mkdir()
-    git("read-tree", judged)
-    git("checkout-index", "--all", "--index")
-previous.write_text(judged + "\n")
-PYDOC
+    local copy_script
+    copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
+    coproc DOC_COPY { "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP" --staged-tree "$DOC_TREE"; }
+    exec 8>&"${DOC_COPY[1]}"
+    IFS= read -r DOC_CHECKOUT <&"${DOC_COPY[0]}" || return 1
 }
 
 doc_record() {
@@ -3770,20 +3725,15 @@ case "$CMD" in
         fi
         CARGO_TARGET_DIR="$(VERIFY_PY_HELPER=DOC_TARGET_PATH_PY "$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
         export CARGO_TARGET_DIR
-        DOC_CHECKOUT="$CARGO_TARGET_DIR/verify-doc/$(VERIFY_PY_HELPER=DOC_CHECKOUT_HASH_PY "$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:24])' "$DOC_REPO_TOP")"
-        mkdir -p "$DOC_CHECKOUT"
-        # fd 8 holds the doc checkout lock; fd 9 belongs to nextest sharing.
-        exec 8>"$DOC_CHECKOUT/lock"
-        flock 8
         DOC_TREE="$(doc_tree)"
         doc_checkout
         if ! lint_config_enabled doc; then
             echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
         DOC_CALLER_DIR=$PWD
-        cd "$DOC_CHECKOUT/tree"
+        cd "$DOC_CHECKOUT"
         # Keep the signal handlers and the active step PID in the caller shell.
-        MAC_SOURCE_ROOT="$DOC_CHECKOUT/tree"
+        MAC_SOURCE_ROOT="$DOC_CHECKOUT"
         LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
         cd "$DOC_CALLER_DIR"
         doc_record
