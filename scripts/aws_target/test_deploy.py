@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -84,19 +85,40 @@ elif service == 'cloudformation' and operation == 'describe-stack-resource':
     logical = args[args.index('--logical-resource-id') + 1]
     reply({'StackResourceDetail': {'PhysicalResourceId': state['outputs']['InstanceId'] if logical == 'Instance' else 'build-scaler'}})
 elif service == 'cloudformation' and operation == 'wait':
+    if (root / ('fail-wait-' + args[service_index + 2])).exists():
+        print('fixture wait failed', file=sys.stderr); sys.exit(1)
     reply({})
+elif service == 'cloudformation' and operation == 'describe-stack-events':
+    reply({'StackEvents': []})
+elif service == 'cloudformation' and operation == 'delete-change-set':
+    name = args[args.index('--change-set-name') + 1]
+    (root / ('update-change-set.json' if name.startswith('update-') else 'change-set.json')).unlink(missing_ok=True); reply({})
 elif service == 'cloudformation' and operation == 'describe-change-set':
-    change = root / 'change-set.json'
+    change = root / ('update-change-set.json' if args[args.index('--change-set-name') + 1].startswith('update-') else 'change-set.json')
     if not change.exists():
         print('ChangeSetNotFound: does not exist', file=sys.stderr); sys.exit(1)
     reply(json.loads(change.read_text()))
 elif service == 'cloudformation' and operation == 'create-change-set':
     name = args[args.index('--stack-name') + 1]
     stack_id = 'arn:aws:cloudformation:us-east-1:123456789012:stack/' + name + '/fixture-id'
+    updating = args[args.index('--change-set-type') + 1] == 'UPDATE'
+    if updating:
+        stack_id = state['stack_id']
     (root / 'reserved-stack').write_text(stack_id)
-    change = root / 'change-set.json'
-    assert not change.exists(), 'duplicate change-set name'
-    change.write_text(json.dumps({'StackId': stack_id, 'Parameters': json.loads(args[args.index('--parameters') + 1])}))
+    change = root / ('update-change-set.json' if updating else 'change-set.json')
+    assert not change.exists() or updating, 'duplicate change-set name'
+    if updating:
+        names = root / 'update-names.json'
+        used = json.loads(names.read_text()) if names.exists() else []
+        change_name = args[args.index('--change-set-name') + 1]
+        assert change_name not in used, 'duplicate update name'
+        names.write_text(json.dumps([*used, change_name]))
+    change.write_text(json.dumps({'StackId': stack_id, 'Status': 'CREATE_COMPLETE', 'Changes': [],
+                                 'Parameters': json.loads(args[args.index('--parameters') + 1])}))
+    if updating and (root / 'update-plan.json').exists():
+        value = json.loads(change.read_text())
+        value.update(json.loads((root / 'update-plan.json').read_text()))
+        change.write_text(json.dumps(value))
     if (root / 'lose-create-reply').exists():
         print('lost CREATE response', file=sys.stderr); sys.exit(1)
     reply({'StackId': stack_id})
@@ -132,26 +154,35 @@ elif service == 'cloudformation' and operation == 'update-stack':
     state_path.write_text(json.dumps(state)); reply({})
 elif service == 'cloudformation' and operation == 'delete-stack':
     state_path.unlink(); (root / 'deleted-stack').touch(); reply({})
-elif service == 'cloudformation' and operation == 'deploy':
-    if 'EnableCompute=true' in args and (root / 'fail-compute').exists():
+elif service == 'cloudformation' and operation in ('deploy', 'execute-change-set'):
+    if operation == 'execute-change-set':
+        change = json.loads((root / 'update-change-set.json').read_text())
+        params = {row['ParameterKey']: state.get('parameters', {}).get(row['ParameterKey'], 'previous-bootstrap')
+                  if row.get('UsePreviousValue') else row['ParameterValue'] for row in change['Parameters']}
+    else:
+        start = args.index('--parameter-overrides') + 1
+        params = dict(word.split('=', 1) for word in args[start:] if '=' in word)
+    if params['EnableCompute'] == 'true' and (root / 'fail-compute').exists():
         print('Compute deploy failed', file=sys.stderr)
         sys.exit(1)
-    start = args.index('--parameter-overrides') + 1
-    params = dict(word.split('=', 1) for word in args[start:] if '=' in word)
-    outputs = {'ComputeEnabled': params['EnableCompute'], 'BudgetName': params['BudgetName'] or args[args.index('--stack-name') + 1] + '-monthly-' + params['DeploymentId'],
+    owner = json.loads((root / 'state/deployment.json').read_text())
+    outputs = {'ComputeEnabled': params['EnableCompute'], 'BudgetName': params['BudgetName'] or owner['stack'] + '-monthly-' + params['DeploymentId'],
                'ExistingDataInput': params['ExistingDataVolumeId']}
     if params['EnableCompute'] == 'true':
         outputs.update(InstanceId='i-fixture', DataVolumeId=params['ExistingDataVolumeId'] or 'vol-created')
     owner = json.loads((root / 'state/deployment.json').read_text())
-    assert owner['account_id'] == '123456789012'
+    assert owner['account_id'] == ('210987654321' if owner['stack'] == 'aws-build' else '123456789012')
     assert owner['stack_id'] == (root / 'reserved-stack').read_text()
     assert owner['deployment_id'] == params['DeploymentId']
-    state = {'outputs': outputs, 'stack_name': args[args.index('--stack-name') + 1], 'stack_id': owner['stack_id']}
+    if params['EnableCompute'] == 'true' and state.get('outputs', {}).get('InstanceId'):
+        outputs.update({key: state['outputs'][key] for key in ('InstanceId', 'DataVolumeId')})
+    state = {'outputs': outputs, 'stack_name': owner['stack'], 'stack_id': owner['stack_id'], 'parameters': params}
     (root / 'deleted-stack').unlink(missing_ok=True)
     (root / 'deleted-volume').unlink(missing_ok=True)
     (root / 'deleted-budget').unlink(missing_ok=True)
     state_path.write_text(json.dumps(state))
     (root / 'change-set.json').unlink(missing_ok=True)
+    (root / 'update-change-set.json').unlink(missing_ok=True)
     if params['EnableCompute'] == 'true' and not params['ExistingDataVolumeId']:
         (root / 'volume-owner').write_text(params['DeploymentId'])
     if params['EnableCompute'] == 'false' and (root / 'slow-foundation').exists():
@@ -337,6 +368,22 @@ class DeploymentTests(CostFixture):
     def commands(self, operation: str = '') -> list[dict[str, object]]:
         path = self.root / 'commands.jsonl'
         rows = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+        if operation == 'deploy':
+            # Compare parameters for both foundation deploys and inspected update executions.
+            updates: dict[str, list[str]] = {}
+            result: list[dict[str, object]] = []
+            for row in rows:
+                args = cast(list[str], row['args'])
+                if 'create-change-set' in args and 'UPDATE' in args:
+                    values = ledger.rows({'values': cast(object, json.loads(args[args.index('--parameters') + 1]))}, 'values')
+                    updates[args[args.index('--change-set-name') + 1]] = [
+                        f"{ledger.text(value, 'ParameterKey')}={value['ParameterValue']}"
+                        for value in values if 'ParameterValue' in value]
+                if 'deploy' in args:
+                    result.append(row)
+                elif 'execute-change-set' in args:
+                    result.append({**row, 'args': [*args, *updates[args[args.index('--change-set-name') + 1]]]})
+            return result
         return [row for row in rows if not operation or operation in cast(list[str], row['args'])]
 
     def prepare_stopped_instance(self) -> int:
@@ -361,7 +408,7 @@ class DeploymentTests(CostFixture):
                                      or (failure == 'instance' and operation == 'describe-instances')):
                 return subprocess.CompletedProcess(arguments, 1, '', 'the requested observation is unavailable')
             result = aws_target.execute_command(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
-            if operation == 'deploy' and 'EnableCompute=true' in arguments:
+            if operation == 'execute-change-set':
                 compute_returned = True
                 if failure == 'timeout':
                     raise subprocess.TimeoutExpired(arguments, timeout)
@@ -411,6 +458,424 @@ class DeploymentTests(CostFixture):
                          [(self.now, self.now + 3600, Decimal('0.1'), 3600),
                           (start, self.now, Decimal('2'), 0)])
 
+    def update_fixture(self) -> deploy.Deployment:
+        subject = self.deployment()
+        _ = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        self.set_clock(self.now + 1)
+        _ = subject.prepare()
+        return subject
+
+    def test_live_update_without_fingerprint_preserves_first_boot_and_saves_fingerprint(self) -> None:
+        subject = self.update_fixture()
+        path = self.state / 'deployment.json'
+        saved = remote.read_record(path)
+        _ = saved.pop('fingerprint')
+        _ = path.write_text(json.dumps(saved))
+        template = Path(conf.read(self.settings).text('bootstrap_template_path'))
+        _ = template.write_text(template.read_text() + '# changed first boot input\n')
+        success, output = self.up_output(subject)
+        self.assertTrue(success, output)
+        self.assertIn('stacks: done', output)
+        args = cast(list[str], self.commands('create-change-set')[-1]['args'])
+        values = ledger.rows({'values': cast(object, json.loads(args[args.index('--parameters') + 1]))}, 'values')
+        self.assertEqual(next(row for row in values if row['ParameterKey'] == 'Bootstrap'),
+                         {'ParameterKey': 'Bootstrap', 'UsePreviousValue': True})
+        self.assertIn('fingerprint', remote.read_record(path))
+        self.assertEqual(aws_config.deployment_outputs(self.state)['InstanceId'], 'i-fixture')
+
+    def test_update_refuses_replacement_for_each_protected_resource_type(self) -> None:
+        subject = self.update_fixture()
+        for logical, kind in (
+                ('Instance', 'AWS::EC2::Instance'), ('DataVolume', 'AWS::EC2::Volume'),
+                ('DataAttachment', 'AWS::EC2::VolumeAttachment'), ('Interface', 'AWS::EC2::NetworkInterface'),
+                ('InterfaceAttachment', 'AWS::EC2::NetworkInterfaceAttachment'), ('Address', 'AWS::EC2::EIP'),
+                ('Association', 'AWS::EC2::EIPAssociation'), ('Budget', 'AWS::Budgets::Budget')):
+            for replacement in ('True', 'Conditional'):
+                with self.subTest(kind=kind, replacement=replacement):
+                    _ = (self.root / 'update-plan.json').write_text(json.dumps({'Changes': [{'ResourceChange': {
+                        'LogicalResourceId': logical, 'ResourceType': kind, 'Replacement': replacement}}]}))
+                    before = len(self.commands('execute-change-set'))
+                    with self.assertRaisesRegex(deploy.DeploymentRefused, logical) as failure:
+                        _ = subject.apply(approve_resources=True)
+                    self.assertIn(kind, str(failure.exception))
+                    self.assertIn('deploy.py down --approve-destroy, then deploy.py up --approve-resources', str(failure.exception))
+                    self.assertEqual(len(self.commands('execute-change-set')), before)
+                    self.assertFalse((self.root / 'update-change-set.json').exists())
+
+    def test_update_refuses_removal_for_each_protected_type(self) -> None:
+        subject = self.update_fixture()
+        for kind in ('AWS::EC2::Instance', 'AWS::EC2::Volume', 'AWS::EC2::VolumeAttachment',
+                     'AWS::EC2::NetworkInterface', 'AWS::EC2::NetworkInterfaceAttachment',
+                     'AWS::EC2::EIP', 'AWS::EC2::EIPAssociation', 'AWS::Budgets::Budget'):
+            with self.subTest(kind=kind):
+                _ = (self.root / 'update-plan.json').write_text(json.dumps({'Changes': [{'ResourceChange': {
+                    'LogicalResourceId': 'OldResource', 'ResourceType': kind, 'Action': 'Remove'}},
+                    {'ResourceChange': {'LogicalResourceId': 'NewResource', 'ResourceType': kind, 'Action': 'Add'}}]}))
+                before = len(self.commands('execute-change-set'))
+                with self.assertRaisesRegex(deploy.DeploymentRefused, 'OldResource') as failure:
+                    _ = subject.apply(approve_resources=True)
+                self.assertIn(kind, str(failure.exception))
+                self.assertIn('deploy.py down --approve-destroy, then deploy.py up --approve-resources', str(failure.exception))
+                self.assertEqual(len(self.commands('execute-change-set')), before)
+                self.assertFalse((self.root / 'update-change-set.json').exists())
+
+    def test_unexecuted_update_cleanup_preserves_each_refusal_and_reports_delete_failure(self) -> None:
+        subject = self.update_fixture()
+        for cause in ('spending check refused', 'preparation check refused', 'create wait failed', 'protected removal'):
+            for delete_fails in (False, True):
+                with self.subTest(cause=cause, delete_fails=delete_fails):
+                    if cause == 'protected removal':
+                        _ = (self.root / 'update-plan.json').write_text(json.dumps({'Changes': [{'ResourceChange': {
+                            'LogicalResourceId': 'Protected', 'ResourceType': 'AWS::EC2::Instance', 'Action': 'Remove'}}]}))
+                    if cause == 'create wait failed':
+                        (self.root / 'fail-wait-change-set-create-complete').touch()
+                    if delete_fails:
+                        (self.root / 'fail-down-delete-change-set').touch()
+                    settings = aws_config.read_deployment_settings(self.settings, self.state)
+                    prepared = subject.prepare()
+                    before = len(self.commands('execute-change-set'))
+                    with mock.patch.object(subject, '_before_request', side_effect=deploy.DeploymentRefused(cause)):
+                        with self.assertRaises((deploy.DeploymentRefused, aws_target.AwsUnavailable)) as failure:
+                            subject._update_stack(settings, prepared.parameters, compute=True)  # pyright: ignore[reportPrivateUsage]
+                    expected = {'create wait failed': 'fixture wait failed', 'protected removal': 'Protected'}.get(cause, cause)
+                    self.assertIn(expected, str(failure.exception))
+                    args = cast(list[str], self.commands('create-change-set')[-1]['args'])
+                    name = args[args.index('--change-set-name') + 1]
+                    self.assertEqual('unexecuted change set remains: ' + name in str(failure.exception), delete_fails)
+                    self.assertEqual((self.root / 'update-change-set.json').exists(), delete_fails)
+                    self.assertEqual(len(self.commands('execute-change-set')), before)
+                    for filename in ('update-change-set.json', 'update-plan.json', 'fail-down-delete-change-set',
+                                     'fail-wait-change-set-create-complete'):
+                        (self.root / filename).unlink(missing_ok=True)
+
+    def test_lost_update_creation_response_discards_the_recovered_change_set(self) -> None:
+        subject = self.update_fixture()
+        execute = subject.execute
+        before = len(self.commands('execute-change-set'))
+        def lose_response(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                          check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+            if 'create-change-set' in arguments:
+                return subprocess.CompletedProcess(arguments, 1, '', 'update creation response lost')
+            return result
+        subject.execute = lose_response
+        with self.assertRaisesRegex(aws_target.AwsUnavailable, 'update creation response lost'):
+            _ = subject.apply(approve_resources=True)
+        self.assertTrue(self.commands('describe-change-set'))
+        self.assertTrue(self.commands('delete-change-set'))
+        self.assertFalse((self.root / 'update-change-set.json').exists())
+        self.assertEqual(len(self.commands('execute-change-set')), before)
+
+    def test_cleanup_value_and_os_errors_preserve_the_original_refusal(self) -> None:
+        subject = self.update_fixture()
+        settings = aws_config.read_deployment_settings(self.settings, self.state)
+        prepared = subject.prepare()
+        api = subject._api(settings)  # pyright: ignore[reportPrivateUsage]
+        call = api.call
+        for error in (ValueError('cleanup value error'), OSError('cleanup OS error')):
+            with self.subTest(error=type(error).__name__):
+                def fail_delete(operation: str, *arguments: str, service: str = 'ec2') -> dict[str, object]:
+                    if operation == 'delete-change-set':
+                        raise error
+                    return call(operation, *arguments, service=service)
+                with (mock.patch.object(subject, '_api', return_value=api),
+                      mock.patch.object(api, 'call', side_effect=fail_delete),
+                      mock.patch.object(subject, '_before_request', side_effect=deploy.DeploymentRefused('original spending refusal'))):
+                    with self.assertRaisesRegex(deploy.DeploymentRefused, 'original spending refusal') as failure:
+                        subject._update_stack(settings, prepared.parameters, compute=True)  # pyright: ignore[reportPrivateUsage]
+                args = cast(list[str], self.commands('create-change-set')[-1]['args'])
+                name = args[args.index('--change-set-name') + 1]
+                self.assertIn('unexecuted change set remains: ' + name, str(failure.exception))
+                self.assertNotIn(str(error), str(failure.exception))
+                self.assertTrue((self.root / 'update-change-set.json').exists())
+                (self.root / 'update-change-set.json').unlink()
+
+    def test_reconciliation_os_error_preserves_update_failure_diagnostics(self) -> None:
+        subject = self.update_fixture()
+        execute = subject.execute
+        _ = (self.root / 'describe-stack-events.json').write_text(json.dumps({'StackEvents': [{
+            'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat(), 'LogicalResourceId': 'DataAttachment',
+            'ResourceType': 'AWS::EC2::VolumeAttachment', 'ResourceStatus': 'UPDATE_FAILED',
+            'ResourceStatusReason': 'fixture attachment failure'}]}))
+        def fail_update(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                        check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if 'execute-change-set' in arguments:
+                return subprocess.CompletedProcess(arguments, 1, '', 'original update failure')
+            return execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+        subject.execute = fail_update
+        with mock.patch.object(subject, '_reconcile_compute_request', side_effect=OSError('fixture disk full')) as reconcile:
+            with self.assertRaisesRegex(aws_target.AwsUnavailable, 'original update failure') as failure:
+                _ = subject.apply(approve_resources=True)
+        reconcile.assert_called_once()
+        reason = str(failure.exception)
+        self.assertIn('DataAttachment (AWS::EC2::VolumeAttachment): UPDATE_FAILED: fixture attachment failure', reason)
+        self.assertIn('stack status: UPDATE_COMPLETE', reason)
+        self.assertIn('compute request reconciliation is unavailable', reason)
+        self.assertNotIn('fixture disk full', reason)
+        self.assertTrue(ledger.CostLedger(self.state).pending_compute_requests())
+
+    def test_foundation_preparation_refusal_discards_the_reservation(self) -> None:
+        subject = self.deployment()
+        _ = subject.prepare()
+        confirm = subject._confirm_preparation  # pyright: ignore[reportPrivateUsage]
+        def refuse(settings: aws_config.DeploymentSettings, parameters: dict[str, str], *, renew: bool = False) -> None:
+            if renew:
+                raise deploy.DeploymentRefused('foundation preparation changed')
+            confirm(settings, parameters, renew=renew)
+        with mock.patch.object(subject, '_confirm_preparation', side_effect=refuse):
+            with self.assertRaisesRegex(deploy.DeploymentRefused, 'foundation preparation changed'):
+                _ = subject.apply(approve_resources=True)
+        self.assertFalse((self.root / 'change-set.json').exists())
+        self.assertFalse(self.commands('deploy'))
+
+    def test_failure_redacts_the_prepared_address_after_the_private_file_changes(self) -> None:
+        subject = self.update_fixture()
+        notification = self.notification_file.read_text().strip()
+        execute = subject.execute
+        for remove in (False, True):
+            with self.subTest(remove=remove):
+                def fail(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                         check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    if 'execute-change-set' in arguments:
+                        if remove:
+                            self.notification_file.unlink()
+                        else:
+                            _ = self.notification_file.write_text('changed@example.invalid\n')
+                        return subprocess.CompletedProcess(arguments, 1, '', 'update refused ' + notification)
+                    return execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+                subject.execute = fail
+                try:
+                    with self.assertRaisesRegex(aws_target.AwsUnavailable, 'update refused <notification address>') as failure:
+                        _ = subject.apply(approve_resources=True)
+                    self.assertNotIn(notification, str(failure.exception))
+                    self.assertIn('stack status: UPDATE_COMPLETE', str(failure.exception))
+                finally:
+                    _ = self.notification_file.write_text(notification + '\n')
+                    subject.execute = execute
+
+    def test_create_reservation_failures_report_events_reason_status_and_redact(self) -> None:
+        subject = self.deployment()
+        prepared = subject.prepare()
+        notification = prepared.parameters['NotificationEmail']
+        execute = subject.execute
+        for operation in ('create-change-set', 'wait'):
+            with self.subTest(operation=operation):
+                failed = False
+                def fail(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                         check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    nonlocal failed
+                    if failed and 'describe-stacks' in arguments:
+                        return subprocess.CompletedProcess(arguments, 0, json.dumps({'Stacks': [{'StackStatus': 'CREATE_FAILED'}]}), '')
+                    if operation == 'create-change-set' and operation in arguments:
+                        failed = True
+                        return subprocess.CompletedProcess(arguments, 1, '', 'reservation refused ' + notification)
+                    result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+                    if 'describe-change-set' in arguments and result.returncode == 0:
+                        reply = ledger.mapping(cast(object, json.loads(result.stdout)))
+                        reply['StatusReason'] = 'reservation reason ' + notification
+                        return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+                    if operation == 'wait' and 'wait' in arguments:
+                        failed = True
+                        return subprocess.CompletedProcess(arguments, 1, '', 'reservation refused ' + notification)
+                    return result
+                _ = (self.root / 'describe-stack-events.json').write_text(json.dumps({'StackEvents': [{
+                    'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat(), 'LogicalResourceId': 'Foundation',
+                    'ResourceType': 'AWS::CloudFormation::Stack', 'ResourceStatus': 'CREATE_FAILED',
+                    'ResourceStatusReason': 'event reason ' + notification}]}))
+                subject.execute = fail
+                try:
+                    with self.assertRaises(aws_target.AwsUnavailable) as failure:
+                        _ = subject.apply(approve_resources=True)
+                    reason = str(failure.exception)
+                    self.assertIn('reservation refused <notification address>', reason)
+                    self.assertIn('Foundation (AWS::CloudFormation::Stack): CREATE_FAILED: event reason <notification address>', reason)
+                    self.assertIn('stack status: CREATE_FAILED', reason)
+                    self.assertNotIn(notification, reason)
+                    if operation == 'wait':
+                        self.assertIn('reservation reason <notification address>', reason)
+                        self.assertFalse((self.root / 'change-set.json').exists())
+                    events = cast(list[str], self.commands('describe-stack-events')[-1]['args'])
+                    expected = 'fixture-build' if operation == 'create-change-set' else ledger.text(
+                        aws_config.deployment_record(self.state), 'stack_id')
+                    self.assertEqual(events[events.index('--stack-name') + 1], expected)
+                finally:
+                    subject.execute = execute
+
+    def test_terminal_update_failure_reconciles_compute_but_uncertain_failure_keeps_it_pending(self) -> None:
+        subject = self.update_fixture()
+        execute = subject.execute
+        for status, timeout in (('UPDATE_COMPLETE', False), ('UPDATE_ROLLBACK_COMPLETE', False),
+                                ('UPDATE_IN_PROGRESS', False), ('UPDATE_ROLLBACK_FAILED', False), ('UPDATE_COMPLETE', True)):
+            with self.subTest(status=status, timeout=timeout):
+                path = self.root / 'fake-stack.json'
+                row = remote.read_record(path)
+                row.update(status='UPDATE_COMPLETE', instance_state='stopped')
+                _ = path.write_text(json.dumps(row))
+                _ = subject.prepare()
+                def fail(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                         check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    if 'execute-change-set' in arguments:
+                        row['status'] = status
+                        _ = path.write_text(json.dumps(row))
+                        if uncertain_timeout:
+                            raise subprocess.TimeoutExpired(arguments, timeout)
+                        return subprocess.CompletedProcess(arguments, 1, '', 'execution failed')
+                    return execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+                uncertain_timeout = timeout
+                subject.execute = fail
+                try:
+                    with self.assertRaises(aws_target.AwsUnavailable):
+                        _ = subject.apply(approve_resources=True)
+                    requests = ledger.CostLedger(self.state).pending_compute_requests()
+                    self.assertEqual(bool(requests), timeout or not status.endswith('_COMPLETE'))
+                finally:
+                    subject.execute = execute
+                    row['status'] = 'UPDATE_COMPLETE'
+                    _ = path.write_text(json.dumps(row))
+                    _ = subject.prepare()
+
+    def test_empty_update_is_success_without_execution_or_compute_request(self) -> None:
+        subject = self.update_fixture()
+        _ = (self.root / 'update-plan.json').write_text(json.dumps({
+            'Status': 'FAILED', 'StatusReason': "The submitted information didn't contain changes."}))
+        (self.root / 'fail-wait-change-set-create-complete').touch()
+        before = len(self.commands('execute-change-set'))
+        outputs = subject.apply(approve_resources=True)
+        self.assertEqual(outputs['InstanceId'], 'i-fixture')
+        self.assertEqual(len(self.commands('execute-change-set')), before)
+        self.assertFalse(ledger.CostLedger(self.state).pending_compute_requests())
+        self.assertTrue(self.commands('delete-change-set'))
+
+    def test_update_failure_reports_current_events_and_rollback_without_the_address(self) -> None:
+        subject = self.update_fixture()
+        (self.root / 'fail-wait-stack-update-complete').touch()
+        notification = self.notification_file.read_text().strip()
+        _ = (self.root / 'describe-stack-events.json').write_text(json.dumps({'StackEvents': [
+            {'Timestamp': datetime.fromtimestamp(self.now - 1, UTC).isoformat(), 'ResourceStatus': 'UPDATE_FAILED',
+             'LogicalResourceId': 'OldFailure', 'ResourceType': 'AWS::EC2::Instance', 'ResourceStatusReason': 'old'},
+            *[{'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat(), 'ResourceStatus': 'UPDATE_FAILED',
+               'LogicalResourceId': name, 'ResourceType': kind, 'ResourceStatusReason': 'rejected ' + notification}
+              for name, kind in (('DataAttachment', 'AWS::EC2::VolumeAttachment'), ('Instance', 'AWS::EC2::Instance'))]]}))
+        execute = subject.execute
+        def failure(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+            if 'execute-change-set' in arguments:
+                path = self.root / 'fake-stack.json'
+                row = remote.read_record(path)
+                row['status'] = 'UPDATE_ROLLBACK_COMPLETE'
+                _ = path.write_text(json.dumps(row))
+            return result
+        subject.execute = failure
+        saved = remote.read_record(self.state / 'deployment.json')
+        _ = saved.pop('fingerprint')
+        _ = (self.state / 'deployment.json').write_text(json.dumps(saved))
+        success, output = self.up_output(subject)
+        self.assertFalse(success, output)
+        self.assertNotIn(notification, output)
+        self.assertNotIn('OldFailure', output)
+        for name, kind in (('DataAttachment', 'AWS::EC2::VolumeAttachment'), ('Instance', 'AWS::EC2::Instance')):
+            self.assertIn(f'{name} ({kind}): UPDATE_FAILED: rejected <notification address>', output)
+        self.assertIn('stack status: UPDATE_ROLLBACK_COMPLETE', output)
+        self.assertIn('the stack rolled back; the box and the volume did not change', output)
+        reason = ledger.text(ledger.mapping(remote.read_record(self.state / 'up.json')['stacks']), 'reason')
+        self.assertIn('<notification address>', reason)
+        self.assertNotIn(notification, reason)
+
+    def test_change_set_creation_and_execution_failures_report_the_cause(self) -> None:
+        subject = self.update_fixture()
+        notification = self.notification_file.read_text().strip()
+        for operation in ('create-change-set', 'execute-change-set'):
+            with self.subTest(operation=operation):
+                execute = subject.execute
+                def fail(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                         check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+                    if operation in arguments:
+                        return subprocess.CompletedProcess(arguments, 1, '', 'operation refused ' + notification)
+                    return result
+                _ = (self.root / 'update-plan.json').write_text(json.dumps({'StatusReason': 'change set refused ' + notification}))
+                subject.execute = fail
+                try:
+                    with self.assertRaises(aws_target.AwsUnavailable) as failure:
+                        _ = subject.apply(approve_resources=True)
+                    reason = str(failure.exception)
+                    self.assertIn('operation refused <notification address>', reason)
+                    self.assertIn('change set refused <notification address>', reason)
+                    self.assertIn('stack status: UPDATE_COMPLETE', reason)
+                    self.assertNotIn(notification, reason)
+                finally:
+                    subject.execute = execute
+                # Reconcile any execution request before the next case.
+                _ = subject.prepare()
+
+    def test_pending_request_reconciles_rollback_before_update_and_refuses_rollback_failed(self) -> None:
+        subject = self.update_fixture()
+        book = ledger.CostLedger(self.state)
+        request = ledger.ComputeRequest(self.now, 'fixture-build', 'us-east-1', Decimal('0.5'))
+        book.record_compute_request(request)
+        path = self.root / 'fake-stack.json'
+        row = remote.read_record(path)
+        row['status'] = 'UPDATE_ROLLBACK_COMPLETE'
+        _ = path.write_text(json.dumps(row))
+        _ = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        resolved = next(item for item in book.read_snapshot().compute_requests if item.request_id == request.request_id)
+        self.assertIsInstance(resolved.resolution, ledger.ComputeInstanceConfirmed)
+        self.assertFalse(book.pending_compute_requests())
+        row = remote.read_record(path)
+        row['status'] = 'UPDATE_ROLLBACK_FAILED'
+        _ = path.write_text(json.dumps(row))
+        book.record_compute_request(ledger.ComputeRequest(self.now, 'fixture-build', 'us-east-1', Decimal('0.5')))
+        before = len(self.commands('create-change-set'))
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'UPDATE_ROLLBACK_FAILED'):
+            _ = subject.prepare()
+        self.assertEqual(len(self.commands('create-change-set')), before)
+
+    def test_new_stack_gets_current_bootstrap(self) -> None:
+        subject = self.deployment()
+        prepared = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        args = cast(list[str], self.commands('deploy')[0]['args'])
+        self.assertIn('Bootstrap=' + prepared.parameters['Bootstrap'], args)
+        self.assertIn('CREATE', cast(list[str], self.commands('create-change-set')[0]['args']))
+
+    def test_recorded_rollback_reconciles_the_real_request_and_finishes_stacks(self) -> None:
+        source = Path(__file__).parent / 'test_data/stack_update'
+        for name in ('deployment.json', 'cost-ledger.json', 'up.json'):
+            _ = shutil.copyfile(source / name, self.state / name)
+        saved = remote.read_record(self.state / 'deployment.json')
+        outputs = ledger.mapping(saved['outputs'])
+        self.replace('stack_name', 'aws-build')
+        self.replace('region', 'us-east-2')
+        self.replace('availability_zone', 'us-east-2a')
+        _ = (self.root / 'describe-subnets.json').write_text(json.dumps({'Subnets': [
+            {'VpcId': 'vpc-fixture', 'AvailabilityZone': 'us-east-2a'}]}))
+        self.replace('cost_explorer_tag_value', 'aws-build')
+        book = ledger.CostLedger(self.state)
+        evidence = book.read_snapshot()
+        self.set_clock(max(row.at for row in evidence.observations) + 1)
+        self.write_price()
+        _ = (self.root / 'reserved-stack').write_text(ledger.text(saved, 'stack_id'))
+        _ = (self.root / 'fake-stack.json').write_text(json.dumps({
+            'outputs': outputs, 'stack_name': 'aws-build', 'stack_id': saved['stack_id'], 'status': 'UPDATE_ROLLBACK_COMPLETE'}))
+        _ = (self.root / 'get-caller-identity.json').write_text(json.dumps({'Account': saved['account_id']}))
+        _ = (self.root / 'get-user.json').write_text(json.dumps({'User': {
+            'Arn': ledger.mapping(saved['scaler_user'])['arn'], 'UserId': ledger.mapping(saved['scaler_user'])['user_id']}}))
+        _ = (self.root / 'describe-instances.json').write_text(json.dumps({'Reservations': [{'Instances': [{
+            'InstanceId': outputs['InstanceId'], 'LaunchTime': 'recorded-boot', 'State': {'Name': 'stopped'}}]}]}))
+        subject = self.deployment()
+        subject._apply_stacks()  # pyright: ignore[reportPrivateUsage]
+        request = next(item for item in book.read_snapshot().compute_requests
+                       if item.request_id == 'b91c2c8572ba4e6f802bdaac9eee0227')
+        self.assertIsInstance(request.resolution, ledger.ComputeInstanceConfirmed)
+        if isinstance(request.resolution, ledger.ComputeInstanceConfirmed):
+            self.assertEqual(request.resolution.instance_id, 'i-0216cf933a26bd1ea')
+        self.assertEqual(aws_config.deployment_outputs(self.state)['DataVolumeId'], 'vol-067914014134c5036')
+        self.assertFalse(book.pending_compute_requests())
+        self.assertTrue(self.commands('execute-change-set'))
+
     def test_compute_command_starts_with_durable_unconfirmed_accounting(self) -> None:
         start = self.prepare_stopped_instance()
         _ = self.deployment().apply(approve_resources=True)
@@ -440,7 +905,7 @@ class DeploymentTests(CostFixture):
         self.replace('stack_name', 'replacement-build')
         self.replace('existing_data_volume_id', outputs['DataVolumeId'])
         _ = subject.prepare()
-        with self.assertRaises(subprocess.TimeoutExpired):
+        with self.assertRaisesRegex(aws_target.AwsUnavailable, 'timed out'):
             _ = self.failing_compute('timeout').apply(approve_resources=True)
         book = ledger.CostLedger(self.state)
         book.observe(ledger.InstanceObservation(start + 60, 'terminated', 'old instance deletion'))
@@ -471,7 +936,7 @@ class DeploymentTests(CostFixture):
 
     def test_confirmed_absence_ends_only_the_unconfirmed_request_interval(self) -> None:
         start = self.prepare_stopped_instance()
-        with self.assertRaises(subprocess.TimeoutExpired):
+        with self.assertRaisesRegex(aws_target.AwsUnavailable, 'timed out'):
             _ = self.failing_compute('timeout').apply(approve_resources=True)
         (self.root / 'fake-stack.json').unlink()
         self.set_clock(start + 3600)
@@ -534,7 +999,7 @@ class DeploymentTests(CostFixture):
         start = self.prepare_stopped_instance()
         self.replace('fallback_usd_per_hour', '0.10')
         _ = self.deployment().prepare()
-        with self.assertRaises(subprocess.TimeoutExpired):
+        with self.assertRaisesRegex(aws_target.AwsUnavailable, 'timed out'):
             _ = self.failing_compute('timeout').apply(approve_resources=True)
         compute = self.commands('deploy')[-1]
         arguments = cast(list[str], compute['args'])
@@ -574,7 +1039,7 @@ class DeploymentTests(CostFixture):
         commands = self.commands()
         operations = [cast(list[str], row['args'])[5] for row in commands]
         self.assertLess(operations.index('describe-spot-price-history'), operations.index('deploy'))
-        self.assertLess(operations.index('deploy'), operations.index('create-access-key'))
+        self.assertLess(operations.index('execute-change-set'), operations.index('create-access-key'))
         self.assertEqual(self.credentials.stat().st_mode & 0o777, 0o600)
         self.assertIn('other-key', self.credentials.read_text())
         self.assertIn('[build-scaler]', self.credentials.read_text())
@@ -877,7 +1342,7 @@ else: raise AssertionError(args)
         self.assertTrue(all(ledger.mapping(row)['status'] == 'done' for name, row in results.items() if name != 'price'), output)
         later = [cast(list[str], row['args']) for row in self.commands()[before:]]
         self.assertEqual(sum('EnableCompute=false' in args for args in later), 1)
-        self.assertEqual(sum('EnableCompute=true' in args for args in later), 1)
+        self.assertEqual(sum('execute-change-set' in args for args in later), 1)
         self.assertEqual(sum('create-access-key' in args for args in later), 1)
         self.assertEqual([row['hostname'] for row in ledger.rows(devices, 'devices')], ['other', 'aws-build'])
         self.assertEqual(remote.read_record(self.state / 'deployment.json')['tailscale_node_id'], 'node-box')
@@ -1071,7 +1536,7 @@ else: raise AssertionError(args)
         failure.unlink()
         success, output = self.up_output(self.deployment())
         self.assertTrue(success, output)
-        self.assertEqual(len(self.commands('create-change-set')), 1)
+        self.assertEqual(len([row for row in self.commands('create-change-set') if 'CREATE' in cast(list[str], row['args'])]), 1)
         saved = remote.read_record(self.state / 'deployment.json')
         self.assertEqual(saved['stack_id'], (self.root / 'reserved-stack').read_text())
 
@@ -1090,7 +1555,7 @@ else: raise AssertionError(args)
                 success, output = self.up_output(self.deployment())
                 self.assertFalse(success, output)
                 self.assertIn('reserved change set differs', output)
-                self.assertEqual(len(self.commands('create-change-set')), 1)
+                self.assertEqual(len([row for row in self.commands('create-change-set') if 'CREATE' in cast(list[str], row['args'])]), 1)
                 self.assertEqual(self.commands('deploy'), [])
 
     def test_reused_volume_requires_a_completed_owner_and_transfers_the_tag(self) -> None:
