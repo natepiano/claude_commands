@@ -363,6 +363,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Constraints from prior phases:**
 - Phase 12: `coverage_overlap.py` and its `child: unknown` rule.
+- Phase 15: an unknown test names its cause (shared child, shared thread, child outlived its test, unverified launch git). An unknown test is never a removal candidate. On test_fast_track.py, 28 of 55 tests stay unknown through "unverified launch git".
 
 **Acceptance gate:**
 - every changed module green in the checkpoint gate run
@@ -389,39 +390,29 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 15 — The coverage tool checks which children and threads are alive at each test boundary  · status: done
 **Depends on:** Phase 12
 
-#### Work Order
+#### As-built
 
-**Goal:** `coverage_overlap.py` gives no test the lines of a thread or child it does not own, and a failed `exec` keeps collection on.
-
-**Spec:** Phase 12 review round 3 found these attribution edges (F003, F004, F005, F008). The hard-landing rule moved them here. Phase 13 waits for this phase: an assertion check does not show which test owns a line. The Astra review of 2026-11-04 (`/tmp/claude/astra/20261105T013927Z-2009698/review.md`) adds the details under each item.
-
-1. Liveness: at each test start and stop, the collector polls each child it holds a `Popen` for. A child of a test alive at its stop makes that test unknown (cause `child outlived its test`), and also each later test that starts while the child is alive. A Python child from setup (`setUpClass`, module setup) alive at a test's start makes that test unknown (cause `shared child`), with or without a set. A child that exited before a test started has no effect on that test. A child with no `Popen` in the parent uses its set's exit time, or no exit time when it wrote no set. A leaf or unverified launch from setup has no effect (risk: a background process from setup that serves later tests).
-   - The audit hook keeps setup `Popen` references with their launch kind and owner; today it keeps only setup launch records. The missing-set check stays separate from liveness: a Python child that exited with no set still makes its test unknown.
-   - A launch with no `Popen` and no set is unknown for each test from its start to the end of the run.
-   - A launch whose `Popen` constructor raised after a fork is no launch. Phase 12 drops only a `Popen` with no pid; record constructor success explicitly, never from an exit code. Test a missing program with `cwd` set.
-2. Threads: a thread alive at a test's start that runs a measured line during the test makes the test unknown (cause `shared thread`). A thread that a test starts and that is alive at its stop makes the test unknown (cause `thread outlived its test`).
-   - `line()` returns `DISABLE`, so a second thread on the same line gives no event. Keep LINE events on while thread attribution is needed. Exclude the runner thread. Compare thread objects, not reusable idents. Reject a shared thread's line before it goes into the set. Test a line that the runner runs before a shared thread runs it.
-   - A child launched from a thread other than the runner thread belongs to no test. Each test that runs while that child is alive is unknown (cause `shared thread`). The audit hook reads the launching thread. Test a setup thread that starts a Python child during a later test.
-3. Exec: separate the set write from the collector stop. A later snapshot replaces an earlier one only for the same collector instance and test. A successful exec keeps the pre-exec set as its own report. Mark a snapshot apart from a completed report. Keep the fork-exec test; add a failed exec and a case with no final report.
+- `line_collector.py` keeps each launch's `Popen`, launch kind, owner test and launching thread, and records constructor success explicitly. At each test start and stop it polls the children it holds.
+- `coverage_overlap.py` marks a test unknown and names the cause:
+  - `child outlived its test`: a test's child is alive at its stop; each later test that starts while it lives is also unknown.
+  - `shared child`: a setup Python child is alive at a test's start.
+  - `shared thread`: a thread alive at a test's start runs a measured line, or a child is launched from a thread other than the runner thread.
+  - `thread outlived its test`: a thread the test started is alive at its stop.
+  - `unverified launch git`: a launch with no `Popen` and no set.
+- LINE events stay on while thread attribution is needed. A shared thread's line never goes into a test's set.
+- An exec writes the set apart from the collector stop. A successful exec keeps the pre-exec set as its own report; a failed exec keeps collection on.
+- Acceptance on `test_fast_track.py`: 25 of 55 tests known, 9 candidates. Collector run 229.3 s against 215.2 s plain (ratio 1.07).
 
 **Files:**
-- `scripts/test_times/line_collector.py`, `scripts/test_times/coverage_overlap.py` — the liveness poll, the thread check, the exec report
+- `scripts/test_times/line_collector.py`, `scripts/test_times/coverage_overlap.py` — liveness, threads, exec report
 - `scripts/test_times/test_coverage_overlap.py` — tests
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `line_collector.py`, `coverage_overlap.py`
-- `test` — `test_coverage_overlap.py`, from the Spec: a setup Python child with no set that is alive at a test's start makes that test unknown (`shared child`); a child that outlives its test and exits before the next test starts leaves the next test known; a thread from an earlier test that runs a measured line makes both tests unknown, and the later test's set has no line of that thread; a failed `os.execv` that the test catches leaves collection on
+**Binds later work:**
+- An unknown test is never a removal candidate.
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 12: `line_collector.py` records launches through an audit hook and holds each `Popen`; `coverage_overlap.child_causes` turns launches and child sets into causes.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/test_times -p 'test_coverage_overlap.py'` green
-- on `test_fast_track.py`, the known count is not lower than after Phase 12, or each newly unknown test names a cause from this Spec
-- on `test_fast_track.py`, the collector run takes less than two times the `module_run.py` run at the same load (LINE events stay on, so measure it again)
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- 28 of 55 `test_fast_track.py` tests stay unknown through `unverified launch git`.
+- The checkpoint also carries the Phase 17 fixture repair: `test_target_report.py` and `test_show.py` write a private `buildlog.conf`, which `update()` reads.
 
 ### Phase 16 — `/test_times top` ranks the slow tests of the calling session's repository  · status: todo
 **Depends on:** none
