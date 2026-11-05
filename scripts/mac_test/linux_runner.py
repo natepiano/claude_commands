@@ -494,10 +494,13 @@ def nextest_words_with_skip(
 
 
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
-                   words: tuple[str, ...], call_id: str, tree_key: str) -> str:
+                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str) -> str:
     arguments = ['python3', '.claude/scripts/mac_test/linux_runner.py', 'run',
                  '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
-                 '--verb', verb, '--call-id', call_id, '--tree-key', tree_key, '--', *words]
+                 '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
+    if repo_identity:
+        arguments.extend(['--repo-identity', repo_identity])
+    arguments.extend(['--', *words])
     return shlex.join(arguments)
 
 
@@ -619,12 +622,12 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
 
 
 def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str) -> int:
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
     if permission_refused(values):
         return 75
     try:
         with interruptible_slot(mirror, values):
-            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key)
+            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
@@ -687,7 +690,7 @@ def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[s
 
 
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str) -> int:
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
     if verb not in ('nextest', 'check', 'doc'):
         raise ValueError('Linux targets accept only test, check and doc')
     if verb == 'nextest':
@@ -728,6 +731,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     }
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
+    if repo_identity:
+        environment['BUILDLOG_REPO_IDENTITY'] = repo_identity
     if verb == 'doc':
         environment['LINT_CONFIG_FORCE'] = '1'
     assignments = ' '.join(f'{key}={shlex.quote(value)}' for key, value in environment.items())
@@ -795,6 +800,7 @@ class RunnerArguments(argparse.Namespace):
         self.verb: str = ''
         self.call_id: str = ''
         self.tree_key: str = ''
+        self.repo_identity: str = ''
         self.words: list[str] = []
 
 
@@ -810,6 +816,7 @@ def main() -> int:
     _ = runner.add_argument('--verb', required=True)
     _ = runner.add_argument('--call-id', required=True)
     _ = runner.add_argument('--tree-key', default='')
+    _ = runner.add_argument('--repo-identity', default='')
     _ = runner.add_argument('words', nargs=argparse.REMAINDER)
     arguments = parser.parse_args(namespace=RunnerArguments())
     values = cast(object, json.loads(arguments.values))
@@ -821,7 +828,7 @@ def main() -> int:
     return run(Path.home() / arguments.mirror, cast(dict[str, str], values),
                arguments.repository, arguments.verb,
                tuple(words[1:] if words[:1] == ['--'] else words),
-               arguments.call_id, arguments.tree_key)
+               arguments.call_id, arguments.tree_key, arguments.repo_identity)
 
 
 if __name__ == '__main__':
