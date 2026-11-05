@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import time
 from typing import Protocol, cast, final
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -72,15 +73,34 @@ class TailnetTransport(Protocol):
 
 
 def tailnet_request(method: str, endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> PolicyReply:
-    """Keep HTTP error bodies and credentials out of deployment errors."""
+    """Report HTTP validation errors without request credentials or user fields."""
     try:
         request = Request('https://api.tailscale.com/api/v2/' + endpoint, data=body or None,
                           headers=headers, method=method)
         with cast(HTTPResponse, urlopen(request, timeout=timeout)) as response:
             content = response.read()
             return PolicyReply(json_record(content) if content else {}, response.headers.get('ETag', ''))
-    except (OSError, ValueError):
-        raise BoxRefused(f'Tailscale {method} {endpoint}: request failed') from None
+    except HTTPError as error:
+        content = error.read().decode(errors='replace')
+        detail = ' '.join(content.split())[:500] if content.strip() else str(error.reason)
+        try:
+            value = cast(object, json.loads(content))
+        except ValueError:
+            value = None
+        if isinstance(value, dict):
+            record = cast(dict[str, object], value)
+            message = record.get('message')
+            details = [message] if isinstance(message, str) and message else []
+            data = record.get('data')
+            for entry in cast(list[object], data) if isinstance(data, list) else []:
+                errors = cast(dict[str, object], entry).get('errors') if isinstance(entry, dict) else None
+                if isinstance(errors, list):
+                    details.extend(item for item in cast(list[object], errors) if isinstance(item, str))
+            detail = '; '.join(' '.join(item.split()) for item in details) or str(error.reason)
+        raise BoxRefused(f'Tailscale {method} {endpoint}: HTTP {error.code}: {detail}') from None
+    except (OSError, ValueError) as error:
+        reason = error.reason if isinstance(error, URLError) else error
+        raise BoxRefused(f'Tailscale {method} {endpoint}: request failed: {reason}') from None
 
 
 @dataclass(frozen=True)
