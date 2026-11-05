@@ -12,7 +12,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, override
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -311,6 +311,37 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(scan.call_count, 2)
         launch.assert_called_once()
         self.assertEqual(output.getvalue(), f"{row.name}: restarted\n")
+
+    def test_live_members_reads_only_selected_local_rows(self) -> None:
+        remote_row = replace(self.rows[0], id=staff.StaffId("remote-row"),
+            current_session=staff.StaffId("remote-conversation"),
+            worktree=staff.PresentWorktree("mac", self.root))
+        record = staff.StaffSnapshot((*self.rows, remote_row))
+        resolver = session_staff.RowResolver(record)
+        with (patch.object(herdr, "read_conversation", side_effect=[
+                  herdr.LiveConversation("claude", (123,)), herdr.StoppedConversation()]) as read,
+              patch.object(sessions, "running_sessions") as registry,
+              patch.object(herdr, "running_codex_threads") as codex,
+              redirect_stderr(io.StringIO()) as errors):
+            selected = restart.live_members(iter((*self.rows[:2], remote_row)), record, resolver=resolver)
+        self.assertEqual(selected, [self.rows[0]])
+        self.assertEqual(read.call_args_list, [
+            call(str(self.rows[0].current_session)), call(str(self.rows[1].current_session))])
+        registry.assert_not_called()
+        codex.assert_not_called()
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_live_members_reports_unknown_and_continues_after_row_errors(self) -> None:
+        for error in (OSError("read failed"), ValueError("invalid conversation")):
+            with (self.subTest(error=error),
+                  patch.object(herdr, "read_conversation", side_effect=[
+                      herdr.UnknownConversation("test-tab (conversation unknown)"), error,
+                      herdr.LiveConversation("codex", (123,))]),
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(restart.live_members(self.rows, staff.StaffSnapshot(self.rows)), [self.rows[2]])
+            self.assertEqual(errors.getvalue().splitlines(), [
+                "anomaly: test-tab (conversation unknown); not blocking",
+                f"{self.rows[1].name}: restart anomaly: {error}"])
 
     def test_codex_clients_stay_live_and_only_daemon_rows_are_omitted(self) -> None:
         self.running.clear()

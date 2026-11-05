@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from enum import Enum
@@ -81,28 +81,6 @@ def json_object(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise RenameRefused("invalid rename journal: expected an object")
     return cast(dict[str, object], value)
-
-
-def plan_paths(cell: str, checkout: Path) -> tuple[Path, ...]:
-    """The tracked plan files under docs/plans that a unit's plan value names."""
-    names = [match[1] for match in re.finditer(r"`([^`]+)`", cell)]
-    if not names:
-        if re.search(r"\s", cell.strip()):
-            return ()
-        names = [cell.strip()]
-    paths: list[Path] = []
-    for name in names:
-        path = Path(name).expanduser()
-        path = (path if path.is_absolute() else checkout / path).resolve()
-        try:
-            relative = path.relative_to(checkout)
-        except ValueError:
-            continue
-        if relative.parts[:2] != ("docs", "plans") or path.suffix != ".md" or not path.is_file():
-            continue
-        if git(checkout, "ls-files", "-z", "--", f":(literal){relative}"):
-            paths.append(path)
-    return tuple(paths)
 
 
 def branch_tip(checkout: Path, branch: str) -> str:
@@ -305,7 +283,7 @@ class NoUnitConversation(NamedTuple):
     """No launch entry identifies this unit's conversation."""
 
 
-def unit_conversation(found: unit_lookup.MarkedUnit | None, *, session_id: str = "") -> UnitConversation | NoUnitConversation:
+def unit_conversation(found: unit_lookup.LabeledSession | None, *, session_id: str = "") -> UnitConversation | NoUnitConversation:
     """Use the live director's id, then its pane launch; retained launches survive a stop."""
     from scripts.accounts import accounts
 
@@ -332,7 +310,7 @@ class UnitPane(NamedTuple):
     shell: int
 
 
-def unit_pane(found: unit_lookup.MarkedUnit | None, _production: str) -> UnitPane | None:
+def unit_pane(found: unit_lookup.LabeledSession | None, _production: str) -> UnitPane | None:
     """Find the unit's exact pane; an exec-launched Claude leaves no shell to close."""
     if found is None:
         return None
@@ -425,17 +403,25 @@ class NoPendingMove(Enum):
 class FolderMove(NamedTuple):
     destination: Path
     branch: str | KeepBranch
+
+
+class PendingRename(NamedTuple):
+    destination: Path
+    branch: str | KeepBranch
     name: str
 
 
-def pending_move(unit: staff.StaffId) -> FolderMove | NoPendingMove:
+def pending_move(unit: staff.StaffId) -> FolderMove | PendingRename | NoPendingMove:
     path = staff.folder_move_path(unit)
     if not path.exists():
         return NoPendingMove.CURRENT
     progress = json_object(read_json(path))
     branch = str(progress.get("branch", ""))
-    return FolderMove(Path(str(progress["destination"])), branch or KeepBranch.CURRENT,
-                      str(progress.get("name", "")))
+    destination = Path(str(progress["destination"]))
+    name = str(progress.get("name", ""))
+    if progress.get("kind") == "rename" or ("kind" not in progress and name):
+        return PendingRename(destination, branch or KeepBranch.CURRENT, name)
+    return FolderMove(destination, branch or KeepBranch.CURRENT)
 
 
 def prepare_move(row: staff.StaffRow, destination: Path, branch: str | KeepBranch,
@@ -451,12 +437,13 @@ def prepare_move(row: staff.StaffRow, destination: Path, branch: str | KeepBranc
         admin_path = str((admin if admin.is_absolute() else folder / admin).resolve())
     write_json(staff.folder_move_path(row.id), {
         "source": str(source), "destination": str(destination), "admin": admin_path,
-        "branch": branch if isinstance(branch, str) else "", "name": name})
+        "branch": branch if isinstance(branch, str) else "",
+        "kind": "rename" if name else "folder", **({"name": name} if name else {})})
 
 
 def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, old: Path,
                         destination: Path, branch: str | KeepBranch) -> bool:
-    """Require the same repository and the unit's registered branch."""
+    """Require the journal identity and the unit's registered branch."""
     owner = record.parent_of(row)
     if (owner is None or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
             or owner.doc.machine != remote.local_machine() or not (destination / ".git").is_file()):
@@ -478,12 +465,13 @@ def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, old: P
         progress_path = staff.folder_move_path(row.id)
         raw: object = read_json(progress_path) if progress_path.exists() else dict[str, object]()
         progress = cast(dict[str, object], raw) if isinstance(raw, dict) else dict[str, object]()
-        if (progress.get("source") == str(old) and progress.get("destination") == str(destination)
-                and progress.get("admin") == str(admin)):
-            _check_move_deadline()
-            head = (admin / "HEAD").read_text().strip()
-            if head.startswith("ref: refs/heads/"):
-                allowed.add(head.removeprefix("ref: "))
+        if (progress.get("source") != str(old) or progress.get("destination") != str(destination)
+                or progress.get("admin") != str(admin)):
+            return False
+        _check_move_deadline()
+        head = (admin / "HEAD").read_text().strip()
+        if head.startswith("ref: refs/heads/"):
+            allowed.add(head.removeprefix("ref: "))
         registered = git(destination, "worktree", "list", "--porcelain", "-z")
         for entry in registered.split("\0\0"):
             fields = entry.split("\0")
@@ -495,9 +483,9 @@ def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, old: P
     return False
 
 
-def move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> None:
+def move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
     """Move a unit through the existing command API."""
-    _ = _move_folder(unit, destination, branch=branch)
+    return _move_folder(unit, destination, branch=branch)
 
 
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
@@ -511,6 +499,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         if row is None or row.kind != "unit" or isinstance(row.worktree, staff.WorktreeUnfilled):
             raise ValueError(f"{unit}: move-folder requires a unit with a worktree")
         location = row.worktree
+        pending = pending_move(unit)
         if location.machine != remote.local_machine():
             raise ValueError(f"{unit}: run move-folder on {location.machine}")
         old = location.path.expanduser().resolve()
@@ -526,28 +515,30 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             missing = destination if isinstance(location, staff.RemovedWorktree) else old
             print(f"anomaly: folder is absent: {missing}", file=sys.stderr)
             staff.folder_move_path(unit).unlink(missing_ok=True)
-            return changed
+            return changed or not isinstance(pending, NoPendingMove)
         recovering = folder == destination
         if recovering and old != destination and not _recoverable_folder(record, row, old, destination, branch):
             raise RenameRefused(f"destination already exists: {destination}")
         current_branch = git(folder, "branch", "--show-current")
+        move_complete = old == destination and (isinstance(branch, KeepBranch) or current_branch == branch)
+        if move_complete and isinstance(pending, NoPendingMove):
+            return False
         members = [row, *record.find(kind="worker", parent=row.id)]
         for member in members[1:]:
             _check_move_deadline()
             _ = locks.enter_context(staff.row_operation(str(member.id)))
         # The delayed import avoids the restart module's dependency on unit_move.
         restart = import_module("scripts.shutdown.restart")
-        live_rows = cast(Callable[[staff.StaffSnapshot, herdr.Herdr], list[staff.StaffRow]], restart.live_rows)
+        live_members = cast(Callable[[Iterable[staff.StaffRow], staff.StaffSnapshot], list[staff.StaffRow]], restart.live_members)
         stop_row = cast(Callable[[staff.StaffRow, herdr.Herdr], bool], restart.stop_row)
         start_row = cast(Callable[[staff.StaffRow, staff.StaffSnapshot, herdr.Herdr], str], restart.start_row)
         client = herdr.Herdr(herdr.shared_session())
-        selected = {member.id for member in members}
         observed_live = set[staff.StaffId]()
 
         def observe() -> set[staff.StaffId]:
             nonlocal observed_live
             _check_move_deadline()
-            found = {member.id for member in live_rows(record, client) if member.id in selected}
+            found = {member.id for member in live_members(members, record)}
             _check_move_deadline()
             observed_live = found
             return found
@@ -556,10 +547,10 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         for member in members:
             if member.id not in live:
                 print(f"info: {member.name}: stopped; shutdown.py restart --only {member.id}")
-        if old == destination and (isinstance(branch, KeepBranch) or current_branch == branch):
+        if move_complete:
             staff.folder_move_path(unit).unlink(missing_ok=True)
-            return False
-        if isinstance(pending_move(unit), NoPendingMove):
+            return True
+        if isinstance(pending, NoPendingMove):
             prepare_move(row, destination, branch)
         changed = False
         reported = set[staff.StaffId]()
@@ -642,7 +633,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                             restart_notice(member, error)
         _check_move_deadline()
         staff.folder_move_path(unit).unlink(missing_ok=True)
-        return changed
+        return changed or not isinstance(pending, NoPendingMove)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

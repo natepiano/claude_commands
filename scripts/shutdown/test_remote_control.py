@@ -123,14 +123,31 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertTrue(lines[0].startswith("trunk unit:"))
         return outcome, output.getvalue(), [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
 
-    def test_live_pane_marks_name_remote_control_messages(self) -> None:
-        launch: dict[str, object] = {"session_id": "conversation", "name": "Working tab",
-                                     "environment": {"SHOWRUNNER_UNIT_ID": "builders-unit", "SHOWRUNNER_UNIT": "demo"}}
-        self.assertEqual(remote_control.remote_control_who(launch), "builders unit")
-        launch["environment"] = {"SHOWRUNNER_UNIT": "demo"}
-        self.assertEqual(remote_control.remote_control_who(launch), "demo showrunner")
-        launch["environment"] = {}
-        self.assertEqual(remote_control.remote_control_who(launch), "Working tab")
+    def test_native_session_selects_the_current_staff_name_despite_retired_marks(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file, showrunner_relationship
+
+        with isolated_staff_file(self.root / "staff.json", {}):
+            parent = showrunner_relationship("current")
+            row = fixture_member("unit", name="current-unit", parent=parent.id)
+            for field in ("sessionId", "session_id"):
+                launch: dict[str, object] = {
+                    field: row.current_session, "name": "Working tab",
+                    "environment": {"SHOWRUNNER_UNIT_ID": "old-unit", "SHOWRUNNER_UNIT": "old"},
+                }
+                self.assertEqual(remote_control.remote_control_who(launch), "current unit")
+                self.assertEqual(remote_control.remote_control_who({"session": launch}), "current unit")
+            self.assertEqual(staff.initial_snapshot().by_current_session(row.current_session), row)
+
+    def test_absent_native_session_uses_the_name_despite_retired_marks(self) -> None:
+        from scripts.production.staff_test_support import isolated_staff_file
+
+        with isolated_staff_file(self.root / "staff.json", {}):
+            launch: dict[str, object] = {
+                "session_id": "conversation", "name": "Working tab",
+                "environment": {"SHOWRUNNER_UNIT_ID": "old-unit", "SHOWRUNNER_UNIT": "old"},
+            }
+            self.assertEqual(remote_control.remote_control_who(launch), "Working tab")
 
     def test_launch_flag_activates_during_grace_without_pane_input_or_push(self) -> None:
         def activate(at: float) -> None:

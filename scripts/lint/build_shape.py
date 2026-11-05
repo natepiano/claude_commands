@@ -1,4 +1,4 @@
-"""Cargo shapes, compile counts and test arguments from the read-only index join.
+"""Read Cargo shapes, compile counts, test arguments, and recorded output roots.
 
 Shape and compile evidence remain independent. The join keeps test arguments
 for readers that must recover missing selection fields in anonymous peaks.
@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
-from contextlib import closing
+from collections.abc import Generator, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import cast
+
+from scripts.buildlog import store
+from scripts.lib.cargo_target_config import cargo_path_argument
 
 TEST_STEPS = ("nextest", "test", "t")
 
@@ -122,6 +125,15 @@ class StepEvidence:
     arguments: tuple[str, ...] = ()
 
 
+@contextmanager
+def _step_index(index_path: Path) -> Generator[tuple[sqlite3.Connection, set[str]]]:
+    """Open the index without writes and read the available step columns."""
+    with closing(sqlite3.connect(index_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
+                   connection.execute("PRAGMA table_info(steps)").fetchall())}
+        yield connection, columns
+
+
 def index_step_evidence(index_path: Path, host: str, step: str,
                         cutoff: datetime, before: datetime) -> dict[tuple[str, str], StepEvidence]:
     """Read shape, compile evidence and test arguments for each call and step.
@@ -133,9 +145,7 @@ def index_step_evidence(index_path: Path, host: str, step: str,
     evidence: dict[tuple[str, str], StepEvidence] = {}
     test_step = step in TEST_STEPS
     try:
-        with closing(sqlite3.connect(index_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
-            columns = {row[1] for row in cast(list[tuple[object, ...]],
-                       connection.execute("PRAGMA table_info(steps)").fetchall())}
+        with _step_index(index_path) as (connection, columns):
             argv_column = "argv" if "argv" in columns else "NULL"
             count_column = "crates_compiled" if "crates_compiled" in columns else "NULL"
             rows = cast(list[tuple[object, ...]], connection.execute(
@@ -186,3 +196,98 @@ def index_step_evidence(index_path: Path, host: str, step: str,
     except (OSError, sqlite3.Error):
         pass
     return evidence
+
+
+@dataclass(frozen=True)
+class AbsoluteRecordedRoot:
+    """A step records an absolute output path."""
+
+    path: Path
+
+
+@dataclass(frozen=True)
+class UnknownRecordedRoot:
+    """A step records no output path."""
+
+
+@dataclass(frozen=True)
+class RelativeRecordedRoot:
+    """A relative output path cannot authorize a floor deletion."""
+
+
+RecordedRoot = AbsoluteRecordedRoot | UnknownRecordedRoot | RelativeRecordedRoot
+
+
+@dataclass(frozen=True)
+class RecordedOutputPair:
+    """The output paths from one step attempt stay together."""
+
+    target_directory: RecordedRoot
+    build_directory: RecordedRoot
+
+
+@dataclass(frozen=True)
+class RecordedOutputRoots:
+    """Step attempts grouped by their recorded workspace identity."""
+
+    workspaces: dict[RecordedRoot, tuple[RecordedOutputPair, ...]]
+
+
+@dataclass(frozen=True)
+class RecordedRootsUnavailable:
+    """The index cannot supply recorded output roots."""
+
+    reason: str
+
+
+def recorded_root(raw: object) -> RecordedRoot:
+    """Read a path without resolving it against the current checkout."""
+    if not isinstance(raw, str) or not raw or raw == store.UNKNOWN_IDENTITY:
+        return UnknownRecordedRoot()
+    path = Path(raw)
+    return AbsoluteRecordedRoot(path) if path.is_absolute() else RelativeRecordedRoot()
+
+
+def _sets_target_folder(raw_argv: object) -> bool:
+    """Reject step overrides that the recorded metadata did not receive."""
+    if not isinstance(raw_argv, str):
+        return False
+    try:
+        decoded = cast(object, json.loads(raw_argv))
+    except ValueError:
+        return False
+    if not isinstance(decoded, list) or not all(isinstance(word, str) for word in cast(list[object], decoded)):
+        return False
+    words = cast(list[str], decoded)
+    if cargo_path_argument(words, "--target-dir") or "--target-dir" in words:
+        return True
+    return any("target-dir" in cargo_path_argument(words[position:], "--config")
+               for position, word in enumerate(words) if word == "--config" or word.startswith("--config="))
+
+
+def recorded_output_roots(index_path: Path, host: str) -> RecordedOutputRoots | RecordedRootsUnavailable:
+    """Read every step attempt on this host without metadata or index updates."""
+    workspaces: dict[RecordedRoot, list[RecordedOutputPair]] = {}
+    try:
+        with _step_index(index_path) as (connection, columns):
+            target = "target_directory" if "target_directory" in columns else "NULL"
+            build = "build_directory" if "build_directory" in columns else target
+            argv = "argv" if "argv" in columns else "NULL"
+            folder = "target_folder" if "target_folder" in columns else "NULL"
+            rows = cast(list[tuple[object, ...]], connection.execute(
+                f"SELECT DISTINCT worktree, cwd, {target}, {build}, {argv}, {folder} FROM steps WHERE host = ?", (host,),
+            ).fetchall())
+        for worktree, cwd, target_path, build_path, raw_argv, target_folder in rows:
+            target_root = recorded_root(target_path)
+            folder_root = recorded_root(target_folder)
+            if (_sets_target_folder(raw_argv)
+                    or isinstance(folder_root, AbsoluteRecordedRoot) and folder_root != target_root):
+                continue
+            workspace = recorded_root(worktree)
+            if not isinstance(workspace, AbsoluteRecordedRoot):
+                workspace = recorded_root(cwd)
+            workspaces.setdefault(workspace, []).append(RecordedOutputPair(
+                target_root, recorded_root(build_path)))
+    except (OSError, sqlite3.Error) as error:
+        return RecordedRootsUnavailable(str(error))
+    return RecordedOutputRoots({workspace: tuple(attempts) for workspace, attempts in workspaces.items()})

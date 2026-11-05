@@ -229,18 +229,32 @@ class Deployment:
             if (values.get('DeploymentId') != parameters['DeploymentId'] or not stack_id.startswith(
                     f'arn:aws:cloudformation:{settings.region}:{account}:stack/{settings.stack_name}/')):
                 raise DeploymentRefused('the reserved change set differs from the saved deployment identity')
-        else:
-            # A CREATE change set reserves the StackId before any resource can exist.
-            reply = api.call('create-change-set', '--stack-name', settings.stack_name,
-                             '--change-set-name', change_name, '--change-set-type', 'CREATE',
-                             '--template-body', 'file://' + str(self.output / 'template.json'),
-                             '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps([
-                                 {'ParameterKey': key, 'ParameterValue': value} for key, value in
-                                 {**parameters, 'EnableCompute': 'false'}.items()]), service='cloudformation')
-        saved['stack_id'] = ledger.text(reply, 'StackId')
-        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
-        _ = api.call('wait', 'change-set-create-complete', '--stack-name', ledger.text(saved, 'stack_id'),
-                     '--change-set-name', change_name, service='cloudformation')
+        reserved = bool(reply)
+        started = self.clock()
+        try:
+            if not reply:
+                # A CREATE change set reserves the StackId before any resource can exist.
+                reply = api.call('create-change-set', '--stack-name', settings.stack_name,
+                                 '--change-set-name', change_name, '--change-set-type', 'CREATE',
+                                 '--template-body', 'file://' + str(self.output / 'template.json'),
+                                 '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps([
+                                     {'ParameterKey': key, 'ParameterValue': value} for key, value in
+                                     {**parameters, 'EnableCompute': 'false'}.items()]), service='cloudformation')
+                reserved = True
+            saved['stack_id'] = ledger.text(reply, 'StackId')
+            write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+            _ = api.call('wait', 'change-set-create-complete', '--stack-name', ledger.text(saved, 'stack_id'),
+                         '--change-set-name', change_name, service='cloudformation')
+        except (AwsUnavailable, subprocess.SubprocessError) as error:
+            stack_id = str(saved.get('stack_id') or settings.stack_name)
+            try:
+                reply = api.call('describe-change-set', '--stack-name', stack_id,
+                                 '--change-set-name', change_name, service='cloudformation')
+            except (AwsUnavailable, subprocess.SubprocessError):
+                pass
+            failure = self._stack_failure(api, settings, stack_id, started, error, reply, parameters['NotificationEmail'])
+            leftover = self._discard_change_set(api, stack_id, change_name) if reserved else ''
+            raise AwsUnavailable(str(failure) + leftover) from None
 
     def _save_scaler_identity(self, settings: DeploymentSettings) -> None:
         saved = deployment_record(self.directory)
@@ -299,7 +313,8 @@ class Deployment:
     def _refresh_observation(self, settings: DeploymentSettings) -> None:
         pending = ledger.CostLedger(self.directory).pending_compute_requests()
         if pending:
-            _ = self._reconcile_compute_request(settings, pending[0])
+            for request in pending:
+                _ = self._reconcile_compute_request(settings, request)
             return
         path = self.directory / 'deployment.json'
         if path.exists():
@@ -404,7 +419,7 @@ class Deployment:
         status = ledger.text(stack, 'StackStatus')
         if status == 'REVIEW_IN_PROGRESS':
             return {}
-        if status not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE'):
+        if status not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE'):
             raise DeploymentRefused(f'reconcile the stack before deployment: {status}')
         outputs: dict[str, str] = {}
         for item in ledger.rows(stack, 'Outputs'):
@@ -470,21 +485,160 @@ class Deployment:
         saved['data_volume_id'] = volume_id
         write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
 
+    @staticmethod
+    def _discard_change_set(api: AwsCli, stack_id: str, name: str) -> str:
+        try:
+            _ = api.call('delete-change-set', '--stack-name', stack_id, '--change-set-name', name, service='cloudformation')
+        except (ValueError, OSError, AwsUnavailable, subprocess.SubprocessError):
+            return '\nunexecuted change set remains: ' + name
+        return ''
+
+    def _stack_failure(self, api: AwsCli, settings: DeploymentSettings, stack_id: str, started: float,
+                       error: Exception, change: dict[str, object], notification: str) -> AwsUnavailable:
+        lines = [str(error)]
+        if change.get('StatusReason'):
+            lines.append(str(change['StatusReason']))
+        try:
+            events = api.call('describe-stack-events', '--stack-name', stack_id, service='cloudformation')
+            for event in ledger.rows(events, 'StackEvents'):
+                stamp = datetime.fromisoformat(ledger.text(event, 'Timestamp').replace('Z', '+00:00')).timestamp()
+                status = ledger.text(event, 'ResourceStatus')
+                if stamp >= started and status.endswith('_FAILED'):
+                    lines.append(f"{ledger.text(event, 'LogicalResourceId')} ({ledger.text(event, 'ResourceType')}): "
+                                 + f"{status}: {event.get('ResourceStatusReason', '')}")
+        except (ValueError, AwsUnavailable, subprocess.SubprocessError):
+            lines.append('stack events are unavailable')
+        try:
+            stacks = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id, service='cloudformation'), 'Stacks')
+            for stack in stacks:
+                status = ledger.text(stack, 'StackStatus')
+                lines.append('stack status: ' + status)
+                if status == 'UPDATE_ROLLBACK_COMPLETE':
+                    lines.append('the stack rolled back; the box and the volume did not change')
+                uncertain = (isinstance(error, subprocess.TimeoutExpired)
+                             or any(word in str(error).lower() for word in ('timed out', 'timeout', 'max attempts exceeded')))
+                if status.endswith('_COMPLETE') and not uncertain:
+                    try:
+                        for request in ledger.CostLedger(self.directory).pending_compute_requests():
+                            _ = self._reconcile_compute_request(settings, request)
+                    except (ValueError, OSError, AwsUnavailable, subprocess.SubprocessError):
+                        lines.append('compute request reconciliation is unavailable')
+        except (ValueError, AwsUnavailable, subprocess.SubprocessError):
+            lines.append('stack status is unavailable')
+        return AwsUnavailable('\n'.join(lines).replace(notification, '<notification address>'))
+
+    def _update_stack(self, settings: DeploymentSettings, parameters: dict[str, str], *, compute: bool) -> None:
+        api = self._api(settings)
+        stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
+        live = self._stack(settings)
+        values: list[dict[str, object]] = [
+            {'ParameterKey': key, 'UsePreviousValue': True} if key == 'Bootstrap' and live.get('InstanceId')
+            else {'ParameterKey': key, 'ParameterValue': value}
+            for key, value in {**parameters, 'EnableCompute': str(compute).lower()}.items()
+        ]
+        name = 'update-' + uuid4().hex
+        started = self.clock()
+        change: dict[str, object] = {}
+        created = False
+        executed = False
+        try:
+            _ = api.call('create-change-set', '--stack-name', stack_id, '--change-set-name', name,
+                         '--change-set-type', 'UPDATE', '--template-body', 'file://' + str(self.output / 'template.json'),
+                         '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(values), service='cloudformation')
+            created = True
+            wait_error: Exception | None = None
+            try:
+                _ = api.call('wait', 'change-set-create-complete', '--stack-name', stack_id,
+                             '--change-set-name', name, service='cloudformation')
+            except (AwsUnavailable, subprocess.SubprocessError) as error:
+                wait_error = error
+            change = api.call('describe-change-set', '--stack-name', stack_id, '--change-set-name', name,
+                              service='cloudformation')
+            reason = str(change.get('StatusReason', ''))
+            if change.get('Status') == 'FAILED' and any(text in reason.lower() for text in (
+                    "didn't contain changes", 'no updates are to be performed', 'no changes')):
+                _ = api.call('delete-change-set', '--stack-name', stack_id, '--change-set-name', name, service='cloudformation')
+                return
+            if wait_error is not None:
+                raise wait_error
+            if change.get('Status') != 'CREATE_COMPLETE':
+                raise AwsUnavailable('the update change set is not complete')
+            protected = {
+                'AWS::EC2::Instance', 'AWS::EC2::Volume', 'AWS::EC2::VolumeAttachment',
+                'AWS::EC2::NetworkInterface', 'AWS::EC2::NetworkInterfaceAttachment',
+                'AWS::EC2::EIP', 'AWS::EC2::EIPAssociation', 'AWS::Budgets::Budget',
+            }
+            replacements: list[str] = []
+            for item in ledger.rows(change, 'Changes'):
+                resource = ledger.mapping(item.get('ResourceChange'))
+                if resource.get('ResourceType') in protected and (resource.get('Action') == 'Remove'
+                        or resource.get('Replacement') in ('True', 'Conditional')):
+                    replacements.append(f"{ledger.text(resource, 'LogicalResourceId')} ({ledger.text(resource, 'ResourceType')})")
+            if replacements:
+                raise DeploymentRefused('up refuses replacement: ' + ', '.join(replacements)
+                                        + '; run deploy.py down --approve-destroy, then deploy.py up --approve-resources')
+            self._before_request(settings, parameters)
+            if compute:
+                self._record_compute_request(settings, parameters)
+            _ = api.call('execute-change-set', '--stack-name', stack_id, '--change-set-name', name, service='cloudformation')
+            executed = True
+            _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation')
+        except (ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+            if not change:
+                try:
+                    change = api.call('describe-change-set', '--stack-name', stack_id,
+                                      '--change-set-name', name, service='cloudformation')
+                    created = True
+                except (AwsUnavailable, subprocess.SubprocessError):
+                    pass
+            leftover = self._discard_change_set(api, stack_id, name) if created and not executed else ''
+            if isinstance(error, ValueError):
+                raise DeploymentRefused((str(error) + leftover).replace(parameters['NotificationEmail'], '<notification address>')) from None
+            failure = self._stack_failure(api, settings, stack_id, started, error, change, parameters['NotificationEmail'])
+            raise AwsUnavailable(str(failure) + leftover) from None
+
+    def _record_compute_request(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
+        book = ledger.CostLedger(self.directory)
+        for request in book.pending_compute_requests():
+            _ = self._reconcile_compute_request(settings, request)
+        book.record_compute_request(ledger.ComputeRequest(int(self.clock()), settings.stack_name, settings.region,
+                                                         money(parameters['SpotMaxPrice'])))
+
     def _deploy(self, settings: DeploymentSettings, parameters: dict[str, str], *, compute: bool) -> None:
         self._before_request(settings, parameters)
         self._adopt_volume(settings, parameters)
         self._reserve_stack(settings, parameters)
-        self._confirm_preparation(settings, parameters, renew=True)
-        self._before_request(settings, parameters)
-        if compute:
-            ledger.CostLedger(self.directory).record_compute_request(
-                ledger.ComputeRequest(int(self.clock()), settings.stack_name, settings.region,
-                                      money(parameters['SpotMaxPrice'])))
-        _ = self._api(settings).call('deploy',
-            '--stack-name', settings.stack_name, '--template-file', str(self.output / 'template.json'),
-            '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset',
-            '--parameter-overrides', *[f'{key}={value}' for key, value in parameters.items()],
-            f'EnableCompute={str(compute).lower()}', service='cloudformation')
+        live = self._stack(settings)
+        try:
+            self._confirm_preparation(settings, parameters, renew=True)
+            self._before_request(settings, parameters)
+        except (ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+            if not live:
+                stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
+                leftover = self._discard_change_set(self._api(settings), stack_id, 'identity-' + parameters['DeploymentId'])
+                if leftover:
+                    reason = (str(error) + leftover).replace(parameters['NotificationEmail'], '<notification address>')
+                    if isinstance(error, ValueError):
+                        raise DeploymentRefused(reason) from None
+                    raise AwsUnavailable(reason) from None
+            raise
+        if live:
+            self._update_stack(settings, parameters, compute=compute)
+        else:
+            if compute:
+                self._record_compute_request(settings, parameters)
+            api = self._api(settings)
+            started = self.clock()
+            try:
+                _ = api.call('deploy',
+                    '--stack-name', ledger.text(deployment_record(self.directory), 'stack_id'),
+                    '--template-file', str(self.output / 'template.json'),
+                    '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset',
+                    '--parameter-overrides', *[f'{key}={value}' for key, value in parameters.items()],
+                    f'EnableCompute={str(compute).lower()}', service='cloudformation')
+            except (AwsUnavailable, subprocess.SubprocessError) as error:
+                raise self._stack_failure(api, settings, ledger.text(deployment_record(self.directory), 'stack_id'),
+                                          started, error, {}, parameters['NotificationEmail']) from None
         self._save_scaler_identity(settings)
         outputs = self._stack(settings)
         saved = deployment_record(self.directory)
@@ -600,9 +754,9 @@ class Deployment:
                 self._confirm_preparation(settings, parameters, renew=True)
             self._deploy(settings, parameters, compute=True)
             pending = ledger.CostLedger(self.directory).pending_compute_requests()
-            if len(pending) != 1:
-                raise DeploymentRefused('the compute request has no durable accounting evidence')
-            outputs = self._reconcile_compute_request(settings, pending[0])
+            outputs = self._stack(settings)
+            for request in pending:
+                outputs = self._reconcile_compute_request(settings, request)
             saved = deployment_record(self.directory)
             saved['fingerprint'] = fingerprint(settings, parameters, TEMPLATE.read_bytes())
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
@@ -770,6 +924,19 @@ class Deployment:
                 raise DeploymentRefused('target removal is incomplete; run deploy.py down --approve-destroy first')
             path = self.directory / 'up.json'
             results = remote.read_record(path) if path.exists() else {}
+            started = int(self.clock())
+            try:
+                status = self.execute(['tailscale', 'status', '--json'], capture_output=True, text=True,
+                                      timeout=conf.read(self.settings_path).whole('box_setup_timeout_s'), check=False)
+                if status.returncode:
+                    raise box.BoxRefused(f'tailscale status failed (exit {status.returncode})')
+                _ = box.policy_device_bindings(box.policy_source(), box.json_record(status.stdout))
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                result = StageResult('refused', started, int(self.clock()), self.admin.redact(str(error)))
+                results['up'] = {field.name: cast(object, getattr(result, field.name)) for field in fields(result)}
+                write_text_atomic(path, json.dumps(results, sort_keys=True) + '\n')
+                print('up: refused: ' + result.reason)
+                return False
             for stage in stages:
                 started = int(self.clock())
                 try:
@@ -781,6 +948,7 @@ class Deployment:
                     reason = 'scaler credential stage failed' if stage.name == 'scaler-key' else self.admin.redact(str(error))
                     result = StageResult('refused', started, int(self.clock()), reason)
                 results = remote.read_record(path) if path.exists() else results
+                _ = results.pop('up', None)
                 previous = ledger.mapping(results.get(stage.name, {}))
                 results[stage.name] = {**previous, **{field.name: cast(object, getattr(result, field.name)) for field in fields(result)}}
                 write_text_atomic(path, json.dumps(results, sort_keys=True) + '\n')

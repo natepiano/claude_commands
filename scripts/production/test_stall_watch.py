@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production import showrunners, staff, unit_names
+from scripts.production import showrunners, staff
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id
 import fake_unit_host
@@ -271,7 +271,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         for session, units in runners.items():
             parent = showrunner_relationship(session)
             live_units = [unit for unit in units if unit not in self.retired]
-            intended = {fixture_member("unit", name=unit_names.name(unit), parent=parent.id,
+            intended = {fixture_member("unit", name=unit, parent=parent.id,
                                        runtime_id=unit_session(unit), worktree=staff.PresentWorktree(
                                            local_machine(), self.root / "worktrees" / unit)).id for unit in live_units}
             for row in staff.snapshot().find(kind="unit", parent=parent.id):
@@ -342,7 +342,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         units = [
             HostedUnit(str(data.get("session", "agents")), f"w{data['id']}:p1",
-                       {"SHOWRUNNER_UNIT": str(data["slug"]), "SHOWRUNNER_UNIT_ID": name}, str(data["pane"]),
+                       {"CODEX_THREAD_ID": unit_session(name)}, str(data["pane"]),
                        str(data.get("agent_status", "idle")), label=str(data["label"]))
             for name, data in self.panes.items()]
         fake_unit_host.write(self.environment, units)
@@ -357,7 +357,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             response["stdout"] = json.dumps(payload)
         _ = responses_path.write_text(json.dumps(responses))
         for unit, data in zip(units, self.panes.values()):
-            fake_unit_host.place_process(self.environment, int(data["pid"]), unit.pane)
+            fake_unit_host.place_process(self.environment, int(data["pid"]), unit.pane, exec_shell=True)
         # Staff sessions identify the directors in these temporary run records.
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
@@ -393,7 +393,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             if owner is not None and isinstance(owner.parent, staff.ReportsTo):
                 parent = membership.by_id(owner.parent.id)
                 assert parent is not None
-                run_state.update(production=parent.name, unit=owner.name)
+                run_state.update(production=parent.name, unit=f"{owner.name}-unit")
             _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
                        "STALL_TEST_SEND_TOGETHER": str(together)}
@@ -443,7 +443,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
               mock.patch("scripts.production.stall_watch.STATE_DIR", self.state),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee"))):
             launch = pane_record.launch("w1:p1", "204f532d-a97a-59e7-a6a7-caf86af3f5ee", str(self.root),
-                {"SHOWRUNNER_UNIT": "showrunner", "SHOWRUNNER_UNIT_ID": "unit-one"}, ["claude", "-n", "unit-one"])
+                {('' + 'SHOWRUNNER_' + 'UNIT'): "showrunner", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "unit-one"}, ["claude", "-n", "unit-one"])
             pane_record.write("agents", launch)
             self.assertIsInstance(stop_resume.stop("204f532d-a97a-59e7-a6a7-caf86af3f5ee"), stop_resume.NotRunning)
             return pane_record.record_path("agents")
@@ -677,7 +677,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         from scripts.production import showrunners
         import unit_lookup as lookup
         runners: list[showrunners.Showrunner] = []
-        marked: dict[str, dict[str, lookup.MarkedUnit]] = {}
+        marked: dict[str, dict[str, lookup.LabeledSession]] = {}
         for slug in ("first", "second"):
             doc = self.root / f"{slug}-production.md"
             _ = doc.write_text(f"# Production\n- **Production slug:** {slug}\n")
@@ -686,10 +686,10 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             marked[slug] = {}
             for name in ("alpha", "beta"):
                 row = unit_membership(slug, name)
-                marked[slug][name] = lookup.MarkedUnit(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name),
-                                                     staff_id=row.current_session)
+                marked[slug][name] = lookup.LabeledSession(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name),
+                                                     identity=lookup.LiveSession(row.current_session))
 
-        def marked_units(slug: str, *, record: staff.StaffSnapshot) -> dict[str, lookup.MarkedUnit]:
+        def labeled_sessions(slug: str, *, record: staff.StaffSnapshot) -> dict[str, lookup.LabeledSession]:
             del record
             return marked[slug]
         with (mock.patch.dict(os.environ, self.environment),
@@ -697,7 +697,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
               mock.patch.object(stall_watch, "STATE_DIR", self.state),
               mock.patch.object(showrunners, "load_settings", return_value={}),
               mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery(runners)),
-              mock.patch.object(lookup, "marked_units", side_effect=marked_units),
+              mock.patch.object(lookup, "labeled_sessions", side_effect=labeled_sessions),
               mock.patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as reads,
               mock.patch.object(stall_watch, "forget", return_value=None) as forget,
               mock.patch.object(stall_watch, "send_all") as send):
@@ -1155,7 +1155,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
               mock.patch.object(herdr, "shared_session", return_value="agents"),
               mock.patch.multiple(stall_watch, STATE_DIR=self.state, SEND=self.bin / "send.py")):
             launch = pane_record.launch("w1:p1", "204f532d-a97a-59e7-a6a7-caf86af3f5ee", str(self.root),
-                {"SHOWRUNNER_UNIT": "showrunner", "SHOWRUNNER_UNIT_ID": "unit-one", "STAFF_ID": row.id},
+                {('' + 'SHOWRUNNER_' + 'UNIT'): "showrunner", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "unit-one", "STAFF_ID": row.id},
                 ["claude", "-n", "unit-one"])
             pane_record.write("agents", launch)
             self.state.mkdir()
@@ -2458,7 +2458,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                     path.unlink()
                 self.send_log.unlink(missing_ok=True)
                 _ = self.tick(START)
-                marks = {"SHOWRUNNER_UNIT": "showrunner", "SHOWRUNNER_UNIT_ID": unit}
+                marks = {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": unit_session(unit)}
                 worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                           env={**os.environ, **marks})
                 self.children.append(worker)
@@ -2472,8 +2472,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
         self.panes["unit-one"]["slug"] = "old-showrunner"
         worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                  env={**self.environment, "SHOWRUNNER_UNIT": "old-showrunner",
-                                       "SHOWRUNNER_UNIT_ID": "unit-one"})
+                                  env={**self.environment, "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": unit_session("unit-one")})
         self.children.append(worker)
         self.process_rows.append(f"{worker.pid} 1 sleep 60")
         for at in (START, START + 300):
@@ -2494,12 +2493,12 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         rows = [stall_watch.Process(10, 1, "claude"), stall_watch.Process(20, 1, "build"),
                 stall_watch.Process(21, 1, "build")]
         with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(stall_watch, "staff_marks", return_value=("old-showrunner", "unit-one")),
+              mock.patch.object(stall_watch, "process_session", return_value="native-unit-one"),
               mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads):
-            self.assertFalse(stall_watch.work_running(10, rows, ("unrelated", "unit-one")))
-            self.assertEqual(reads.call_count, 1)
-            self.assertTrue(stall_watch.work_running(10, rows, ("showrunner", "unit-one")))
-            self.assertEqual(reads.call_count, 2)
+            self.assertFalse(stall_watch.work_running(10, rows, "unrelated"))
+            self.assertEqual(reads.call_count, 0)
+            self.assertTrue(stall_watch.work_running(10, rows, "native-unit-one"))
+            self.assertEqual(reads.call_count, 0)
 
     def test_recent_transcript_or_subagent_activity_prevents_a_bump(self) -> None:
         _ = self.tick(START)

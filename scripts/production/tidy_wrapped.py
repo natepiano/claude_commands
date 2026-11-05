@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production import staff, unit_lookup  # noqa: E402
+from scripts.production import staff, unit_lookup
+from scripts.production.store_owner import showrunner_id  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
@@ -37,18 +38,27 @@ class TidyRefused(Exception):
     pass
 
 
-def outstanding_path(slug: str) -> Path:
+def outstanding_path(slug: str, *, identities: QuestionStaff | None = None) -> Path:
     if not SLUG.fullmatch(slug) or slug in SHARED:
         raise TidyRefused(f"{slug!r} is not a production slug")
-    return STATE_DIR / "outstanding" / f"{slug}.json"
+    identity = showrunner_id(slug, record=identities.record if identities else None,
+                             sources=identities.sources if identities else None)
+    return STATE_DIR / "outstanding" / f"{identity}.json"
 
 
-def owned_paths(slug: str) -> tuple[Path, ...]:
-    outstanding = outstanding_path(slug)
-    return (STATE_DIR / "footers-off" / slug, STATE_DIR / "review-paused" / f"{slug}.json",
-            STATE_DIR / "outstanding" / f"{slug}.answered.jsonl",
-            outstanding, STATE_DIR / "counts" / slug,
-            STATE_DIR / "reports" / f"{slug}.json", STATE_DIR / slug)
+def owned_paths(slug: str, *, identities: QuestionStaff | None = None) -> tuple[Path, ...]:
+    from update_registration import QuestionStaff
+
+    if not SLUG.fullmatch(slug) or slug in SHARED:
+        raise TidyRefused(f"{slug!r} is not a production slug")
+    identities = identities if identities is not None else QuestionStaff.read()
+    identity = showrunner_id(slug, record=identities.record, sources=identities.sources)
+    return (STATE_DIR / "footers-off" / identity, STATE_DIR / "review-paused" / f"{identity}.json",
+            STATE_DIR / "outstanding" / f"{identity}.answered.jsonl",
+            STATE_DIR / "outstanding" / f"{identity}.history.jsonl",
+            STATE_DIR / "outstanding" / f"{identity}.lock",
+            STATE_DIR / "outstanding" / f"{identity}.json", STATE_DIR / "counts" / identity,
+            STATE_DIR / "reports" / f"{identity}.json", STATE_DIR / identity)
 
 
 def can_hold_questions(document: Path) -> bool:
@@ -62,17 +72,24 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
     """Close the production's questions and delete its state files."""
     from update_registration import QuestionFolder, QuestionStaff, close_questions, question_folder
 
-    paths = owned_paths(slug)
+    if not SLUG.fullmatch(slug) or slug in SHARED:
+        raise TidyRefused(f"{slug!r} is not a production slug")
+    identities = identities if identities is not None else QuestionStaff.read()
+    reference = identities.owner(document).id if document is not None else slug
+    paths = owned_paths(reference, identities=identities)
     if document is not None and can_hold_questions(document):
-        identities = identities if identities is not None else QuestionStaff.read()
         try:
-            if isinstance(question_folder(document, identities), QuestionFolder):
+            folder = question_folder(document, identities)
+            if isinstance(folder, QuestionFolder):
                 close_questions(document, identities)
+                directory = paths[-1]
+                if folder.path.parent == directory and directory.is_dir():
+                    paths = (*paths[:-1], *(path for path in directory.iterdir() if path != folder.path))
         except staff.StaffRefused as error:
             raise TidyRefused(str(error)) from error
     owners = {slug}
     if document is not None:
-        record = staff.initial_snapshot()
+        record = identities.record
         try:
             owners.update(row.name for row in unit_lookup.doc_units(document, record))
         except staff.StaffUnreadable:
@@ -119,10 +136,11 @@ def main(argv: list[str]) -> int:
     for name in argv:
         try:
             slug = wrapped_slug(Path(name))
-            if identities is None and can_hold_questions(Path(name)):
+            if identities is None:
                 identities = QuestionStaff.read()
             removed = tidy(slug, Path(name), identities=identities)
-        except (TidyRefused, RegistrationFailure, OSError, UnicodeError, ValueError) as error:
+        except (TidyRefused, RegistrationFailure, staff.StaffRefused, staff.StaffUnreadable,
+                OSError, UnicodeError, ValueError) as error:
             print(f"kept: {error}", file=sys.stderr)
             failed = True
             continue
