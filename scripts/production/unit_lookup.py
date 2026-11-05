@@ -494,7 +494,8 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
                         break
                     seen.add(current)
                     if holders.get(current) == holders[process.pid]:
-                        inherited.add(current)
+                        # A registered Claude keeps its pane; its headless claude child is the copy.
+                        inherited.add(process.pid if current in claudes else current)
             except (OSError, ValueError, IndexError, subprocess.SubprocessError):
                 # Keep this process evidence when its ancestry is unavailable.
                 pass
