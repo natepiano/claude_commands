@@ -185,6 +185,7 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
     import remote
 
     selected: list[staff.StaffRow] = []
+    shared_unknown = 0
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     for row in rows:
         try:
@@ -195,15 +196,21 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
                 observed = herdr.read_conversation(str(row.current_session), "claude")
                 if not isinstance(observed, herdr.LiveConversation):
                     codex = herdr.codex_conversations()
+                    herdr.codex_notes(codex)
                     observed = herdr.read_conversation(str(row.current_session), codex=codex)
             else:
                 observed = herdr.read_conversation(str(row.current_session), codex=codex)
             if isinstance(observed, herdr.LiveConversation):
                 selected.append(row)
             elif isinstance(observed, herdr.UnknownConversation):
-                herdr.conversation_note(observed)
+                if observed.shared_codex:
+                    shared_unknown += 1
+                if not observed.shared_codex or os.environ.get("SHUTDOWN_DETAIL") == "1":
+                    herdr.conversation_note(observed)
         except (OSError, ValueError) as error:
             _anomaly(row, error)
+    if shared_unknown:
+        print(f"anomaly: {shared_unknown} rows not proved live or stopped (shared cause above); not blocking", file=sys.stderr)
     return selected
 
 
