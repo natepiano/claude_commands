@@ -414,7 +414,9 @@ grep -q '^gpt-current=medium,high$' <(effective_registry) \
 # the catalog and the state file itself.
 mkdir -p "$(dirname "$SYNC_STATE")"
 mkdir "$(dirname "$SYNC_STATE")/sync.lock"
+registry_read_probe "$TEST_DIR" "$AGENTS"
 run_sync >"$TEST_DIR/stdout" 2>"$STDERR_FILE" || fail "a held lock did not exit 0"
+[[ ! -s "$TEST_REGISTRY_READS" ]] || fail "a sync without sync.lock read the registry: $(cat "$TEST_REGISTRY_READS")"
 assert_contains "$(<"$TEST_DIR/stdout")" "already running" \
     "a held lock was not reported as contention"
 rmdir "$(dirname "$SYNC_STATE")/sync.lock"
@@ -449,9 +451,11 @@ assert_contains "$(<"$STDERR_FILE")" "cannot create the sync state directory" \
 before="$TEST_DIR/before-invalid.conf"
 cp "$AGENTS" "$before"
 printf '%s\n' '{invalid' > "$MODELS_CACHE"
+: > "$TEST_REGISTRY_READS"
 if run_sync >/dev/null 2>&1; then
     fail "invalid cache unexpectedly succeeded"
 fi
+[[ -s "$TEST_REGISTRY_READS" ]] || fail "the invalid-cache sync did not read the registry"
 cmp "$before" "$AGENTS" || fail "invalid cache changed the registry"
 
 # Updating the shared catalog must keep the registry and its mode

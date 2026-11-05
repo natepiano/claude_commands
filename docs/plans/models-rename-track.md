@@ -326,7 +326,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - Isolated test copies take the whole `scripts/lib` folder with `shutil.copytree`, not a list of file names.
 - A merge that takes one side of a whole file drops this phase's fixture; use `git merge-file --theirs` for the conflict hunk only.
 
-### Phase 5b — 5a follow-ups: tests that fail without the simplify repairs  · status: todo
+### Phase 5b — 5a follow-ups: tests that fail without the simplify repairs  · status: done
 
 **Owner:** models-unit. 5a routed findings F005, F007 and F009 here at repair round 8 under the hard landing (2026-11-05). The 5a repairs landed; only the tests that fail without them are missing.
 

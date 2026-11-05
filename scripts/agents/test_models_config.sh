@@ -143,6 +143,36 @@ test_resolve_reads_registry_once() (
     echo "models_config single-read tests passed"
 )
 
+test_inherited_editor_writes_without_catalog_sync() (
+    export MODELS_CONFIG_FILE="$TEST_DIR/inherited-editor.conf"
+    export MODELS_LAUNCH_CONFIGURATION="" MODELS_CONFIG_TIER_ONLY=0
+    export CODEX_CONFIG_FILE="$TEST_DIR/editor-codex.toml"
+    export CODEX_MODELS_CACHE_FILE="$TEST_DIR/editor-models.json"
+    export CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/editor-last-success"
+    write_test_registry "$MODELS_CONFIG_FILE"
+    printf '%s\n' 'model = "gpt-test"' > "$CODEX_CONFIG_FILE"
+    printf '%s\n' '{"models":[{"slug":"gpt-test","visibility":"list","supported_reasoning_levels":[{"effort":"high"}]}]}' > "$CODEX_MODELS_CACHE_FILE"
+    touch -t 200001010000 "$CODEX_CATALOG_SYNC_STATE_FILE"
+    touch -t 200001010001 "$CODEX_CONFIG_FILE" "$CODEX_MODELS_CACHE_FILE"
+    export MODELS_REGISTRY_EDIT_BASE
+    MODELS_REGISTRY_EDIT_BASE="$("$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from scripts.lib.models_registry import RegistryEditBase
+path = Path(os.environ["MODELS_CONFIG_FILE"])
+print(RegistryEditBase(path, path.read_text(), ()).environment({})["MODELS_REGISTRY_EDIT_BASE"])
+PYTHON
+    )"
+    registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
+    bash "$SCRIPT_DIR/default_models.sh" direct.impl gpt-test:medium > "$TEST_DIR/editor-output" \
+        || fail "the inherited editor write failed"
+    [[ "$(wc -l < "$TEST_REGISTRY_READS")" -eq 2 ]] \
+        || fail "the inherited editor read outside its two publication reads: $(cat "$TEST_REGISTRY_READS")"
+    grep -q '^impl=gpt-test:medium$' "$MODELS_CONFIG_FILE" \
+        || fail "the inherited editor did not publish its row"
+)
+
 test_registry_edit_refreshes_readers() (
     MODELS_CONFIG_FILE="$TEST_DIR/edit-refresh.conf"
     write_fixture "$TEST_DIR/base.conf"
@@ -991,6 +1021,7 @@ agents_resolve production.director
 test_registry_edit_refreshes_readers
 test_changed_registry_file_refreshes_readers
 test_resolve_reads_registry_once
+test_inherited_editor_writes_without_catalog_sync
 test_spaced_keys_and_shell_quoting
 test_editor_uses_matching_text_and_values_after_a_concurrent_edit
 

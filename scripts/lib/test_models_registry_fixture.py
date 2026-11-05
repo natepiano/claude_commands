@@ -1,6 +1,7 @@
 """Assignment scopes share the complete registry fixture's row-override API."""
 from __future__ import annotations
 
+import io
 import os
 import sys
 import subprocess
@@ -9,6 +10,8 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 from typing import override
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stderr
 
 from scripts.lib import models_registry, test_models_registry as fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -43,25 +46,39 @@ class RegistryOverrideTests(unittest.TestCase):
             "", "quoted ' value $(exit 9)", "", "",
         ])
 
-    def test_fresh_operations_sync_before_reading_and_inherited_or_tier_only_operations_skip_sync(self) -> None:
+    def _catalog_sync_environment(self, body: str) -> dict[str, str]:
         root = self.path.parent
-        library = root / "scripts/lib/models_registry.py"
         script = root / "scripts/agents/sync_codex_catalog.sh"
         script.parent.mkdir(parents=True)
-        log = root / "sync-log"
-        state = root / "sync-state"
-        config = root / "codex.toml"
-        cache = root / "models.json"
-        for path in (config, cache):
+        _ = script.write_text(body)
+        script.chmod(0o755)
+        paths = {"CODEX_CONFIG_FILE": root / "codex.toml",
+                 "CODEX_MODELS_CACHE_FILE": root / "models.json",
+                 "CODEX_CATALOG_SYNC_STATE_FILE": root / "sync-state"}
+        for key, path in paths.items():
             _ = path.write_text("fixture")
-        _ = script.write_text("#!" + sys.executable + "\n" + '\n'.join([
+            os.utime(path, (1, 1) if key == "CODEX_CATALOG_SYNC_STATE_FILE" else (2, 2))
+        return {**{key: str(path) for key, path in paths.items()}, "MODELS_CONFIG_TIER_ONLY": "0"}
+
+    @contextmanager
+    def _catalog_sync_scope(self, environment: dict[str, str]) -> Generator[None]:
+        library = self.path.parent / "scripts/lib/models_registry.py"
+        with patch.object(models_registry, "__file__", str(library)), patch.dict(os.environ, environment):
+            yield
+
+    def test_fresh_operations_sync_before_reading_and_inherited_or_tier_only_operations_skip_sync(self) -> None:
+        root = self.path.parent
+        log = root / "sync-log"
+        sync_environment = self._catalog_sync_environment("#!" + sys.executable + "\n" + '\n'.join([
             "import os", "from pathlib import Path",
             "path = Path(os.environ['MODELS_CONFIG_FILE'])",
             f"with Path({str(log)!r}).open('a') as output: output.write(str(path) + '\\n')",
             "path.write_text(path.read_text().replace('source=before', 'source=synced'))",
             "Path(os.environ['CODEX_CATALOG_SYNC_STATE_FILE']).touch()",
         ]) + "\n")
-        script.chmod(0o755)
+        state = Path(sync_environment["CODEX_CATALOG_SYNC_STATE_FILE"])
+        config = Path(sync_environment["CODEX_CONFIG_FILE"])
+        cache = Path(sync_environment["CODEX_MODELS_CACHE_FILE"])
         original = "[catalog]\nsource=before\n"
         for factory in (models_registry.launch_configuration, models_registry.edit_base):
             for mode in ("missing-state", "new-config", "new-cache", "current-state", "inherited", "tier-only"):
@@ -81,9 +98,7 @@ class RegistryOverrideTests(unittest.TestCase):
                                  else models_registry.RegistryEditBase(self.path, original, ()))
                     environment = inherited.environment({}) if mode == "inherited" else {}
                     synchronize = mode not in ("inherited", "tier-only", "current-state")
-                    with patch.object(models_registry, "__file__", str(library)), patch.dict(os.environ, {
-                        "CODEX_CONFIG_FILE": str(config), "CODEX_MODELS_CACHE_FILE": str(cache),
-                        "CODEX_CATALOG_SYNC_STATE_FILE": str(state),
+                    with self._catalog_sync_scope({**sync_environment,
                         "MODELS_CONFIG_TIER_ONLY": "1" if mode == "tier-only" else "0",
                     }):
                         configuration = factory(environment)
@@ -92,6 +107,19 @@ class RegistryOverrideTests(unittest.TestCase):
                     self.assertEqual(configuration.text, original.replace("before", "synced") if synchronize else original)
                     self.assertEqual(next(row.value for row in configuration.rows if row.key == "source"),
                                      "synced" if synchronize else "before")
+
+    def test_failed_catalog_sync_warns_and_returns_the_current_configuration(self) -> None:
+        environment = self._catalog_sync_environment("#!/bin/sh\nexit 9\n")
+        original = "# Keep the current configuration.\n[assignments]\ndirect=codex\n"
+        _ = self.path.write_text(original)
+        for factory in (models_registry.launch_configuration, models_registry.edit_base):
+            with self.subTest(factory=factory.__name__), \
+                    self._catalog_sync_scope(environment), redirect_stderr(io.StringIO()) as errors:
+                configuration = factory({})
+            self.assertEqual(errors.getvalue(),
+                             "WARNING: Codex catalog sync failed; using the current model registry.\n")
+            self.assertEqual(configuration.path, self.path)
+            self.assertEqual(configuration.text, original)
 
     def test_shell_operations_use_unexported_registry_paths_and_explicit_paths_take_precedence(self) -> None:
         selected = fixture.write_registry(self.path, {"assignments": {"direct": "claude"}})

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 import fcntl
 import io
@@ -879,7 +879,10 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
 
     def test_resolve_reuses_the_stored_role_and_live_model_identity(self) -> None:
         self.open_worker()
-        self.assertEqual(self.resolve(self.session_dir), "address-with-no-role-suffix")
+        probe = RegistryReadProbe(self.session_dir, Path(os.environ["MODELS_CONFIG_FILE"]))
+        with probe.active({**os.environ, "MODELS_LAUNCH_CONFIGURATION": "", "MODELS_REGISTRY_EDIT_BASE": ""}):
+            self.assertEqual(self.resolve(self.session_dir), "address-with-no-role-suffix")
+        self.assertEqual(probe.total(), 0, probe.reads())
         record = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         worker = cast(dict[str, object], record["address-with-no-role-suffix"])
         self.assertEqual(worker["thread_id"], mesh_fixture.THREAD_ID)
