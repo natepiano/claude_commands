@@ -222,50 +222,31 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 ### Phase 3s — A moved session resumes only its own workers  · status: done
 
-**Owner:** models-unit (sdlc, 2026-11-05: "You own it; one worker beside 5a after the 3q hash"). shutdown-unit agrees the `stop_resume.py` and `inventory.py` edits (2026-11-05).
+#### As-built
 
-**Depends on:** 3q, and shutdown-unit's F007 (`stop(session, *, deadline=math.inf)` in `stop_resume.py`) on sdlc: merge sdlc after F007 lands, before dispatch.
-
-**Scope (sdlc, 2026-11-05):** devtools-unit 3t deletes the Codex branches of `implement.sh` and `review.sh` and switches every caller to `assign.sh`, `resume_message.resume_worker_command` included. 3s keeps only the worker list. If 3s lands first, it keeps the old resume command.
-
-#### Work Order
-
-**Goal:** A session move tells the moved session to resume only its own workers, with one result for each worker.
-
-**Spec:**
-
-1. Cause (cargo-liner showrunner, 2026-11-05 01:0x move to claude4): the move told the showrunner to resume 24 Codex workers of four units, not its own. One line carried a direct `implement.sh` resume command. `stop_resume.py:496` builds the list from `codex_seats([Path(run) for run in unit_runs.held(identity)])`. `unit_runs.held` finds each run's owner through staff (`unit_runs.director`, `unit_runs.py:132`), so the move takes every worker of every run the session directs. `inventory.codex_seats` (`inventory.py:843`) adds every roster entry of those runs and does not check each worker's `parent`.
-2. The move lists the moved row's staff children only: the worker rows whose `parent` is the moved row (`docs/plans/staff-lifecycle.md` section 2, item 6). Each child gives one entry, keyed by its fixed staff id, also when several runs name it.
-3. Each child gets one named result:
-   1. Resumable: its turn was live. Print its resume command from `resume_message.resume_worker_command`, unchanged.
-   2. Idle: its turn was not live. Keep the "idle: nothing to run now" line.
-   3. Unavailable: its roster entry, its run or its last assignment cannot be read. Print the child and the reason on one `anomaly:` line. Never call it idle.
-4. Do not edit the resume command: `resume_worker_command`, `_resume_task` and the fallback sentence belong to devtools-unit 3t.
-5. Delete the code this makes dead in the move's worker path. Keep `unit_runs.held` for its other caller (`unit_lookup.py:279`).
-6. Unexpected cases print one `anomaly:` line and continue (staff spec section 4).
-7. Carry the three results as one semantic type with variants Resumable, Idle and Unavailable, from `inventory.py` to the message text. `PausedSeat` (`inventory.py:812`) has required run fields and a `turn_live` Boolean, so it cannot hold an Unavailable child.
+- A session move lists only the moved row's staff children: the worker rows whose `parent` is the moved row. Each child gives one `WorkerResume` result, keyed by its staff id: `Resumable` (its resume command from `resume_message.resume_worker_command`, unchanged), `Idle` ("idle: nothing to run now"), or `Unavailable` (one `anomaly:` line with the child and the reason). `PausedSeat`, `Resumable`, `Idle`, `Unavailable` and `WorkerResume` live in `scripts/lib/resume_message.py`; `ResumeWorkers.results` matches on them.
+- `inventory.worker_resumes(parent, membership)` builds the list. It reads `agents_log.assignments` once, uses one clock reading, and takes the newest record pair from `session_staff.worker_run_entries`. Status comes from `worker_state.worker_status_path(directory, slot)` when the record has a slot, else from the roster entry. A slot record is live at `implementing`; a roster record is live at a `ROSTER_LIVE` status or a paused turn.
+- `session_staff._worker_runs` is one shared scan of the owners' marker runs and `unit_runs.run_folders()`, in mtime order. In each run, `impl_worker_*.json` records come first and roster entries last, so the roster record wins. `worker_run_entries` returns real records only; `worker_run_index` returns record runs and owner-marker runs, so `release_source` finds a loaded source thread through the owner marker.
+- `unit_runs.run_folders(root_override=None)` lists run folders in root order and name order, skips `root / "active"`, removes duplicate resolved paths and skips an unreadable root. `held_by_session` and the run index use it.
+- `scripts/direct/worker_state.py` holds `ROSTER_LIVE`, `worker_status_paths(run, pattern)` (run root, then `phases/*`) and `worker_status_path(run, slot)`; `assign.py`, `implement.sh`, `direct_run.py` and the inventory use them.
+- `worker_admission.admit` has no `role` parameter; the `AGENT_BG_ROLE` assignments and the prime `--role` option are gone.
 
 **Files:**
-- `scripts/shutdown/stop_resume.py` — the workers line of the move (shutdown-unit's file, agreed).
-- `scripts/shutdown/inventory.py` — `codex_seats` takes the staff children when it must (shutdown-unit's file, agreed; `_session_details` is messaging-unit's fenced code: do not edit it).
-- `scripts/lib/resume_message.py` — the per-worker result lines only; not `resume_worker_command` or `_resume_task`.
-- `scripts/shutdown/test_stop_resume.py`, `scripts/shutdown/test_inventory.py`, `scripts/lib/test_relaunch.py`, `scripts/notify/test_auto_silence.py` — regressions and callers.
+- `scripts/shutdown/inventory.py` — `worker_resumes`, the move's worker list.
+- `scripts/shutdown/stop_resume.py` — the move message's workers line.
+- `scripts/lib/resume_message.py` — the `WorkerResume` result types.
+- `scripts/production/session_staff.py` — the shared worker run scan.
+- `scripts/lib/unit_runs.py` — `run_folders`.
+- `scripts/direct/worker_state.py` — the slot status resolver.
+- `scripts/production/worker_admission.py` — `admit` without `role`.
 
-**Workers:** `1 writer` — `impl` writes the source and its regression tests.
+**Binds later work:** the live family-switch proofs merge the devtools launcher revision onto the 3s forms: `admit` takes no `role`, slot status comes from `worker_status_path`, the roster record wins over a slot record, and `worker_run_index` keeps marker-only runs.
 
-**Constraints from prior phases:**
+**Gotchas:**
+- A Claude worker has no mesh roster entry; its records are `impl_worker_<slot>.json` and the slot status file.
+- A read of `mesh_roster.json` under its shared lock creates the lock file; scan run folders only, never the `active` marker folder.
 
-1. 3q: `stop_resume.release_source` and `ReleaseSource` stay as 3q left them; F007's `stop` deadline merges beside them.
-2. devtools-unit 3t owns the resume command's switch to `assign.sh`. Keep one owner for each edit when 3s and 3t both edit `resume_message.py`.
-3. 5a: an agent start removes the operation snapshot with `models_registry.agent_environment` (Python) or the `models_config.sh` shell function. Keep that at every start this phase touches.
-
-**Acceptance gate:**
-
-1. A test moves a showrunner row that owns a unit's run in staff and has one worker child of its own, with a mixed-owner roster: the message lists only its own worker.
-2. A test covers a live-turn worker of each family (Codex and Claude): each gets one resumable entry with its resume command.
-3. Tests cover a child with no roster entry (one `anomaly:` line, not idle) and a child that two runs name (one entry).
-4. `test_stop_resume.py`, `test_inventory.py`, `test_relaunch.py`, `test_auto_silence.py` pass; basedpyright 0/0 on changed files and every caller module.
-5. Source lines net negative.
+**Ruled out:** a test that counts agents-log reads — it tests the implementation, not the behavior.
 
 ### Phase 3r — Live family-switch proofs through assign.sh  · status: todo
 
@@ -287,7 +268,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 4. For each switch, save the staff row before and after, the transcript extract path, and the destination's first-turn log. Put the evidence under `${PHASE_DIR}/proofs/`.
 5. Stop the worker and remove the fixture unit after the proofs.
 6. A switch defect the proofs find is fixed at its cause, with a real-path regression test. The director assigns that repair.
-7. Before the proofs, after devtools' one-launch-path change is on sdlc: remove the unused `role` parameter of `worker_admission.admit` at every caller (`assign.py`, `implement.sh`, `scripts/astra/design_roles.py`, `workers.py`, `codex_mesh.py`), and remove the `AGENT_BG_ROLE` assignments in `implement.sh` and `launch_friend.sh`. sdlc ruling 2026-11-04: models-unit owns `admit`, so it switches all callers. Ledger 3q F027 and F028.
+7. Done in the 3s checkpoint df2a08345: `worker_admission.admit` has no `role` parameter (`worker_admission.py:167`), and the `AGENT_BG_ROLE` assignments are gone. Ledger 3q F027 and F028.
 
 **Files:**
 - `scripts/production/worker_admission.py`
@@ -296,25 +277,26 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - `scripts/agents/codex_mesh.py`
 - `scripts/production/test_worker_admission.py`
 - `scripts/agents/test_agent_bg.py`
-- `scripts/direct/assign.py`, `scripts/direct/implement.sh`, `scripts/astra/design_roles.py`, `scripts/ask_a_friend/launch_friend.sh`, `scripts/direct/workers.py` — Spec item 7
-- `scripts/agents/test_codex_mesh.py`, `scripts/production/test_worker_fill.py`, `scripts/production/staff_test_support.py` — Spec item 7 callers; the generated child-process code at `staff_test_support.py:147` calls `admit(role=...)`
+- `scripts/direct/assign.py`, `scripts/direct/implement.sh`, `scripts/astra/design_roles.py`, `scripts/ask_a_friend/launch_friend.sh`, `scripts/direct/workers.py` — the launch path the proofs drive
+- `scripts/agents/test_codex_mesh.py`, `scripts/production/test_worker_fill.py`, `scripts/production/staff_test_support.py` — regression tests for a switch defect
 
 **Workers:** `1 writer + 1 tester`
 
-- `impl` — Spec item 7: the `admit` role parameter at every caller and the AGENT_BG_ROLE assignments, with their test edits (the test files and `staff_test_support.py` in Files); then any switch defect the director assigns. `test` starts after `impl` lands item 7.
-- `test` — Run both live switches through assign.sh on a fixture unit after item 7 lands, and record the evidence paths. Hand any defect to the director.
+- `impl` — Any switch defect the director assigns: the source repair only.
+- `test` — Run both live switches through assign.sh on a fixture unit, record the evidence paths, and write the regression tests and fixtures for each defect. Hand any defect to the director.
 
 **Constraints from prior phases:**
 
 1. 3q lands first; both phases edit the switch code.
 2. Live proofs use a throwaway fixture unit and never the live roster of a real unit.
-3. 5a: `codex_mesh.py` launch functions take a `models_registry.LaunchModelConfiguration` (`codex_mesh.py:6802`), and each later submission reads a fresh one. A fresh read runs catalog sync first; an inherited snapshot does not. Agent starts remove the operation variables after the environment loads. Item 7 keeps these, and the 5a lifetime and environment tests stay green.
+3. 5a: `codex_mesh.py` launch functions take a `models_registry.LaunchModelConfiguration` (`codex_mesh.py:6802`), and each later submission reads a fresh one. A fresh read runs catalog sync first; an inherited snapshot does not. Agent starts remove the operation variables after the environment loads. A switch repair keeps these, and the 5a lifetime and environment tests stay green.
+4. 3s: `admit` takes no `role` argument, and slot status comes from `worker_state.worker_status_path` (run root, then `phases/*`). The devtools revision 37faa1a05 still passes `role` to `admit` (`assign.py:831-834`) and reads the root-only status path (`assign.py:540`). At the merge that brings it in, keep the 3s forms: no `role`, `worker_status_path`, roster record over slot record, and marker-only runs in `session_staff.worker_run_index`. The 3s suites (`test_session_staff.py`, `test_inventory.py`, `test_unit_runs.py`, `test_worker_state.py`) pass on the merged tree before the proofs.
 
 **Acceptance gate:**
 
 1. Both switches keep the worker's fixed staff id and open no second destination.
 2. Each destination reads the extract before its first assignment.
-3. Item 7: `test_worker_admission.py`, `test_worker_fill.py`, `test_codex_mesh.py`, `test_agent_bg.py` and every other `admit` caller suite pass; basedpyright 0/0 on changed files and caller modules. `test_default_switch_request_reuses_the_published_destination_after_fresh_admission` and `test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch` stay.
+3. `test_worker_admission.py`, `test_worker_fill.py`, `test_codex_mesh.py`, `test_agent_bg.py` and the 3s suites pass; basedpyright 0/0 on changed files and caller modules. `test_default_switch_request_reuses_the_published_destination_after_fresh_admission` and `test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch` stay.
 4. Both outcomes go to sdlc with the evidence paths.
 
 ### Phase 5a — Bash reads the resolved model registry in one call  · status: done
@@ -350,7 +332,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 **Depends on:** 5a.
 
-**Order (models-unit, 2026-11-05):** starts when 3r item 7 lands, because both edit `test_codex_mesh.py`.
+**Order (models-unit, 2026-11-05):** starts after df2a08345, which landed 3r item 7; it does not wait for the 3r live proofs.
 
 #### Work Order
 
@@ -358,7 +340,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 **Spec:**
 
-1. F005: A test proves that worker reuse reads the registry zero times. `workers.resolve` returns a reused worker at `workers.py:519`, before it acquires a configuration at `workers.py:540`. Test the reuse path with no inherited snapshot, so a read moved before line 519 fails the test.
+1. F005: A test proves that worker reuse reads the registry zero times. `workers.resolve` returns a reused worker at `workers.py:519`, before it acquires a configuration at `workers.py:542`. Test the reuse path with no inherited snapshot, so a read moved before line 519 fails the test.
 2. F007: The registry-read count test drives the `default_models.sh` write path (not `--check`) with `MODELS_REGISTRY_EDIT_BASE` set and stale catalog sources. It proves no catalog sync runs inside an edit. The sensitivity revert targets the inherited-snapshot branch of `models_registry._snapshot` (`models_registry.py:70`); `models_config.sh` has no sync gate now.
 3. F009: A test proves that `sync_codex_catalog.sh` parses the registry only after it holds the catalog synchronization lock (the `sync.lock` folder, `sync_codex_catalog.sh:64`). Run it in write mode: `--check` takes no synchronization lock.
 4. A test proves that a failed catalog sync prints `WARNING: Codex catalog sync failed; using the current model registry.` to stderr and returns the current configuration (`models_registry.py:108`). The fixture sync script exits nonzero.
