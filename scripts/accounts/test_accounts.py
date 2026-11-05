@@ -525,7 +525,7 @@ class AccountsTests(unittest.TestCase):
     def test_stored_role_counts_use_the_native_current_session_without_a_launch_record(self) -> None:
         self.assert_stored_role_counts("native session")
 
-    def test_missing_or_unreadable_staff_keeps_showrunner_counts(self) -> None:
+    def test_missing_or_unreadable_staff_supplies_no_group_members(self) -> None:
         from scripts.production import staff
         from scripts.herdr import pane_launch
         from scripts.shutdown import inventory
@@ -550,7 +550,7 @@ class AccountsTests(unittest.TestCase):
                   patch.object(accounts, "_worker_status_records", return_value=[]),
                   redirect_stderr(io.StringIO()) as errors):
                 counts, _inputs = read()
-            self.assertEqual(counts, {(self.main_dir, "showrunners"): {"runner": "busy"}})
+            self.assertEqual(counts, {})
             self.assertEqual(errors.getvalue(), "" if missing else
                              "accounts: unit counts are incomplete: private staff unavailable\n")
 
@@ -637,6 +637,12 @@ class AccountsTests(unittest.TestCase):
             "fourth": {"status": "paused", "thread_id": "four", "port": 123},
             "ended": {"status": "ended", "thread_id": "ended", "port": 123},
         }))
+        for identity in ("runner-a", "runner-b"):
+            _ = fixture_member("showrunner", name=identity, runtime_id=fixture_runtime_id(identity))
+        stored = staff.local_snapshot()
+        membership = staff.StaffSnapshot(tuple(
+            replace(row, current_session=staff.StaffId(row.name)) if row.name in ("runner-a", "runner-b") else row
+            for row in stored.rows))
         runners = inventory.ShowrunnerRegistrations((
             inventory.ShowrunnerRegistration("runner-a", "runner-a", ""),
             inventory.ShowrunnerRegistration("runner-b", "runner-b", ""),
@@ -658,13 +664,13 @@ class AccountsTests(unittest.TestCase):
             _ = accounts.set_group_account("showrunners", runner_label, why="fixture")
             with (self.subTest(runner_label=runner_label),
                   patch.object(sessions, "running_sessions", return_value=owners),
+                  patch.object(staff, "local_snapshot", return_value=membership),
                   patch.object(pane_launch, "record_directory", return_value=records),
                   patch.object(accounts, "_session_config_dir", side_effect=live_directory),
                   # Even on a client machine, counts use only the retained local record.
                   patch.object(staff, "snapshot", side_effect=AssertionError("no owner fetch")),
                   patch.object(inventory, "showrunner_registrations", return_value=runners),
                   patch.object(accounts, "_mesh_server_running", return_value=True),
-                  patch.object(accounts, "live_group_members", side_effect=AssertionError("rich inventory")),
                   patch.object(subprocess, "run", side_effect=AssertionError("no process or network discovery")),
                   patch.object(subprocess, "Popen", side_effect=AssertionError("no process or network discovery"))):
                 code, text, error = self.run_cli("status", "--stored", "--json")
@@ -675,6 +681,44 @@ class AccountsTests(unittest.TestCase):
             self.assertIn(str(run / "mesh_roster.json"), document["session_inputs"])
             self.assertIn(str(records / "fixture.json"), document["session_inputs"])
             self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_board_and_group_move_share_staff_membership_and_the_live_process_account(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.shutdown import inventory
+        from scripts.production.staff_test_support import unit_membership
+
+        for label in ("claude2", "claude4"):
+            self.login_directory(label, label + "@example.invalid")
+        member = unit_membership("fixture", "models")
+        _ = accounts.set_group_account("units", "claude2", why="fixture")
+        records = self.root / "member-launches"
+        records.mkdir()
+        launch = pane_launch.PaneLaunch(pane_id="models-pane", session_id=member.id,
+            config_dir=str(self.home / ".claude2"), cwd=str(self.root), name=member.name,
+            model="", remote_control=False, environment={}, flags_read=True, written_at="2026-11-05T06:00:00Z")
+        _ = (records / "fixture.json").write_text(json.dumps({"models-pane": launch}))
+        owner = sessions.SessionRecord(pid=990901, sessionId=member.current_session, name=member.name,
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
+        membership = staff.local_snapshot()
+        with (patch.object(staff, "local_snapshot", return_value=membership),
+              patch.object(sessions, "running_sessions", return_value=[owner]),
+              patch.object(pane_launch, "record_directory", return_value=records),
+              patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude4")),
+              patch.object(inventory, "listing", side_effect=AssertionError("timer membership was read")),
+              patch.object(accounts, "_worker_status_records", return_value=[]),
+              patch.object(accounts, "move_sessions", side_effect=AssertionError("preview moved a session"))):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly())
+            result = accounts.move_group("units", "claude2", dry_run=True)
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        rows = {row["label"]: row for row in document["accounts"]}
+        self.assertEqual(rows["claude4"]["roles"], ["units"])
+        self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "shell": 0, "idle": 0, "total": 1}])
+        self.assertEqual(rows["claude2"]["role_counts"], [{"busy": 0, "shell": 0, "idle": 0, "total": 0}])
+        self.assertIsInstance(result, accounts.GroupMoveDryRun)
+        assert isinstance(result, accounts.GroupMoveDryRun)
+        self.assertEqual(result.session_ids, (member.current_session,))
+        self.assertIn(f"{member.name}: {member.current_session} · stop, then resume on claude2 (from claude4)", result.lines)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:
@@ -1928,29 +1972,9 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude3", (), 10, 1)])
 
-    def test_showrunner_group_move_names_every_unregistered_timer_even_without_live_members(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "other@example.invalid")
-        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
-        inventory = import_module("inventory")
-        stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
-                                       doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
-        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
-              patch.object(inventory, "unregistered_showrunners", return_value=stale),
-              patch.object(accounts, "move_sessions") as moved):
-            code, output, error = self.run_cli("move", "showrunners", "claude3")
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
-        self.assertIn("showrunners: no live session moves", output)
-        for runner in stale:
-            line = next(line for line in output.splitlines() if line.startswith(runner["slug"] + ":"))
-            self.assertIn("no session runs under the id", line)
-            self.assertIn("in any Claude session on", line)
-            self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", line)
-            self.assertIn(f"--production {runner['doc']}", line)
-        moved.assert_not_called()
-
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
+        from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
+
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "other@example.invalid")
         sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
@@ -1958,7 +1982,8 @@ class AccountsTests(unittest.TestCase):
         stale = showrunners.Showrunner(session="", socket="", slug="missing", zone="America/New_York",
                                        doc="/w/missing-production.md")
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
-              patch.object(inventory, "unregistered_showrunners", return_value=[stale]),
+              patch.object(inventory, "showrunner_registrations", return_value=ShowrunnerRegistrations((
+                  ShowrunnerRegistration("missing", stale["slug"], stale["doc"]),))),
               patch.object(accounts, "move_sessions") as moved):
             code, output, error = self.run_cli("move", "showrunners", "claude3", "--dry-run")
         self.assertEqual((code, error), (0, ""))
@@ -1970,6 +1995,31 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("--production /w/missing-production.md", output)
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
+        moved.assert_not_called()
+
+    def test_showrunner_group_move_names_every_unregistered_timer_even_without_live_members(self) -> None:
+        from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
+
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.login_directory("claude3", "other@example.invalid")
+        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
+        inventory = import_module("inventory")
+        stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
+                                       doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
+        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
+              patch.object(inventory, "showrunner_registrations", return_value=ShowrunnerRegistrations(tuple(
+                  ShowrunnerRegistration(runner["slug"], runner["slug"], runner["doc"]) for runner in stale))),
+              patch.object(accounts, "move_sessions") as moved):
+            code, output, error = self.run_cli("move", "showrunners", "claude3")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
+        self.assertIn("showrunners: no live session moves", output)
+        for runner in stale:
+            line = next(line for line in output.splitlines() if line.startswith(runner["slug"] + ":"))
+            self.assertIn("no session runs under the id", line)
+            self.assertIn("in any Claude session on", line)
+            self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", line)
+            self.assertIn(f"--production {runner['doc']}", line)
         moved.assert_not_called()
 
     def test_burn_after_role_retirement_without_history_never_defaults_to_showrunners(self) -> None:
