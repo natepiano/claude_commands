@@ -2786,8 +2786,7 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS
                  ) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Stop workers and retain their staff rows until assign.sh can restart them."""
-    from scripts.production import staff, session_staff, worker_admission
-
+    from scripts.production import staff, session_staff
     del why
     target = note_file.canonical_label(target)
     if _label_is(target, "codex"):
@@ -2812,6 +2811,7 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
             preview = f"not moved: {reason}" if reason else f"would stop; restart on {target} stays pending"
             lines.append(f"{row.name} ({row.id}): {preview}")
         return GroupMoveDryRun(identities, tuple(lines))
+    release_source = cast(stop_results.ReleaseSource, import_module("scripts.shutdown.stop_resume").release_source)
     runs_by_worker = session_staff.worker_run_index(record)
     results: list[SessionMoveOutcome] = []
     for row in rows:
@@ -2819,8 +2819,8 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
             with staff.row_operation(row.id):
                 if reason := restart_refusal(row.id):
                     raise AccountsError(f"{reason}; source remains running")
-                released = worker_admission.release_source(row, lambda: runs_by_worker.get(row.id, ()), record)
-                if not isinstance(released, worker_admission.SourceReleased):
+                released = release_source(row, lambda: runs_by_worker.get(row.id, ()), record.backends.get(row.id, staff.BACKEND_UNAVAILABLE))
+                if not isinstance(released, stop_results.SourceReleased):
                     raise AccountsError(released.reason)
                 results.append(stop_results.ResumePending(row.id, target,
                     "assign.sh cannot carry the staff id and destination account yet"))
