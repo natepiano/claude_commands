@@ -13,20 +13,24 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
-from unittest.mock import patch
+from unittest.mock import MagicMock, call as mock_call, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment
+    from ..lint.test_build_shape import create_step_index, record_root_attempt
 else:
     from memory_test_support import config_environment
+    from test_build_shape import create_step_index, record_root_attempt
 
 import index
 import memory
-from cargo_output import CargoOutputRoots
+from cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
@@ -749,6 +753,109 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertIn("builds: reset in the window; since the reset high 2, max 0, oom_kill 0; stall 0.0 s; peak 4.0", result.stdout)
         self.assertIn("CI: reset in the window; since the reset high 1, max 1, oom_kill 0; stall 0.0 s; peak 6.0", result.stdout)
         self.assertNotIn("no new high in the window", result.stdout)
+
+
+class BuildOutputRootsTests(unittest.TestCase):
+    base: Path = Path()
+    current: Path = Path()
+    index_file: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.current = self.checkout("current")
+        self.index_file = self.base / "steps.sqlite"
+        memory.build_output_roots.cache_clear()
+        self.addCleanup(memory.build_output_roots.cache_clear)
+        create_step_index(self.index_file)
+
+    def checkout(self, name: str) -> Path:
+        path = self.base / name
+        path.mkdir()
+        _ = (path / "Cargo.toml").write_text("[workspace]\n")
+        return path
+
+    def recorded_step(self, target: str, build: str, *, worktree: str = "", cwd: str = "",
+                      host: str = "natedev", argv: tuple[str, ...] = ("cargo", "check")) -> None:
+        record_root_attempt(self.index_file, worktree, target, build, cwd=cwd, host=host, argv=argv)
+
+    def build_roots(self, outputs: Mapping[Path, CargoOutputRoots],
+                    index_file: Path | None = None) -> tuple[frozenset[Path], MagicMock]:
+        def read(checkout: Path) -> CargoOutputRoots | CargoOutputUnavailable:
+            return outputs.get(checkout, CargoOutputUnavailable("fixture"))
+
+        with patch.object(memory, "read_cargo_output_roots", side_effect=read) as metadata:
+            roots = memory.build_output_roots(index_file if index_file is not None else self.index_file,
+                                             self.current, "natedev")
+        return roots, metadata
+
+    def test_recorded_pair_resolves_paths_and_uses_one_workspace(self) -> None:
+        workspace = self.checkout("recorded")
+        outside = self.checkout("outside")
+        target = self.base / "target"
+        alias = self.base / "target-alias"
+        alias.symlink_to(target)
+        build = self.base / "build"
+        self.recorded_step(str(alias), str(build), worktree=str(workspace), cwd=str(outside))
+        roots, metadata = self.build_roots({})
+        self.assertEqual(roots, frozenset((target, build)))
+        self.assertCountEqual(metadata.call_args_list, [mock_call(self.current), mock_call(workspace)])
+
+    def test_incomplete_pairs_keep_absolute_sides_without_a_workspace(self) -> None:
+        target = self.base / "target"
+        build = self.base / "build"
+        orphan = self.base / "orphan"
+        self.recorded_step(str(target), store.UNKNOWN_IDENTITY)
+        self.recorded_step("relative-target", str(build))
+        self.recorded_step("", "relative-build")
+        self.recorded_step(store.UNKNOWN_IDENTITY, str(orphan), worktree="relative-workspace", cwd="")
+        roots, metadata = self.build_roots({})
+        self.assertEqual(roots, frozenset((target, build, orphan)))
+        metadata.assert_called_once_with(self.current)
+
+    def test_unavailable_index_keeps_current_checkout_metadata(self) -> None:
+        empty_index = self.base / "empty.sqlite"
+        sqlite3.connect(empty_index).close()
+        missing_index = self.base / "missing.sqlite"
+        outputs = CargoOutputRoots(self.current, self.current / "target", self.current / "build")
+        for index_file in (missing_index, empty_index):
+            with self.subTest(index_file=index_file):
+                roots, metadata = self.build_roots({self.current: outputs}, index_file)
+                self.assertEqual(roots, frozenset((outputs.target_directory, outputs.build_directory)))
+                metadata.assert_called_once_with(self.current)
+
+    def test_other_host_adds_neither_outputs_nor_checkout(self) -> None:
+        foreign = self.checkout("foreign")
+        target = self.base / "local-target"
+        self.recorded_step(str(target), "")
+        self.recorded_step(str(foreign / "target"), str(foreign / "build"), worktree=str(foreign), host="mac")
+        roots, metadata = self.build_roots({})
+        self.assertEqual(roots, frozenset((target,)))
+        metadata.assert_called_once_with(self.current)
+
+    def test_metadata_probes_manifests_and_keeps_only_successful_outputs(self) -> None:
+        recorded = self.checkout("recorded")
+        unavailable = self.checkout("unavailable")
+        no_manifest = self.base / "no-manifest"
+        no_manifest.mkdir()
+        self.recorded_step("", "", cwd=str(recorded))
+        self.recorded_step("", "", worktree=str(unavailable))
+        self.recorded_step("", "", worktree=str(no_manifest))
+        current_outputs = CargoOutputRoots(self.current, self.current / "target", self.current / "build")
+        recorded_outputs = CargoOutputRoots(recorded, recorded / "target", recorded / "build")
+
+        roots, metadata = self.build_roots({self.current: current_outputs, recorded: recorded_outputs})
+        self.assertEqual(roots, frozenset((current_outputs.target_directory, current_outputs.build_directory,
+                                          recorded_outputs.target_directory, recorded_outputs.build_directory)))
+        self.assertCountEqual(metadata.call_args_list, [mock_call(self.current), mock_call(recorded), mock_call(unavailable)])
+
+    def test_target_override_adds_neither_pair_nor_checkout(self) -> None:
+        overridden = self.checkout("overridden")
+        self.recorded_step(str(overridden / "target"), str(overridden / "build"), worktree=str(overridden),
+                           argv=("cargo", "check", "--target-dir", str(overridden / "target")))
+        roots, metadata = self.build_roots({})
+        self.assertEqual(roots, frozenset())
+        metadata.assert_called_once_with(self.current)
 
 
 if __name__ == "__main__":

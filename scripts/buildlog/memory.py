@@ -10,12 +10,11 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import index
 import cgroup_capture
@@ -83,19 +82,21 @@ def cmdline_program(cmdline: str) -> str:
 @lru_cache(maxsize=1)
 def build_output_roots(index_file: Path, current_checkout: Path, host: str) -> frozenset[Path]:
     """Keep the active ledger's Cargo roots for this process."""
+    if TYPE_CHECKING:
+        from ..lint import build_shape
+    else:
+        from scripts.lint import build_shape
+
     roots: set[Path] = set()
     checkouts: set[Path] = {current_checkout}
-    try:
-        with closing(sqlite3.connect(f"{index_file.as_uri()}?mode=ro", uri=True)) as connection:
-            rows = cast(list[tuple[str, str, str, str]], connection.execute(
-                "SELECT DISTINCT target_directory, build_directory, worktree, cwd FROM steps WHERE host = ?",
-                (host,),
-            ).fetchall())
-        for target, build, worktree, cwd in rows:
-            roots.update(Path(path).resolve() for path in (target, build) if path and Path(path).is_absolute())
-            checkouts.update(Path(path) for path in (worktree, cwd) if path and Path(path).is_absolute())
-    except (OSError, sqlite3.Error):
-        pass
+    recorded = build_shape.recorded_output_roots(index_file, host)
+    if isinstance(recorded, build_shape.RecordedOutputRoots):
+        paths = {root.path for pairs in recorded.workspaces.values() for pair in pairs
+                 for root in (pair.target_directory, pair.build_directory)
+                 if isinstance(root, build_shape.AbsoluteRecordedRoot)}
+        roots.update(path.resolve() for path in paths)
+        checkouts.update(workspace.path for workspace in recorded.workspaces
+                         if isinstance(workspace, build_shape.AbsoluteRecordedRoot))
     for checkout in checkouts:
         if not (checkout / "Cargo.toml").is_file():
             continue
