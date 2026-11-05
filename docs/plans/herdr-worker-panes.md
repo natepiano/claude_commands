@@ -1746,33 +1746,17 @@ Each save makes one `pane process-info` call per listed pane.
 
 ### Phase 5c — Unknown pane evidence keeps the saved place past the age limit  · status: done
 
-**Depends on:** 5b (the saved layout binds rows from the native process scan).
+#### As-built
 
-#### Work Order
-
-**Goal:** A save with unknown pane evidence drops no saved tab binding for age, so a row whose pane cannot be read keeps its saved place (sdlc, 2026-11-05: a dropped binding loses a saved place, which is a wrong result).
-
-**Spec:**
-1. Today `Herdr.record_layout` (scripts/herdr/herdr.py about line 1398) gets `found, known` from `Herdr._row_panes`. When `known` is false it skips the retired-row filter, but it still calls `merged_layout(saved, live, now)`. `merged_order` (about line 1046) drops every saved entry unseen for longer than `LAYOUT_KEEP_SECONDS` (14 days). A row whose pane evidence is unknown is never seen live, so its binding goes after 14 days, while `_row_panes` prints "row placement retained".
-2. Give `merged_order` and `merged_layout` one keyword, `expire: bool = True`. With `expire=False`, no saved entry is dropped for age; live order and the seen time of live entries do not change. `record_layout` passes `expire=known`.
-3. A save with every pane known keeps the age rule as it is.
-4. Change nothing else. Add no second scan and no new message.
+`merged_order(saved, live, now, *, expire=True)` and `merged_layout(..., *, expire=True)` drop a saved entry unseen for longer than `LAYOUT_KEEP_SECONDS` only when `expire` is true.
+`Herdr.record_layout` passes `expire=known`, so a save with unknown pane evidence keeps every saved workspace and tab binding in its place.
+A save with every pane known keeps the age rule.
 
 **Files:**
-- `scripts/herdr/herdr.py` — the `expire` keyword and its one caller.
-- `scripts/herdr/test_herdr.py` — the regression tests.
+- `scripts/herdr/herdr.py` — the `expire` keyword and its caller.
+- `scripts/herdr/test_herdr.py` — unknown evidence keeps old bindings; known evidence expires them.
 
-**Workers:** `1 writer` — one slot owns both files.
-
-**State:** the saved layout file only; no new state.
-
-**Constraints from prior phases:** since 5b, `record_layout` reads `pane process-info` for every listed pane; every fake herdr in a new test answers it for each listed pane, and the test that needs unknown evidence makes one pane's reply fail.
-
-**Acceptance gate:**
-1. A test saves a layout with a tab binding seen more than `LAYOUT_KEEP_SECONDS` ago, beside a proved live row and one pane whose process-info read fails: the old binding stays, in its place, and stderr says the placement was retained.
-2. A test with every pane known and the same old binding: the binding is dropped, as before.
-3. Test 1 fails without the change; test 2 passes with and without it. The herdr, title and shutdown suites pass; basedpyright 0/0 on the changed files.
-4. Record added and deleted source lines in the checkpoint message.
+**Binds later work:** A change to how `record_layout` decides `known` passes the same value to `expire`.
 
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: moved: shutdown-unit (sdlc, 2026-11-04)
 
@@ -2218,11 +2202,13 @@ Keep busy panes open.
 - `scripts/production/test_staff_accessors.py` — read-only inventory gate.
 - `scripts/direct/progress_history.py`, `scripts/direct/recorder_state.py` — read only: the last dispatch role, pass identity, and existing state path.
 
-**Workers:** `1 writer + 1 tester` — split source and test files.
-- `impl` owns `worker_panes.py`, `herdr.py`, `models_registry.py`, `config/direct.conf`, and the staff accessor table rows.
+**Workers:** `2 writers + 2 testers` — one job per worker.
+- `impl` owns `worker_panes.py`, `config/direct.conf`, and the staff accessor table rows.
   The API hub is `scripts/herdr/worker_panes.py`.
-- `test` owns `test_worker_panes.py`, `test_herdr.py`, `test_herdr_sessions.py`, `test_models_registry.py`, and `fake_herdr.py`.
-  This slot changes every affected fake's process-info fixtures and writes behavior tests from the Spec.
+- `impl2` owns `herdr.py` and `models_registry.py`.
+- `test` owns `test_worker_panes.py` and `test_models_registry.py`.
+- `test2` owns `test_herdr.py`, `test_herdr_sessions.py`, and `fake_herdr.py`.
+  This slot changes every affected fake's process-info fixtures.
 
 **State:** staff rows; panes; `~/.local/state/staff/locks/<id>.lock`.
 
