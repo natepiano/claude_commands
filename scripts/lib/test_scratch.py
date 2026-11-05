@@ -191,7 +191,7 @@ class ScratchTests(unittest.TestCase):
                                        {"source.txt": "style source\n"})
         started = time.time()
         with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
-            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
             # Supply build output, but let copies supply every cache marker.
             fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"

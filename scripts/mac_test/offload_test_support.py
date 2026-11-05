@@ -88,6 +88,7 @@ class CommandFixture(TypedDict):
 class CommandEvent(TypedDict):
     command: str
     args: list[str]
+    transport_args: NotRequired[list[str]]
     claimed: bool
     exclude: NotRequired[str]
     copy_claim: NotRequired[bool]
@@ -526,6 +527,17 @@ raise SystemExit(offload.main())
         events = [cast(CommandEvent, json.loads(line))
                   for line in path.read_text(encoding="utf-8").splitlines()]
         for event in events:
+            if event["command"] == "ssh" and "copies.py mirror-use " in event["args"][-1]:
+                transport = event["args"]
+                words = shlex.split(transport[-1])
+                boundary = words.index("--")
+                self.assertEqual(words[boundary + 1:boundary + 3], ["sh", "-c"])
+                self.assertEqual(len(words[boundary + 3:]), 1)
+                self.assertIn("--owner", words[:boundary])
+                self.assertIn("--repository", words[:boundary])
+                self.assertIn("--session", words[:boundary])
+                event["transport_args"] = transport
+                event["args"] = [*transport[:-1], words[boundary + 3]]
             if "claim" in event:
                 event["copy_claim"] = event["claim"].get("copy", False)
                 event["what"] = event["claim"]["what"]

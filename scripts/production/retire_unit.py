@@ -19,6 +19,7 @@ for folder in ("production", "lib", "message", "shutdown", "direct"):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / folder))
 
 from scripts.production import staff, staff_sources, unit_config
+from scripts.copies import copies
 from scripts.shutdown.remote import local_machine
 from scripts.shutdown import stop_resume
 from scripts.message import sessions
@@ -541,6 +542,13 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
     refused = refusals(unit, settings=settings)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
+        return 1
+    try:
+        copies.remove_trees(unit.name)
+        if row.name != unit.name:
+            copies.remove_trees(row.name)
+    except (copies.CopyError, OSError) as error:
+        print(f"refused: {error}")
         return 1
     failed = remove(unit, settings=settings)
     if failed:

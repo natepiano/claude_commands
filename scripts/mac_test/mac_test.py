@@ -460,6 +460,7 @@ class CliArguments(argparse.Namespace):
         self.repo_root: str = ""
         self.copy: bool = False
         self.target: str = ""
+        self.leased_slots: list[int] = []
         self.from_pid: int = 0
         self.package: str = ""
         self.verb: offload.MacVerb = "nextest"
@@ -2071,7 +2072,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     for claim in overlapping:
         record = claim.record
         if ("remote_host" in record and record.get("cleanup_pending")
-                and record["pid"] == args.pid and not run_is_kept(record)):
+                and record["pid"] == args.pid and not run_is_kept(record)
+                and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
             print(f"leftovers: {record['remote_host']}")
             if "slot" in record:
                 print(f"slot: {record['slot']}")
@@ -2080,12 +2082,15 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         try:
             capacity = slot_capacity(paths, scope)
             slots = preferred_slots(paths, scope, args.worktree, capacity)
+            if args.leased_slots:
+                slots = tuple(slot for slot in slots if slot in args.leased_slots)
         except (OSError, StateReadError, ConfigError) as error:
             print(f"state unreadable: {error}")
             return ClaimFinished(12)
         for claim in overlapping:
             if (claim.record["pid"] == args.pid and claim.record["worktree"] == args.worktree
                     and not run_is_kept(claim.record) and "slot" in claim.record
+                    and (not args.leased_slots or claim.record["slot"] in args.leased_slots)
                     and isinstance(block, NoMacBlock)):
                 print(f"claimed\nslot: {claim.record['slot']}")
                 return ClaimFinished(0)
@@ -2095,6 +2100,16 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                 scope = selected
                 overlapping = ()
                 break
+        else:
+            if args.leased_slots and slots:
+                selected_slot = next((claim.record["slot"] for claim in overlapping
+                                      if run_is_kept(claim.record) and "slot" in claim.record
+                                      and claim.record["slot"] in args.leased_slots), slots[0])
+                scope = RepositoryScope(scope.name, scope.key, selected_slot)
+                overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
+    if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)
+            and args.leased_slots and scope.slot not in args.leased_slots):
+        return ClaimFinished(11)
     if isinstance(args.remote, str) or reserve_wait:
         for claim in overlapping:
             record = claim.record
@@ -2175,6 +2190,9 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     if len(owners) != 1 or not isinstance(args.remote, str):
         return ClaimFinished(12)
     claim = owners[0]
+    if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(claim.scope, RepositoryScope)
+            and args.leased_slots and claim.scope.slot not in args.leased_slots):
+        return ClaimFinished(11)
     # A reservation grants capacity. A later block still prevents new work.
     # Retained remote work keeps its cleanup path.
     if "remote_host" not in claim.record:
@@ -2664,6 +2682,7 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
     _ = claim.add_argument("--copy", action="store_true")
 
+    _ = claim.add_argument("--leased-slot", dest="leased_slots", type=int, action="append", default=[])
     _ = claim.add_argument("--from-pid", type=int, default=0)
     wait_claim = commands.add_parser("claim-wait")
     _ = wait_claim.add_argument("--pid", type=int, required=True)

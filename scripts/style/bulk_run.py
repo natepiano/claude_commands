@@ -1045,7 +1045,7 @@ def require_test_tree(repo: Path, tree: str) -> None:
 
 
 def test_tree(repo: Path, commit: str, tree: str, runner: Runner, times: dict[str, float], *, owner: str = "") -> CommandResult:
-    with copies.standing(owner or style_sync.gate_owner(repo), repo, commit) as checkout:
+    with copies.standing(owner or style_sync.gate_owner(repo), repo, copies.CommittedSource(commit)) as checkout:
         require_test_tree(checkout, tree)
         result = tested_tree_proof(checkout, tree, runner, times)
         require_test_tree(checkout, tree)

@@ -124,9 +124,18 @@ sha=$(git -C $repo rev-parse --verify "$sha^{commit}") || exit 2
 # The Mac cannot fetch from GitHub over ssh, so the commits go as a bundle.
 # When the source already holds the commit, no bundle is needed.
 clone_task=gate:mac-run-${sha}-$$
-clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clone $source_arg --task $clone_task --name hana") || exit 4
+copies_script=$lib/../copies/copies.py
+copy_owner=$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2])); from scripts.copies import copies; print(copies.source_owner(Path(sys.argv[2])))' $copies_script $repo) || exit 4
+copy_owner_arg=${(q)copy_owner}
+copy_session=${owner:-pid-$$}
+copy_session_arg=${(q)copy_session}
+clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clone $source_arg --task $clone_task --name hana --owner $copy_owner_arg --repository hana --session $copy_session_arg") || exit 4
 [[ $clone == /* && $clone != *$'\n'* ]] || { print -u2 'mac_run: scratch clone returned no absolute checkout'; exit 4 }
 clone_arg=${(q)clone}
+mirror_lease=$(python3 $copies_script register-remote --repo $repo --repository hana --owner $copy_owner --host $host --path $clone --session $copy_session --shell-lease) || exit 4
+exec 8>"$mirror_lease"
+flock 8
+python3 $copies_script register-remote --repo $repo --repository hana --owner $copy_owner --host $host --path $clone --session $copy_session || exit 4
 base=$(ssh $host "git -C $clone_arg rev-parse HEAD")
 if git -C $repo merge-base --is-ancestor $sha $base 2>/dev/null; then
   ssh $host "git -C $clone_arg checkout -q --detach $sha"
