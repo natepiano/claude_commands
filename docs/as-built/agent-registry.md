@@ -250,14 +250,14 @@ ended again so `design_roles.py end` can confirm the thread release.
 `stop` sets every roster worker to `ended` (with `--pause`, a shutdown stop, every
 non-ended worker to the followable `paused` instead), SIGTERMs each recorded pid (SIGKILL
 after `REAP_WAIT_SECS`, 5 s, checked every `REAP_POLL_SECS`, 0.2 s) and removes the
-server file. `scripts/direct/end_session.sh` calls it for every run folder the director
-holds (`unit_runs.py held`: the marker's run and each folder that records the director): the server is detached on purpose so it outlives
-each worker, so the end of the run is the only point that knows nobody needs
-it. That is also why it reaps `mesh_retired.json` as well as the live record —
-a server the retry below abandoned is left running, since it may still be
-finishing a peer worker's turn. Its watcher stops it sooner once no client and
-no running turn is left on it, and drops it from that list, so `stop` never
-signals a pid that has since gone to another process.
+server file. `scripts/direct/end_session.sh` calls it for every run folder the director holds.
+`unit_runs.py held` lists these folders.
+`end` also stops the recorded servers when every worker in the run has status `ended`.
+It uses the existing server reaper before `staff.retire`, so a retirement refusal leaves the servers stopped.
+Another open worker keeps the servers.
+A held design role keeps its existing lifecycle.
+The reaper includes retired server records.
+A watcher can stop an unused server earlier.
 
 **Recovering from a wedged app-server.** A stuck server answers every thread
 that attaches with a provider message it cached earlier — no round trip — so a

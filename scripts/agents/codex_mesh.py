@@ -6417,16 +6417,21 @@ def command_end(args: argparse.Namespace) -> int:
     """
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
-    with unit_workers.ending_worker(Path(session_dir), target) as remember_end, worker_lifecycle.membership_operation(session_dir):
+    with unit_workers.ending_worker(Path(session_dir), target) as remember_end, worker_lifecycle.membership_operation(session_dir) as membership:
         with worker_lifecycle.lock_worker(session_dir, target):
             result = end_worker_locked(args)
         if not result:
-            entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(target))
+            roster = _read_json_object(_session_path(session_dir, ROSTER_FILE))
+            entry = _as_dict(roster.get(target))
             if entry.get("status") != "ended":
                 return result
             remember_end()
             # The design end operation publishes its lifecycle before retirement.
             if not entry.get("held_design_id"):
+                if all(_as_dict(worker).get("status") == "ended" for worker in roster.values()):
+                    with worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS) as deadline:
+                        with _bulk_workers(session_dir, deadline=deadline, membership=membership) as workers, _server_lock(session_dir, deadline=deadline):
+                            _reap_run_servers(session_dir, operation=workers)
                 native = _as_str(session_staff.worker_session(entry))
                 row = staff.by_current_session(native) if native else None
                 if row is not None and row.kind == "worker":
@@ -6949,8 +6954,6 @@ def _release_source_servers(session_dir: str, row: staff.StaffRow, *, deadline: 
             return SourceReleaseUnknown("source server pid is invalid")
         server = _recorded_server_availability(record)
         if not isinstance(server, LiveServer):
-            if _pid_alive(pid):
-                return SourceReleaseUnknown("source server endpoint is unknown")
             observed = True
             continue
         client = Client(server.port, f"release-{os.getpid()}", operation_deadline=deadline)

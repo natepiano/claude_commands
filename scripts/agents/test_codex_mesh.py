@@ -1096,6 +1096,13 @@ class MeshCommandFixture(unittest.TestCase):
         select_fixture_workers(self.home, notes=self.home)
         self.server = StubAppServer(self.respond)
         signal_process = codex_mesh._signal_process  # pyright: ignore[reportPrivateUsage]
+        reap_process = codex_mesh._reap  # pyright: ignore[reportPrivateUsage]
+
+        def reap_fixture(pid: int, *, deadline: float = codex_mesh.NO_LOCK_DEADLINE) -> bool:
+            # The stub uses a thread in this process; real child processes use the real reaper.
+            return True if pid == os.getpid() else reap_process(pid, deadline=deadline)
+
+        self.patches.enter_context(patch.object(codex_mesh, "_reap", reap_fixture))
 
         def protect_runner(pid: object, signum: int, *, group: bool = False) -> None:
             if pid == os.getpid() and signum != 0:
@@ -2262,6 +2269,21 @@ class StaffAdmissionTests(MeshCommandFixture):
                     _ = server.write_text(json.dumps(evidence))
                 result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
                 self.assertIsInstance(result, expected)
+
+    def test_source_release_ignores_an_unrelated_live_pid_without_a_live_server(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        row = session_staff.worker_row(self.worker_record())
+        assert row is not None
+        server = self.session_dir / codex_mesh.SERVER_FILE
+        for retained in (False, True):
+            with self.subTest(retained=retained):
+                evidence = {"pid": os.getpid(), "port": 0}
+                self.write_pool_roster({"worker": {"staff_id": row.id, "status": "done"}})
+                contents = {"previous_servers": [evidence]} if retained else evidence
+                atomic_file.write_text_atomic(server, json.dumps(contents))
+                result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
+                self.assertIsInstance(result, stop_results.SourceReleased)
+                os.kill(os.getpid(), 0)
 
     def test_only_active_records_belong_to_the_matching_launcher(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
@@ -10086,7 +10108,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
             ))
 
         self.assertEqual(code, 0)
-        self.assertEqual(output.getvalue(), "ending worker\n")
+        self.assertEqual(output.getvalue(), f"ending worker\nstopped app-server {os.getpid()}\n")
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual(self.methods("turn/interrupt"), [])
 
@@ -10104,6 +10126,59 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(self.worker_record()["staff_id"], THREAD_ID)
         self.assertIsNone(staff.local_snapshot().by_id(staff.native_id(THREAD_ID)))
         self.assertEqual(self.worker_record()["context_tokens"], 123456)
+
+    def test_end_stops_the_last_workers_server_before_staff_retirement(self) -> None:
+        for refuse in (False, True):
+            with self.subTest(retire_refuses=refuse):
+                self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+                row = session_staff.worker_row(self.worker_record())
+                assert row is not None
+                with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                      stdin=subprocess.PIPE) as process:
+                    atomic_file.write_text_atomic(self.session_dir / codex_mesh.SERVER_FILE,
+                        json.dumps({"pid": process.pid, "port": self.server.port}))
+                    retire = staff.retire
+
+                    def retire_after_stop(identity: staff.StaffId) -> staff.StaffRow | None:
+                        self.assertIsNotNone(process.poll())
+                        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+                        if refuse:
+                            raise staff.StaffRefused("fixture retirement refusal")
+                        return retire(identity)
+
+                    with patch.object(staff, "retire", side_effect=retire_after_stop):
+                        code, output, errors = self.run_mesh(["end", "--to", "worker"])
+                    self.assertEqual(code, 1 if refuse else 0, errors)
+                    self.assertIn(f"stopped app-server {process.pid}", output)
+                    self.assertIsNotNone(process.poll())
+                    self.assertEqual(self.worker_record()["status"], "ended")
+                    if refuse:
+                        self.assertIn("fixture retirement refusal", errors)
+                        self.assertEqual(staff.by_id(row.id), row)
+                    else:
+                        self.assertEqual(errors, "")
+                        self.assertIsNone(staff.by_id(row.id))
+
+    def test_end_keeps_the_server_for_another_open_worker(self) -> None:
+        self.write_pool_roster({
+            "worker": {"thread_id": THREAD_ID, "status": "done"},
+            "peer": {"thread_id": fixture_runtime_id("open peer"), "status": "done"},
+        })
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE) as process:
+            server = self.session_dir / codex_mesh.SERVER_FILE
+            atomic_file.write_text_atomic(server, json.dumps({"pid": process.pid, "port": self.server.port}))
+            before = server.read_bytes()
+            code, output, errors = self.run_mesh(["end", "--to", "worker"])
+            self.assertEqual(code, 0, errors)
+            self.assertNotIn("stopped app-server", output)
+            self.assertIsNone(process.poll())
+            self.assertEqual(server.read_bytes(), before)
+            self.assertEqual(self.worker_record()["status"], "ended")
+            self.assertEqual(_as_test_dict(self.roster()["peer"])["status"], "done")
+            assert process.stdin is not None
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=LauncherHangGuard("open peer server cleanup").remaining()), 0)
 
     def test_capacity_exhaustion_has_a_distinct_run_outcome(self) -> None:
         """Retry exhaustion is control state, not failure text."""
@@ -13432,6 +13507,11 @@ def observed(handle, operation):
         print('locking', flush=True)
     return flock(handle, operation)
 fcntl.flock = observed
+# The server fixture uses a thread in the parent process.
+reap_process = codex_mesh._reap
+def reap_fixture(pid, *, deadline=codex_mesh.NO_LOCK_DEADLINE):
+    return True if pid == os.getppid() else reap_process(pid, deadline=deadline)
+codex_mesh._reap = reap_fixture
 with isolated_source_readers():
     raise SystemExit(codex_mesh.main(['end', '--session-dir', sys.argv[1], '--to', 'worker']))
 """
