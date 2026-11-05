@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -17,6 +18,8 @@ from scripts.build_queue.queue_card import select_waiters
 from scripts.build_queue.queue_lines import json_form, plain
 from scripts.build_queue.queue_evidence import step_labels
 from scripts.build_queue.queue_view import QueueModel, HostLoad, HostLoadUnavailable, UnknownCpuCount, render_view
+from scripts.build_queue.queue_lines import Span
+from scripts.buildlog.mac_idle_alert import alert_line, state_dir
 from scripts.lint import memory_admit
 from scripts.lib.user_zone import user_zone
 from scripts.message import unit_labels
@@ -152,6 +155,9 @@ def main() -> int:
             from scripts.build_queue.queue_card import render_selection
 
             lines.extend([(), *render_selection(model, words[0], arguments.columns)])
+        alert = alert_line(state_dir() / "alert.json", time.time(), user_zone())
+        if alert is not None:
+            lines.insert(0, (Span(alert, "error", bold=True),))
         print(json.dumps(json_form(lines, arguments.columns, reading.explanation.now),
                          ensure_ascii=False, separators=(",", ":")) if arguments.json else plain(lines))
     except admission_protocol.AdmissionUnavailable as error:

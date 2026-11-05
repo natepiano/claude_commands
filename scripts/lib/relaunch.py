@@ -119,7 +119,7 @@ def _execute_request(path: Path) -> None:
     for key in request["unset"]:
         _ = environment.pop(key, None)
     environment.update(request["environment"])
-    if "cwd" in request and not environment.get("SHOWRUNNER_UNIT_ID"):
+    if "cwd" in request:
         os.chdir(request["cwd"])
     print(" ".join(request["note"].splitlines()), flush=True)
     script = str(Path(__file__).resolve())

@@ -1,6 +1,6 @@
 # builds-natest — Next
 
-The phase backlog of natest-unit. At each phase end, re-sort with `python3 ~/.claude/scripts/test_times/show.py top`, and the next speed phase takes the top live module that no phase holds.
+The phase backlog of natest-unit. At each phase end, rank modules with `python3 ~/.claude/scripts/test_times/show.py top --repo ~/.claude`. The next speed phase takes the highest ranked live module that no phase holds, subject to the floor rule.
 
 ## Descending sort
 
@@ -22,11 +22,17 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 
 ## Items to consider
 
-- [ ] **Select the next speed targets after Phase 14.**
-  - Target: the highest ranked live modules in `test_times top` that no phase owns, subject to the plan's floor rule.
-  - Why needed: the user's mission takes the next module when the longest one is shorter (2026-11-03). The 2026-11-03 list named `scripts/direct/test_review_launcher_pool.py`, which no longer exists.
-  - Completion condition: each selected module goes through the Speed method with its current path and a measured baseline.
-  - Revealed by: the 2026-11-03 sort; the Phase 11 architect review.
+- [x] **One path to `send.py`.** 29 production modules build their own `send.py` path in place of `session_send`. Sent to the showrunner on 2026-11-05 with the owner of each file; recommended owner: natedev-messaging. Phase 26 refuses the sender when `TEST_SENDER_GUARD` is set; the runner item below owns the guard for every module. No natest work remains on this caller cleanup.
+- [ ] **The test runner guards every module from the real `send.py`.**
+  - Target: `scripts/test_times/module_run.py`, `scripts/message/session_send_test_support.py`
+  - Why needed: after Phase 26, only the four modules that call `forbid_real_sender()` are guarded, and the runner finds the marker through that module's stored record. A module that never installs the guard, or a marker variable inherited from a parent, is not checked (Phase 26 adversary round 2). No module in the gate takes either path today.
+  - Completion condition: the runner sets one marker path before `unittest.main` for every module and checks that path after it; the four installs reuse it; the gate shows which modules, if any, start the real `send.py`.
+  - Revealed by: Phase 26 adversary review round 2, 2026-11-05.
+- [ ] **Select the next speed target after Phases 24 and 27.**
+  - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
+  - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
+  - Candidate: `direct/test_verify_lint_cache_versions.py`, gate median 116.1 s over 5 runs on 2026-11-05; it waits on the verify-unit remake like Phase 24. Confirm the rank at selection.
+  - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
 - [ ] **Architecture proposal: the type-check job**
   - Target: `scripts/production/merge_gate.py` (owner sdlc devtools-unit)
   - Why needed: report-unit names `types/basedpyright` among the three highest-CPU gate jobs (2-4 min). One basedpyright job checks every listed folder in each gate.

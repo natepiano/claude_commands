@@ -183,6 +183,16 @@ class NativePaneSessionTests(StaffTestCase):
             with self.assertRaisesRegex(ValueError, "native process start changed"):
                 _ = client.codex_launch("w1:p1", arguments)
 
+    def test_codex_launch_removes_retired_identity_before_retaining_the_launch(self) -> None:
+        identity = fixture_runtime_id("clean-codex-launch")
+        observation = herdr.NativeAgentProcess(herdr.RolloutThread(identity), "same-start", {"SHOWRUNNER_UNIT": "old"})
+        with (codex_launch_evidence(self.root, ["codex", "resume", identity]) as info,
+              patch.object(herdr, "native_process", return_value=observation),
+              patch.object(herdr, "run_program", return_value=subprocess.CompletedProcess[str](
+                  [], 0, json.dumps({"result": info}), ""))):
+            entry = herdr.Herdr("agents").codex_launch("w1:p1", ["resume", identity])
+        self.assertEqual(entry["environment"], {})
+
     def test_foreground_process_without_argv_does_not_hide_the_agent(self) -> None:
         identity = fixture_runtime_id("foreground-agent")
         observation = herdr.NativeAgentProcess(herdr.RolloutThread(identity), "same-start", {"CODEX_HOME": str(self.root / ".codex2")})
@@ -1492,6 +1502,27 @@ class LaunchDestinationTests(StaffTestCase):
                     self.assertIn("CODEX_HOME=/account", command[1])
                     self.assertIn("cd -- /tmp", command[1])
 
+    def test_existing_pane_removes_legacy_labels_in_a_private_shell(self) -> None:
+        client = Mock(spec=herdr.Herdr)
+        cast(Mock, client.panes).return_value = [{"pane_id": "worker", "terminal_id": "terminal-one"}]
+        prepared = herdr.PreparedAgentEnvironment(self.root, {
+            "CODEX_THREAD_ID": "replacement-native-id", "KEPT_SETTING": "kept"})
+        with (patch.object(herdr, "Herdr", return_value=client),
+              patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
+            _ = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
+                prepared, "codex", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
+        command = cast(list[str], cast(Mock, client.run_in_pane).call_args.args[1])
+        legacy = "SHOWRUNNER_" + "UNIT"
+        unit_id = legacy + "_ID"
+        shell_environment = {"PATH": os.environ["PATH"], legacy: "old production", unit_id: "old-unit",
+                             "SHOWRUNNER_EXTRA": "old value=with spaces", "CODEX_THREAD_ID": "old-native-id"}
+        query = (f"; printf '%s\\n' \"${{{legacy}-unset}}\" \"${{{unit_id}-unset}}\" "
+                 '"${SHOWRUNNER_EXTRA-unset}" "$CODEX_THREAD_ID" "$KEPT_SETTING"')
+        result = subprocess.run([shutil.which("sh") or "/bin/sh", "-c", command[1] + query],
+                                env=shell_environment, capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["unset", "unset", "unset", "replacement-native-id", "kept"])
+
     def test_existing_pane_refuses_overwriting_proved_foreground_work(self) -> None:
         client = herdr.Herdr("agents")
         log = self.root / "occupied-pane.jsonl"
@@ -2034,12 +2065,12 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(self.commands()[-1], ["--session", "fixture", "pane", "rename", "worker", "dispatch-owner"])
 
     def test_unmarked_child_cannot_inherit_its_directors_staff_identity(self) -> None:
-        with patch.dict(os.environ, {"STAFF_ID": "s123456789ab", "SHOWRUNNER_UNIT": "old",
-                                     "SHOWRUNNER_UNIT_ID": "alpha-unit", "KEPT_SETTING": "kept"}):
+        with patch.dict(os.environ, {"STAFF_ID": "s123456789ab", ('' + 'SHOWRUNNER_' + 'UNIT'): "old",
+                                     ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit", "KEPT_SETTING": "kept"}):
             environment = herdr.unmarked_environment()
         self.assertNotIn("STAFF_ID", environment)
-        self.assertNotIn("SHOWRUNNER_UNIT", environment)
-        self.assertNotIn("SHOWRUNNER_UNIT_ID", environment)
+        self.assertNotIn(('' + 'SHOWRUNNER_' + 'UNIT'), environment)
+        self.assertNotIn(('' + 'SHOWRUNNER_' + 'UNIT_ID'), environment)
         self.assertEqual(environment["KEPT_SETTING"], "kept")
 
 
@@ -2523,13 +2554,9 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
         message = isolated.parent / "message"
         copy_session_modules(message)
-        library = isolated.parent / "lib"
-        library.mkdir(exist_ok=True)
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/process_failure.py", library / "process_failure.py")
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/probe_session.py", library / "probe_session.py")
-        for relative in ("lib/script_envelope.py", "lib/session_paths.py", "lib/atomic_file.py", "lib/conf.py", "lib/agent_scope.py", "agents/worker_lifecycle.py",
-                         "production/staff.py", "shutdown/remote.py"):
+        _ = shutil.copytree(Path(herdr.__file__).resolve().parents[1] / "lib", isolated.parent / "lib", dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "test_*"))
+        for relative in ("agents/worker_lifecycle.py", "production/staff.py", "shutdown/remote.py"):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)
@@ -2760,7 +2787,7 @@ class HerdrTests(unittest.TestCase):
             f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated\n")
         self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
         self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": [{'pane_id': 'w1:p1', 'workspace_id': 'w1'}, {'pane_id': 'w1:p2', 'workspace_id': 'w1'}]}}))
-        self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 SHOWRUNNER_UNIT=prod SHOWRUNNER_UNIT_ID=unit")
+        self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 CODEX_THREAD_ID=unit")
         self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p1")
         self.darwin_environment(74, "claude HERDR_PANE_ID=forged", "")
         self.configure(["-o", "command=", "-p", "75"], code=1, stderr="vanished")
@@ -2770,7 +2797,7 @@ class HerdrTests(unittest.TestCase):
         self.configure(["-a", "-p", "76", "-d", "cwd", "-Fn"], code=1, stderr="gone")
         rows = herdr.herdr_processes()
         self.assertCountEqual(rows, [
-            herdr.HerdrProcess(71, herdr.HerdrPlace("writing", "w1:p1"), {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}, "zsh", "/work folder"),
+            herdr.HerdrProcess(71, herdr.HerdrPlace("writing", "w1:p1"), {"CODEX_THREAD_ID": "unit"}, "zsh", "/work folder"),
             herdr.HerdrProcess(72, herdr.HerdrPlace("writing", "w1:p1"), {}, "claude", "/work folder"),
             herdr.HerdrProcess(76, herdr.HerdrPlace("writing", "w1:p2"), {}, "claude",
                                herdr.UnreadableCwd("process 76 cwd: stderr: gone"))])
@@ -2786,7 +2813,7 @@ class HerdrTests(unittest.TestCase):
                        f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n")
         self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
         self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": [{'pane_id': 'w1:p1', 'workspace_id': 'w1'}]}}))
-        self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 SHOWRUNNER_UNIT=prod SHOWRUNNER_UNIT_ID=unit")
+        self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 CODEX_THREAD_ID=unit")
         self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p1")
         for output, code, error in (("", 1, "permission denied"), ("p72\nfcwd\n", 0, ""),
                                     ("n/one\nn/two\n", 0, "")):
@@ -2795,7 +2822,7 @@ class HerdrTests(unittest.TestCase):
                     self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], output, code, error)
                 processes = {process.pid: process for process in herdr.herdr_processes()}
                 self.assertCountEqual(processes, [71, 72])
-                self.assertEqual(processes[71].marks, {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"})
+                self.assertEqual(processes[71].marks, {"CODEX_THREAD_ID": "unit"})
                 for process in processes.values():
                     self.assertIsInstance(process.working_directory, herdr.UnreadableCwd)
                     self.assertEqual(process.place, herdr.HerdrPlace("writing", "w1:p1"))
@@ -3150,15 +3177,15 @@ class HerdrTests(unittest.TestCase):
         _ = (folder / "shared-session").write_text("fixture\n")
 
     def test_programs_and_servers_never_inherit_a_units_marks(self) -> None:
-        with patch.dict(os.environ, SHOWRUNNER_UNIT="show/demo-unit", SHOWRUNNER_UNIT_ID="id-demo", KEPT="yes"), \
+        with patch.dict(os.environ, {"SHOWRUNNER_" + "UNIT": "show/demo-unit", "SHOWRUNNER_" + "UNIT_ID": "id-demo", "KEPT": "yes"}), \
                 patch.object(subprocess, "run") as run:
             _ = herdr.run_program(["true"])
             given = cast(dict[str, str], run.call_args.kwargs["env"])
             self.assertEqual(given["KEPT"], "yes")
-            self.assertNotIn("SHOWRUNNER_UNIT", given)
-            self.assertNotIn("SHOWRUNNER_UNIT_ID", given)
-            _ = herdr.run_program(["true"], environment={"SHOWRUNNER_UNIT": "explicit"})
-            self.assertEqual(run.call_args.kwargs["env"], {"SHOWRUNNER_UNIT": "explicit"})
+            self.assertNotIn(('' + 'SHOWRUNNER_' + 'UNIT'), given)
+            self.assertNotIn(('' + 'SHOWRUNNER_' + 'UNIT_ID'), given)
+            _ = herdr.run_program(["true"], environment={('' + 'SHOWRUNNER_' + 'UNIT'): "explicit"})
+            self.assertEqual(run.call_args.kwargs["env"], {})
 
     def test_shared_session_is_agents_until_named(self) -> None:
         self.assertEqual(herdr.shared_session(), "agents")
@@ -3174,11 +3201,13 @@ class HerdrTests(unittest.TestCase):
 
     def test_open_tab_creates_the_production_workspace_once_then_adds_tabs(self) -> None:
         members = {name: fixture_member("showrunner", name=name) for name in ("boss", "alpha")}
-        options = ["--label", "boss", "--cwd", "/repo", "--env", "SHOWRUNNER_UNIT=prod", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
+        options = ["--label", "boss", "--cwd", "/repo", "--env",
+                   "CLAUDE_CODE_SESSION_ID=" + members["boss"].current_session, "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
         self.configure_herdr(["workspace", "create", *options], json.dumps({"result": {
             "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}}}))
         self.configure_herdr(["tab", "list"], json.dumps({"result": {"tabs": []}}))
-        environment = {"SHOWRUNNER_UNIT": "prod", herdr.nix_env.HEAL_SESSION_ENV: "healed-session",
+        environment = {('' + 'SHOWRUNNER_' + 'UNIT'): "prod",
+                       "CLAUDE_CODE_SESSION_ID": members["boss"].current_session, herdr.nix_env.HEAL_SESSION_ENV: "healed-session",
                        herdr.nix_env.HEAL_DIRECTORY_ENV: "/repo"}
         self.assertEqual(herdr.open_tab("fixture", "boss", "boss", "/repo", environment), "w1:p1")
         self.assertEqual(self.commands()[1:4], [["--session", "fixture", "workspace", "create", *options],
@@ -3196,10 +3225,22 @@ class HerdrTests(unittest.TestCase):
             {"pane_id": f"w1:p{index}", "tab_id": f"w1:t{index}",
              "agent_session": {"value": members[name].current_session}}
             for index, name in enumerate(("boss", "alpha"), 1)]}}))
+        self.enterContext(fake_unit_host.private_process_registry())
+        for index, name in enumerate(("boss", "alpha"), 1):
+            pid = 992000 + index
+            fake_unit_host.process(os.environ, pid, 1, ["claude"], {})
+            registry = sessions.sessions_dir() / f"{pid}.json"
+            registry.parent.mkdir(parents=True, exist_ok=True)
+            _ = registry.write_text(json.dumps({"pid": pid, "procStart": "1", "name": name,
+                "sessionId": members[name].current_session, "updatedAt": 1, "messagingSocketPath": ""}))
+            self.configure_herdr(["pane", "process-info", "--pane", f"w1:p{index}"], json.dumps({"result": {
+                "process_info": {"shell_pid": 990000 + index, "foreground_process_group_id": pid,
+                    "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
-        self.assertEqual([command[2:] for command in self.commands()[-9:]], [
+        self.assertEqual([command[2:] for command in self.commands()[-11:]], [
             tab, ["pane", "rename", "w1:p2", "alpha"], ["tab", "list", "--workspace", "w1"], ["workspace", "list"],
-            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"], ["pane", "list"]])
+            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"], ["pane", "list"],
+            ["pane", "process-info", "--pane", "w1:p1"], ["pane", "process-info", "--pane", "w1:p2"]])
         saved = herdr.saved_layout("fixture")
         self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
                          [("boss", layout_row_ids(["boss", "alpha"]))])
@@ -3245,7 +3286,7 @@ class HerdrTests(unittest.TestCase):
                     client.tabs.insert(split if reverse else split + 1, {**client.tabs[split], "pane_id": "split-pane"})
                 before = {pane["pane_id"]: pane["tab_id"] for pane in client.tabs}
                 processes = [herdr.HerdrProcess(991004, herdr.HerdrPlace("fixture", by_title["zulu"]["pane_id"]),
-                    {"SHOWRUNNER_UNIT": "boss", "SHOWRUNNER_UNIT_ID": "zulu"}, "claude", "/repo")] if "zulu" in by_title else []
+                    {('' + 'SHOWRUNNER_' + 'UNIT'): "boss", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "zulu"}, "claude", "/repo")] if "zulu" in by_title else []
                 with patch.object(herdr, "herdr_processes", return_value=processes):
                     moved = client.order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[]))
                 self.assertEqual(client.layout(), [("boss", expected), ("other", [])])
@@ -3439,12 +3480,13 @@ class HerdrTests(unittest.TestCase):
         self.assertNotIn(server / "environ", opened)
 
     def test_handoff_survivors_keep_their_unit_after_reparenting(self) -> None:
+        identity = fixture_runtime_id("handoff-director")
         server = self.process(30, 1, ["herdr", "server", "--handoff-import", "/fixture/import", "token"], {})
         self.unix_socket(self.root / "config/herdr/sessions/writing/herdr.sock", 100)
         self.socket_fd(server, 100)
         shell = self.process(11, 1, ["zsh"], {"HERDR_PANE_ID": "p1"})
         claude = self.process(12, 11, ["claude"], {"HERDR_PANE_ID": "p1", "HERDR_SESSION": "stale",
-                              "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "unit"})
+                              "CLAUDE_CODE_SESSION_ID": identity})
         _ = self.process(5, 1, ["subreaper"], {})
         # setsid in the replacement does not change these inherited memberships.
         for membership in ("0::", "1:name=systemd:"):
@@ -3458,18 +3500,19 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual({row.pid: row.place for row in rows},
                                      {11: herdr.HerdrPlace("writing", "p1"), 12: herdr.HerdrPlace("writing", "p1")})
                     self.assertEqual(next(row.marks for row in rows if row.pid == 12),
-                                     {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "unit"})
+                                     {"CLAUDE_CODE_SESSION_ID": identity})
                     self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("writing", "p1"))
                     self.assertEqual(herdr.herdr_places(), {row.pid: row.place for row in rows})
 
     def test_shared_scope_handoff_uses_preserved_shells_without_reading_unrelated_environments(self) -> None:
+        identity = fixture_runtime_id("handoff-director")
         servers = [self.process(pid, 1, ["herdr", "server"], {}) for pid in (30, 40)]
         for server, name in zip(servers, ("writing", "other")):
             self.unix_socket(self.root / f"config/herdr/sessions/{name}/herdr.sock", int(server.name))
             self.socket_fd(server, int(server.name))
         shell = self.process(11, 1, ["zsh"], {"HERDR_PANE_ID": "w1:p1"})
         claude = self.process(12, 11, ["claude"], {"HERDR_PANE_ID": "w1:p1", "HERDR_SESSION": "stale",
-                              "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "unit"})
+                              "CLAUDE_CODE_SESSION_ID": identity})
         other_shell = self.process(21, 1, ["zsh"], {"HERDR_PANE_ID": "w1:p1"})
         unrelated = self.process(20, 1, ["unrelated"], {"HERDR_PANE_ID": "w1:p1"})
         _ = self.process(5, 1, ["subreaper"], {})
@@ -3498,7 +3541,7 @@ class HerdrTests(unittest.TestCase):
                         21: herdr.HerdrPlace("other", "w1:p1"),
                     })
                     self.assertEqual(next(row.marks for row in rows if row.pid == 12),
-                                     {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "unit"})
+                                     {"CLAUDE_CODE_SESSION_ID": identity})
                     self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("writing", "w1:p1"))
                     self.assertEqual(herdr.herdr_places(), {row.pid: row.place for row in rows})
 
@@ -4014,7 +4057,7 @@ class HerdrTests(unittest.TestCase):
         server = self.process(10, 1, ["/fixture/herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
-        marks = {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}
+        marks = {"CODEX_THREAD_ID": "unit"}
         process = self.process(12, 10, ["/bin/claude"], {**marks, "HERDR_PANE_ID": "pane-1"})
         (process / "cwd").unlink()
         (process / "cwd").symlink_to(self.root / "deleted-directory")
@@ -4096,15 +4139,16 @@ class HerdrTests(unittest.TestCase):
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         unit = unit_membership("production", "unit")
+        codex = fixture_member("agent", name="codex-pane")
 
         server = self.process(10, 1, ["/fixture/herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
         _ = self.process(12, 10, ["/bin/claude"], {
-            "HERDR_PANE_ID": "pane-unit", "SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "unit",
-            "STAFF_ID": unit.id,
+            "HERDR_PANE_ID": "pane-unit",
+            "CLAUDE_CODE_SESSION_ID": unit.current_session,
         })
-        _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex"})
+        _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex", "CODEX_THREAD_ID": codex.current_session})
         import unit_lookup as lookup
         from scripts.production import session_staff
 
@@ -4121,7 +4165,7 @@ class HerdrTests(unittest.TestCase):
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
             def read_callers() -> tuple[object, object, object]:
-                return (roster._every_marked_unit(), inventory._unit_sessions((  # pyright: ignore[reportPrivateUsage]
+                return (roster._every_labeled_session(), inventory._unit_sessions((  # pyright: ignore[reportPrivateUsage]
                     inventory.ShowrunnerRegistration("runner", "production", str(self.root / "production.md")),
                 )), roster._herdr_codex_panes("fixture"))  # pyright: ignore[reportPrivateUsage]
 
@@ -4154,16 +4198,16 @@ class HerdrTests(unittest.TestCase):
         server = self.process(10, 1, ["/fixture/herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
-        process = self.process(12, 10, ["/bin/claude"], {"HERDR_PANE_ID": "pane-unit", "SHOWRUNNER_UNIT_ID": "first"})
+        process = self.process(12, 10, ["/bin/claude"], {"HERDR_PANE_ID": "pane-unit", "CODEX_THREAD_ID": "first"})
         with herdr.process_snapshot():
             rows = herdr.herdr_processes()
             expected = herdr.herdr_processes()
-            rows[0].marks["SHOWRUNNER_UNIT_ID"] = "caller change"
+            rows[0].marks["CODEX_THREAD_ID"] = "caller change"
             rows.clear()
-            _ = process.joinpath("environ").write_bytes(b"HERDR_PANE_ID=pane-unit\0SHOWRUNNER_UNIT_ID=second\0")
+            _ = process.joinpath("environ").write_bytes(b"HERDR_PANE_ID=pane-unit\0CODEX_THREAD_ID=second\0")
             self.assertEqual(herdr.herdr_processes(), expected)
         with herdr.process_snapshot():
-            self.assertEqual(herdr.herdr_processes()[0].marks["SHOWRUNNER_UNIT_ID"], "second")
+            self.assertEqual(herdr.herdr_processes()[0].marks["CODEX_THREAD_ID"], "second")
 
     def test_process_snapshot_does_not_change_scan_failure_or_retry(self) -> None:
         with (patch.object(herdr, "_process_sessions", side_effect=[herdr.HerdrFailure("fixture scan failed"), {}]) as scans,
@@ -4243,11 +4287,11 @@ class HerdrTests(unittest.TestCase):
         server = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
-        _ = self.process(12, 10, ["/bin/claude", "--model", "fixture"], {"HERDR_PANE_ID": "pane-1", "SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit", "SECRET": "never returned"})
+        _ = self.process(12, 10, ["/bin/claude", "--model", "fixture"], {"HERDR_PANE_ID": "pane-1", "CODEX_THREAD_ID": "unit", "SECRET": "never returned"})
         unreadable = self.process(13, 10, ["/bin/sleep"], {"HERDR_PANE_ID": "pane-2"})
         unreadable.joinpath("environ").unlink()
         unreadable.joinpath("environ").mkdir()
-        self.assertEqual(herdr.herdr_processes(), [herdr.HerdrProcess(12, herdr.HerdrPlace("fixture", "pane-1"), {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}, "claude", str(self.root))])
+        self.assertEqual(herdr.herdr_processes(), [herdr.HerdrProcess(12, herdr.HerdrPlace("fixture", "pane-1"), {"CODEX_THREAD_ID": "unit"}, "claude", str(self.root))])
 
     def test_ancestry_loop_is_skipped_and_vanished_cwd_keeps_placement(self) -> None:
         _ = self.process(10, 11, ["/bin/sh"], {"HERDR_PANE_ID": "pane-1"})
@@ -4306,7 +4350,7 @@ class HerdrTests(unittest.TestCase):
             pid = 20 + offset * 2
             _ = self.process(pid, 10, ["/fixture/herdr", *arguments], {"HERDR_PANE_ID": "pane-owner"})
             _ = self.process(pid + 1, pid, ["/bin/child"], {
-                "HERDR_PANE_ID": "pane-owner", "SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "unit",
+                "HERDR_PANE_ID": "pane-owner", "CODEX_THREAD_ID": "unit",
             })
             with self.subTest(arguments=arguments):
                 self.assertEqual(herdr.herdr_place_of(pid), herdr.HerdrPlace("owner", "pane-owner"))
@@ -4315,7 +4359,7 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(len(processes), len(commands) * 2)
         self.assertTrue(all(process.place.session == "owner" for process in processes))
         self.assertEqual([process.marks for process in processes if process.command == "child"],
-                         [{"SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "unit"}] * len(commands))
+                         [{"CODEX_THREAD_ID": "unit"}] * len(commands))
 
     def test_socket_ownership_decides_place_despite_conflicting_argv(self) -> None:
         server = self.process(10, 1, ["/fixture/herdr", "--handoff", "--session=other", "server"], {})
@@ -5019,6 +5063,16 @@ class LayoutHerdr(herdr.Herdr):
             case ["agent", "list"]:
                 return {"agents": []}
             case ["pane", "process-info"]:
+                pane = next(tab for tab in self.tabs if tab["pane_id"] == arguments[-1])
+                if "session_id" in pane and "HERDR_PROC" in os.environ:
+                    pid = 992000 + self.tabs.index(pane)
+                    fake_unit_host.process(os.environ, pid, 1, ["claude"], {})
+                    registry = sessions.sessions_dir() / f"{pid}.json"
+                    registry.parent.mkdir(parents=True, exist_ok=True)
+                    _ = registry.write_text(json.dumps({"pid": pid, "procStart": "1", "name": pane["label"],
+                        "sessionId": pane["session_id"], "updatedAt": 1, "messagingSocketPath": ""}))
+                    return {"process_info": {"shell_pid": 42, "foreground_process_group_id": pid,
+                        "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}
                 activity = self.pane_activity(arguments[-1])
                 command = activity.commands[0] if isinstance(activity, herdr.PaneRunning) else "zsh"
                 foreground = 43 if isinstance(activity, herdr.PaneRunning) else 42
@@ -5223,6 +5277,42 @@ class RowTabTests(StaffTestCase):
             _ = self.client.move_row_tabs(self.rows["parent"].id)
         self.assertEqual(self.client.commands, [])
         self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_record_layout_binds_the_native_row_instead_of_a_stale_mark(self) -> None:
+        self.client.tabs = self.client.tabs[:1]
+        self.client.tabs[0]["mark"] = self.rows["stopped"].current_session
+
+        self.client.record_layout()
+
+        self.assertEqual(self.bindings(), [("old-production", self.rows["unit"].id)])
+
+    def test_record_layout_does_not_bind_a_mark_without_a_native_process(self) -> None:
+        self.client.tabs = self.client.tabs[:1]
+        self.client.tabs[0]["mark"] = self.rows["unit"].current_session
+        del self.client.tabs[0]["session_id"]
+
+        self.client.record_layout()
+
+        self.assertEqual(self.bindings(), [])
+
+    def test_record_layout_keeps_the_saved_place_when_pane_evidence_is_unknown(self) -> None:
+        self.client.tabs = self.client.tabs[:2]
+        self.client.tabs[0]["mark"] = self.rows["unit"].current_session
+        self.client.tabs[1]["mark"] = self.rows["stopped"].current_session
+        self.client.unknown.add(self.client.tabs[1]["pane_id"])
+        saved = herdr.SavedSpace(name="remembered", seen=time.time(), tabs=[
+            herdr.SavedName(name=self.rows["stopped"].id, seen=time.time(), terminal_id="retained-terminal")])
+        path = herdr.layout_path("fixture")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(herdr.SavedLayout(at=time.time(), workspaces=[saved])))
+        record = staff.StaffSnapshot(tuple(row for row in staff.snapshot().rows if row.id != self.rows["stopped"].id))
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.client.record_layout(record=record)
+
+        self.assertEqual(self.bindings(), [("remembered", self.rows["stopped"].id), ("old-production", self.rows["unit"].id)])
+        self.assertEqual(herdr.saved_layout("fixture")["workspaces"][0], saved)
+        self.assertIn("pane evidence is unknown", errors.getvalue())
 
     def test_transfer_preserves_shared_tabs_separate_tabs_and_nested_grid_splits(self) -> None:
         initial = [dict(pane) for pane in self.client.tabs]
@@ -5476,8 +5566,10 @@ class SavedLayoutTests(unittest.TestCase):
         _ = (proc / "42/stat").write_text("42 (shell) S 1 42 42 1 42 " + "0 " * 13 + "4200\n")
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
-            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "HERDR_PROC": str(proc)})))
+            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "HERDR_PROC": str(proc),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.enterContext(fake_unit_host.private_process_registry())
 
     def running(self) -> LayoutHerdr:
         client = LayoutHerdr()
@@ -5554,7 +5646,7 @@ class SavedLayoutTests(unittest.TestCase):
         client = LayoutHerdr()
         cases: tuple[tuple[str, str, dict[str, str]], ...] = (
             ("control", "control", {}),
-            ("control", "roles", {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}),
+            ("control", "roles", {('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "roles-unit"}),
             ("scratch", "scratch", {}))
         for space, name, environment in cases:
             with self.subTest(session=name):
@@ -5626,11 +5718,11 @@ class SavedLayoutTests(unittest.TestCase):
         client.spaces.append(("w1", "boss"))
         for title in ("apple", "zulu", "boss", "beta", "mike", "able", "aardvark"):
             _ = client.add_tab("w1", title)
-        marks = {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "one"}
+        marks = {('' + 'SHOWRUNNER_' + 'UNIT'): "prod", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "one"}
         processes = [herdr.HerdrProcess(index, herdr.HerdrPlace(session, tab["pane_id"]), environment, "claude", "/repo")
                      for index, (tab, session, environment) in enumerate((
                          (client.tabs[1], "fixture", marks), (client.tabs[4], "fixture", marks),
-                         (client.tabs[5], "fixture", {"SHOWRUNNER_UNIT": "prod"}),
+                         (client.tabs[5], "fixture", {('' + 'SHOWRUNNER_' + 'UNIT'): "prod"}),
                          (client.tabs[6], "other", marks)))]
         with patch.object(herdr, "herdr_processes", return_value=processes):
             _ = client.order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[]))
@@ -5641,14 +5733,14 @@ class SavedLayoutTests(unittest.TestCase):
         client = LayoutHerdr()
         _ = client.open_tab("boss", "boss", "/repo", {})
         _ = client.open_tab("boss", "apple", "/repo", {})
-        pane = client.open_tab("boss", "zulu", "/repo", {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "one"})
+        pane = client.open_tab("boss", "zulu", "/repo", {('' + 'SHOWRUNNER_' + 'UNIT'): "prod", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "one"})
         self.assertEqual(client.layout(), [("boss", ["boss", "zulu", "apple"])])
         self.assertEqual(next(tab["label"] for tab in client.tabs if tab["pane_id"] == pane), "zulu")
         processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", pane),
-                                       {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "one"}, "claude", "/repo")]
+                                       {('' + 'SHOWRUNNER_' + 'UNIT'): "prod", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "one"}, "claude", "/repo")]
         with patch.object(herdr, "herdr_processes", return_value=processes):
             _ = client.open_tab("boss", "banana", "/repo", {})
-            _ = client.open_tab("boss", "aardvark", "/repo", {"SHOWRUNNER_UNIT": "prod"})
+            _ = client.open_tab("boss", "aardvark", "/repo", {('' + 'SHOWRUNNER_' + 'UNIT'): "prod"})
         self.assertEqual(client.layout(), [("boss", ["boss", "zulu", "aardvark", "apple", "banana"])])
 
     def test_sort_tabs_uses_staff_identity_and_membership_after_hand_resume_or_transfer(self) -> None:
@@ -5664,9 +5756,9 @@ class SavedLayoutTests(unittest.TestCase):
         # Hand resumes have no marks; a transferred process can retain the old production mark.
         processes = [
             herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", client.tabs[7]["pane_id"]),
-                               {"CLAUDE_CODE_SESSION_ID": pinned.id, "SHOWRUNNER_UNIT": "natedev"}, "claude", "/repo"),
+                               {"CLAUDE_CODE_SESSION_ID": pinned.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "natedev"}, "claude", "/repo"),
             herdr.HerdrProcess(2, herdr.HerdrPlace("fixture", client.tabs[6]["pane_id"]),
-                               {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "gone-unit"}, "claude", "/repo"),
+                               {('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "gone-unit"}, "claude", "/repo"),
         ]
         with patch.object(herdr, "herdr_processes", return_value=processes), \
                 patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:

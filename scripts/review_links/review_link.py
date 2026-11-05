@@ -22,6 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file, conf
 
 
+SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
+
+
 def private_name(name: str) -> bool:
     """Identify publisher metadata and unfinished writes in any letter case."""
     folded = name.casefold()
@@ -187,7 +190,7 @@ def main(arguments: list[str]) -> int:
     args = parser.parse_args(arguments)
     try:
         urls = snapshot(cast(list[Path], args.files), cast(str, args.name), new=cast(bool, args.new))
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except SNAPSHOT_ERRORS as error:
         print(f"review_link: {error}", file=sys.stderr)
         return 2
     print("\n".join(urls))

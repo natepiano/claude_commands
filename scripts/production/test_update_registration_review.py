@@ -14,6 +14,7 @@ from typing import cast
 from unittest import mock
 
 from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, dailies_render, read_production, review
+from scripts.production.cli_fixture import production_paths
 import showrunner_tree
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
@@ -135,7 +136,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn(unavailable, output.getvalue())
         self.assertIn("Reminder", output.getvalue())
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
-        with mock.patch.dict(os.environ, self.env):
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
             _ = self.run_questions(self.question_state([]))
             self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))

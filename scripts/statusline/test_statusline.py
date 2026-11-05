@@ -725,16 +725,17 @@ class CountsRowTests(unittest.TestCase):
         self.cache = self.home / ".local/state/showrunner/counts/show"
         path = self.home / ".local/state/staff/staff.json"
         path.parent.mkdir(parents=True)
-        _ = path.write_text(staff_text(OWNER), encoding="utf-8")
+        _ = path.write_text(staff_text(replace(OWNER, doc=staff.LiveDoc("natedev", doc))), encoding="utf-8")
 
 
     def questions(self, *items: OutstandingItem) -> None:
-        path = self.home / ".local/state/showrunner/outstanding/show.json"
+        path = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps(list(items)), encoding="utf-8")
 
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
-        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id}
+        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
         result = subprocess.run([shell, "-c", COMMAND], input=json.dumps({"session_id": session_id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         return [ANSI.sub("", line) for line in result.stdout.splitlines()]
@@ -753,7 +754,8 @@ class CountsRowTests(unittest.TestCase):
     def test_each_count_in_the_row_is_bold_inside_its_shipped_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
-        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id}
+        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
         result = subprocess.run(["/bin/sh", "-c", COMMAND], input=json.dumps({"session_id": OWNER.id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         self.assertEqual(result.stdout.splitlines()[-1],
@@ -801,7 +803,7 @@ class CountsRowTests(unittest.TestCase):
 
     def test_a_deferred_question_joins_the_row_when_its_time_comes(self) -> None:
         later = datetime.now(USER_ZONE) + timedelta(hours=1)
-        outstanding = self.home / ".local/state/showrunner/outstanding/show.json"
+        outstanding = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 self.questions({"since": "2026-10-16T19:00", "text": "A", "after": later.strftime("%Y-%m-%dT%H:%M")})

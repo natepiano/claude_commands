@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Show gate, module and kept test times for the current host."""
+"""Show repository test times and gate module times for the current host."""
 from __future__ import annotations
 
 import argparse
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import sqlite3
@@ -16,12 +16,17 @@ from typing import TYPE_CHECKING, Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 if TYPE_CHECKING:
-    from ..buildlog import index as index, store
+    from ..buildlog import index as index, parse, store, treekey
+    from ..buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 else:
     import index
+    import parse
     import store
+    import treekey
+    from mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+TOOL_REPOSITORY = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(TOOL_REPOSITORY))
 from scripts.lib import conf
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
@@ -187,6 +192,61 @@ def cutoff(days: int) -> str:
     return store.utc_iso((datetime.now(UTC) - timedelta(days=days)).timestamp())
 
 
+@dataclass
+class NextestHistory:
+    binary: str
+    test: str
+    passed_seconds: list[float] = field(default_factory=list)
+    runs_kept: int = 0
+    failures: int = 0
+    last_seconds: float | DurationNotRecorded = DURATION_NOT_RECORDED
+
+    @property
+    def median_seconds(self) -> float | DurationNotRecorded:
+        return statistics.median(self.passed_seconds) if self.passed_seconds else DURATION_NOT_RECORDED
+
+    @property
+    def rank(self) -> tuple[bool, float, str, str]:
+        duration = self.median_seconds if self.passed_seconds else self.last_seconds
+        value = duration if isinstance(duration, float) else 0.0
+        return not self.passed_seconds, -value, self.binary, self.test
+
+
+def nextest_top(connection: sqlite3.Connection, host: str, limit: int, repo: Path, identity: str) -> None:
+    """Rank retained nextest results within one repository, host and age limit."""
+    config = conf.read("test_times")
+    threshold = parse.nextest_slow_test_s()
+    histories: dict[tuple[str, str], NextestHistory] = {}
+    for row in query_rows(connection, """
+        SELECT t.binary, t.test, t.status, t.duration_s FROM steps s INDEXED BY steps_host_started
+        JOIN tests t ON t.step_id = s.id
+        WHERE s.repo_identity = ? AND s.host = ? AND s.started_at >= ?
+        ORDER BY s.started_at
+    """, (identity, host, cutoff(config.whole("TOP_MAX_AGE_DAYS")))):
+        binary, name = str(row["binary"]), str(row["test"])
+        key = binary, name
+        if key not in histories:
+            histories[key] = NextestHistory(binary, name)
+        history = histories[key]
+        history.runs_kept += 1
+        status = str(row["status"])
+        recorded_duration = row["duration_s"]
+        duration = recorded_duration if isinstance(recorded_duration, float) else DURATION_NOT_RECORDED
+        if status in ("passed", "flaky") and isinstance(duration, float):
+            history.passed_seconds.append(duration)
+        if status in ("failed", "timed_out"):
+            history.failures += 1
+        history.last_seconds = duration
+    ranked = sorted(histories.values(), key=lambda history: history.rank)[:limit]
+    print(f"repository: {repo.name} ({identity}); host: {host}; recorded threshold: > {seconds(threshold)} s")
+    print_table(["rank", "binary", "test", "median s", "runs kept", "failed / timed out", "last s"], [
+        [str(rank), history.binary, history.test,
+         seconds(median) if isinstance(median := history.median_seconds, float) else "",
+         str(history.runs_kept), str(history.failures),
+         seconds(history.last_seconds) if isinstance(history.last_seconds, float) else ""]
+        for rank, history in enumerate(ranked, 1)], "no nextest tests recorded yet")
+
+
 def suites(connection: sqlite3.Connection, host: str, days: int) -> None:
     rows = query(connection, """
         SELECT r.*, (
@@ -307,6 +367,7 @@ class ReportRequestArguments(argparse.Namespace):
     command: ReportCommand
     limit: int
     repo: Path
+    host: str
     days: int
     runs: int
     subject: str
@@ -315,9 +376,10 @@ class ReportRequestArguments(argparse.Namespace):
 def arguments(argv: list[str]) -> ReportRequestArguments:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    top_parser = subcommands.add_parser("top", help="rank live modules by their median wall time")
+    top_parser = subcommands.add_parser("top", help="rank repository tests or gate modules by median time")
     _ = top_parser.add_argument("--limit", type=positive, default=20)
-    _ = top_parser.add_argument("--repo", type=Path, default=Path("~/.claude"))
+    _ = top_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    _ = top_parser.add_argument("--host", default=store.host_name())
     suites_parser = subcommands.add_parser("suites", help="show gate runs")
     _ = suites_parser.add_argument("--days", type=positive, default=7)
     suite_parser = subcommands.add_parser("suite", help="show one folder suite")
@@ -362,7 +424,21 @@ def main(argv: list[str] | None = None) -> int:
         host = store.host_name()
         match request.command:
             case "top":
-                top(connection, host, request.limit, request.repo.expanduser().resolve())
+                if TYPE_CHECKING:
+                    from ..buildlog import repository
+                else:
+                    import repository
+
+                repo = request.repo.expanduser().resolve()
+                repo = Path(treekey.worktree(str(repo)) or str(repo))
+                identity = repository.repository_key(str(repo))
+                if identity == store.UNKNOWN_IDENTITY:
+                    print(f"repository identity unavailable for {repo}", file=sys.stderr)
+                    return 1
+                if identity == repository.repository_key(str(TOOL_REPOSITORY)):
+                    top(connection, request.host, request.limit, repo)
+                else:
+                    nextest_top(connection, request.host, request.limit, repo, identity)
             case "suites":
                 suites(connection, host, request.days)
             case "suite":

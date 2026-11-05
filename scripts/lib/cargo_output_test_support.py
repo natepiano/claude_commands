@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 import os
@@ -32,7 +32,9 @@ def fake_cargo_output_roots(
         reader, vars(bare_module).get("read_cargo_output_roots"),
     )
 
-    def read(checkout: Path) -> CargoOutputRoots | CargoOutputUnavailable:
+    def read(checkout: Path, *, cargo: Sequence[str] = ("cargo",), options: Sequence[str] = (),
+             environment: Mapping[str, str] | None = None) -> CargoOutputRoots | CargoOutputUnavailable:
+        del cargo, options, environment
         resolved = checkout.resolve()
         for roots in mappings:
             if resolved == roots.workspace_root:

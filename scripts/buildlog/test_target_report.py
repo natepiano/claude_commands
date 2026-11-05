@@ -8,13 +8,18 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 import unittest
 from unittest import mock
 
 import index
 import report
 from test_index import Record, STAMP, call, encode, local_day, point_root_at, step
+
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import write_config_fixture
+else:
+    from scripts.lint.memory_test_support import write_config_fixture
 
 
 class TargetReportTests(unittest.TestCase):
@@ -24,6 +29,7 @@ class TargetReportTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
+        _ = write_config_fixture(self.root.parent / "buildlog.conf")
         self.registry = self.root.parent / "build_targets.conf"
         _ = self.registry.write_text(
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"

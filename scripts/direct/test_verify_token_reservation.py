@@ -120,11 +120,10 @@ trap probe_local_attempt DEBUG
             '#!/bin/bash\n'
             + 'if [[ "$1" == acquire ]]; then printf "token\\n" >> "$TEST_SLEEP_LOG"; fi\n'
             + 'exec bash "$TEST_REAL_BOARD" "$@"\n')
-        sleep = self.root / "stubs" / "sleep"
-        _ = sleep.write_text('#!/bin/sh\nprintf "sleep %s\\n" "$*" >> "$TEST_SLEEP_LOG"\n'
+        self.write_wait_sleep('printf "sleep %s\\n" "$*" >> "$TEST_SLEEP_LOG"\n'
                              + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"\n'
                              + 'exit 0\n')
-        sleep.chmod(0o755)
+        _ = self.admission.occupy_host()
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 0 kB\n")
         log = self.root / "sleep-log"
         environment = {**self.environment, "HOME": str(home),
@@ -195,7 +194,7 @@ buildlog_release_memory 0
         _ = (self.root / "release").touch()
         self.assertEqual(new.wait(timeout=TEST_HANG_GUARD_SECS), 0, new_errors.read_text())
         self.assertEqual(old.wait(timeout=TEST_HANG_GUARD_SECS), 0, old_errors.read_text())
-        wait_until(lambda: not self.admission.server.reservations, self.admission.state_dir)
+        wait_until(self.admission.callers_released, self.admission.state_dir)
         self.assertEqual(self.admission.server.waiters, {})
         rows = [line for line in (self.admission.state_dir / "queue_times.jsonl").read_text().splitlines()
                 if '"token_gap"' in line]

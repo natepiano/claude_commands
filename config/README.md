@@ -460,7 +460,8 @@ Rsync replaces complete files and preserves this host's append files.
 
 ## test_times.conf
 
-`SLOW_TEST_S` sets the minimum test time retained in the build log.
+`SLOW_TEST_S` sets the minimum gate test time retained in the build log.
+`NEXTEST_SLOW_TEST_S` sets the recording threshold for nextest rows.
 Failed tests, errors, and unexpected successes remain in the log at every duration.
 `TOP_RUNS` sets the number of recent gate runs used to rank each module by its median wall time.
 Callers read these settings through `scripts/lib/conf.py` at each use.
@@ -593,7 +594,7 @@ Directory transfers delete removed source files from warm mirrors.
 The probe checks disk capacity, the script commit, and tool versions inside the selected shell.
 The runner checks tool versions again before execution. A mismatch permits local fallback without a test result.
 The local trust rules must permit shell evaluation before the sender claims Linux capacity.
-`build_budget_gib` sets the Linux memory budget. Repository build folder budgets cannot exceed it.
+`build_budget_gib` bounds the repository build folder budgets on disk.
 After each step, the runner uses the existing lint budget sweep on the selected build folder.
 The sweep removes the least recently used output and keeps the remaining output warm.
 Only a disk floor violation removes the whole folder.

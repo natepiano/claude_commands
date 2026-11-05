@@ -395,8 +395,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         return reply
                     if not isinstance(reply, wire.Wait):
                         raise CheckerFailure("invalid admission answer")
-                    if isinstance(reply.reason, gate.ReadingUnavailable):
-                        raise CheckerFailure(reply.reason.reason)
+                    cause = reply.reason.cause if isinstance(reply.reason, gate.HeadAdmissionStatus) else reply.reason
+                    if isinstance(cause, gate.ReadingUnavailable):
+                        raise CheckerFailure(cause.reason)
                     if launch and retry.launch_without_wait:
                         return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
                     had_wait = True
@@ -408,7 +409,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         return LeftQueue()
                     if CLOCK.monotonic() >= retry.deadline:
                         return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
-                    if isinstance(reply.reason, gate.EstimateExpired):
+                    if isinstance(cause, gate.EstimateExpired):
                         if refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
                             raise CheckerFailure("estimate cannot be refreshed")
                         refresh_pending = True
@@ -524,23 +525,24 @@ def token_wait(reservation: str, configuration: gate.MemoryConfig | wire.Cleanup
 
 def wait_reasons(result: gate.AdmissionWaitSnapshot) -> tuple[str, ...]:
     """Describe why admission holds, without treating changing samples as a new reason."""
-    decision = result.decision
-    if isinstance(decision.pressure, gate.MemoryPressure):
-        if decision.pressure.next_start_at:
-            return ("memory pressure recovery",)
-        if decision.pressure.swap_used_percent > result.policy.pressure.swap_used_limit:
+    cause = result.head_reason.cause if isinstance(result.head_reason, gate.HeadAdmissionStatus) else result.head_reason
+    if isinstance(cause, gate.MemoryPressure):
+        if cause.condition == "swap":
             return ("swap memory pressure",)
         return ("memory pressure",)
-    if isinstance(result.head_reason, gate.BehindOlderFit):
-        return (gate.older_fit_text(result.head_reason),)
-    reasons: list[str] = []
-    if result.head_need:
-        reasons.append(f"queue head {result.head_label}")
-    if decision.charged + result.peak.bytes > decision.budget:
-        reasons.append("build memory budget")
-    if result.available < decision.threshold:
-        reasons.append("free memory")
-    return tuple(reasons) or ("admission refresh",)
+    if isinstance(cause, gate.BehindHead):
+        return (f"queue head {cause.head_name}",)
+    if isinstance(cause, (gate.PressureUnavailable, gate.ReadingUnavailable)):
+        return (cause.reason,)
+    if isinstance(cause, gate.StartSpacingWait):
+        return ("start spacing",)
+    if isinstance(cause, gate.NeedsMemory):
+        return ("free memory",)
+    if isinstance(cause, gate.EstimateExpired):
+        return ("estimate expired",)
+    if isinstance(cause, gate.TokenWaitingWaiter):
+        return ("waiting for the cargo token",)
+    return ("admission refresh",)
 
 
 @dataclass
@@ -592,10 +594,9 @@ class WaitOutput:
         if snapshot.head_need:
             text += f"; head {snapshot.head_label} needs {snapshot.head_need / gate.GIB:.1f} GiB"
         summary = ", ".join(f"{Path(item.folder).name} {item.step} in {item.folder}" for item in snapshot.running)
-        reason_text = (gate.head_wait_text(snapshot.head_reason, user_zone(), snapshot.policy)
+        reason_text = (gate.head_wait_text(snapshot.head_reason, user_zone())
             if isinstance(snapshot.head_reason, gate.HeadAdmissionStatus) else
-            gate.older_fit_text(snapshot.head_reason) if isinstance(snapshot.head_reason, gate.BehindOlderFit) else
-            gate.pressure_text(decision.pressure, snapshot.policy) if isinstance(decision.pressure, gate.MemoryPressure) else "")
+            gate.pressure_text(decision.pressure) if isinstance(decision.pressure, gate.MemoryPressure) else "")
         summary = "; ".join(part for part in (reason_text, summary) if part)
         if not snapshot.running and summary:
             text += "; " + summary
@@ -636,7 +637,6 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     config = gate.read_memory_config()
     estimate = gate.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
                                   store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
-                                  budget=gate.resolve_admission_limits(gate.UnknownHostTotal(), config).budget,
                                   build_history_generation=lambda: build_history_generation(config))
     width_value = gate.test_threads(argv)
     width_value = width_value or (int(os.environ["NEXTEST_TEST_THREADS"]) if os.environ.get("NEXTEST_TEST_THREADS", "").isdecimal() else None)

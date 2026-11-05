@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pane_launch
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
+from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.message import sessions as runtime_sessions
@@ -53,7 +54,7 @@ from scripts.production import staff
 from process_failure import failure_detail
 import nix_env as nix_env
 from place import HerdrPlace as HerdrPlace
-from pane_launch import MEMBER_MARKS as MEMBER_MARKS, UNIT_MARKS as UNIT_MARKS, RecordedLabels, StaffLabelsRead
+from pane_launch import RecordedLabels, StaffLabelsRead
 
 NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 
@@ -913,13 +914,13 @@ def json_items(value: object, context: str) -> list[object]:
 
 def child_environment(environment: dict[str, str]) -> dict[str, str]:
     """Keep launch proofs and retired identity hints out of child processes."""
-    return {key: value for key, value in staff.child_environment(environment).items()
+    return {key: value for key, value in legacy_identity.without_legacy_identity(staff.child_environment(environment)).items()
             if key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV)}
 
 
 def unmarked_environment() -> dict[str, str]:
-    """Exclude unit identity and one-launch heal proof from inherited child environments."""
-    return child_environment({key: value for key, value in os.environ.items() if key not in MEMBER_MARKS})
+    """Remove legacy labels and launch proofs from inherited child environments."""
+    return child_environment(dict(os.environ))
 
 
 PROGRAM_TIMEOUT_SECONDS = 10.0
@@ -1394,16 +1395,12 @@ class Herdr:
         spaces = self.listed("workspace")
         tabs = self.listed("tab")
         panes = self.listed("pane")
+        found, known = self._row_panes(record, panes)
         owners: dict[str, list[str]] = {}
-        for pane in panes:
-            agent = pane.get("agent_session")
-            if not isinstance(agent, dict):
-                continue
-            native = cast(dict[str, object], agent).get("value")
-            row = record.by_current_session(native) if isinstance(native, str) else None
-            if row is not None:
+        for row_id, matches in found.items():
+            for pane in matches:
                 tab = json_text(pane.get("tab_id"), "herdr pane tab id")
-                owners.setdefault(tab, []).append(row.id)
+                owners.setdefault(tab, []).append(row_id)
         live: list[_LiveSpace] = []
         for space in spaces:
             workspace = json_text(space.get("workspace_id"), "herdr workspace id")
@@ -1415,8 +1412,9 @@ class Herdr:
                 live.append(_LiveSpace(workspace, label, identities))
         if live:
             saved = saved_layout(self.session)
-            for space in saved["workspaces"]:
-                space["tabs"] = [item for item in space["tabs"] if record.by_id(staff.StaffId(item["name"])) is not None]
+            if known:
+                for space in saved["workspaces"]:
+                    space["tabs"] = [item for item in space["tabs"] if record.by_id(staff.StaffId(item["name"])) is not None]
             _write_layout(self.session, merged_layout(saved, live, time.time()))
 
     def pane_tab(self, pane: str) -> tuple[str, int, SavedName]:
@@ -1788,7 +1786,7 @@ class Herdr:
             cwd = json_text(process.get("cwd"), "Codex launch cwd")
             if not Path(cwd).is_absolute():
                 raise ValueError("Codex launch working folder is unavailable")
-            entry = pane_launch.launch(pane, observed.identity.id, cwd, observed.environment,
+            entry = pane_launch.launch(pane, observed.identity.id, cwd, legacy_identity.without_legacy_identity(observed.environment),
                                        ["codex", *arguments], kind="codex")
             entry["pid"], entry["proc_start"] = pid, observed.started
             matches.append(entry)
@@ -3914,7 +3912,8 @@ def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
         _live_pane_reader.reset(token)
 
 
-def _process_parent(pid: int) -> int:
+def linux_process_parent(pid: int) -> int:
+    """Read the parent pid from the Linux process root."""
     stat = (_proc_root() / str(pid) / "stat").read_text()
     return int(stat[stat.rindex(")") + 1:].split()[1])
 
@@ -3934,7 +3933,7 @@ def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
     except OSError:
         return NotInHerdr()
     session = _process_sessions(candidates, _live_server_processes(candidates)).get(pid, "")
-    return (_live_pane_reader.get()(session).place(pid, environment, _process_parent)
+    return (_live_pane_reader.get()(session).place(pid, environment, linux_process_parent)
             if session else NotInHerdr())
 
 
@@ -3953,7 +3952,7 @@ def herdr_places() -> dict[int, HerdrPlace]:
             environment = _process_environment(_proc_root() / str(pid))
         except OSError:
             continue
-        place = _live_pane_reader.get()(session).place(pid, environment, _process_parent)
+        place = _live_pane_reader.get()(session).place(pid, environment, linux_process_parent)
         if isinstance(place, HerdrPlace):
             places[pid] = place
     return places
@@ -4055,7 +4054,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
     children: dict[int, list[Path]] = {}
     for process in candidates:
         try:
-            parent = _process_parent(int(process.name))
+            parent = linux_process_parent(int(process.name))
             children.setdefault(parent, []).append(process)
         except (OSError, ValueError, IndexError):
             continue
@@ -4296,7 +4295,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
 
 def _process_marks(pid: int, environment: dict[str, str], arguments: list[str]) -> dict[str, str]:
     """Project proved agent identities for reports; retain membership when proof is unavailable."""
-    marks = {key: environment[key] for key in MEMBER_MARKS if key in environment}
+    marks = {key: environment[key] for key in NATIVE_ID_MARKS if key in environment}
     kind = "codex" if is_codex_process(arguments) else "claude" if is_claude_process(arguments) else ""
     if kind:
         try:
@@ -4305,10 +4304,6 @@ def _process_marks(pid: int, environment: dict[str, str], arguments: list[str]) 
         except (HerdrFailure, OSError, ValueError):
             return marks
     return marks
-
-
-def has_staff_marks(environment: dict[str, str]) -> bool:
-    return all(environment.get(mark) for mark in UNIT_MARKS)
 
 
 @dataclass(frozen=True)
@@ -4371,7 +4366,7 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
             if process.stat().st_uid != os.getuid():
                 continue
             environment = _process_environment(process)
-            place = _live_pane_reader.get()(session).place(pid, environment, _process_parent)
+            place = _live_pane_reader.get()(session).place(pid, environment, linux_process_parent)
             if isinstance(place, NotInHerdr):
                 continue
             arguments = _process_arguments(process)
@@ -4517,7 +4512,7 @@ def launch_agent(name: str, space: str, title: str, cwd: str, environment: dict[
 
     herdr owns the executable selected by --kind. The pane carries the loaded
     environment, so its canonical executable inherits it, including on resume.
-    Caller account choices and unit marks take precedence over inherited ones.
+    Caller account choices and session labels take precedence over inherited ones.
     """
     _check_agent_arguments(kind, agent_arguments)
     session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
@@ -4618,10 +4613,13 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             exports = shlex.join([f"{key}={value}" for key, value in environment.items()
                                   if not key.startswith("HERDR_") or key == "HERDR_AGENT_PANE"])
             removals = prepared.unset_environment | {
-                "STAFF_ID", "SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+                "STAFF_ID", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
                 "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
             }
-            script = (f"unalias {kind} 2>/dev/null; cd -- {shlex.quote(str(prepared.directory))} && "
+            script = (f"unalias {kind} 2>/dev/null; "
+                      "for legacy_label in $(env); do case $legacy_label in SHOWRUNNER_*=*) "
+                      'unset "${legacy_label%%=*}";; esac; done; '
+                      f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
             client.run_in_pane(pane, ["eval", script], terminal=destination.terminal)
         outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
