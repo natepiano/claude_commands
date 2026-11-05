@@ -1961,7 +1961,7 @@ Test failed close and interrupted retirement, then rerun without another launch.
 
 **Ruled out:** `ps lstart` seconds as the darwin generation — a pid reused in the same second reads the same.
 
-### Phase 7 — worker_panes.py: start-or-resume, close, observe  · status: todo
+### Phase 7 — worker_panes.py: start-or-resume, close, observe  · status: done
 
 **Owner:** models-unit, after 3n (sdlc, 2026-11-02). herdr-unit and models-unit settle each `herdr.py` window on the berth board.
 
@@ -2116,8 +2116,8 @@ Keep busy panes open.
      Retain the scan's diagnostic without printing it again; never report stopped or absent from this result.
    - `UncertainWorker`: pane evidence is incomplete, terminal identity is missing, native identities duplicate, or ownership conflicts.
      Leave that worker unchanged and continue unrelated proved work.
-   Convert boundary nulls into `PaneConversation | NoPaneConversation` in `PaneIdentity` and `TabSession`.
-   These new variants replace bare optional conversation values.
+   `PaneIdentity` and `TabSession` keep `session_id: str | None`.
+   A variant type there changes truth and equality checks in shutdown callers outside this phase, for no change in behavior (director, 2026-11-05).
    Each caller supplies one `staff.snapshot()` for all observed parents.
    Keep `Herdr.panes()` as the shared parser.
 3. **`start_or_resume`.** Resolve an existing published native-id row first.
@@ -2164,7 +2164,7 @@ Keep busy panes open.
      Compose it from the existing registry settings and role policies; add no second settings reader.
      The registry supplies no sandbox.
      Use `READ_ONLY_SANDBOX` for `review` and `astra-reviewer`.
-     Use `design_roles.py` policy `launch_sandbox` for `astra-designer`.
+     Use `design_roles.DESIGNER_SANDBOX` for `astra-designer`; `access_policy` uses the same constant.
      Use the existing `WORKER_SANDBOX` from `codex_mesh.py` for `impl`, `test`, and `fix`.
      Keep this mapping in one new private `_registry_row(role: WorkerRole)` function.
      Take the role from the explicit argument for this dispatch.
@@ -2192,7 +2192,8 @@ Keep busy panes open.
 - `scripts/herdr/worker_panes.py` — new.
 - `config/direct.conf` — `WORKER_SPLIT_RATIO=0.667`, with `# range: 0.1..0.9`.
 - `scripts/herdr/test_worker_panes.py` — new.
-- `scripts/herdr/herdr.py` — `RowPaneScan`, `UnknownPane`, all scan callers, and `PaneConversation | NoPaneConversation`.
+- `scripts/herdr/herdr.py` — `RowPaneScan`, `UnknownPane`, and all scan callers.
+- `scripts/astra/design_roles.py` — `DESIGNER_SANDBOX`, the one designer sandbox value.
 - `scripts/herdr/test_herdr.py`, `scripts/herdr/test_herdr_sessions.py` — scan, layout, and caller behavior tests.
 - `scripts/herdr/fake_herdr.py` — the fake's `agent list` and `pane process-info` answers that the tests need.
 - `scripts/lib/models_registry.py`, `scripts/lib/test_models_registry.py` — `launch_settings` and `LaunchSettings` (models-unit's files).
@@ -3380,7 +3381,7 @@ Measured 2026-11-02 on natedev, herdr 0.9.5 (protocol 22), in probe workspaces o
 | Probe | Result | Who uses it |
 | --- | --- | --- |
 | Which side `--ratio` measures | The original pane: the left side of a `right` split, the top of a `down` split. `pane split --direction right --ratio 0.3` gave the original pane 27 of 91 columns. | Phase 7 split sizes |
-| `split_ratio` on a nested split | It changes the nearest split that holds the pane. The root split kept its ratio 0.3. | Phase 7 |
+| `split_ratio` on a nested split | It changes the nearest split that holds the pane. The root split kept its ratio 0.3. | Phase 7 sets each split by its tree path with `layout.set_split_ratio`; `split_ratio` is removed |
 | A close rebalances the rest | No. The closed branch collapses into its sibling. The other split ratios stay. | Phase 7, Phase 10 |
 | Label after the agent exits | Kept. After `/exit`, Codex and Claude panes kept their `label_pane` label and their `terminal_id`. | Phase 7 finds a stopped worker's shell by its label |
 | Label after a cross-workspace move | Kept, with the same `terminal_id`. The pane id changes (`w1P:p2` became `w1Q:p1`). | Phase 7 |

@@ -35,6 +35,7 @@ from scripts.production import staff, session_staff, worker_admission
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
 BUSY = ('starting', 'running', 'waiting_capacity')
+DESIGNER_SANDBOX = 'danger-full-access'
 
 
 class MeshLifecycleClient(Protocol):
@@ -606,7 +607,7 @@ def _prompt(design: HeldDesign, role: Role, text: str) -> tuple[Path, Path]:
 
 
 def access_policy(design: HeldDesign, role: Role) -> ThreadAccessPolicy:
-    return PhaseBoundDesigner(design.placement.generation, 'danger-full-access') if role == 'designer' else ReadOnlyReviewer()
+    return PhaseBoundDesigner(design.placement.generation, DESIGNER_SANDBOX) if role == 'designer' else ReadOnlyReviewer()
 
 
 def _mesh_context(design: HeldDesign) -> None:

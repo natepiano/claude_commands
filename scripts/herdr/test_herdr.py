@@ -3075,6 +3075,20 @@ class HerdrTests(unittest.TestCase):
              "terminal_id": f"terminal-{index}"}
             for index, session_id in enumerate((None, None, None, "sid-alpha"))])
 
+    def test_panes_preserves_tab_and_focus_when_the_transport_supplies_them(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "terminal_id": "terminal-w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "focused": True},
+            {"pane_id": "w1:p2", "terminal_id": "terminal-w1:p2", "workspace_id": "w1", "tab_id": "w1:t1", "focused": False},
+            {"pane_id": "w2:p1", "terminal_id": "terminal-w2:p1", "workspace_id": "w2"}]}}))
+
+        self.assertEqual(self.herdr.panes(), [
+            {"pane_id": "w1:p1", "terminal_id": "terminal-w1:p1", "workspace_id": "w1",
+             "label": None, "session_id": None, "tab_id": "w1:t1", "focused": True},
+            {"pane_id": "w1:p2", "terminal_id": "terminal-w1:p2", "workspace_id": "w1",
+             "label": None, "session_id": None, "tab_id": "w1:t1", "focused": False},
+            {"pane_id": "w2:p1", "terminal_id": "terminal-w2:p1", "workspace_id": "w2",
+             "label": None, "session_id": None}])
+
     def test_session_list_keeps_running_only(self) -> None:
         rows: list[herdr.SessionEntry] = [
             {"name": "live", "running": True, "default": False, "session_dir": "/live", "socket_path": "/live/socket"},
@@ -5162,6 +5176,14 @@ class RowTabsHerdr(LayoutHerdr):
         self.focused_pane: str = "p1"
         self.trees: dict[str, dict[str, object]] = {"t0": split_tree("right", 0.3, "p0", "p1")}
         self.count: int = 100
+        self.scans: list[herdr.RowPaneScan] = []
+
+    @override
+    def scan_row_panes(self, record: staff.StaffSnapshot,
+                       panes: list[dict[str, object]]) -> herdr.RowPaneScan:
+        scan = super().scan_row_panes(record, panes)
+        self.scans.append(scan)
+        return scan
 
     @override
     def run(self, *arguments: str, deadline: float = math.inf) -> str:
@@ -5240,6 +5262,9 @@ class RowTabTests(StaffTestCase):
         self.rows["unit"] = fixture_member("unit", name="director", parent=self.rows["parent"].id)
         for key in ("split", "worker", "stopped"):
             self.rows[key] = fixture_member("worker", name=key, parent=self.rows["unit"].id)
+        for key, row in self.rows.items():
+            self.rows[key] = staff.update_current_session(row.current_session,
+                staff.native_id(fixture_runtime_id("row-tab-runtime:" + key)))
         self.client = RowTabsHerdr()
         self.client.spaces = [("w1", "old-production"), ("w2", self.rows["parent"].name)]
         for index, row in enumerate((self.rows["unit"], self.rows["split"], self.rows["worker"])):
@@ -5277,6 +5302,60 @@ class RowTabTests(StaffTestCase):
             _ = self.client.move_row_tabs(self.rows["parent"].id)
         self.assertEqual(self.client.commands, [])
         self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_layout_scan_retains_each_unknown_location_and_uses_the_supplied_snapshot(self) -> None:
+        self.client.unknown.update(("p1", "p2"))
+        self.client.tabs.append({**self.client.tabs[0], "pane_id": "foreign",
+            "terminal_id": "foreign-terminal", "tab_id": "foreign-tab",
+            "session_id": self.rows["parent"].current_session})
+        record = staff.StaffSnapshot(tuple(row for row in staff.snapshot().rows
+                                          if row.id != self.rows["parent"].id))
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.client.record_layout(record=record)
+
+        self.assertEqual(len(self.client.scans), 1)
+        scan = self.client.scans[0]
+        self.assertEqual({row_id: [pane["pane_id"] for pane in panes]
+                          for row_id, panes in scan.found.items()}, {self.rows["unit"].id: ["p0"]})
+        self.assertEqual([(item.pane, item.tab, item.reason) for item in scan.unknown], [
+            ("p1", "t0", "private process facts are unavailable"),
+            ("p2", "t1", "private process facts are unavailable")])
+        notes = errors.getvalue().splitlines()
+        self.assertEqual(len(notes), 2)
+        for pane, tab in (("p1", "t0"), ("p2", "t1")):
+            self.assertEqual(sum(pane in line and tab in line for line in notes), 1)
+        self.assertEqual(self.bindings(), [("old-production", self.rows["unit"].id)])
+
+    def test_retitle_uses_proved_rows_and_reports_an_unknown_pane_once(self) -> None:
+        self.client.unknown.add("p2")
+        self.client.tabs[1]["pane_label"] = "old-worker-label"
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertTrue(self.client.retitle_row(self.rows["split"].id))
+
+        self.assertEqual(self.client.tabs[1]["pane_label"], self.rows["split"].name)
+        self.assertEqual(self.client.tabs[2]["pane_label"], self.rows["worker"].name)
+        self.assertEqual(len(self.client.scans), 1)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        for text in ("p2", "t1", "private process facts are unavailable"):
+            self.assertIn(text, errors.getvalue())
+
+    def test_transfer_continues_for_a_proved_tab_and_keeps_an_unknown_tab(self) -> None:
+        unknown = dict(self.client.tabs[2])
+        self.client.unknown.add(unknown["pane_id"])
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+
+        moved = [pane for pane in self.client.tabs if pane["terminal_id"] != unknown["terminal_id"]]
+        self.assertEqual({pane["workspace_id"] for pane in moved}, {"w2"})
+        self.assertEqual(next(pane for pane in self.client.tabs
+                              if pane["terminal_id"] == unknown["terminal_id"]), unknown)
+        self.assertEqual(len(self.client.scans), 1)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        for text in (unknown["pane_id"], unknown["tab_id"], "private process facts are unavailable"):
+            self.assertIn(text, errors.getvalue())
 
     def test_record_layout_binds_the_native_row_instead_of_a_stale_mark(self) -> None:
         self.client.tabs = self.client.tabs[:1]
