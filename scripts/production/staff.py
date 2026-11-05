@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, NewType, Protocol, TypeVar, cast
+from typing import ClassVar, Literal, NewType, Protocol, TypeVar, cast
 from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -52,18 +52,18 @@ class StaffRoot:
 @dataclass(frozen=True)
 class ClaudeBackend:
     """The worker runs in Claude."""
+    family: ClassVar[str] = "claude"
 
 
 @dataclass(frozen=True)
 class CodexBackend:
+    family: ClassVar[str] = "codex"
     codex_home: Path
 
 
 @dataclass(frozen=True)
 class BackendUnavailable:
     """No producer proved the worker backend."""
-
-
 
 
 def _seconds(key: str) -> float:
@@ -613,15 +613,22 @@ def operation_fds() -> tuple[int, ...]:
         result.append(int(os.environ["STAFF_OPERATION_FD"]))
     for variable in os.environ:
         if variable.startswith("STAFF_ROW_FD_"):
-            path = _file().parent / "rows" / f"{variable.removeprefix('STAFF_ROW_FD_')}.lock"
+            path, variable = _row_lock(variable.removeprefix("STAFF_ROW_FD_"))
             if _joined_operation(path, variable):
                 result.append(int(os.environ[variable]))
     return tuple(result)
 
 
+def _row_lock(key: str) -> tuple[Path, str]:
+    return _file().parent / "rows" / f"{key}.lock", "STAFF_ROW_FD_" + key
+
+
 @contextmanager
 def row_operation(reference: str) -> Generator[None]:
     """Lock one staff row across lifecycle commands and inherited children."""
+    if _joined_operation(*_row_lock(reference)):
+        yield
+        return
     record = initial_snapshot()
     row = record.by_member_reference(reference)
     if row is None:
@@ -630,8 +637,14 @@ def row_operation(reference: str) -> Generator[None]:
     if row is None:
         yield
         return
-    variable = "STAFF_ROW_FD_" + str(row.id)
-    path = _file().parent / "rows" / f"{row.id}.lock"
+    with slot_operation(str(row.id), row.name):
+        yield
+
+
+@contextmanager
+def slot_operation(key: str, name: str) -> Generator[None]:
+    """Lock a row or a named worker slot across inherited children."""
+    path, variable = _row_lock(key)
     if _joined_operation(path, variable):
         yield
         return
@@ -640,7 +653,7 @@ def row_operation(reference: str) -> Generator[None]:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise StaffRefused(f"{row.name}: another operation holds this row") from error
+            raise StaffRefused(f"{name}: another operation holds this row") from error
         previous = os.environ.get(variable)
         os.environ[variable] = str(lock.fileno())
         try:
@@ -734,6 +747,16 @@ def _parent_kinds(kind: Kind) -> tuple[Kind, ...]:
     return () if kind == "agent" else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
 
 
+def validate_name(kind: Kind, name: str) -> None:
+    """Check a staff name before a caller writes its operation journal."""
+    if not name or _valid_id(name) or name != name.strip() or "/" in name or any(
+        ord(character) < 32 or ord(character) == 127 for character in name
+    ):
+        raise StaffRefused(f"invalid short staff name: {name!r}")
+    if kind == "worker":
+        _ = WorkerName.parse(name)
+
+
 def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = ()) -> None:
     """Check the complete proposed graph before any bytes are replaced."""
     indexed: dict[StaffId, StaffRow] = {}
@@ -761,12 +784,7 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
             worktrees.add(location)
         if row.kind not in _KINDS:
             raise StaffRefused(f"invalid staff kind: {row.kind}")
-        if not row.name or _valid_id(row.name) or row.name != row.name.strip() or "/" in row.name or any(
-            ord(character) < 32 or ord(character) == 127 for character in row.name
-        ):
-            raise StaffRefused(f"invalid short staff name: {row.name!r}")
-        if row.kind == "worker":
-            _ = WorkerName.parse(row.name)
+        validate_name(row.kind, row.name)
         key = (row.kind, None if row.kind == "showrunner" else row.parent, row.name)
         if key in names:
             raise StaffRefused(f"{row.kind} name already exists: {row.name}")
@@ -838,6 +856,11 @@ def _load(*, initial: bool = False) -> StaffSnapshot:
     if type(schema) is not int or schema not in (1, 2):
         raise StaffUnreadable(f"unsupported staff schema: {schema!r}")
     return replace(_snapshot_value(fields), inputs=(str(_file().absolute()),))
+
+
+def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
+    """Find the backend for this row's current session."""
+    return _found_backends((row,)).get(row.id, BACKEND_UNAVAILABLE)
 
 
 def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | CodexBackend]:

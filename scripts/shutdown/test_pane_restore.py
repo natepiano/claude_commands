@@ -203,7 +203,7 @@ class PaneRestoreTests(unittest.TestCase):
                             "HERDR_PANE_RECORD_DIR": str(self.root / "herdr-panes")}),
                         mock.patch.object(sessions, "session_liveness", side_effect=session_liveness),
                         mock.patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness),
-                        mock.patch.object(herdr, "_codex_conversations", return_value=({}, [])),
+                        mock.patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
                         mock.patch.object(sessions, "running_sessions", list),
                         mock.patch.object(herdr, "open_tab", self.open_tab)):
             _ = cast(object, self.enterContext(patcher))
@@ -324,7 +324,7 @@ class PaneRestoreTests(unittest.TestCase):
         entry = pane_record.read("agents")["w1:p2"]
         self.assertEqual((entry["session_id"], entry["config_dir"], entry["name"], entry["model"], entry["cwd"]),
                          ("019b3a40-4250-7000-8000-000000000102", str(self.config), "alpha", "opus", "/work/alpha"))
-        self.assertEqual(entry["environment"], {"SHOWRUNNER_UNIT": "demo"})
+        self.assertEqual(entry["environment"], {})
 
 
 @final
@@ -816,6 +816,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         moved = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments,
                            dict(os.environ), self.checkout)
         self.assertEqual(moved.returncode, 0, moved.stderr)
+        self.assertEqual(backend.stops, [self.owner.current_session])
+        self.assertEqual(len(backend.starts), 1)
         self.assertEqual(pane_record.resume_launch(pane_record.read("agents")["w1:p1"])["cwd"], str(self.new_folder))
         backend.live = False
         backend.publish_process_state()
@@ -850,7 +852,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                   timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
             nonlocal published, publishing
             self.assertEqual(kind, "codex")
-            self.assertEqual(agent_arguments, ["-c", 'projects={' + json.dumps(str(self.new_folder))
+            self.assertEqual(agent_arguments, ["-C", str(self.new_folder), "-c", 'projects={' + json.dumps(str(self.new_folder))
                 + '={trust_level="trusted"}}', "resume", self.owner.current_session, "--model", "fixture-model"])
             self.assertIsInstance(opening, herdr.NoOpeningPrompt)
             self.assertGreater(timeout_ms, 0)

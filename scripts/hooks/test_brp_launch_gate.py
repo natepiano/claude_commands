@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.build_queue import admission_protocol as wire
 from scripts.lint import memory_admit as gate
 from unittest.mock import patch
@@ -160,14 +160,23 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.assertEqual(result.stderr, "other app reached memory wait\n")
 
     def test_aged_launch_without_a_reservation_still_holds_for_free_memory(self) -> None:
+        with self.admission.loop_turn():
+            busy = only_admitted(self.admission.server.handle_request(
+                self.admission.request(run=self.admission.run_owner())))
+            self.admission.allow_next_start()
         self.admission.free(4 * gate.GIB)
         self.admission.compiler(8 * gate.GIB)
         self.environment.update(BUILDLOG_MEM_WAIT_LIMIT_S="0",
-            BUILDLOG_MEM_WAIT_SINCE=str(self.admission.clock.now() - admission_policy_fixture().timing.head_seconds - 1))
+            BUILDLOG_MEM_WAIT_SINCE=str(self.admission.clock.now() - admission_policy_fixture().timing.estimate_refresh_seconds - 1))
         result = self.run_hook()
         self.assert_denied(result,
             "BRP launch memory check failed (exit 2): memory admission check failed "
             + "(launch wait limit reached without admission); step refused")
+        with self.admission.loop_turn():
+            self.assertEqual([record.reservation_id for record in self.admission.server.reservations.values()],
+                             [busy.reservation])
+            self.assertEqual(self.admission.server.handle_request(
+                wire.ReleaseRequest("release-busy", busy.reservation, 0)), [wire.Ok()])
         self.assertEqual(self.admission.server.reservations, {})
         self.assertEqual(self.admission.server.waiters, {})
         self.assertEqual(len(self.admission.server.launches), 0)
@@ -215,6 +224,10 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.assertEqual(result.stderr, "memory admitted\n")
 
     def test_low_memory_wait_leaves_old_release_record_unchanged(self) -> None:
+        with self.admission.loop_turn():
+            _ = only_admitted(self.admission.server.handle_request(
+                self.admission.request(run=self.admission.run_owner())))
+            self.admission.allow_next_start()
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 8388608 kB\n")
         states = self.root / "wait-states"

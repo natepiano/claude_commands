@@ -70,9 +70,9 @@ Every command checks holds through `target_state`. The sole holder may run its o
 - The hold and routing messages repeat only when their text or decline reason changes. `verify.sh: running on natedev` marks local execution.
 - After routing, every command checks the hold before taking the cargo token. A test gives this wait the same Mac retry hook, so a hold that starts just after routing still permits a Mac run. Per step, `scripts/lint/invoke.sh` checks it again after memory admission. A new hold returns the memory reservation, waits, then repeats memory admission. Mac runs answer to Mac claims, not natedev holds.
 - `verify.sh` and `invoke.sh` create a missing, nonempty `$TMPDIR` before they make temp files. The lint CLI sources `invoke.sh` before it runs a command, so it uses the same setup.
-- `buildlog-sample.timer` also checks for an idle Mac every 60 seconds on natedev. After three minutes with no claim, no block and no active reach backoff, `scripts/buildlog/mac_idle.py` checks eligible waiting test calls. A call record carries PID and start time, package, temp path and retry deadline. Memory admission records, hold wait files or `wait-local` children, routing wait children and cargo-token waiter files prove the wait; a process name alone does not.
-- The watch creates a missing session temp folder only when the session record's PID and start time still match. It writes a per-call `.retry` marker for a missing hook or a delayed retry. The call's own leave check reads it, checks `free-now` and runs its own Mac attempt. Memory and hold waits use the exported marker hook when their normal hook is empty. Token waits use the same retry check. Permanent exclusions stay excluded. The watch changes no build hold or claim file and starts no second test.
-- Buildlog schema 21 includes `mac_idle`, one row per cause per call. An unknown cause sends one message to the `builds-unit` director in production `build-followups`, resolved with `roster.py --json`; it never messages the user. Failed sends stay pending without more log rows. State lives under `~/.local/state/mac-idle/`. See the idle Mac watch in [mac-test-offload.md](mac-test-offload.md).
+- `buildlog-sample.timer` checks once per minute on natedev. Three minutes without a natedev build or test on the Mac, while recorded `mac_allowed` steps wait in `waiting_hold` or `waiting_mac`, gives a red top line in `/build:queue` and `/build:status`. A block and a claim with `work_idle_since` both count as idle; a parked app does not count as build or test work. A future reach backoff shows `MAC UNREACHABLE`; unreadable and stale state show watch diagnostics.
+- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`; at the default ten minutes it sends one phone push per outage. Blocks use an emergency push cleared by `/build:mac unblock` or the saved outage ending; idle claims and free Macs ask for a decision. The idle interval and its send keys reset after an active job. No waiting steps means no idle line or push.
+- Repairs still run only when no block or live claim exists. Buildlog schema 21 includes `mac_idle`, one row per cause per call; `message_showrunner` names its message action and failed sends stay pending without more rows. State lives under `~/.local/state/mac-idle/`. See the idle Mac watch in [mac-test-offload.md](mac-test-offload.md).
 - Exports for the build log: `BUILDLOG_TARGET` is `mac` from the start of a Mac attempt and for a call that ends there, empty after a decline or a lost run, `natedev` once tests start locally (a Mac pass confirmed on natedev is `natedev` with `BUILDLOG_MAC=passed`). `BUILDLOG_HOLD_WAIT_S` sums every wait a hold caused: routing sleeps, each declined Mac retry's seconds, and `wait-local`'s; memory waits are not counted. `BUILDLOG_MAC_HOLDER` carries a `busy` decline's `holder=` value and is passed on the `record.py call` line, never exported.
 
 ### The no-hold shortcut: `scripts/lint/memory_gate.sh`
@@ -152,8 +152,20 @@ A missing or invalid live percent stops the floor pass with one line.
 
 `cargo_output.py` reads `workspace_root`, `target_directory`, and `build_directory` from Cargo metadata.
 Older Cargo metadata uses `target_directory` for both output roots.
-The sweep saves these mappings in `cargo-output-roots.json` beside its floor records.
-It keeps prior mappings for discovery and cold-rebuild attribution during the drain.
+A step row's output roots use its command's Cargo inputs. The recorder omits them when `target_directory` differs from `target_dir`.
+Start-time capture applies config files, then `CARGO_BUILD_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`, then inline and file values from `--config`.
+It applies `CARGO_TARGET_DIR` next, then `--target-dir`.
+The workspace budget sweep and each real floor pass save these mappings in `cargo-output-roots.json` beside the floor records.
+The floor reads output pairs from every recorded step kind on this host.
+It keeps each attempt's target and build directories together, keyed by `worktree`, or `cwd` when `worktree` is unknown.
+The floor uses recorded pairs first, then the saved output cache and its prior pairs.
+It keeps saved pairs when their checkout no longer exists.
+It runs no Cargo metadata command.
+An unavailable build index leaves only the saved cache as evidence.
+Unknown roots, relative roots, and steps with target folder overrides authorize no deletion.
+A discovered target with neither source has `NoRecordedEvidence` and stays protected until a new queue step builds it.
+The natedev low-space report lists protected folders by size so natedev can choose what to delete.
+The sweep keeps prior mappings for cold-rebuild attribution.
 No separate setup is required when the build drive is absent.
 
 The floor reads free space and computes the shortfall for each filesystem.
@@ -169,6 +181,14 @@ The root filesystem keeps `floor.json`, `floor.lock`, and `floor-alert.lock`.
 Other filesystems use `floor-<major>-<minor>` with the same suffixes.
 Each filesystem keeps its own growth measurements and alert receipts.
 Old root floor records remain readable.
+Each other sweep keeps its failure record in the same folder, with its own `-alert.lock`.
+Target discovery uses `floor-discovery.json`.
+A workspace sweep uses `workspace-<sha256>.json`, named from its sorted output roots.
+A run from the workspace root and a run from a member folder share that record.
+The temporary sweep uses `temporary-sweep.json`.
+A failure tells natedev once per failure episode, and a clean pass ends the episode.
+A workspace pass that finds no output root is skipped, so it keeps the episode open.
+A clean workspace sweep with no saved record writes no state file.
 Each new `floor_scan` row names its filesystem and probe path.
 CI paths come from `sweep_ci_targets`; missing paths are skipped, and the sweep never takes CI output.
 
@@ -227,8 +247,10 @@ in the lock file. If a known holder keeps a real pass below the floor from
 running longer than `floor_lock_alert_minutes=15` in `[sweep]`, the waiting pass
 tells natedev its pid, command and the free space. The start time, rather than
 the file's mtime, sets the age. A successful send is saved in the floor record
-once per pid and start time; failed sends are tried on the next pass. A hold
-with no readable identity sends no alert. Waiting passes serialize the receipt
+once per pid and start time; failed sends are tried on the next pass. A pass
+that sees no holder keeps that receipt, so the same holder does not alert again.
+A hold whose start time is unreadable alerts once per pid, from the time a pass
+first saw it. Waiting passes serialize the receipt
 check, send and success record under a separate stable `floor-alert.lock`.
 The active pass updates its measurement under that same lock, reading the
 latest receipts before it writes, so neither pass can restore an older record.

@@ -17,16 +17,33 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_runtime
 
 
 class NativeSessionLabelTests(StaffTestCase):
-    def test_runtime_identity_selects_the_member_despite_a_stale_mark_and_display_name(self) -> None:
-        runner, unit, worker = self.tree()
+    def test_runtime_identity_selects_the_current_member_and_removes_copied_labels(self) -> None:
+        _, unit, worker = self.tree()
+        current = staff.native_id(fixture_runtime_id("label-unit-after-clear"))
+        unit = staff.update_current_session(unit.current_session, current)
+        self.assertNotEqual(unit.id, unit.current_session)
         labels = session_labels.StaffLabels(staff.snapshot(), {}, {})
-        environment = {"STAFF_ID": worker.id, "SHOWRUNNER_UNIT_ID": "models-unit"}
-        selected = labels.environment(environment, unit.id)
-        self.assertEqual(selected["CLAUDE_CODE_SESSION_ID"], unit.id)
-        self.assertEqual(selected["SHOWRUNNER_UNIT"], runner.name)
-        self.assertEqual(selected["SHOWRUNNER_UNIT_ID"], "models-unit")
-        self.assertNotIn("STAFF_ID", selected)
-        self.assertEqual(labels.environment(environment, worker.id)["CLAUDE_CODE_SESSION_ID"], worker.id)
+        environment = {"STAFF_ID": worker.id, "SHOWRUNNER_" + "UNIT_ID": "models-unit"}
+        selected = labels.environment(environment, unit.current_session)
+        self.assertEqual(selected, {"CLAUDE_CODE_SESSION_ID": unit.current_session})
+        self.assertEqual(labels.environment(environment, worker.current_session),
+                         {"CLAUDE_CODE_SESSION_ID": worker.current_session})
+        self.assertEqual(labels.environment(environment, unit.id), {})
+
+    def test_retained_reference_projects_the_current_session_without_copied_identity(self) -> None:
+        from scripts.shutdown import pane_record
+
+        fixture = self.row_production()
+        self.assertNotEqual(fixture.unit.id, fixture.unit.current_session)
+        membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, ()))
+        launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
+            {"STAFF_ID": fixture.unit.id, "SHOWRUNNER_" + "UNIT": "old", "ENABLE_TOOL_SEARCH": "true"},
+            ["claude"])
+        before = self.staff_file.read_bytes()
+        selected = membership.environment(launch)
+        self.assertEqual(selected, {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session,
+                                    "ENABLE_TOOL_SEARCH": "true"})
+        self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_unknown_runtime_is_not_assigned_by_its_unique_folder_or_display_name(self) -> None:
         runner, unit, _ = self.tree()
@@ -36,7 +53,7 @@ class NativeSessionLabelTests(StaffTestCase):
         selected = labels.environment({"STAFF_ID": unit.id}, fixture_runtime_id("unpublished"))
         self.assertNotIn("CLAUDE_CODE_SESSION_ID", selected)
         self.assertNotIn("STAFF_ID", selected)
-        self.assertNotIn("SHOWRUNNER_UNIT", selected)
+        self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in selected))
         self.assertEqual(self.staff_file.read_bytes(), before)
 
 

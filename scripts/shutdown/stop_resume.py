@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import argparse
 import json
@@ -14,6 +15,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 from importlib import import_module
@@ -28,6 +30,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import herdr
+from scripts.lib import operation_deadline
 import pane_record
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.shutdown.codex_trust import trust_arguments
@@ -42,13 +45,13 @@ from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
-    ResumeResult as ResumeResult,
+    ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
 )
 import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
-    from scripts.production.staff import StaffRow, StaffSnapshot
+    from scripts.production.staff import StaffRow, StaffSnapshot, ClaudeBackend, CodexBackend, BackendUnavailable
 
 
 class RowStarter(Protocol):
@@ -120,6 +123,8 @@ def _signal_process(pid: int, number: int) -> None:
                 raise ValueError("herdr did not place the pid in a workspace pane")
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             raise PermissionError(f"{refusal}: {error}") from error
+    if number in (signal.SIGTERM, signal.SIGKILL):
+        operation_deadline.check()
     os.kill(pid, number)
 
 
@@ -140,14 +145,35 @@ def _record_launches(selected: list[str]) -> None:
         print(f"stop: launch note anomaly: {error}", file=sys.stderr)
 
 
-def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend: ClaudeBackend | CodexBackend | BackendUnavailable) -> SourceRelease:
+    """Resolve native stop evidence before creating the destination."""
     from scripts.production import staff
 
-    with staff.row_operation(session):
-        return _stop_recorded(session)
+    result = stop(row.id)
+    if isinstance(result, SessionNotFound):
+        return SourceUnresolved(f"{row.id}: lifecycle could not resolve the staff reference; check the staff row and retry")
+    if isinstance(result, StopFailed):
+        return SourceReleaseUnknown(f"{result.reason}; inspect the source session and retry")
+    if isinstance(result, NotRunning) and isinstance(backend, staff.CodexBackend):
+        stop_mesh = cast(Callable[[staff.StaffRow, tuple[Path, ...]], SourceRelease],
+                         import_module("scripts.agents.codex_mesh").stop_worker_for_switch)
+        released = stop_mesh(row, runs())
+        return released if isinstance(released, SourceReleased) else replace(released, reason=f"{released.reason}; inspect the source session and retry")
+    return SourceReleased()
 
 
-def _stop_recorded(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+def stop(session: str, *, deadline: float = math.inf) -> StopResult:
+    from scripts.production import staff
+
+    try:
+        with operation_deadline.within(deadline), staff.row_operation(session):
+            return _stop_recorded(session)
+    except TimeoutError as error:
+        reason = str(error)
+        return StopFailed(session, reason if "deadline passed" in reason else f"deadline passed; {reason}")
+
+
+def _stop_recorded(session: str) -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     _record_launches([session])
     result = _stop(session)
@@ -174,9 +200,11 @@ def _retire_prompt(session_id: str) -> None:
         print(f"{session_id}: prompt cancellation: {error}", file=sys.stderr)
 
 
-def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+def _stop(session: str) -> StopResult:
     """Signal only the process that proves the current conversation."""
     identity = session
+    last_signal = ""
+    signal_pid = 0
     tab: herdr.TabSession | SessionNotFound = SessionNotFound(session)
     try:
         from scripts.production import staff
@@ -213,16 +241,17 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         if not herdr.check_native_target(live.pid, kind, proved):
             return StopFailed(identity, "process identity changed; no signal sent")
         _signal_process(live.pid, signal.SIGTERM)
+        last_signal = "SIGTERM"
+        signal_pid = live.pid
         deadline = monotonic() + STOP_GRACE_SECONDS
         while _same_process(live.pid, started):
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
-            _ = Event().wait(min(0.1, remaining))
+            _ = Event().wait(operation_deadline.remaining(min(0.1, remaining)))
         else:
             return Stopped(identity, live.pid)
         if _same_process(live.pid, started):
-            last_signal = "SIGTERM"
             try:
                 if not herdr.check_native_target(live.pid, kind, proved):
                     return StopFailed(identity, "process identity changed; no signal sent")
@@ -238,12 +267,15 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     return StopFailed(identity, f"pid {live.pid} is still running after {last_signal}")
-                _ = Event().wait(min(0.1, remaining))
+                _ = Event().wait(operation_deadline.remaining(min(0.1, remaining)))
         return Stopped(identity, live.pid)
     except ProcessLookupError:
         return NotRunning(identity)
     except (OSError, ValueError, herdr.HerdrFailure) as error:
-        return StopFailed(identity, str(error))
+        reason = str(error)
+        if isinstance(error, TimeoutError) and last_signal:
+            reason += f"; pid {signal_pid} received {last_signal} and still runs"
+        return StopFailed(identity, reason)
 
 
 def resume_arguments(entry: pane_record.PaneLaunch) -> list[str]:
@@ -452,8 +484,12 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             except (OSError, ValueError) as error:
                 print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         if isinstance(tab, SessionNotFound):
+            workspace = row
+            while workspace is not None and workspace.kind != "showrunner":
+                workspace = names.tab_record.parent_of(workspace)
+            space = workspace.name if workspace is not None else entry["name"] or "agents"
             with herdr.restore_staff(names.tab_record, labels=names.labels):
-                pane = client.open_tab(entry["environment"].get("SHOWRUNNER_UNIT", "agents"),
+                pane = client.open_tab(space,
                     entry["name"] or identity, entry["cwd"], entry["environment"])
             entry = entry.copy()
             entry["pane_id"] = pane
@@ -568,7 +604,7 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
 def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, requester: str = "",
                 why: str = "") -> str:
     """Build one actionable outcome for the showrunner, user push and stay log."""
-    from scripts.production import showrunners, staff_sources
+    from scripts.production import showrunners, staff, staff_sources
     from scripts.accounts import unit_watchdog
     from scripts.notify.push_texts import render
     from datetime import datetime, timezone
@@ -576,8 +612,15 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     from probe_session import PROBE_ENV
     import remote
 
+    try:
+        record = staff.snapshot()
+    except (staff.StaffUnreadable, ValueError) as error:
+        print(f"{identity}: staff anomaly: {error}", file=sys.stderr)
+        record = staff.StaffSnapshot(())
+    row = record.by_current_session(identity)
     entry = pane_record.read(herdr.shared_session()).get(pane)
-    entry = entry if entry and entry["session_id"] == identity else None
+    entry = entry if entry and (entry["session_id"] == identity
+        or row is not None and record.by_member_reference(entry["session_id"]) == row) else None
     environment = entry["environment"] if entry else {}
     name = entry["name"] if entry else ""
     try:
@@ -587,7 +630,7 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     except (OSError, ValueError, herdr.HerdrFailure):
         pass  # The saved launch name still identifies a session whose pane is gone.
     name = name or identity
-    unit = environment.get("SHOWRUNNER_UNIT_ID", "")
+    unit = row.name if row is not None and row.kind == "unit" else ""
     if unit:
         try:
             recovery = unit_watchdog.run(datetime.now(timezone.utc), dry_run=False)
@@ -674,7 +717,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
             stops = [pool.submit(handoff_failures.__getitem__, session) if session in handoff_failures else
                      pool.submit(already_up.__getitem__, session) if session in already_up else
                      pool.submit(_stop, session) for session in selected]
-            stopped: list[Stopped | NotRunning | StopFailed | SessionNotFound | ClaudeUp] = []
+            stopped: list[StopResult | ClaudeUp] = []
             for session, future in zip(selected, stops):
                 try:
                     result = future.result()

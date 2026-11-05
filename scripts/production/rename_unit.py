@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rename a staff unit, its folder, its Git branch, and its displays."""
+"""Rename a staff unit, its displays, its folder and its branch."""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +19,7 @@ from scripts.shutdown import remote
 from scripts.herdr import herdr
 from scripts.production.rename_state import RenameRefused
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.agents import worker_lifecycle
 from scripts.message import sessions
 
 
@@ -26,7 +27,6 @@ from scripts.message import sessions
 class UnitRename:
     member: staff.StaffRow
     name: str
-    destination: Path
 
 
 def plan(slug: str, old: str, new: str) -> UnitRename:
@@ -36,19 +36,16 @@ def plan(slug: str, old: str, new: str) -> UnitRename:
         found = staff_sources.member(staff_sources.UnitMember(slug, new), record)
     if isinstance(found, staff_sources.NoSuchMember):
         raise ValueError(f"{slug}/{old}: no unit staff row")
-    if old != new:
-        if isinstance(found.row.worktree, staff.WorktreeUnfilled):
-            raise ValueError(f"{old}: the staff worktree is unfilled")
-        if found.row.worktree.machine != remote.local_machine():
-            raise ValueError(f"{old}: run rename on {found.row.worktree.machine}")
     name = unit_names.name(new)
-    return UnitRename(found.row, name, Path.home() / "worktrees" / name)
+    if (found.row.name != name and not isinstance(found.row.worktree, staff.WorktreeUnfilled)
+            and found.row.worktree.machine != remote.local_machine()):
+        raise ValueError(f"{old}: run rename on {found.row.worktree.machine}")
+    return UnitRename(found.row, name)
 
 
 def relocate_staff_worktree(member_id: staff.StaffId, worktree: Path) -> None:
     """Keep the location state when a production rename moves a unit."""
-    row = staff.by_id(member_id)
-    if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+    if (row := staff.by_id(member_id)) is None or isinstance(row.worktree, staff.WorktreeUnfilled):
         raise ValueError(f"{member_id}: no unit worktree")
     _ = staff.set_worktree(row.id, replace(row.worktree, path=worktree), expected=row.worktree)
 
@@ -99,38 +96,51 @@ def repair_displays(row: staff.StaffRow) -> bool:
 
 
 def apply(slug: str, old: str, new: str) -> UnitRename:
-    with staff.operation():
-        request = plan(slug, old, new)
-        row = request.member
+    request = plan(slug, old, new)
+    with staff.row_operation(str(request.member.id)):
+        if (row := staff.by_id(request.member.id)) is None:
+            raise ValueError(f"{slug}/{old}: no unit staff row")
         changed = row.name != request.name
+        pending = unit_move.pending_move(row.id)
+        if isinstance(pending, unit_move.FolderMove) and changed:
+            if not unit_move.move_folder(row.id, pending.destination, branch=pending.branch):
+                print("unchanged")
+                return request
+            if (row := staff.by_id(request.member.id)) is None:
+                raise ValueError(f"{slug}/{old}: no unit staff row")
+            pending = unit_move.pending_move(row.id)
+        movement = pending
+        if isinstance(pending, unit_move.PendingRename) and pending.name != request.name:
+            raise ValueError(f"{row.name}: finish the pending rename to {pending.name}")
+        if isinstance(pending, unit_move.NoPendingMove) and changed:
+            if isinstance(row.worktree, staff.WorktreeUnfilled):
+                print(f"anomaly: {request.name}: the staff worktree is unfilled", file=sys.stderr)
+            else:
+                if row.worktree.machine != remote.local_machine():
+                    raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
+                folder = row.worktree.path.expanduser().resolve()
+                target = unit_names.swap_stem(folder.name, row.name, request.name)
+                destination = folder.with_name(target) if target is not None else folder
+                checkout = folder if folder.exists() else destination
+                branch = unit_move.git(checkout, "branch", "--show-current") if checkout.exists() else ""
+                renamed_branch = unit_names.swap_stem(branch, row.name, request.name)
+                if target is None:
+                    print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
+                if renamed_branch is None:
+                    print(f"anomaly: branch {branch} does not end with -{row.name}", file=sys.stderr)
+                target_branch = renamed_branch if renamed_branch is not None else unit_move.KeepBranch.CURRENT
+                if target is not None or renamed_branch is not None:
+                    movement = unit_move.PendingRename(destination, target_branch, request.name)
+                    unit_move.prepare_move(row, destination, target_branch, request.name)
         if changed:
             row = staff.rename(row.id, request.name)
-        location = row.worktree
-        if old != new and isinstance(location, staff.WorktreeUnfilled):
-            raise ValueError(f"{row.name}: the staff worktree is unfilled")
-        if old != new and not isinstance(location, staff.WorktreeUnfilled) and location.path != request.destination:
-            if isinstance(location, staff.PresentWorktree):
-                unit_move.move_folder(row.id, request.destination)
-            else:
-                request.destination.parent.mkdir(parents=True, exist_ok=True)
-                if location.path.exists():
-                    _ = unit_move.git(location.path, "worktree", "move", str(location.path), str(request.destination))
-                relocate_staff_worktree(row.id, request.destination)
-            changed = True
-        if old == new:
-            pass
-        elif request.destination.is_dir():
-            branch = unit_move.git(request.destination, "branch", "--show-current")
-            if branch != request.name:
-                _ = unit_move.git(request.destination, "branch", "-m", request.name)
-                changed = True
-        else:
-            print(f"anomaly: folder is absent: {request.destination}", file=sys.stderr)
         try:
             changed = repair_displays(row) or changed
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             print(f"anomaly: display: {error}", file=sys.stderr)
             changed = True
+        if isinstance(movement, (unit_move.FolderMove, unit_move.PendingRename)):
+            changed = unit_move.move_folder(row.id, movement.destination, branch=movement.branch) or changed
         print("done" if changed else "unchanged")
         return request
 
@@ -147,12 +157,16 @@ def main(argv: list[str]) -> int:
         try:
             if cast(str, args.action) == "plan":
                 request = plan(cast(str, args.slug), cast(str, args.old), cast(str, args.new))
-                print(f"Rename {request.member.name} to {request.name}; folder {request.destination}")
+                print(f"Rename {request.member.name} to {request.name}")
             else:
                 _ = apply(cast(str, args.slug), cast(str, args.old), cast(str, args.new))
             return 0
-        except (OSError, ValueError, RenameRefused, herdr.HerdrFailure) as error:
-            print(f"rename_unit: {error}", file=sys.stderr)
+        except worker_lifecycle.OperationDeadlineExpired as error:
+            print(f"rename_unit: anomaly: {error}", file=sys.stderr)
+            return 0
+        except (OSError, ValueError, RenameRefused, herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
+            message = f"error: {str(error).splitlines()[0]}" if isinstance(error, subprocess.TimeoutExpired) else str(error)
+            print(f"rename_unit: {message}", file=sys.stderr)
             return 1
     return staff.cli_result(run)
 

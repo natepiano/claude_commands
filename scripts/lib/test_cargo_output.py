@@ -14,6 +14,23 @@ from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, r
 
 
 class CargoOutputTests(unittest.TestCase):
+    def test_metadata_command_uses_its_environment(self) -> None:
+        checkout = Path("/workspace")
+        target = checkout / "selected-output"
+        environment = {"CARGO_TARGET_DIR": str(target)}
+        payload = {"workspace_root": str(checkout), "target_directory": str(target)}
+        with mock.patch("scripts.lib.cargo_output.subprocess.run", return_value=subprocess.CompletedProcess(
+            [], 0, json.dumps(payload), "",
+        )) as run:
+            self.assertEqual(read_cargo_output_roots(checkout, cargo=("/tools/cargo", "+nightly"),
+                                                     options=("--config", 'build.target-dir="selected-output"'),
+                                                     environment=environment), CargoOutputRoots(checkout, target, target))
+        run.assert_called_once_with(
+            ["/tools/cargo", "+nightly", "metadata", "--format-version", "1", "--no-deps",
+             "--config", 'build.target-dir="selected-output"'],
+            cwd=checkout, capture_output=True, text=True, check=False, env=environment,
+        )
+
     def test_metadata_selects_arbitrary_intermediate_root_and_keeps_missing_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory).resolve()

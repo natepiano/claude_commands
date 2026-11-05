@@ -131,6 +131,7 @@ PY
 
     def release_memory_after_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
+        _ = admission.occupy_host()
         admission.free(8 * gate.GIB)
         recorded = False
 

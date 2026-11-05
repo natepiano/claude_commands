@@ -8,6 +8,12 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 # typical cases use existing test facts or the Nix thresholds, never invented log citations.
 
 
+def mac_idle_reservation(holder: str, detail: str) -> str:
+    """The optional reservation sentence used as a catalog value."""
+    return (f'The Mac reservation lists holder "{holder}" and label "{detail}".'
+            if holder not in ("", "none") else "")
+
+
 ENTRIES = (
     PushText("decision.choices", "{sender}", "decision", "{title}",
         ActionTemplate("On {machine}, reply in the {session} terminal: {choice_labels}."),
@@ -42,6 +48,27 @@ ENTRIES = (
          PushExample("unreachable", {"reason": "natedev could not reach the Mac for more than 24 hours.", "action": "Wake the Mac and connect it to the network."}),
          PushExample("command", {"reason": "The update failed with an error the job does not know.", "action": "In the Claude session named natedev, ask it to read the vault update error in the hourly log."})),
         purpose="The Mac vault cannot update. One alert is sent until a pull succeeds."),
+    PushText("mac_idle.blocked", "Mac idle watch", "blocked", "{holder} blocks waiting Mac tests",
+        ActionTemplate("On natedev, in the {holder} session, ask it to finish its Mac work and run /build:mac unblock"),
+        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
+        + "{waiting} steps wait behind the {holder} session's block. It labeled the reservation \"{detail}\". "
+        + "Waiting work can use the Mac after {clears}.",
+        (PushExample("research_block", {"minutes": "10", "waiting": "7", "holder": "research",
+            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"}),
+         PushExample("three_waiting", {"minutes": "12", "waiting": "3", "holder": "research",
+            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"})),
+        purpose="A Mac block holds up eligible steps past the configured threshold."),
+    PushText("mac_idle.stuck", "Mac idle watch", "decision", "Waiting tests are not using the Mac",
+        ActionTemplate("On natedev, ask the builds showrunner to get the waiting steps onto the Mac"),
+        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
+        + "{waiting} steps wait. {reservation} "
+        + "To restore Mac work: {clears}.",
+        (PushExample("idle_research_claim", {"minutes": "10", "waiting": "3",
+            "reservation": mac_idle_reservation("research", "P15 F11 L0 run"), "since": "07:50 EDT", "clears": "release of the idle claim P15 F11 L0 run"}),
+         PushExample("free_mac", {"minutes": "10", "waiting": "7",
+            "reservation": mac_idle_reservation("none", ""), "since": "07:47 EDT",
+            "clears": "the builds showrunner checks why the waiting steps do not take the Mac"})),
+        purpose="Eligible steps wait while the Mac has no build or test."),
     PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
         ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
         "The nix shell for {session}'s worktree did not load, so its builds will fail. "
@@ -166,21 +193,6 @@ ENTRIES = (
         (PushExample("typical", {"account": "codex1"}),
          PushExample("long_account", {"account": "codex999"})),
         purpose="Codex stopped work for lack of usage, and Claude could not take it."),
-    # sweep.py sends this only when no idle build output is left and no Claude session holds a busy
-    # target; {paths} lists, largest first, the busy targets and then the largest measured folders.
-    # Sizes follow the 2026-10-21 disk check on natedev (HANDOFF-builds-unit.md, 00:45 EDT): 26 GiB held in
-    # cargo-liner-berth's target, about 86 GiB of scratch clones under /tmp.
-    PushText("sweep.disk_floor", "sweep", "note", "Builds need more disk space",
-        ActionTemplate("In the Claude session named natedev, name the paths below that it may remove."),
-        "The natedev computer has {free} free. Builds need {floor}. They may fail until {shortfall} more is free. "
-        + "Build cache cleanup freed {removed} and has no idle build output left.\n\n{paths}\n\n"
-        + "The session removes only the paths you name.",
-        (PushExample("typical", {"shortfall": "10.0 GiB", "free": "290.0 GiB", "floor": "300.0 GiB", "removed": "2.0 GiB",
-            "paths": "/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.\n\n"
-            + "/tmp/claude-1000/scratch: frees 86.0 GiB."}),
-         PushExample("no_free_space", {"shortfall": "300.0 GiB", "free": "0.0 GiB", "floor": "300.0 GiB", "removed": "0.0 GiB",
-            "paths": "/tmp/claude-1000/scratch: frees 86.0 GiB.\n\n/home/natepiano/.local/share/Trash: frees 40.0 GiB."})),
-        purpose="Builds need more disk space. You name the paths to remove."),
     PushText("rust.passed", "rust_release", "decision", "Hana can use the new Rust compiler",
         ActionTemplate("In the Claude session named natedev, reply upgrade or wait."),
         "Hana, the editor project, passed its compiler check on Rust {version}: no errors. "

@@ -31,7 +31,7 @@ from scripts.production.production_doc import Refusal
 from scripts.copies import copies
 from scripts.message import send_result
 from scripts.message import send_budget
-from scripts.production import showrunners
+from scripts.production import showrunners, unit_names
 import style_ledger
 from process_failure import failure_detail
 import scratch
@@ -92,6 +92,8 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             match outcome.header.outcome:
                 case "sent" | "skipped" | "kept" | "replaced":
                     return
+                case "retry":
+                    raise Refusal(f"send.py: needs a retry: {outcome.header.detail}")
                 case "queued" | "failed" | "refused" | "held" | "pending":
                     pass
         raise Refusal(f"send.py: {failure_detail(sent)}")
@@ -493,7 +495,8 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
             return
         for wait in waits:
             try:
-                addresses = [director.address for director in directors if director.unit == wait.unit]
+                unit = unit_names.unit_id(ledger.unit_name(wait.unit))
+                addresses = [director.address for director in directors if director.unit == unit]
                 if not addresses:
                     raise Refusal("no live director")
                 if len(addresses) != 1:
@@ -505,7 +508,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                 ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:
                     raise Refusal(f"send.py: {failure_detail(result)}")
-            except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+            except (Refusal, OSError, ValueError, style_ledger.LedgerError, subprocess.TimeoutExpired) as error:
                 print(f"style_ledger: wake {wait.unit}: " + " ".join(str(error).splitlines()))
                 continue
             ledger.acknowledge_sync_wait(wait)

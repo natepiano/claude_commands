@@ -18,12 +18,8 @@ if TYPE_CHECKING:
 from scripts.message import sessions
 from place import HerdrPlace
 from scripts.lib.probe_session import PROBE_ENV
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, legacy_identity
 from scripts.production import staff
-
-UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
-MEMBER_MARKS = UNIT_MARKS
-
 
 # The launch environment a resume must give back. Credentials never enter the record.
 KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
@@ -151,14 +147,11 @@ class RecordedLabels:
         self.membership: StaffLabels | StaffLabelsRead = membership
 
     def resolve(self, pid: int, environment: Mapping[str, str]) -> dict[str, str]:
-        # Raw discovery already has these process labels. Ownership projections
-        # pass their staff snapshot explicitly and still require native proof.
-        if isinstance(self.membership, StaffLabelsRead) and all(environment.get(key) for key in UNIT_MARKS):
-            return {key: value for key, value in environment.items() if key != "STAFF_ID"}
+        values = legacy_identity.without_legacy_identity(environment)
         record = sessions.read_session(sessions.sessions_dir() / f"{pid}.json")
         if (isinstance(record, sessions.UnreadableSessionRecord) or record["pid"] != pid
                 or not sessions.running_session(record)):
-            return dict(environment)
+            return values
         if self.membership is StaffLabelsRead.PENDING:
             from scripts.production import staff
             from scripts.production.session_labels import StaffLabels
@@ -167,7 +160,6 @@ class RecordedLabels:
                 self.membership = StaffLabels.read()
             except (staff.StaffUnreadable, OSError, ValueError):
                 self.membership = StaffLabelsRead.UNAVAILABLE
-        values = dict(environment)
         if not isinstance(self.membership, StaffLabelsRead):
             values = self.membership.environment(values, record["sessionId"])
         return values

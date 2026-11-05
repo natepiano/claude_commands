@@ -107,7 +107,6 @@ SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
-RUNNER = Path(__file__).resolve().parents[1] / "test_times" / "module_run.py"
 ROLLBACK_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 # Restore dispositions and the mask in every child, including types. The runner
 # defers cancellation until the child is registered for cleanup.
@@ -878,11 +877,12 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
                     aborted: bool) -> None:
     """Build one gate record without changing the gate verdict."""
     try:
+        slow_test_s = gate_record.slow_test_s()
         modules = gate_record.module_runs([
             gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds,
                                   job.peak_mib, job.returncode, job.restart, job.times)
             for job in executions
-        ])
+        ], slow_test_s)
         suites: list[gate_record.SuiteRun] = [
             {"suite": suite, "wall_s": suite_finished.get(suite, began) - began,
              "status": int(any(job.returncode for job in results
@@ -899,12 +899,20 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             "checkout": str(ledger.repo), "branch": branch, "sha": sha,
             "tree": ledger.tree.tree if isinstance(ledger.tree, CleanTestTree) else "",
             "source": ledger.source, "aborted": aborted, "dirty": isinstance(ledger.tree, UnrecordableTestTree),
-            "suites": suites, "modules": modules,
+            "suites": suites, "modules": modules, "slow_test_s": slow_test_s,
         }
     except Exception as error:
         gate_record.report_not_written(error)
         return
     gate_record.write_gate_run(run)
+
+
+def module_runner(repo: Path) -> Path:
+    """Use the test runner from the tested checkout."""
+    runner = repo / "scripts" / "test_times" / "module_run.py"
+    if not runner.is_file():
+        raise GateRefused(f"test runner not found: {runner}")
+    return runner
 
 
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
@@ -923,6 +931,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     modules = discover_test_modules(repo)
     if not modules:
         raise GateRefused("the test list is empty")
+    runner = module_runner(repo)
     tmpfs = Path("/dev/shm")
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
@@ -1060,7 +1069,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
-                            [*scope_prefix, python, str(RUNNER), str(path.parent), path.name])
+                            [*scope_prefix, python, str(runner), str(path.parent), path.name])
                     with rollback_signals(defer=True):
                         if request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)

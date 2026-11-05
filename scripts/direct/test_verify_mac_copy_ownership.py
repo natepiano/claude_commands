@@ -9,6 +9,7 @@ import os
 import signal
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, invoke_mac_claim
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.build_queue.admission_test_support import caller_admission
 
 
 @final
@@ -45,9 +46,12 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         self.environment["BUILD_TARGETS_POLL_S"] = "3600"
         process, copy = self.start_copy_call(copy={"TEST_COPY_WAIT": "1", "TEST_COPY_CLAIM": mac_test_script})
 
+        admission = caller_admission(self, self.root, self.environment)
+
         def claim(*words: str) -> subprocess.CompletedProcess[str]:
-            return invoke_mac_claim([*words, "--pid", str(os.getpid())],
-                              self.environment, self.root)
+            with admission.loop_turn():
+                return invoke_mac_claim([*words, "--pid", str(os.getpid())],
+                                        self.environment, self.root)
 
         new_test = claim("claim", "--what", "nextest other", "--worktree", str(self.root))
         self.addCleanup(claim, "release")

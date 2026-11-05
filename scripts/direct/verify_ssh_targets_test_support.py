@@ -288,6 +288,23 @@ class VerifySshTargetsFixture(VerifyMacOffloadFixture):
         super().build_fixture()
         self.environment.update(fake_memory_readings(self.root))
         self.environment["TEST_SOURCE_REPO"] = str(REPOSITORY)
+        # Restore the private wait identity after the gate removes inherited values.
+        reader = Path(self.environment["LINT_CONFIG_READER"])
+        with reader.open("a") as stream:
+            _ = stream.write(r'''
+fixture_wait_since=${BUILDLOG_MEM_WAIT_SINCE-}
+fixture_wait_first_file=${BUILDLOG_MEM_WAIT_FIRST_FILE-}
+source() {
+    builtin source "$@"
+    local status=$?
+    if [[ "$1" == */memory_gate.sh ]]; then
+        export BUILDLOG_MEM_WAIT_SINCE=$fixture_wait_since
+        export BUILDLOG_MEM_WAIT_FIRST_FILE=$fixture_wait_first_file
+        unset -f source
+    fi
+    return "$status"
+}
+''')
         self.write_executable(self.runner, SSH_RUNNER)
         self.write_executable(self.bin_directory / "git", GIT_STUB.replace(
             "wanted=ls-files", 'wanted=remote\nif has "$@"; then printf "https://example.com/team/hana.git\\n"; exit 0; fi\nwanted=ls-files'))

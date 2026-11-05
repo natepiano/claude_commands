@@ -1,6 +1,6 @@
 # builds-natest — Next
 
-The phase backlog of natest-unit. At each phase end, re-sort with `python3 ~/.claude/scripts/test_times/show.py top`, and the next speed phase takes the top live module that no phase holds.
+The phase backlog of natest-unit. At each phase end, rank modules with `python3 ~/.claude/scripts/test_times/show.py top --repo ~/.claude`. The next speed phase takes the highest ranked live module that no phase holds, subject to the floor rule.
 
 ## Descending sort
 
@@ -22,11 +22,17 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 
 ## Items to consider
 
-- [ ] **Speed phases for ranks 7-10**
-  - Target: `scripts/shutdown/test_restart.py`, `scripts/hana_shot/test_hana_shot.py`, `scripts/direct/test_workers.py`, `scripts/direct/test_review_launcher_pool.py`
-  - Why needed: the user's mission takes the next module when the longest one is shorter (2026-11-03).
-  - Completion condition: each module's median wall time is at most half its baseline, with the speed method in the plan's Delegation Context.
-  - Revealed by: the 2026-11-03 sort.
+- [x] **One path to `send.py`.** 29 production modules build their own `send.py` path in place of `session_send`. Sent to the showrunner on 2026-11-05 with the owner of each file; recommended owner: natedev-messaging. Phase 26 refuses the sender when `TEST_SENDER_GUARD` is set; the runner item below owns the guard for every module. No natest work remains on this caller cleanup.
+- [ ] **The test runner guards every module from the real `send.py`.**
+  - Target: `scripts/test_times/module_run.py`, `scripts/message/session_send_test_support.py`
+  - Why needed: after Phase 26, only the four modules that call `forbid_real_sender()` are guarded, and the runner finds the marker through that module's stored record. A module that never installs the guard, or a marker variable inherited from a parent, is not checked (Phase 26 adversary round 2). No module in the gate takes either path today.
+  - Completion condition: the runner sets one marker path before `unittest.main` for every module and checks that path after it; the four installs reuse it; the gate shows which modules, if any, start the real `send.py`.
+  - Revealed by: Phase 26 adversary review round 2, 2026-11-05.
+- [ ] **Select the next speed target after Phases 24 and 27.**
+  - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
+  - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
+  - Candidate: `direct/test_verify_lint_cache_versions.py`, gate median 116.1 s over 5 runs on 2026-11-05; it waits on the verify-unit remake like Phase 24. Confirm the rank at selection.
+  - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
 - [ ] **Architecture proposal: the type-check job**
   - Target: `scripts/production/merge_gate.py` (owner sdlc devtools-unit)
   - Why needed: report-unit names `types/basedpyright` among the three highest-CPU gate jobs (2-4 min). One basedpyright job checks every listed folder in each gate.
@@ -37,8 +43,38 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: `module_seconds.json` keeps 728 keys for 664 test files; old `delegate/*` keys remain after the folder moved. Memory admission reads the peak file the same way.
   - Completion condition: send the showrunner a proposal to drop keys whose module file is gone, with the key counts.
   - Revealed by: plan research, 2026-11-03.
-- [ ] **The build log test suite finishes about 20 seconds sooner.**
+- [x] **The build log test suite finishes about 20 seconds sooner.** Taken by Phase 28 (2026-11-05): parallel starts, one process for each module.
   - Target: `scripts/buildlog/test_index.py` — `LogIsolationTests.test_each_module_uses_a_temporary_log`
   - Why needed: the test starts one Python process for each of the 33 `test_*.py` modules in `scripts/buildlog`: 24.5 s of the 34.8 s suite run at load 70 (11:24 EST, 2026-11-03). It is the slowest test in the index suite, and each new module adds one more process.
   - Completion condition: one process imports every module and reports each module's log root; the test keeps one assertion per module and takes under 3 s on an idle natedev.
   - Revealed by: Phase 3
+- [ ] **The simplify-lens report validation test starts fewer processes and keeps its recorder checks.**
+  - Target: `scripts/direct/test_simplify_lens.py` — `test_report_validation_trims_whitespace_and_requires_pass_or_a_numbered_item` (25 s, 8 review-launcher runs)
+  - Why needed: Phase 6 left this test as the module's largest cost. Each of the 8 runs checks the report result, the saved status and the review record's `status` and `raised` fields, so a parse-only call cannot replace them.
+  - Completion condition: every existing check stays; the needed process boundaries stay; same-load pairs show the gain.
+  - Revealed by: Phase 6; showrunner ruling 2026-11-04; the Phase 11 architect review.
+- [ ] **Each improved module keeps a reference time.**
+  - Target: `scripts/test_times/show.py`, `config/test_times.conf`
+  - Why needed: the gate's slowdown warning compares with a rolling median, which slowly accepts a slowdown as normal (Astra plan review, 2026-11-04).
+  - Completion condition: each module a speed phase improved has its after median stored as a reference; a gate median 20% over it is reported at phase start.
+  - Revealed by: Astra plan review; starts after Phase 14 lands (showrunner ruling 2026-11-04).
+- [ ] **Architecture proposal: `mac_run.sh` reads its config keys in one start**
+  - Target: `scripts/production/mac_run.sh` (recent owner: builds-resources)
+  - Why needed: `config_value()` starts `python3 conf.py get` once for each key. `test_mac_run.py` makes 339 such starts (23.5 s traced of a 49.5 s traced run); they set the Phase 29 floor.
+  - Completion condition: send the showrunner a proposal for one `conf.py` start that prints every key `mac_run.sh` needs, with the same validation; estimated gain 12-14 s on the module.
+  - Also: `mac_test.py` claim and release take 19.3 s in 35 starts (owner verify-unit); profile their imports before a proposal (estimated 3-6 s).
+  - Revealed by: Phase 29, 2026-11-05.
+- [ ] **Architecture proposal: one injected Git runner in fast_track.py**
+  - Target: `scripts/production/fast_track.py` (owner: production) and `scripts/production/test_fast_track.py`
+  - Why needed: the module's floor is 55 tests at about 3.5 s each of real Git work (Phase 7); the test file alone cannot go lower.
+  - Completion condition: decision tests run against the runner; a few process tests keep real Git; same-load pairs show the gain (about 3 minutes on one module).
+  - Risk: a recorded Git transcript is a second model of Git that can drift from real Git (showrunner, 2026-11-04).
+  - Revealed by: Phase 7; showrunner ruling 2026-11-04 (next, not current).
+
+## Floors
+
+| Module | Floor (pair median wall s) | Limiting operation | Phase |
+| --- | --- | --- | --- |
+| `direct/test_simplify_lens.py` | 118 | one real review-launcher run per test (3-6 s) | 6 |
+| `production/test_fast_track.py` | 193 | real Git work, about 3.5 s per test | 7 |
+| `production/test_mac_run.py` | 40.5 (load 40) | one `conf.py` start for each config key in `mac_run.sh` | 29 |

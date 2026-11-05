@@ -2787,11 +2787,6 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
                  ) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Stop workers and retain their staff rows until assign.sh can restart them."""
     from scripts.production import staff, session_staff
-    from scripts.production.worker_admission import AdmissionRefused
-    from scripts.agents.codex_mesh import stop_worker_for_switch
-    stop = cast(Callable[[str], stop_results.Stopped | stop_results.NotRunning | stop_results.StopFailed | stop_results.SessionNotFound],
-                import_module("scripts.shutdown.stop_resume").stop)
-
     del why
     target = note_file.canonical_label(target)
     if _label_is(target, "codex"):
@@ -2816,6 +2811,7 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
             preview = f"not moved: {reason}" if reason else f"would stop; restart on {target} stays pending"
             lines.append(f"{row.name} ({row.id}): {preview}")
         return GroupMoveDryRun(identities, tuple(lines))
+    release_source = cast(stop_results.ReleaseSource, import_module("scripts.shutdown.stop_resume").release_source)
     runs_by_worker = session_staff.worker_run_index(record)
     results: list[SessionMoveOutcome] = []
     for row in rows:
@@ -2823,19 +2819,12 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
             with staff.row_operation(row.id):
                 if reason := restart_refusal(row.id):
                     raise AccountsError(f"{reason}; source remains running")
-                stopped = stop(row.id)
-                if isinstance(stopped, stop_results.SessionNotFound):
-                    raise AccountsError("source reference is unresolved")
-                if isinstance(stopped, stop_results.StopFailed):
-                    raise AccountsError(stopped.reason)
-                if isinstance(stopped, stop_results.NotRunning) and isinstance(record.backends.get(row.id), staff.CodexBackend):
-                    runs = runs_by_worker.get(row.id, ())
-                    if not runs:
-                        raise AccountsError("source thread stop is unresolved; no run reference")
-                    stop_worker_for_switch(row, runs)
+                released = release_source(row, lambda: runs_by_worker.get(row.id, ()), record.backends.get(row.id, staff.BACKEND_UNAVAILABLE))
+                if not isinstance(released, stop_results.SourceReleased):
+                    raise AccountsError(released.reason)
                 results.append(stop_results.ResumePending(row.id, target,
                     "assign.sh cannot carry the staff id and destination account yet"))
-        except (OSError, ValueError, AccountsError, AdmissionRefused, staff.StaffRefused) as error:
+        except (OSError, ValueError, AccountsError, staff.StaffRefused) as error:
             results.append(SessionMoveRefused(row.id, str(error).replace("\n", " ")))
     outcomes = tuple(results)
     stdout, stderr, code = _move_output(outcomes, ())
