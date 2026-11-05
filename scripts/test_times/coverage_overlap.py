@@ -35,6 +35,10 @@ if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus
 
 
+class ModuleImportsFailed(Exception):
+    """Selected test modules failed during discovery."""
+
+
 @dataclass(frozen=True)
 class TestCoverage:
     test_id: str
@@ -318,12 +322,22 @@ def main(argv: list[str]) -> int:
     def load_suite() -> unittest.TestSuite:
         loader = unittest.TestLoader()
         suite = unittest.TestSuite()
+        import_errors: list[str] = []
         for path in paths:
+            previous_errors = len(loader.errors)
             suite.addTests(loader.discover(str(path.parent), pattern=path.name))
+            if len(loader.errors) > previous_errors:
+                reason = str(loader.errors[-1]).splitlines()[-1]
+                import_errors.append(f"coverage overlap: {path.name} does not import: {reason}")
+        if import_errors:
+            raise ModuleImportsFailed("\n".join(import_errors))
         return suite
 
     try:
         result, tests = collect(load_suite)
+    except ModuleImportsFailed as error:
+        print(str(error), file=sys.stderr)
+        return 2
     except (RuntimeError, conf.Unusable) as error:
         print(f"coverage overlap: {error}", file=sys.stderr)
         return 2
