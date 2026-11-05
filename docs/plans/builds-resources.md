@@ -1684,7 +1684,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** `target_folder` as the authoritative output root (builds ruling 2026-11-04).
 
-### Phase 63 — The phone gets one low-disk push under the alert line, with a text that passes the review  · status: todo
+### Phase 63 — The phone gets one low-disk push under the alert line, with a text that passes the review  · status: done
 **Depends on:** Phase 61 (both change `scripts/lint/sweep.py`).
 
 #### Work Order
@@ -1727,3 +1727,43 @@ The rejected texts and the reviewer's suggested rewrites are in the resources ru
 - Tests prove: a fall under the alert line sends one push and one natedev alert; a second pass under the line sends none; free space exactly at the line keeps the episode; a rise above the line and a new fall sends one more; a failed phone delivery with a sent natedev alert retries only the phone, and the reverse retries only natedev; a restart mid-episode sends nothing twice, also when the pass stops after a send and before its receipt is saved; an old record's open episode gets one phone push; a sweep-failure alert sends no phone push; the unavailable-measurement text names no folder; protected folders appear labelled as protected, with the same sizes on both channels, and are never floor holders.
 - `scripts/notify/test_push_texts.py` passes with a normal approval record. `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
 - Change-Review line: the phone gets one low-disk push | read the phone pushes after natedev free space falls under 150 GiB | one push arrives that says which folders to delete and what each one holds.
+
+### Phase 64 — Recorded step outputs have one owner, distinct rows and row facts  · status: todo
+**Depends on:** Phase 63 (both change `scripts/lint/sweep.py`); report-unit Phase 20 and its follow-up for `scripts/buildlog/memory.py` (merge `origin/builds` first).
+
+#### Work Order
+
+**Goal:** one buildlog module reads the recorded step outputs once, returns each distinct row with its facts, and each caller applies its own rule.
+
+**Measured (report-unit Phase 20 review, builds 2026-11-04):**
+- `recorded_output_roots` (`scripts/lint/build_shape.py` :268-293) returns 15,838 pairs on natedev, of which 1,120 are distinct per workspace. Both callers dedupe again. Its own CPU time is about 410 ms; the old `memory.py` SQL took 84 ms.
+- The reader applies sweep's deletion rules (skip a row whose argv sets its own target folder; one workspace key per row) for every caller, also for memory kill classification.
+- The reader lives in lint, but buildlog owns the steps table.
+- `create_step_index` and `record_root_attempt` live in `scripts/lint/test_build_shape.py` :22-30; `test_sweep.py` :42 and the memory tests import them from there.
+
+**Spec:**
+1. Move `recorded_output_roots` and its types into a buildlog module (for example `scripts/buildlog/step_outputs.py`). lint loads the store once.
+2. Return each distinct row once. Keep argv out of `DISTINCT`: a SQL prefilter on `target-dir` marks the override rows. Delete the second dedupe in both callers.
+3. Return row facts (the target-folder override marker, worktree, cwd) instead of applied rules. `sweep.py` applies its own deletion rule. `memory.py` applies its own rule.
+4. Move `create_step_index` and `record_root_attempt` into a test support module under `scripts/buildlog/`. `test_build_shape.py`, `test_sweep.py` and the memory tests import them from there.
+5. Measure the reader's CPU time on natedev before and after.
+
+**Constraints from prior phases:**
+- Keep the Phase 62 floor mapping, its speed and its protections: a target with no recorded evidence is `NoRecordedEvidence` and is never deleted or a floor holder; a row whose argv sets its own target folder gives sweep no evidence; an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>`. Keep the five Phase 62 protected tests in `test_sweep.py` unchanged.
+- `index_step_evidence` keeps its own `_step_index` reader and its results.
+- report-unit edits `memory.py` in its Phase 20 and one follow-up. Make the `memory.py` part of Spec 3 after both merge.
+
+**Files:**
+- `scripts/buildlog/step_outputs.py` (new), `scripts/lint/build_shape.py` — the reader and its types.
+- `scripts/lint/sweep.py`, `scripts/buildlog/memory.py` — the callers and their rules.
+- `scripts/buildlog/` test support module (new), `scripts/lint/test_build_shape.py`, `scripts/lint/test_sweep.py`, the memory tests — tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the reader module, `build_shape.py`, `sweep.py` and `memory.py`.
+- `test` owns the test support module and the tests.
+
+**Acceptance gate:**
+- Tests prove: the reader returns each distinct row once with its facts; sweep skips an override row and keeps one workspace key per row; memory classification applies its own rule to the same rows.
+- `scripts/lint/test_build_shape.py`, `scripts/lint/test_sweep.py` and the memory tests pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
+- The reader's CPU time on natedev, before and after, is in the checkpoint notice. A floor-only dry run on natedev stays under 30 s.
+- Change-Review line: none — internal reader structure; sweep and memory behavior do not change.

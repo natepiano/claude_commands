@@ -166,6 +166,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stdout
@@ -639,10 +640,39 @@ class LockAlertTransition:
     alert: NoLockAlertNeeded | FloorLockAlertCandidate
 
 
-class PhoneCrossing(Enum):
-    ABOVE = "above"
-    UNDER_PENDING = "under_pending"
-    UNDER_PUSHED = "under_pushed"
+class CrossingReceipt(Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+
+
+@dataclass(frozen=True)
+class AbovePhoneFloor:
+    """No low-space crossing is open."""
+
+
+@dataclass(frozen=True)
+class OpenPhoneCrossing:
+    identity: str
+    natedev: CrossingReceipt = CrossingReceipt.PENDING
+    phone: CrossingReceipt = CrossingReceipt.PENDING
+
+
+PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing
+
+
+@dataclass(frozen=True)
+class NoCrossingSend:
+    """This delivery does not report a low-space crossing."""
+
+
+NO_CROSSING_SEND = NoCrossingSend()
+UNSAVED_CROSSING_KEY = "natedev:unsaved-crossing"
+
+
+@dataclass(frozen=True)
+class CrossingSendKey:
+    key: str
+    repeat_minutes: float
 
 
 @dataclass(frozen=True)
@@ -677,7 +707,7 @@ class FloorRecord:
     lock_alert: FloorLockAlertState = NoFloorLockAlert()
     filesystem: str = ""
     measured_roots: tuple[str, ...] = ()
-    phone_crossing: PhoneCrossing = PhoneCrossing.ABOVE
+    phone_crossing: PhoneCrossing = AbovePhoneFloor()
     failure: NoFailure | FailurePending | FailureReported = NoFailure()
 
 
@@ -742,6 +772,41 @@ class UnavailableDiskMeasurement:
 
 
 DiskMeasurement = AvailableDiskMeasurement | UnavailableDiskMeasurement
+
+
+class FolderChoiceKind(Enum):
+    SCRATCH = "scratch"
+    TRASH = "trash"
+    PROTECTED = "protected"
+    OTHER = "other"
+
+
+@dataclass(frozen=True)
+class FolderChoice:
+    label: str
+    bytes: int
+    kind: FolderChoiceKind
+
+
+@dataclass(frozen=True)
+class AvailableFolderChoices:
+    choices: tuple[FolderChoice, ...]
+
+
+@dataclass(frozen=True)
+class InsufficientFolderChoices:
+    choices: tuple[FolderChoice, ...]
+
+
+@dataclass(frozen=True)
+class UnavailableFolderChoices:
+    """No current folder choice is available."""
+
+
+UNAVAILABLE_FOLDER_CHOICES = UnavailableFolderChoices()
+
+
+FolderChoices = AvailableFolderChoices | InsufficientFolderChoices | UnavailableFolderChoices
 
 
 class FloorAlertChannels(Enum):
@@ -1231,8 +1296,8 @@ def alert_floor_lock(path: str, free: int, floor: int, *,
             message = (f"natedev has {gib(free)} free, under the {gib(floor)} floor. "
                        f"The disk floor sweep cannot run: pid {candidate.pid} ({candidate.command}) "
                        f"has held floor.lock since {when(candidate.started_at)}.")
-            delivery = send_floor_alert(message, FloorAlertChannels.NATEDEV, lint_settings=lint_settings)
-            if delivery.natedev.accepted:
+            delivery = send_floor_alert(message, lint_settings=lint_settings)
+            if delivery.accepted:
                 state = candidate.receipt
         if state != current.lock_alert:
             write_floor_record(record_path, replace(current, lock_alert=state))
@@ -2786,10 +2851,22 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
                               else ObservedUnreadableFloorHold(pid, float(observed)))
     filesystem = data.get("filesystem", "")
     measured_roots = data.get("measured_roots", [])
-    try:
-        crossing = PhoneCrossing(data.get("phone_crossing", PhoneCrossing.ABOVE.value))
-    except ValueError:
-        crossing = PhoneCrossing.ABOVE
+    crossing: PhoneCrossing = AbovePhoneFloor()
+    saved_crossing = data.get("phone_crossing")
+    if saved_crossing in ("under_pending", "under_pushed"):
+        # Old receipts prove session delivery only. The phone still needs its first send.
+        crossing = OpenPhoneCrossing(f"legacy-{float(measured):.9f}",
+                                    CrossingReceipt.ACCEPTED if saved_crossing == "under_pushed"
+                                    else CrossingReceipt.PENDING)
+    elif isinstance(saved_crossing, dict):
+        saved_channels = cast(dict[str, object], saved_crossing)
+        identity = saved_channels.get("identity")
+        if isinstance(identity, str) and identity:
+            try:
+                crossing = OpenPhoneCrossing(identity, CrossingReceipt(saved_channels.get("natedev")),
+                                            CrossingReceipt(saved_channels.get("phone")))
+            except ValueError:
+                crossing = OpenPhoneCrossing(identity)
     failure: NoFailure | FailurePending | FailureReported = NoFailure()
     saved_failure = data.get("failure")
     if saved_failure == "reported":
@@ -2825,7 +2902,10 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         "build_cache_bytes": record.build_cache_bytes,
         "last_alert_at": alert_at,
         "last_push_at": push_at,
-        "phone_crossing": record.phone_crossing.value,
+        "phone_crossing": ({"identity": record.phone_crossing.identity,
+                            "natedev": record.phone_crossing.natedev.value,
+                            "phone": record.phone_crossing.phone.value}
+                           if isinstance(record.phone_crossing, OpenPhoneCrossing) else "above"),
     }
     if isinstance(record.failure, FailurePending):
         data["failure"] = {"status": record.failure.event.status, "detail": record.failure.event.detail}
@@ -2922,10 +3002,14 @@ def movement(amount: int, increase: str, decrease: str) -> str:
     return f"stayed level at {gib(0)}"
 
 
-def alert_path(path: str, limit: int) -> str:
+def home_relative(path: str) -> str:
+    """Replace the home folder prefix with a tilde."""
     home = os.path.expanduser("~")
-    if path == home or path.startswith(home + os.sep):
-        path = "~" + path[len(home):]
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+
+def alert_path(path: str, limit: int) -> str:
+    path = home_relative(path)
     if len(path) <= limit:
         return path
     leaf = path.rsplit("/", 1)[-1]
@@ -3067,15 +3151,19 @@ def holder_message_text(holder: FloorHolder, free: int, floor: int, *,
     ])
 
 
+def leaf_directories(measurement: AvailableDiskMeasurement) -> list[OutsideCacheDirectory]:
+    """Exclude parent folders when a measured child is available."""
+    names = [item.path for item in measurement.directories]
+    return [item for item in measurement.directories
+            if not any(name.startswith(item.path.rstrip(os.sep) + os.sep) for name in names)]
+
+
 def page_paths(measurement: DiskMeasurement) -> list[str]:
     """List measured folders without duplicate parent folders."""
     if not isinstance(measurement, AvailableDiskMeasurement):
         return []
-    names = [item.path for item in measurement.directories]
-    leaves = [item for item in measurement.directories
-              if not any(name.startswith(item.path.rstrip(os.sep) + os.sep) for name in names)]
     return [f"{item.path}: holds {gib(item.bytes)}."
-            for item in sorted(leaves, key=lambda item: item.bytes, reverse=True)]
+            for item in sorted(leaf_directories(measurement), key=lambda item: item.bytes, reverse=True)]
 
 
 def measure_protected_folders(roots: frozenset[str], excluded: frozenset[str]) -> tuple[tuple[str, int], ...]:
@@ -3095,6 +3183,98 @@ def protected_folder_lines(protected: Sequence[tuple[str, int]], path_limit: int
             *(f"{alert_path(path, path_limit)}: holds {gib(size)}." for path, size in largest)]
 
 
+def folder_choice(path: str, size: int) -> FolderChoice:
+    """Describe measured folders without assuming their contents are build output."""
+    folder = Path(path)
+    name = " ".join(folder.name.split())
+    label = home_relative(str(folder))
+    if name.casefold() in ("trash", ".trash"):
+        return FolderChoice(label, size, FolderChoiceKind.TRASH)
+    if any(part.casefold() == "scratch" for part in folder.parts):
+        return FolderChoice(label, size, FolderChoiceKind.SCRATCH)
+    return FolderChoice(label, size, FolderChoiceKind.OTHER)
+
+
+def classified_folder_choices(choices: tuple[FolderChoice, ...], shortfall: int) -> FolderChoices:
+    """Use the largest measured choice to select the text state."""
+    if not choices:
+        return UNAVAILABLE_FOLDER_CHOICES
+    return (AvailableFolderChoices(choices) if choices[0].bytes >= shortfall
+            else InsufficientFolderChoices(choices))
+
+
+def folder_choices(measurement: DiskMeasurement, protected: Sequence[tuple[str, int]], shortfall: int, *,
+                   now: float, lint_settings: conf.ConfigRead) -> FolderChoices:
+    """Use current measurements and keep protected folders distinct from holders."""
+    choices = [FolderChoice(home_relative(path), size, FolderChoiceKind.PROTECTED)
+               for path, size in protected if size > 0]
+    if isinstance(measurement, AvailableDiskMeasurement):
+        age = now - measurement.measured_at.timestamp()
+        if 0 <= age <= lint_settings.number("sweep_snapshot_max_age_seconds"):
+            protected_paths = {item[0] for item in protected}
+            choices.extend(folder_choice(item.path, item.bytes) for item in leaf_directories(measurement)
+                           if item.bytes > 0 and item.path not in protected_paths)
+    choices.sort(key=lambda item: (-item.bytes, item.label))
+    return classified_folder_choices(tuple(choices[:lint_settings.whole("sweep_page_paths")]), shortfall)
+
+
+@cache
+def prepare_push_texts() -> None:
+    """Add the notification module path once per process."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+
+
+def disk_floor_push(free: int, floor: int, removed: int, choices: FolderChoices) -> RenderedPush:
+    """Render folder choices with the action for their measurement state."""
+    if TYPE_CHECKING:
+        from ..notify.push_texts import render
+    else:
+        prepare_push_texts()
+        from push_texts import render
+    lines: list[str] = []
+    folder_action = "In the natedev Claude session, say which folders to delete."
+    shortfall = gib(max(0, floor - free))
+    if isinstance(choices, UnavailableFolderChoices):
+        folder_action = "In the natedev Claude session, reply measure or delete nothing."
+        lines = ["Folder sizes are unknown or out of date, so no folder is recommended yet.", "",
+                 "Measure first (recommended): natedev lists folder sizes, then you choose what to delete.", "",
+                 "Delete nothing: the disk stays low and builds can fail."]
+    else:
+        contents = {FolderChoiceKind.TRASH: "discarded files", FolderChoiceKind.SCRATCH: "scratch files"}
+        for item in choices.choices:
+            if item.kind is FolderChoiceKind.PROTECTED:
+                lines.append(f"{item.label} holds {gib(item.bytes)}. It is protected: no build record shows what made it. Cleanup never deletes it.")
+            elif isinstance(choices, InsufficientFolderChoices) and item.kind in contents:
+                lines.append(f"{item.label}: holds {gib(item.bytes)} of {contents[item.kind]}.")
+            else:
+                effect = {
+                    FolderChoiceKind.TRASH: "Deleting it removes discarded files.",
+                    FolderChoiceKind.SCRATCH: "Deleting it removes temporary work; check for work you still need.",
+                    FolderChoiceKind.OTHER: "Deleting it removes its contents; their use is unknown.",
+                }[item.kind]
+                lines.append(f"{item.label}: holds {gib(item.bytes)}. {effect}")
+        closing = "Delete nothing: builds can fail when the disk is full."
+        if isinstance(choices, AvailableFolderChoices):
+            recommendation = choices.choices[0]
+            if recommendation.kind is FolderChoiceKind.PROTECTED:
+                deletion = "Delete it" if len(choices.choices) == 1 else f"Delete {recommendation.label}"
+                lines.append(f"{deletion} (recommended): frees {gib(recommendation.bytes)} against the {shortfall} shortfall.")
+                closing = "Keep it: free space stays low, and builds can fail."
+            elif recommendation.kind in (FolderChoiceKind.SCRATCH, FolderChoiceKind.OTHER):
+                lines.append(f"Recommended: review {recommendation.label} first; its size covers the {shortfall} shortfall.")
+            else:
+                lines.append(f"Recommended: {recommendation.label} covers the {shortfall} shortfall.")
+        else:
+            total = gib(sum(item.bytes for item in choices.choices))
+            deletion = "Delete it" if len(choices.choices) == 1 else f"Delete these {len(choices.choices)}"
+            lines.append(f"{deletion} (recommended): frees {total}, so builds get some room. That is only part of the {shortfall} shortfall, so builds can still fail.")
+        lines.append(closing)
+    return render("sweep.disk_floor", free=gib(free), floor=gib(floor),
+                  folder_action=folder_action,
+                  cleanup=f"Cleanup removed {gib(removed)}." if removed else "The cleanup run freed nothing.",
+                  choices="\n".join(lines))
+
+
 @dataclass(frozen=True)
 class NoPhoneAlert:
     """This cleanup report goes only to the machine's session."""
@@ -3103,76 +3283,107 @@ class NoPhoneAlert:
 NO_PHONE_ALERT = NoPhoneAlert()
 
 
+def fit_disk_floor_push(free: int, floor: int, removed: int, choices: FolderChoices, *,
+                        lint_settings: conf.ConfigRead) -> RenderedPush | NoPhoneAlert:
+    """Fit actual values by trimming choices, then use the unavailable surface."""
+    limit = lint_settings.whole("sweep_push_text_limit")
+    while True:
+        rendered = disk_floor_push(free, floor, removed, choices)
+        if len(rendered.message) < limit:
+            return rendered
+        if not isinstance(choices, UnavailableFolderChoices):
+            choices = classified_folder_choices(choices.choices[:-1], max(0, floor - free))
+        else:
+            print("lint sweep: phone text exceeds sweep_push_text_limit", file=sys.stderr)
+            return NO_PHONE_ALERT
+
+
 def session_send_argv(to: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> list[str]:
-    """send.py's argv for a disk floor message to the session named to; the text goes on stdin."""
+    """Build the session command; its message goes through stdin."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     return [sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
             "--to", to, "--from", "disk_floor", "--timeout", f"{lint_settings.number("sweep_sender_timeout_seconds"):g}"]
 
 
+def crossing_send_argv(repeat: CrossingSendKey | NoCrossingSend) -> list[str]:
+    """Give each channel its delivery key and repeat window."""
+    return (["--key", repeat.key, "--repeat-minutes", f"{repeat.repeat_minutes:g}"]
+            if isinstance(repeat, CrossingSendKey) else [])
+
+
+def run_send(command: list[str], label: str, *, input: str | None, timeout: float) -> FloorChannelOutcome:
+    """Run either sender and report delivery, queuing, or failure."""
+    try:
+        result = subprocess.run(command, input=input, text=True, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"lint sweep: {label} failed: {error}", file=sys.stderr)
+        return FloorChannelOutcome.FAILED
+    outcome = {send_result.EXIT["sent"]: FloorChannelOutcome.DELIVERED,
+               send_result.EXIT["queued"]: FloorChannelOutcome.QUEUED}.get(result.returncode, FloorChannelOutcome.FAILED)
+    if outcome.accepted:
+        print(f"lint sweep: {label} {outcome.value}")
+    else:
+        print(f"lint sweep: {label} failed ({result.returncode}): {failure_detail(result)}", file=sys.stderr)
+    return outcome
+
+
 def send_holder_message(session: str, message: str, *,
+    repeat: CrossingSendKey | NoCrossingSend = NO_CROSSING_SEND,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> FloorChannelOutcome:
     """Send a session message and distinguish delivery, queuing, and failure."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    try:
-        result = subprocess.run(session_send_argv(session, lint_settings=lint_settings), input=message,
-                                text=True, capture_output=True,
-                                timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
-    except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"lint sweep: message to {session} failed: {error}", file=sys.stderr)
-        return FloorChannelOutcome.FAILED
-    outcome = {send_result.EXIT["sent"]: FloorChannelOutcome.DELIVERED,
-               send_result.EXIT["queued"]: FloorChannelOutcome.QUEUED}.get(result.returncode, FloorChannelOutcome.FAILED)
-    if outcome.accepted:
-        print(f"lint sweep: message to {session} {outcome.value}")
+    command = session_send_argv(session, lint_settings=lint_settings) + crossing_send_argv(repeat)
+    return run_send(command, f"message to {session}", input=message,
+                    timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
+
+
+def disk_floor_channels() -> FloorAlertChannels:
+    """Keep phone delivery disabled until the user records a current approval."""
+    if TYPE_CHECKING:
+        from ..notify.push_texts import approval_date
     else:
-        print(f"lint sweep: message to {session} failed ({result.returncode}): {failure_detail(result)}", file=sys.stderr)
-    return outcome
+        prepare_push_texts()
+        from push_texts import approval_date
+    return (FloorAlertChannels.NATEDEV_AND_PHONE if approval_date("sweep.disk_floor")
+            else FloorAlertChannels.NATEDEV)
 
 
-def send_floor_alert(message: str, channels: FloorAlertChannels, *,
-                     phone: RenderedPush | NoPhoneAlert = NO_PHONE_ALERT,
+def send_phone_push(phone: RenderedPush, *,
+    repeat: CrossingSendKey | NoCrossingSend = NO_CROSSING_SEND,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> FloorAlertDelivery:
+) -> FloorChannelOutcome:
+    """Send the phone channel independently of the natedev receipt."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    scripts = Path(__file__).resolve().parents[1]
-    command: list[str] = []
-    if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        if TYPE_CHECKING:
-            from ..notify.push_texts import RenderedPush, user_send_argv
-        else:
-            sys.path.insert(0, str(scripts / "notify"))
-            from push_texts import RenderedPush, user_send_argv
+    if TYPE_CHECKING:
+        from ..notify.push_texts import user_send_argv
+    else:
+        prepare_push_texts()
+        from push_texts import user_send_argv
+        import review
+    command = user_send_argv(phone)
+    command[1] = str(Path(__file__).resolve().parents[1] / "message/send.py")
+    command.extend(crossing_send_argv(repeat))
+    return run_send(command, "phone alert", input=None,
+                    timeout=send_budget.user_seconds(review.user_send_seconds()))
 
-        if not isinstance(phone, RenderedPush):
-            raise ValueError("phone channel requires a rendered disk alert")
-        command = user_send_argv(phone)
-        command[1] = str(scripts / "message/send.py")
+
+def send_floor_alert(message: str, *,
+    repeat: CrossingSendKey | NoCrossingSend = NO_CROSSING_SEND,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> FloorChannelOutcome:
+    """Send the natedev message and return its channel outcome."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     filesystem = FLOOR_FILESYSTEM.get()
     if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
         message = f"Filesystem {filesystem.key} at {filesystem.probe_path}:\n{message}"
-    natedev = send_holder_message("natedev", message, lint_settings=lint_settings)
-    if not command:
-        return FloorAlertDelivery(natedev, FloorChannelOutcome.NOT_ATTEMPTED)
-    if not TYPE_CHECKING:
-        import review
-    try:
-        result = subprocess.run(command, input=None, text=True, capture_output=True,
-                                timeout=send_budget.user_seconds(review.user_send_seconds()))
-    except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"lint sweep: phone alert failed: {error}", file=sys.stderr)
-        return FloorAlertDelivery(natedev, FloorChannelOutcome.FAILED)
-    if result.returncode == send_result.EXIT["sent"]:
-        print("lint sweep: phone alert delivered")
-        return FloorAlertDelivery(natedev, FloorChannelOutcome.DELIVERED)
-    print(f"lint sweep: phone alert failed ({result.returncode}): {failure_detail(result)}", file=sys.stderr)
-    return FloorAlertDelivery(natedev, FloorChannelOutcome.FAILED)
+    return send_holder_message("natedev", message, repeat=repeat, lint_settings=lint_settings)
 
 
 if TYPE_CHECKING:
@@ -3530,6 +3741,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
         return
     after = outcome.after if isinstance(outcome, FloorOutcome) else 0
     protected = outcome.protected if isinstance(outcome, FloorOutcome) else ()
+    removed = outcome.removed if isinstance(outcome, FloorOutcome) else 0
     filesystem = FLOOR_FILESYSTEM.get()
     root_scope = scope is FloorFailureScope.FILESYSTEM and (
         not isinstance(filesystem, FilesystemFloor) or filesystem.root_device)
@@ -3538,7 +3750,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
         return
     phone_floor = int(lint_settings.number("sweep_phone_floor_gib") * GIB)
 
-    def finalize(previous: NoFloorRecord | FloorRecord) -> FloorRecord:
+    def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
         current = floor_record_or_new(previous, after)
         free = after
         if root_scope:
@@ -3547,58 +3759,108 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
                 free = free_bytes(filesystem.probe_path if isinstance(filesystem, FilesystemFloor)
                                   else os.path.expanduser("~"))
                 if free > phone_floor:
-                    current = replace(current, phone_crossing=PhoneCrossing.ABOVE)
-                elif free < phone_floor and current.phone_crossing is PhoneCrossing.ABOVE:
-                    current = replace(current, phone_crossing=PhoneCrossing.UNDER_PENDING)
+                    current = replace(current, phone_crossing=AbovePhoneFloor())
+                elif free < phone_floor and isinstance(current.phone_crossing, AbovePhoneFloor):
+                    current = replace(current, phone_crossing=OpenPhoneCrossing(uuid.uuid4().hex))
             except OSError as error:
                 print(f"lint sweep: cannot measure the phone floor: {error}", file=sys.stderr)
         failure = current.failure
-        if outcome.status:
+        if assessment.status:
             if isinstance(failure, NoFailure):
-                failure = FailurePending(FloorFailureEvent(outcome.status, detail))
+                failure = FailurePending(FloorFailureEvent(assessment.status, detail))
         else:
             failure = NoFailure()
         current = replace(current, failure=failure)
-        crossing_pending = root_scope and current.phone_crossing is PhoneCrossing.UNDER_PENDING
-        if not crossing_pending and not isinstance(failure, FailurePending):
+        crossing = current.phone_crossing if root_scope else AbovePhoneFloor()
+        natedev_pending = isinstance(crossing, OpenPhoneCrossing) and crossing.natedev is CrossingReceipt.PENDING
+        phone_due = (isinstance(crossing, OpenPhoneCrossing) and crossing.phone is CrossingReceipt.PENDING
+                     and not assessment.status)
+        phone_pending = phone_due and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE
+        crossing_pending = natedev_pending or phone_pending
+        pending_failure = isinstance(failure, FailurePending)
+        if not crossing_pending and not pending_failure:
             return current
         problems: list[str] = []
         if crossing_pending:
             problems.append(f"Free disk space fell below the {gib(phone_floor)} alert line. {gib(free)} remains.")
-            problems.extend(page_paths(read_disk_measurement()))
+            measurement = read_disk_measurement()
+            problems.extend(page_paths(measurement))
+        else:
+            measurement = UnavailableDiskMeasurement("missing")
         if isinstance(failure, FailurePending):
             problems.append(f"The {scope.label} failed with status {failure.event.status}. {failure.event.detail}")
         def render(path_limit: int) -> str:
             protected_lines = (protected_folder_lines(protected, path_limit, lint_settings=lint_settings)
                                if crossing_pending else [])
             return "\n".join([*problems, *protected_lines])
-        # Crossings and sweep failures go only to natedev.
-        if send_floor_alert(fit_alert_text(render, lint_settings=lint_settings), FloorAlertChannels.NATEDEV,
-                            lint_settings=lint_settings).natedev.accepted:
-            if crossing_pending:
-                current = replace(current, phone_crossing=PhoneCrossing.UNDER_PUSHED)
-            if isinstance(failure, FailurePending):
+        message = fit_alert_text(render, lint_settings=lint_settings)
+
+        def save_delivery(delivery: FloorAlertDelivery) -> None:
+            nonlocal current
+            receipt = current.phone_crossing
+            if isinstance(receipt, OpenPhoneCrossing):
+                receipt = replace(receipt,
+                                  natedev=CrossingReceipt.ACCEPTED if delivery.natedev.accepted else receipt.natedev,
+                                  phone=CrossingReceipt.ACCEPTED if delivery.phone.accepted else receipt.phone)
+                current = replace(current, phone_crossing=receipt)
+            if delivery.natedev.accepted and isinstance(current.failure, FailurePending):
                 current = replace(current, failure=FailureReported())
+            _ = save(current)
+
+        # Crossings and sweep failures go only to natedev.
+        # A current text approval permits the crossing's separate phone delivery.
+        identity_saved = save(current) if isinstance(crossing, OpenPhoneCrossing) else False
+        if natedev_pending or pending_failure:
+            repeat: CrossingSendKey | NoCrossingSend = NO_CROSSING_SEND
+            if not pending_failure and isinstance(crossing, OpenPhoneCrossing):
+                repeat = (CrossingSendKey(f"natedev:{crossing.identity}", lint_settings.number("sweep_crossing_repeat_minutes"))
+                          if identity_saved else CrossingSendKey(UNSAVED_CROSSING_KEY,
+                                                                 lint_settings.number("sweep_alert_interval_seconds") / 60))
+            delivery = send_floor_alert(message, repeat=repeat, lint_settings=lint_settings)
+            save_delivery(FloorAlertDelivery(delivery, FloorChannelOutcome.NOT_ATTEMPTED))
+        if phone_pending and identity_saved and isinstance(crossing, OpenPhoneCrossing):
+            choices = folder_choices(measurement, protected, max(0, phone_floor - free),
+                                     now=time.time(), lint_settings=lint_settings)
+            phone = fit_disk_floor_push(free, phone_floor, removed, choices, lint_settings=lint_settings)
+            if not isinstance(phone, NoPhoneAlert):
+                result = send_phone_push(phone,
+                                        repeat=CrossingSendKey(f"phone:{crossing.identity}",
+                                                               lint_settings.number("sweep_crossing_repeat_minutes")),
+                                        lint_settings=lint_settings)
+                save_delivery(FloorAlertDelivery(FloorChannelOutcome.NOT_ATTEMPTED, result))
         return current
 
     record_lock = ExitStack()
+    last_saved: NoFloorRecord | FloorRecord = NoFloorRecord()
+    def save_record(current: FloorRecord) -> bool:
+        nonlocal last_saved
+        if current == last_saved:
+            return True
+        try:
+            write_floor_record(path, current)
+            last_saved = current
+            return True
+        except OSError as error:
+            print(f"lint sweep: cannot save the notification state: {error}", file=sys.stderr)
+            return False
+
+    def no_record_access(current: FloorRecord) -> bool:
+        del current
+        return False
+
     try:
         try:
             previous = record_lock.enter_context(locked_floor_record(path))
         except OSError as error:
             print(f"lint sweep: cannot access the notification record: {error}", file=sys.stderr)
-            # Make one delivery attempt when storage cannot provide a locked record.
-            _ = finalize(NoFloorRecord())
+            _ = finalize(NoFloorRecord(), no_record_access)
             return
-        current = finalize(previous)
-        if current == previous or (isinstance(previous, NoFloorRecord) and isinstance(current.failure, NoFailure)
-                                   and current.phone_crossing is PhoneCrossing.ABOVE):
+        last_saved = previous
+        current = finalize(previous, save_record)
+        if (isinstance(previous, NoFloorRecord) and isinstance(current.failure, NoFailure)
+                and isinstance(current.phone_crossing, AbovePhoneFloor)):
             return
-        try:
-            # Delivery comes first. A failed save can repeat a delivered alert on the next pass.
-            write_floor_record(path, current)
-        except OSError as error:
-            print(f"lint sweep: cannot save the notification state: {error}", file=sys.stderr)
+        _ = save_record(current)
     finally:
         try:
             record_lock.close()
@@ -3826,8 +4088,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,
                                                           ci_bytes, measurement, failures, protected=protected,
                                                           lint_settings=lint_settings)
-                        delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV, lint_settings=lint_settings)
-                        if delivered.natedev.accepted or told:
+                        delivered = send_floor_alert(message, lint_settings=lint_settings)
+                        if delivered.accepted or told:
                             push_history = DeliveredAlert(time.time())
                     elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= alert_interval):
                         free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
@@ -3855,7 +4117,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                                                        reasons, read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
                                                        or filesystem.root_device else UnavailableDiskMeasurement("missing"),
                                                        lint_settings=lint_settings)
-                            if send_floor_alert(message, FloorAlertChannels.NATEDEV, lint_settings=lint_settings).natedev.accepted:
+                            if send_floor_alert(message, lint_settings=lint_settings).accepted:
                                 history = DeliveredAlert(time.time())
                     write_floor_record(record_path, replace(
                         base, measured_at=now, free_bytes=after_free, build_cache_bytes=after_caches,

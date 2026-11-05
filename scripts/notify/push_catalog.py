@@ -208,6 +208,27 @@ ENTRIES = (
         (PushExample("typical", {"machine": "natedev"}),
          PushExample("long_machine", {"machine": "macbook-workstation"})),
         purpose="All Codex agents stopped. You can redeem your usage reset now."),
+    PushText("sweep.disk_floor", "disk_floor", "decision", "natedev disk is low; builds can fail",
+        ActionTemplate("{folder_action}"),
+        "natedev has {free} free. Alerts start below {floor}. {cleanup}\n\n{choices}\n\n"
+        + "natedev checks your choice before it deletes anything.",
+        (PushExample("available", {
+            "folder_action": "In the natedev Claude session, say which folders to delete.",
+            "free": "140.0 GiB", "floor": "150.0 GiB", "cleanup": "Cleanup removed 2.0 GiB.",
+            "choices": "~/.local/share/Trash: holds 26.0 GiB. Deleting it removes discarded files.\nRecommended: ~/.local/share/Trash covers the 10.0 GiB shortfall.\nDelete nothing: builds can fail when the disk is full."}),
+         PushExample("unavailable", {
+            "folder_action": "In the natedev Claude session, reply measure or delete nothing.",
+            "free": "140.0 GiB", "floor": "150.0 GiB", "cleanup": "The cleanup run freed nothing.",
+            "choices": "Folder sizes are unknown or out of date, so no folder is recommended yet.\n\nMeasure first (recommended): natedev lists folder sizes, then you choose what to delete.\n\nDelete nothing: the disk stays low and builds can fail."}),
+         PushExample("insufficient", {
+            "folder_action": "In the natedev Claude session, say which folders to delete.",
+            "free": "120.0 GiB", "floor": "150.0 GiB", "cleanup": "The cleanup run freed nothing.",
+            "choices": "~/Trash: holds 20.0 GiB of discarded files.\n~/scratch: holds 5.0 GiB of scratch files.\nDelete these 2 (recommended): frees 25.0 GiB, so builds get some room. That is only part of the 30.0 GiB shortfall, so builds can still fail.\nDelete nothing: builds can fail when the disk is full."}),
+         PushExample("protected", {
+            "folder_action": "In the natedev Claude session, say which folders to delete.",
+            "free": "140.0 GiB", "floor": "150.0 GiB", "cleanup": "Cleanup removed 2.0 GiB.",
+            "choices": "~/old-output holds 26.0 GiB. It is protected: no build record shows what made it. Cleanup never deletes it.\nDelete it (recommended): frees 26.0 GiB against the 10.0 GiB shortfall.\nKeep it: free space stays low, and builds can fail."})),
+        purpose="A low-disk alert offers measured folder choices for natedev review."),
     # Current disk-floor.nix: alertGib=150, build floor=300 GiB.
     PushText("nixos.disk_low", "disk_floor", "note", "Builds need more disk space",
         ActionTemplate("In a terminal on natedev, delete {shortfall} GiB of personal files you no longer need."),
