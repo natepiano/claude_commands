@@ -211,9 +211,18 @@ def main() -> None:
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output))
-    _ = unittest.main(module=None,
-                      argv=["python -m unittest", "discover", "-s", start_dir, "-p", pattern],
-                      testRunner=TimedRunner)
+    try:
+        _ = unittest.main(module=None,
+                          argv=["python -m unittest", "discover", "-s", start_dir, "-p", pattern],
+                          testRunner=TimedRunner)
+    except SystemExit:
+        if "scripts.message.session_send_test_support" in sys.modules:
+            from scripts.message import session_send_test_support
+
+            if isinstance(session_send_test_support.sender_violation, session_send_test_support.RealSenderRefused):
+                print(f"{pattern}: started the real scripts/message/send.py", file=sys.stderr)
+                sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":
