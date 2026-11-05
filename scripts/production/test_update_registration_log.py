@@ -65,7 +65,6 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn("Next: merge alpha phase 2 when its gate is green; send the restarts plan at 03:30", log)
 
     def test_the_first_call_moves_the_scratchpad_state_and_rewrites_the_tick_prompt(self) -> None:
-        slug = self.doc.name.removesuffix("-production.md")
         owner = staff.by_id(self.fixture_staff_id())
         assert owner is not None
         timer = self.state / "notifier" / f"showrunner-{owner.id}"

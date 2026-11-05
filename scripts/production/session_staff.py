@@ -485,8 +485,14 @@ class MemberSources:
     launches: tuple[PaneLaunch, ...]
 
     def canonical_slug(self, slug: str) -> str:
-        """Resolve an exact slug change from a recorded journal."""
-        return slug if slug in self.productions else showrunners.rename_history().get(slug, slug)
+        """Resolve a former slug from loaded documents, then recorded journals."""
+        if slug in self.productions:
+            return slug
+        matches = [name for name, source in self.productions.items()
+                   if slug in showrunners.former_slugs(source.document)]
+        if matches:
+            return matches[0] if len(matches) == 1 else slug
+        return showrunners.rename_history().get(slug, slug)
 
     def member(self, selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
         if isinstance(selector, FolderMember):

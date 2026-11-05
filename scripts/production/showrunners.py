@@ -7,6 +7,7 @@ import json
 import math
 from time import monotonic
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -509,6 +510,13 @@ def adopt_session_state(slug: str, staff_id: str,
         return []
     scratch = timer_scratch(slug, record)
     return copy_session_state(staff_id, scratch) if scratch is not None else []
+
+
+def former_slugs(text: str) -> tuple[str, ...]:
+    """Read former names only from the production's Production Context section."""
+    context = re.search(r"^## Production Context\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+    formerly = re.search(r"^- \*\*Formerly:\*\*(.*)$", context[1] if context else "", re.MULTILINE)
+    return tuple(re.findall(r"`([^`]+)`", formerly[1])) if formerly else ()
 
 
 def rename_history() -> dict[str, str]:

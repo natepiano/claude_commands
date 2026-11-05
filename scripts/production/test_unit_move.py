@@ -50,8 +50,8 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
             FakeClient.close_tab_of(client, arguments[2])
             return subprocess.CompletedProcess(arguments, 0, "", "")
 
-        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(),
-                                      herdr.HerdrPlace("agents", "w7:p1"))
+        labeled = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(),
+            herdr.HerdrPlace("agents", "w7:p1"), identity=unit_lookup.LiveSession(owner.current_session))
 
         def launch(request: add_unit.UnitLaunch, _director: add_unit.DirectorAgent, _prompt: str,
                    _account: accounts.ClaudeLaunchAccount, *, target: str = "", model: str = "",
@@ -66,9 +66,9 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
               mock.patch("pane_record.RECORD_DIR", records),
               mock.patch.dict(os.environ, self.env)):
             pane_record.write("agents", original)
-            with (mock.patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
+            with (mock.patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(labeled)),
                   mock.patch.object(add_unit, "launch_session", side_effect=launch),
-                  mock.patch.object(add_unit, "wait_for_remote_control", return_value=marked),
+                  mock.patch.object(add_unit, "wait_for_remote_control", return_value=labeled),
                   client.empty_shell(shell_pid, old),
                   mock.patch.object(client, "run", side_effect=close),
                   mock.patch.object(herdr, "Herdr", return_value=client)):

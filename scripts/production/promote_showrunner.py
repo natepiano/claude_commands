@@ -311,8 +311,6 @@ def _main(argv: list[str]) -> int:
     was_pending = pending.exists()
     if not was_pending:
         save_promotion(promotion, target_directory)
-        import showrunner_parent
-        showrunner_parent.save_notice(slug, showrunner_parent.PendingParentNotice("attach", promotion.parent.slug))
     try:
         current = unit_lookup.labeled_session(promotion.parent.slug, unit) if was_pending else promotion.marked
         if current is not None and isinstance(current.claude, unit_lookup.ClaudeUnknown):
@@ -345,6 +343,8 @@ def _main(argv: list[str]) -> int:
         new_member = staff_sources.MemberFound(staff.promote_unit(
             retained.id if retained is not None else native, name=name, parent=parent_row.id, doc=document))
     try:
+        import showrunner_parent
+        showrunner_parent.save_notice(slug, showrunner_parent.PendingParentNotice("attach", promotion.parent.slug))
         if was_pending and showrunners.current_name(slug):
             started = showrunners.main(["attach", slug, promotion.parent.slug])
         else:
