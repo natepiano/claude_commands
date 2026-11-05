@@ -328,40 +328,22 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 ### Phase 5b — 5a follow-ups: tests that fail without the simplify repairs  · status: done
 
-**Owner:** models-unit. 5a routed findings F005, F007 and F009 here at repair round 8 under the hard landing (2026-11-05). The 5a repairs landed; only the tests that fail without them are missing.
+#### As-built
 
-**Depends on:** 5a.
-
-**Order (models-unit, 2026-11-05):** starts after df2a08345, which landed 3r item 7; it does not wait for the 3r live proofs.
-
-#### Work Order
-
-**Goal:** Each 5a simplify repair has a test that fails when the repair is reverted.
-
-**Spec:**
-
-1. F005: A test proves that worker reuse reads the registry zero times. `workers.resolve` returns a reused worker at `workers.py:519`, before it acquires a configuration at `workers.py:542`. Test the reuse path with no inherited snapshot, so a read moved before line 519 fails the test.
-2. F007: The registry-read count test drives the `default_models.sh` write path (not `--check`) with `MODELS_REGISTRY_EDIT_BASE` set and stale catalog sources. It proves no catalog sync runs inside an edit. The sensitivity revert targets the inherited-snapshot branch of `models_registry._snapshot` (`models_registry.py:70`); `models_config.sh` has no sync gate now.
-3. F009: A test proves that `sync_codex_catalog.sh` parses the registry only after it holds the catalog synchronization lock (the `sync.lock` folder, `sync_codex_catalog.sh:64`). Run it in write mode: `--check` takes no synchronization lock.
-4. A test proves that a failed catalog sync prints `WARNING: Codex catalog sync failed; using the current model registry.` to stderr and returns the current configuration (`models_registry.py:108`). The fixture sync script exits nonzero.
-5. Revert each repair in a scratch copy and record that its test fails. Restore the repair.
+- Worker reuse reads the registry zero times: `test_resolve_reuses_the_stored_role_and_live_model_identity` runs `workers.resolve` inside a `RegistryReadProbe` with both operation snapshots cleared.
+- The `default_models.sh` write path with `MODELS_REGISTRY_EDIT_BASE` set and stale catalog sources makes exactly two registry reads and publishes its row (`test_inherited_editor_writes_without_catalog_sync`). A catalog sync inside the edit adds reads, so the count fails on it.
+- `sync_codex_catalog.sh` reads the registry only under the `sync.lock` folder: the held-lock contention run requires an empty read log, and the invalid-cache run requires a nonempty one.
+- A failed catalog sync prints `WARNING: Codex catalog sync failed; using the current model registry.` to stderr and returns the current path and text, for `launch_configuration` and `edit_base` (`test_failed_catalog_sync_warns_and_returns_the_current_configuration`).
+- Each of these tests fails when its repair is reverted.
 
 **Files:**
-- `scripts/agents/test_codex_mesh.py`
-- `scripts/direct/test_workers.py`
-- `scripts/agents/test_models_config.sh`
-- `scripts/agents/test_sync_codex_catalog.sh`
-- `scripts/lib/test_models_registry_fixture.py`
+- `scripts/direct/test_workers.py` — the worker-reuse read count.
+- `scripts/agents/test_models_config.sh` — the inherited-editor read count.
+- `scripts/agents/test_sync_codex_catalog.sh` — the `sync.lock` read assertions.
+- `scripts/lib/test_models_registry_fixture.py` — `_catalog_sync_environment`, `_catalog_sync_scope` and the failed-sync test.
 
-**Workers:** `1 tester`
+**Gotchas:**
+- `RegistryEditBase(path, text, ()).environment({})["MODELS_REGISTRY_EDIT_BASE"]` gives the encoded edit base for shell tests.
+- Shell tests set catalog times with `touch -t`, with the state newer than the sources.
 
-**Constraints from prior phases:**
-
-1. 5a: a fresh `launch_configuration` or `edit_base` read runs catalog sync first; an inherited snapshot never does. Tests that make fresh reads set `CODEX_CATALOG_SYNC_STATE_FILE`, `CODEX_CONFIG_FILE` and `CODEX_MODELS_CACHE_FILE` to temp paths with fixed `os.utime` values, as `test_codex_mesh.py` `setUpModule` does.
-
-**Acceptance gate:**
-
-1. Each new test from items 1-3 passes on the 5a tree and fails with its repair reverted. The summary quotes each failing assertion.
-2. The item 4 test passes and covers the warning text and the returned configuration.
-3. Pass the five affected suites.
-4. Pass the Delegation Context merge gate.
+**Ruled out:** a sync-process hook in the inherited-editor test, because the read count already fails on the revert; a separate lock-read test, because the contention run covers it.
