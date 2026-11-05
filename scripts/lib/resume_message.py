@@ -87,6 +87,7 @@ def _resume_phase_id(seat: PausedSeat) -> str:
 def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     """Build a complete launcher invocation that continues this worker's thread."""
     from scripts.direct.worker_state import worker_slot
+    from scripts.production import session_staff
 
     launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
     prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
@@ -95,7 +96,7 @@ def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
             return _resume_task(seat, cwd, prompt)
         except ValueError:
             pass
-    # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
+    # Find the saved slot through staff_id, including identities from named fix workers.
     recorded_slot = worker_slot(Path(seat["run_dir"]), seat["seat"]) or ""
     team_role = recorded_slot or seat["role"]
     phase_id = _resume_phase_id(seat)
@@ -105,7 +106,7 @@ def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
         start.extend(("--phase", phase_id))
     if launcher == "review.sh":
         assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-                                       seat["thread_id"], datetime.now(timezone.utc))
+                                       session_staff.worker_session(seat), datetime.now(timezone.utc))
         if isinstance(assignment, agents_log.Assignment) and assignment.role == "review" and assignment.lens:
             start.extend(("--lens", assignment.lens))
     kind = team_role if team_role in {"impl", "test", "fix"} else "impl"

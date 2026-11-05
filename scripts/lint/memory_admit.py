@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Prot
 from functools import lru_cache
 from itertools import chain
 from types import UnionType, MappingProxyType
-from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
@@ -37,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 from build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
-                         StepEvidence, build_shape, index_step_evidence, recorded_build_shape)
+                         StepEvidence, TEST_STEPS, build_shape, index_step_evidence, recorded_build_shape)
 from atomic_file import write_text_atomic
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 import conf
@@ -54,7 +53,6 @@ if TYPE_CHECKING:
     from ..buildlog import record as record
     from ..buildlog import store as store
     from ..buildlog import index
-
     file_marks = index
 else:
     import parse
@@ -72,6 +70,135 @@ ANON_SHARE = 0.65
 HISTORY_DAYS = 14
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
+
+
+TestScope = Literal["full", "filtered"]
+
+
+VERIFY_PACKAGE_PREDICATE = r"package\(([A-Za-z0-9_-]+)\)"
+VERIFY_NAME_PREDICATE = r"test\([A-Za-z0-9_:]+\)"
+VERIFY_NAME_UNION = rf"\(\s*{VERIFY_NAME_PREDICATE}(?:\s*\|\s*{VERIFY_NAME_PREDICATE})+\s*\)"
+VERIFY_FILTER_SELECTION = re.compile(
+    rf"\s*{VERIFY_PACKAGE_PREDICATE}\s*&\s*(?:{VERIFY_NAME_PREDICATE}|{VERIFY_NAME_UNION})\s*")
+VERIFY_PACKAGE_SELECTION = re.compile(rf"\s*{VERIFY_PACKAGE_PREDICATE}\s*")
+VERIFY_TEST_NAMES = re.compile(r"\btest\(([A-Za-z0-9_:]+)\)")
+TEST_PREDICATE = re.compile(r"\btest\s*\(")
+TEST_EXPRESSION_OPTIONS = {"-E", "--filter-expr", "--filterset"}
+TEST_OPTION_VALUES = {"-p", "--package", "--manifest-path", "--target", "--target-dir", "--profile",
+              "--features", "--test-threads", "-j", "--jobs", "--config-file", "--cargo-profile",
+              "--bin", "--example", "--test", "--bench", "--status-level", "--final-status-level",
+              "--failure-output", "--success-output", "--color", "--message-format", "--retries",
+              "--archive-file", "--workspace-remap", "--partition", "-F", "--exclude", "-P",
+              "--run-ignored", "-Z", "--no-tests", "--max-fail", "--tool-config-file", "--test-group"}
+
+
+def filter_set(names: Iterable[str]) -> tuple[str, ...]:
+    """Use one sorted key for each set of test filters."""
+    return tuple(sorted(set(names)))
+
+
+@dataclass(frozen=True)
+class PackageTestSelection:
+    package: str
+    filters: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BroadTestSelection:
+    pass
+
+
+def filter_expressions(argv: list[str]) -> list[str]:
+    expressions: list[str] = []
+    arguments = iter(argv)
+    for word in arguments:
+        if word in TEST_EXPRESSION_OPTIONS:
+            expressions.append(next(arguments, ""))
+        elif word.startswith(("--filter-expr=", "--filterset=")):
+            expressions.append(word.split("=", 1)[1])
+        elif word.startswith("-E") and len(word) > 2:
+            expressions.append(word[2:].removeprefix("="))
+    return expressions
+
+
+def _verify_test_selection(argv: list[str], scope: TestScope) -> PackageTestSelection | BroadTestSelection:
+    """Recognize the whole positive expression verify emits, never its fragments."""
+    expressions = filter_expressions(argv)
+    if len(expressions) != 1:
+        return BroadTestSelection()
+    match = VERIFY_FILTER_SELECTION.fullmatch(expressions[0])
+    if match:
+        names = cast(list[str], VERIFY_TEST_NAMES.findall(expressions[0]))
+        return PackageTestSelection(match.group(1), filter_set(names))
+    # Full package runs retain their package metadata, without an exact filter set.
+    match = VERIFY_PACKAGE_SELECTION.fullmatch(expressions[0])
+    if match and scope == "full":
+        return PackageTestSelection(match.group(1), ())
+    return BroadTestSelection()
+
+
+def _test_scope(argv: list[str], step: str) -> TestScope:
+    words = argv[argv.index(step) + 1:]
+    if step == "nextest" and words and words[0] in ("run", "list"):
+        words = words[1:]
+    arguments = iter(words)
+    for word in arguments:
+        option = word.split("=", 1)[0]
+        if option in ("--skip", "--exact"):
+            return "filtered"
+        if option in TEST_EXPRESSION_OPTIONS or word.startswith("-E"):
+            expression = (word[2:].removeprefix("=") if word.startswith("-E") and len(word) > 2 else
+                          word.split("=", 1)[1] if "=" in word else next(arguments, ""))
+            if TEST_PREDICATE.search(expression):
+                return "filtered"
+        elif word in TEST_OPTION_VALUES:
+            _ = next(arguments, "")
+        elif not word.startswith("-"):
+            return "filtered"
+    return "full"
+
+
+def test_selection(argv: Sequence[str]) -> HistorySelection:
+    """Read the package, scope and canonical filters with one command parse."""
+    words = list(argv)
+    step = parse.step_name(words)
+    scope = _test_scope(words, step) if step in TEST_STEPS else "full"
+    selection = _verify_test_selection(words, scope)
+    package = selection.package if isinstance(selection, PackageTestSelection) else ""
+    filters = selection.filters if isinstance(selection, PackageTestSelection) else ()
+    if step in ("check", "build"):
+        packages: list[str] = []
+        arguments = iter(words)
+        for word in arguments:
+            if word in ("-p", "--package"):
+                packages.append(next(arguments, ""))
+            elif word.startswith("--package="):
+                packages.append(word.split("=", 1)[1])
+            elif word.startswith("-p") and len(word) > 2:
+                packages.append(word[2:])
+        selected = set(packages)
+        package = selected.pop() if len(selected) == 1 else ""
+    return HistorySelection(package, scope, filters)
+
+
+def verify_test_selection(argv: list[str]) -> PackageTestSelection | BroadTestSelection:
+    """Recognize the whole positive expression that verify emits."""
+    return _verify_test_selection(argv, test_selection(argv).scope)
+
+
+def test_filters(argv: list[str]) -> tuple[str, ...]:
+    """Return the canonical filters of a verify test selection."""
+    return test_selection(argv).filters
+
+
+def test_package(argv: list[str]) -> str:
+    """Return one test or compile package, or an empty string."""
+    return test_selection(argv).package
+
+
+def test_scope(argv: list[str]) -> TestScope:
+    """Keep test selection separate from package, target and execution options."""
+    return test_selection(argv).scope
 
 
 @dataclass(frozen=True)
@@ -133,7 +260,6 @@ class UnknownRepository:
 
 
 Repository = RepositoryIdentity | UnknownRepository
-TestScope = Literal["full", "filtered"]
 LegacyNeedSource = Literal["measured", "buildlog", "pooled", "fallback"]
 NeedSource = str
 
@@ -284,18 +410,8 @@ class OutcomeNotRecorded:
 FinalOutcome = Completed | Failed | Killed | OwnerGone
 HistoryOutcome = FinalOutcome | OutcomeNotRecorded
 NO_BUILD_SHAPE = NoBuildShape()
+NO_STEP_EVIDENCE = StepEvidence(NoBuildShape(), CompileCountUnknown())
 OUTCOME_NOT_RECORDED = OutcomeNotRecorded()
-
-
-@dataclass(frozen=True)
-class PackageTestSelection:
-    package: str
-    filters: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class BroadTestSelection:
-    pass
 
 
 class TestPhaseChargeUse(TypedDict):
@@ -1570,14 +1686,9 @@ class ProgramProfile:
         return "full"
 
 
-def anonymous_history_rows(source: Path | BinaryIO) -> Iterator[dict[str, object]]:
-    """Read whole anonymous-history rows; an open handle must already be locked."""
-    if isinstance(source, Path):
-        with source.open("rb") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            yield from anonymous_history_rows(handle)
-        return
-    yield from store.whole_rows(source, 0)
+def anonymous_history_rows(path: Path) -> Iterator[dict[str, object]]:
+    """Read complete anonymous-history rows under a shared lock."""
+    return store.locked_rows(path)
 
 
 def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
@@ -1585,20 +1696,17 @@ def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
     """Read one program's peak history, without using cargo estimates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []
-    try:
-        for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
-            try:
-                if row.get("host") != host or row.get("step") != program:
-                    continue
-                peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
-                if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
-                    continue
-                if cutoff <= datetime.fromisoformat(ended.replace("Z", "+00:00")) <= now:
-                    peaks.append(peak)
-            except (ValueError, TypeError, AttributeError):
+    for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+        try:
+            if row.get("host") != host or row.get("step") != program:
                 continue
-    except FileNotFoundError:
-        pass
+            peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
+            if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
+                continue
+            if cutoff <= datetime.fromisoformat(ended.replace("Z", "+00:00")) <= now:
+                peaks.append(peak)
+        except (ValueError, TypeError, AttributeError):
+            continue
     return MeasuredProgramPeak(percentile(peaks), len(peaks)) if peaks else FirstProgramPeak(first_peak_bytes)
 
 
@@ -1865,23 +1973,7 @@ def percentile(values: list[int]) -> int:
     return values[(90 * len(values) + 99) // 100 - 1]
 
 
-def test_threads(argv: list[str]) -> int | None:
-    """Return nextest's explicitly requested test width, when it is numeric."""
-    for index, argument in enumerate(argv):
-        value: str | None = None
-        if argument in ("--test-threads", "-j"):
-            if index + 1 < len(argv):
-                value = argv[index + 1]
-        elif argument.startswith("--test-threads="):
-            value = argument.removeprefix("--test-threads=")
-        elif argument.startswith("-j") and len(argument) > 2:
-            value = argument[2:]
-        if value is not None:
-            try:
-                return int(value)
-            except ValueError:
-                return None
-    return None
+test_threads = parse.test_threads
 
 
 def expected_peak(repository: Repository, step: str, host: str, now: datetime, root: Path,
@@ -1890,31 +1982,39 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
                   fresh: bool = False,
                   shape: BuildShape | NoBuildShape = NO_BUILD_SHAPE,
                   first_peak_bytes: int, budget: int) -> ExpectedPeak:
-    """The process-memory promise of a step over HISTORY_DAYS.
+    """Estimate a compile promise from HISTORY_DAYS of earlier peaks.
 
-    The gate pools every test width: one width's history is thin and rebuild-heavy, and the
-    claim of a width comes only after admission. `test_threads` narrows the measured history to
-    one width, for width_trial.py's report.
+    Full test requests with a package recover missing selection fields from
+    indexed arguments. Other requests keep the recorded scope rule.
+    The gate pools test widths. `test_threads` selects one width for reports.
     """
     if step == "build":
         return build_expected_peak(repository, shape, host, now, root, first_peak_bytes, budget)
     if isinstance(repository, UnknownRepository):
         return ExpectedPeak(first_peak_bytes, "fallback", 0)
+    filters = filter_set(filters)
     if fresh and step == "nextest" and package:
         compile_peak = expected_peak(repository, step, host, now, root, test_threads,
                                      scope=scope, filters=filters, package=package,
                                      first_peak_bytes=first_peak_bytes, budget=budget)
         return fresh_test_peak(repository, step, host, now, root, test_threads,
-                               scope, tuple(sorted(set(filters))), package, compile_peak)
+                               scope, filters, package, compile_peak)
     if scope == "filtered" and package:
         return filtered_peak(repository, step, host, now, root, test_threads,
-                             tuple(sorted(set(filters))), package)
+                             filters, package)
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
-    rows = [entry[0] for entry in compiling_history(root, host, step, now)
-            if entry[0].get("test_scope", "full") == scope
-            and (test_threads is None or entry[0].get("test_threads") == test_threads)
-            and (entry[0].get("repo_identity") or entry[0].get("repo") not in GENERIC_REPO_NAMES)]
+    rows: list[dict[str, object]] = []
+    for item, evidence in compiling_history(root, host, step, now):
+        if package and step in TEST_STEPS:
+            selection = history_selection(item, evidence)
+            if selection.package != package or selection.scope != scope:
+                continue
+        elif item.get("test_scope", "full") != scope:
+            continue
+        if (test_threads is None or item.get("test_threads") == test_threads) and (
+                item.get("repo_identity") or item.get("repo") not in GENERIC_REPO_NAMES):
+            rows.append(item)
     measured = [int(cast(int, item["anon_peak_bytes"]))
                 for item in repository_history(rows, repository)]
     pooled = [int(cast(int, item["anon_peak_bytes"])) for item in rows]
@@ -1922,7 +2022,7 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
         return ExpectedPeak(percentile(measured), "measured", len(measured))
     peaks: list[int] = []
     try:
-        with closing(sqlite3.connect((root / store.INDEX_NAME).resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
             if repository.legacy_name:
                 columns = {row[1] for row in cast(list[tuple[object, ...]],
                            connection.execute("PRAGMA table_info(steps)").fetchall())}
@@ -1934,7 +2034,10 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
                     (host, repository.legacy_name, step, cutoff, before),
                 ).fetchall())
                 for value, raw_argv in indexed:
-                    if test_scope(history_arguments(raw_argv)) == scope:
+                    arguments = history_arguments(raw_argv)
+                    selection = test_selection(arguments)
+                    if (selection.scope == scope
+                            and (step not in TEST_STEPS or not package or selection.package == package)):
                         peaks.append(value)
     except (OSError, sqlite3.Error):
         pass
@@ -1964,11 +2067,33 @@ def repository_history(rows: Sequence[dict[str, object]],
     return [row for row in rows if history_matches_repository(row, repository)]
 
 
+@dataclass(frozen=True)
+class HistorySelection:
+    package: str
+    scope: TestScope
+    filters: tuple[str, ...]
+
+
+def history_selection(item: Mapping[str, object], evidence: StepEvidence) -> HistorySelection:
+    """Keep recorded fields and recover missing fields from test arguments."""
+    recovered = (test_selection(evidence.arguments)
+                 if evidence.arguments and any(key not in item for key in ("package", "test_scope", "filters"))
+                 else HistorySelection("", "full", ()))
+    package = item.get("package", recovered.package)
+    scope = item.get("test_scope", recovered.scope)
+    names = item.get("filters", recovered.filters)
+    filters = (filter_set(cast(Sequence[str], names))
+               if isinstance(names, (list, tuple))
+               and all(isinstance(name, str) for name in cast(Sequence[object], names)) else ())
+    return HistorySelection(package if isinstance(package, str) else "",
+                            "filtered" if scope == "filtered" else "full", filters)
+
+
 def compiling_history(root: Path, host: str, step: str,
                       now: datetime, *, include_current_end: bool = False) -> list[tuple[dict[str, object], StepEvidence]]:
     """Exclude only peaks whose known attempts compiled no crates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
-    evidence = index_step_evidence(root / store.INDEX_NAME, host, step,
+    evidence = index_step_evidence(file_marks.index_path_in(root), host, step,
                                    datetime.min.replace(tzinfo=now.tzinfo), now)
     peaks: list[tuple[dict[str, object], StepEvidence]] = []
     try:
@@ -1976,7 +2101,7 @@ def compiling_history(root: Path, host: str, step: str,
             if item.get("host") != host or item.get("step") != step:
                 continue
             joined = evidence.get((str(item.get("call_id", "")), step),
-                                  StepEvidence(NoBuildShape(), CompileCountUnknown()))
+                                  NO_STEP_EVIDENCE)
             if isinstance(joined.compilation, NoCratesCompiled):
                 continue
             try:
@@ -2329,12 +2454,11 @@ def history_arguments(raw: object) -> list[str]:
 def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
                   root: Path, width: int | None, filters: tuple[str, ...],
                   package: str) -> ExpectedPeak:
-    """Prefer the exact filter set, then this package's filtered runs, at any count.
+    """Use the larger exact-filter and package anonymous p90.
 
-    Old anon rows lack the package and cannot identify a workspace member. The
-    index's argv can, so those older measured runs remain usable there. Build
-    and check peaks cover compilation when no filtered run has been measured; no other
-    repository's test or compile peak participates in this estimate.
+    Recorded selection fields take priority. The shared resolver reads indexed
+    test arguments only when a field is missing. Indexed test peaks, then
+    check and build peaks, cover missing anonymous history.
     """
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
@@ -2346,30 +2470,35 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
                  for name in dict.fromkeys((step, "check", "build"))}
     for sample_step, history in histories.items():
         selected = repository_history([entry[0] for entry in history], repository)
-        for item in selected:
+        selected_ids = {id(item) for item in selected}
+        for item, evidence in history:
+            if id(item) not in selected_ids:
+                continue
             peak = cast(int, item["anon_peak_bytes"])
-            sample_package = item.get("package", "")
+            selection = history_selection(item, evidence) if sample_step in TEST_STEPS else HistorySelection(
+                cast(str, item.get("package", "")), "full", ())
+            sample_package = selection.package
             if (sample_step in ("check", "build")
                     and (sample_package == package
                          or (not sample_package and package == repository.name))):
                 compile_peaks.append(peak)
-            if (sample_step != step or item.get("test_scope") != "filtered"
+            if (sample_step != step or selection.scope != "filtered"
                     or sample_package != package
                     or (width is not None and item.get("test_threads") != width)):
                 continue
             measured.append(peak)
-            names = item.get("filters")
-            if (filters and isinstance(names, list)
-                    and all(isinstance(name, str) for name in cast(list[object], names))
-                    and tuple(sorted(set(cast(list[str], names)))) == filters):
+            if filters and selection.filters == filters:
                 exact.append(peak)
-    if exact:
-        return ExpectedPeak(percentile(exact), "measured", len(exact))
+    if measured:
+        package_peak = percentile(measured)
+        if exact and (exact_peak := percentile(exact)) >= package_peak:
+            return ExpectedPeak(exact_peak, "measured", len(exact))
+        return ExpectedPeak(package_peak, "measured", len(measured))
     indexed: list[int] = []
     indexed_exact: list[int] = []
     if repository.legacy_name:
         try:
-            connection = sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)
+            connection = sqlite3.connect(file_marks.read_only_uri(root), uri=True)
             try:
                 columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
                            connection.execute("PRAGMA table_info(steps)").fetchall())}
@@ -2383,27 +2512,24 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
                 ).fetchall())
                 for value, raw_argv, sample_step in rows:
                     arguments = history_arguments(raw_argv)
-                    sample_package = test_package(arguments)
+                    selection = test_selection(arguments)
+                    sample_package = selection.package
                     if sample_step in ("check", "build"):
                         if (sample_package == package
                                 or (not sample_package and package == repository.name)):
                             compile_index.append(int(value))
-                    elif (sample_package == package and test_scope(arguments) == "filtered"
+                    elif (sample_package == package and selection.scope == "filtered"
                           and (width is None or test_threads(arguments) == width)):
                         indexed.append(int(value))
-                        if filters and test_filters(arguments) == filters:
+                        if filters and selection.filters == filters:
                             indexed_exact.append(int(value))
             finally:
                 connection.close()
         except (OSError, sqlite3.Error):
             pass
-    for values, source in ((indexed_exact, "buildlog"),
-                           (measured, "measured"), (indexed, "buildlog")):
+    for values in (indexed_exact, indexed):
         if values:
-            peak = percentile(values)
-            if source == "buildlog":
-                peak = int(peak * ANON_SHARE)
-            return ExpectedPeak(peak, cast(Literal["measured", "buildlog"], source), len(values))
+            return ExpectedPeak(int(percentile(values) * ANON_SHARE), "buildlog", len(values))
     if compile_peaks:
         return ExpectedPeak(percentile(compile_peaks), "measured", len(compile_peaks))
     if compile_index:
@@ -2419,11 +2545,12 @@ def current_worktree_steps(root: Path, host: str, worktree: str,
     The index is only an acceleration: missing, replaced or incompatible data
     makes us read the canonical file instead. Partial or corrupt tails refuse
     freshness rather than hiding a more recent build.
+    This reader holds one lock for os.fstat and file_marks.marks and rejects partial tails that whole_rows skips.
     """
     prefixes: dict[str, tuple[int, str]] = {}
     indexed: dict[str, list[dict[str, object]]] = {}
     try:
-        with closing(sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
             _ = connection.execute("BEGIN")
             prefixes = {path: (offset, marks) for path, offset, marks in cast(
                 list[tuple[str, int, str]], connection.execute("SELECT path, offset, marks FROM files").fetchall())}
@@ -2538,7 +2665,7 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     try:
-        with closing(sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
             rows = cast(list[tuple[str | None, str, int | None, str]], connection.execute(
                 "SELECT call_id, argv, peak_mem_bytes, repo FROM steps WHERE host = ? "
                 + "AND step = ? AND started_at >= ? AND started_at < ? AND ended_at < ? "
@@ -3146,22 +3273,6 @@ def git_output(directory: str, *arguments: str) -> str:
         return ""
 
 
-def remote_identity(remote: str, directory: str) -> str:
-    if "://" not in remote and ":" in remote and not remote.startswith(("/", ".")):
-        host, path = remote.split(":", 1)
-        remote = f"ssh://{host}/{path}"
-    parsed = urlsplit(remote)
-    if parsed.hostname:
-        path = parsed.path.rstrip("/").removesuffix(".git")
-        # SSH and HTTPS name the same repository; credentials are not identity.
-        port = f":{parsed.port}" if parsed.port and parsed.port not in (22, 443) else ""
-        return urlunsplit(("https", parsed.hostname.lower() + port, path, "", ""))
-    path = Path(parsed.path if parsed.scheme == "file" else remote).expanduser()
-    if not path.is_absolute():
-        path = Path(directory) / path
-    return str(path.resolve()).rstrip("/").removesuffix(".git")
-
-
 def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if not argv:
         return UnknownRepository(), ""
@@ -3170,7 +3281,7 @@ def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     worktree = Path(facts["worktree"] or cwd).name
     remote = git_output(directory, "remote", "get-url", "origin")
     if remote:
-        key = remote_identity(remote, directory)
+        key = record.remote_identity(remote, directory)
         name = key.rsplit("/", 1)[-1]
         checkout_name = Path(facts["repo_path"] or cwd).name
         legacy = name if checkout_name == name and name not in GENERIC_REPO_NAMES else ""
@@ -3179,101 +3290,6 @@ def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if roots:
         return RepositoryIdentity("git-root:" + roots[0], Path(facts["repo_path"] or cwd).name), worktree
     return UnknownRepository(), worktree
-
-
-def recorded_repository_key(argv: list[str], cwd: str) -> str:
-    """Encode admission's repository identity at the build-log boundary."""
-    repository, _ = git_identity(argv, cwd)
-    return repository.key if isinstance(repository, RepositoryIdentity) else store.UNKNOWN_IDENTITY
-
-
-def filter_expressions(argv: list[str]) -> list[str]:
-    expressions: list[str] = []
-    arguments = iter(argv)
-    for word in arguments:
-        if word in ("-E", "--filter-expr", "--filterset"):
-            expressions.append(next(arguments, ""))
-        elif word.startswith(("--filter-expr=", "--filterset=")):
-            expressions.append(word.split("=", 1)[1])
-        elif word.startswith("-E") and len(word) > 2:
-            expressions.append(word[2:].removeprefix("="))
-    return expressions
-
-
-def verify_test_selection(argv: list[str]) -> PackageTestSelection | BroadTestSelection:
-    """Recognize the whole positive expression verify emits, never its fragments."""
-    expressions = filter_expressions(argv)
-    if len(expressions) != 1:
-        return BroadTestSelection()
-    package_predicate = r"package\(([A-Za-z0-9_-]+)\)"
-    name_predicate = r"test\([A-Za-z0-9_:]+\)"
-    union = rf"\(\s*{name_predicate}(?:\s*\|\s*{name_predicate})+\s*\)"
-    match = re.fullmatch(rf"\s*{package_predicate}\s*&\s*(?:{name_predicate}|{union})\s*",
-                         expressions[0])
-    if match:
-        names = cast(list[str], re.findall(r"\btest\(([A-Za-z0-9_:]+)\)", expressions[0]))
-        return PackageTestSelection(match.group(1), tuple(sorted(set(names))))
-    # Full package runs retain their package metadata, without an exact filter set.
-    match = re.fullmatch(rf"\s*{package_predicate}\s*", expressions[0])
-    if match and test_scope(argv) == "full":
-        return PackageTestSelection(match.group(1), ())
-    return BroadTestSelection()
-
-
-def test_filters(argv: list[str]) -> tuple[str, ...]:
-    """Verify's positive filter names, sorted and deduplicated like its cache key."""
-    selection = verify_test_selection(argv)
-    return selection.filters if isinstance(selection, PackageTestSelection) else ()
-
-
-def test_package(argv: list[str]) -> str:
-    """A verify test selection or compile package; empty means broader history."""
-    if parse.step_name(argv) not in ("check", "build"):
-        selection = verify_test_selection(argv)
-        return selection.package if isinstance(selection, PackageTestSelection) else ""
-    packages: list[str] = []
-    arguments = iter(argv)
-    for word in arguments:
-        if word in ("-p", "--package"):
-            packages.append(next(arguments, ""))
-        elif word.startswith("--package="):
-            packages.append(word.split("=", 1)[1])
-        elif word.startswith("-p") and len(word) > 2:
-            packages.append(word[2:])
-    selected = set(packages)
-    return selected.pop() if len(selected) == 1 else ""
-
-
-def test_scope(argv: list[str]) -> TestScope:
-    """Keep test selection separate from package, target and execution options."""
-    step = parse.step_name(argv)
-    if step not in ("nextest", "test", "t"):
-        return "full"
-    words = argv[argv.index(step) + 1:]
-    if step == "nextest" and words and words[0] in ("run", "list"):
-        words = words[1:]
-    values = {"-p", "--package", "--manifest-path", "--target", "--target-dir", "--profile",
-              "--features", "--test-threads", "-j", "--jobs", "--config-file", "--cargo-profile",
-              "--bin", "--example", "--test", "--bench", "--status-level", "--final-status-level",
-              "--failure-output", "--success-output", "--color", "--message-format", "--retries",
-              "--archive-file", "--workspace-remap", "--partition", "-F", "--exclude", "-P",
-              "--run-ignored", "-Z", "--no-tests", "--max-fail", "--tool-config-file", "--test-group"}
-    expressions = {"-E", "--filter-expr", "--filterset"}
-    arguments = iter(words)
-    for word in arguments:
-        option = word.split("=", 1)[0]
-        if option in ("--skip", "--exact"):
-            return "filtered"
-        if option in expressions or word.startswith("-E"):
-            expression = (word[2:].removeprefix("=") if word.startswith("-E") and len(word) > 2 else
-                          word.split("=", 1)[1] if "=" in word else next(arguments, ""))
-            if re.search(r"\btest\s*\(", expression):
-                return "filtered"
-        elif word in values:
-            _ = next(arguments, "")
-        elif not word.startswith("-"):
-            return "filtered"
-    return "full"
 
 
 def queue_life_identity(row: Waiter) -> QueueLifeIdentity:

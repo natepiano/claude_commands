@@ -190,7 +190,8 @@ The build report is too long for the user and is not used for analysis. Retire i
 **Files:** `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/test_moments.py`.
 
 ### Phase 6 — Dylib A/B timing for hana  · status: todo
-**Depends on:** none
+**Depends on:** the user lifts the hana pause (paused 2026-11-04).
+**Workers:** 1 writer (the benchmark runner).
 
 2026-11-03 (the user approved, through the builds showrunner): real-use data cannot isolate the Bevy dylib's effect. Time the same hana commit on the same machine with the dylib on and off. Run each side through verify.sh:
 
@@ -199,7 +200,7 @@ The build report is too long for the user and is not used for analysis. Retire i
 
 The result goes to the showrunner. No repository code changes.
 
-Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases.
+Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases. Record the `record.py` commit of each run: Phase 16 cut its CPU per step. If runs used different versions, say so; do not repeat completed runs for that reason.
 
 ### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
 **Depends on:** none (runs beside Phase 6)
@@ -282,3 +283,90 @@ Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command
 ### Phase 13 — Buildlog tests import their own modules  · status: done
 
 Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHONPATH. test_costs subprocess tests fail with no module cli or costs; test_vault_pull fails to import conf. Each test sets its own import path.
+
+### Phase 14 — Build history charts open and show every machine's costs  · status: done
+**Depends on:** Phase 8, Phase 10
+
+#### As-built
+
+- Cause (C950, C951 "not works", 2026-11-04): the aws-build target was configured with no build log, and "All machines" needed every configured machine, so every cost chart was unavailable. `buildlog` is also not on the terminal PATH; that fix is in `/etc/nixos` and goes through the builds showrunner.
+- `costs.first_source_times` gives each machine's first indexed event. Empty and eventless monthly files do not count. `CostReading.first_sources` carries the mapping; `build_series` joins it with observations.
+- `cost_value` returns `NoDataYet` for each day before a machine's first event. JS sums (All machines and grouped "Other") skip those cells. The chart, table, tooltip and detail line read the same cell. A machine with no data in the window shows one line, and the selector names it "no data yet".
+- A machine with recorded data that misses a day still makes the day unavailable. A missing applicable wait stays unavailable.
+- Page CPU: 7 days about 0.6 s, 30 days about 1.8 s.
+- The checkpoint's Change-Review rows re-check C950 and C951 with the full path.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
+
+### Phase 15 — The build page ranks the top costs with the action that cuts each  · status: todo
+**Depends on:** Phase 14; the builds showrunner names the build page
+
+The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to builds to review - i'm not sure about this". The builds showrunner ran it. The data is useful: memory wait is 236 step-hours a day, eight times the next cost. The output does not tell the user what to do. Ruling:
+
+1. Delete the `buildlog costs` command. The ranking moves onto the one build page the user uses. builds names that page.
+2. Show at most the top 3 costs. Each line gives the cost in plain words and hours, then the action that cuts it and its owner. The action text lives in config, not code.
+3. Show hours in the user's zone. No seconds, no UTC, no microseconds.
+4. Move the Definitions block into the as-built doc.
+5. Check the memory-wait number first. 236 h a day means about 10 steps wait at all times. queue-unit's 10l bug (on main now) made a waiting step with the AWS hook hold its grant and never start. Say how many of the 236 h came from that bug.
+6. The build history charts (C950) go on the same page. No second page.
+
+The page is queue-unit's Build Memory page (`memory_live.html`, fed by `memory_feed.py`); queue's 10m moves it into the repo. Agreed with queue-unit 2026-11-04: report-unit gives typed data, no HTML, from `charts.page_section(days)` and `costs.top_costs(n=3)`. queue's feed calls them and its page draws them. A 7-day read stays under 1 s. Send queue-unit the signatures and types when they land.
+
+Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder): the 236 h/day is a 7-day average that old days drive. Oct 29-31 had 347-533 h/day; Nov 1-3 had 7-90 h/day. The 10l bug adds at most 125 h in total (Nov 2-4). `costs.py` counts each wait correctly. builds ruling: the top 3 rank the last 2 days, so a fixed cost does not stay on top. Each line shows one number. It shows the 7-day value beside it only when the two differ by more than half. The window length lives in config.
+
+Each fix returns as a new Change-Review row.
+
+Acceptance: one page request through queue's feed calls both providers for 7 days in under 1 s total. Interface tests pass `NoDataYet`, `CostUnavailable` and `MacIdleUpperBound` through to the feed unchanged. Phase 16's `test_machine_aliases_read_sync_configuration_once` stays green.
+
+**Constraints from prior phases:** `costs.machine_name` reads `sync_config()` once and calls `record._target_hosts` (Phase 16).
+
+**Workers:** 1 writer (report-unit's providers and their interface tests). queue-unit owns the page and the feed integration test.
+
+**Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `docs/as-built/` (Definitions).
+
+### Phase 16 — Each build step spends less CPU to write its build-log row  · status: done
+**Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
+
+#### As-built
+
+- `record.py` loads config, target, hash, gzip, json, store and url parsing only on the paths that use them. The pending writer uses `os.open(O_EXCL, 0o600)` and `os.replace`; ids come from `os.urandom`.
+- One owner for each rule: `record.remote_identity` (repository key; admission's `git_identity` calls it), `record.recorded_repository_key` (origin remote, else `git-root:<first root>`), `parse.test_threads` (admission keeps the name `memory_admit.test_threads`), `record._target_hosts` (one `sync_config()` read for all targets).
+- `remote_identity` has an SCP shortcut that skips `urllib.parse`; it builds the path as the urlsplit path does, so keys are unchanged. `test_step_row.py` pins the keys in a table and uses a temporary build log.
+- CPU ms per call, bevy_brp with a real Cargo.toml, before -> after (merged tree 08397569e): terminal 294.8 -> 150.3, tee 289.3 -> 151.4, call 118.2 -> 86.3, step-context 77.2 -> 60.0, test-phase-context 208.2 -> 80.9. The driver is in the phase 18 folder (`cpu_driver.py`).
+
+**Files:** `scripts/buildlog/record.py`, `parse.py`, `step_context.py`, `costs.py`, `test_step_row.py`, `test_costs.py`, `scripts/lint/memory_admit.py`, `test_memory_admit.py`, three as-built docs.
+
+**Gotchas:** `memory_admit.py` is edited by several units; the builds merge took builds' direct buildlog imports over phase 16's typed stubs.
+
+### Phase 17 — The build log stores each memory reading once each minute  · status: done
+**Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
+
+#### As-built
+
+- Each `buildlog sample` tick writes the slices once, in the sample row. The tick `memory_snapshot` row (`TickMemorySnapshot`) holds `kind`, `at`, `host` and `zram` only. `memory.write_snapshot(at, host) -> None` writes it.
+- The standalone `buildlog snapshot` row (`MemorySnapshot`) keeps its slices, because no sample row is beside it.
+- `memory.nearest_snapshot` takes the nearest non-null slices from `samples` UNION ALL `memory_snapshots` (snapshot row first on equal distance), and the nearest zram in a second query. Old logs, new ticks and standalone snapshots give the same report. No slice reading in the window reads as unavailable, never as absent.
+- Log size: 8,321,760 bytes/day before, 4,808,160 after (1,440 ticks).
+
+**Files:** `scripts/buildlog/memory.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_memory_window.py`, `docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`.
+
+**Gotchas:** old logs keep slices in `memory_snapshots`, so the reader reads both tables.
+
+**Ruled out:** a join on equal `at` text between the two writers (a miss showed the slice as absent).
+
+### Phase 18 — Each test step's row records the memory charge admission gave its test phase  · status: todo
+**Depends on:** none (from next items; showrunner 2026-11-04: natest P10 is on builds, the index.py freeze has ended, start now)
+
+Admission now saves the charge it gave a test phase: `memory_admit.read_test_phase_charge_use` returns `TestPhaseChargeUse` (`bytes`, `selected_at`, `reservation_id`, `need`) or `NoTestPhaseChargeUse`, and finalization copies it into the admission history row as `test_phase_charge_use`. The step row still writes `test_phase_charge: null` (`record.py` `test_phase_context`), and the index has no column for it.
+
+1. Find where the recorder can read the charge for its own step: the sampling context that `invoke.sh` passes to `record.py test-phase-context`, the reservation's saved file, or the admission history row by `reservation_id`. Quote the code that proves the charge exists at that moment.
+2. Copy the charge into the step row's `test_phase_charge`. Compute nothing. No charge records null.
+3. Add an index column for the charge bytes, so `buildlog query` can rank steps by it.
+
+Acceptance: a step with a charge records it for terminal and tee steps; a step without one records null. The index column holds the bytes or null. CPU per `record.py` call stays at or below the Phase 16 values (terminal 150.3 ms, tee 151.4 ms, test-phase-context 80.9 ms).
+
+**Constraints from prior phases:** `record.py` keeps its imports lazy (Phase 16). Do not import `memory_admit` on the step path. An edit to `memory_admit.py` or `invoke.sh` needs a notice to queue-unit.
+
+**Workers:** 1 writer (rowcpu).
+
+**Files:** `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, their tests, `docs/as-built/buildlog-memory-stalls.md`; `scripts/lint/invoke.sh` and `scripts/lint/memory_admit.py` only if step 1 shows the charge must pass through them.

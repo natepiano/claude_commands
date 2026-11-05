@@ -210,7 +210,7 @@ def read_pause() -> SyncPaused | SyncRunning:
 
 
 @contextmanager
-def sync_lock(wait_for_running_sync: bool = False) -> Generator[None]:
+def sync_lock(wait_for_running_sync: bool = False, *, blocking: bool = True) -> Generator[None]:
     path = store.root() / LOCK_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as lock:
@@ -221,7 +221,7 @@ def sync_lock(wait_for_running_sync: bool = False) -> Generator[None]:
                 print("buildlog sync: waiting for the running sync to finish")
                 fcntl.flock(lock, fcntl.LOCK_EX)
         else:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         yield
 
 
@@ -265,6 +265,27 @@ def failed(step: str, result: subprocess.CompletedProcess[str] | None) -> bool:
 def sync() -> int:
     with sync_lock():
         return _sync_locked()
+
+
+def sync_target(target: str) -> None:
+    """Exchange one target after a step without waiting for another sync."""
+    try:
+        with sync_lock(blocking=False):
+            if isinstance(read_pause(), SyncPaused):
+                return
+            peer = next((peer for peer in configured_peers() if peer.target == target), None)
+            if peer is None or not record.target_hosts(target):
+                return
+            _ = health.write_snapshot()
+            settings = record.sync_config()
+            _ = sync_peer(peer, store.root(), store.host_name(), ssh_options(),
+                          configured_timeout(settings, "sync.reach_timeout_s"),
+                          configured_timeout(settings, "sync.rsync_timeout_s"))
+    except BlockingIOError:
+        print(f"buildlog sync: {target}: another sync holds the lock; hourly sync can retry")
+    except Exception as error:  # The recorder must preserve the step result.
+        detail = " ".join(str(error).split())
+        print(f"buildlog sync: {target}: exchange failed ({detail}); hourly sync can retry")
 
 
 def _sync_locked() -> int:

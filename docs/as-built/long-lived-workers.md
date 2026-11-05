@@ -119,7 +119,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 - Without `--to`, it opens a new worker named by `worker_name.sh`. After the turn it writes the worker's identity file.
 - With `--to`, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
-  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, worker_id}` for this launch, with `worker_id` the thread id. The saved `model` is retained for compatibility with old identity files; it does not select a turn's model or effort. Each turn uses an explicit override or the current role default. A mismatch fails with `has no matching durable worker identity`. A missing file with a roster thread for the name is not a mismatch: the claim writes the identity from the roster and continues. That resumes a reopened worker, and a fix worker of a run from before 2026-10-17, whose record the impl worker's replaced. A worker recorded under another slot is still refused.
+  1. Finds the saved identity through its `staff_id`. A new identity uses `impl_worker_<slot>.json`. The compatibility launcher uses `impl_worker_fix.json` for a repair in the `impl` slot. Named `assign.sh` workers use their names as new slots. The saved model does not select the next turn's model. Each turn uses an explicit override or the current role default. A missing identity is created from the roster. A worker recorded under another slot is refused.
   2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
   3. If the roster's `context_tokens` is an integer greater than `UNIT_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On exit 4 (the roster changed during compaction) it refuses the follow-up and advises inspection and same-thread `reopen` when idle. On other failures it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
@@ -130,7 +130,15 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 **Code review dispatch.** Use `assign.sh --role review --session-dir <run>
 --phase <phase> --prompt <file> --cwd <worktree>`. Each broad-review lens has
-its own dispatch; closure review omits the lens. The returned handle names its
+its own dispatch; closure review omits the lens.
+Each artifact uses the worker name: `<worker>_status`, `<worker>_summary.txt`,
+`<worker>_agent.log`, and `<worker>_reply.txt`.
+Reviews add `_<lens>_<pass>`, or `_<pass>` without a lens.
+The launcher claims the worker before it writes these artifacts.
+A refused claim leaves the artifacts unchanged.
+Use `arm-review --worker <worker>` for an early named reviewer.
+Its marker reads `<worker>_status_<lens>` and `<worker>_pid_<lens>`.
+Legacy `review.sh` markers retain their `review` prefix. The returned handle names its
 status, log and summary. The allocator uses `review`, then `review2` when the
 first worker is busy. Both threads stay read-only.
 
@@ -337,12 +345,12 @@ Role IDs are `<design_id>/designer` and `<design_id>/reviewer`. Instance names a
 | `end <instance>` | `end` | End one role. When no role of the design stays open, it also stops the design mesh server and writes `end-server-release.json`; a failed stop leaves the role `RoleNeedsRecovery`. |
 | `unbind-run <run>` | `unbind_run` | Unbind every design bound to that run. |
 | `list [--json]` | `list_roles` | Default: one plain line per role with instance ID, role, lifecycle state, holder, holder session or unavailable reason, thread ID when present, and document; `no held roles` when empty, then one line per problem. `--json`: the full local roles and problems dict, with `transition.json`, move marker and failed status mapped to recovery/paused states; no network calls. |
-| `register --repository --host --checkout [--inventory-complete]` | `register_repository` | Register a repository with the authority. |
+| `register --repository --host --checkout` | `register_repository` | Register a repository with the authority. |
 | `authority <operation>` | `_authority_local` | Run one authority operation from JSON on stdin; refuses on a host that is not the authority. |
 
 Other public functions: `queue_message`, `pending_messages`, `held_document`, `end_holder`, `check_patch`, `rename_holder`, `rename_failures`, `move_holder`, `holder_failures`, `transfer_route`, `durable_meshes`, `resolve_holder`, `resolve_model`, `access_policy`, `refresh_census`, `authority_request`.
 
-**Ownership authority.** `config/design_roles.conf` pins `[ownership] host=natedev` (override file: `DESIGN_ROLES_CONFIG`; local host: `DESIGN_ROLES_HOST`, else the short hostname). `authority_request` runs locally on that host, else over `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> … design_roles.py authority <op>` with a 30 s limit; failure is `RoleRefused('ownership authority unavailable: …')`. Only the authority writes `DESIGN_OWNERSHIP_STATE`, else `~/.local/state/astra/design-ownership/`: `repositories.json` (ID to per-host absolute checkouts and `inventory_complete`) and `placements/<sha256(repository_id \0 relative document)>.json`. Operations: `register`, `reserve`, `lookup`, `advance` (generation +1 on the placement and its aliases), `checkout` (move a host's checkout mapping), `alias`, `legacy` (record `adoption_required`), `adopt-reserve`, `adopt-commit`. Every operation except `register` refuses until `inventory_complete` is true, and refuses a host with no explicit checkout mapping or a document outside it. A placement on another host refuses: the pair always lives on its holder's host. `[roles] new_open=false` makes `open_role` and `adopt` refuse and keeps every existing identity.
+**Ownership authority.** `config/design_roles.conf` pins `[ownership] host=natedev`. `DESIGN_ROLES_CONFIG` overrides the configuration file. `DESIGN_ROLES_HOST` overrides the local host; otherwise, the short hostname applies. `authority_request` runs locally on the authority host. Other hosts use `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> … design_roles.py authority <op>` with a 30 s limit. Failure raises `RoleRefused('ownership authority unavailable: …')`. Only the authority writes `DESIGN_OWNERSHIP_STATE`, which defaults to `~/.local/state/astra/design-ownership/`. `repositories.json` maps repository IDs to absolute checkout paths for each host. `placements/<sha256(repository_id \0 relative document)>.json` stores placements. Operations are `register`, `reserve`, `lookup`, `advance`, `checkout`, `alias`, `legacy`, `adopt-reserve`, and `adopt-commit`. `advance` increases the generation for the placement and its aliases. `checkout` changes a host's checkout mapping. `legacy` records `adoption_required`. Operations except `register` refuse a host without an explicit checkout mapping or a document outside that checkout. A placement on another host refuses. Both roles remain on the holder's host. `[roles] new_open=false` makes `open_role` and `adopt` refuse and keeps every existing identity.
 
 **Authorization.** `_check_host` requires the design host to equal the local host.
 `worker_parent` reads the helper's worker row from the staff record.

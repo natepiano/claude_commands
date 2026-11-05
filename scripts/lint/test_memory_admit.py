@@ -40,13 +40,18 @@ import nextest_budget as budget
 from build_shape import BuildShape, build_shape
 from memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
 if TYPE_CHECKING:
+    from ..buildlog import store
+    from ..buildlog import record as buildlog_record
+    from ..buildlog import index as file_marks
     from ..lib import test_hang_guard
     from ..message.roster import UnitLabels
 else:
+    import store
+    import record as buildlog_record
+    import index as file_marks
     from scripts.lib import test_hang_guard
     from scripts.message.roster import UnitLabels
 
-store = gate.store
 READY_FOR_ADMISSION = gate.ReadyForAdmission()
 
 
@@ -120,6 +125,7 @@ LAST_TEST_BUILD_AT = NOW - timedelta(minutes=1)
 INVOKE = Path(__file__).with_name("invoke.sh")
 MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
 HANA = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
+CARGO_LINER = gate.RepositoryIdentity("cargo-liner", "cargo-liner", "cargo-liner")
 RELEASE_BUILD = ["cargo", "build", "--release", "--features=bevy/trace_chrome", "--bin", "hana"]
 RELEASE_SHAPE = build_shape(RELEASE_BUILD)
 HistoryAppendStop = Literal["before newline", "inside UTF-8"]
@@ -147,7 +153,7 @@ def write_history_rows(root: Path, rows: Iterable[dict[str, object]], *,
         for original in rows:
             row = dict(original)
             if indexed:
-                with closing(sqlite3.connect(root / store.INDEX_NAME)) as db, db:
+                with closing(sqlite3.connect(file_marks.index_path_in(root))) as db, db:
                     _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, "
                                    + "started_at TEXT, peak_mem_bytes INTEGER, argv TEXT, call_id TEXT, "
                                    + "crates_compiled INTEGER DEFAULT 1, repo_identity TEXT)")
@@ -415,7 +421,7 @@ class HistoryTests(unittest.TestCase):
         write_history_rows(self.root, rows, indexed=True)
 
     def add_index(self, *, at: datetime = HISTORY_AT) -> None:
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER, crates_compiled INTEGER DEFAULT 1)")
             for index in range(5):
                 _ = db.execute("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes) VALUES (?, ?, ?, ?, ?)",
@@ -456,7 +462,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.peak().source, "buildlog")
 
     def test_legacy_index_without_compile_counts_keeps_its_clippy_peaks(self) -> None:
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT)")
             _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
@@ -494,7 +500,7 @@ class HistoryTests(unittest.TestCase):
 
     def test_buildlog_tier_keeps_filtered_runs_separate(self) -> None:
         self.add_index()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("ALTER TABLE steps ADD COLUMN argv TEXT")
             _ = db.execute("UPDATE steps SET argv = ?", (json.dumps(["cargo", "nextest", "run"]),))
             for _ in range(5):
@@ -522,6 +528,23 @@ class FilteredPromiseTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
         (self.root / "admission").mkdir()
 
+    def test_package_check_keeps_legacy_measured_peaks_without_package_fields(self) -> None:
+        arguments = ["cargo", "check", "-p", "hana"]
+        rows: list[dict[str, object]] = [{
+            "host": self.host, "repo": HANA.legacy_name, "repo_identity": HANA.key,
+            "step": "check", "anon_peak_bytes": 2 * GIB,
+            "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
+        }] * 5
+        write_history_rows(self.root, rows, indexed=True)
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
+            _ = db.execute("UPDATE steps SET argv=?", (json.dumps(arguments),))
+        config = admission_configuration_fixture()
+        estimate = gate.expected_peak(
+            HANA, "check", self.host, NOW, self.root,
+            package=gate.test_package(arguments), scope=gate.test_scope(arguments),
+            first_peak_bytes=config.program_first_peaks["cargo"], budget=config.build_budget_bytes)
+        self.assertEqual(estimate, gate.ExpectedPeak(2 * GIB, "measured", 5))
+
     def samples(self, peaks: list[int], *, package: str = "hana", filters: tuple[str, ...] = (),
                 scope: gate.TestScope = "filtered", step: str = "nextest",
                 repository: gate.RepositoryIdentity = HANA, host: str = "test-host",
@@ -533,6 +556,86 @@ class FilteredPromiseTests(unittest.TestCase):
             "filters": list(filters), "anon_peak_bytes": peak,
             "ended_at": store.utc_iso(at.timestamp()),
         } for peak in peaks), indexed=indexed, crates=crates)
+
+    def legacy_selection_sample(self, call_id: str, anonymous_peak: int,
+                                indexed_peak: int, expression: str) -> None:
+        """Keep the selection only in argv, as the older recorder did."""
+        write_history_rows(self.root, [{
+            "host": self.host, "repo": CARGO_LINER.legacy_name, "step": "nextest",
+            "call_id": call_id, "anon_peak_bytes": anonymous_peak,
+            "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
+        }], indexed=True)
+        arguments = ["cargo", "nextest", "run", "-E", expression]
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
+            _ = db.execute("UPDATE steps SET argv=?, peak_mem_bytes=? WHERE call_id=?",
+                           (json.dumps(arguments), indexed_peak, call_id))
+
+    def test_legacy_exact_selection_uses_its_anonymous_peak_before_the_indexed_peak(self) -> None:
+        # The cargo-tile row supplied the indexed_exact tier on 2026-10-22.
+        # Its exact and package histories contain the same anonymous row.
+        names = ("an_excluded_command_after_a_valued_global_option_is_excluded",
+                 "cargo_offline_port_passes_straight_through_the_shim",
+                 "the_installed_shim_skips_every_valued_global_option")
+        expression = "package(cargo-tile) & (" + " | ".join(f"test({name})" for name in names) + ")"
+        self.legacy_selection_sample("v20261018T004601-3696591-31646",
+                                     1_114_603_520, 2_897_424_384, expression)
+        estimate = self.promise(names, repository=CARGO_LINER, package="cargo-tile")
+        self.assertEqual(estimate, gate.ExpectedPeak(1_114_603_520, "measured", 1))
+
+    def test_legacy_package_selection_recovers_anonymous_peaks_for_an_unseen_filter(self) -> None:
+        # These cargo-handler rows supplied the indexed tier on 2026-10-21.
+        # No exact row matches the new filter, so the package p90 sets the promise.
+        samples = (
+            ("v20261021T155249-4110155-296", 833_626_112, 3_038_146_560,
+             "light_running_and_waiting_stems"),
+            ("v20261021T152015-1436029-2533", 828_477_440, 2_620_203_008,
+             "shell_running_uses_agent_running_ink"),
+            ("v20261021T141843-3388864-5330", 1_114_439_680, 3_182_821_376,
+             "default_tree_sort_preserves"),
+            ("v20261021T140931-2292796-12929", 1_125_695_488, 3_289_464_832,
+             "shell_rows_draw_running"),
+            ("v20261021T130628-2237327-5786", 530_890_752, 2_714_832_896,
+             "unassigned_and_unlabeled_role_cells"),
+        )
+        for call_id, anonymous_peak, indexed_peak, name in samples:
+            self.legacy_selection_sample(call_id, anonymous_peak, indexed_peak,
+                                         f"package(cargo-handler) & test({name})")
+        estimate = self.promise(("new_filter",), repository=CARGO_LINER, package="cargo-handler")
+        self.assertEqual(estimate, gate.ExpectedPeak(1_125_695_488, "measured", 5))
+
+    def test_full_package_selection_excludes_other_packages_from_legacy_anonymous_history(self) -> None:
+        # The full cargo-handler tier mixed these packages on 2026-10-21.
+        samples = (
+            ("cargo-handler", "v20261021T153138-2292084-16164", 671_563_776, 2_940_760_064),
+            ("cargo-handler", "v20261021T150957-577237-15636", 709_586_944, 3_062_943_744),
+            ("cargo-handler", "v20261021T144821-2738321-14641", 670_871_552, 3_004_026_880),
+            ("cargo-handler", "v20261021T143045-736918-24002", 1_101_647_872, 2_983_149_568),
+            ("cargo-handler", "v20261021T134700-3850863-2816", 1_168_596_992, 2_912_776_192),
+            ("cargo-berth", "v20261021T115802-2170238-2089", 1_721_237_504, 4_158_533_632),
+            ("cargo-berth", "v20261021T115036-1012290-20085", 1_943_429_120, 4_275_789_824),
+            ("cargo-berth", "v20261021T114640-618929-30845", 952_893_440, 3_459_043_328),
+            ("cargo-berth", "v20261021T114115-4061014-30821", 1_681_874_944, 4_025_790_464),
+            ("cargo-berth", "v20261021T113635-3464735-28770", 1_779_761_152, 4_688_084_992),
+        )
+        for package, call_id, anonymous_peak, indexed_peak in samples:
+            self.legacy_selection_sample(call_id, anonymous_peak, indexed_peak,
+                                         f"package({package})")
+        estimate = self.promise((), repository=CARGO_LINER, package="cargo-handler", scope="full")
+        self.assertEqual(estimate, gate.ExpectedPeak(1_168_596_992, "measured", 5))
+
+    def test_a_larger_package_peak_protects_a_lower_exact_filter_peak(self) -> None:
+        # These rows appear in promise_sources.json as anon:30269 and anon:30112.
+        self.legacy_selection_sample(
+            "v20261021T155249-4110155-296", 833_626_112, 3_038_146_560,
+            "package(cargo-handler) & test(light_running_and_waiting_stems)")
+        self.legacy_selection_sample(
+            "v20261021T140931-2292796-12929", 1_125_695_488, 3_289_464_832,
+            "package(cargo-handler) & (test(shell_rows_draw_running) | test(shell_timer_status_keeps)"
+            + " | test(status_cells_keep_glyph) | test(showrunner_session_sort_ignores)"
+            + " | test(unassigned_session_sort_ignores) | test(summary_name_sort_ignores))")
+        estimate = self.promise(("light_running_and_waiting_stems",),
+                                repository=CARGO_LINER, package="cargo-handler")
+        self.assertEqual(estimate, gate.ExpectedPeak(1_125_695_488, "measured", 2))
 
     def test_five_keyed_runs_exclude_older_unkeyed_peaks(self) -> None:
         self.samples([19 * GIB] * 10, scope="full", keyed=False)
@@ -572,7 +675,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak(self) -> None:
         self.samples([7 * GIB], filters=("native_rate",), crates=0)
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             for count in (None, 0):
                 _ = db.execute("INSERT INTO steps(host,repo,step,started_at,call_id,crates_compiled) "
                                + "SELECT host,repo,step,started_at,call_id,? FROM steps LIMIT 1", (count,))
@@ -580,7 +683,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_legacy_index_without_compile_counts_keeps_its_filtered_nextest_peaks(self) -> None:
         arguments = ["cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"]
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT)")
             _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
@@ -599,7 +702,7 @@ class FilteredPromiseTests(unittest.TestCase):
             "filters": ["native_rate"], "anon_peak_bytes": 21 * GIB,
             "call_id": "different-step", "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
         }])
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("INSERT INTO steps(host,repo,step,started_at,call_id,crates_compiled) "
                            + "VALUES (?,?,?,?,?,?)",
                            (self.host, "hana", "check", HISTORY_AT.isoformat(), "different-step", 5))
@@ -617,9 +720,14 @@ class FilteredPromiseTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(sum(row["step"] == "merge-gate" for row in gate.anonymous_history_rows(path)), 10)
 
-    def promise(self, filters: tuple[str, ...] = ("native_rate",)) -> gate.ExpectedPeak:
-        return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
-                                  scope="filtered", package="hana", filters=filters, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
+    def promise(self, filters: tuple[str, ...] = ("native_rate",), *,
+                repository: gate.RepositoryIdentity = HANA, package: str = "hana",
+                scope: gate.TestScope = "filtered") -> gate.ExpectedPeak:
+        config = admission_configuration_fixture()
+        return gate.expected_peak(repository, "nextest", self.host, NOW, self.root,
+                                  scope=scope, package=package, filters=filters,
+                                  first_peak_bytes=config.program_first_peaks["cargo"],
+                                  budget=config.build_budget_bytes)
 
     def test_unfinished_rows_do_not_change_the_filtered_estimate(self) -> None:
         self.samples([3 * GIB], filters=("native_rate",))
@@ -628,18 +736,18 @@ class FilteredPromiseTests(unittest.TestCase):
             lambda: gate.filtered_peak(HANA, "nextest", self.host, NOW, self.root,
                                        None, ("native_rate",), "hana"))
 
-    def test_exact_filter_set_uses_its_p90_regardless_of_name_order(self) -> None:
-        self.samples([number * GIB for number in range(1, 11)], filters=("render", "native_rate"))
+    def test_filter_name_order_keeps_the_larger_exact_p90(self) -> None:
+        self.samples([number * GIB for number in range(11, 21)], filters=("render", "native_rate"))
         self.samples([14 * GIB] * 10, filters=("other",))
         self.samples([19 * GIB] * 10, scope="full")
         for filters in (("native_rate", "render"), ("render", "native_rate")):
             with self.subTest(filters=filters):
-                self.assertEqual(self.promise(filters), gate.ExpectedPeak(9 * GIB, "measured", 10))
+                self.assertEqual(self.promise(filters), gate.ExpectedPeak(19 * GIB, "measured", 10))
 
-    def test_one_exact_native_rate_sample_precedes_other_filtered_history(self) -> None:
+    def test_a_lower_exact_sample_keeps_the_larger_package_p90(self) -> None:
         self.samples([2 * GIB], filters=("native_rate",))
         self.samples([9 * GIB] * 10, filters=("render",))
-        self.assertEqual(self.promise(), gate.ExpectedPeak(2 * GIB, "measured", 1))
+        self.assertEqual(self.promise(), gate.ExpectedPeak(9 * GIB, "measured", 11))
 
     def test_unseen_filter_set_uses_all_filtered_runs_of_the_same_package(self) -> None:
         self.samples([number * GIB for number in range(1, 6)], filters=("render",))
@@ -669,7 +777,7 @@ class FilteredPromiseTests(unittest.TestCase):
         self.assertEqual(self.promise().bytes, gate.FILTERED_FLOOR)
 
     def test_compile_fallback_can_use_same_package_buildlog_history(self) -> None:
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for package, peak in (("hana", 8 * GIB), ("hana-ui", 20 * GIB)):
@@ -679,9 +787,9 @@ class FilteredPromiseTests(unittest.TestCase):
                 ] * 5)
         self.assertEqual(self.promise().bytes, max(gate.FILTERED_FLOOR, int(8 * GIB * gate.ANON_SHARE)))
 
-    def test_exact_buildlog_filters_precede_broader_filtered_anon_history(self) -> None:
+    def test_package_anonymous_history_precedes_exact_indexed_history(self) -> None:
         self.samples([19 * GIB] * 10, filters=("other",))
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for package, names, peaks in (
@@ -695,7 +803,7 @@ class FilteredPromiseTests(unittest.TestCase):
                      json.dumps(argv)) for peak in peaks
                 ])
         self.assertEqual(self.promise(("native_rate", "render")),
-                         gate.ExpectedPeak(int(9 * GIB * gate.ANON_SHARE), "buildlog", 10))
+                         gate.ExpectedPeak(19 * GIB, "measured", 10))
 
     def test_verify_nextest_expression_supplies_package_and_canonical_filter_set(self) -> None:
         cases = (
@@ -764,7 +872,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_negated_index_expression_cannot_supply_a_positive_exact_promise(self) -> None:
         self.samples([9 * GIB] * 5, filters=("other",))
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for expression in ("package(hana) & not test(native_rate)", "package(hana) & !test(native_rate)"):
@@ -805,7 +913,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_build_measurements_precede_compile_index_history(self) -> None:
         self.samples([8 * GIB] * 5, step="build", scope="full")
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)", [
@@ -815,7 +923,7 @@ class FilteredPromiseTests(unittest.TestCase):
         self.assertEqual(self.promise(), gate.ExpectedPeak(8 * GIB, "measured", 5))
 
     def test_no_filtered_history_uses_same_package_build_index_measurements(self) -> None:
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             for package, peak in (("hana", 8 * GIB), ("hana-ui", 20 * GIB)):
@@ -827,7 +935,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_indexed_member_compile_promise_can_exceed_the_full_suite(self) -> None:
         self.samples([12 * GIB] * 5, scope="full")
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "peak_mem_bytes INTEGER, argv TEXT, crates_compiled INTEGER DEFAULT 1)")
             _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes,argv) VALUES (?, ?, ?, ?, ?, ?)", [
@@ -850,7 +958,7 @@ class FilteredPromiseTests(unittest.TestCase):
         self.samples([20 * GIB], filters=("native_rate",))
         self.samples([2 * GIB], filters=("small_test",))
         self.assertEqual(self.promise(), gate.ExpectedPeak(20 * GIB, "measured", 1))
-        self.assertEqual(self.promise(("small_test",)), gate.ExpectedPeak(2 * GIB, "measured", 1))
+        self.assertEqual(self.promise(("small_test",)), gate.ExpectedPeak(20 * GIB, "measured", 2))
 
     def test_compile_fallback_can_exceed_the_full_suite_promise(self) -> None:
         self.samples([4 * GIB] * 5, scope="full")
@@ -893,7 +1001,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         self.state.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(self.state)})))
         (self.root / "admission").mkdir()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
                            + "ended_at TEXT, peak_mem_bytes INTEGER, argv TEXT, call_id TEXT, "
                            + "worktree TEXT, tree_key TEXT, status INTEGER, tests_run INTEGER, "
@@ -910,7 +1018,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         if scope == "filtered":
             selection = " | ".join(f"test({name})" for name in filters)
             expression += " & " + (selection if len(filters) == 1 else f"({selection})")
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             for peak in peaks:
                 self.sample_id += 1
                 call = f"call-{self.sample_id}"
@@ -934,7 +1042,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         timestamp = store.utc_iso(at.timestamp())
         arguments = ["cargo", "nextest", "run", "-E", expression]
         if indexed:
-            with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+            with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
                 _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                (self.host, "hana", "nextest", timestamp, timestamp if finished else None, None,
                                 json.dumps(arguments), "last-build", worktree or str(self.worktree),
@@ -956,9 +1064,9 @@ class FreshTestPromiseTests(unittest.TestCase):
         path = self.root / self.host / f"{NOW:%Y-%m}.jsonl"
         offset = path.stat().st_size
         with path.open("rb") as handle:
-            marks = gate.file_marks.marks(handle, offset)
+            marks = file_marks.marks(handle, offset)
         source = path.relative_to(self.root).as_posix()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("ALTER TABLE steps ADD COLUMN test_build_key TEXT")
             _ = db.execute("ALTER TABLE steps ADD COLUMN src TEXT")
             _ = db.execute("UPDATE steps SET test_build_key = tree_key, src = ? WHERE worktree = ?",
@@ -1029,7 +1137,7 @@ class FreshTestPromiseTests(unittest.TestCase):
 
     def test_fresh_index_peak_is_scaled_when_no_joined_anon_measurement_exists(self) -> None:
         self.samples([GIB], measured=False)
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("UPDATE steps SET peak_mem_bytes = ? WHERE crates_compiled = 0", (4 * GIB,))
         self.previous_build()
         self.assertEqual(self.promise(), gate.ExpectedPeak(int(4 * GIB * gate.ANON_SHARE), "buildlog", 1))
@@ -1253,7 +1361,7 @@ class FreshTestPromiseTests(unittest.TestCase):
     def test_logged_disk_sweep_since_build_forces_compile_promise(self) -> None:
         self.samples([2 * GIB])
         self.previous_build()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("INSERT INTO steps(host, worktree, step, started_at, sweep_freed_bytes) "
                            + "VALUES (?, ?, 'sweep', ?, ?)",
                            (self.host, str(self.worktree), store.utc_iso((NOW - timedelta(seconds=30)).timestamp()), GIB))
@@ -1278,7 +1386,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         meminfo = self.root / 'meminfo'
         _ = meminfo.write_text('MemAvailable: 67108864 kB\n')
         arguments = ['cargo', 'nextest', 'run', '-E', 'package(hana) & test(native_rate)']
-        with patch.dict(os.environ, {'BUILDLOG_TEST_BUILD_KEY': 'current-key', 'BUILDLOG_TREE': 'source-only-key', 'BUILDLOG_TEST_TARGET_DIR': str(configured), 'BUILDLOG_TEST_BUILD_DIR': str(configured), 'CARGO_TARGET_DIR': str(self.worktree / 'target')}), patch.object(gate, 'git_identity', return_value=(HANA, 'checkout')), patch.object(gate.store, 'host_name', return_value=self.host), patch.object(gate.record, 'git_directory', return_value=str(self.worktree)), patch.object(gate.record, 'git_facts', return_value={'worktree': str(self.worktree)}), patch.object(gate, 'process_start_time', return_value=None):
+        with patch.dict(os.environ, {'BUILDLOG_TEST_BUILD_KEY': 'current-key', 'BUILDLOG_TREE': 'source-only-key', 'BUILDLOG_TEST_TARGET_DIR': str(configured), 'BUILDLOG_TEST_BUILD_DIR': str(configured), 'CARGO_TARGET_DIR': str(self.worktree / 'target')}), patch.object(gate, 'git_identity', return_value=(HANA, 'checkout')), patch.object(store, 'host_name', return_value=self.host), patch.object(buildlog_record, 'git_directory', return_value=str(self.worktree)), patch.object(buildlog_record, 'git_facts', return_value={'worktree': str(self.worktree)}), patch.object(gate, 'process_start_time', return_value=None):
             fresh = gate.step_estimate(arguments, str(self.worktree), gate.INFER_FROM_ARGV, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
             self.assertEqual(fresh.profile.peak.bytes, 2 * GIB)
             _ = (self.state / 'target-deletes.json').write_text(json.dumps({str(configured): (NOW - timedelta(seconds=30)).timestamp()}))
@@ -1338,6 +1446,13 @@ class RepositoryHistoryTests(unittest.TestCase):
         self.assertEqual(self.estimate(first), gate.ExpectedPeak(19 * GIB, "measured", 5))
         self.assertEqual(self.estimate(second), gate.ExpectedPeak(2 * GIB, "measured", 5))
 
+    def test_repository_identity_uses_the_recorders_remote_rule(self) -> None:
+        directory = self.checkout("project", "git@example.org:owner/project.git")
+        with patch.object(gate.record, "remote_identity", return_value="https://example.org/owner/project") as normalize:
+            identity = self.identity(directory)
+        self.assertEqual(identity.key, "https://example.org/owner/project")
+        normalize.assert_called_once_with("git@example.org:owner/project.git", str(directory))
+
     def test_same_repository_shares_peaks_across_folders_and_remote_forms(self) -> None:
         first = self.identity(self.checkout("one/repo", "git@example.org:nate/first.git"))
         second = self.identity(self.checkout("two/different", "https://user@example.org/nate/first/"))
@@ -1356,7 +1471,7 @@ class RepositoryHistoryTests(unittest.TestCase):
         write_history_rows(self.root, rows, indexed=True)
         self.assertEqual(self.estimate(identity), gate.ExpectedPeak(3 * GIB, "measured", 5))
         peaks.unlink()
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER, crates_compiled INTEGER DEFAULT 1)")
             _ = db.executemany("INSERT INTO steps(host,repo,step,started_at,peak_mem_bytes) VALUES (?, ?, ?, ?, ?)",
                                [(self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), 4 * GIB)] * 5)
@@ -2231,7 +2346,7 @@ class ServicePriorityRepairTests(unittest.TestCase):
             prefix = b"this old prefix is not JSON\n"
             _ = path.write_bytes(prefix)
             request = wire.PrioritySetRequest("stopped-set", "chosen", "saved reason", "director")
-            with patch.object(gate.record, "queue_priority", side_effect=KeyboardInterrupt):
+            with patch.object(buildlog_record, "queue_priority", side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
                     _ = fixture.server.handle_request(request)
             priority = fixture.server.priority
@@ -2419,7 +2534,7 @@ class BuildPromiseFixture(MemoryQueueFixture):
 
     def index_build(self, call_id: str, arguments: list[str], *,
                     at: datetime = HISTORY_AT, crates: int = 1) -> None:
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection, connection:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as connection, connection:
             _ = connection.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, "
                                    + "repo_identity TEXT, step TEXT, started_at TEXT, "
                                    + "call_id TEXT, argv TEXT, peak_mem_bytes INTEGER, crates_compiled INTEGER DEFAULT 1)")
@@ -2562,7 +2677,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
 
     def test_legacy_index_without_compile_counts_keeps_its_build_peak(self) -> None:
         self.index_build("legacy-build", RELEASE_BUILD)
-        with closing(sqlite3.connect(self.root / store.INDEX_NAME)) as connection, connection:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as connection, connection:
             _ = connection.execute("ALTER TABLE steps DROP COLUMN crates_compiled")
         self.sample(5, call_id="legacy-build", record_shape=False)
         peak = self.estimate()
@@ -2680,7 +2795,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
 
     def test_old_history_matches_a_copy_with_a_different_checkout_name(self) -> None:
         self.index_build("copied-build", RELEASE_BUILD)
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection, connection:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as connection, connection:
             _ = connection.execute("UPDATE steps SET repo = 'hana-copy'")
         self.sample(16, record_shape=False, call_id="copied-build")
         peak = self.estimate()
@@ -2692,10 +2807,10 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.sample(5, record_shape=False, call_id="joined")
         for call_id in ("dev", "no-index-match", ""):
             self.sample(20, record_shape=False, call_id=call_id)
-        before = (self.root / "index.sqlite").read_bytes()
+        before = file_marks.index_path_in(self.root).read_bytes()
         peak = self.estimate()
         self.assertEqual((peak.bytes, peak.count), (gate.shape_headroom_bytes(5 * GIB, self.release_headroom), 1))
-        self.assertEqual((self.root / "index.sqlite").read_bytes(), before)
+        self.assertEqual(file_marks.index_path_in(self.root).read_bytes(), before)
 
     def test_rows_without_shape_or_join_cannot_supply_even_a_profile_fallback(self) -> None:
         for _ in range(10):
@@ -3045,11 +3160,10 @@ class BuildFinalizerTests(BuildPromiseFixture):
                 reads_at_expiry = 0
                 history_reader = gate.anonymous_history_rows
                 history_scans = 0
-                def count_history_scans(source: Path | BinaryIO) -> Iterator[dict[str, object]]:
+                def count_history_scans(path: Path) -> Iterator[dict[str, object]]:
                     nonlocal history_scans
-                    if isinstance(source, Path):
-                        history_scans += 1
-                    return history_reader(source)
+                    history_scans += 1
+                    return history_reader(path)
                 def observe(reply: wire.Wait) -> None:
                     nonlocal reads_at_expiry
                     replies.append(reply)
@@ -3218,6 +3332,13 @@ class BuildNeedBasisTests(BuildPromiseFixture):
 
 
 class ProgramProfileTests(MemoryQueueFixture):
+    def test_absent_history_uses_the_first_program_peak(self) -> None:
+        history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
+        self.assertFalse(history.exists())
+        self.assertEqual(list(gate.anonymous_history_rows(history)), [])
+        self.assertEqual(gate.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB),
+                         gate.FirstProgramPeak(4 * GIB))
+
     def test_unfinished_rows_do_not_change_the_program_estimate(self) -> None:
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         _ = history.write_text(json.dumps({

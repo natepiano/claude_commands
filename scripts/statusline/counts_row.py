@@ -70,13 +70,18 @@ def write(instance: Path) -> Path:
         # Nothing readable to count: the row stays empty until the timer's conf changes.
         line, due, sources = "", "", [instance / "conf"]
     cache = cache_path(instance.name.removeprefix("showrunner-"))
+    write_cache(cache, line, due, sources, began)
+    return cache
+
+
+def write_cache(cache: Path, line: str, due: str, sources: list[Path], began: int, details: str = "") -> None:
+    """Replace the cache with the answer, deadline, source paths, and optional result details."""
     cache.parent.mkdir(parents=True, exist_ok=True)
     scratch = cache.with_name(f".{cache.name}.{os.getpid()}")
     named = dict.fromkeys(str(watched(path)) for path in sources)
-    _ = scratch.write_text("\n".join([line, due, *named]) + "\n", encoding="utf-8")
+    _ = scratch.write_text("\n".join([line, due, *named, *([details] if details else [])]) + "\n", encoding="utf-8")
     os.utime(scratch, ns=(began, began))
     _ = scratch.replace(cache)
-    return cache
 
 
 def main(argv: list[str]) -> int:

@@ -181,7 +181,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
             if arguments[:2] == ("pane", "list"):
                 place = self.marked["demo-unit"].place
                 assert isinstance(place, herdr.HerdrPlace)
-                return {"panes": [{"pane_id": place.pane, "workspace_id": place.pane.split(":")[0]}]}
+                return {"panes": [{"pane_id": place.pane, "terminal_id": "unit-terminal",
+                                   "workspace_id": place.pane.split(":")[0]}]}
             if arguments[:2] == ("pane", "process-info"):
                 return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": PID,
                     "foreground_processes": [{"pid": PID, "name": "claude", "argv": ["claude"]}]}}
@@ -388,7 +389,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery(("sent child", "sent parent"))),
               mock.patch.object(add_showrunner, "main") as restart):
             code, out, err = self.run_main()
-        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual((code, err), (0, "unchanged\n"), out)
         appeared.assert_called_once_with("child")
         restart.assert_not_called()
         prompt.assert_not_called()
@@ -422,7 +423,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                   mock.patch.object(showrunners, "tell_others", side_effect=send_notices) as notices,
                   mock.patch.object(add_showrunner, "main") as restart):
                 code, out, err = self.run_main()
-        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual((code, err), (0, "unchanged\n"), out)
         restart.assert_not_called()
         notices.assert_called_once()
         self.assertIn("sent child", out)

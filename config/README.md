@@ -62,6 +62,11 @@ context-usage hooks read it to calculate the auto-compaction trigger.
 The per-call message uses `context_usage.conf`. A new family, or a family
 whose first 1M release changes, is a row here.
 
+## codex_daemon.conf
+
+`agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
+Both callers read the value when they use it.
+
 ## context_usage.conf
 
 `message = off` disables the per-call context message for main threads and subagents.
@@ -255,7 +260,8 @@ This file defines the disabled AWS SSH target. `offload=off` prevents work.
 The active target list remains `targets=mac,natedev` in `build_targets.conf`.
 The user completes deployment before target activation.
 
-`host=aws-build` names the Tailscale SSH host. `instance_id` and `region` remain empty before deployment.
+`host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
+The controller reads the instance ID from `deployment.json`.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
 `kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
 
@@ -305,7 +311,12 @@ Positive numeric settings use the readable lower bound `# range: 0.001..`.
 Zero-permitted settings retain `# range: 0..`. Whole-number settings retain their existing limits.
 
 Deployment settings require the account inputs before preparation.
-`deployment_profile` names the administrator profile. `credentials_profile` names the scaler profile.
+`deployment_profile` names the legacy administrator section for migration.
+`credentials_profile` names the unattended scaler profile.
+`admin_secret_file=~/.config/aws-build/admin.gpg` holds symmetric AES256 encrypted administrator credentials.
+Run `deploy.py secrets` in a terminal to create or update it.
+The command removes imported plain administrator credentials after encryption succeeds.
+Deployment reads the passphrase once through `/dev/tty` and disables the GPG symmetric passphrase cache.
 `stack_name`, `availability_zone`, `vpc_id`, and `subnet_id` select the deployment location.
 `ami_id`, `ami_owner_id`, `nixos_release`, and `root_device_name` identify the official x86_64 NixOS image.
 `notification_email_file` names a private file with one address for Budget notices.
@@ -316,15 +327,24 @@ The `budget_notice_*_percent` keys set the notice thresholds.
 `budget_stop_percent` sets the stop threshold. The live spending guard remains the primary limit.
 `root_volume_gib` sizes the root volume.
 `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.
-`existing_data_volume_id` selects a retained volume. An empty value requests a new volume.
+The saved `deployment.json` record identifies the instance and retained data volume.
+Replacement uses its saved `DataVolumeId`. Configuration contains no instance or volume ID.
 `spot_max_usd_per_hour` limits the Spot request price.
 `deployment_price_file` names the price state file outside the repository. Its default path is `~/.config/aws-build/deployment-price`.
-Run `python3 scripts/aws_target/deploy.py price` before `prepare`.
+Run `python3 scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
+The command records stage results and times in `up.json` beside `deployment.json`.
+It checks live state before each stage. It always refreshes the price.
+Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
 The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
 It writes the price and its read time atomically with mode `0600`.
 `prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
-`preflight_max_age_s` limits preparation age. `deployment_timeout_s` bounds each deployment command.
+`preflight_max_age_s` limits preparation age. A completed foundation wait renews preparation for unchanged inputs.
+The guard runs before each resource request. `deployment_timeout_s` bounds each deployment command.
 `scaler_user_name` names the IAM user.
+`scaler_key_check_attempts=12` bounds the identity checks after key creation.
+`scaler_key_check_delay_s=5` allows IAM time to publish the key between checks.
+The scaler stage keeps other credential profiles and writes the private file with mode `0600`.
+It verifies the new key before deleting old keys. It deletes a new key that fails verification.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
 `scripts_source_url`, `scripts_source_sha256`, and `scripts_source_commit` identify the public archive.
 The bootstrap command writes `bootstrap.sh` and `remote.conf` in the output directory.
@@ -626,3 +646,30 @@ Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
 | `smoke_call_seconds` | `5` | Maximum time for a BRP request. |
 | `smoke_signal_grace_seconds` | `2` | Delay after the termination signal. |
 | `smoke_poll_seconds` | `1` | Delay between readiness and exit checks. |
+
+### AWS box setup inputs
+
+`deploy.py up` reads these inputs at use.
+
+| Key | Default | Reason |
+| --- | --- | --- |
+| `admin_secret_file` | `~/.config/aws-build/admin.gpg` | Encrypt AWS administrator keys and Tailscale OAuth values together with mode `0600`. |
+| `tailscale_key_expiry_s` | `300` | Expire an unused single-use join key after five minutes. |
+| `nixos_configuration_directory` | `/etc/nixos` | Read the reviewed box configuration from a clean `main` checkout. |
+| `box_setup_timeout_s` | `3600` | Bound each setup command and the idle shutdown hold. |
+| `box_check_attempts` | `60` | Bound SSM and SSH recovery checks. |
+| `box_check_delay_s` | `5` | Allow registration and Tailscale restarts between checks. |
+
+The OAuth JSON contains `client_id` and `client_secret`.
+`config/aws-build-tailscale.json` holds only the public box access rules and source device names.
+The helper prints policy changes and preserves unrelated rules.
+
+`idle_stop_margin_s=120` allows two extra minutes for the box to finish its idle stop.
+The range is 0 through 600 seconds.
+The routing proof uses `scripts/aws_target/proof_crate` in this repository.
+Its `default` development shell uses the host tools.
+The setup checks compare plain tool commands on both hosts.
+These stages need no other source repository.
+`deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.
+The controller and sender use this record before the tracked `offload` value.
+The command edits no tracked file.

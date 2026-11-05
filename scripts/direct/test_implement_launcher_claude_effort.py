@@ -29,12 +29,10 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
                 else:
                     self.assertNotIn("--effort", arguments)
                 self.assertEqual(
-                    (session_dir / "impl_bg_id_impl").read_text(encoding="utf-8"),
-                    "abc12345\n",
+                    self.recorded_worker(session_dir).current_session,
+                    json.loads(next((self.root / "sessions").glob("*.json")).read_text())["sessionId"],
                 )
-                self.assertIn(
-                    "abc12345\t", (session_dir / "workers").read_text(encoding="utf-8")
-                )
+                self.assertTrue(self.recorded_worker(session_dir).current_session.startswith("abc12345-"))
 
 
 if __name__ == "__main__":

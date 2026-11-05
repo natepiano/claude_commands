@@ -69,9 +69,9 @@ class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
         name, original = next(iter(self.assignment_records().items()))
         _ = self.successful("implement", "--to", name)
         identities = [read_object(path) for path in self.session_dir.rglob("impl_worker_*.json")]
-        matched = [identity for identity in identities if identity.get("name") == name]
+        matched = [identity for identity in identities if identity.get("staff_id") == original["staff_id"]]
         self.assertEqual(len(matched), 1, identities)
-        self.assertEqual(matched[0]["worker_id"], original["thread_id"])
+        self.assertEqual(matched[0]["staff_id"], original["staff_id"])
         self.assertNotIn("role", matched[0])
         self.assertEqual(self.assignment_records()[name]["role"], "impl")
         self.assertEqual(len(self.methods("thread/start")), 1)
@@ -90,23 +90,6 @@ class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(cast(dict[str, object], turn["sandboxPolicy"])["type"], "dangerFullAccess")
         self.assertEqual(after["role"], "impl")
         self.assertEqual(after["access_policy"], {"kind": "WorkerLaunchPolicy"})
-
-    def test_a_corrupt_durable_family_or_worker_id_refuses_before_the_next_turn(self) -> None:
-        _ = self.successful()
-        name = next(iter(self.assignment_records()))
-        identity_path = self.identity_path(name)
-        identity = read_object(identity_path)
-        for field, value in (("family", "claude"), ("worker_id", "another-worker-thread")):
-            with self.subTest(field=field):
-                damaged = {**identity, field: value}
-                _ = identity_path.write_text(json.dumps(damaged))
-                result = self.launch("implement", "--to", name)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn(f"{name} has no matching durable worker identity for slot {name}",
-                              result.stdout + result.stderr)
-                self.assertEqual(read_object(identity_path), damaged)
-                self.assertEqual(self.turn_starts, 1)
-        _ = identity_path.write_text(json.dumps(identity))
 
     def test_a_saved_slot_keys_the_claim_and_board_for_a_full_worker_address(self) -> None:
         name = "project-impl"

@@ -16,6 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff, session_staff
+from scripts.usage import agents_log
+
 AstraRole = Literal["designer", "reviewer"]
 RoleState = Literal["busy", "idle"]
 
@@ -23,10 +27,7 @@ RoleState = Literal["busy", "idle"]
 class RoleRecord(TypedDict):
     """The on-disk ownership record; null fields belong to the other launch mode."""
 
-    role: AstraRole
-    thread_id: str
-    codex_home: str
-    manager: str
+    staff_id: str
     held_at: str
     session_dir: str | None
     worker: str | None
@@ -60,6 +61,7 @@ class HeldDesignRole:
 
 class HeldRole(TypedDict):
     role: AstraRole
+    staff_id: str
     thread_id: str
     codex_home: str
     manager: str
@@ -77,13 +79,10 @@ class RoleArguments(argparse.Namespace):
 
     command: str = ""
     role: AstraRole = "designer"
-    thread: str = ""
-    codex_home: str = ""
+    staff_id: str = ""
     session_dir: str | None = None
     worker: str | None = None
     pid: int | None = None
-    manager: str | None = None
-    thread_id: str = ""
     json: bool = False
 
 
@@ -91,10 +90,10 @@ def state_root() -> Path:
     return Path(os.environ.get("ASTRA_ROLES_STATE") or "~/.local/state/astra/roles").expanduser()
 
 
-def _record_path(thread_id: str) -> Path:
-    if not thread_id or thread_id in (".", "..") or "/" in thread_id or "\\" in thread_id:
-        raise ValueError("a thread id must be a file name")
-    return state_root() / f"{thread_id}.json"
+def _record_path(staff_id: str) -> Path:
+    if not staff_id or staff_id in (".", "..") or "/" in staff_id or "\\" in staff_id:
+        raise ValueError("a staff id must be a file name")
+    return state_root() / f"{staff_id}.json"
 
 
 def _json_object(path: Path) -> dict[str, object]:
@@ -104,46 +103,48 @@ def _json_object(path: Path) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _mesh_worker(session_dir: Path, worker: str) -> dict[str, object]:
+def _mesh_worker(session_dir: Path, worker: str, *, membership: staff.StaffSnapshot) -> dict[str, object]:
     value = _json_object(session_dir / "mesh_roster.json").get(worker)
     if not isinstance(value, dict):
         raise ValueError(f"{session_dir}: roster has no worker {worker}")
     entry = cast(dict[str, object], value)
-    if not isinstance(entry.get("thread_id"), str) or not entry["thread_id"]:
+    if not session_staff.worker_session(entry, membership):
         raise ValueError(f"{session_dir}: worker {worker} has no thread")
     return entry
 
 
-def hold(role: AstraRole, thread_id: str = "", codex_home: str = "", *,
+def hold(role: AstraRole, staff_id: str = "", *,
          session_dir: str | Path | None = None, worker: str | None = None,
-         pid: int | None = None, manager: str | None = None,
-         design_id: str = "", role_id: str = "") -> HeldRole:
+         pid: int | None = None,
+         design_id: str = "", role_id: str = "") -> HeldRole | None:
     """Write an ownership record atomically; invalid launch details raise ValueError."""
-    manager = (os.environ.get("CLAUDE_CODE_SESSION_ID", "") if manager is None else manager).strip()
-    if not manager:
-        raise ValueError("the edge needs a Claude session id")
+    membership = staff.local_snapshot()
     if design_id:
-        if session_dir is not None or worker is not None or pid is not None or role_id != role or not codex_home:
-            raise ValueError("durable holds need design_id, role_id, thread and codex_home")
+        if session_dir is not None or worker is not None or pid is not None or role_id != role:
+            raise ValueError("durable holds need design_id, role_id and staff_id")
     elif session_dir is not None:
-        if not worker or thread_id or codex_home or pid is not None:
+        if not worker or staff_id or pid is not None:
             raise ValueError("mesh holds need session_dir and worker only")
         session_dir = Path(session_dir).expanduser().resolve()
-        entry = _mesh_worker(session_dir, worker)
-        thread_id = cast(str, entry["thread_id"])
-        home = _json_object(session_dir / "mesh_server.json").get("codex_home")
-        if not isinstance(home, str) or not home:
-            raise ValueError(f"{session_dir}: mesh server has no codex_home")
-        codex_home = home
-    elif worker is not None or not codex_home or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        raise ValueError("exec holds need thread, codex_home and a positive pid")
-    record = RoleRecord(role=role, thread_id=thread_id, codex_home=codex_home, manager=manager,
-                        held_at=datetime.now(timezone.utc).isoformat(),
+        entry = _mesh_worker(session_dir, worker, membership=membership)
+        staff_id = str(entry.get("staff_id", ""))
+    elif worker is not None or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("exec holds need staff_id and a positive pid")
+    member = membership.by_id(staff.StaffId(staff_id))
+    if member is None or member.kind != "worker":
+        print(f"anomaly: {staff_id}: Astra hold has no worker staff row", file=sys.stderr)
+        return None
+    task_role = "review" if role == "reviewer" else "impl"
+    task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                              member.current_session, datetime.now(timezone.utc))
+    if not isinstance(task, agents_log.Assignment) or task.role != task_role:
+        agents_log.append(member.current_session, task_role, None, datetime.now(timezone.utc))
+    record = RoleRecord(staff_id=member.id, held_at=datetime.now(timezone.utc).isoformat(),
                         session_dir=str(session_dir) if session_dir is not None else None, worker=worker, pid=pid)
     if design_id:
         record.update(design_id=design_id, role_id=role_id)
-    path = _record_path(thread_id)
-    held = _parse_record(record, path)
+    path = _record_path(member.id)
+    held = _parse_record(record, path, membership)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as output:
         temporary = Path(output.name)
@@ -156,9 +157,9 @@ def hold(role: AstraRole, thread_id: str = "", codex_home: str = "", *,
     return held
 
 
-def release(thread_id: str) -> None:
+def release(staff_id: str) -> None:
     """Remove a hold, including one whose thread has already stopped."""
-    _record_path(thread_id).unlink(missing_ok=True)
+    _record_path(staff_id).unlink(missing_ok=True)
 
 
 def _pid_running(pid: int) -> bool:
@@ -172,31 +173,49 @@ def _pid_running(pid: int) -> bool:
 
 
 def _record_text(record: dict[str, object], key: str) -> str:
-    value = record[key]
+    value = record.get(key)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"missing or invalid {key}")
     return value
 
 
-def _parse_record(record: dict[str, object] | RoleRecord, path: Path) -> HeldRole:
-    keys = {"role", "thread_id", "codex_home", "manager", "held_at", "session_dir", "worker", "pid"}
-    durable = "design_id" in record
-    if set(record) != keys | ({"design_id", "role_id"} if durable else set()):
-        raise ValueError("record has missing or extra fields")
-    # JSON is untyped at this boundary. Build the domain value only after validation.
+def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership: staff.StaffSnapshot) -> HeldRole:
     fields = cast(dict[str, object], record)
-    role = fields["role"]
-    if role not in ("designer", "reviewer"):
-        raise ValueError("unknown Astra role")
-    thread_id = _record_text(fields, "thread_id")
-    codex_home = _record_text(fields, "codex_home")
-    manager = _record_text(fields, "manager")
+    expected = {"staff_id", "held_at", "session_dir", "worker", "pid"}
+    if "design_id" in fields:
+        expected.update(("design_id", "role_id"))
+    if set(fields) != expected:
+        raise ValueError("invalid Astra hold fields")
+    reference = fields.get("staff_id")
+    member = membership.by_id(staff.StaffId(str(reference)))
+    if member is None or member.kind != "worker" or not isinstance(member.parent, staff.ReportsTo):
+        raise ValueError("Astra hold has no worker staff row")
+    backend = membership.backends.get(member.id)
+    parent = membership.by_id(member.parent.id)
+    if not isinstance(backend, staff.CodexBackend) or parent is None:
+        raise ValueError("Astra hold backend or parent is unavailable")
+    role: AstraRole
+    task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                              member.current_session, datetime.now(timezone.utc))
+    if fields.get("role_id") in ("designer", "reviewer"):
+        role = cast(AstraRole, fields["role_id"])
+    elif isinstance(task, agents_log.Assignment) and task.role in ("impl", "review"):
+        role = "reviewer" if task.role == "review" else "designer"
+    else:
+        raise ValueError("worker does not hold an Astra role")
+    thread_id, codex_home, manager = member.current_session, str(backend.codex_home), parent.current_session
     held_at = _record_text(fields, "held_at")
-    if thread_id != path.stem:
-        raise ValueError("thread id differs from file name")
+    if path.stem != member.id:
+        raise ValueError("staff id differs from file name")
+    lifetime = _role_lifetime(fields, role)
+    return HeldRole(staff_id=member.id, role=role, thread_id=thread_id, codex_home=codex_home,
+                    manager=manager, held_at=held_at, lifetime=lifetime)
+
+
+def _role_lifetime(fields: dict[str, object], role: AstraRole) -> MeshWorker | ExecProcess | HeldDesignRole:
     session_dir, worker, pid = fields["session_dir"], fields["worker"], fields["pid"]
     lifetime: MeshWorker | ExecProcess | HeldDesignRole
-    if durable:
+    if "design_id" in fields:
         if session_dir is not None or worker is not None or pid is not None or fields["role_id"] != role:
             raise ValueError("invalid durable role lifetime")
         lifetime = HeldDesignRole(_record_text(fields, "design_id"), _record_text(fields, "role_id"))
@@ -206,14 +225,12 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path) -> HeldRol
         lifetime = ExecProcess(pid)
     else:
         raise ValueError("record needs a mesh worker or an exec pid")
-    return HeldRole(role=role, thread_id=thread_id, codex_home=codex_home,
-                    manager=manager, held_at=held_at, lifetime=lifetime)
+    return lifetime
 
 
 def _role_record(role: HeldRole) -> RoleRecord:
     lifetime = role["lifetime"]
-    record = RoleRecord(role=role["role"], thread_id=role["thread_id"], codex_home=role["codex_home"],
-                      manager=role["manager"], held_at=role["held_at"],
+    record = RoleRecord(staff_id=role["staff_id"], held_at=role["held_at"],
                       session_dir=lifetime.session_dir if isinstance(lifetime, MeshWorker) else None,
                       worker=lifetime.worker if isinstance(lifetime, MeshWorker) else None,
                       pid=lifetime.pid if isinstance(lifetime, ExecProcess) else None)
@@ -222,11 +239,14 @@ def _role_record(role: HeldRole) -> RoleRecord:
     return record
 
 
-def live_roles() -> list[LiveRole]:
+def _worker_state(entry: dict[str, object]) -> RoleState:
+    pid = entry.get("launcher_pid")
+    return "busy" if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _pid_running(pid) else "idle"
+
+
+def live_roles(membership: staff.StaffSnapshot | None = None) -> list[LiveRole]:
     """Return readable live holds with current state; remove holds known to have ended."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.production import staff
-    staff_record: staff.StaffSnapshot | None = None
+    membership = membership if membership is not None else staff.local_snapshot()
     roles: list[LiveRole] = []
     try:
         paths = sorted(state_root().glob("*.json"))
@@ -235,7 +255,7 @@ def live_roles() -> list[LiveRole]:
         return roles
     for path in paths:
         try:
-            record = _parse_record(_json_object(path), path)
+            record = _parse_record(_json_object(path), path, membership)
             lifetime = record["lifetime"]
             if isinstance(lifetime, HeldDesignRole):
                 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -245,13 +265,12 @@ def live_roles() -> list[LiveRole]:
                 if isinstance(instance.lifecycle, design_roles.RoleEnded):
                     path.unlink(missing_ok=True)
                     continue
-                if isinstance(instance.lifecycle, design_roles.RoleNotOpened) or instance.lifecycle.thread_id != record["thread_id"]:
-                    raise ValueError("durable instance thread differs from hold")
-                entry = _mesh_worker(design_roles.mesh_directory(lifetime.design_id), instance.name)
-                state: RoleState = "busy" if entry.get("status") in ("starting", "running", "waiting_capacity") else "idle"
-                if staff_record is None:
-                    staff_record = staff.snapshot()
-                record["manager"] = design_roles.worker_parent(design, instance.role, staff_record).current_session
+                if isinstance(instance.lifecycle, design_roles.RoleNotOpened) or instance.lifecycle.staff_id != record["staff_id"]:
+                    raise ValueError("durable instance differs from hold")
+                entry = _mesh_worker(design_roles.mesh_directory(lifetime.design_id), instance.name,
+                                     membership=membership)
+                state = _worker_state(entry)
+                record["manager"] = design_roles.worker_parent(design, instance.role, membership).current_session
             elif isinstance(lifetime, MeshWorker):
                 session_dir = Path(lifetime.session_dir)
                 if not session_dir.exists():
@@ -265,8 +284,8 @@ def live_roles() -> list[LiveRole]:
                 if not isinstance(value, dict):
                     raise ValueError("mesh worker is not a JSON object")
                 entry = cast(dict[str, object], value)
-                thread = entry.get("thread_id")
-                if not isinstance(thread, str) or not thread:
+                thread = session_staff.worker_session(entry, membership)
+                if not thread:
                     raise ValueError("mesh worker has no thread")
                 status = entry.get("status")
                 if not isinstance(status, str) or not status:
@@ -274,13 +293,13 @@ def live_roles() -> list[LiveRole]:
                 if status in ("ended", "failed") or thread != record["thread_id"]:
                     path.unlink(missing_ok=True)
                     continue
-                state = "busy" if status in ("starting", "running", "waiting_capacity") else "idle"
+                state = _worker_state(entry)
             else:
                 if not _pid_running(lifetime.pid):
                     path.unlink(missing_ok=True)
                     continue
                 state = "busy"
-            roles.append(LiveRole(role=record["role"], thread_id=record["thread_id"],
+            roles.append(LiveRole(staff_id=record["staff_id"], role=record["role"], thread_id=record["thread_id"],
                                   codex_home=record["codex_home"], manager=record["manager"],
                                   held_at=record["held_at"], lifetime=lifetime, state=state))
         except (OSError, UnicodeError, ValueError) as error:
@@ -294,20 +313,19 @@ def main(argv: list[str]) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     holding = commands.add_parser("hold")
     _ = holding.add_argument("role", choices=("designer", "reviewer"))
-    for flag in ("session-dir", "worker", "thread", "codex-home", "manager"):
+    for flag in ("session-dir", "worker", "staff-id"):
         _ = holding.add_argument(f"--{flag}")
     _ = holding.add_argument("--pid", type=int)
     releasing = commands.add_parser("release")
-    _ = releasing.add_argument("thread_id")
+    _ = releasing.add_argument("staff_id")
     listing = commands.add_parser("list")
     _ = listing.add_argument("--json", action="store_true")
     args = parser.parse_args(argv, namespace=RoleArguments())
     try:
         if args.command == "hold":
-            _ = hold(args.role, args.thread or "", args.codex_home or "",
-                     session_dir=args.session_dir, worker=args.worker, pid=args.pid, manager=args.manager)
+            _ = hold(args.role, args.staff_id or "", session_dir=args.session_dir, worker=args.worker, pid=args.pid)
         elif args.command == "release":
-            release(args.thread_id)
+            release(args.staff_id)
         else:
             roles = live_roles()
             if args.json:

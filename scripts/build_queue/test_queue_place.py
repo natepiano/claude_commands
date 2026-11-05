@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Unpack, cast
+from typing import TYPE_CHECKING, Unpack, cast
 from unittest import mock
 
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_service as service, admission_protocol as wire
@@ -26,6 +26,12 @@ from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate
+
+if TYPE_CHECKING:
+    from ..buildlog import store
+else:
+    import store
+
 from scripts.lint.memory_test_support import commit_config_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue.queue_fixture import write_memory_config
 
@@ -306,12 +312,12 @@ class QueuePlaceFixture(ExitStack):
 
     def history(self) -> list[dict[str, object]]:
         path = self.directory / "anon_peaks.jsonl"
-        return list(gate.anonymous_history_rows(path)) if path.exists() else []
+        return list(gate.anonymous_history_rows(path))
 
     def seed(self, values: list[int], *, program: str = "rust-analyzer", host: str = "") -> None:
         with (self.directory / "anon_peaks.jsonl").open("a") as output:
             for value in values:
-                _ = output.write(json.dumps({"step": program, "host": host or gate.store.host_name(),
+                _ = output.write(json.dumps({"step": program, "host": host or store.host_name(),
                     "anon_peak_bytes": value, "ended_at": datetime.now(UTC).isoformat()}) + "\n")
 
     def assert_cleaned(self, test: unittest.TestCase) -> None:

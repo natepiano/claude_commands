@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
+from scripts.statusline import rebuild_row
 
 
 def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
@@ -20,7 +22,7 @@ def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
         return f"{row.name} showrunner", "showrunner"
     if row.kind == "worker":
         return "worker", "worker"
-    parent = record.by_id(row.parent) if row.parent is not None else None
+    parent = record.parent_of(row)
     label = f"{row.name} unit"
     if parent is not None:
         label += f" for {parent.name}"
@@ -46,8 +48,20 @@ def main() -> None:
     except OSError:
         record = staff.StaffSnapshot(())
     label, role = assignment(record, str(payload.get("session_id", "")))
+    rebuild_config = Path(__file__).resolve().parents[2] / "config/statusline.conf"
+    rebuild = rebuild_row.read(rebuild_config)
+    if rebuild.refresh_due:
+        try:
+            _ = subprocess.Popen(
+                [sys.executable, "-I", str(Path(rebuild_row.__file__).resolve()), "refresh", "--config", str(rebuild_config)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            pass
     os.execvp("jq", ["jq", "-n", "--argjson", "payload", json.dumps(payload),
-                     "--arg", "assignment", label, "--arg", "role", role, *sys.argv[1:]])
+                     "--arg", "assignment", label, "--arg", "role", role,
+                     "--arg", "rebuild", rebuild.row(), *sys.argv[1:]])
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
-"""Cargo build shapes and their read-only join to older admission peaks.
+"""Cargo shapes, compile counts and test arguments from the read-only index join.
 
-A shape separates profile, feature selection and target selection. It does not
-claim that a cached build and a full compile have the same peak; that split is
-separate from this key. Rows without valid argv or a call id prove no shape.
+Shape and compile evidence remain independent. The join keeps test arguments
+for readers that must recover missing selection fields in anonymous peaks.
+Rows without valid arguments prove no shape.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import cast
+
+TEST_STEPS = ("nextest", "test", "t")
 
 
 @dataclass(frozen=True)
@@ -117,16 +119,19 @@ def combine_compile_counts(first: CompiledCrates | NoCratesCompiled | CompileCou
 class StepEvidence:
     shape: BuildShape | NoBuildShape
     compilation: CompiledCrates | NoCratesCompiled | CompileCountUnknown
+    arguments: tuple[str, ...] = ()
 
 
 def index_step_evidence(index_path: Path, host: str, step: str,
                         cutoff: datetime, before: datetime) -> dict[tuple[str, str], StepEvidence]:
-    """Read independent shape and compile evidence for each call and step.
+    """Read shape, compile evidence and test arguments for each call and step.
 
-    The caller filters the peak row by repository and completion time.
+    The caller filters peaks by repository and completion time.
     Missing columns preserve the facts that the index can supply.
+    This join does not parse test selections.
     """
     evidence: dict[tuple[str, str], StepEvidence] = {}
+    test_step = step in TEST_STEPS
     try:
         with closing(sqlite3.connect(index_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             columns = {row[1] for row in cast(list[tuple[object, ...]],
@@ -155,12 +160,19 @@ def index_step_evidence(index_path: Path, host: str, step: str,
                 elif count == 0:
                     compilation = NoCratesCompiled()
             shape: BuildShape | NoBuildShape = NoBuildShape()
+            arguments: tuple[str, ...] = ()
             try:
                 decoded = cast(object, json.loads(raw_argv)) if isinstance(raw_argv, str) else None
                 if isinstance(decoded, list) and decoded:
                     words = cast(list[object], decoded)
-                    if all(isinstance(word, str) for word in words):
-                        shape = build_shape(cast(list[str], words))
+                    for word in words:
+                        if not isinstance(word, str):
+                            break
+                    else:
+                        decoded_arguments = cast(list[str], words)
+                        if test_step:
+                            arguments = tuple(decoded_arguments)
+                        shape = build_shape(decoded_arguments)
             except (ValueError, TypeError):
                 pass
             previous = evidence.get((call_id, name))
@@ -168,7 +180,9 @@ def index_step_evidence(index_path: Path, host: str, step: str,
                 compilation = combine_compile_counts(previous.compilation, compilation)
                 if isinstance(shape, NoBuildShape):
                     shape = previous.shape
-            evidence[call_id, name] = StepEvidence(shape, compilation)
+                if not arguments:
+                    arguments = previous.arguments
+            evidence[call_id, name] = StepEvidence(shape, compilation, arguments)
     except (OSError, sqlite3.Error):
         pass
     return evidence

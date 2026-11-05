@@ -29,7 +29,6 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_showrun
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
-from dailies_input_test_support import setUpModule as setUpModule
 
 
 class RowDailiesTests(StaffTestCase):

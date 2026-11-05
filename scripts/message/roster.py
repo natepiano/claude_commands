@@ -13,6 +13,7 @@ import sys
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
@@ -23,8 +24,6 @@ for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "herdr"
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
-import remove_workers  # noqa: E402
-from worker_state import worker_ledger  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import unit_runs  # noqa: E402
 import herdr  # noqa: E402
@@ -32,8 +31,8 @@ import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
 import sessions  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
-from scripts.production import staff
-from scripts.production import session_staff
+from scripts.production import staff, session_staff, worker_admission
+from scripts.usage import agents_log
 from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
@@ -71,6 +70,7 @@ MESSAGEABLE_WORKER_STATUSES = frozenset(("running", "waiting_capacity"))
 
 
 from scripts.message.unit_labels import (
+    staff_relationships,
     UnderShowrunner as UnderShowrunner,
     RunsProduction as RunsProduction,
     ProductionWithoutRunningShowrunner as ProductionWithoutRunningShowrunner,
@@ -712,7 +712,7 @@ def _serialized_entry(entry: RosterEntry) -> SerializedRosterEntry:
 @dataclass(frozen=True)
 class _WorkerPlace:
     run: _LiveRun
-    worker_name: str
+    member: staff.StaffRow
 
 
 @dataclass(frozen=True)
@@ -770,32 +770,28 @@ def _raw_session_details(records: list[SessionRecord], problems: list[str]) -> d
     return details
 
 
-def _worker_ledger(run: _LiveRun, problems: list[str]) -> list[tuple[str, str]]:
-    path = run.path / remove_workers.LEDGER
+def _worker_ledger(run: _LiveRun, problems: list[str], membership: staff.StaffSnapshot) -> list[staff.StaffRow]:
     try:
-        path = worker_ledger(run.path)
-        if not path.exists():
-            return []
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
-        _problem(problems, f"worker ledger {path}", error)
+        owner = (membership.by_current_session(run.director.session_id)
+                 if isinstance(run.director, _DirectorSession)
+                 else worker_admission.parent(membership, run=run.path))
+    except ValueError as error:
+        _problem(problems, str(run.path), error)
         return []
-    workers: list[tuple[str, str]] = []
-    for line in lines:
-        session_id, separator, name = line.partition("\t")
-        if session_id.strip():
-            workers.append((session_id.strip(), name.strip() if separator else ""))
-    return workers
+    if owner is None:
+        return []
+    return [row for row in membership.find(kind="worker", parent=owner.id)
+            if isinstance(membership.backends.get(row.id), staff.ClaudeBackend)]
 
 
 def _slot_role(name: str) -> str:
-    """Read a slot identity for legacy launch records, never a job assignment."""
+    """Read the address suffix when no launch records a slot."""
     candidate = name.rpartition("-")[2]
     return candidate
 
 
 def _worker_slot(run: Path, name: str, record: Mapping[str, object], problems: list[str]) -> str:
-    """The recorded slot can contain hyphens and is independent of the address."""
+    """Read the saved slot through staff_id, including named fix workers."""
     if slot := _as_string(record.get("slot")):
         return slot
     fallback = _slot_role(name)
@@ -805,21 +801,20 @@ def _worker_slot(run: Path, name: str, record: Mapping[str, object], problems: l
         except (OSError, UnicodeError, ValueError) as error:
             _problem(problems, f"worker launch {path}", error)
             continue
-        if launch.get("name") == name:
+        if record.get("staff_id") and launch.get("staff_id") == record["staff_id"]:
             return _as_string(launch.get("slot")) or fallback
     return fallback
 
 
-def _worker_assignment(run: Path, slot: str, record: Mapping[str, object]) -> WorkerAssignment:
-    role = worker_role(record)
-    legacy_role = _as_string(record.get("role"))
-    if not legacy_role:
-        label = "no role"
-    elif legacy_role not in KNOWN_SLOT_ROLES:
-        label = "role unknown"
-    else:
-        lens = _as_string(record.get("lens"))
-        label = f"review ({lens})" if legacy_role == "review" and lens else legacy_role
+def _worker_assignment(run: Path, slot: str, record: Mapping[str, object],
+                       membership: staff.StaffSnapshot) -> WorkerAssignment:
+    assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                                    session_staff.worker_session(record, membership), datetime.now(timezone.utc))
+    if isinstance(assignment, agents_log.Unassigned):
+        return WorkerAssignment("no role", str(run), AssignmentUnrecorded(), slot)
+    role = worker_role({"role": assignment.role})
+    label = (f"review ({assignment.lens})" if assignment.role == "review" and assignment.lens
+             else assignment.role)
     return WorkerAssignment(label, str(run), role, slot)
 
 
@@ -832,7 +827,7 @@ def _held_location(parent: staff.StaffRow, membership: staff.StaffSnapshot,
     if parent.kind == "unit":
         director = UnderDirector(parent.name, session.name if session else parent.name,
                                  _session_address(session) if session else "")
-        parent_runner = membership.by_id(parent.parent) if parent.parent is not None else None
+        parent_runner = membership.parent_of(parent)
         if parent_runner is None or parent_runner.kind != "showrunner":
             raise ValueError("design worker has no showrunner staff parent")
         runner = parent_runner
@@ -870,7 +865,7 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
             membership = staff.snapshot()
             if published_id := _as_string(record.get("staff_id")):
                 worker = membership.by_id(staff.StaffId(published_id))
-                parent = membership.by_id(worker.parent) if worker is not None and worker.parent is not None else None
+                parent = membership.parent_of(worker) if worker is not None else None
                 if worker is None or worker.kind != "worker" or parent is None:
                     raise ValueError("design worker parent is unavailable")
             else:
@@ -894,7 +889,7 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     place = places.get(unit_runs.director(run))
     if place is not None:
         showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
-    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record)
+    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record, membership)
     entry = RosterEntry(machine="", kind="codex", role="worker", name=name, status="",
                         reach=Messageable(name), cwd="", showrunner=showrunner,
                         director=director, assignment=assignment)
@@ -904,11 +899,11 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     return shown_name(entry)
 
 
-def _claude_assignment(run: Path, name: str, problems: list[str]) -> WorkerAssignment:
+def claude_assignment(run: Path, member: staff.StaffRow, problems: list[str]) -> WorkerAssignment:
     """The launch names the slot; the board records its current assignment."""
-    slot = _slot_role(name)
+    slot = _slot_role(member.name)
     legacy_label = slot if slot in KNOWN_SLOT_ROLES else "role unknown"
-    slot = _worker_slot(run, name, {}, problems)
+    slot = _worker_slot(run, member.name, {"staff_id": member.id}, problems)
     try:
         result = subprocess.run(["bash", str(SCRIPTS / "direct/board.sh"), "roles", str(run)],
                                 capture_output=True, text=True, timeout=5, check=True,
@@ -964,19 +959,8 @@ def _between_turns_reason(director: DirectorRelationship) -> str:
 def _run_server_homes(run: _LiveRun) -> dict[int, Path]:
     """Homes of serving servers, including turns finishing on retired servers."""
     homes: dict[int, Path] = {}
-    records: list[dict[str, object]] = []
-    try:
-        retired = _read_object(run.path / "mesh_retired.json").get("servers", [])
-        if isinstance(retired, list):
-            for item in cast(list[object], retired):
-                if isinstance(item, dict):
-                    records.append(cast(dict[str, object], item))
-    except (OSError, UnicodeError, ValueError):
-        pass
-    try:
-        records.append(_read_object(run.path / "mesh_server.json"))
-    except (OSError, UnicodeError, ValueError):
-        pass
+    from scripts.agents import codex_mesh
+    records = codex_mesh.run_server_records(run.path)
     for record in records:
         port, home = record.get("port"), record.get("codex_home")
         if isinstance(port, int) and not isinstance(port, bool):
@@ -1052,16 +1036,18 @@ def _process_cwds(table: Mapping[int, process_table.Process]) -> dict[tuple[str,
 
 
 def _ledger_workers(
-    runs: Iterable[_LiveRun], records: Iterable[SessionRecord], problems: list[str]
+    runs: Iterable[_LiveRun], records: Iterable[SessionRecord], problems: list[str],
+    membership: staff.StaffSnapshot,
 ) -> dict[str, _WorkerPlace]:
     workers: dict[str, _WorkerPlace] = {}
     records_list = list(records)
-    for run in runs:
-        for ledger_id, worker_name in _worker_ledger(run, problems):
+    for run in sorted(runs, key=lambda run: (isinstance(run.director, _NoRunningDirector),
+                                             not (run.path / unit_runs.STATE_FILE).exists())):
+        for member in _worker_ledger(run, problems, membership):
             for record in records_list:
                 session_id = record["sessionId"]
-                if session_id == ledger_id or session_id.startswith(ledger_id):
-                    _ = workers.setdefault(session_id, _WorkerPlace(run, worker_name))
+                if session_id == member.current_session:
+                    _ = workers.setdefault(session_id, _WorkerPlace(run, member))
     return workers
 
 
@@ -1098,7 +1084,7 @@ def _claude_entries(
         elif session_id in workers:
             role = "worker"
             worker = workers[session_id]
-            assignment = _claude_assignment(worker.run.path, worker.worker_name or record["name"], problems)
+            assignment = claude_assignment(worker.run.path, worker.member, problems)
             run_director = worker.run.director
             if isinstance(run_director, _NoRunningDirector):
                 place = _stopped_run_place(worker.run.path)
@@ -1198,12 +1184,12 @@ def _review_workers(
     entries: list[RosterEntry] = []
     try:
         # A launch that names its phase writes in that phase's directory.
-        statuses = sorted([*run.path.glob("review_status*"), *run.path.glob("phases/*/review_status*")])
+        statuses = sorted([*run.path.glob("*_status*"), *run.path.glob("phases/*/*_status*")])
     except OSError as error:
         _problem(problems, f"review state in {run.path}", error)
         return entries
     for status_path in statuses:
-        suffix = status_path.name.removeprefix("review_status")
+        worker, _, suffix = status_path.name.rpartition("_status")
         if suffix and not suffix.startswith("_"):
             continue
         lens = suffix.removeprefix("_")
@@ -1214,7 +1200,7 @@ def _review_workers(
             continue
         if status != "reviewing":
             continue
-        pid_path = status_path.parent / f"review_pid{suffix}"
+        pid_path = status_path.parent / f"{worker}_pid{suffix}"
         try:
             launcher_pid = int(pid_path.read_text(encoding="utf-8").strip())
         except (OSError, UnicodeError, ValueError) as error:
@@ -1247,6 +1233,7 @@ def _unit_workers(
     machine: str, runs: list[_LiveRun], claude_entries: Mapping[str, RosterEntry],
     production_places: Mapping[str, _ProductionPlace],
     problems: list[str], *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
+    membership: staff.StaffSnapshot,
 ) -> tuple[list[RosterEntry], set[str]]:
     try:
         table = process_table.snapshot()
@@ -1260,16 +1247,30 @@ def _unit_workers(
         server_homes = _run_server_homes(run)
         place = _run_place(run, claude_entries, production_places)
         for name, record in sorted(_mesh_records(run, problems).items()):
-            status = _as_string(record.get("status"))
             if not _listed_mesh_worker(record):
                 continue
-            thread_id = _as_string(record.get("thread_id"))
+            try:
+                record = cast(_MeshWorker, cast(object, record))
+            except staff.StaffUnreadable as error:
+                _problem(problems, f"{run.path}: {name}", error)
+                continue
+            member = membership.by_id(staff.StaffId(_as_string(record.get("staff_id"))))
+            parent = (membership.by_id(member.parent.id)
+                      if member is not None and isinstance(member.parent, staff.ReportsTo) else None)
+            if parent is None:
+                _problem(problems, f"{run.path}: {name}", "worker parent is unavailable")
+                continue
+            assert member is not None
+            director, showrunner = staff_relationships(
+                membership, member, {key: item.name for key, item in claude_entries.items()},
+                {key: item.showrunner for key, item in claude_entries.items()})
+            status = _as_string(record.get("status"))
+            thread_id = _as_string(session_staff.worker_session(record, membership))
             if thread_id:
                 worker_threads.add(thread_id)
             run_path = str(run.path.resolve())
             cwd = (
-                _as_string(record.get("cwd"))
-                or process_cwds.get((name, run_path), "")
+                process_cwds.get((name, run_path), "")
                 or place.cwd
             )
             entries.append(RosterEntry(
@@ -1281,12 +1282,12 @@ def _unit_workers(
                 reach=(
                     Messageable(f"worker:{run.path.name}/{name}")
                     if status in MESSAGEABLE_WORKER_STATUSES
-                    else CannotReceiveMessages(_between_turns_reason(place.director))
+                    else CannotReceiveMessages(_between_turns_reason(director))
                 ),
                 cwd=cwd,
-                showrunner=place.showrunner,
-                director=place.director,
-                assignment=_worker_assignment(Path(run_path), _worker_slot(run.path, name, record, problems), record),
+                showrunner=showrunner,
+                director=director,
+                assignment=_worker_assignment(Path(run_path), _worker_slot(run.path, name, record, problems), record, membership),
                 thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
                 account=_worker_account(run, record, server_homes),
             ))
@@ -1294,7 +1295,7 @@ def _unit_workers(
     return entries, worker_threads
 
 
-def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: list[str],
+def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: list[str], *,
                    membership: staff.StaffSnapshot) -> tuple[list[RosterEntry], set[str]]:
     entries: list[RosterEntry] = []
     threads: set[str] = set()
@@ -1308,15 +1309,15 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
                     continue
                 parent = design_roles.worker_parent(design, instance.role, membership)
                 showrunner, director = _held_location(parent, membership, claude)
-                thread = instance.lifecycle.thread_id
-                if thread in threads:
-                    continue
                 raw_entry = roster.get(instance.name, {})
                 if not isinstance(raw_entry, dict):
                     raise ValueError('durable roster entry is not an object')
                 entry = cast(dict[str, object], raw_entry)
-                if (entry.get('transferring_role') or entry.get('role_redirect')
-                        or design_roles.transfer_route(thread, design.placement.design_id)):
+                thread = session_staff.worker_session(entry, membership)
+                if not thread:
+                    print(f"anomaly: {instance.name}: held role has no Codex backend", file=sys.stderr)
+                    continue
+                if thread in threads:
                     continue
                 threads.add(thread)
                 status = _as_string(entry.get('status')) or type(instance.lifecycle).__name__
@@ -1377,24 +1378,18 @@ def machine_name() -> str:
     return socket.gethostname().split(".", 1)[0]
 
 
-def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot | None = None,
-                  records: list[SessionRecord] | None = None) -> Roster:
+def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot,
+                  records: list[SessionRecord]) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
     warnings: list[str] = []
     machine = machine_name()
-    running = sessions.running_sessions() if records is None else records
+    running = records
     newest: dict[str, SessionRecord] = {}
     for record in running:
         _ = newest.setdefault(record["sessionId"], record)
     records = list(newest.values())
     details = _raw_session_details(records, problems)
-    try:
-        if membership is None:
-            membership = staff.initial_snapshot()
-    except staff.StaffUnreadable as error:
-        _problem(problems, "staff membership", error)
-        membership = staff.StaffSnapshot(())
     resolver = session_staff.RowResolver(membership)
     diagnostics = _StaffDiagnostics(problems)
     registered = _registered_showrunners(
@@ -1404,7 +1399,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     runner_ids = _showrunner_ids(records, registered, membership=membership)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
-    workers = _ledger_workers(runs, records, problems)
+    workers = _ledger_workers(runs, records, problems, membership)
     production_places: dict[str, _ProductionPlace] = {}
     try:
         production_places = _production_places(
@@ -1418,9 +1413,9 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
         home_state=home_state, problems=problems,
     )
     unit_workers, worker_threads = _unit_workers(
-        machine, runs, claude, production_places, problems, home_state=home_state
+        machine, runs, claude, production_places, problems, home_state=home_state, membership=membership
     )
-    durable_roles, durable_threads = _durable_roles(machine, claude, warnings, membership)
+    durable_roles, durable_threads = _durable_roles(machine, claude, warnings, membership=membership)
     unit_workers.extend(durable_roles)
     worker_threads.update(durable_threads)
     codex_sessions: list[RosterEntry] = []
@@ -1498,13 +1493,23 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
 @role_map_command
 def roster(environment: Mapping[str, str], scope: RosterScope, *,
            membership: staff.StaffSnapshot | None = None, records: list[SessionRecord] | None = None) -> Roster:
+    problems: list[str] = []
+    try:
+        membership = staff.initial_snapshot() if membership is None else membership
+    except staff.StaffUnreadable as error:
+        _problem(problems, "staff membership", error)
+        membership = staff.StaffSnapshot(())
+    records = sessions.running_sessions() if records is None else records
     match scope:
         case ThisMachine():
-            return _local_roster(environment, membership=membership, records=records)
+            local = _local_roster(environment, membership=membership, records=records)
+            local.problems[:0] = problems
+            return local
         case AllMachines():
             with ThreadPoolExecutor(max_workers=2) as pool:
                 peer = pool.submit(peer_roster, environment)
                 local = _local_roster(environment, membership=membership, records=records)
+                local.problems[:0] = problems
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
                           [*local.warnings, *other.warnings], (*local.row_anomalies, *other.row_anomalies))

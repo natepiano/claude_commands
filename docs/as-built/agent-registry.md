@@ -521,3 +521,9 @@ Accepted Codex turns record `turn_model` and `turn_effort` in the roster for dis
 The simplify launch lock owner alone writes its report, status, and summary.
 The `review_status_simplify` file contains one atomic status line: `preparing`, `reviewing`, `reviewed`, or `error`.
 A rejected launch writes its reason to stderr and preserves the shared files.
+
+Named `assign.sh` workers use separate phase artifacts for each worker name.
+The files are `<worker>_status`, `<worker>_summary.txt`, `<worker>_agent.log`, and `<worker>_reply.txt`.
+Review files also include the lens and pass suffix.
+The launcher writes these files only after its claim succeeds.
+The compatibility launchers retain their existing filenames.

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 import io
 import os
 from pathlib import Path
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -22,21 +23,34 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
     from ..buildlog import record, store
+    from ..buildlog.index import index_path_in
     from ..lint.memory_test_support import write_config_fixture
-    from ..production.merge_gate import discover_test_modules
+    from ..production.gate_modules import discover_test_modules
     from . import gate_record, show
     from .gate_record import GateRun, ModuleRun, TestTime
     from .gate_record_test_support import gate_run
 else:
-    from scripts.buildlog import record, store
-    from scripts.lint.memory_test_support import write_config_fixture
-    from scripts.production.merge_gate import discover_test_modules
+    # Import show first because it adds the build log folder to the import path.
     from scripts.test_times import gate_record, show
+    from scripts.buildlog import record, store
+    from index import index_path_in
+    from scripts.lint.memory_test_support import write_config_fixture
+    from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
     from scripts.test_times.gate_record_test_support import gate_run
 
 EPOCH = datetime(2026, 11, 3, 14, 30, tzinfo=UTC).timestamp()
 HOST = store.host_name()
+REPORT_COMMANDS = (("top",), ("suites",), ("suite", "tools"),
+                   ("module", "tools/test_alpha.py"), ("test", "target"))
+
+
+def run(*arguments: str) -> tuple[int, str, str]:
+    output = io.StringIO()
+    errors = io.StringIO()
+    with redirect_stdout(output), redirect_stderr(errors):
+        status = show.main(list(arguments))
+    return status, output.getvalue(), errors.getvalue()
 
 
 def module_run(module: str, wall_s: float, *, suite: str = "tools", attempt: int = 1,
@@ -98,11 +112,9 @@ class TestTimesTests(unittest.TestCase):
             gate_record.write_gate_run(run)
 
     def report(self, *arguments: str) -> str:
-        output = io.StringIO()
-        with redirect_stdout(output):
-            status = show.main(list(arguments))
-        self.assertEqual(status, 0, output.getvalue())
-        return output.getvalue()
+        status, output, errors = run(*arguments)
+        self.assertEqual(status, 0, output + errors)
+        return output
 
     def line(self, output: str, subject: str) -> str:
         lines = [line for line in output.splitlines() if subject in line]
@@ -285,15 +297,47 @@ class TestTimesTests(unittest.TestCase):
         self.assertNotIn("123", suite)
 
     def test_empty_reports_return_success_with_the_subject(self) -> None:
-        for arguments, expected in (
-            (("top", "--repo", str(self.repo)), "no modules recorded yet"),
-            (("suites",), "no gate runs recorded yet"),
-            (("suite", "tools"), "no gate runs recorded for suite tools"),
-            (("module", "tools/test_alpha.py"), "no gate runs recorded for module tools/test_alpha.py"),
-            (("test", "target"), "no tests recorded matching target"),
-        ):
+        for arguments, expected in zip(REPORT_COMMANDS, (
+            "no modules recorded yet", "no gate runs recorded yet", "no gate runs recorded for suite tools",
+            "no gate runs recorded for module tools/test_alpha.py", "no tests recorded matching target",
+        ), strict=True):
             with self.subTest(arguments=arguments):
                 self.assertEqual(self.report(*arguments), expected + "\n")
+
+    def test_reports_rebuild_a_dropped_gate_table_from_recorded_runs(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        before = self.report("module", "tools/test_alpha.py")
+        with closing(sqlite3.connect(index_path_in(self.log))) as connection:
+            _ = connection.execute("DROP TABLE gate_modules")
+        self.assertEqual(self.report("module", "tools/test_alpha.py"), before)
+
+    def test_reports_name_a_missing_gate_table_without_a_traceback(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = self.report("suites")
+        with closing(sqlite3.connect(index_path_in(self.log))) as connection:
+            _ = connection.execute("DROP TABLE gate_modules")
+        for arguments in REPORT_COMMANDS:
+            with self.subTest(arguments=arguments), mock.patch.object(show.index, "update", return_value=0):
+                status, output, errors = run(*arguments)
+                self.assertEqual(status, 1)
+                self.assertEqual(output, "")
+                self.assertEqual(errors.splitlines(), [
+                    "test times unavailable: no such table: gate_modules; run `buildlog reindex`",
+                ])
+
+    def test_report_query_errors_propagate_after_the_table_probe(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        open_index = show.open_report_index
+
+        def remove_table_after_probe() -> sqlite3.Connection:
+            connection = open_index()
+            with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+                writer.execute("DROP TABLE gate_modules").close()
+            return connection
+
+        with mock.patch.object(show, "open_report_index", remove_table_after_probe), \
+                self.assertRaisesRegex(sqlite3.OperationalError, "no such table: gate_modules"):
+            _ = run("top", "--repo", str(self.repo))
 
     def test_cli_imports_the_index_from_an_external_working_folder(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])

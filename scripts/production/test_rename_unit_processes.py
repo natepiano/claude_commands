@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast, final, override
 from unittest import mock
+from scripts.production import staff, worker_admission
+from scripts.production.staff_test_support import fixture_worker
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -93,12 +95,18 @@ class RunProcessTests(StaffTestCase):
         (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
         parent = recorded_showrunner("demo", self.root / "demo-production.md")
         member = fixture_unit_location(parent, worktree.name, worktree)
-        _ = (folder / "director").write_text(member.current_session + "\n", encoding="utf-8")
+        _ = (folder / "progress_history_state.json").write_text(json.dumps({"production": parent.name, "unit": member.name}))
         return folder
 
     def run_record(self, folder: Path, label: str, pid: int) -> Path:
         path = folder / retire_unit.DETACHED_RUNS / f"{label}.json"
-        _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "cwd": str(self.unit_folder)}))
+        parent = worker_admission.parent(staff.local_snapshot(), run=folder)
+        member = fixture_worker(folder.name + "-" + label, parent.id, backend=staff.CodexBackend(self.root / "codex"))
+        _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "staff_id": member.id}))
+        roster = folder / "mesh_roster.json"
+        entries = cast(dict[str, object], json.loads(roster.read_text())) if roster.exists() else {}
+        entries[member.name] = {"staff_id": member.id, "status": "done"}
+        _ = roster.write_text(json.dumps(entries))
         return path
 
     def watcher(self, folder: Path) -> list[str]:
