@@ -8807,9 +8807,9 @@ def _account_move_command(session_dir: str, name: str, assignments: agents_log.R
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     assignment = task_role(session_staff.worker_session(record), assignments)
     role = assignment.role if isinstance(assignment, AssignedWorkerRole) else ""
-    return shlex.join(["bash", str(Path(__file__).resolve().parents[1] / "direct/assign.sh"),
-                       "--role", "implement" if role == "impl" else role, "--operation", "resume-account-move",
-                       "--session-dir", session_dir, "--to", name])
+    return assign_gate.assign_command(session_dir, name, role,
+                                      [("--role", role), ("--operation", "resume-account-move"),
+                                       ("--session-dir", session_dir), ("--to", name)])
 
 
 def command_resume_account_move(args: argparse.Namespace) -> int:

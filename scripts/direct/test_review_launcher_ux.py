@@ -11,7 +11,7 @@ import subprocess
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
 
-    def test_ux_raised_counts_defect_rows_without_headers_candidates_or_numbered_text(self) -> None:
+    def test_plain_ux_defect_report_does_not_write_a_turn_record(self) -> None:
         session = self.start_implementation("ux-defect-count")
         self.finish_implementation(session)
         _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
@@ -31,9 +31,9 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         result = subprocess.run(self.review_command(session, "ux", ""), env=environment,
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.turn_records(session)[0]["raised"], 3)
+        self.assertEqual(self.turn_records(session), [])
 
-    def test_ux_pass_with_only_table_headers_records_zero_raised(self) -> None:
+    def test_plain_ux_pass_does_not_write_a_turn_record(self) -> None:
         session = self.start_implementation("ux-pass-count")
         self.finish_implementation(session)
         _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
@@ -42,7 +42,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         result = subprocess.run(self.review_command(session, "ux", ""), env=environment,
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.turn_records(session)[0]["raised"], 0)
+        self.assertEqual(self.turn_records(session), [])
 
 
 if __name__ == "__main__":

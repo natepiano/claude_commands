@@ -294,7 +294,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
             "reviewed\n",
         )
-    def test_early_verdict_without_delivery_records_void_and_findings_without_a_pass(self) -> None:
+    def test_plain_early_verdict_without_delivery_keeps_findings_without_a_turn_record_or_pass(self) -> None:
         session = self.start_implementation("void-unit-review")
         ready = session / "ready"
         environment = self.environment()
@@ -304,12 +304,11 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
-        record, = self.turn_records(session)
-        self.assertEqual(record["status"], "void")
-        self.assertEqual(record["raised"], 1)
+        self.assertEqual(self.turn_records(session), [])
+        self.assertEqual((session / "review_findings_1_contract.txt").read_text(), environment["STUB_FINDINGS"])
         self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
 
-    def test_own_term_records_canceled_instead_of_successful_exit_trap(self) -> None:
+    def test_plain_review_term_keeps_the_signal_exit_code_without_a_turn_record(self) -> None:
         session = self.start_implementation("own-signal")
         self.finish_implementation(session)
         environment = self.environment()
@@ -327,8 +326,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                 self.assertTrue((session / "agent_prompt_received.txt").exists())
                 process.send_signal(signal.SIGTERM)
                 code = process.wait(timeout=TEST_HANG_GUARD_SECS)
-                record, = self.turn_records(session)
-                self.assertEqual(record["status"], "canceled")
+                self.assertEqual(self.turn_records(session), [])
                 self.assertEqual(code, 143)
             finally:
                 finish.touch()

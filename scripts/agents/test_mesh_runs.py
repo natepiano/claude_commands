@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, NamedTuple, cast, override
@@ -30,6 +31,7 @@ from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, session_staff
+from scripts.usage import agents_log
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, fixture_session
 
 WORKER = "unit-impl"
@@ -855,15 +857,32 @@ sys.exit(1)
         active.mkdir()
         _ = (active / "director-session").write_text(f"{self.session}\n", encoding="utf-8")
         self.write_roster(THREAD_ONE, "done", DEAD_PID, port=4100)
-        record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(2)"]))
+        path = self.record([sys.executable, "-c", "raise SystemExit(2)"])
+        with patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.root / "usage")}):
+            agents_log.append(THREAD_ONE, "test", None, datetime.now(timezone.utc))
+            record = self.supervise(path)
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0].session_id, self.unit.current_session)
         for part in (f"Worker {WORKER}'s run", f"Worker: {WORKER}",
-                     f"Dispatch the worker (assign.sh --to {WORKER})",
+                     f"Dispatch the worker (assign.sh --role test --to {WORKER})",
                      "Command: ", "FAIL (exit 2)", "Log: "):
             self.assertIn(part, self.sent[0].text)
         self.assertEqual(self.pending(), {})
         self.assertIn("sent to director", record.get("delivery", ""))
+
+    def test_director_hint_uses_the_current_role_after_the_worker_changes_roles(self) -> None:
+        self.write_roster(THREAD_ONE, "done", DEAD_PID, port=4100)
+        with patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.root / "usage")}):
+            agents_log.append(THREAD_ONE, "impl", None, datetime.now(timezone.utc))
+            with (patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)),
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(mesh_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+                                                "--", sys.executable, "-c", "pass"]), 0)
+            path = next((self.session / codex_mesh.DETACHED_RUNS_DIR).glob("*.json"))
+            agents_log.append(THREAD_ONE, "review", "contract", datetime.now(timezone.utc))
+            record = self.supervise(path)
+        self.assertNotIn("role", record)
+        self.assertIn(f"Dispatch the worker (assign.sh --role review --to {WORKER})", self.sent[0].text)
 
     def test_a_run_started_for_the_seats_role_reaches_the_seat(self) -> None:
         # tool-based-ui-trunk-box started its runs with `--to box` (2026-10-20): each was lost.

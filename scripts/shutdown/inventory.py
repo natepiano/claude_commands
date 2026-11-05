@@ -26,6 +26,7 @@ for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.whoami import account
 from probe_session import PROBE_ENV
 import unit_runs
@@ -785,7 +786,7 @@ def _launcher_command(pid: int) -> list[str]:
                 argv = list(process.arguments.argv)
         except (OSError, ValueError, IndexError, UnicodeError, subprocess.SubprocessError):
             return []
-        if any(Path(arg).name in {"implement.sh", "review.sh", "assign.sh", "assign.py"} for arg in argv):
+        if any(Path(arg).name in WORKER_LAUNCHERS for arg in argv):
             return argv
         pid = parent
     return []

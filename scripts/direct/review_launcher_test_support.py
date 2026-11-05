@@ -251,7 +251,7 @@ class ReviewLauncherFixture(LauncherFixture):
         return session_dir
 
     def review_command(
-        self, session_dir: Path, lens: str, ready_file: str,
+        self, session_dir: Path, lens: str = "contract", ready_file: str = "",
     ) -> list[str]:
         command = [
             "bash", str(self.review_script), str(session_dir), str(self.working_dir),
@@ -296,11 +296,6 @@ class ReviewLauncherFixture(LauncherFixture):
         self.recorder(
             "finish-pass", "--session-dir", str(session_dir), "--status", "completed"
         )
-
-    def claude_review_command(
-        self, session_dir: Path, lens: str = "contract", ready_file: str = "",
-    ) -> list[str]:
-        return self.review_command(session_dir, lens, ready_file)
 
     def events(self, name: str) -> list[dict[str, object]]:
         path = self.history_dir / "runs" / f"{name}.jsonl"
@@ -370,7 +365,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         environment["STUB_REVIEW_WORKING_DIR"] = str(self.working_dir)
         if commit_change:
             environment["STUB_REVIEW_COMMIT"] = "1"
-        command = self.claude_review_command(session)
+        command = self.review_command(session)
         command[2:2] = ["--phase", "3"]
         result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         return result, session / "phases" / "3"

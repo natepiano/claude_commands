@@ -11,13 +11,15 @@ import subprocess
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
 
-    def test_a_parallel_phase_writing_its_own_files_during_a_review_leaves_the_review_passed(self) -> None:
+    def test_plain_review_does_not_require_the_tree_guard(self) -> None:
+        (self.review_script.parent / "review_tree.py").unlink()
         result, phase_dir = self.side_by_side_review("parallel-writer", "other.txt")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("changed the working tree", result.stderr)
         self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "reviewed\n")
         log = "".join(path.read_text(encoding="utf-8") for path in phase_dir.glob("review_agent_1*.log"))
-        self.assertIn("open phase 4's files changed during the review: other.txt", log)
+        self.assertNotIn("tree check", log)
+        self.assertEqual((self.working_dir / "other.txt").read_text(), "changed by reviewer\n")
         self.assertEqual(list(phase_dir.glob("review_tree_*")), [])
 
     def test_a_parallel_phase_commit_during_a_review_leaves_the_review_passed(self) -> None:
@@ -25,29 +27,31 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "reviewed\n")
 
-    def test_beside_a_parallel_phase_an_edit_to_the_reviewed_phases_file_still_fails(self) -> None:
+    def test_plain_review_allows_changes_to_its_phase_files(self) -> None:
         result, phase_dir = self.side_by_side_review("parallel-own-edit", "reviewed.txt")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("changed the working tree: reviewed.txt", result.stderr)
-        self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "error\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("changed the working tree", result.stderr)
+        self.assertEqual((self.working_dir / "reviewed.txt").read_text(), "changed by reviewer\n")
+        self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "reviewed\n")
 
-    def test_beside_a_parallel_phase_an_edit_no_phase_holds_still_fails(self) -> None:
+    def test_plain_review_allows_changes_to_unheld_files(self) -> None:
         result, _ = self.side_by_side_review("parallel-unheld-edit", "loose.txt")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("changed the working tree: loose.txt", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("changed the working tree", result.stderr)
+        self.assertEqual((self.working_dir / "loose.txt").read_text(), "changed by reviewer\n")
 
-    def test_a_claude_reviewer_that_edits_fails_and_names_the_reviewer_and_path(self) -> None:
+    def test_plain_claude_review_keeps_its_previous_behavior_after_an_edit(self) -> None:
         session_dir = self.start_implementation("edited")
         self.finish_implementation(session_dir)
         edited = self.working_dir / "reviewed.txt"
 
         result = self.run_claude_review(session_dir, edit_path=str(edited))
 
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("fresh reviewer", result.stderr)
-        self.assertIn("reviewed.txt", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("changed the working tree", result.stderr)
+        self.assertEqual((self.working_dir / "reviewed.txt").read_text(), "changed by reviewer\n")
         self.assertEqual(
-            (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
+            (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
         self.assertEqual(
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
@@ -57,9 +61,10 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             event for event in self.pass_events("edited")
             if event.get("pass_kind") == "review"
         ]
-        self.assertEqual(reviews[-1].get("status"), "error")
+        self.assertEqual(reviews[-1].get("status"), "completed")
+        self.assertEqual(self.turn_records(session_dir), [])
 
-    def test_a_reviewer_commit_is_detected_and_names_its_changed_path(self) -> None:
+    def test_plain_claude_review_allows_a_commit(self) -> None:
         session_dir = self.start_implementation("committed-edit")
         self.finish_implementation(session_dir)
 
@@ -69,14 +74,14 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             commit_change=True,
         )
 
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("fresh reviewer", result.stderr)
-        self.assertIn("reviewed.txt", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("changed the working tree", result.stderr)
+        self.assertEqual((self.working_dir / "reviewed.txt").read_text(), "changed by reviewer\n")
         self.assertEqual(
-            (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
+            (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
 
-    def test_a_change_to_an_existing_untracked_file_is_detected(self) -> None:
+    def test_plain_claude_review_allows_changes_to_an_untracked_file(self) -> None:
         session_dir = self.start_implementation("untracked-edit")
         self.finish_implementation(session_dir)
         untracked = self.working_dir / "notes.txt"
@@ -86,11 +91,11 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             session_dir, edit_path=str(untracked)
         )
 
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("fresh reviewer", result.stderr)
-        self.assertIn("notes.txt", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("changed the working tree", result.stderr)
+        self.assertEqual(untracked.read_text(), "changed by reviewer\n")
         self.assertEqual(
-            (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
+            (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
 
     def test_both_lenses_run_at_once_without_overwriting_each_other(self) -> None:

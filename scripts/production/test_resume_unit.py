@@ -81,11 +81,17 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertNotEqual(row.id, row.current_session)
         unit = resume_unit.find_unit("alpha", "alpha")
         assert isinstance(unit, resume_unit.RetiredUnitRecovery)
-        self.assertEqual(unit.display_name, row.name)
+        self.assertEqual(unit.branch, row.name)
         command = resume_unit.launch_command(replace(unit, name="stale-table-unit"))
         self.assertEqual(command[command.index("--production") + 2], row.name)
         self.assertEqual(command[command.index("--resume") + 1], row.current_session)
         self.assertNotIn("STAFF_ID", " ".join(command))
+
+    def test_recovery_refuses_an_empty_session_id(self) -> None:
+        unit = resume_unit.find_unit("alpha", "alpha")
+        assert isinstance(unit, resume_unit.RetiredUnitRecovery)
+        with self.assertRaisesRegex(resume_unit.Refused, "^alpha-unit: recovery requires a session id$"):
+            _ = replace(unit, session_id=" ")
 
     def test_recovery_requires_each_retirement_fact(self) -> None:
         unit = resume_unit.find_unit("alpha", "alpha")

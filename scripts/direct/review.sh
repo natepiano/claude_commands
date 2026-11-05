@@ -42,7 +42,7 @@
 #                                        start + [wrapper] beats every 60s, each
 #                                        carrying an activity digest decoded from
 #                                        the reviewer's streamed log. Fresh
-#                                        reviewers are read-only and get a tree check.
+#                                        reviewers are read-only. Simplify gets a tree check.
 #                                        The check excludes paths held by another
 #                                        open phase (review_tree.py).
 
@@ -101,6 +101,13 @@ PASS_INDEX="${7:-1}"
 LENS="${REQUESTED_LENS:-${8:-}}"
 EARLY_READY_FILE="${9:-}"
 TASK="direct.${SUBTASK}"
+# shellcheck source=/dev/null
+source "${BASH_SOURCE[0]%/*}/../agents/models_config.sh"
+if [[ "${TASK}" == direct.simplify && "$(_agents_live_family direct simplify)" != claude ]]; then
+  echo "ERROR: direct.simplify requires a Claude assignment." >&2
+  exit 2
+fi
+agents_resolve_claude_launcher "${TASK}" review.sh || exit $?
 
 case "${PASS_INDEX}" in
   ''|*[!0-9]*|0) PASS_INDEX=1 ;;
@@ -222,8 +229,7 @@ if [[ "${TASK}" == direct.simplify ]]; then
   PROMPT_FILE="${PREPARE_RESULT}"
 fi
 
-# Validate before worker allocation, compaction or any reviewer starts. UX has no
-# pass window, so this command also records its launch evidence.
+# Validate before any reviewer starts. UX records launch evidence without a pass window.
 if [[ -f "${PROGRESS_STATE}" ]]; then
   if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" check-launch \
     --session-dir "${SESSION_DIR}" --pass-kind review \
@@ -251,7 +257,7 @@ initialize_review_artifacts() {
   echo "$$" > "${ARTIFACT_DIR}/review_pid${SUFFIX}"
 }
 
-# Each review names its persistent worker on the unit board.
+# Each review registers its slot on the unit board.
 board_post() {
   [[ -n "${TEAM_SLOT}" ]] || return 0
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${TEAM_SLOT}" "$1" "$2" || true
@@ -269,7 +275,7 @@ capture_tree_baseline() {
 }
 
 count_turn_findings() {
-  [[ "${TURN_FINDINGS_READY}" -eq 1 && "${TURN_COUNT_READY}" -eq 0 ]] || return 0
+  [[ "${TASK}" == direct.simplify && "${TURN_FINDINGS_READY}" -eq 1 && "${TURN_COUNT_READY}" -eq 0 ]] || return 0
   TURN_RAISED="$("$PY" - "${FINDINGS_FILE}" "${LENS}" <<'PY'
 import re
 import sys
@@ -303,43 +309,19 @@ PY
 }
 
 write_turn_record() {
-  UNIT_LIB_DIR="${SCRIPT_DIR%/*}/lib" "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
+  "$PY" - "${SCRIPT_DIR}/../.." "${SESSION_DIR}" "${TURN_STARTED_AT}" "${TURN_RECORD_STATUS}" \
     "${REVIEWER_LABEL}" "${TURN_THREAD_ID}" \
     "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" "${TURN_RAISED}" <<'PY'
-import itertools
 import json
-import os
 import sys
-import time
 from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from scripts.direct.progress_history import write_review_turn
 
-(session, started, pid, status, reviewer, thread_id,
- progress, lens, number, raised) = sys.argv[1:]
-metadata = json.loads(progress)
-unit, phase = metadata.get("unit", ""), metadata.get("phase", "")
-record = {
-    "arm": "own",
-    "reviewer": reviewer, "thread_id": thread_id, "unit": unit, "phase": phase,
-    "phase_instance_id": metadata.get("phase_instance_id", ""),
-    "history_file": metadata.get("history_file", ""),
-    "kind": "ux" if lens == "ux" else "broad" if int(number) == 1 and lens else "closure",
-    "lens": lens, "pass": int(number), "started_at": int(started),
-    "finished_at": time.time(),
-    "status": status, "raised": int(raised),
-}
-sys.path.insert(0, os.environ["UNIT_LIB_DIR"])
-from unit_runs import history_root
-root = history_root() / "review_turns" / Path(session).name
-root.mkdir(parents=True, exist_ok=True)
-for sequence in itertools.count():
-    try:
-        output = (root / f"{started}-{pid}-{sequence}.json").open("x", encoding="utf-8")
-    except FileExistsError:
-        continue
-    with output:
-        json.dump(record, output, ensure_ascii=False)
-        output.write("\n")
-    break
+session, started, status, reviewer, thread_id, progress, lens, number, raised = sys.argv[2:]
+write_review_turn(Path(session), json.loads(progress), reviewer=reviewer, thread_id=thread_id,
+                  lens=lens, pass_number=int(number), started_at=int(started), status=status,
+                  raised=int(raised), details={})
 PY
 }
 
@@ -356,17 +338,18 @@ finish_review_exit() {
   if [[ "${code}" -ne 0 && "${TURN_FINDINGS_READY}" -eq 1 ]]; then
     write_review_status error
   fi
-  if [[ "${PASS_STARTED}" -eq 1 ]]; then
+  if [[ "${TASK}" == direct.simplify && "${PASS_STARTED}" -eq 1 ]]; then
     UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       && PASS_STARTED=0 || code=1
   fi
   finish_style_review "${code}" || code=1
-  count_turn_findings
-  if ! write_turn_record; then
-    review_error "unable to write review turn record"
-    write_review_status error
-    code=1
+  if [[ "${TASK}" == direct.simplify ]]; then
+    count_turn_findings
+    if ! write_turn_record; then
+      review_error "unable to write review turn record"
+      code=1
+    fi
   fi
 
   rm -f "${TREE_BASELINE_FILE}"
@@ -378,8 +361,8 @@ finish_review_exit() {
 
 interrupt_review() {
   TURN_RECORD_STATUS="canceled"
-  # Stop the fresh reviewer and its child processes.
-  if [[ -n "${AGENT_PID:-}" ]]; then
+  # Stop the simplify reviewer and its child processes.
+  if [[ "${TASK}" == direct.simplify && -n "${AGENT_PID:-}" ]]; then
     "$PY" "${SCRIPT_DIR}/../lib/process_group.py" "${AGENT_PID}" TERM || true
     wait "${AGENT_PID}" 2>/dev/null || true
   fi
@@ -387,12 +370,12 @@ interrupt_review() {
     kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
     wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
   fi
-  count_turn_findings
   exit "$1"
 }
 
-TURN_STARTED_AT="$(date +%s)"
-TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${PHASE_ID}" <<'PYMETA'
+if [[ "${TASK}" == direct.simplify ]]; then
+  TURN_STARTED_AT="$(date +%s)"
+  TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${PHASE_ID}" <<'PYMETA'
 import json
 import sys
 from pathlib import Path
@@ -409,6 +392,7 @@ print(json.dumps({"unit": state.get("unit", ""), "phase": phase.get("id", ""),
                   "history_file": state.get("history_file", "")}))
 PYMETA
 )"
+fi
 trap finish_review_exit EXIT
 trap 'interrupt_review 143' TERM
 trap 'interrupt_review 130' INT
@@ -426,25 +410,8 @@ if [[ -n "${STYLE_SINCE}" ]]; then
   PROMPT_FILE="${STYLE_INPUT_DIR}/prompt.md"
 fi
 
-# shellcheck source=/dev/null
-source "${SCRIPT_DIR}/../agents/models_config.sh"
-if [[ "${TASK}" == direct.simplify && "$(_agents_live_family direct simplify)" != claude ]]; then
-  review_error "direct.simplify requires a Claude assignment"
-  write_review_status error
-  exit 1
-fi
-if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
-  write_review_status error
-  exit 1
-fi
-
 TREE_BASELINE_READY=0
-if [[ "${AGENT_FAMILY}" != claude ]]; then
-  review_error "Codex reviewers must use assign.sh"
-  write_review_status error
-  exit 2
-fi
-if [[ -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ]]; then
+if [[ "${TASK}" == direct.simplify && ( -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ) ]]; then
   capture_tree_baseline
 fi
 initialize_review_artifacts
@@ -477,7 +444,6 @@ record_pass_start() {
 if [[ -z "${EARLY_READY_FILE}" ]]; then
   if ! record_pass_start; then
     echo "ERROR: unable to record the review pass start." >&2
-    write_review_status error
     exit 1
   fi
 fi
@@ -527,12 +493,15 @@ PY
   fi
 fi
 
-TURN_THREAD_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
-"$PY" "${SCRIPT_DIR}/../usage/agents_log.py" append \
-  --id "${TURN_THREAD_ID}" --role review ${LENS:+--lens "${LENS}"} || true
-FRESH_REVIEW_ARGS="${AGENT_EXEC_EXTRA_ARGS:-} --session-id ${TURN_THREAD_ID}"
-AGENT_EXEC_EXTRA_ARGS="${FRESH_REVIEW_ARGS}" "$PY" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-  bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
+REVIEW_PREFIX=()
+if [[ "${TASK}" == direct.simplify ]]; then
+  TURN_THREAD_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  "$PY" "${SCRIPT_DIR}/../usage/agents_log.py" append \
+    --id "${TURN_THREAD_ID}" --role review --lens "${LENS}" || true
+  export AGENT_EXEC_EXTRA_ARGS="${AGENT_EXEC_EXTRA_ARGS:-} --session-id ${TURN_THREAD_ID}"
+  REVIEW_PREFIX=("$PY" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
+fi
+"${REVIEW_PREFIX[@]}" bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
   "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
 AGENT_PID=$!
 
@@ -549,7 +518,7 @@ if [[ -n "${EARLY_READY_FILE}" ]]; then
   while kill -0 "${AGENT_PID}" 2>/dev/null && [[ ! -e "${EARLY_READY_FILE}" ]]; do
     sleep "${UNIT_EARLY_POLL_SECS:-5}"
   done
-  if [[ -e "${EARLY_READY_FILE}" && "${TREE_BASELINE_READY}" -eq 0 ]]; then
+  if [[ "${TASK}" == direct.simplify && -e "${EARLY_READY_FILE}" && "${TREE_BASELINE_READY}" -eq 0 ]]; then
     capture_tree_baseline
   fi
   if [[ -e "${EARLY_READY_FILE}" ]] && kill -0 "${AGENT_PID}" 2>/dev/null; then
@@ -559,7 +528,6 @@ if [[ -n "${EARLY_READY_FILE}" ]]; then
       wait "${AGENT_PID}" 2>/dev/null || true
       kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
       wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
-      write_review_status error
       exit 1
     fi
   fi
@@ -608,7 +576,6 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
   if [[ "${PASS_STARTED}" -eq 0 && -e "${EARLY_READY_FILE}" ]]; then
     if ! record_pass_start; then
       echo "ERROR: unable to record the review pass start." >&2
-      write_review_status error
       exit 1
     fi
   fi
@@ -617,7 +584,6 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
     if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed; then
       echo "ERROR: unable to record the review pass completion." >&2
-      write_review_status error
       exit 1
     fi
     PASS_STARTED=0
@@ -630,7 +596,6 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
     if [[ ${#FAST_TRACK_COMMITS[@]} -gt 0 ]]; then
       if ! (cd "${WORKING_DIR}" && "$PY" "${FAST_TRACK_SCRIPT}" --mark-reviewed \
         --unit "${FAST_TRACK_UNIT}" --pass "${PHASE_ID}/${PASS_INDEX}/${LENS}" "${FAST_TRACK_COMMITS[@]}"); then
-        write_review_status error
         echo "ERROR: unable to record the fast-track review completion." >&2
         exit 1
       fi
@@ -641,7 +606,6 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
   board_post "done" \
     "launcher: ${LENS} review finished; findings in review_findings_${PASS_INDEX}${SUFFIX}.txt"
 else
-  write_review_status error
   # An early reviewer that failed before its pass started recorded nothing;
   # there is no pass to close.
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then

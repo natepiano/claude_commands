@@ -507,6 +507,7 @@ class LifecycleTests(LifecycleFixture):
         self.assert_step(result, "ok")
         self.assertEqual(self.git("rev-parse", "HEAD"), tip)
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), tip)
+        self.assertNotIn("other-showrunner", self.doc.read_text())
 
     def test_promote_main_holds_when_origin_main_is_ahead(self) -> None:
         self.running()

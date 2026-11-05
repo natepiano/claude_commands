@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch the configured Claude worker and record its pass outcome.
 # --to follows an existing worker. --phase selects its artifact directory.
-# Each team slot has a status, summary, reply, log, and resolved model record.
+# Each team slot has a status, summary, log, and resolved model record.
 # The shared board and heartbeat describe each worker during its pass.
 
 set -euo pipefail
@@ -85,7 +85,6 @@ fi
 
 PY="${SCRIPT_DIR}/../lib/py"
 SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
-REPLY_FILE="${ARTIFACT_DIR}/impl_reply${SLOT}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/impl_status${SLOT}"
 LOG_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}.log"
 AGENT_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}"
@@ -99,26 +98,19 @@ FINDINGS_STATE="${SESSION_DIR}/findings_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
 source "${SCRIPT_DIR}/../agents/models_config.sh"
-if ! agents_resolve "${TASK}"; then
-  exit 1
-fi
-
-if [[ "${AGENT_FAMILY}" != "claude" ]]; then
-  echo "implement.sh: Codex workers must use assign.sh." >&2
-  exit 2
-fi
+agents_resolve_claude_launcher "${TASK}" implement.sh || exit $?
 
 # Lock identity checks and claim writes.
 worker_record() {
   "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
-  "${AGENT_FAMILY}" "${AGENT_MODEL}" "${SCRIPT_DIR}" "${PASS_KIND}" <<'PY'
+  "${AGENT_MODEL}" "${SCRIPT_DIR}" "${PASS_KIND}" <<'PY'
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-action, root_text, slot, name, family, model, script_dir, pass_kind = sys.argv[1:]
+action, root_text, slot, name, model, script_dir, pass_kind = sys.argv[1:]
 root = Path(root_text)
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(script_dir).resolve().parents[1]))
@@ -150,7 +142,7 @@ with worker_claim_lock(root):
     reference = member.id if member else ""
     worker_id = member.current_session if member else ""
     if action == "switch":
-        raise SystemExit(0 if member and session_staff.worker_family(staff.local_snapshot(), member.id) != family else 1)
+        raise SystemExit(0 if member and session_staff.worker_family(staff.local_snapshot(), member.id) != "claude" else 1)
     elif action == "record":
         if not worker_id:
             raise SystemExit(1)
@@ -188,7 +180,7 @@ with worker_claim_lock(root):
         row = next((row for row in rows if row.get("sessionId") == worker_id), None)
         if row is None or row.get("status") != "idle":
             fail(f"{name} is busy or gone")
-        claim_file.write_text(json.dumps({"pid": int(os.environ["FOLLOW_LAUNCHER_PID"]), "worker": name, "turn_id": ""}))
+        claim_file.write_text(json.dumps({"pid": int(os.environ["FOLLOW_LAUNCHER_PID"]), "worker": name}))
     elif action == "release":
         claim = read(claim_file)
         if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
@@ -223,7 +215,6 @@ if [[ -n "${PHASE_ID}" ]] && ! "$PY" "${SCRIPT_DIR}/phase_reservation.py" claim 
 fi
 
 : > "${SUMMARY_FILE}"
-rm -f "${REPLY_FILE}"
 echo "implementing" > "${STATUS_FILE}"
 
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
@@ -253,7 +244,6 @@ fi
 
 bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
 
-MESH_FIELD="mesh=${MESH_NAME}; reach=SendMessage"
 # Record the opening role. Later board role changes remain authoritative.
 ROLE_FIELD="role=${PASS_KIND}; "
 if [[ -n "${FOLLOW_TO}" ]]; then
@@ -262,7 +252,7 @@ else
   LAUNCH_NOTE="launcher up"
 fi
 bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
-  "${SUBTASK} ${LAUNCH_NOTE} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; ${ROLE_FIELD}status in impl_status${SLOT}" || true
+  "${SUBTASK} ${LAUNCH_NOTE} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); mesh=${MESH_NAME}; reach=SendMessage; ${ROLE_FIELD}status in impl_status${SLOT}" || true
 
 export UNIT_RUN_DIR="${SESSION_DIR}"
 # Keep temporary test files under this run for later cleanup.
@@ -312,11 +302,6 @@ fi
 
 kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
-
-# Keep the worker summary when it exists. Use its last reply otherwise.
-if [[ ! -s "${SUMMARY_FILE}" && -s "${REPLY_FILE}" ]]; then
-  cp "${REPLY_FILE}" "${SUMMARY_FILE}"
-fi
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   if [[ -f "${PROGRESS_STATE}" ]]; then

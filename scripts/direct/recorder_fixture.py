@@ -23,7 +23,7 @@ from unittest.mock import patch
 # imports user_zone eagerly; its production integrations remain real children.
 from scripts.direct import progress_history
 from scripts.lib import models_registry, user_zone
-from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
@@ -45,30 +45,6 @@ def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
 
 
 
-
-STUB_ATOMIC_JSON_WRITER = '''
-import pathlib
-import sys
-if len(sys.argv) > 1 and sys.argv[1] == 'compact':
-    session = pathlib.Path(sys.argv[sys.argv.index('--session-dir') + 1])
-    if (session / 'compact_roster_changed').exists():
-        with (session / 'mesh_events.txt').open('a') as events:
-            events.write('compact\\n')
-        print('codex_mesh: roster changed during compaction; reopen before following', file=sys.stderr)
-        sys.exit(4)
-def write_json(path, value):
-    import json
-    import os
-    import tempfile
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.')
-    try:
-        with os.fdopen(descriptor, 'w') as output:
-            json.dump(value, output)
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-'''
 
 LEGACY_RECORDER_ARGUMENTS = """
 # Compatibility for older launch cases whose subject is root-level artifacts.
@@ -167,15 +143,6 @@ class LauncherFixture(unittest.TestCase):
             "--phase-id", "3", "--phase-title", "Retry handling",
         )
         return session_dir
-
-
-def launcher_registry(implementation_roles: tuple[str, ...]) -> str:
-    """Build both launcher registries from the same catalog and role settings."""
-    return registry_text({
-        "assignments": ExactRows({"direct": "codex"}),
-        "direct.codex": {**dict.fromkeys(implementation_roles, "gpt-called:xhigh"), "review": "gpt-blind:max"},
-        "codex.agents": {"gpt-called": "low,medium,high,xhigh,max", "gpt-blind": "low,medium,high,xhigh,max"},
-    })
 
 
 def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:

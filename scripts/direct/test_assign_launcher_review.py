@@ -32,6 +32,25 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
              str(self.project), str(self.prompt), "review", "review", "review", "2", "contract", ""],
             env=environment, check=False)
 
+    def test_a_follow_claim_publishes_only_its_launcher_and_worker(self) -> None:
+        self.review_launcher("--new-worker", "project-review", "1")
+        name = next(iter(self.assignment_records()))
+        original = self.server.respond
+        claims: list[dict[str, object]] = []
+
+        @self.hang_guard.callback
+        def read_claim(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                claims.extend(read_object(path) for path in self.session_dir.glob("impl_claim_*.json"))
+            return original(request)
+
+        self.server.respond = read_claim
+        self.review_launcher("--to", name, "2")
+        claim, = claims
+        self.assertEqual(set(claim), {"pid", "worker"})
+        self.assertEqual(claim["worker"], name)
+        self.assertIsInstance(claim["pid"], int)
+
     def watch(self, path: Path) -> codex_mesh.LinuxFileChanges | codex_mesh.KqueueFileChanges:
         if sys.platform.startswith("linux"):
             return codex_mesh.LinuxFileChanges({path})

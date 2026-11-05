@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable, Mapping
@@ -35,6 +37,7 @@ from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import production_doc, session_staff, showrunners, staff, unit_config  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
+from scripts.usage import agents_log  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -1066,6 +1069,59 @@ def _open_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
         for slot, record in _pass_slots(state).items()
         if _string(record.get("status")) == "active"
     }
+
+
+class DispatchDetailNotRecorded(Enum):
+    """The dispatch has no unique value for this detail."""
+
+    UNRECORDED = "unrecorded"
+
+
+@dataclass(frozen=True)
+class RecordedDispatch:
+    role: str
+    phase_id: str | DispatchDetailNotRecorded
+    lens: str | DispatchDetailNotRecorded
+    paths: str | DispatchDetailNotRecorded
+
+
+@dataclass(frozen=True)
+class NoDispatchRecorded:
+    """The worker has no recorded dispatch."""
+
+
+def last_dispatch(worker_id: staff.StaffId, run: Path) -> RecordedDispatch | NoDispatchRecorded:
+    """Read the worker's dispatch through the shared state and role loaders."""
+    try:
+        worker = staff.local_snapshot().by_id(worker_id)
+    except staff.StaffUnreadable:
+        return NoDispatchRecorded()
+    if worker is None or worker.kind != "worker":
+        return NoDispatchRecorded()
+    try:
+        state = _read_state(run)
+    except SystemExit:
+        state = {}
+    names = {worker.name}
+    if (run / "mesh_roster.json").is_file():
+        names.update(name for name, entry in session_staff.read_worker_roster(run / "mesh_roster.json").items()
+                     if (_object_dict(entry) or {}).get("staff_id") == worker_id)
+    records = [record for record in _pass_slots(state).values() if record.get("worker_name") in names]
+    task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                              worker.current_session, datetime.now(UTC))
+    latest = max(records, key=lambda record: _number(record.get("started_at")), default=dict[str, object]())
+    role = _string(latest.get("kind")) or (task.role if isinstance(task, agents_log.Assignment) else "")
+    if not role:
+        return NoDispatchRecorded()
+    phases = {_string((_object_dict(record.get("phase")) or {}).get("id")).strip() for record in records}
+    missing = DispatchDetailNotRecorded.UNRECORDED
+    phase = next(iter(phases)) if len(phases) == 1 and "" not in phases else missing
+    lens = _string(latest.get("lens")) or (
+        task.lens if isinstance(task, agents_log.Assignment) and task.role == "review" and role == "review" else "")
+    paths = _string(latest.get("paths")) or (
+        str(phase_reservation.phase_directory(run, phase) / phase_reservation.FILES_FILE)
+        if isinstance(phase, str) and role != "review" else missing)
+    return RecordedDispatch(role, phase, lens or missing, paths)
 
 
 def _pass_phase_instance(record: dict[str, object]) -> str:
@@ -6162,6 +6218,32 @@ class RecordedCodeFindings:
 
 CodeReviewEvidence = NoRecordedCodeReview | RecordedCodeFindings
 SEPARATE_TRIAL_LENSES = ("ux", "simplify")
+
+
+def write_review_turn(session_dir: Path, metadata: Mapping[str, object], *,
+                      reviewer: str, thread_id: str, lens: str, pass_number: int,
+                      started_at: int, status: str, raised: int, details: Mapping[str, object]) -> None:
+    """Store one review result without replacing another result from the same second."""
+    record: dict[str, object] = {
+        "arm": "own", "unit": metadata.get("unit", ""), "phase": metadata.get("phase", ""),
+        "phase_instance_id": metadata.get("phase_instance_id", ""),
+        "history_file": metadata.get("history_file", ""),
+        "reviewer": reviewer, "thread_id": thread_id, "lens": lens,
+        "kind": "ux" if lens == "ux" else "broad" if pass_number == 1 and lens else "closure",
+        "pass": pass_number, "started_at": started_at, "finished_at": time.time(),
+        "status": status, "raised": raised, **details,
+    }
+    root = plan_history.history_root() / "review_turns" / session_dir.name
+    root.mkdir(parents=True, exist_ok=True)
+    for sequence in itertools.count():
+        try:
+            output = (root / f"{started_at}-{os.getpid()}-{sequence}.json").open("x", encoding="utf-8")
+        except FileExistsError:
+            continue
+        with output:
+            json.dump(record, output, ensure_ascii=False)
+            _ = output.write("\n")
+        return
 
 
 def _phase_review_records(session_dir: Path, instance_id: str) -> Iterable[dict[str, object]]:

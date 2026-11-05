@@ -495,10 +495,12 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         _ = write_registry(registry, {"assignments": {"direct.simplify": "codex"},
                                       "direct.codex": {"simplify": "sol:high"}}, base_text=registry.read_text())
 
-        result = self.launch()
+        result = subprocess.run(self.command(), env=self.env, capture_output=True, text=True,
+                                check=False, timeout=TEST_HANG_GUARD_SECS)
 
+        self.assertEqual(result.returncode, 2)
         self.assertIn("direct.simplify requires a Claude assignment", result.stderr)
-        self.assertEqual(self.status(), "error")
+        self.assertFalse(self.phase_file("review_status_simplify").exists())
         self.assertFalse(self.calls.exists())
         self.assertEqual(self.passes(), [])
 

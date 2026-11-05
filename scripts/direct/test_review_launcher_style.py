@@ -28,7 +28,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
             environment["STUB_TURN_FAILURE"] = "1"
         if outcome != "missing" and since == "HEAD" and not fail:
             environment["STUB_EXPECT_PREPARED_STYLE"] = "1"
-        command = self.claude_review_command(session)
+        command = self.review_command(session)
         command[2:2] = ["--phase", "3", "--style-since", since]
         if until:
             command[2:2] = ["--style-until", until]
@@ -75,14 +75,14 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         self.assertEqual(dispatch[1], "readonly")
         self.assertNotIn("--sandbox", dispatch)
 
-    def test_pass_and_rerun_use_new_inputs_and_fresh_claude_sessions(self) -> None:
+    def test_pass_and_rerun_use_new_inputs_without_turn_records(self) -> None:
         session = self.session_with_changes("style-rerun")
         first = self.launch(session)
         self.assertEqual(first.returncode, 0, first.stderr)
         old = self.state(session)
         old_input = Path(str(old["input_directory"]))
         before = (old_input / "style-review.diff").read_bytes()
-        first_record, = self.turn_records(session)
+        self.assertEqual(self.turn_records(session), [])
         _ = (self.working_dir / "reviewed.txt").write_text("retry content\n")
         second = self.launch(session)
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -91,8 +91,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         self.assertEqual((old_input / "style-review.diff").read_bytes(), before)
         self.assertIn("+retry content", (session / "prepared_at_dispatch.diff").read_text())
         records = self.turn_records(session)
-        self.assertIn(first_record, records)
-        self.assertEqual(len({str(record["thread_id"]) for record in records}), 2)
+        self.assertEqual(records, [])
 
     def test_missing_error_and_failed_dispatch_remain_owed(self) -> None:
         for outcome, fail in (("missing", False), ("Error", False), ("Pass", True)):
@@ -114,7 +113,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
                 environment = self.environment()
                 environment["LINT_CONFIG_FILE"] = str(config)
                 environment["CONF_DIR"] = str(Path(config).parent)
-                command = self.claude_review_command(session)
+                command = self.review_command(session)
                 command[2:2] = ["--phase", "3", "--style-since", "HEAD"]
                 result = subprocess.run(command, env=environment, text=True, capture_output=True,
                                         check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -138,7 +137,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         environment = self.environment()
         finish = self.root / "finish-style-owner"
         environment["STUB_REVIEW_FINISH_FILE"] = str(finish)
-        command = self.claude_review_command(session)
+        command = self.review_command(session)
         command[2:2] = ["--phase", "3", "--style-since", "HEAD"]
         process = subprocess.Popen(command, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
@@ -172,7 +171,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         environment = self.environment()
         finish = self.root / "finish-style-worker"
         environment["STUB_REVIEW_FINISH_FILE"] = str(finish)
-        command = self.claude_review_command(session)
+        command = self.review_command(session)
         command[2:2] = ["--phase", "3", "--style-since", "HEAD"]
         process = subprocess.Popen(command, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:

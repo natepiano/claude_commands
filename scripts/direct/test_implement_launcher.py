@@ -1,12 +1,12 @@
 """Test Claude launcher validation and artifact placement."""
 from __future__ import annotations
 
+import json
 import subprocess
 from typing import cast
 
 from scripts.direct import implement_launcher_test_support as support
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 
 
@@ -129,7 +129,8 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
 
     def test_codex_workers_are_refused_before_artifacts_or_claims_change(self) -> None:
         session = self.start_phase("codex-refused")
-        _ = write_registry(self.root / ".claude/config/models.conf", base_text=support.MODELS_REGISTRY)
+        registry = self.root / ".claude/config/models.conf"
+        _ = registry.write_text(registry.read_text().replace("direct=claude", "direct=codex"))
         summary = session / "impl_summary_impl.txt"
         _ = summary.write_text("previous summary\n")
         before = (session / "progress_history_state.json").read_bytes()
@@ -142,3 +143,64 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                 self.assertEqual((session / "progress_history_state.json").read_bytes(), before)
                 self.assertFalse((session / "impl_claim_impl.json").exists())
                 self.assertFalse((self.root / "launch_args.json").exists())
+
+    def test_phase_claim_precedes_the_claude_worker_open(self) -> None:
+        session = self.start_phase("claim-before-open")
+        environment, calls = self.claim_fixture(session, "clear")
+        result = subprocess.run(self.implement_command(session, "--phase", "3"),
+                                capture_output=True, text=True, check=False, env=environment,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls.read_text().splitlines(), ["sid-director.phase-3 check reviewed.txt --json"])
+        state = (session / "phases/3/delegated_phase_reservation_state.json").read_text()
+        self.assertIn('"r1"', state)
+        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(), ["claim", "open"])
+
+    def test_refused_phase_claim_prevents_the_claude_worker_open(self) -> None:
+        session = self.start_phase("claim-refused")
+        environment, calls = self.claim_fixture(session, "blocked")
+        result = subprocess.run(self.implement_command(session, "--phase", "3"),
+                                capture_output=True, text=True, check=False, env=environment,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("phase 3 could not claim its files", result.stderr)
+        self.assertEqual(len(calls.read_text().splitlines()), 1)
+        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(), ["claim"])
+        self.assertEqual(self.launch_records(session, "pass_started"), [])
+
+    def test_unreadable_ledger_allows_the_worker_with_the_claim_pending(self) -> None:
+        session = self.start_phase("claim-unreadable")
+        environment, calls = self.claim_fixture(session, "ledger_unreadable")
+        result = subprocess.run(self.implement_command(session, "--phase", "3"),
+                                capture_output=True, text=True, check=False, env=environment,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls.read_text().splitlines()), 1)
+        state = (session / "phases/3/delegated_phase_reservation_state.json").read_text()
+        self.assertIn("enrolled_awaiting_first_touch", state)
+        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(), ["claim", "open"])
+
+    def test_new_worker_identity_precedes_the_heartbeat_watcher(self) -> None:
+        session = self.start_phase("identity-before-heartbeat")
+        watcher = self.root / "scripts/agents/heartbeat_watch.sh"
+        _ = watcher.write_text('#!/bin/bash\ncat "$UNIT_RUN_DIR/impl_worker_impl.json" > "$UNIT_RUN_DIR/watcher-identity"\n')
+        sender = self.root / "opening-send.py"
+        _ = sender.write_text(sender.read_text().replace(
+            "print('SENT: fixture')",
+            "import subprocess\n"
+            + f"subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], {str(session / 'watcher-identity')!r}], check=True)\n"
+            + "print('SENT: fixture')"))
+        result = self.worker_launch(session)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        identity = cast(dict[str, object], json.loads((session / "watcher-identity").read_text()))
+        self.assertEqual(identity["staff_id"], self.recorded_worker(session).id)
+
+    def test_model_resolution_failure_preserves_the_previous_pass(self) -> None:
+        session = self.start_phase("resolve-failed")
+        registry = self.root / ".claude/config/models.conf"
+        _ = registry.write_text("invalid configuration\n")
+        before = (session / "progress_history_state.json").read_bytes()
+        result = self.checked_launch(session)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual((session / "progress_history_state.json").read_bytes(), before)
+        self.assertEqual(self.launch_records(session, "pass_started"), [])

@@ -268,14 +268,27 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.finish_implementation(session)
         registry = self.root / ".claude/config/models.conf"
         _ = registry.write_text(registry.read_text().replace("direct=claude", "direct=codex"))
+        phase = session / "phases/3"
+        phase.mkdir(parents=True, exist_ok=True)
+        for name in ("review_slot_contract", "review_agent_1_contract.log"):
+            _ = (phase / name).write_text("Keep this evidence.\n")
+        before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in phase.iterdir()}
+        events = self.events(session.name)
         environment = self.environment()
         environment["TEST_WORKER_STARTED"] = str(session / "review-worker-started")
-        result = subprocess.run(self.review_command(session, "contract", ""), env=environment,
+        command = self.review_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment,
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(result.stderr.splitlines(), ["ERROR: Codex reviewers must use assign.sh"])
+        self.assertEqual(result.stderr.splitlines(), ["review.sh: Codex workers must use assign.sh."])
         self.assertFalse((session / "review-worker-started").exists())
         self.assertFalse((session / "mesh_roster.json").exists())
+        self.assertEqual({path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in phase.iterdir()}, before)
+        self.assertEqual(self.turn_records(session), [])
+        self.assertEqual(self.events(session.name), events)
+        self.assertEqual(list(phase.glob("review_status*")), [])
 
     def test_removed_review_options_refuse_before_any_review_starts(self) -> None:
         for flag in ("--pool", "--lease", "--to", "--slot"):

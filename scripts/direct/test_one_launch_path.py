@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from scripts.direct.progress_history import DispatchDetailNotRecorded, RecordedDispatch
 from scripts.lib import resume_message
 from scripts.shutdown.inventory import PausedSeat
 
@@ -209,7 +210,8 @@ class ResumeAssignmentTests(unittest.TestCase):
     def test_worker_without_a_saved_launcher_uses_assign_and_the_recorded_phase(self) -> None:
         seat = PausedSeat(run_dir="/run", seat="worker", role="test", staff_id="worker-id",
                           turn_live=True, launcher_command=[])
-        with patch.object(resume_message, "_resume_phase_id", return_value="3t"):
+        with patch("scripts.lib.resume_message.progress_history.last_dispatch", return_value=RecordedDispatch(
+                "test", "3t", DispatchDetailNotRecorded.UNRECORDED, "/run/phases/3t/files")):
             command = shlex.split(resume_message.resume_worker_command(seat, "/tree"))
         self.assertEqual(command[:2], ["bash", str(ROOT / "scripts/direct/assign.sh")])
         options = dict(zip(command[2::2], command[3::2]))

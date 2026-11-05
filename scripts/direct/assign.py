@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
-import itertools
 import os
 import re
 import signal
@@ -26,7 +25,7 @@ from scripts.astra import design_roles
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
-from scripts.direct import phase_reservation, workers
+from scripts.direct import phase_reservation, progress_history, workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
@@ -573,7 +572,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if record.get("status") == "ended":
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
-        worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
+        worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker}))
         # Each turn runs at the caller's model:effort (models.conf default or explicit override).
         return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 
@@ -603,27 +602,13 @@ def record_review(dispatch: Dispatch, completed: bool, summary: Path) -> None:
     record = read_roster(dispatch.run, dispatch.worker)
     raised = len(re.findall(r"^\s*\d+[.)]\s+", summary.read_text(), re.MULTILINE))
     store = workers.ledger_for_run(dispatch.run)
-    evidence: dict[str, object] = {
-        "arm": "own", "pool": store.path.parent.name, "unit": store.path.stem,
-        "phase": dispatch.phase, "phase_instance_id": phase.get("instance_id", ""),
-        "history_file": state.get("history_file", ""), "reviewer": dispatch.worker,
-        "thread_id": session_staff.worker_session(record), "lens": dispatch.args.lens,
-        "kind": "ux" if dispatch.args.lens == "ux" else "broad" if dispatch.args.pass_number == 1 and dispatch.args.lens else "closure",
-        "pass": dispatch.args.pass_number, "started_at": int(dispatch.started_at),
-        "finished_at": time.time(), "status": "reviewed" if completed else "error",
-        "raised": raised, "lease_ordinal": 0, "prime_hash": "",
-    }
-    root = unit_runs.history_root() / "review_turns" / dispatch.run.name
-    root.mkdir(parents=True, exist_ok=True)
-    for sequence in itertools.count():
-        try:
-            output = (root / f"{int(dispatch.started_at)}-{os.getpid()}-{sequence}.json").open("x", encoding="utf-8")
-        except FileExistsError:
-            continue
-        with output:
-            json.dump(evidence, output)
-            _ = output.write("\n")
-        break
+    progress_history.write_review_turn(dispatch.run, {
+        "unit": store.path.stem, "phase": dispatch.phase,
+        "phase_instance_id": phase.get("instance_id", ""), "history_file": state.get("history_file", ""),
+    }, reviewer=dispatch.worker, thread_id=session_staff.worker_session(record), lens=dispatch.args.lens,
+       pass_number=dispatch.args.pass_number, started_at=int(dispatch.started_at),
+       status="reviewed" if completed else "error", raised=raised,
+       details={"pool": store.path.parent.name, "lease_ordinal": 0, "prime_hash": ""})
 
 
 def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,

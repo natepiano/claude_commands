@@ -65,7 +65,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.open_repair_round(session_dir)
 
         result = self.worker_launch(
-            session_dir, to=name, kind="fix", fail=True, resolves_round=True
+            session_dir, to=name, kind="fix", behavior="queued", resolves_round=True
         )
 
         self.assertNotEqual(result.returncode, 0)
@@ -184,7 +184,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.observe_status_at_records()
 
         result = self.worker_launch(
-            session_dir, to=name, kind="fix", fail=True,
+            session_dir, to=name, kind="fix", behavior="queued",
             resolves_round=True,
         )
 

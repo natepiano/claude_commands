@@ -16,7 +16,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, override
 
-from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
+from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
 
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment, write_config_fixture
@@ -41,6 +41,8 @@ root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
 if sys.argv[1] == '--bg':
     settings = json.loads(sys.argv[sys.argv.index('--settings') + 1])['env']
     session = pathlib.Path(settings['UNIT_RUN_DIR'])
+    with (session / 'mesh_events.txt').open('a') as events:
+        events.write('open\\n')
     baseline = session / 'phases/3/phase_baseline'
     if baseline.exists():
         (session / 'baseline-at-worker-open').write_bytes(baseline.read_bytes())
@@ -130,9 +132,6 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-MODELS_REGISTRY = launcher_registry(("impl", "test", "fix"))
-
-
 class ImplementLauncherFixture(LauncherFixture):
     """Every worker carries a kind, and the board line says which."""
 
@@ -199,9 +198,6 @@ class ImplementLauncherFixture(LauncherFixture):
         for name in ("conf.py", "conf.sh"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
-        home_lib = self.root / ".claude/scripts/lib"
-        home_lib.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib/py", home_lib / "py")
         configure_launcher_fixture(direct_dir / "implement.sh")
         _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
         claude = self.root / "claude-bin"
@@ -230,7 +226,6 @@ class ImplementLauncherFixture(LauncherFixture):
     @override
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
-        environment["CONF_DIR"] = str(self.root)
         environment["CLAUDE_BIN"] = str(self.root / "claude-bin")
         environment["STUB_CLAUDE_ROOT"] = str(self.root)
         environment["NOTIFIER_SESSIONS_DIR"] = str(self.root / "sessions")
@@ -252,34 +247,28 @@ class ImplementLauncherFixture(LauncherFixture):
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
         return environment
 
-    def launch(
-        self, session_dir: Path, kind: str, slot: str
-    ) -> subprocess.CompletedProcess[str]:
+    def implement_command(self, session: Path, *options: str, kind: str = "impl",
+                          slot: str = "impl", subtask: str = "impl") -> list[str]:
+        return ["bash", str(self.implement_script), *options, str(session), str(self.working_dir),
+                str(self.prompt_file), subtask, "the retry path", kind, "writing the retry path", "0", slot]
+
+    def launch_environment(self, session: Path, slot: str = "impl") -> dict[str, str]:
         environment = self.environment()
-        environment["STUB_SUMMARY"] = str(session_dir / f"impl_summary_{slot}.txt")
-        return subprocess.run(
-            [
-                "bash", str(self.implement_script), str(session_dir), str(self.working_dir),
-                str(self.prompt_file), kind, "the retry path", kind,
-                "writing the retry path", "0", slot,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-        )
+        environment["STUB_SUMMARY"] = str(session / f"impl_summary_{slot}.txt")
+        return environment
+
+    def launch(self, session_dir: Path, kind: str, slot: str) -> subprocess.CompletedProcess[str]:
+        return self.worker_launch(session_dir, kind=kind, slot=slot, subtask=kind)
 
     def checked_launch(
         self, session: Path, *options: str, kind: str = "impl",
     ) -> subprocess.CompletedProcess[str]:
-        environment = self.environment()
+        environment = self.launch_environment(session)
         _ = environment.pop("TEST_LEGACY_LAUNCH", None)
         environment["TEST_WORKER_STARTED"] = str(session / "worker-started")
         environment["STUB_SUMMARY"] = str(session / "phases" / "3" / "impl_summary_impl.txt")
         return subprocess.run(
-            ["bash", str(self.implement_script), *options, str(session), str(self.working_dir),
-             str(self.prompt_file), kind, "the retry path", kind, "writing the retry path", "0", "impl"],
+            self.implement_command(session, *options, kind=kind, subtask=kind),
             check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
@@ -315,27 +304,29 @@ printf '%s\\n' '{answer}'
 
     def worker_launch(
         self, session_dir: Path, *, to: str = "", slot: str = "impl",
-        kind: str = "impl", fail: bool = False, resolves_round: bool = False,
-        fix_cause: str = "",
+        kind: str = "impl", behavior: str = "complete", resolves_round: bool = False,
+        fix_cause: str = "", subtask: str = "impl",
     ) -> subprocess.CompletedProcess[str]:
-        arguments = ["bash", str(self.implement_script)]
+        options: list[str] = []
         if to:
-            arguments.extend(("--to", to))
+            options.extend(("--to", to))
         if fix_cause:
-            arguments.extend(("--fix-cause", fix_cause))
-        arguments.extend((str(session_dir), str(self.working_dir), str(self.prompt_file),
-                          "impl", "the retry path", kind, "writing the retry path", "0", slot))
-        environment = self.environment()
-        environment["STUB_SUMMARY"] = str(session_dir / f"impl_summary_{slot}.txt")
+            options.extend(("--fix-cause", fix_cause))
+        environment = self.launch_environment(session_dir, slot)
         if to:
-            member = self.recorded_worker(session_dir, slot)
-            transcript = next((self.root / ".claude/projects").rglob(f"{member.current_session}.jsonl"))
-            environment.update({"STUB_TRANSCRIPT": str(transcript),
-                                "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
-                                "STUB_SEND_BEHAVIOR": "queued" if fail else "complete"})
+            records = [cast(dict[str, object], json.loads(path.read_text()))
+                       for path in (self.root / "sessions").glob("*.json")]
+            session_id = next((str(row["sessionId"]) for row in records if row["name"] == to), "")
+            if session_id:
+                transcript = next((self.root / ".claude/projects").rglob(f"{session_id}.jsonl"))
+                environment.update({"STUB_TRANSCRIPT": str(transcript),
+                                    "CLAUDE_PROJECTS_DIR": str(transcript.parent.parent),
+                                    "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
+                                    "STUB_SEND_BEHAVIOR": behavior})
         if resolves_round:
             environment["UNIT_RESOLVES_ROUND"] = "1"
-        return subprocess.run(arguments, check=False, capture_output=True, text=True,
+        return subprocess.run(self.implement_command(session_dir, *options, kind=kind, slot=slot, subtask=subtask),
+                              check=False, capture_output=True, text=True,
                               env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def open_repair_round(self, session_dir: Path) -> None:
@@ -399,8 +390,6 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         return member
 
     def claude_worker(self, session_dir: Path) -> Path:
-        registry = self.root / ".claude" / "config" / "models.conf"
-        _ = write_registry(registry, base_text=CLAUDE_REGISTRY)
         sessions = self.root / "sessions"
         sessions.mkdir()
         projects = self.root / ".claude" / "projects" / "fixture"
@@ -429,65 +418,20 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             "implemented\n", encoding="utf-8"
         )
         _ = (self.root / "worker_state").write_text("idle\n", encoding="utf-8")
-        for name, content in (("claude-bin", STUB_CLAUDE), ("send", STUB_SEND)):
-            script = self.root / name
-            _ = script.write_text(content, encoding="utf-8")
-            script.chmod(0o755)
         return transcript
-
-    def claude_follow(
-        self, session_dir: Path, transcript: Path, behavior: str
-    ) -> subprocess.CompletedProcess[str]:
-        environment = self.environment()
-        environment.update({
-            "CLAUDE_BIN": str(self.root / "claude-bin"),
-            "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
-            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "CLAUDE_PROJECTS_DIR": str(transcript.parent.parent),
-            "STUB_CLAUDE_ROOT": str(self.root),
-            "STUB_TRANSCRIPT": str(transcript),
-            "STUB_SUMMARY": str(session_dir / "impl_summary_impl.txt"),
-            "STUB_SEND_BEHAVIOR": behavior,
-        })
-        try:
-            return subprocess.run(
-                ["bash", str(self.implement_script), "--to", "fixture-impl",
-                 str(session_dir), str(self.working_dir), str(self.prompt_file),
-                 "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
-                check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-            )
-        except subprocess.TimeoutExpired as error:
-            delivered = self.root / "delivered_message.txt"
-            raise AssertionError(
-                " ".join((
-                    f"Claude follow timed out: transcript={transcript.read_text()!r},",
-                    f"delivered={delivered.exists()},",
-                    f"worker_state={(self.root / 'worker_state').read_text()!r},",
-                    f"stdout={error.stdout!r}, stderr={error.stderr!r}",
-                ))
-            ) from error
 
     def claude_launch(
         self, session_dir: Path, registry_row: str, *, inherited_effort: str = "", kind: str = "impl"
     ) -> subprocess.CompletedProcess[str]:
         registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, {"direct.claude": {"impl": registry_row}}, base_text=CLAUDE_REGISTRY)
-        stub = self.root / "claude-bin"
-        _ = stub.write_text(STUB_CLAUDE, encoding="utf-8")
-        stub.chmod(0o755)
-        environment = self.environment()
-        environment["CLAUDE_BIN"] = str(stub)
-        environment["STUB_CLAUDE_ROOT"] = str(self.root)
-        environment["NOTIFIER_SESSIONS_DIR"] = str(self.root / "sessions")
-        environment["STUB_SUMMARY"] = str(session_dir / "impl_summary_impl.txt")
+        environment = self.launch_environment(session_dir)
         if inherited_effort:
             environment["AGENT_BG_EFFORT"] = inherited_effort
         else:
             _ = environment.pop("AGENT_BG_EFFORT", None)
         return subprocess.run(
-            ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
-             str(self.prompt_file), "impl", "the retry path", kind,
-             "writing the retry path", "0", "impl"],
+            self.implement_command(session_dir, kind=kind),
             check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 

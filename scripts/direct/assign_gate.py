@@ -7,6 +7,8 @@ import shlex
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
+ASSIGN_LAUNCHERS = frozenset({"assign.sh", "assign.py"})
+WORKER_LAUNCHERS = ASSIGN_LAUNCHERS | {"implement.sh", "review.sh"}
 ASSIGN = ROOT / 'scripts/direct/assign.py'
 LAUNCHERS = {
     ROOT / 'scripts/direct/implement.sh',
@@ -17,6 +19,20 @@ LAUNCHERS = {
 }
 PYTHON_HOPS = {ROOT / 'scripts/production/worker_fill.py'}
 REFUSAL = 'Start workers through assign.sh from the director session.'
+
+
+def assign_role(role: str) -> str:
+    """Return the role name accepted by assign.sh."""
+    return "implement" if role == "impl" else role
+
+
+def assign_command(run_dir: str, worker: str, role: str, options: list[tuple[str, str]]) -> str:
+    """Build an assignment command with the current worker and run."""
+    current = {"--role": assign_role(role), "--session-dir": run_dir, "--to": worker}
+    pairs = [(option, current.get(option, value)) for option, value in options if option != "--new-worker"]
+    supplied = {pair[0] for pair in pairs}
+    pairs.extend((option, value) for option, value in current.items() if option not in supplied)
+    return shlex.join(["bash", str(ROOT / "scripts/direct/assign.sh"), *(value for pair in pairs for value in pair)])
 
 
 def called_by_assign() -> bool:

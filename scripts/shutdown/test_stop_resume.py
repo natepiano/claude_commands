@@ -529,6 +529,97 @@ class StopResumeTests(unittest.TestCase):
         seat["launcher_command"] = shlex.split(rebuilt)
         self.assertEqual(stop_resume.resume_worker_command(seat, cwd), rebuilt)
 
+    def test_positional_review_resume_keeps_the_pass_lens_and_delivery_file(self) -> None:
+        run, cwd = str(self.root / "worker run"), str(self.root / "staff folder")
+        ready = str(self.root / "final diff ready")
+        for requested_lens in ("", "contract"):
+            with self.subTest(requested_lens=requested_lens):
+                command = ["bash", str(stop_resume.SCRIPTS / "direct/review.sh")]
+                if requested_lens:
+                    command.extend(("--lens", requested_lens))
+                command.extend((run, "/old tree", "old prompt", "review", "check this change", "reviewing",
+                                "3", "adversary", ready))
+                seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="worker-id",
+                                  turn_live=True, launcher_command=command)
+                rebuilt = shlex.split(stop_resume.resume_worker_command(seat, cwd))
+                options = dict(zip(rebuilt[2::2], rebuilt[3::2]))
+                self.assertEqual(options["--pass"], "3")
+                self.assertEqual(options["--lens"], requested_lens or "adversary")
+                self.assertEqual(options["--early-ready"], ready)
+                self.assertEqual(options["--cwd"], cwd)
+                self.assertEqual(options["--prompt"], str(Path(run) / "review2.resume-prompt.md"))
+                seat["launcher_command"] = rebuilt
+                self.assertEqual(shlex.split(stop_resume.resume_worker_command(seat, cwd)), rebuilt)
+
+    def test_saved_assignment_resume_keeps_task_options_and_repeated_images(self) -> None:
+        run, cwd = str(self.root / "worker run"), str(self.root / "staff folder")
+        task = ["--role", "review", "--model", "gpt-6.1", "--effort", "high",
+                "--image", "/image one.png", "--image", "/image two.png", "--operation", "follow",
+                "--held-role", "reviewer", "--held-design", "design-id", "--family", "codex",
+                "--phase", "3t", "--lens", "contract", "--pass", "4", "--summary", "/summary file",
+                "--early-ready", "/ready file", "--style-since", "abc", "--style-until", "def",
+                "--diff", "/saved diff", "--log", "/saved log", "--id-file", "/saved id",
+                "--from-session-dir", "/former run", "--fix-cause", "keep this cause", "--paths", "/saved paths"]
+        for launcher in ("assign.sh", "assign.py"):
+            with self.subTest(launcher=launcher):
+                saved = ["bash" if launcher.endswith(".sh") else "python3",
+                         str(stop_resume.SCRIPTS / "direct" / launcher), "--new-worker", "former-worker",
+                         "--session-dir", "/old run", "--cwd", "/old tree", "--prompt", "/old prompt", *task]
+                seat = PausedSeat(run_dir=run, seat="review2", role="impl", staff_id="worker-id",
+                                  turn_live=True, launcher_command=saved)
+                rebuilt = shlex.split(stop_resume.resume_worker_command(seat, cwd))
+                self.assertEqual(rebuilt, ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"),
+                                          "--to", "review2", "--session-dir", run, "--cwd", cwd,
+                                          "--prompt", str(Path(run) / "review2.resume-prompt.md"), *task])
+                self.assertEqual(seat["launcher_command"], saved)
+                seat["launcher_command"] = rebuilt
+                self.assertEqual(shlex.split(stop_resume.resume_worker_command(seat, cwd)), rebuilt)
+
+    def test_writer_resume_uses_the_phase_folder_and_has_no_run_paths_fallback(self) -> None:
+        run = str(self.root / "worker run")
+        for phase in ("ad hoc", ""):
+            with self.subTest(phase=phase):
+                command = ["bash", str(stop_resume.SCRIPTS / "direct/implement.sh")]
+                if phase:
+                    command.extend(("--phase", phase))
+                command.extend((run, "/old tree", "old prompt", "impl", "the task", "impl", "writing", "0", "impl"))
+                seat = PausedSeat(run_dir=run, seat="writer", role="impl", staff_id="worker-id",
+                                  turn_live=True, launcher_command=command)
+                rebuilt = shlex.split(stop_resume.resume_worker_command(seat, "/current tree"))
+                options = dict(zip(rebuilt[2::2], rebuilt[3::2]))
+                self.assertEqual(options["--role"], "implement")
+                if phase:
+                    self.assertEqual(options["--paths"], str(Path(run) / "phases/adhoc/files"))
+                else:
+                    self.assertNotIn("--paths", options)
+
+    def test_resume_without_a_launcher_uses_the_shared_last_dispatch(self) -> None:
+        from scripts.direct import progress_history
+
+        run = self.root / "worker run"
+        seat = PausedSeat(run_dir=str(run), seat="worker", role="impl",
+                          staff_id="019b3a40-4250-7000-8000-000000000104", turn_live=True, launcher_command=[])
+        for role in ("review", "test"):
+            with self.subTest(role=role):
+                missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+                dispatch = progress_history.RecordedDispatch(
+                    role, "3t", "contract" if role == "review" else missing,
+                    missing if role == "review" else "/saved/paths.txt")
+                with patch.object(progress_history, "last_dispatch", return_value=dispatch) as read:
+                    command = shlex.split(stop_resume.resume_worker_command(seat, "/current/tree"))
+                read.assert_called_once_with(staff.StaffId(seat["staff_id"]), run)
+                self.assertEqual(command[:2], ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh")])
+                options = dict(zip(command[2::2], command[3::2]))
+                self.assertEqual(options["--role"], role)
+                self.assertEqual(options["--phase"], "3t")
+                self.assertEqual(options["--cwd"], "/current/tree")
+                self.assertEqual(options["--prompt"], str(run / "worker.resume-prompt.md"))
+                if role == "review":
+                    self.assertEqual(options["--lens"], "contract")
+                    self.assertNotIn("--paths", options)
+                else:
+                    self.assertEqual(options["--paths"], "/saved/paths.txt")
+
     def test_recovery_opens_a_fresh_tab_for_a_missing_pane_then_uses_the_shared_resume(self) -> None:
         self.client.rows.clear()
         def open_tab(space: str, title: str, cwd: str, environment: dict[str, str]) -> str:

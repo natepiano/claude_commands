@@ -4830,6 +4830,37 @@ with patch.object(fcntl, "flock", admission):
             expected,
         )
 
+    def test_the_review_writer_preserves_caller_counts_and_phase_identity(self) -> None:
+        self.write_full_config()
+        session = self.start_run("shared-review-writer", 71_200)
+        self.start_phase(session, 71_210)
+        state = self.read_state(session)
+        phase = cast(dict[str, object], state["phase"])
+        metadata = {"unit": "unit Ω", "phase": phase["id"], "phase_instance_id": phase["instance_id"],
+                    "history_file": state["history_file"]}
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.history_dir)}):
+            for number, lens, status, raised in ((1, "contract", "reviewed", 3), (2, "", "error", 7),
+                                                (1, "ux", "void", 2), (1, "contract", "reviewed", 0)):
+                progress_history.write_review_turn(session, metadata, reviewer="reviewer Ω", thread_id="thread",
+                                                   lens=lens, pass_number=number, started_at=71_220,
+                                                   status=status, raised=raised,
+                                                   details={"pool": "pool", "lease_ordinal": 0, "prime_hash": ""})
+        records = [cast(dict[str, object], json.loads(path.read_text()))
+                   for path in (self.history_dir / "review_turns" / session.name).glob("*.json")]
+        self.assertCountEqual([record["raised"] for record in records], [3, 7, 2, 0])
+        self.assertCountEqual([record["kind"] for record in records], ["broad", "closure", "ux", "broad"])
+        self.assertCountEqual([record["status"] for record in records], ["reviewed", "error", "void", "reviewed"])
+        self.assertTrue(all(record["phase_instance_id"] == phase["instance_id"] for record in records))
+        self.assertTrue(all(record["unit"] == "unit Ω" and record["reviewer"] == "reviewer Ω" for record in records))
+        self.assertTrue(all(record["pool"] == "pool" and record["lease_ordinal"] == 0 and record["prime_hash"] == ""
+                            for record in records))
+        self.assertTrue(all(record["pass"] == 2 for record in records if record["kind"] == "closure"))
+        self.assertTrue(all(cast(float, record["finished_at"]) >= cast(int, record["started_at"]) for record in records))
+        self.assertIn("code 3 findings", self.run_command("review-trial", "--session-dir", str(session), at=71_300))
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=71_310)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "next", "--phase-title", "Next", at=71_320)
+        self.assertIn("code 0 findings", self.run_command("review-trial", "--session-dir", str(session), at=71_330))
+
     def phase_review_records(self, session: Path) -> tuple[str, Path]:
         state = self.read_state(session)
         instance = cast(str, cast(dict[str, object], state["phase"])["instance_id"])
@@ -8052,6 +8083,82 @@ class EtaWorkClockTests(unittest.TestCase):
         # Work time: 3600 + grace + 3400 of 3600 + grace + 3600. Wall time read 79%.
         expected = 100.0 * (7_000 + self.grace) / (7_200 + self.grace)
         self.assertAlmostEqual(cast(float, sample["temporal_percent"]), expected, places=3)
+
+
+class LastDispatchTests(StaffTestCase):
+    def dispatch_fixture(self, passes: dict[str, object]) -> tuple[Path, staff.StaffRow]:
+        _, unit, _ = self.tree()
+        worker = fixture_worker("dispatch-worker", unit.id)
+        run = self.root / "dispatch-run"
+        self.write_json(run / unit_runs.STATE_FILE,
+                        {"main_agent": {"session_id": unit.current_session}, "pass": passes})
+        self.enterContext(patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.root / "usage")}))
+        return run, worker
+
+    def test_last_dispatch_returns_the_latest_record_for_the_staff_worker(self) -> None:
+        run, worker = self.dispatch_fixture({
+            "impl": {"instance_id": "first", "worker_name": "former-name", "kind": "impl",
+                     "started_at": 1, "phase": {"id": "3t"}},
+            "test": {"instance_id": "last", "worker_name": "former-name", "kind": "test",
+                     "started_at": 2, "phase": {"id": "3t"}, "paths": "/explicit/paths.txt"},
+            "other": {"instance_id": "peer", "worker_name": "another-worker", "kind": "fix",
+                      "started_at": 3, "phase": {"id": "4"}},
+        })
+        path = run / unit_runs.STATE_FILE
+        self.write_json(run / "mesh_roster.json", {"former-name": {"staff_id": worker.id}})
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        current = staff.native_id(fixture_runtime_id("dispatch-new-session"))
+        _ = staff.update_current_session(worker.id, current)
+        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.RecordedDispatch(
+            "test", "3t", progress_history.DispatchDetailNotRecorded.UNRECORDED, "/explicit/paths.txt"))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_last_dispatch_reports_no_dispatch_without_a_pass_or_role(self) -> None:
+        run, worker = self.dispatch_fixture({})
+        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.NoDispatchRecorded())
+        (run / unit_runs.STATE_FILE).unlink()
+        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.NoDispatchRecorded())
+
+    def test_last_dispatch_reads_the_older_single_pass_shape(self) -> None:
+        run, worker = self.dispatch_fixture({"instance_id": "old", "worker_name": "dispatch-worker",
+                                             "kind": "impl", "phase": {"id": "3t"}})
+        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.RecordedDispatch(
+            "impl", "3t", progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            str(run / "phases/3t/files")))
+
+    def test_last_dispatch_uses_the_canonical_directory_for_a_phase_with_spaces(self) -> None:
+        run, worker = self.dispatch_fixture({"instance_id": "ad-hoc", "worker_name": "dispatch-worker",
+                                             "kind": "fix", "phase": {"id": "ad hoc"}})
+        path = phase_reservation.phase_directory(run, "ad hoc") / phase_reservation.FILES_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("src/fix.py\n")
+        dispatch = progress_history.last_dispatch(worker.id, run)
+        self.assertIsInstance(dispatch, progress_history.RecordedDispatch)
+        assert isinstance(dispatch, progress_history.RecordedDispatch)
+        self.assertEqual(dispatch.paths, str(path))
+        assert isinstance(dispatch.paths, str)
+        self.assertEqual(Path(dispatch.paths).read_text(), "src/fix.py\n")
+
+    def test_last_dispatch_has_no_phase_when_the_worker_has_two_phases(self) -> None:
+        run, worker = self.dispatch_fixture({
+            "impl": {"instance_id": "first", "worker_name": "dispatch-worker", "kind": "impl",
+                     "started_at": 1, "phase": {"id": "3t"}},
+            "test": {"instance_id": "last", "worker_name": "dispatch-worker", "kind": "test",
+                     "started_at": 2, "phase": {"id": "4"}},
+        })
+        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.RecordedDispatch(
+            "test", progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            progress_history.DispatchDetailNotRecorded.UNRECORDED))
+
+    def test_last_dispatch_reads_the_review_lens_from_the_shared_role_log(self) -> None:
+        from scripts.usage import agents_log
+
+        run, worker = self.dispatch_fixture({"review": {
+            "instance_id": "review", "worker_name": "dispatch-worker", "kind": "review", "phase": {"id": "3t"}}})
+        agents_log.append(worker.current_session, "review", "contract", datetime.now(UTC))
+        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.RecordedDispatch(
+            "review", "3t", "contract", progress_history.DispatchDetailNotRecorded.UNRECORDED))
 
 
 class StaffProgressHistoryTests(StaffTestCase):

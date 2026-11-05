@@ -26,12 +26,12 @@ class ImplementLauncherWorkerTests(ImplementLauncherFixture):
 
     def test_live_claim_refuses_a_second_claude_launcher_without_a_pass(self) -> None:
         session = self.start_phase("live-claim")
-        transcript = self.claude_worker(session)
+        _ = self.claude_worker(session)
         claim = session / "impl_claim_impl.json"
-        saved = json.dumps({"pid": os.getpid(), "worker": "fixture-impl", "turn_id": ""})
+        saved = json.dumps({"pid": os.getpid(), "worker": "fixture-impl"})
         _ = claim.write_text(saved)
         before = self.open_passes(session)
-        result = self.claude_follow(session, transcript, "complete")
+        result = self.worker_launch(session, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("claimed by launcher", result.stderr)
         self.assertEqual(self.open_passes(session), before)
@@ -40,10 +40,10 @@ class ImplementLauncherWorkerTests(ImplementLauncherFixture):
 
     def test_stale_claim_recovers_before_a_claude_follow(self) -> None:
         session = self.start_phase("stale-claim")
-        transcript = self.claude_worker(session)
+        _ = self.claude_worker(session)
         claim = session / "impl_claim_impl.json"
-        _ = claim.write_text(json.dumps({"pid": 99999999, "worker": "fixture-impl", "turn_id": ""}))
-        result = self.claude_follow(session, transcript, "complete")
+        _ = claim.write_text(json.dumps({"pid": 99999999, "worker": "fixture-impl"}))
+        result = self.worker_launch(session, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session / "impl_status_impl").read_text(), "implemented\n")
         self.assertFalse(claim.exists())

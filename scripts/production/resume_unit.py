@@ -53,11 +53,10 @@ class RetiredUnitRecovery:
     branch: str
     plan: unit_config.PlanFile | unit_config.StandbyPlan | unit_config.PermanentPlan
     session_id: str
-    display_name: str
 
     def __post_init__(self) -> None:
-        if not self.branch.strip() or not self.session_id.strip():
-            raise Refused(f"{self.name}: recovery requires a branch and session id")
+        if not self.session_id.strip():
+            raise Refused(f"{self.name}: recovery requires a session id")
 
 
 def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = None) -> RetiredUnitRecovery | NoRecoveryRequired:
@@ -87,8 +86,7 @@ def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = Non
     pair = unit_config.place(member.row.id, worktree, cleanup=False)
     if isinstance(pair, unit_config.Both) and not pair.same:
         raise Refused(f"{pair.worktree} and {pair.parked}: configurations differ; no file was changed")
-    return RetiredUnitRecovery(production, name, worktree, member.row.name, saved.plan, member.row.current_session,
-                               display_name=member.row.name)
+    return RetiredUnitRecovery(production, name, worktree, member.row.name, saved.plan, member.row.current_session)
 
 
 def resume_record(production: Production, name: str) -> Path:
@@ -144,7 +142,8 @@ def refusals(unit: RetiredUnitRecovery) -> list[str]:
 
 
 def launch_command(unit: RetiredUnitRecovery) -> list[str]:
-    return [sys.executable, str(ADD_UNIT), "--production", str(unit.production.doc), unit.display_name,
+    # The row name is both the branch and the add_unit name.
+    return [sys.executable, str(ADD_UNIT), "--production", str(unit.production.doc), unit.branch,
             "--resume", unit.session_id, "--cwd", str(unit.worktree), *unit_config.plan_arguments(unit.plan)]
 
 
