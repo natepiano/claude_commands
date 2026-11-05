@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import herdr
 import pane_launch
 import fake_herdr
+from scripts.message import codex_daemon
 from fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
@@ -314,6 +315,11 @@ class NativePaneSessionTests(StaffTestCase):
 
 
 class CodexAnomalyNameTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(patch.object(codex_daemon, "read_daemons", return_value=[]))
+
     def test_codex_managed_daemon_distinguishes_thread_holders(self) -> None:
         managed = ["/opt/bin/codex", "app-server", "--listen", "unix://",
                    "--analytics-default-enabled", "--managed-daemon"]
@@ -347,7 +353,7 @@ class CodexAnomalyNameTests(StaffTestCase):
               patch.object(sessions, "process_start", return_value="fixture-start"),
               redirect_stderr(io.StringIO()) as output):
             self.assertEqual(herdr.running_codex_threads(thread_host=lambda _arguments: False), identities)
-            self.assertEqual(len(output.getvalue().splitlines()), 6)
+            self.assertEqual(len(output.getvalue().splitlines()), 5)
             self.assertTrue(all("Codex thread unknown" in line for line in output.getvalue().splitlines()))
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 _ = herdr.codex_rollout_thread(42)
@@ -357,7 +363,7 @@ class CodexAnomalyNameTests(StaffTestCase):
             self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), {live})
             (proc / "43" / "fd" / "0").unlink()
             self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), set())
-            self.assertEqual(len(output.getvalue().splitlines()), 17)
+            self.assertEqual(len(output.getvalue().splitlines()), 14)
             self.assertTrue(all("Codex thread unknown" in line for line in output.getvalue().splitlines()))
 
     def assert_unknown_codex_note(self, source: Literal["tab", "registry", "pid"]) -> None:
