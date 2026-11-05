@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.production import session_staff as labels, staff
-from scripts.production.staff_test_support import StaffTestCase, unit_membership, fixture_worker
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, unit_membership
 import herdr
 from pane_launch import PaneLaunch
 
@@ -39,32 +39,22 @@ class StatusDiscoveryTests(StaffTestCase):
                 self.assertIsInstance(states["broken"].claude, labels.ClaudeUnknown)
                 self.assertIsInstance(states["healthy"].claude, labels.ClaudeNotRunning)
 
-    def test_duplicate_unknown_and_stopped_processes_have_no_selected_pane(self) -> None:
-        from scripts.production import live_units
-
-        row = unit_membership("show", "broken")
-        healthy = unit_membership("show", "healthy")
-        for state in (labels.ClaudeUnknown("missing record"), labels.ClaudeNotRunning()):
-            with self.subTest(state=state):
-                first = labels.LabeledSession("", state, labels.Place("agents", "w1:p1"),
-                    labels.ObservedProcess(910001, "zsh"), labels.LiveSession(row.current_session))
-                second = replace(first, place=labels.Place("agents", "w2:p1"), process=labels.ObservedProcess(910002, "zsh"))
-                sibling = replace(first, place=labels.Place("agents", "w3:p1"), identity=labels.LiveSession(healthy.current_session))
+    def test_agent_children_select_the_agent_without_an_anomaly(self) -> None:
+        row = unit_membership("show", "unit")
+        row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("claim-after-clear")))
+        place = labels.Place("agents", "w1:p1")
+        children = [labels.LabeledSession("", labels.ClaudeUnknown("child process"), place,
+                    labels.ObservedProcess(910001 + index, command), labels.LiveSession(row.current_session))
+                    for index, command in enumerate(("bevy_brp_mcp", "zsh", "python3", "sleep", "sh", "codex-code-mode-host"))]
+        for command in ("claude", "codex"):
+            with self.subTest(agent=command):
+                agent = replace(children[0], process=labels.ObservedProcess(910099, command))
                 errors = StringIO()
                 with redirect_stderr(errors):
-                    grouped = labels.group_labeled_sessions([first, second, sibling], record=staff.snapshot(),
+                    grouped = labels.group_labeled_sessions([*children, agent], record=staff.snapshot(),
                                                             sources=labels.MemberSources({}, ()))
-                self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                self.assertIn("broken", grouped.faults.get("show", {}), repr(grouped))
-                states = {unit.unit: unit.session for unit in live_units._joined("show", grouped)}  # pyright: ignore[reportPrivateUsage]
-                self.assertTrue(all(unit is not None for unit in states.values()))
-                broken = states["broken"]
-                sibling_state = states["healthy"]
-                assert broken is not None and sibling_state is not None
-                self.assertIsInstance(broken.claude, labels.ClaudeUnknown)
-                self.assertEqual(broken.place, labels.Place("", ""))
-                self.assertIsInstance(broken.process, labels.ProcessUnobserved)
-                self.assertEqual(sibling_state.claude, state)
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(grouped.units, {"show": {row.name: replace(agent, unit=row.name)}})
 
 
 class WorkerRunDiscoveryTests(StaffTestCase):

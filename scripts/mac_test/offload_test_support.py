@@ -31,6 +31,7 @@ else:
     from memory_test_support import write_config_fixture, config_environment
 
 import offload
+import conf
 import mac_test
 import treekey
 from offload_test_commands import COMMAND_STUB, write_shell
@@ -117,9 +118,11 @@ class RemoteClaimRecord(TypedDict):
 
 HANA = offload.KnownRepository("hana")
 
-HANA_COMMAND_PATTERN = "[.]local/state/mac-test/mirror/hana([/'\"[:space:]]|$)"
+FIXTURE_MIRROR_ROOT = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root").removeprefix("~/")
 
-HANA_CWD_PATTERN = "^n.*/[.]local/state/mac-test/mirror/hana(/|$)"
+HANA_COMMAND_PATTERN = offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana([/'\"[:space:]]|$)"
+
+HANA_CWD_PATTERN = "^n.*/" + offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana(/|$)"
 
 CLAIM_STUB = r'''
 from __future__ import annotations
@@ -576,7 +579,7 @@ raise SystemExit(offload.main())
         self.assertIn("awk -v pattern=\"$mirror_cwd_pattern\" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'", remote)
         self.assertNotIn("pkill", remote)
         self.assertNotIn("PIPESTATUS", remote)
-        self.assertNotIn(".local/state/mac-test/mirror/", remote.replace("[.]local/state/mac-test/mirror/", ""))
+        self.assertNotIn(FIXTURE_MIRROR_ROOT + "/", remote.replace(offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/", ""))
 
     def remote_claim(self) -> RemoteClaimRecord:
         return cast(RemoteClaimRecord, json.loads(self.claim_file.read_text()))
