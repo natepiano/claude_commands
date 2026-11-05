@@ -1727,6 +1727,7 @@ Files: scripts/herdr/herdr.py (`prompt_input_state` and a small helper beside it
 4. Pending kinds (F019): a folder-only move and a pending rename are distinct journal variants, not `FolderMove.name == ""`.
 5. Order (F020): set the displays before the folder and branch move (rule 2).
 6. Do not change `unit_move.observe()`; shutdown's fix3 owns it.
+7. Hana owner (sdlc merge gate on 63ba5e6a6, 2026-11-04): 4e removed `SHOWRUNNER_UNIT_ID`. `hana_shot.launch` sets `HANA_TEST_OWNER` from `--owner`, else from the caller's staff row: the caller's unit name (a worker's parent unit), found by `staff.runtime_id()` in the local staff record. No row or an unreadable record gives an empty owner. `hana_instances.is_test_hana` keeps `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` as agent markers. The tests change with it.
 
 The restart deadline (F007) moved to shutdown-unit Phase 4l.
 
@@ -1737,6 +1738,9 @@ The restart deadline (F007) moved to shutdown-unit Phase 4l.
 - `scripts/production/unit_move.py` — recovery identity and journal variants.
 - `scripts/production/test_rename_unit.py` — tests.
 - `scripts/production/test_unit_move.py` — tests.
+- `scripts/hana_shot/hana_shot.py`, `scripts/hana_shot/test_hana_shot.py` — owner from the staff row (item 7).
+- `scripts/hana_instances/test_hana_instances.py` — native agent markers (item 7).
+- `docs/as-built/hana-test-windows.md` — owner and marker text (item 7).
 
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: moved: shutdown-unit (sdlc, 2026-11-04)
 
