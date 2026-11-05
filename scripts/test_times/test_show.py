@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import chdir, closing, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 import io
 import os
@@ -22,9 +22,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
-    from ..buildlog import record, store
+    from ..buildlog import parse, record, store
     from ..buildlog.index import index_path_in
-    from ..buildlog.test_index import encode
+    from ..buildlog.test_index import call, configure_cleanup, encode, step
+    from ..lib.rerun_test_support import initialize_repository
     from ..lint.memory_test_support import write_config_fixture
     from ..production.gate_modules import discover_test_modules
     from . import gate_record, show
@@ -33,9 +34,10 @@ if TYPE_CHECKING:
 else:
     # Import show first because it adds the build log folder to the import path.
     from scripts.test_times import gate_record, show
-    from scripts.buildlog import record, store
+    from scripts.buildlog import parse, record, store
     from index import index_path_in
-    from test_index import encode
+    from test_index import call, configure_cleanup, encode, step
+    from scripts.lib.rerun_test_support import initialize_repository
     from scripts.lint.memory_test_support import write_config_fixture
     from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
@@ -43,6 +45,7 @@ else:
 
 EPOCH = datetime(2026, 11, 3, 14, 30, tzinfo=UTC).timestamp()
 HOST = store.host_name()
+TOOL_IDENTITY = record.recorded_repository_key(["git"], str(Path(__file__).resolve().parents[2]))
 REPORT_COMMANDS = (("top",), ("suites",), ("suite", "tools"),
                    ("module", "tools/test_alpha.py"), ("test", "target"))
 
@@ -97,6 +100,7 @@ class TestTimesTests(unittest.TestCase):
             "BUILDLOG_DIR": str(self.log), "CONF_DIR": str(self.config),
             "HOME": str(self.root / "home"), "USER_ZONE": "America/New_York",
         }))
+        _ = configure_cleanup(self, self.log)
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7")
         _ = write_config_fixture(self.config / "buildlog.conf")
         _ = self.enterContext(mock.patch.object(show, "datetime", ReportTime))
@@ -104,6 +108,31 @@ class TestTimesTests(unittest.TestCase):
             path = self.repo / "scripts" / "tools" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_text("# A live fixture module.\n", encoding="utf-8")
+        initialize_repository(self.repo, self.root / "claude-origin.git", os.environ)
+        _ = subprocess.run(["git", "-C", str(self.repo), "remote", "set-url", "origin", TOOL_IDENTITY],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = self.enterContext(chdir(self.repo))
+
+    def repository(self, name: str) -> tuple[Path, str]:
+        path = self.root / name
+        path.mkdir()
+        initialize_repository(path, self.root / f"{name}-origin.git", os.environ)
+        return path, record.recorded_repository_key(["git"], str(path))
+
+    def write_nextest(self, repository: tuple[Path, str], text: str, *, epoch: float = EPOCH,
+                      host: str = HOST, call_id: str = "", caller: str = "test") -> None:
+        self.next_id += 1
+        path, identity = repository
+        argv = ["cargo", "nextest", "run", "--workspace"]
+        entry = step(
+            f"nextest-{self.next_id}", step="nextest", argv=argv, host=host, call_id=call_id,
+            started_at=store.utc_iso(epoch), ended_at=store.utc_iso(epoch + 30),
+            cwd=str(path), worktree=str(path), repo_path=str(path), caller=caller, repo_identity=identity,
+            **parse.log_facts("nextest", text),
+        )
+        if identity == store.UNKNOWN_IDENTITY:
+            del entry["repo_path"]
+        store.append_line(store.host_file(host, epoch), entry)
 
     def write_run(self, modules: list[ModuleRun], *, epoch: float = EPOCH,
                   host: str = HOST, aborted: bool = False, status: int = 0,
@@ -136,8 +165,14 @@ class TestTimesTests(unittest.TestCase):
         return lines[0]
 
     def cell(self, output: str, row: str, header: str) -> str:
-        headings = list(re.finditer(r"\S.*?(?= {2,}|$)", output.splitlines()[0]))
-        index = [match.group() for match in headings].index(header)
+        for line in output.splitlines():
+            headings = list(re.finditer(r"\S.*?(?= {2,}|$)", line))
+            names = [match.group() for match in headings]
+            if header in names:
+                break
+        else:
+            self.fail(f"The report has no {header} column: {output}")
+        index = names.index(header)
         start = headings[index].start()
         end = headings[index + 1].start() if index + 1 < len(headings) else len(row)
         return row[start:end].strip()
@@ -185,6 +220,134 @@ class TestTimesTests(unittest.TestCase):
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
         changed = self.report("top", "--repo", str(self.repo))
         self.assertLess(changed.index("types/basedpyright"), changed.index("tools/test_alpha.py"))
+
+    def test_top_ranks_only_the_working_repository_on_the_current_host_within_the_age_limit(self) -> None:
+        hana = self.repository("hana")
+        other = self.repository("other")
+        for offset, duration in enumerate((2.0, 8.0, 4.0)):
+            self.write_nextest(hana, f"        PASS [ {duration:.3f}s] hana-bin tests::shared\n",
+                               epoch=EPOCH + offset * 60)
+        self.write_nextest(hana, "        PASS [ 6.000s] other-bin tests::shared\n")
+        self.write_nextest(other, "        PASS [ 900.000s] hana-bin tests::shared\n"
+                           + "        PASS [ 900.000s] other-bin tests::other_repository\n")
+        self.write_nextest(hana, "        PASS [ 800.000s] hana-bin tests::shared\n"
+                           + "        PASS [ 800.000s] hana-bin tests::other_host\n", host="other-host")
+        self.write_nextest(hana, "        PASS [ 700.000s] hana-bin tests::shared\n"
+                           + "        PASS [ 700.000s] hana-bin tests::old\n", epoch=EPOCH - 8 * 86400)
+        folder = hana[0] / "crates" / "widget"
+        folder.mkdir(parents=True)
+        with chdir(folder):
+            output = self.report("top")
+        with chdir(other[0]):
+            self.assertEqual(self.report("top", "--repo", str(hana[0])), output)
+        first = self.line(output, "other-bin")
+        second = self.line(output, "hana-bin")
+        self.assertLess(output.index(first), output.index(second))
+        self.assertEqual(self.cell(output, first, "median s"), "6.000")
+        self.assertEqual(self.cell(output, second, "median s"), "4.000")
+        self.assertEqual(self.cell(output, second, "runs kept"), "3")
+        for excluded in ("other_repository", "other_host", "tests::old"):
+            self.assertNotIn(excluded, output)
+        self.assertIn(hana[1], output)
+        self.assertIn(HOST, output)
+        self.assertIn("1.000", output)
+
+    def test_top_uses_the_same_relative_origin_from_the_root_and_a_subdirectory(self) -> None:
+        hana = self.repository("hana")
+        _ = subprocess.run(["git", "-C", str(hana[0]), "remote", "set-url", "origin", "../hana-origin.git"],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.write_nextest(hana, "        PASS [ 2.000s] hana tests::relative_origin\n")
+        nested = hana[0] / "crates" / "widget"
+        nested.mkdir(parents=True)
+        with chdir(hana[0]):
+            expected = self.report("top")
+        with chdir(nested):
+            output = self.report("top")
+        self.assertEqual(output, expected)
+        self.assertEqual(self.cell(output, self.line(output, "tests::relative_origin"), "median s"), "2.000")
+
+    def test_top_selects_mac_history_on_natedev_only_with_the_host_argument(self) -> None:
+        hana = self.repository("hana")
+        mac_host = "Nates-MacBook-Pro-2023"
+        self.write_nextest(hana, "        PASS [ 2.000s] hana tests::linux\n", host="natedev")
+        self.write_nextest(hana, "        PASS [ 4.000s] hana tests::mac\n", host=mac_host)
+        with chdir(hana[0]), mock.patch.object(socket, "gethostname", return_value="natedev"):
+            local = self.report("top")
+            remote = self.report("top", "--host", mac_host)
+        self.assertIn("tests::linux", local)
+        self.assertNotIn("tests::mac", local)
+        self.assertIn("host: natedev;", local)
+        self.assertNotIn("tests::linux", remote)
+        self.assertIn(f"host: {mac_host};", remote)
+        self.assertEqual(self.cell(remote, self.line(remote, "tests::mac"), "median s"), "4.000")
+
+    def test_nextest_heading_reads_the_recording_threshold_at_each_report(self) -> None:
+        hana = self.repository("hana")
+        self.write_nextest(hana, "        PASS [ 2.000s] hana tests::recorded\n")
+        with chdir(hana[0]):
+            before = self.report("top")
+            _ = write_config_fixture(self.config / "test_times.conf", "NEXTEST_SLOW_TEST_S=3.0")
+            after = self.report("top")
+        self.assertIn("recorded threshold: > 1.000 s", before)
+        self.assertIn("recorded threshold: > 3.000 s", after)
+        self.assertEqual(self.cell(after, self.line(after, "tests::recorded"), "median s"), "2.000")
+
+    def test_top_keeps_the_module_view_from_the_claude_working_directory(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        self.write_nextest((self.repo, TOOL_IDENTITY), "        PASS [ 40.000s] claude-bin tests::nextest\n")
+        expected = self.report("top", "--repo", str(self.repo))
+        with chdir(self.repo / "scripts" / "tools"):
+            output = self.report("top")
+        self.assertEqual(output, expected)
+        self.assertEqual(self.cell(output, self.line(output, "tools/test_alpha.py"), "median s"), "8.000")
+        self.assertNotIn("claude-bin", output)
+
+    def test_top_ranks_a_mac_mirror_test_under_the_repository_of_its_natedev_call(self) -> None:
+        hana, identity = self.repository("hana")
+        mirror = self.root / "mirror"
+        mirror.mkdir()
+        mac_host = "Nates-MacBook-Pro-2023"
+        self.write_nextest((mirror, store.UNKNOWN_IDENTITY), "        PASS [ 2.000s] hana tests::mac_mirror\n",
+                           host=mac_host, call_id="served-call", caller="verify-mac")
+        for entry in (
+            call("served-call", repo_path=str(hana)),
+            step("repository-evidence", call_id="served-call", repo_path=str(hana),
+                 repo_identity=identity),
+        ):
+            store.append_line(store.host_file("natedev", EPOCH), entry)
+        with chdir(hana), mock.patch.object(socket, "gethostname", return_value=mac_host):
+            output = self.report("top")
+        row = self.line(output, "tests::mac_mirror")
+        self.assertEqual(self.cell(output, row, "median s"), "2.000")
+        self.assertEqual(self.cell(output, row, "runs kept"), "1")
+        self.assertIn(identity, output)
+        self.assertIn(mac_host, output)
+
+    def test_top_uses_passed_durations_and_places_failure_only_tests_last_by_time(self) -> None:
+        hana = self.repository("hana")
+        self.write_nextest(hana, "        PASS [ 2.000s] hana tests::mixed\n"
+                           + "        PASS [ 1.250s] hana tests::fast\n")
+        self.write_nextest(hana, "  TRY 2 PASS [ 4.000s] hana tests::mixed\n", epoch=EPOCH + 30)
+        self.write_nextest(hana, "        FAIL [ 90.000s] hana tests::mixed\n", epoch=EPOCH + 60)
+        self.write_nextest(hana, "     TIMEOUT [ 80.000s] hana tests::mixed\n"
+                           + "     TIMEOUT [ 70.000s] hana tests::timeout_only\n", epoch=EPOCH + 120)
+        self.write_nextest(hana, "        FAIL [ 60.000s] hana tests::failure_only\n", epoch=EPOCH + 180)
+        with chdir(hana[0]):
+            output = self.report("top")
+        ordered = [self.line(output, name)
+                   for name in ("tests::mixed", "tests::fast", "tests::timeout_only", "tests::failure_only")]
+        positions = [output.index(line) for line in ordered]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(self.cell(output, ordered[0], "median s"), "3.000")
+        self.assertEqual(self.cell(output, ordered[0], "runs kept"), "4")
+        self.assertEqual(self.cell(output, ordered[0], "failed / timed out"), "2")
+        for line in ordered[2:]:
+            self.assertEqual(self.cell(output, line, "median s"), "")
+            self.assertEqual(self.cell(output, line, "runs kept"), "1")
+            self.assertEqual(self.cell(output, line, "failed / timed out"), "1")
+        self.assertEqual(self.cell(output, ordered[0], "last s"), "80.000")
+        self.assertEqual(self.cell(output, ordered[2], "last s"), "70.000")
+        self.assertEqual(self.cell(output, ordered[3], "last s"), "60.000")
 
     def test_top_excludes_failed_aborted_old_and_other_checkout_rows_before_the_run_limit(self) -> None:
         self.write_run([module_run("test_alpha.py", 4.0), module_run("test_beta.py", 6.0)])
