@@ -469,6 +469,7 @@ class CommandLine(argparse.Namespace):
     group: next_moves.NextMoveGroup = "units"
     percent: float = 0
     hold_mode: next_moves.HoldMode = next_moves.FixedHold(0)
+    fallback_targets: list[str] = []
     next_expect: list[str] = []
     next_position: next_moves.GroupPosition = next_moves.GroupPosition(1)
     next_destination: next_moves.GroupPosition = next_moves.GroupPosition(1)
@@ -2785,11 +2786,7 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS
                  ) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Stop workers and retain their staff rows until assign.sh can restart them."""
-    from scripts.production import staff, session_staff
-    from scripts.production.worker_admission import AdmissionRefused
-    from scripts.agents.codex_mesh import stop_worker_for_switch
-    stop = cast(Callable[[str], stop_results.Stopped | stop_results.NotRunning | stop_results.StopFailed | stop_results.SessionNotFound],
-                import_module("scripts.shutdown.stop_resume").stop)
+    from scripts.production import staff, session_staff, worker_admission
 
     del why
     target = note_file.canonical_label(target)
@@ -2822,19 +2819,12 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
             with staff.row_operation(row.id):
                 if reason := restart_refusal(row.id):
                     raise AccountsError(f"{reason}; source remains running")
-                stopped = stop(row.id)
-                if isinstance(stopped, stop_results.SessionNotFound):
-                    raise AccountsError("source reference is unresolved")
-                if isinstance(stopped, stop_results.StopFailed):
-                    raise AccountsError(stopped.reason)
-                if isinstance(stopped, stop_results.NotRunning) and isinstance(record.backends.get(row.id), staff.CodexBackend):
-                    runs = runs_by_worker.get(row.id, ())
-                    if not runs:
-                        raise AccountsError("source thread stop is unresolved; no run reference")
-                    stop_worker_for_switch(row, runs)
+                released = worker_admission.release_source(row, lambda: runs_by_worker.get(row.id, ()), record)
+                if not isinstance(released, worker_admission.SourceReleased):
+                    raise AccountsError(released.reason)
                 results.append(stop_results.ResumePending(row.id, target,
                     "assign.sh cannot carry the staff id and destination account yet"))
-        except (OSError, ValueError, AccountsError, AdmissionRefused, staff.StaffRefused) as error:
+        except (OSError, ValueError, AccountsError, staff.StaffRefused) as error:
             results.append(SessionMoveRefused(row.id, str(error).replace("\n", " ")))
     outcomes = tuple(results)
     stdout, stderr, code = _move_output(outcomes, ())
@@ -5094,6 +5084,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = next_add.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
     _ = next_add.add_argument("percent", type=float)
     _ = next_add.add_argument("label")
+    _ = next_add.add_argument("--else", dest="fallback_targets", action="append", default=[])
     hold_options = next_add.add_mutually_exclusive_group()
     _ = hold_options.add_argument("--hold-minutes", dest="hold_mode",
                                   type=lambda text: next_moves.FixedHold(float(text)), default=next_moves.FixedHold(0))
@@ -5173,7 +5164,8 @@ def group_half_point_hold(group: ClaudeGroup, now: datetime, *, account_config: 
 
 def validate_next_move_target(entry: next_moves.NextMove) -> None:
     if isinstance(entry, next_moves.ClaudeGroupMove):
-        _ = claude_account_dir(entry.to)
+        for target in (entry.to, *entry.fallback_targets):
+            _ = claude_account_dir(target)
     elif isinstance(entry.to, next_moves.CodexWorkersTarget):
         _ = check_codex_target(entry.to.label, accounts_home() / ".codex", repair=False)
     elif isinstance(entry.to.account, next_moves.ClaudeWorkersTarget):
@@ -5220,10 +5212,11 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
                 if role_map.is_role_map_host():
                     candidate = next_moves.decode_next_moves(json.dumps([dict(id="validation", group=options.group,
                         at_percent=options.percent, **next_moves.encode_hold_mode(options.hold_mode), to=options.label,
+                        **{"else": options.fallback_targets},
                         added_at=datetime.now(timezone.utc).isoformat())]))[0]
                     validate_next_move_target(candidate)
                 _ = next_moves.add_next_move(options.group, options.percent, options.label,
-                                             options.hold_mode, insertion=options.insertion)
+                                             options.hold_mode, fallback_targets=tuple(options.fallback_targets), insertion=options.insertion)
                 print(next_moves.list_next_moves() if role_map.is_role_map_host()
                       else f"added {options.group} account move")
             elif options.next_action == "remove":

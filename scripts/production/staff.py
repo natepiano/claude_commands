@@ -630,8 +630,15 @@ def row_operation(reference: str) -> Generator[None]:
     if row is None:
         yield
         return
-    variable = "STAFF_ROW_FD_" + str(row.id)
-    path = _file().parent / "rows" / f"{row.id}.lock"
+    with slot_operation(str(row.id), row.name):
+        yield
+
+
+@contextmanager
+def slot_operation(key: str, name: str) -> Generator[None]:
+    """Lock a row or a named worker slot across inherited children."""
+    variable = "STAFF_ROW_FD_" + key
+    path = _file().parent / "rows" / f"{key}.lock"
     if _joined_operation(path, variable):
         yield
         return
@@ -640,7 +647,7 @@ def row_operation(reference: str) -> Generator[None]:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise StaffRefused(f"{row.name}: another operation holds this row") from error
+            raise StaffRefused(f"{name}: another operation holds this row") from error
         previous = os.environ.get(variable)
         os.environ[variable] = str(lock.fileno())
         try:

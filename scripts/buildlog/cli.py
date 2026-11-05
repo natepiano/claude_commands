@@ -364,7 +364,7 @@ def main(argv: list[str]) -> int:
             return 2
         taken = sample.sample()
         try:
-            _ = memory.write_snapshot(taken.at, taken.host, taken.slices)
+            memory.write_snapshot(taken.at, taken.host)
         except (OSError, ValueError) as error:
             print(f"buildlog sample: memory snapshot unavailable: {error}", file=sys.stderr)
         if taken.host == "natedev":

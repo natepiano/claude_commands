@@ -17,7 +17,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.test_times import gate_record
-from scripts.buildlog import record
+from scripts.buildlog import record, store
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.test_times.gate_record import ModuleTimes, TestTime
 from scripts.test_times.gate_record_test_support import gate_run, module_times
 
@@ -39,6 +40,7 @@ class GateRecordTests(unittest.TestCase):
             "CONF_DIR": str(self.config), "BUILDLOG_DIR": str(self.buildlog),
             "HOME": str(self.root / "home"),
         }))
+        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=0.5")
 
     def write_json(self, value: object) -> None:
         _ = self.timing_path.write_text(json.dumps(value), encoding="utf-8")
@@ -150,9 +152,8 @@ class GateRecordTests(unittest.TestCase):
             gate_record.Execution("notify", "test_b.py", 8.0, 6.0, 16.0, 0, "", times),
             gate_record.Execution("notify", "test_a.py", 9.0, 7.0, 17.0, 0, "", times),
         ]
-        with mock.patch.object(gate_record, "slow_test_s", return_value=1.25) as threshold:
-            modules = gate_record.module_runs(executions)
-        threshold.assert_called_once_with()
+        modules = gate_record.module_runs(executions, 1.25)
+        self.assertEqual(gate_record.module_runs([], 1.25), [])
         self.assertEqual([row["attempt"] for row in modules], [1, 1, 1, 2, 1, 2])
         self.assertEqual(len(modules), len(executions))
         for execution, row in zip(executions, modules, strict=True):
@@ -172,18 +173,6 @@ class GateRecordTests(unittest.TestCase):
                              (0, 0, 0, 0, 0.0))
             self.assertEqual(row["tests"], [])
             self.assertEqual(row["times_missing"], reason)
-
-    def test_module_runs_do_not_read_the_threshold_without_test_times(self) -> None:
-        executions = [
-            gate_record.Execution("hooks", "test_a.py", 1.0, 0.5, 12.0, 1, "",
-                                  gate_record.NoModuleTimes("missing file")),
-            gate_record.Execution(*gate_record.TYPE_CHECK_JOB, 2.0, 1.0, 13.0, 0, "",
-                                  gate_record.TimingNotApplicable()),
-        ]
-        with mock.patch.object(gate_record, "slow_test_s", side_effect=AssertionError("No threshold is needed")):
-            modules = gate_record.module_runs(executions)
-            self.assertEqual(gate_record.module_runs([]), [])
-        self.assertEqual([row["times_missing"] for row in modules], ["missing file", ""])
 
     def test_record_warning_replaces_newlines_with_spaces(self) -> None:
         stderr = io.StringIO()
@@ -218,7 +207,41 @@ class GateRecordTests(unittest.TestCase):
             self.assertIsInstance(row["id"], str)
             self.assertTrue(str(row["id"]).startswith(f'{row["host"]}-'))
             self.assertEqual({key: row[key] for key in run}, run)
+            self.assertEqual(row["slow_test_s"], 0.5)
+            self.assertEqual(row["tests_run"], 2)
         self.assertNotEqual(rows[0]["id"], rows[1]["id"])
+
+    def test_gate_write_keeps_the_used_threshold_and_counts_each_module_attempt(self) -> None:
+        config = self.config / "test_times.conf"
+        _ = write_config_fixture(config, "SLOW_TEST_S=0.75")
+        threshold = gate_record.slow_test_s()
+        first = module_times()
+        first["tests_run"] = 3
+        retry = module_times()
+        retry["tests_run"] = 5
+        other = module_times()
+        other["tests_run"] = 7
+        run = gate_run()
+        run["slow_test_s"] = threshold
+        run["modules"] = gate_record.module_runs([
+            gate_record.Execution("tools", "test_a.py", 3.0, 2.0, 12.0, 143, "hold", first),
+            gate_record.Execution("tools", "test_a.py", 4.0, 3.0, 13.0, 0, "", retry),
+            gate_record.Execution("tools", "test_b.py", 5.0, 4.0, 14.0, 0, "", other),
+            gate_record.Execution("tools", "test_missing.py", 1.0, 0.5, 10.0, 1, "",
+                                  gate_record.NoModuleTimes("runner stopped")),
+            gate_record.Execution(*gate_record.TYPE_CHECK_JOB, 2.0, 1.0, 11.0, 0, "",
+                                  gate_record.TimingNotApplicable()),
+        ], threshold)
+        _ = write_config_fixture(config, "SLOW_TEST_S=1.25")
+        gate_record.write_gate_run(run)
+        entries = [entry for path in self.buildlog.glob("*/*.jsonl") for entry in store.locked_rows(path)]
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["slow_test_s"], 0.75)
+        self.assertEqual(entry["tests_run"], 15)
+        self.assertEqual(entry["modules"], run["modules"])
+        self.assertEqual([test["test"] for test in run["modules"][0]["tests"]],
+                         ["Example.test_pass", "Example.test_fail"])
 
     def test_gate_write_failure_reports_one_line_and_returns(self) -> None:
         _ = self.buildlog.write_text("This file blocks the output directory.\n", encoding="utf-8")

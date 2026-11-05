@@ -17,7 +17,7 @@ import re
 import shlex
 from collections.abc import Mapping
 from pathlib import Path, PurePath
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 
@@ -45,7 +45,6 @@ SUMMARY = re.compile(r"^\s*Summary \[\s*[\d.]+s\]\s+(\d+)(?:/\d+)? tests? run:(.
 NOT_RESULT = frozenset({"START", "DELAY", "RETRY", "CANCEL", "SKIP", "FLAKY", "SETUP"})
 PASSED = frozenset({"PASS", "LEAK", "TMPASS"})
 TIMED_OUT = frozenset({"TIMEOUT", "TMT"})
-SLOW_TEST_S = 1.0
 
 MEND_APPLIED = re.compile(r"^\s*mend: applied\b(.*)$")
 MEND_NONE = re.compile(r"^\s*mend: no\b.*\bfix(?:es)? available")
@@ -262,12 +261,22 @@ def result_status(word: str) -> str:
     return "failed"
 
 
+def nextest_slow_test_s() -> float:
+    """Read the nextest recording threshold at use."""
+    if TYPE_CHECKING:
+        from ..lib import conf
+    else:
+        from scripts.lib import conf
+
+    return conf.read("test_times").number("NEXTEST_SLOW_TEST_S")
+
+
 def test_results(lines: list[str]) -> tuple[list[TestRow], list[Summary]]:
     """Per-test rows worth keeping, and the Summary counts.
 
     Only lines before the Summary count: nextest reprints the failed and flaky
     ones after it. A row is kept for a test that failed, was retried, ran past
-    SLOW_TEST_S or was reported SLOW; the counts cover every test.
+    NEXTEST_SLOW_TEST_S or was reported SLOW; the counts cover every test.
     """
     tests: dict[tuple[str, str], TestRow] = {}
     summaries: list[Summary] = []
@@ -296,13 +305,16 @@ def test_results(lines: list[str]) -> tuple[list[TestRow], list[Summary]]:
             row["attempts"] = attempt
             row["status"] = result_status(word)
             row["duration_s"] = float(duration)
+    if not tests:
+        return [], summaries
+    slow_test_s = nextest_slow_test_s()
     rows: list[TestRow] = []
     for row in tests.values():
         if row["attempts"] == 0:
             row["attempts"] = 1
         if row["status"] == "passed" and row["attempts"] > 1:
             row["status"] = "flaky"
-        if row["status"] != "passed" or row["attempts"] > 1 or row["slow"] or (row["duration_s"] or 0) > SLOW_TEST_S:
+        if row["status"] != "passed" or row["attempts"] > 1 or row["slow"] or (row["duration_s"] or 0) > slow_test_s:
             rows.append(row)
     return rows, summaries
 
@@ -355,3 +367,21 @@ def log_facts(step: str, text: str) -> LogFacts:
     if step == "sweep":
         facts["sweep_freed_bytes"] = sweep_freed(lines)
     return facts
+
+def test_threads(argv: list[str]) -> int | None:
+    """Return nextest's explicitly requested test width, when it is numeric."""
+    for index, argument in enumerate(argv):
+        value: str | None = None
+        if argument in ("--test-threads", "-j"):
+            if index + 1 < len(argv):
+                value = argv[index + 1]
+        elif argument.startswith("--test-threads="):
+            value = argument.removeprefix("--test-threads=")
+        elif argument.startswith("-j") and len(argument) > 2:
+            value = argument[2:]
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None

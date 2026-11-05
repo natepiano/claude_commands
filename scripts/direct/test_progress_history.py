@@ -5453,13 +5453,13 @@ with patch.object(fcntl, "flock", admission):
         session_dir = self.start_run("early-phase", started_at)
         self.start_phase_and_pass(session_dir, started_at)
         _ = self.run_command(
-            "arm-review", "--session-dir", str(session_dir), "--phase-id", "3", "--lens", "adversary",
+            "arm-review", "--session-dir", str(session_dir), "--phase-id", "3", "--lens", "adversary", "--worker", "review7",
             "--activity", "reviewing the diff the writer is still producing", at=started_at + 100,
         )
         state = cast(dict[str, object], json.loads((session_dir / "progress_history_state.json").read_text()))
         armed = cast(dict[str, object], state["early_review"])
-        self.assertEqual(armed["status_file"], str(session_dir / "phases" / "3" / "review_status_adversary"))
-        self.assertEqual(armed["pid_file"], str(session_dir / "phases" / "3" / "review_pid_adversary"))
+        self.assertEqual(armed["status_file"], str(session_dir / "phases" / "3" / "review7_status_adversary"))
+        self.assertEqual(armed["pid_file"], str(session_dir / "phases" / "3" / "review7_pid_adversary"))
 
     def test_an_early_review_runs_as_its_own_row_beside_the_open_pass(self) -> None:
         """The one moment two agents work at once, shown as two running rows."""

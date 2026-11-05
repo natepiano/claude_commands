@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.production.cli_fixture import process_boundary
+
 from argparse import Namespace
 from collections.abc import Callable
 import json
@@ -234,6 +236,8 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Phase 14 is not open (open phases: 15, 16)", result.stderr)
 
+    # Keep process persistence coverage.
+    @process_boundary
     def test_ids_are_stable_across_rounds(self) -> None:
         self.assertEqual(self.open_finding("blocker", "first"), "F001")
         self.assertEqual(self.open_finding("minor", "second"), "F002")
@@ -511,6 +515,8 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(payload["verdict"], "dispatch")
         self.assertIsNone(payload["advisory"])
 
+    # Keep process configuration coverage.
+    @process_boundary
     def test_an_unusable_config_value_stops_the_run(self) -> None:
         """A bad value is an error, not a fall back to some compiled limit."""
         self.write_config("MIN_REPAIR_BUDGET=zero\n")

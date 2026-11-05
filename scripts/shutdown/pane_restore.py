@@ -24,8 +24,7 @@ import pane_launch  # noqa: E402
 import pane_record  # noqa: E402
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.shutdown.codex_trust import trust_arguments
-import sessions  # noqa: E402
-from scripts.production import staff, staff_sources  # noqa: E402
+from scripts.production import staff  # noqa: E402
 from scripts.whoami.account import named_account_environment  # noqa: E402
 
 START_TIMEOUT_MS = 90_000
@@ -50,7 +49,7 @@ class ResolvedResume:
 
 
 def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession,
-            launch: pane_record.PaneLaunch | ResolvedResume) -> None:
+            launch: pane_record.PaneLaunch | ResolvedResume, *, reported_unknown: str = "") -> None:
     if isinstance(launch, ResolvedResume):
         original, proof = launch.original, launch.proof
     else:
@@ -66,7 +65,7 @@ def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession,
     title = entry["name"] or pane.label
     launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], environment, kind,
         trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)),
-        herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
+        herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title, reported_unknown=reported_unknown)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(launched.reason)
     path = pane_record.record_path(session)
@@ -90,14 +89,7 @@ def restore(session: str, *, dry_run: bool) -> int:
     except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
         print(f"pane_restore: retained launch repair failed: {error}", file=sys.stderr)
     entries = pane_record.read(session)
-    live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
-    codex_unknown = ""
-    if any(pane_launch.agent_kind(entry) == "codex" for entry in entries.values()):
-        try:
-            live.update(herdr.running_codex_threads(thread_host=staff_sources.codex_thread_host))
-        except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
-            codex_unknown = str(error)
-            print(f"pane_restore: Codex liveness anomaly: {error}", file=sys.stderr)
+    live: set[str] = set()
     failures = 0
     for pane in client.tab_sessions():
         saved = entries.get(pane.pane_id)
@@ -105,9 +97,13 @@ def restore(session: str, *, dry_run: bool) -> int:
             entry = names.resume(saved) if saved is not None else None
             if entry is not None:
                 entry["environment"] = names.environment(entry)
-            if entry is not None and pane_launch.agent_kind(entry) == "codex" and codex_unknown:
-                raise herdr.HerdrFailure(f"cannot exclude a running copy: {codex_unknown}")
             label = entry["name"] if entry is not None and entry["name"] else pane.label
+            observed = (herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))
+                        if entry is not None else herdr.StoppedConversation())
+            if isinstance(observed, herdr.LiveConversation) and entry is not None:
+                live.add(entry["session_id"])
+            elif isinstance(observed, herdr.UnknownConversation):
+                herdr.conversation_note(observed)
             reason = skip_reason(pane, entry, live)
             if entry is None or reason:
                 if reason:
@@ -124,14 +120,16 @@ def restore(session: str, *, dry_run: bool) -> int:
                 current_names = LaunchNames.read()
                 entry = current_names.resume({**saved, "session_id": reference})
                 entry["environment"] = current_names.environment(entry)
-                current_live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
-                if pane_launch.agent_kind(entry) == "codex":
-                    current_live.update(herdr.running_codex_threads(thread_host=staff_sources.codex_thread_host))
-                if entry["session_id"] in current_live:
+                current = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))
+                if isinstance(current, herdr.UnknownConversation) and not isinstance(observed, herdr.UnknownConversation):
+                    herdr.conversation_note(current)
+                if isinstance(current, herdr.LiveConversation):
                     print(f"{pane.pane_id} {label}: unchanged")
                     continue
                 with herdr.restore_staff(current_names.tab_record, labels=current_names.labels):
-                    _resume(session, client, pane, ResolvedResume(saved, current_names.resume_proof(saved, entry)))
+                    _resume(session, client, pane, ResolvedResume(saved, current_names.resume_proof(saved, entry)),
+                            reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
+                                              observed.reason if isinstance(observed, herdr.UnknownConversation) else ""))
             live.add(entry["session_id"])
             print(f"{pane.pane_id} {label}: resumed {entry['session_id']}")
         except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
