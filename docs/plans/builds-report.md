@@ -232,7 +232,7 @@ The user, 2026-11-03: tables do not work for them. Lower priority. Design a char
 #### As-built
 
 - Design: `docs/plans/builds-report-charts-design.md`. The user said "go" on 2026-11-03, relayed by builds.
-- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html` and opens it. The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
+- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.py` and prints the tailnet link (Phase 22). The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
 - Charts: hana phase time (daily median and p90), costs by cause as small multiples, and costs by machine. Each has numbered moment lines, a crosshair tooltip and a table view.
 - `costs.py` is the shared cost reader for `buildlog costs` and `buildlog charts`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
 - `index.py` `COST_INDEXES` (made in `create_schema` and `open_for_update`) give indexed window reads instead of whole-table scans.
@@ -404,3 +404,71 @@ Routed from resources' Phase 62 review (F021), through the builds showrunner (20
 - The "Each memory tick writes one row" next item also changes `memory.py`; do not run the two at the same time.
 
 **Workers:** 1 writer (rowcpu).
+
+
+### Phase 21 — Each memory tick writes one row  · status: todo
+**Depends on:** none (from next items; showrunner 2026-11-04: open it now; natest P10 is on builds and the index.py freeze has ended)
+
+#### Work Order
+
+**Goal:** Each `buildlog sample` tick writes one row: the sample row carries zram, and the tick writes no `memory_snapshot` row.
+
+**Spec:**
+Source: Phase 17 simplify item 1. Each tick now writes `kind`, `at` and `host` twice through two writers (`sample.sample()` and `memory.write_snapshot`, called from `cli.py` `sample`); the tick `memory_snapshot` row holds only zram.
+
+1. `sample.sample()` adds `zram` to the sample record, read with `memory.zram_state` (path from `BUILDLOG_ZRAM`, default `/sys/block/zram0`). Keep imports lazy where they are lazy now.
+2. `index.py`: add a `zram` TEXT column to `SAMPLE_COLUMNS` ("JSON zram storage at the sample time") and bump `SCHEMA_VERSION` from 32 to 33.
+3. Delete the tick writer: `memory.write_snapshot`, `memory.tick_snapshot`, `TickMemorySnapshot`, and the `memory.write_snapshot` call and its error line in `cli.py` `sample`. `MemorySnapshot` (the standalone `buildlog snapshot` row with slices and zram) stays and becomes a TypedDict of its own.
+4. `memory.nearest_snapshot` reads the nearest zram from `samples` UNION ALL `memory_snapshots`, the same way it reads slices (snapshot row first on equal distance). Old logs (zram only in `memory_snapshots`), new ticks (zram only in `samples`) and standalone snapshots give the same report.
+5. Update the as-built docs that name the tick snapshot row: `docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`.
+
+Acceptance:
+- Tests: a tick writes one row with zram and no `memory_snapshot` row; the memory window report gives the same zram line for an old-log fixture (zram in `memory_snapshots`), a new-log fixture (zram in `samples`) and a standalone snapshot; zram absent reads `zram: unavailable` as now. The index test covers the new column and schema 33.
+- Log size per day for 1,440 ticks, before and after (Phase 17 after: 4,808,160 bytes/day); about 105 KB/day less.
+- CPU per `buildlog sample` tick: an interleaved A/B (10 samples per tree) against a shared clone of the Phase 19 shrink c5d618d86, from the same run. The tick must not cost more.
+
+**Files:**
+- `scripts/buildlog/sample.py` — zram in the sample record.
+- `scripts/buildlog/index.py` — the column and schema bump.
+- `scripts/buildlog/memory.py` — delete the tick writer; zram reader over both tables.
+- `scripts/buildlog/cli.py` — the `sample` command.
+- `scripts/buildlog/test_sample.py` — tick tests.
+- `scripts/buildlog/test_memory_window.py` — report tests.
+- `scripts/buildlog/test_index.py` — the column and schema test.
+- `scripts/buildlog/test_mac_idle.py` — it patches `memory.write_snapshot`.
+- `docs/as-built/buildlog-memory-stalls.md` — the tick row text.
+- `docs/as-built/build-memory-admission.md` — the tick row text.
+- `scripts/buildlog/cgroup_test_support.py` — the shared zram fixture writer and reading.
+
+**Constraints from prior phases:** Phase 17: the reader reads both tables, because old logs keep slices in `memory_snapshots`; a join on equal `at` text between two writers failed. Phase 19: measure CPU only as an interleaved A/B against the prior commit, in one run. natest may change `index.py` for /test_times at the same time; keep the index change to the one column and the schema bump.
+
+**Workers:** 1 writer (rowcpu): one small file set with `memory.py` as the hub.
+
+**State:** sample rows in the build log (new rows only) and the index schema (33).
+
+
+### Phase 22 — buildlog charts prints a tailnet link  · status: done
+**Depends on:** none (the builds showrunner, 2026-11-04: change review C1044)
+
+#### Work Order
+
+**Goal:** Every `buildlog charts` run prints a bare tailnet link to the page and no file path.
+
+**Spec:**
+The user ran `buildlog charts` in an ssh terminal on natedev from the Mac (no DISPLAY). It printed the path and opened nothing, with no message. The user, 2026-11-04 (through the builds showrunner): "it should always be a tailscale link". The showrunner's rule:
+
+1. Every run publishes the page through `scripts/review_links/review_link.py` (`snapshot`), the one tailnet link tool, and prints the bare link. This holds in every session: ssh or local, natedev or the Mac.
+2. Print no file path.
+3. No open on the Mac over ssh, and no target config read. The user clicks the link. A browser opens only where a local display exists (`webbrowser.open(link)`), and it never replaces the printed link. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` skip that open.
+4. A failed publish prints one stderr line with the reason and exits non-zero.
+
+Acceptance: tests in `test_charts.py`: the printed line is the link (local display, no display, `--no-open`); no output line is a file path; a failed publish gives one stderr line and a non-zero exit; a `False` from `webbrowser.open` does not change the output. One live check on natedev from an ssh session: `buildlog charts`, then open the printed link on the Mac; the director checks it.
+
+**Files:**
+- `scripts/buildlog/charts.py` — the open paths.
+- `scripts/buildlog/test_charts.py` — the tests.
+- `scripts/review_links/review_link.py` — export `SNAPSHOT_ERRORS`; its `main` and charts catch it (natedev agreed 2026-11-04).
+
+**Workers:** 1 writer (test2): charts.py is the only code file.
+
+**State:** none (the review link files belong to `review_link.py`).
