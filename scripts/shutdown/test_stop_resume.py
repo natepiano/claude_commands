@@ -26,6 +26,7 @@ from scripts.shutdown import restart, stop_resume
 from scripts.shutdown.stop_results import ClaudeStartState
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.shutdown.inventory import PausedSeat
 import herdr
 import pane_record
@@ -392,11 +393,12 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr, "repository_root", return_value=self.root))
         _ = self.enterContext(patch.object(herdr, "repository_trust_key", return_value=self.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
+            "HOME": str(self.root),
             "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
         })))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="agents"))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
@@ -680,6 +682,9 @@ class StopResumeTests(unittest.TestCase):
 
     def prompt_retirement_fixture(self, *, alerted: bool) -> Path:
         """Publish cancellation requests for the watcher with an isolated send.py recorder."""
+        from scripts.production.staff_test_support import unit_membership
+
+        _ = unit_membership("production", "alpha")
         self.entry["environment"].update({"SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "alpha"})
         pane_record.write("agents", self.entry)
         state = self.root / "stall-watch"
@@ -1268,9 +1273,10 @@ class StopResumeTests(unittest.TestCase):
         self.start.assert_not_called()
 
     def test_self_move_hands_off_the_whole_batch_without_signalling(self) -> None:
-        from scripts.production.staff_test_support import isolated_staff_file
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("agent", name="alpha", runtime_id=self.entry["session_id"])
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.add_beta()
@@ -1293,6 +1299,22 @@ class StopResumeTests(unittest.TestCase):
                 self.assertIn("batch", argv)
                 self.assertEqual(argv[argv.index("--target") + 1], "claude4")
                 self.assertEqual(argv[-2:], ["beta", "alpha"])
+        self.kill.assert_not_called()
+        self.start.assert_not_called()
+
+    def test_self_move_uses_the_current_session_of_a_saved_staff_reference(self) -> None:
+        current = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "alpha", staff.StaffRoot(),
+                             current_session=staff.StaffId(current))
+        saved = self.entry.copy()
+        saved["session_id"] = row.id
+        pane_record.save("agents", {saved["pane_id"]: saved})
+        self.client.rows[0]["agent_session"] = None
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": current}),
+              patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,)))):
+            result = stop_resume.move_sessions(["alpha"], "claude4", why="limit")
+        self.assertEqual(result, [stop_resume.MoveHandedOff(current)])
+        self.detach.assert_called_once()
         self.kill.assert_not_called()
         self.start.assert_not_called()
 

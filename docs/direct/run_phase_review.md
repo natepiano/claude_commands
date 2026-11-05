@@ -50,7 +50,7 @@ affected phases and next items, then give the rest a consistency pass. Choose
 an open worker that did not write the affected files when one exists; otherwise
 have their writer read them cold and argue against its choices. Post the
 <RoleReassignment/> handoff when its role changes, open the prompt under
-<ReviewPromptContract/>, and use `review.sh --to <full-worker-name>`, this
+<ReviewPromptContract/>, and use `assign.sh --role review --to <full-worker-name>`, this
 session, and the next review index.
 If every open worker is busy, open and retain a role-named worker with `review.sh
 --slot review`. Only a phase review outside a unit run omits both `--to`

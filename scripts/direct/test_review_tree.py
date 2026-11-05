@@ -14,22 +14,30 @@ from typing import final, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, recorder_state, review_tree  # noqa: E402
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.lib import unit_runs
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class OtherPhasesPathsTests(unittest.TestCase):
     session: Path = Path()
+    owner_id: str = ""
 
     @override
     def setUp(self) -> None:
         self.session = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.enterContext(isolated_staff_file(self.session / "staff.json", {}))
+        owner = fixture_member("showrunner", name="review-owner")
+        self.owner_id = fixture_member("unit", name="review-unit", parent=owner.id,
+                                    worktree=staff.PresentWorktree("natedev", self.session / "tree-x")).id
 
     def open_phases(self, files: dict[str, str]) -> None:
         """The recorder lists each phase id open, and each phase's directory holds its files list."""
         records = [{"id": phase, "instance_id": phase, "status": "active"} for phase in files]
         _ = (self.session / recorder_state.STATE_FILENAME).write_text(json.dumps({
-            "phase": records[-1], "open_phases": records[:-1]}))
+            "phase": records[-1], "open_phases": records[:-1], unit_runs.OWNER_FIELD: self.owner_id}))
         for phase, listed in files.items():
             directory = phase_reservation.phase_directory(self.session, phase)
             directory.mkdir(parents=True)

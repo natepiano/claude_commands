@@ -304,9 +304,20 @@ class ImplementLauncherFixture(LauncherFixture):
         }))
         self.implement_script = self.build_script_tree()
 
+    @override
+    def start_phase(self, name: str) -> Path:
+        session = super().start_phase(name)
+        state_file = session / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(state_file.read_text()))
+        state["owner_staff_id"] = self.staff_parent
+        _ = state_file.write_text(json.dumps(state))
+        return session
+
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
         direct_dir, agents, lib = prepare_launcher_runtime(self.root)
+        # These tests cover the launcher after admission. Assign tests cover admission.
+        _ = (direct_dir / "assign_gate.py").write_text("# Admission succeeds in this private fixture.\n")
         for name in ("conf.py", "conf.sh"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")

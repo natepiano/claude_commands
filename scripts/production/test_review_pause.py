@@ -11,6 +11,11 @@ import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
 import review_pause
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 if TYPE_CHECKING:
@@ -22,6 +27,7 @@ else:
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("review_pause.py")
 ZONE = "America/Los_Angeles"
+SESSION = fixture_runtime_id("review-showrunner")
 
 
 class ReviewPauseTests(unittest.TestCase):
@@ -37,13 +43,13 @@ class ReviewPauseTests(unittest.TestCase):
         notifier = self.root / "notifier"
         self.instance = notifier / "showrunner-demo"
         self.instance.mkdir(parents=True)
-        doc = self.root / "production.md"
+        doc = self.root / "demo-production.md"
         _ = doc.write_text(
             "> **Status: PRODUCTION — running.** demo\n"
             + f"- **User zone:** {ZONE} — demo\n"
         )
         _ = (self.instance / "conf").write_text(
-            f"TARGET=session:current\nCHECK=zsh /x/check.sh {doc}\n"
+            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh {doc}\n"
         )
         _ = (self.instance / "state").write_text("ENABLED=1\nNEXT_DUE=1\n")
         self.enabled = self.instance / "enabled"
@@ -81,12 +87,16 @@ class ReviewPauseTests(unittest.TestCase):
         )
         stub.chmod(0o755)
         self.environment = {
-            **os.environ, "HOME": str(self.root), "CLAUDE_CODE_SESSION_ID": "current",
+            **os.environ, "HOME": str(self.root), "CLAUDE_CODE_SESSION_ID": SESSION,
             "NOTIFIER_STATE_DIR": str(notifier), "SHOWRUNNER_STATE_DIR": str(state),
             "SHOWRUNNER_NOTIFIER": str(stub),
         }
 
-    def run_script(self, *args: str, session: str = "current") -> subprocess.CompletedProcess[str]:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = fixture_member("showrunner", name="demo", runtime_id=SESSION,
+                           doc=staff.LiveDoc("natedev", doc))
+
+    def run_script(self, *args: str, session: str = SESSION) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True,
                               text=True, check=False,
                               env={**self.environment, "CLAUDE_CODE_SESSION_ID": session}, timeout=TEST_HANG_GUARD_SECS)
@@ -173,7 +183,11 @@ class ReviewPauseTests(unittest.TestCase):
     def test_later_production_failure_keeps_earlier_pause_and_retries_both(self) -> None:
         other = self.instance.with_name("showrunner-zeta")
         other.mkdir()
-        _ = (other / "conf").write_text((self.instance / "conf").read_text())
+        doc = self.root / "zeta-production.md"
+        _ = doc.write_text((self.root / "demo-production.md").read_text())
+        _ = fixture_member("showrunner", name="zeta", doc=staff.LiveDoc("natedev", doc))
+        _ = (other / "conf").write_text(
+            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh {doc}\n")
         _ = (other / "state").write_text("ENABLED=1\nNEXT_DUE=1\n")
         (other / "enabled").touch()
         other_record = self.record.with_name("zeta.json")
