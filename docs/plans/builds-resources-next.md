@@ -29,13 +29,15 @@
 
 - [ ] **Match trims against each step's recorded Cargo output roots**
   - Target: `scripts/lint/sweep.py` (`RebuildStep`, `read_rebuild_evidence`, `_rebuild_causes`), `scripts/lint/build_shape.py`, and their tests.
-  - Dependency: Phase 62's shared recorded-root evidence contract.
+  - Dependency: Phase 62's shared root types and recorded-root safety rules.
   - Why needed: `_rebuild_causes()` still matches trims through saved workspace mappings.
-  - Completion condition: keep the step identities needed to use Phase 62's coherent root pairs and named unknown states.
+  - Completion condition: retain each attempt's identity and root pair in the existing locked-row reader.
+  - Reuse the shared root decoding. Never infer an attempt's roots from the workspace aggregate returned by `recorded_output_roots`.
+  - Keep unknown, relative, and override-affected roots explicit. Do not attribute a trim through an uncertain root.
   - Keep the `store.locked_rows` reads; do not create or refresh the index during rebuild reporting.
-  - Test removed copies, changed mappings, repeated attempts with different roots, missing roots, and unavailable indexed evidence.
+  - Test removed copies, changed mappings, repeated attempts with different roots, unknown roots, relative roots, overrides, and a missing index.
   - Add no second mapping, join, or recorder.
-  - Revealed by: Phases 4, 11, 17, and 58; Phase 62 owns the first recorded-root consumer.
+  - Revealed by: Phases 4, 11, 17, 58, and 62.
 
 - [ ] **The working-set summary tells a Node script apart from a Node task or one-line program**
   - Target: `scripts/build_targets/working_set.py`, `scripts/build_targets/test_working_set.py`

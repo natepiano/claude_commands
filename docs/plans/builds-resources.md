@@ -598,7 +598,8 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
 - Phase 11's compile split and Phase 60's selection rules apply inside each side. Phase 17 adopted no compile bands.
 - Build history inside each side: `build_expected_peak` (`memory_admit.py` :2195) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1811). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The split removes rows; it changes none of those values, and Phase 11's lower pool never replaces a same-shape `build` promise.
-- `scripts/lint/build_shape.py` holds the one Cargo shape parser (`build_shape()` :61) and the one anon-to-index join (`index_step_evidence` :125; Phase 24 Part A, Phase 11 widens it). Since Phase 60 the join keeps the decoded argv of test steps in `StepEvidence.arguments` and parses no test selection.
+- `scripts/lint/build_shape.py` holds the one Cargo shape parser (`build_shape()` :64) and the one anon-to-index join (`index_step_evidence` :137; Phase 24 Part A, Phase 11 widens it). Since Phase 60 the join keeps the decoded argv of test steps in `StepEvidence.arguments` and parses no test selection.
+- Phase 62 (`01bf65845`): `_step_index` (`build_shape.py` :129) opens the index read-only for two readers with different grouping rules. `index_step_evidence` keeps its call-and-step join; put the `sha` there. `recorded_output_roots` (:268) keeps host-wide attempt root pairs per workspace, skips rows whose argv sets a target folder or whose `target_folder` differs from `target_directory`, and names each root state (`AbsoluteRecordedRoot`, `UnknownRecordedRoot`, `RelativeRecordedRoot`, `RecordedRootsUnavailable`). Do not merge the two readers. Keep `scripts/lint/test_build_shape.py` recorded-root tests and the floor tests in `scripts/lint/test_sweep.py` green unchanged.
 - Phase 60 (`e88fb841d`): test selection is parsed only by `test_selection()` (`memory_admit.py` :162). `history_selection(item, evidence)` (:2091) is the one resolver of package, scope and filters for an anonymous row: a recorded field wins, and only a missing field is parsed from `arguments`. The side split filters rows after that resolver; add no second selection parser. Keep the tests for recorded-field precedence, missing-field recovery and test-only arguments (`test_indexed_test_arguments_remain_available_for_selection`, `test_missing_test_arguments_keep_the_compile_count`, `test_package_check_keeps_legacy_measured_peaks_without_package_fields`).
 - Phase 60: keep the full-package selection (`memory_admit.py` :2023–2026) and the larger of the exact-filter and package p90 in `filtered_peak` (:2506–2510) on each side of a split.
 - Initial estimates run through `admission_client.step_request()` and `memory_admit.step_estimate()`.
@@ -1635,7 +1636,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Goal:** a workspace or temporary-sweep failure sends one natedev alert per failure episode through the Phase 58 failure-episode states, and the floor code that Phase 58 added has one copy of each rule and named states for each record.
 
 **Measured (Phase 58 review pass 1, repair round 8, landing rule):** these findings moved here from Phase 58. None is a regression, and none fails a test or gate. F003 was there before Phase 58 (`2925d6453^` has the same status aggregation); this deferral is an exception to the Phase 58 rule that a failed sweep sends a push.
-- F003: `main()` returns status 1 for a workspace or temporary-sweep failure and sends no notification (`scripts/lint/sweep.py` ~:3342).
+- F003: `main()` returns status 1 for a workspace or temporary-sweep failure and sends no notification (`main()`, `scripts/lint/sweep.py` :4181).
 - F010: `scan_floor_roots` forces one scan worker in code; one config key has two meanings.
 - F011: `ObservedUnreadableFloorHold.alert_delivered` is a bare flag.
 - F012: `send_floor_alert` returns a different fact for each channel.
@@ -1648,7 +1649,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - F019: the natedev closing line states a policy, not this event's phone result.
 - F020: two comments repeat other text.
 - F021: `target_dirs` pushes branches back only for `visit` to pop them.
-- F022: `discover_cargo_outputs` nests two executors and shares `refreshed`.
+- F022: satisfied by Phase 62; `discover_cargo_outputs` (`sweep.py` :419) has no executors and no `refreshed` state.
 - F023: build trees and `roots_for` are computed more than once per target.
 - F024: the new tests copy their setup and add patches inside `subTest` loops.
 Full detail: `findings.py status --phase 58` in the resources run folder.
@@ -1657,20 +1658,20 @@ Full detail: `findings.py status --phase 58` in the resources run folder.
 1. Route workspace and temporary-sweep failures through the Phase 58 failure-episode finalizer, each with its own failure scope. Send one natedev alert for each failure episode (builds ruling 2026-11-04 18:32 EST: sweep failures go to natedev only).
    - Give each scope a named identity, one per workspace and one for the temporary sweep, so unrelated workspaces never share an episode.
    - Return named assessment outcomes: `tmp_sweep.run_if_due()` (`scripts/lint/tmp_sweep.py:1377`) returns 0 when the sweep is not due, and workspace lock contention returns 0 with no assessment. A skip is not a recovery: it never clears a pending failure.
-2. Add `sweep_scan_workers.natedev=1` to `config/lint.conf` and a separate `sweep_discovery_workers` key. Delete the code override and the unused `map` branch.
+2. Add `sweep_scan_workers.natedev=1` to `config/lint.conf` and a separate `sweep_discovery_workers` key for the `target_dirs` directory-search pool (`sweep.py` :2389). Delete the code override in `scan_floor_roots` (`sweep.py` :2216-2219) and the unused `map` branch.
 3. Replace `alert_delivered` with two states: `ObservedUnreadableFloorHold` and `ReportedUnreadableFloorHold`. Decode old records: `alert_delivered` true reads as reported, false as observed.
 4. Return `FloorAlertDelivery(natedev, phone)` from `send_floor_alert`. Each field is a named channel outcome: not attempted, delivered, queued or failed.
 5. Add one pure transition `next_lock_alert(previous, holder, process, now)`, where `process` is a named observation (live sweep, other process, unreadable), never a bool. Write once, only when the state changed. Use it at lock acquisition too.
 6. Use `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, and one `_command_text(bytes)` helper.
 7. Change `page_paths` to `page_paths(measurement)`. Put the closing string in the `render` list. State the phone result of the event in the natedev closing line.
 8. Remove the two repeated comments.
-9. Simplify `target_dirs` (one loop over a named 3-level constant, `visit(search, directory, depth)`, no `len < 2` case). Phase 62 removes the metadata refresh in `discover_cargo_outputs`; simplify only what remains of it.
+9. Simplify `target_dirs` (one loop over a named 3-level constant, `visit(search, directory, depth)`, no `len < 2` case; `sweep.py` :2323). Phase 62 removed the metadata refresh from `discover_cargo_outputs`; do not change that function here.
 10. Compute `roots_for` once per distinct root. Pass found markers to `is_cargo_target`. Fill `known_trees` from discovery.
 11. Add `phone_calls(send)`, `record=` on `locked_floor` and `saved_lock_alert()` test helpers. Move patches above loops. Keep one status-1 channel assert.
-12. A real floor pass walks each idle target only once (Phase 58 simplify item 33; builds 2026-11-04: current). To compute `after_caches` (`scripts/lint/sweep.py` ~:3572-3575), walk again only the targets that had deletions. Do not compute it from blocks minus freed inodes: hard links make that number wrong.
+12. A real floor pass walks each idle target only once (Phase 58 simplify item 33; builds 2026-11-04: current). To compute `after_caches` (`scripts/lint/sweep.py` ~:3699), walk again only the targets that had deletions. Do not compute it from blocks minus freed inodes: hard links make that number wrong.
 
 **Constraints from prior phases:**
-- Phase 62 runs first and changes `discover_cargo_outputs` and the floor's folder mapping. Keep its recorded-root mapping, its protections and its speed.
+- Phase 62 (`01bf65845`) maps floor targets from recorded step pairs, then the saved cache. Keep its recorded-root mapping, its speed and these protections: a target with no recorded evidence is `NoRecordedEvidence` and is never deleted or a floor holder; an unrecorded target nested under a recorded or cached output root outside the configured roots is found and protected; a real pass saves merged pairs (an internal cache for `folder_audit` and `disk.py`); an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>` to stderr. Keep these `scripts/lint/test_sweep.py` tests unchanged: `test_unrecorded_and_unknown_root_targets_stay_protected`, `test_unrecorded_nested_targets_outside_search_roots_stay_protected`, `test_a_dry_floor_pass_reports_an_unreadable_recorded_root_index`, `test_unavailable_index_uses_saved_roots_after_the_checkout_is_gone`, `test_recorded_pairs_precede_saved_pairs_and_dry_discovery_keeps_the_cache`.
 - Keep the Phase 58 alert rule (natedev only), its notification finalizer, the failure-episode and crossing states, and the dry-run result. Phase 50 and 53 own the floor rules, Mac claims and outside caches.
 - Keep the warm floor-only dry run on natedev under 30 s.
 
@@ -1679,64 +1680,44 @@ Full detail: `findings.py status --phase 58` in the resources run folder.
 - `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py` — temporary-sweep assessment outcomes and their tests.
 - `config/lint.conf` — any changed key.
 
-**Workers:** `1 writer`
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `sweep.py`, `tmp_sweep.py` and `config/lint.conf`.
+- `test` owns `test_sweep.py` and `test_tmp_sweep.py`, and runs `scripts/notify/test_push_texts.py`.
 
 **Acceptance gate:**
 - Tests prove, for each scope (one workspace, a second workspace, the temporary sweep): failure sends one natedev alert; a skip (not due, or lock contention) keeps the episode; a second failure sends nothing; a clean pass ends the episode; a failure in one workspace never ends or merges with another's. Old records with `alert_delivered` decode to the new states.
 - `scripts/lint/test_sweep.py`, `scripts/lint/test_tmp_sweep.py` and `scripts/notify/test_push_texts.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
-- `sweep.py --floor-only --dry-run` on natedev exits 0 in under 30 s on a cold run and on three warm runs in a row at natedev's normal build load (load 45-70), with the same targets as before the phase. Record each run's load and time in the checkpoint notice.
+- `sweep.py --floor-only --dry-run` on natedev exits 0 in under 30 s on three warm runs in a row at natedev's normal build load (load 45-70). Every baseline target that still exists is mapped as before the phase. Record each run's load and time in the checkpoint notice. (No cold run: `disk-floor.timer` runs the floor every 120 s, so no run follows 30 minutes without a sweep.)
 - Tests prove: a real pass walks again only the targets that had deletions, and `after_caches` equals a full walk on a fixture with hard links.
 - Time one real floor pass on natedev before and after Spec 12. Put both times in the checkpoint notice.
 - Change-Review line: a failed workspace sweep reaches natedev once | read the natedev session after a workspace sweep failure | one alert arrives, with the failure status.
 
 ### Phase 62 — The floor sweep takes its target folders from recorded step rows  · status: done
-**Depends on:** Phase 58 (its checkpoint). Runs before Phase 61 (builds ruling 2026-11-04).
 
-#### Work Order
+#### As-built
 
-**Goal:** the floor pass finds build output from the build queue's recorded step rows and runs no `cargo metadata`, so a cold floor-only dry run on natedev finishes in under 30 seconds.
-
-**Measured (Phase 58 checkpoint):** `sweep.py --floor-only --dry-run` on natedev took 42.6 s on the first run after a pause (load 56-71), and 24.0-25.3 s on warm runs. After the last Phase 58 repair, three runs in a row took 30.0 s, 45.9 s and 22.9 s at load 45-60 on 32 cores: a warm run can also pass 30 s under load. Output discovery runs Cargo metadata for each checkout; a warm run reuses its cached answers.
-
-**Why:** the build queue owns build folders (user, 2026-11-03). Step rows already record the Cargo output roots.
-
-**Ruling (builds showrunner, 2026-11-04 19:0x EST):** the floor deletes only folders it can prove a queue step built, the same rule as the Mac cleanup (only our own output). A target folder from before the step rows recorded it is not deleted until a new step builds it.
-
-**Where the evidence is:**
-- The build index `steps` table has `target_directory` and `build_directory` (`scripts/buildlog/index.py:160-161`). Older records hold `unknown`; `build_directory` falls back to `target_directory`. `scripts/buildlog/record.py:925-948` writes them from `read_cargo_output_roots`; sweep steps carry none.
-- `scripts/buildlog/memory.py:84` `build_output_roots()` reads `DISTINCT target_directory, build_directory, worktree, cwd FROM steps WHERE host = ?` and then runs `read_cargo_output_roots` (Cargo metadata) per checkout. The floor must not take that metadata step.
-- `scripts/lint/build_shape.py:125` `index_step_evidence()` reads one step kind, drops rows without `call_id`, and merges repeated attempts without their root pairs. Memory admission depends on its current results.
-- `scripts/lint/sweep.py:399` `discover_cargo_outputs()` combines the `target_dirs` directory search, the saved output cache (`saved_cargo_output_roots`, :362), the cwds of live build-hold sessions and `read_cargo_output_roots` per candidate in a 16-worker pool. A target it cannot map stays protected.
-
-**Spec:**
-1. Add one shared recorded-root reader for the floor. It enumerates step rows of every step kind on this host, keyed by workspace identity (`worktree`, else `cwd`). It keeps each attempt's `target_directory`/`build_directory` as one pair. `unknown`, a relative path and a missing index each get a named state, never a bare `None`. Do not change `index_step_evidence()` results; memory admission tests stay green.
-2. Map target folders from the recorded pairs and the saved output cache only. Run no `cargo metadata` and no `read_cargo_output_roots` in the floor pass.
-3. Sources, in order: recorded step pairs; the saved output cache, including roots whose checkout no longer exists; nothing else. A folder with neither gets a named state (no recorded evidence) and stays protected. With the index unavailable, the cache alone applies.
-4. Keep the outside-cache handling of Phase 53 and the active-build and Mac-claim protections of Phase 50 unchanged.
-5. The natedev low-space alert lists the largest protected folders (no recorded evidence) with their sizes, so natedev can choose what to delete.
-6. Add a reader field only with its first consumer. Reuse a field that another consumer already added.
-7. State the rule in `docs/as-built/build-targets.md` (the floor sweep section): a target folder from before the step rows recorded it is not deleted until a new step builds it.
-
-**Constraints from prior phases:**
-- Keep the Phase 58 alert rule, its notification finalizer and its failure-episode and crossing states.
-- Do not kill or signal a live sweep. Do not delete a target to test the fix; use `--dry-run` or private fixtures.
-- `scripts/lint/build_shape.py` is also in Phase 18's Files. Phase 62 lands first; Phase 18 builds on its reader and keeps one join.
+- `build_shape.recorded_output_roots(index_path, host)` (`scripts/lint/build_shape.py`) reads the distinct step rows of every step kind on this host (worktree, cwd, target, build, argv, target_folder). It returns `RecordedOutputRoots`, the attempt pairs per workspace keyed by `RecordedRoot` (`AbsoluteRecordedRoot | UnknownRecordedRoot | RelativeRecordedRoot`), or `RecordedRootsUnavailable(reason)`. `_step_index` opens the index read-only for this reader and for `index_step_evidence`, whose results are unchanged.
+- A row whose argv sets its own target folder (`--target-dir`, `--config …target-dir`), or whose absolute `target_folder` differs from `target_directory`, gives no evidence.
+- `sweep.discover_cargo_outputs` maps targets from the recorded pairs, then from the saved cache (workspaces and history). It runs no Cargo metadata and has no worker pool. A target with neither is `NoRecordedEvidence`: it is protected, counts in the left-alone total and is never a floor holder. `target_dirs` also searches the recorded and cached output roots outside the configured roots, so a nested unrecorded target there is found and protected.
+- A real pass saves the merged pairs to `cargo-output-roots.json`; history keeps extra pairs. `folder_audit` and `disk.py` read that cache.
+- With the index unavailable, the saved cache alone applies, and each pass prints `lint sweep: recorded output roots unavailable: <reason>` to stderr.
+- The natedev low-space alert lists the largest protected folders with sizes (`protected_folder_lines`, limited by `sweep_measurement_paths`, sized once per pass, without the recorded targets inside them).
+- A floor-only dry run on natedev takes 6.8-8.5 s at load 64-66.
 
 **Files:**
-- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` — `discover_cargo_outputs`, `_hold_floor`, the low-space alert text and their tests.
-- `scripts/lint/build_shape.py`, `scripts/lint/test_build_shape.py` — the shared recorded-root reader and its tests (or a new module beside it, with one reader only).
-- `docs/as-built/build-targets.md` — the floor rule for folders with no recorded evidence.
+- `scripts/lint/build_shape.py` — the shared recorded-root reader beside `index_step_evidence`.
+- `scripts/lint/sweep.py` — floor discovery from recorded pairs and the cache, `NoRecordedEvidence`, the protected folder measurement and alert lines.
+- `docs/as-built/build-targets.md` — the floor rule: a target folder from before the step rows recorded it is not deleted until a new step builds it.
+- `scripts/lint/test_sweep.py`, `scripts/lint/test_build_shape.py` — tests.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `sweep.py`, the reader module and the as-built doc.
-- `test` owns `test_sweep.py` and the reader tests.
+**Binds later work:** `build_shape.py` holds two `_step_index` readers, `recorded_output_roots` and `index_step_evidence`; keep them apart and keep one join. The floor keeps its recorded-root mapping, its speed and the `NoRecordedEvidence` protection. A phone low-space text uses the same protected-folder measurement and never makes a protected folder a floor holder. Trim matching for rebuild reports reuses the shared root decoding.
 
-**Acceptance gate:**
-- Tests prove: the floor pass takes its folders from step rows; repeated attempts with different roots keep their pairs; a folder with no step row and no cache entry keeps its protection; a row with `unknown` roots counts as no evidence; with the index unavailable the saved cache still maps its folders; a saved root whose checkout is gone is still found; outside caches keep their Phase 53 handling; the low-space alert lists the largest protected folders; no `cargo metadata` call runs during the floor pass; `scripts/lint/test_memory_admit.py` passes unchanged.
-- `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass, with the tests of the step-evidence reader. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
-- On natedev, `sweep.py --floor-only --dry-run` exits 0 in under 30 s on a cold run (the first run after at least 30 minutes with no sweep) and on three warm runs in a row, at natedev's normal build load (load 45-70). Compare its targets with a dry run from before the phase: every difference is a folder with no recorded evidence, now listed as protected. Record the command, commit, load and time of each run in the checkpoint notice.
-- Change-Review line: the floor scan is fast after a pause | on natedev, wait 30 minutes after a sweep, then time `~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --dry-run` | exit status is 0, and the run finishes in under 30 s.
-- Change-Review line: the floor deletes only folders a queue build made | on natedev, run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --dry-run` | a target folder from before the step rows recorded it is listed as protected, and it is not deleted until a new queue build writes to it.
+**Gotchas:**
+- `scripts/buildlog/record.py:925` reads Cargo metadata without a step's target-folder override, so such rows give no evidence until the recorder is fixed.
+- `scripts/buildlog/memory.py` `build_output_roots()` still runs Cargo metadata per checkout.
+- A cold-run timing cannot be measured on natedev: `disk-floor.timer` runs the floor every 120 s.
+
+**Ruled out:** `target_folder` as the authoritative output root (builds ruling 2026-11-04).
 
 ### Phase 63 — The phone gets one low-disk push under the alert line, with a text that passes the review  · status: todo
 **Depends on:** Phase 61 (both change `scripts/lint/sweep.py`).
@@ -1756,6 +1737,7 @@ The rejected texts and the reviewer's suggested rewrites are in the resources ru
 3. Send the push with the natedev alert on a crossing (`FloorAlertChannels.NATEDEV_AND_PHONE`). Keep one push per crossing.
 4. Use `sweep_push_text_limit` and `sweep_page_paths` in `config/lint.conf`, or remove them and their `config/README.md` rows. Phase 58 left them with no reader.
 5. Give the alert text a surface for each folder-choice state: measurements available (recommend one choice), measurement unavailable or stale (say so and name no folder), and no single choice frees enough (say what the largest choice frees). Never invent a deletion recommendation. Each state has a catalog example that passes the review.
+   - Protected folders (`NoRecordedEvidence`): since Phase 62 the natedev alert lists the largest of them with sizes (`protected_folder_lines`, from `FloorOutcome.protected`; `notify_floor_problem`, `sweep.py` :3418). The phone text uses the same measurement, labels these folders as protected (the floor never deletes them; only a person can), and says each one "holds" its size. They are never floor holders.
 6. Records from Phase 58 hold `UnderPhoneFloorPushed` after natedev delivery alone, so they prove no phone delivery. Keep the natedev and phone receipts as separate states for each crossing. An open episode in an old record gets its first phone push once, with no second natedev alert.
 7. The `sweep_phone_floor_gib` comment ("Send one phone alert") and the `Phone` state names must be true at the checkpoint (builds 2026-11-04). If this phase cannot bring back the phone push, file the key rename with `/unit:question`: a rename deletes a key.
 8. If the text still fails the review, keep the alert natedev only and ask the builds showrunner.
@@ -1765,9 +1747,11 @@ The rejected texts and the reviewer's suggested rewrites are in the resources ru
 - `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — the low-space text and its review record.
 - `config/lint.conf`, `config/README.md` — `sweep_push_text_limit`, `sweep_page_paths` and the `sweep_phone_floor_gib` comment.
 
-**Workers:** `1 writer`
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `sweep.py`, `push_catalog.py`, `push_texts_reviewed.json`, `config/lint.conf` and `config/README.md`.
+- `test` owns `test_sweep.py` and the channel-retry and folder-choice cases, and runs `scripts/notify/test_push_texts.py` and `scripts/lint/test_tmp_sweep.py`.
 
 **Acceptance gate:**
-- Tests prove: a fall under the alert line sends one push and one natedev alert; a second pass under the line sends none; free space exactly at the line keeps the episode; a rise above the line and a new fall sends one more; a failed phone delivery with a sent natedev alert retries only the phone, and the reverse retries only natedev; a restart mid-episode sends nothing twice; an old record's open episode gets one phone push; a sweep-failure alert sends no phone push; the unavailable-measurement text names no folder.
+- Tests prove: a fall under the alert line sends one push and one natedev alert; a second pass under the line sends none; free space exactly at the line keeps the episode; a rise above the line and a new fall sends one more; a failed phone delivery with a sent natedev alert retries only the phone, and the reverse retries only natedev; a restart mid-episode sends nothing twice; an old record's open episode gets one phone push; a sweep-failure alert sends no phone push; the unavailable-measurement text names no folder; protected folders appear labelled as protected, with the same sizes on both channels, and are never floor holders.
 - `scripts/notify/test_push_texts.py` passes with a normal approval record. `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
 - Change-Review line: the phone gets one low-disk push | read the phone pushes after natedev free space falls under 150 GiB | one push arrives that says which folders to delete and what each one holds.
