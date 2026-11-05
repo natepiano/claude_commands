@@ -10,6 +10,13 @@
 
 From the user (via natedev): Mission: find the longest-running ~/.claude tests and make them faster. Keep a descending sort of test times; when it makes the longest one shorter, it takes the next one. Build tools that instantly show the history of ~/.claude test suite times and of individual test times. Use parallelism, removal of trivial tests, shared code and good engineering practice. It must also send architectural change proposals back. It organizes its work in phases so /unit:direct works, and keeps its own phase backlog: the user wants the standard process engaged.
 
+## Standing work
+
+1. At each phase start, read the merge gate's slowdown warnings; natest-unit owns them. A warned module goes to `builds-natest-next.md`.
+2. At each phase end, re-sort with `show.py top`. Before the last todo phase starts, add a speed phase for the top live module that no phase holds.
+3. `builds-natest-next.md` lists each module with a reported floor. A floored module is a target again only when its gate median rises 20% above its floor.
+4. When no live module has a median over 60 s, the plan holds and tells the showrunner; it does not close.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the scripts, commands and config that run the user's productions. This plan records test times and makes the slowest test modules faster.
@@ -63,9 +70,9 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
      - Remove trivial tests (Invariants above).
      - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does.
      - Call code in-process in place of a subprocess when the test does not check the process boundary; keep one process test for each boundary.
-     - Split a module whose tests are independent into two or more files, so the gate runs them at the same time. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time. Every file of the group is in acceptance.
+     - Split a module whose tests are independent into two or more files, so the gate runs them at the same time. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time. Every file of the group is in acceptance. Time the group with one `module_run.py` process per file, all started at once (as `pairs.sh` does), from the first start to the last end. The gate runs at most half the CPU count of modules at once (`DEFAULT_MAX_RUNNING_JOBS` in `merge_gate.py`); a group with more files than that gains less in the gate.
   4. A change to a shared support file (for example `scripts/lint/memory_test_support.py`) is allowed only when every module that imports it stays green; name those importers in the final gate run.
-  5. After the edit, measure the gain in same-load pairs: run the module at the phase base (a `copies.py run --commit <base>` copy) and in the worktree at the same time, three rounds, into `<module>-pair-<before|after>-<n>-<sha>.json`, with `/proc/loadavg` beside each round. The host load changes all day, so a before batch and a later after batch do not compare. The director runs the pairs after the last repair lands (example: `phases/7/pairs.sh` in the run directory). Half the wall time is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. Report the before and after medians, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
+  5. After the edit, measure the gain in same-load pairs: run the module at the phase base (a `copies.py run --commit <base>` copy) and in the worktree at the same time, three rounds, into `<module>-pair-<before|after>-<n>-<sha>.json`, with `/proc/loadavg` beside each round. The host load changes all day, so a before batch and a later after batch do not compare. The director runs the pairs after the last repair lands (example: `phases/7/pairs.sh` in the run directory). Half the wall time is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. A floor names its cost breakdown and the one operation that limits it. A proposal names its owner, its revisit condition, and whether its gain is measured or estimated. The pair tool prints the before and after medians as a table when it ends. Report the before and after medians, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
 
 ## Phases
 
@@ -193,40 +200,24 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 6 — The simplify-lens and assign-launcher modules run faster  · status: done
 **Depends on:** Phase 5
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_simplify_lens.py` (median 132 s, 61 s CPU) runs in at most half its baseline wall time, and the assign launcher group records its session once per class (F025), with no CPU increase and no lost coverage.
-
-**Spec:** apply the speed method (Delegation Context). Each writer owns one module group.
-- `agents/test_codex_mesh.py` left this phase: codex-mesh retires, so the builds showrunner stopped new mesh test work (2026-11-04). Do not edit it.
-- `direct/test_simplify_lens.py`: `scripts/direct/wait_for_test_state.py` already waits on folder events and process descriptors (37). Find the cost from the timings.
-- F025: each assign launcher test runs the recorder setup from the start (about 150 git starts a run). Record the session once per class and copy it per test. Do it in `assign_launcher_test_support.py`; do not edit `test_codex_mesh.py`.
-- F025 isolation: the parent fixture makes a new root and server for each test, and the recorder state holds absolute history and project paths (`progress_history.py:1358`). Restore the session, history and project together for each test, with private paths and a fresh server identity. Add a test that proves a recorder write in one test cannot reach the class seed or another test.
-- Type: `AssignLauncherFixture.launch()` and `successful()` take `script: Path | None` (`assign_launcher_test_support.py:119`, `:139`); absence means in-process and presence means a separate process. Replace it with named execution choices (for example `InProcessAssignment | LauncherScript`). Keep the existing process tests.
-- Measure CPU with the sequential method from phase 5: run the before and after trees one after the other on an idle host, never side by side.
+- `test_simplify_lens.py` seeds one git repository per class and copies it for each test. `setUp()` still records `start-run` and `start-phase simplify` for each test, except the ad hoc test, where the assignment makes the phase. Same-load pairs: 204 s to 118 s wall, CPU 117 s to 94 s.
+- `assign_launcher_test_support.py` defines `AssignmentExecution = InProcessAssignment | LauncherScript`; `AssignLauncherFixture.launch()` and `successful()` take `execution`. The process tests stay.
+- The assign launcher group records its session for each test, as before.
 
 **Files:**
-- `scripts/direct/test_simplify_lens.py` — speed edits
-- `scripts/direct/wait_for_test_state.py` — read; edit only under speed method step 4
-- `scripts/direct/assign_launcher_test_support.py` — F025 per-class recording
-- `scripts/direct/test_assign_launcher*.py` — fixture use only
+- `scripts/direct/test_simplify_lens.py` — per-class git seed
+- `scripts/direct/assign_launcher_test_support.py` — named execution choices
+- `scripts/direct/test_assign_launcher.py`, `_identity`, `_reuse`, `_review` — use the execution choices
+- `scripts/agents/test_heartbeat.py` — checks the wait helper
 
-**Workers:** 2 writers — one module group each; there is no new test to write before the code
-- `impl` — `scripts/direct/assign_launcher_test_support.py`, `scripts/direct/test_assign_launcher*.py`
-- `test` opens as impl — `scripts/direct/test_simplify_lens.py`; hub: `scripts/direct/wait_for_test_state.py`
+**Gotchas:**
+- The simplify-lens floor is one real review-launcher run per test (3-6 s); `test_report_validation` takes 25 s for 8 launches.
+- On natedev, before and after batches at different times compare host load, not code; measure with same-load pairs.
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 5: the assign launcher tests are four files (`test_assign_launcher.py`, `_identity`, `_reuse`, `_review`) with one support module, `assign_launcher_test_support.py`. Each still imports `scripts.agents.test_codex_mesh` as a fixture, so the gate run includes it.
-- Phase 5: the SSH target tests are five files with `verify_ssh_targets_test_support.py`; they are not in this phase.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_simplify_lens.py'` and `-p 'test_assign_launcher*.py'` green
-- `python3 -m unittest discover -s scripts/lib` green
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
-- Each module's (or group's) after median `wall_s` is at most half its before median, or the phase report names the measured floor and the proposal sent; its `cpu_s` median is not higher
-- The checkpoint gate is green
+**Ruled out:**
+- A per-class recorder seed for the assign launcher tests (F025): it gained about 4%, so simple wins (showrunner ruling).
 
 ### Phase 7 — The fast-track module and the next live slow module run in half their time  · status: todo
 **Depends on:** none (its two modules share no file with Phase 6; each baseline is its own gate median and an idle-host run, so Phase 6 need not land first)
@@ -333,7 +324,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Files:**
 - `scripts/lib/py_floor_test_support.py`, `scripts/lib/nix_env_test_support.py` — helpers
 - `scripts/direct/recorder_fixture.py`, `scripts/direct/test_simplify_lens.py` — callers
-- every module that imports `nix_env_test_support.py` — run in the gate
+- `scripts/direct/test_simplify_result.py`, `scripts/direct/test_verify_nix_shell.py`, `scripts/nix_env/test_heal.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_claude_result.py`, `scripts/lint/test_invoke_scope.py`, `scripts/lib/test_nix_env.py`, `scripts/lib/test_nix_env_launches.py` — importers of `nix_env_test_support.py`, run in the gate
 
 **Workers:** 2 writers — one helper each
 - `impl` — `py_floor_test_support.py`, `recorder_fixture.py`, `test_simplify_lens.py`
@@ -400,7 +391,8 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 3. Measure the gain with same-load pairs (Speed method step 5).
 4. Report each removed test, its covering test, and the time saved; and each kept candidate with its reason.
 
-**Files:** the 10 test modules, named at dispatch.
+**Files:**
+- `scripts/test_times/coverage_overlap.py` — read only; the director names the 10 test modules at dispatch and adds them here
 
 **Workers:** 2 writers — modules split by folder; no hub file.
 
@@ -413,3 +405,44 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - every changed module green in the checkpoint gate run
 - each removal names a covering test that checks the same result
 - the pair medians show each changed module's wall and CPU time not higher than before
+
+### Phase 14 — `test_times top` ranks only valid runs  · status: todo
+**Depends on:** none (runs beside Phase 12; the two share no file)
+
+#### Work Order
+
+**Goal:** `test_times top` ranks each module from its passed runs on one checkout within an age limit, and lists the live modules it has no run for.
+
+**Change-Review:** `/test_times top` shows other ranks: failed, old and other-checkout runs no longer count, and one new line under the table names the unmeasured modules.
+
+**Spec:**
+
+1. `show.py top` (`scripts/test_times/show.py:131`) counts a module row only when:
+   - its `status` is 0 and its run is not `aborted`;
+   - its run's `checkout` is `TOP_CHECKOUT` in `config/test_times.conf` (default `~/worktrees/claude-natedev-builds`, the builds merge checkout with the most runs; expand `~`);
+   - its `started_at` is within `TOP_MAX_AGE_DAYS` (default 7) of now.
+   Keep the `host` and `restart = ''` filters. Add no column.
+2. Under the table, print one line: `unmeasured: <n> live modules` and their `suite/module` names, comma-separated, when a live module from `discover_test_modules` has no counted row. Print nothing when every live module has one.
+3. Each gate run record stores `slow_test_s` (the `SLOW_TEST_S` value the run used) and `tests_run` (the sum over its modules). `gate_record.py` writes both; `scripts/buildlog/index.py` adds both columns to `gate_runs` (`:477`). The schema hash changes, so the index opens a new file (Phase 10); a record without the fields reads as null.
+4. `show.py suites` prints `tests run` for each run. A test row that is not kept shows the run's `slow_test_s`, so "faster than the threshold" and "removed" read differently.
+
+**Files:**
+- `scripts/test_times/show.py`, `config/test_times.conf` — ranking filters and the unmeasured line
+- `scripts/test_times/gate_record.py`, `scripts/buildlog/index.py` — the two run fields
+- `scripts/test_times/test_show.py`, `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_gate_index.py` — tests
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `show.py`, `gate_record.py`, `index.py`, hub: `config/test_times.conf`
+- `test` — `test_show.py`, `test_gate_record.py`, `test_gate_index.py`, from the Spec: a failed, aborted, old or other-checkout row does not rank; an unmeasured live module is named; a new run stores `slow_test_s` and `tests_run`; an old record reads as null
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 4: `show.py` reads the index through `index.read_only_uri`, and prints through `print_table` and `terminal_cells.py`.
+- Phase 10: a new column changes the schema hash and opens a new index file; no code names `index.sqlite`.
+- Showrunner ruling 2026-11-04: fix the wrong results only; no status, age or sample columns.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/test_times` and `python3 -m unittest discover -s scripts/buildlog` green
+- `python3 scripts/test_times/show.py top` on the live index prints in under 1 s
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
