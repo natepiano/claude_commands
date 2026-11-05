@@ -15,6 +15,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 from importlib import import_module
@@ -44,13 +45,13 @@ from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
-    ResumeResult as ResumeResult,
+    ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
 )
 import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
-    from scripts.production.staff import StaffRow, StaffSnapshot
+    from scripts.production.staff import StaffRow, StaffSnapshot, ClaudeBackend, CodexBackend, BackendUnavailable
 
 
 class RowStarter(Protocol):
@@ -144,7 +145,24 @@ def _record_launches(selected: list[str]) -> None:
         print(f"stop: launch note anomaly: {error}", file=sys.stderr)
 
 
-def stop(session: str, *, deadline: float = math.inf) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend: ClaudeBackend | CodexBackend | BackendUnavailable) -> SourceRelease:
+    """Resolve native stop evidence before creating the destination."""
+    from scripts.production import staff
+
+    result = stop(row.id)
+    if isinstance(result, SessionNotFound):
+        return SourceUnresolved(f"{row.id}: lifecycle could not resolve the staff reference; check the staff row and retry")
+    if isinstance(result, StopFailed):
+        return SourceReleaseUnknown(f"{result.reason}; inspect the source session and retry")
+    if isinstance(result, NotRunning) and isinstance(backend, staff.CodexBackend):
+        stop_mesh = cast(Callable[[staff.StaffRow, tuple[Path, ...]], SourceRelease],
+                         import_module("scripts.agents.codex_mesh").stop_worker_for_switch)
+        released = stop_mesh(row, runs())
+        return released if isinstance(released, SourceReleased) else replace(released, reason=f"{released.reason}; inspect the source session and retry")
+    return SourceReleased()
+
+
+def stop(session: str, *, deadline: float = math.inf) -> StopResult:
     from scripts.production import staff
 
     try:
@@ -155,7 +173,7 @@ def stop(session: str, *, deadline: float = math.inf) -> Stopped | NotRunning | 
         return StopFailed(session, reason if "deadline passed" in reason else f"deadline passed; {reason}")
 
 
-def _stop_recorded(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+def _stop_recorded(session: str) -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     _record_launches([session])
     result = _stop(session)
@@ -182,7 +200,7 @@ def _retire_prompt(session_id: str) -> None:
         print(f"{session_id}: prompt cancellation: {error}", file=sys.stderr)
 
 
-def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+def _stop(session: str) -> StopResult:
     """Signal only the process that proves the current conversation."""
     identity = session
     last_signal = ""
@@ -699,7 +717,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
             stops = [pool.submit(handoff_failures.__getitem__, session) if session in handoff_failures else
                      pool.submit(already_up.__getitem__, session) if session in already_up else
                      pool.submit(_stop, session) for session in selected]
-            stopped: list[Stopped | NotRunning | StopFailed | SessionNotFound | ClaudeUp] = []
+            stopped: list[StopResult | ClaudeUp] = []
             for session, future in zip(selected, stops):
                 try:
                     result = future.result()

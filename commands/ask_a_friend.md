@@ -106,7 +106,9 @@ One short section: the question, the friend's position, your position, and what 
 
 ### EndFriend
 
-`bash ~/.claude/scripts/ask_a_friend/end_friend.sh "${SESSION_DIR}"` — foreground on both families; on codex, `FRIEND_TERMINAL` then exits on its own. Run it on every exit path, including errors and user cancellation: a friend left running keeps a session or an app-server alive for nothing.
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/worker_fill.py end-friend --run "${SESSION_DIR}"`
+
+Run this command on every exit path, including errors and user cancellation. It stops the friend and records the ended status.
 
 ## Rules
 

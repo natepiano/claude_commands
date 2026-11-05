@@ -2554,13 +2554,9 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
         message = isolated.parent / "message"
         copy_session_modules(message)
-        library = isolated.parent / "lib"
-        library.mkdir(exist_ok=True)
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/process_failure.py", library / "process_failure.py")
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/probe_session.py", library / "probe_session.py")
-        for relative in ("lib/operation_deadline.py", "lib/script_envelope.py", "lib/session_paths.py", "lib/atomic_file.py", "lib/conf.py", "lib/legacy_identity.py", "lib/agent_scope.py", "agents/worker_lifecycle.py",
-                         "production/staff.py", "shutdown/remote.py"):
+        _ = shutil.copytree(Path(herdr.__file__).resolve().parents[1] / "lib", isolated.parent / "lib", dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "test_*"))
+        for relative in ("agents/worker_lifecycle.py", "production/staff.py", "shutdown/remote.py"):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)
