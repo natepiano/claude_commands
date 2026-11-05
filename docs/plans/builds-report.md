@@ -464,38 +464,22 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 **Ruled out:** opening the page on the Mac over ssh with a target config read — the user's rule is "it should always be a tailscale link".
 
 ### Phase 23 — The first kill lookup runs its cargo metadata probes in parallel  · status: done
-**Depends on:** Phase 20 (one reader for recorded output folders).
 
-The builds showrunner asked for this on 2026-11-04 (Phase 20 simplify item 9).
+#### As-built
 
-#### Work Order
-
-**Goal:** `memory.build_output_roots` runs its `cargo metadata` probes in a thread pool, so the first kill lookup in a process drops from about 5 s to about 1 s wall time, with the same root set. Measured cost: total CPU rises about 0.7 s (4.85 to 5.54 s, parallel `cargo metadata` contention), once per report process that classifies a kill; `METADATA_PROBE_WORKERS=1` restores the sequence.
-
-**Spec:**
-`scripts/buildlog/memory.py` `build_output_roots` runs `read_cargo_output_roots(checkout)` once for each checkout with a `Cargo.toml`, one at a time. On the live natedev index that is 116 probes: wall 10.0 s, child CPU 6.7 s.
-1. Run those probes through `concurrent.futures.ThreadPoolExecutor(max_workers=<workers>)` with `executor.map`. Each probe is a `cargo metadata` subprocess, so threads give real parallel work.
-2. Read the worker count at use from `config/buildlog.conf` key `METADATA_PROBE_WORKERS` (default 8, whole number 1..), with `conf.read("buildlog").whole(...)`, which returns an `int` for `ThreadPoolExecutor(max_workers=...)`. `.number(...)` returns a float and is wrong here. Add the key with a `# Basis:` line and a `# whole: 1..` line, the same form as `config/build_folders.conf`.
-3. Keep the result the same: a `CargoOutputRoots` result adds its target and build directories; a `CargoOutputUnavailable` result adds nothing; a checkout with no `Cargo.toml` is not probed; the set does not depend on probe order. An exception that a probe raises still reaches the caller, as now.
-4. Keep the signature, the `@lru_cache(maxsize=1)`, the lazy `build_shape` import and the Phase 20 recorded-root code.
+- `memory.build_output_roots` runs `read_cargo_output_roots` for each checkout with a `Cargo.toml` through `ThreadPoolExecutor(max_workers=workers)` and `executor.map`. The root set does not depend on probe order, and a probe exception reaches the caller.
+- `config/buildlog.conf` `METADATA_PROBE_WORKERS=8` (`# whole: 1..`) sets `workers`, read at use with `conf.read("buildlog").whole(...)`.
+- On the live natedev index (157 roots, same set), the first kill lookup takes 1.08 s wall instead of 4.98 s. Total CPU is 5.54 s instead of 4.85 s, because parallel `cargo metadata` runs contend. The cost is paid once per report process that classifies a kill.
 
 **Files:**
-- `scripts/buildlog/memory.py` — the probe loop runs in a thread pool.
-- `config/buildlog.conf` — `METADATA_PROBE_WORKERS=8`.
-- `scripts/buildlog/test_memory_window.py` — tests.
+- `scripts/buildlog/memory.py` — the pooled probe loop; `concurrent.futures` is a top-level import, and `build_shape` stays a lazy import (import cycle).
+- `config/buildlog.conf` — `METADATA_PROBE_WORKERS`.
+- `scripts/buildlog/test_memory_window.py` — `probe`, `configure_workers` (`write_config_fixture`, so the committed limits stay) and `probes_meet` (one `threading.Barrier(2)`) helpers; tests for overlapping probes, one worker in sequence and exception propagation.
 
-**Workers:** 1 writer (rowcpu): three small files; nothing splits.
+**Gotchas:** `METADATA_PROBE_WORKERS=1` restores the sequence and the lower CPU.
 
-**State:** none.
-
-**Constraints from prior phases:**
-- Phase 20: `build_output_roots` reads recorded pairs through `build_shape.recorded_output_roots`; checkouts come from absolute workspace keys plus the current checkout. Tests use a `build_roots` helper in `BuildOutputRootsTests`.
-- Phase 19: measure CPU only as an interleaved A/B against the prior commit, in one run.
-- Order with resources: resources plans one phase after its Phase 63 that changes the reader boundary in `memory.py` (Phase 20 findings F008, F010, F011, F012). Phase 23 lands first; resources merges it before that change.
-
-**Acceptance gate:**
-- A test proves two probes run at the same time (for example, a probe that waits on a `threading.Barrier(2)` with a short timeout fails when the probes run one at a time).
-- A test proves the worker count comes from `METADATA_PROBE_WORKERS` (a value of 1 runs the probes one at a time). The tests write the key through `write_config_fixture`, so they keep the committed `# whole: 1..` limit; `scripts/lib/test_conf.py` covers the refusal of a fractional value.
-- The Phase 20 outcome tests and `test_kill_classification_reads_index_and_metadata_once_for_the_process` stay green unchanged.
-- Interleaved A/B on the live natedev index with real `cargo metadata`, 5 fresh processes per tree, base = the Phase 20 checkpoint: wall time, own CPU and child CPU means, and the same root set.
-- basedpyright on the changed Python files: 0 errors, 0 warnings, 0 notes.
+**Ruled out:**
+- Checking recorded roots before the probes — a second cached reader for a path that runs about once a month.
+- Pooling the `disk.py` timer probes — background wall time only; CPU stays the same.
+- Probing fewer checkouts from recorded pairs or saved roots — the roots go wrong after a Cargo config change.
+- A test that a fractional worker count is refused — it tests only the conf library, which `scripts/lib/test_conf.py` covers.
