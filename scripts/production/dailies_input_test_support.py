@@ -228,7 +228,7 @@ class DailiesInputFixture(unittest.TestCase):
         self.showrunner_state = self.root / "showrunner-state"
         upgrade = self.root / "bevy upgrade stub.py"
         _ = upgrade.write_text(BEVY_UPGRADE_STUB, encoding="utf-8")
-        self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
+        self.env = {**os.environ, "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles", "BUILD_HOLD_DIR": str(self.holders),
                     "DAILIES_BEVY_UPGRADE": str(upgrade),
                     "DAILIES_BEVY_EVENTS": str(self.root / "bevy-events.json"),
                     "DAILIES_BEVY_OUTPUT": "", "DAILIES_BEVY_STDERR": "",

@@ -2,9 +2,9 @@
 
 ## Items to consider
 
-- [ ] **Memory pressure is sampled every 5–10 s, not only at each admission poll**
-  - Target: `scripts/lint/memory_admit.py` (pressure reading), the buildlog sampler, `docs/as-built/build-memory-admission.md`
-  - Why needed: the pressure hold (full avg10 > 5.0) is judged only from readings taken when a step polls, so the record has no steady avg10 series to tell how long holds last or to replay another limit against a freeze.
+- [ ] **Record memory PSI avg10 every 5–10 seconds, independently of admission passes.**
+  - Target: `scripts/buildlog/sample.py`, `scripts/lint/memory_admit.py` (`read_pressure`), `scripts/build_queue/admission_service.py`, their tests, and `docs/as-built/build-memory-admission.md`.
+  - Why needed: The service reads PSI during admission passes. The buildlog sampler records cumulative stalls, but it does not record the required avg10 series.
   - Completion condition: `/proc/pressure/memory` some and full avg10 are recorded every 5–10 s on natedev with a time stamp, kept for at least 7 days, and the pressure replay reads them; a test fakes the pressure file and checks the series.
   - Revealed by: the pressure hold question during Phase 16 (builds showrunner 2026-10-30: limit 5.0 stays, the sampler is `next`)
 
@@ -15,10 +15,10 @@
   - Revealed by: Phase 25 review (Phase 4 Spec 6; builds showrunner 2026-10-30: next, dated on or after 2026-12-05)
 
 - [ ] **Measure EASY backfill against the deployed Rule A queue policy**
-  - Start after both Phase 39 checkpoints reach main and one day of observations exists.
+  - Start after both Phase 39 checkpoints reach main and seven days exist within one unchanged policy and configuration span. Calibrate the deployed model first. Stop comparison if calibration fails.
   - Bound the cohort at changes to queue priority, head policy, estimation, running charge, budget, or headroom settings.
   - Compare EASY with the deployed ordered walk, including Rule A and recovery spacing.
-  - Use the same admission function and cohort settings for both policies.
+  - Use the shipped `head_policy` for the deployed baseline. Add any alternate analysis rule explicitly; Phase 20 provides no alternate rule argument.
   - Report additional wait savings and head delay.
   - Revealed by: Phase 30; baseline corrected after Phase 31's Work Order and Phase 39.
 
@@ -27,11 +27,14 @@
   - Completion condition: the call uses fewer imports or a lighter entry path; the change reports before and after CPU figures for the same call, and the build_targets and verify tests pass.
   - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
 
-- [ ] **Use recorded Cargo output roots for trim matching and Phase 17**
-  - Target: `scripts/lint/sweep.py`, Phase 11's shared step-evidence reader in `scripts/lint/build_shape.py`, and their tests
-  - Why needed: Phase 51 records both Cargo output roots for each step (`record.py` :935, `index.py` :118). Trim attribution still uses saved workspace mappings instead of each step's recorded roots (`sweep.py` :3796, :3876).
-  - Completion condition: match trims through recorded output roots after copies disappear or mappings change. Expose both roots through Phase 11's shared reader for Phase 17. Keep named unknown states for missing historical evidence. Add no second mapping or recorder.
-  - Revealed by: Phase 4 (builds showrunner 2026-10-30: next); narrowed after the Phase 37 architect review and again after the Phase 51 and 53 architect review
+- [ ] **Use recorded Cargo output roots for trim matching**
+  - Target: `scripts/lint/sweep.py`, `scripts/lint/build_shape.py` and their tests.
+  - Dependency: reuse recorded-root evidence if another consumer has added it; otherwise add it with this consumer.
+  - Why needed: `_rebuild_causes()` matches trims through saved workspace mappings instead of each step's recorded roots.
+  - Completion condition: read both recorded roots through the shared reader, with named unknown states and coherent root pairs for repeated attempts.
+  - Test removed copies, changed mappings, repeated attempts with different roots and missing roots.
+  - Add no second mapping, join or recorder.
+  - Revealed by: Phases 4, 11 and 17 (builds showrunner 2026-10-30: next); Phase 17 shipped no reader extension.
 
 - [ ] **The working-set summary tells a Node script apart from a Node task or one-line program**
   - Target: `scripts/build_targets/working_set.py`, `scripts/build_targets/test_working_set.py`
@@ -49,3 +52,13 @@
   - Target: `mods/unit-board/hooks/register.tsx`, `mods/unit-board/tests/queue.test.ts`, the shared queue-priority writer and its tests, and `commands/build/queue.md`.
   - Completion condition: typed `/build:queue bump <unit>` from any pane sets or replaces persistent priority through the existing writer, without a session-role check on the plugin route; tests cover a non-showrunner pane and replacement, while direct priority commands retain their existing caller checks.
   - Revealed by: Phase 26; approved by builds in `S/next_items_pending.md`.
+
+- [ ] **The floor sweep takes its target folders from recorded step rows**
+  - Target: `scripts/lint/sweep.py` (`discover_cargo_outputs`, `_hold_floor`), the shared step-evidence reader and their tests.
+  - Dependency: follow Phase 58's C1008 fix and preserve its 30-second limit.
+  - Why needed: the build queue owns build folders (user, 2026-11-03). Output discovery still runs Cargo metadata for checkouts, although step rows record Cargo output roots.
+  - Completion condition: use both recorded roots through the shared reader and run no `cargo metadata` during the floor pass.
+  - Add reader fields only with their first consumer; reuse fields that another consumer already added.
+  - Represent missing folder evidence with a named state and preserve existing deletion protections.
+  - Test the evidence source and missing evidence; require a successful natedev floor-only dry run below 30 seconds.
+  - Revealed by: Phase 58 part B and C1008 (builds showrunner 2026-11-04: next, after the Phase 58 fix)

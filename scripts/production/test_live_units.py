@@ -156,7 +156,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.members("alpha-unit")
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         receiving = showrunner_relationship("receiving")
-        _ = staff.move(row.id, receiving.id)
+        _ = staff.move(row.id, staff.ReportsTo(receiving.id))
         self.hosts({"unit": HostedUnit("director", "w4:p1", {
             "STAFF_ID": row.id, "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit",
         })})

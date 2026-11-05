@@ -20,7 +20,7 @@ from scripts.whoami.account_test_support import write_codex_auth
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
-EXAMPLE_FIRST_LINE = "unassigned | /tmp/claude_commands"
+EXAMPLE_FIRST_LINE = "/tmp/claude_commands"
 ACCOUNT_FIRST_LINE = EXAMPLE_FIRST_LINE
 # The account leads the second line, then the model and tokens, then the quota windows.
 MODEL_TOKENS = "Opus 5.5 high | 182,340"

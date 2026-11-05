@@ -767,10 +767,33 @@ def tool(name: str, fallback: Path, override: str) -> str:
     return os.environ.get(override) or shutil.which(name) or str(fallback)
 
 
+class CheckpointTestStep(NamedTuple):
+    label: str
+    command: list[str]
+    folder: Path
+
+
+class CargoPackage(NamedTuple):
+    folder: Path
+    name: str
+
+
+class CargoWorkspace(NamedTuple):
+    pass
+
+
+def read_cargo_package(folder: Path) -> CargoPackage | CargoWorkspace:
+    manifest = tomllib.loads((folder / "Cargo.toml").read_text(encoding="utf-8"))
+    if "package" not in manifest:
+        # A workspace root's manifest names no package, so paths under it have no package tests.
+        return CargoWorkspace()
+    return CargoPackage(folder, cast(str, manifest["package"]["name"]))
+
+
 def test_steps(production: Production, paths: tuple[str, ...],
-               merge_tests: tuple[tuple[str, ...], ...]) -> list[tuple[str, list[str]]]:
+               merge_tests: tuple[tuple[str, ...], ...]) -> list[CheckpointTestStep]:
     checkout = production.checkout
-    packages: set[str] = set()
+    packages: set[CargoPackage] = set()
     examples: set[tuple[str, str]] = set()
     for raw in paths:
         path = checkout / raw
@@ -779,25 +802,31 @@ def test_steps(production: Production, paths: tuple[str, ...],
                 break
             manifest = parent / "Cargo.toml"
             if manifest.exists():
-                # A workspace root's manifest names no package: a path under it, such as docs, has no tests.
-                if "package" in tomllib.loads(manifest.read_text(encoding="utf-8")):
-                    packages.add(parent.name)
+                package = read_cargo_package(parent)
+                if isinstance(package, CargoPackage):
+                    packages.add(package)
                 break
         match = re.search(r"(?:^|/)crates/([^/]+)/examples/([^/.]+)", raw)
         if match:
-            examples.add((match.group(1), match.group(2)))
+            folder = checkout / "crates" / match.group(1)
+            if (folder / "Cargo.toml").exists():
+                package = read_cargo_package(folder)
+                if isinstance(package, CargoPackage):
+                    examples.add((package.name, match.group(2)))
     verify = tool("verify.sh", Path.home() / ".claude/scripts/direct/verify.sh", "MERGE_CHECKPOINT_VERIFY")
     verify_command = [verify] if os.access(verify, os.X_OK) else ["bash", verify]
-    steps = [(f"package {package}", [*verify_command, "test", package]) for package in sorted(packages)]
-    steps.extend((f"example {package}/{name}", [*verify_command, "example", package, name])
+    steps = [CheckpointTestStep(f"package {package.name}", [*verify_command, "test", package.name], package.folder)
+             for package in sorted(packages)]
+    steps.extend(CheckpointTestStep(f"example {package}/{name}", [*verify_command, "example", package, name], checkout)
                  for package, name in sorted(examples))
-    steps.extend((f"merge test {index}", list(command)) for index, command in enumerate(merge_tests, 1))
+    steps.extend(CheckpointTestStep(f"merge test {index}", list(command), checkout)
+                 for index, command in enumerate(merge_tests, 1))
     return steps
 
 
-def run_test_command(command: list[str], checkout: Path) -> subprocess.CompletedProcess[str]:
+def run_test_command(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(command, cwd=checkout, capture_output=True, text=True, check=False)
+        return subprocess.run(command, cwd=folder, capture_output=True, text=True, check=False)
     except OSError as error:
         return subprocess.CompletedProcess(command, 127, "", f"{error}\n")
 
@@ -865,22 +894,23 @@ def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
     """Run checkpoint commands and their retries; the caller owns merge rollback."""
     steps = test_steps(production, paths, merge_tests)
     log.parent.mkdir(parents=True, exist_ok=True)
-    failed: list[tuple[str, list[str], frozenset[str]]] = []
+    failed: list[tuple[CheckpointTestStep, frozenset[str]]] = []
     with log.open("a", encoding="utf-8") as output:
-        for name, command in steps:
-            result = run_test_command(command, production.checkout)
+        for step in steps:
+            result = run_test_command(step.command, step.folder)
             _ = output.write(result.stdout + result.stderr)
-            _ = output.write(f"{name.replace(' ', '_')}_EXIT={result.returncode}\n")
+            _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
-            stop_cancelled_test(name, result, log)
-            if not test_passed(command, result):
-                failed.append((name, command, failed_tests(result.stdout + result.stderr)))
+            stop_cancelled_test(step.label, result, log)
+            if not test_passed(step.command, result):
+                failed.append((step, failed_tests(result.stdout + result.stderr)))
     unresolved: list[str] = []
-    for name, command, tests in failed:
+    for step, tests in failed:
+        name, command, folder = step
         # Only known flaky tests failed: rerun those alone, not the whole command.
         alone = bool(tests) and tests <= flaky_tests
         with log.open("a", encoding="utf-8") as output:
-            result = run_test_command(only_tests(command, tests) if alone else command, production.checkout)
+            result = run_test_command(only_tests(command, tests) if alone else command, folder)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
         stop_cancelled_test(name, result, log)
@@ -899,7 +929,7 @@ def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
         raise Stop("red", "failed", f"{', '.join(unresolved)} failed; log {log}",
                    f"repair {', '.join(unresolved)} and send a new checkpoint; test log: {log}")
     report("red", "ok", "all commands green or known flakes green alone")
-    return ", ".join(name for name, _ in steps) if steps else "no tests"
+    return ", ".join(step.label for step in steps) if steps else "no tests"
 
 
 def test_passed(command: list[str], result: subprocess.CompletedProcess[str]) -> bool:

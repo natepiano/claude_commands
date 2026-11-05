@@ -32,6 +32,7 @@ import herdr
 import pane_launch
 import fake_herdr
 from fake_herdr import CommandResponse
+from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
@@ -442,7 +443,7 @@ class WaitingAgentCLI:
 
 
 # The probe that each transient server start runs before it gives panes their own scopes.
-SCOPE_PROBE = ["--user", "--scope", "--quiet", "--collect", "--", "true"]
+SCOPE_PROBE = ["--user", "--scope", "--quiet", "--collect", "--slice=app-agents.slice", "--", "true"]
 PROCESS_SESSIONS = herdr._process_sessions  # pyright: ignore[reportPrivateUsage]
 STARTUP_PROCESSES = herdr._startup_processes  # pyright: ignore[reportPrivateUsage]
 STARTUP_PROCESS_READER = herdr._startup_process_reader  # pyright: ignore[reportPrivateUsage]
@@ -893,6 +894,32 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIn("recipient changed", cast(herdr.PromptNotSubmitted, outcome).reason)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
+
+    def test_bridge_status_system_turn_makes_the_destination_ready(self) -> None:
+        self.ready_at = 60
+        row = {"type": "system", "subtype": "bridge_status",
+               "timestamp": (self.launched_at + timedelta(seconds=1)).isoformat()}
+        write_text_atomic(self.path, json.dumps(row) + "\n")
+        state = self.client.prompt_input_state("destination:p1", self.transcript, self.launched_at)
+        self.assertIsInstance(state, herdr.PromptInputReady)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_bridge_status_requires_a_system_turn_and_an_empty_composer(self) -> None:
+        self.ready_at = 60
+        for kind, screen in (
+            ("user", "────────\n❯ \n────────"),
+            ("assistant", "────────\n❯ \n────────"),
+            ("system", "Restoring conversation"),
+            ("system", "────────\n❯ another task\n────────"),
+        ):
+            with self.subTest(kind=kind, screen=screen):
+                row = {"type": kind, "subtype": "bridge_status",
+                       "timestamp": (self.launched_at + timedelta(seconds=1)).isoformat()}
+                write_text_atomic(self.path, json.dumps(row) + "\n")
+                self.screen = screen
+                state = self.client.prompt_input_state("destination:p1", self.transcript, self.launched_at)
+                self.assertIsInstance(state, herdr.PromptInputNotReady)
+                self.assertEqual((self.typed, self.enters), ([], []))
 
     def test_remote_control_signal_still_requires_a_visible_empty_composer(self) -> None:
         self.ready_at = 60
@@ -1377,6 +1404,29 @@ class LaunchDestinationTests(StaffTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
+
+    def test_pane_launch_waits_for_shell_cleanup_before_sending_the_command(self) -> None:
+        client = herdr.Herdr("agents")
+        clock = StartupClock()
+
+        def advance(seconds: float) -> None:
+            clock.elapsed += seconds
+
+        def checked(*_args: object, **_kwargs: object) -> bool:
+            self.assertFalse(run.called)
+            if clock.elapsed < 0.2:
+                raise herdr.HerdrFailure("pane runs other work: direnv, bash", "wrong_target")
+            return clock.elapsed >= 0.4
+
+        with (patch.object(herdr, "check_target", side_effect=checked) as check,
+              patch.object(herdr, "_pane_row", return_value=herdr.NoPane("worker")),
+              patch.object(time, "monotonic", lambda: clock.elapsed),
+              patch.object(time, "sleep", side_effect=advance),
+              patch.object(client, "run") as run):
+            client.run_in_pane("worker", ["claude", "--resume", "thread"])
+        self.assertGreaterEqual(check.call_count, 5)
+        self.assertGreaterEqual(clock.elapsed, 0.4)
+        run.assert_called_once_with("pane", "run", "worker", "claude --resume thread")
 
     def test_all_destinations_start_and_label_before_start(self) -> None:
         run_in_pane = herdr.Herdr.run_in_pane
@@ -2467,7 +2517,8 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/process_failure.py", library / "process_failure.py")
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/probe_session.py", library / "probe_session.py")
-        for relative in ("lib/script_envelope.py", "lib/atomic_file.py", "lib/session_paths.py", "production/staff.py", "shutdown/remote.py"):
+        for relative in ("lib/script_envelope.py", "lib/session_paths.py", "lib/atomic_file.py", "lib/conf.py", "lib/agent_scope.py", "agents/worker_lifecycle.py",
+                         "production/staff.py", "shutdown/remote.py"):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)
@@ -3459,8 +3510,8 @@ class HerdrTests(unittest.TestCase):
         for membership in ("0::", "1:name=systemd:"):
             _ = (server / "cgroup").write_text(f"{membership}{slice_path}/herdr-writing.service\n")
             for process in (shell, claude, daemon):
-                _ = (process / "cgroup").write_text(f"{membership}{slice_path}/{herdr.PANE_SLICE}/run-p11.scope\n")
-            _ = (unrelated / "cgroup").write_text(f"{membership}{slice_path}/{herdr.PANE_SLICE}/run-p20.scope\n")
+                _ = (process / "cgroup").write_text(f"{membership}{slice_path}/{agents_slice()}/run-p11.scope\n")
+            _ = (unrelated / "cgroup").write_text(f"{membership}{slice_path}/{agents_slice()}/run-p20.scope\n")
             for parent in (1, 5):
                 _ = (shell / "stat").write_text(f"11 (zsh) S {parent} 0 0\n")
                 with self.subTest(orphan_parent=parent, membership=membership):
@@ -3507,6 +3558,18 @@ class HerdrTests(unittest.TestCase):
                     "FAKE_HERDR_RESPONSES": str(self.responses_path)})
                 self.assertEqual(self.commands(), [["--user", "--scope", "--quiet", "--collect",
                                                     "--slice=app-agents.slice", "--", str(real), "-l"]])
+
+    def test_agent_slice_changes_apply_to_the_next_wrapper_and_scope_read(self) -> None:
+        config = self.root / "configuration"
+        config.mkdir()
+        _ = (config / "codex_daemon.conf").write_text("agents_slice=app-custom.slice\n")
+        with patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            self.configure_herdr(["status", "server"], "status: stopped\n")
+            _ = herdr.start_server("fixture", 0)
+            wrapper = (self.root / "home/.local/state/herdr/pane-shell").read_text()
+            self.assertIn("--slice=app-custom.slice", wrapper)
+            scope = Path("/app.slice/app-custom.slice/run-p11.scope")
+            self.assertEqual(herdr.pane_scopes([("0", scope)]), [("0", scope)])
 
     def test_pane_shell_falls_back_to_bin_sh(self) -> None:
         plain = self.root / "not-executable"
@@ -5131,6 +5194,13 @@ class RowTabTests(StaffTestCase):
         self.assertFalse(self.client.move_row_tabs(self.rows["unit"].id))
         self.assertEqual(self.client.commands, [])
 
+    def test_a_staff_root_has_no_parent_workspace(self) -> None:
+        before = self.staff_file.read_bytes()
+        with self.assertRaisesRegex(herdr.HerdrFailure, "has no parent workspace"):
+            _ = self.client.move_row_tabs(self.rows["parent"].id)
+        self.assertEqual(self.client.commands, [])
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
     def test_transfer_preserves_shared_tabs_separate_tabs_and_nested_grid_splits(self) -> None:
         initial = [dict(pane) for pane in self.client.tabs]
         for grid in (False, True):
@@ -5408,8 +5478,8 @@ class SavedLayoutTests(unittest.TestCase):
         retired = unit_membership("current", "retired-unit")
         old_child = unit_membership("wrapped", "child-unit")
         _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
-        assert old_child.parent is not None
-        _ = staff.set_doc(old_child.parent, staff.WrappedDoc("natedev", self.root / "archive.md"))
+        assert isinstance(old_child.parent, staff.ReportsTo)
+        _ = staff.set_doc(old_child.parent.id, staff.WrappedDoc("natedev", self.root / "archive.md"))
         processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p1"),
                                        {"STAFF_ID": retired.id}, "claude", "/missing")]
         classifier = herdr.UnitTabClassifier("fixture", processes, staff.snapshot())

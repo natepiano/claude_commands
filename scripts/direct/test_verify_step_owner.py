@@ -51,7 +51,7 @@ class TokenWaitNoteTests(unittest.TestCase):
                                     text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
-            self.assertIn("w74 holds it", result.stderr)
+            self.assertIn("w74 (pid unknown) holds it", result.stderr)
             self.assertNotIn("it came free just now", result.stderr)
 
 

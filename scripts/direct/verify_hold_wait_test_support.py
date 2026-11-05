@@ -23,10 +23,9 @@ from typing import ClassVar, Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.direct.verify_mac_offload_test_support import (
-    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit,
-)
+from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -360,15 +359,16 @@ else:
 
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
+        record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
-                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": "thread-impl",
+                                         "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                          "UNIT_PASS_OWNER": "launcher",
                                          "UNIT_HISTORY_DIR": str(self.fixture.root / "history"),
                                          "UNIT_SYNC_WRITES": "0", "CLAUDE_PROBE_SESSION": ""})
         for arguments in (
             ["start-run", "--session-dir", str(session), "--working-dir", str(self.fixture.root),
              "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
-             "--main-session-id", "fixture-director"],
+             "--main-session-id", fixture_runtime_id("fixture-director")],
             ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Hold"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "6", "--pass-kind", "impl",
              "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
@@ -376,15 +376,13 @@ else:
         ):
             result = invoke_recorder(arguments, self.fixture.environment, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            "fixture-impl": {"thread_id": "thread-impl"}}))
         return self.fixture.root / "history" / "runs" / f"{session.name}.jsonl"
 
     def assert_wait_follows_worker_thread(self, worker_name: str) -> None:
         history = self.record_phase()
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            "fixture-impl": {"thread_id": "thread-impl"}, worker_name: {"thread_id": "thread-test"}}))
+        record_wait_workers(self.fixture.root, session, self.fixture.environment,
+                            {"fixture-impl": "thread-impl", worker_name: "thread-test"})
         for arguments in (
             ["start-phase", "--session-dir", str(session), "--phase-id", "7", "--phase-title", "Test"],
             ["start-pass", "--session-dir", str(session), "--phase-id", "7", "--pass-kind", "test",
@@ -393,7 +391,7 @@ else:
         ):
             result = invoke_recorder(arguments, {**self.fixture.environment, "UNIT_TEAM_ROLE": "test"}, self.fixture.root)
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.fixture.environment["CODEX_THREAD_ID"] = "thread-test"
+        self.fixture.environment["CODEX_THREAD_ID"] = fixture_runtime_id("thread-test")
         self.hold()
         process = self.start("test", "sample", "--local", "worker attribution", "--filter", "smoke")
         self.wait_for_call(process)
@@ -407,7 +405,7 @@ else:
         for wait in (started, finished):
             self.assertEqual((wait["phase_id"], wait["phase_instance_id"], wait["pass_instance_id"],
                               wait["worker_name"], wait["owner_session"]),
-                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, "thread-test"))
+                             ("7", worker_pass["phase_instance_id"], worker_pass["pass_instance_id"], worker_name, fixture_runtime_id("thread-test")))
 
     def count_python_starts(self) -> Path:
         starts = self.fixture.root / "python-starts"

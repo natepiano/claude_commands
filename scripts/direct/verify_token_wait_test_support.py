@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -326,14 +327,16 @@ esac
                     os.close(descriptor)
 
     def record_phase(self, session: Path) -> None:
+        record_wait_workers(self.root, session, self.environment,
+                            {f"fixture-{slot}": f"thread-{slot}" for slot in ("impl", "first", "second")})
         self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
                                  "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
-                                 "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": "thread-impl",
+                                 "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                  "CLAUDE_PROBE_SESSION": ""})
         for arguments in (
             ["start-run", "--session-dir", str(session), "--working-dir", str(self.root),
              "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
-             "--main-session-id", "fixture-director"],
+             "--main-session-id", fixture_runtime_id("fixture-director")],
             ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Resources"],
         ):
             result = invoke_recorder(arguments, self.environment, self.root)
@@ -345,8 +348,6 @@ esac
             result = invoke_recorder(arguments, {**self.environment, "UNIT_TEAM_ROLE": slot}, self.root)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            f"fixture-{slot}": {"thread_id": f"thread-{slot}"} for slot in ("impl", "first", "second")}))
 
     def phase_waits(self, session: Path) -> list[dict[str, object]]:
         return [row for row in (cast(dict[str, object], json.loads(line)) for line in

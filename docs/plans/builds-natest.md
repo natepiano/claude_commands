@@ -258,74 +258,110 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Each module's (or group's) after median `wall_s` is at most half its before median, or the phase report names the measured floor and the proposal sent; its `cpu_s` median is not higher
 - The checkpoint gate is green, with the importers of each changed support file in it
 
-### Phase 8 — The test history tool starts without the merge gate module  · status: todo
-**Depends on:** Phase 4
-**Blocked by:** devtools 4y — its `merge_gate.py` type-check fix reaches origin/builds (sdlc order, 2026-11-03); the builds showrunner says when.
+### Phase 8 — The test history tool starts without the merge gate module  · status: done
+
+#### As-built
+
+- `scripts/production/gate_modules.py` holds `test_module_name`, `discover_test_modules` and the gate refusal error `GateRefused`. Discovery uses `os.walk`, skips `__pycache__`, and sorts on the path parts, so `merge_gate` keeps its module order. `merge_gate.py`, `show.py` and every `test_merge_gate*.py` module import these names from `gate_modules`.
+- `show.py` does not import `merge_gate`, so each `/test_times` command starts about 0.4 s faster.
+- `index.GATE_TABLES` is the tuple of gate tables, taken from the `TABLES` keys. `show.py` probes them after `index.update()` and `read_only()`. A missing gate table gives one line that ends "run `buildlog reindex`", exit 1. After the probe, a report query error keeps its traceback.
+- `index.update()` makes no `meta` root write when the stored root is the same.
+
+**Files:**
+- `scripts/production/gate_modules.py`, `scripts/production/merge_gate.py` — discovery and `GateRefused`
+- `scripts/test_times/show.py`, `scripts/test_times/test_show.py` — the light import and the missing-table line
+- `scripts/buildlog/index.py`, `scripts/buildlog/test_gate_index.py` — `GATE_TABLES` and the no-write update
+- `scripts/production/test_merge_gate*.py` — imports from `gate_modules`
+
+**Gotchas:**
+- basedpyright reports a name reached through another module's import as private (`reportPrivateLocalImportUsage`). A moved name moves in every importer in the same phase.
+
+### Phase 9 — Memory admission and the disk sweeper read the build log through the locked reader  · status: done
+
+#### As-built
+
+- `memory_admit.anonymous_history_rows(path)` returns `store.locked_rows(path)`. `sweep.build_log_rows`, `sweep.trim_row_recorded` and `sweep.read_sweep_removals` read through `store.locked_rows`. A month file that the rebuild enumerated and then cannot open still fails the rebuild report.
+- `memory_admit.py` imports the buildlog modules under `TYPE_CHECKING`, like `sweep.py`; the hand-copied store protocols are gone. `admission_service.py`, `admission_client.py` and their tests import `store` the same way.
+- `memory_admit.current_worktree_steps` keeps its own locked read: it needs the handle under the same lock for `os.fstat` and the file marks, and it raises on a partial tail.
+- `queue_lines.py` and `queue_view.py` pad through `scripts/lib/terminal_cells.py`; the padding cases are in `test_terminal_cells.py`.
+
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/lint/sweep.py` and their tests — the locked reads
+- `scripts/build_queue/admission_service.py`, `admission_client.py`, `admission_test_support.py`, `queue_lines.py`, `queue_view.py` and their tests
+- `scripts/lib/test_terminal_cells.py` — the padding cases
+
+**Gotchas:**
+- Reading `cgroup.procs` of a cgroup the kernel is removing gives ENODEV, not `FileNotFoundError`. `reservation_lifetime` catches only `FileNotFoundError`; resources-unit owns the fix.
+
+### Phase 10 — Each schema keeps its own build log index file  · status: todo
+**Depends on:** Phase 8, Phase 9
 
 #### Work Order
 
-**Goal:** `show.py` imports test discovery from a light module, so each `/test_times` subcommand starts about 0.4 s faster, and it names a missing gate table in one line instead of a traceback.
+**Goal:** two trees with different index schemas never rebuild each other's build log index, and the shared row reader holds its lock only while it reads bytes.
 
 **Spec:**
 
-1. After the director merges origin/builds with devtools 4y in it, move `GateRefused`, `discover_test_modules` and `test_module_name` from `scripts/production/merge_gate.py` into a new `scripts/production/gate_modules.py`. The name must not match `test_*.py`. `merge_gate.py` imports the three names from it; behavior does not change.
-2. `scripts/test_times/show.py` and `scripts/test_times/test_show.py` import `discover_test_modules` and `test_module_name` from `gate_modules.py`. `show.py` no longer imports `merge_gate.py` (measured: 373 ms of import time, cumulative, on natedev).
-3. `show.py top` (and each subcommand that reads gate tables) prints one clear line when the index has no `gate_modules` or `gate_runs` table, and exits 1. Today it ends in a traceback (`sqlite3.OperationalError: no such table: gate_modules`) on natedev, because the live index was built by an older indexer. Add a test for that case to `test_show.py`.
+1. Name the index file by a hash of the schema, so each schema has its own file. The hash covers every table, column and index, including the `build_history_group` column and the `steps_build_group_history` index (report-unit P11 e15006b41). Today one file name serves every schema, so a tree with another schema rebuilds the index each time it opens it.
+2. `index.update()` rebuilds when any `TABLES` name is missing from the file, not only on a version change (Phase 8 review F012).
+3. Delete an index file of another schema only after it is unused for an age read from config (`config/` file, no constant in code).
+4. `store.locked_rows` reads the bytes under the shared lock, releases the lock, then decodes and yields the rows (Phase 9 review F014). Writers in `locked_append` then wait only for the read, not for the caller's work.
+5. One function names the index file, and every reader calls it. Remove `store.INDEX_NAME`. The readers today build `root / store.INDEX_NAME` or `"buildlog/index.sqlite"`: `scripts/lint/memory_admit.py:1854,1939,2290,2344,2459`, `scripts/buildlog/width_trial.py:449` and `scripts/hierarchies/measure.py:1839,2680`. Put the function where `memory_admit.py` can import it without loading the index build code, or state the import cost.
+6. A dropped gate table is rebuilt by `update()`, so the Phase 8 test `test_reports_name_a_missing_gate_table_without_a_traceback` (`scripts/test_times/test_show.py:305`) changes. One test proves a report succeeds after a gate table is dropped. One test keeps the one-line diagnostic for a table still missing after `update()`, with `update()` patched to do nothing.
 
 **Files:**
-- `scripts/production/gate_modules.py` — new: gate test discovery and module names
-- `scripts/production/merge_gate.py` — imports them (owner devtools-unit)
-- `scripts/test_times/show.py` — imports from `gate_modules.py`
-- `scripts/test_times/test_show.py` — imports from `gate_modules.py`
+- `scripts/buildlog/index.py` — schema hash file name, missing-table rebuild, old-file cleanup
+- `scripts/buildlog/store.py` — `locked_rows` lock span, `INDEX_NAME` removed
+- `scripts/lint/memory_admit.py`, `scripts/buildlog/width_trial.py`, `scripts/hierarchies/measure.py` — readers of the index file
+- `scripts/buildlog/test_index.py`, `scripts/buildlog/test_gate_index.py`, `scripts/buildlog/test_store.py`, `scripts/test_times/test_show.py` — tests
+- the tests that build the index path by name: `scripts/hierarchies/test_measure.py`, `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_sample.py`, `scripts/buildlog/test_memory_window.py`, `scripts/buildlog/test_width_trial.py`, `scripts/lint/test_build_shape.py`, `scripts/lint/test_memory_admit.py`
+- a `config/` file for the cleanup age
 
-**Workers:** 1 writer — the move and its import changes must land together
-- `impl` — all four files
-- `test` opens as impl — no work
+**Workers:** 1 writer + 1 tester — the index, store and reader changes are one module group
+- `impl` — `index.py`, `store.py`, the config file, `memory_admit.py`, `width_trial.py`, `measure.py`
+- `test` — every test file above, from the Spec
 
 **State:** none
 
 **Constraints from prior phases:**
-- Phase 4: `show.py top` names live modules with `test_module_name(repo, suite, path)`. A test in `test_show.py` loads each module the gate discovers in `scripts/test_times`.
-- Phase 2: any edit to `merge_gate.py` runs every `test_merge_gate*.py` file, `test_merge_gate_holds.py` included.
-- Builds showrunner, 2026-11-03: test the move against devtools' tip and name that tip in the checkpoint notice's also-touches line.
+- Phase 8: `index.GATE_TABLES` is the tuple of gate tables, taken from the `TABLES` keys; `show.py` probes them. `update()` skips the `meta` root write when the stored root is the same.
+- Phase 9: `memory_admit.anonymous_history_rows`, `sweep.build_log_rows`, `sweep.trim_row_recorded` and `sweep.read_sweep_removals` read through `store.locked_rows`. `sweep.build_log_rows` raises `FileNotFoundError` when an enumerated month is absent after the read.
+- Ledger routes: Phase 8 F012, F013; Phase 9 F014.
 
 **Acceptance gate:**
-- Every `scripts/production/test_merge_gate*.py` file green. `test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list` fails on every tree between 19:00 and 24:00 EST (the gate writes the UTC date); devtools-unit owns that repair. Until it reaches origin/builds, run that one test outside those hours; keep its assertion.
-- `python3 -m unittest discover -s scripts/test_times -p 'test_*.py'` green
-- `basedpyright scripts/production/gate_modules.py scripts/production/merge_gate.py scripts/test_times` prints `0 errors, 0 warnings, 0 notes`
-- `python3 -X importtime scripts/test_times/show.py top` lists no `scripts.production.merge_gate` import
+- `python3 -m unittest discover -s scripts/buildlog` green
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_sweep.py`, `scripts/lint/test_build_shape.py`, `scripts/hierarchies/test_measure.py` and `scripts/test_times` green in the checkpoint gate run
+- `basedpyright scripts/buildlog scripts/lint/memory_admit.py scripts/hierarchies/measure.py` and every changed test file prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 9 — Memory admission and the disk sweeper read the build log through the locked reader  · status: todo
-**Depends on:** Phase 4
-**Blocked by:** resources P51/P53 and queue 10c reach origin/builds (builds showrunner order, 2026-11-03).
+### Phase 11 — Shared test fixtures skip repeated setup  · status: todo
+**Depends on:** Phase 6
 
 #### Work Order
 
-**Goal:** `memory_admit.py` and `sweep.py` read build log month files through `store.locked_rows`, so the build log has one locked row reader, and `queue_lines.py` pads through `terminal_cells.py`.
+**Goal:** a test with a fresh HOME skips the `lib/py` interpreter probe, and `NixFixture` stops copying the whole `config` folder for each test.
 
 **Spec:**
 
-1. After the director merges origin/builds with resources P51/P53 and queue 10c in it, the `Path` branch of `memory_admit.anonymous_history_rows` (`memory_admit.py:1387` before that merge) and `sweep.build_log_rows` (`sweep.py:1573`) call `store.locked_rows(path, start)` in place of their own open, shared flock and `whole_rows` loop. Behavior does not change. The `BuildLogStore` protocol in `memory_admit.py` (line 72 before that merge) gets a `locked_rows` method so the call type-checks; the locked `BinaryIO` branch stays as it is.
-2. `scripts/build_queue/queue_lines.py` imports `pad_left` and `pad_right` from `scripts/lib/terminal_cells.py` and drops its own copies; every importer of them switches to `terminal_cells.py`.
+1. Add one shared helper in `scripts/lib/py_floor_test_support.py` that sets `XDG_CACHE_HOME` to a folder for the test and writes the interpreter cache file there with `cache_file_name()` (`:26`). `recorder_fixture.launcher_environment` (`scripts/direct/recorder_fixture.py:198-208`) and `test_simplify_lens.py` use it; the copy in `recorder_fixture.py` goes. Estimate: 20-40 ms for each test that makes a fresh HOME.
+2. `NixFixture.setUp` (`scripts/lib/nix_env_test_support.py:50`) copies the `config` folder (55 files, 288 KB) once per class, or copies only the files the tests read. Each test keeps its own writable copy of any file it changes.
+3. Measure each changed importer module before and after with `scripts/test_times/module_run.py`, three runs each.
 
 **Files:**
-- `scripts/lint/memory_admit.py` — `anonymous_history_rows` calls `locked_rows` (owner resources-unit, moving to queue-unit)
-- `scripts/lint/sweep.py` — `build_log_rows` calls `locked_rows` (owner resources-unit)
-- `scripts/build_queue/queue_lines.py` — imports the padding helpers (owner queue-unit)
-- `scripts/build_queue/queue_view.py` — imports the padding helpers (line 12)
-- `scripts/build_queue/test_queue_lines.py` — imports the padding helpers (line 10)
+- `scripts/lib/py_floor_test_support.py`, `scripts/lib/nix_env_test_support.py` — helpers
+- `scripts/direct/recorder_fixture.py`, `scripts/direct/test_simplify_lens.py` — callers
+- every module that imports `nix_env_test_support.py` — run in the gate
 
-**Workers:** 1 writer — two short call-site edits; the existing tests prove them
-- `impl` — all three files and the importers of the padding helpers
-- `test` opens as impl — no work
+**Workers:** 2 writers — one helper each
+- `impl` — `py_floor_test_support.py`, `recorder_fixture.py`, `test_simplify_lens.py`
+- `test` opens as impl — `nix_env_test_support.py`
 
 **State:** none
 
 **Constraints from prior phases:**
-- Phase 4: `store.locked_rows(path: Path, start: int = 0)` opens the file, takes a shared flock and yields `whole_rows(handle, start)`; an absent file yields no rows. `record.read_attempt_results` already calls it. `index.read_file` keeps its own unlocked offset read.
-- Owners: the checkpoint notice names resources-unit and queue-unit.
+- Phase 6: `test_simplify_lens.py` seeds one git repository per class. `setUp()` still records `start-run` and `start-phase simplify` for each test, except the ad hoc test, where the assignment makes the phase.
+- Ledger routes: Phase 6 F018, F019. Phase 6 F017 (the `assign.py` exec call) belongs to sdlc devtools, not this phase.
 
 **Acceptance gate:**
-- `scripts/lint/test_memory_admit.py` and `scripts/lint/test_sweep.py` green in the checkpoint gate run
-- `python3 -m unittest discover -s scripts/build_queue` green
-- `basedpyright scripts/lint/memory_admit.py scripts/lint/sweep.py scripts/build_queue/queue_lines.py scripts/build_queue/queue_view.py scripts/build_queue/test_queue_lines.py` prints `0 errors, 0 warnings, 0 notes`
+- every importer of the two helpers green in the checkpoint gate run
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+- each changed importer's after median `cpu_s` is not higher than its before median

@@ -7,6 +7,7 @@ from typing import cast
 from pathlib import Path
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import fixture_runtime_id
 
 
 class VerifyTokenHistoryTests(VerifyTokenWaitFixture):
@@ -26,10 +27,10 @@ fi
 exit 0
 ''')
         first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                             "UNIT_TEAM_ROLE": "first", "CODEX_THREAD_ID": "thread-first", "TEST_BLOCK": "1",
+                             "UNIT_TEAM_ROLE": "first", "CODEX_THREAD_ID": fixture_runtime_id("thread-first"), "TEST_BLOCK": "1",
                              "UNIT_TOKEN_CLOCK_FILE": str(first_clock)}
         second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                              "UNIT_TEAM_ROLE": "second", "CODEX_THREAD_ID": "thread-second", "TEST_WAITING": str(waiting),
+                              "UNIT_TEAM_ROLE": "second", "CODEX_THREAD_ID": fixture_runtime_id("thread-second"), "TEST_WAITING": str(waiting),
                               "TEST_WAIT_GATE": str(resume),
                               "UNIT_TOKEN_CLOCK_FILE": str(second_clock)}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,

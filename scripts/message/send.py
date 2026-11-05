@@ -1748,8 +1748,8 @@ def resolve_staff_recipient(
         chain = [candidate.name]
         parent = candidate
         visited = {candidate.id}
-        while parent.kind != "showrunner" and parent.parent is not None:
-            ancestor = membership.by_id(parent.parent)
+        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo):
+            ancestor = membership.by_id(parent.parent.id)
             if ancestor is None or ancestor.id in visited:
                 break
             visited.add(ancestor.id)
@@ -1818,6 +1818,10 @@ def matching_recipients(
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [member.reason])
+    if isinstance(member, staff.StaffRow):
+        for anomaly in observed.row_anomalies:
+            if anomaly.row.id == member.id:
+                return RecipientSearchFailed(anomaly.diagnostic, observed.diagnostics)
     matches = (_staff_transport_matches(member, observed.entries) if isinstance(member, staff.StaffRow)
                else _sender_label_matches(to, observed.entries))
     if matches or isinstance(scope, LocalOnly):
@@ -1853,6 +1857,10 @@ def resolve_recipient(
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
+    if isinstance(member, staff.StaffRow):
+        for anomaly in observed.row_anomalies:
+            if anomaly.row.id == member.id:
+                usage_error(anomaly.diagnostic)
     if isinstance(scope, NamedMachine):
         return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
                                           else to if to.startswith("worker:") else f"session:{member.current_session}")
@@ -3019,10 +3027,10 @@ def repeat_notice_owner(sender: str) -> str:
         usage_error(member.reason)
     visited: set[staff.StaffId] = set()
     while member.kind != "showrunner":
-        if member.parent is None or member.id in visited:
+        if isinstance(member.parent, staff.StaffRoot) or member.id in visited:
             usage_error(f"missing showrunner staff row for {sender!r}")
         visited.add(member.id)
-        parent = membership.by_id(member.parent)
+        parent = membership.by_id(member.parent.id)
         if parent is None:
             usage_error(f"missing showrunner staff row for {sender!r}")
         member = parent

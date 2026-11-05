@@ -640,7 +640,8 @@ class QueueTests(NotificationGuardedTestCase):
             limits=memory_admit.AdmissionLimits(20 * GIB, 3 * GIB))
         row:memory_admit.Waiter = {"pid":10, "start_time":"10", "need":12 * GIB, "since":NOW - 300}
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], 12 * GIB,
-            memory_admit.head_wait_reason(decision, 12 * GIB, 30 * GIB, row, NOW, policy=admission_policy_fixture()))
+            memory_admit.HeadAdmissionStatus(decision, 12 * GIB, 30 * GIB,
+                memory_admit.head_window(row, NOW, policy=admission_policy_fixture())))
         view = memory_admit.QueueView((head,), running, 30 * GIB, 4 * GIB, 3 * GIB, NOW)
         model = self.model(queue_read_fixture(view, policy=admission_policy_fixture()), selected=True)
         text = self.checks(view) + "\n" + plain(queue_card.render_selection(model, "holder", 400))
@@ -784,8 +785,8 @@ class QueueTests(NotificationGuardedTestCase):
                                            [memory_admit.MeasuredMemory(15 * GIB)])
         head = memory_admit.WaitingStep(
             10, "head-id", "clone88ci", "check", "/tmp/clone88", now - 2400,
-            int(10.9 * GIB), memory_admit.head_wait_reason(decision, int(10.9 * GIB), int(23.1 * GIB),
-                {"pid": 10, "start_time": "10", "need": int(10.9 * GIB), "since": now - 2400}, now, policy=admission_policy_fixture()),
+            int(10.9 * GIB), memory_admit.HeadAdmissionStatus(decision, int(10.9 * GIB), int(23.1 * GIB),
+                memory_admit.head_window({"pid": 10, "start_time": "10", "need": int(10.9 * GIB), "since": now - 2400}, now, policy=admission_policy_fixture())),
         )
         follower = memory_admit.WaitingStep(
             11, "follower-id", "", "doc", "/tmp/tree", now - 300,
@@ -934,8 +935,8 @@ class QueueTests(NotificationGuardedTestCase):
                                            [memory_admit.MeasuredMemory(int(16.1 * GIB))])
         waiting = memory_admit.WaitingStep(
             10, "head-id", "unit", "nextest", "/tmp/tree", NOW - 2400, need,
-            memory_admit.head_wait_reason(decision, need, available,
-                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW, policy=admission_policy_fixture()))
+            memory_admit.HeadAdmissionStatus(decision, need, available,
+                memory_admit.head_window({"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW, policy=admission_policy_fixture())))
         view = memory_admit.QueueView((waiting, ), (), available, 0, 3 * GIB, NOW)
         text = self.checks(view)
         self.assertIn("10.9", text)
@@ -976,8 +977,8 @@ class QueueTests(NotificationGuardedTestCase):
                                        [memory_admit.PromisedMemory(4 * GIB)])
         waiting = memory_admit.WaitingStep(
             10, "head-id", "unit", "clippy", "/tmp/tree", NOW - 2400, 3 * GIB,
-            memory_admit.head_wait_reason(decision, 3 * GIB, 5 * GIB,
-                {"pid": 10, "start_time": "10", "need": 3 * GIB, "since": NOW - 2400}, NOW, policy=admission_policy_fixture()),
+            memory_admit.HeadAdmissionStatus(decision, 3 * GIB, 5 * GIB,
+                memory_admit.head_window({"pid": 10, "start_time": "10", "need": 3 * GIB, "since": NOW - 2400}, NOW, policy=admission_policy_fixture())),
         )
         view = memory_admit.QueueView((waiting, ), (), 5 * GIB, 4 * GIB, 3 * GIB, NOW)
         text = self.checks(view)
@@ -999,8 +1000,8 @@ class QueueTests(NotificationGuardedTestCase):
             decision = memory_admit.decide(available, 60 * GIB, need, memory)
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "nextest", "/tmp/tree", NOW - 2400,
-            need, memory_admit.head_wait_reason(decision, need, available,
-                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW, policy=admission_policy_fixture()),
+            need, memory_admit.HeadAdmissionStatus(decision, need, available,
+                memory_admit.head_window({"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW, policy=admission_policy_fixture())),
         )
         view = memory_admit.QueueView((waiting, ), (), available, 0, 3 * GIB, NOW)
         text = self.checks(view)
@@ -1011,8 +1012,8 @@ class QueueTests(NotificationGuardedTestCase):
         decision = memory_admit.decide(available, 60 * GIB, need, [memory_admit.MeasuredMemory(GIB)])
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "nextest", "/tmp/tree", NOW - 2400,
-            need, memory_admit.head_wait_reason(decision, need, available,
-                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW, policy=admission_policy_fixture()),
+            need, memory_admit.HeadAdmissionStatus(decision, need, available,
+                memory_admit.head_window({"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW, policy=admission_policy_fixture())),
         )
         view = memory_admit.QueueView((waiting, ), (), available, 0, 3 * GIB, NOW)
         text = self.checks(view)
@@ -1024,7 +1025,8 @@ class QueueTests(NotificationGuardedTestCase):
         decision = memory_admit.decide(available, 60 * GIB, need, [])
         row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need, "since": NOW - 300}
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
-                                       memory_admit.head_wait_reason(decision, need, available, row, NOW, policy=admission_policy_fixture()))
+                                       memory_admit.HeadAdmissionStatus(decision, need, available,
+                                           memory_admit.head_window(row, NOW, policy=admission_policy_fixture())))
         view = memory_admit.QueueView((head, ), (), available, 0, 3 * GIB, NOW)
         with mock.patch.object(memory_admit, "decide", side_effect=AssertionError("one decision")):
             text = self.checks(view)
@@ -1038,7 +1040,8 @@ class QueueTests(NotificationGuardedTestCase):
                                            pressure=memory_admit.MemoryPressure(23.4, condition="full"))
         row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need, "since": NOW - 300}
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
-                                       memory_admit.head_wait_reason(decision, need, available, row, NOW, policy=admission_policy_fixture()))
+                                       memory_admit.HeadAdmissionStatus(decision, need, available,
+                                           memory_admit.head_window(row, NOW, policy=admission_policy_fixture())))
         running = memory_admit.RunningStep("other", "other", "doc", "/tmp/other", 19 * GIB,
                                           memory_admit.MeasuredMemory(19 * GIB))
         text = self.checks(memory_admit.QueueView((head, ), (running, ), available, 0, 3 * GIB, NOW))
@@ -1077,7 +1080,8 @@ class QueueTests(NotificationGuardedTestCase):
                     row["priority_since"] = now
                 waiting = memory_admit.WaitingStep(
                     10, "waiting-id", "unit", "nextest", "/tmp/tree", row["since"], need,
-                    memory_admit.head_wait_reason(decision, need, available, row, now, policy=admission_policy_fixture()))
+                    memory_admit.HeadAdmissionStatus(decision, need, available,
+                        memory_admit.head_window(row, now, policy=admission_policy_fixture())))
                 follower = replace(waiting, pid=11, reason=memory_admit.BehindHead("unit", row["since"], "waiting-id"))
                 view = memory_admit.QueueView((waiting, follower), (), available, 0, 3 * GIB, now)
                 reading = queue_read_fixture(view, policy=admission_policy_fixture())

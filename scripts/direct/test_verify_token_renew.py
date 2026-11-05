@@ -28,7 +28,7 @@ def token_renewal_functions() -> str:
 
 
 def token_admission_functions() -> str:
-    return shell_functions(VERIFY, "record_token_wait", "admit_with_token", "buildlog_wait_for_memory")
+    return shell_functions(VERIFY, "record_token_wait", "buildlog_wait_for_memory")
 
 
 
@@ -179,8 +179,7 @@ buildlog_release_memory() {
     rm -f "$TEST_ROOT/reservation"
     BUILDLOG_MEM_RESERVATION=""
 }
-# Force the admission-after-queue path, using the real board for ownership.
-try_token_now() { return 1; }
+# Use the real board for token ownership.
 acquire_token() {
     TOKEN_WAITED=0
     [[ "$TOKEN_HELD" == 0 ]] || return 0
@@ -193,7 +192,7 @@ acquire_token() {
 }
 buildlog_wait_for_memory_only() {
     passes=$(( passes + 1 ))
-    if (( passes == 2 )); then
+    if (( passes == 1 )); then
         cp "$BOARD_DIR/locks/cargo.d/expires" "$TEST_ROOT/original-expiry"
         : > "$TEST_ROOT/memory-wait"
         "$PY" "$TEST_WAIT_HELPER" "$TEST_RELEASE"
@@ -322,7 +321,7 @@ release_token
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertTrue((self.root / "command-ran").exists())
-        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0", "1", "1"])
+        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["1", "1"])
         self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
         self.assertEqual((self.root / "token-waits").read_text().splitlines(), ["7"])
         self.assertFalse((self.root / "reservation").exists())
@@ -337,7 +336,7 @@ release_token
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertTrue((self.root / "command-ran").exists())
         self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired", "acquired"])
-        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0", "1", "1"])
+        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["1", "1"])
         self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
         self.assertEqual((self.root / "token-waits").read_text().splitlines(), ["7"])
         self.assertFalse((self.root / "reservation").exists())
