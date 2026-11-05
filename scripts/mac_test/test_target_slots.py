@@ -16,6 +16,14 @@ import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING, cast, override
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+    from ..lib.process_start_test_support import process_reader
+else:
+    from scripts.lib import process_start as process_identity
+    from scripts.lib.process_start_test_support import process_reader
+
 import unittest
 from unittest import mock
 
@@ -74,7 +82,7 @@ class RepositorySlotTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
-        _ = self.enterContext(mock.patch.object(mac_test, "process_start_time", side_effect=self.process_start))
+        _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "utc_now", return_value=datetime(2026, 11, 1, tzinfo=timezone.utc)))
         _ = self.enterContext(mock.patch.object(time, "monotonic", return_value=100.0))
         _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
