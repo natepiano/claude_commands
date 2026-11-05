@@ -120,12 +120,13 @@ class BerthNotConfigured(NamedTuple):
 class Unit(NamedTuple):
     name: str
     # The unit's session name at this moment, read from its live session; empty when none runs.
-    # It addresses the unit and is never a key: every record is kept under the unit's name.
+    # The session addresses the unit. The fixed staff id keys saved state.
     session: str
     branch: str
     worktree: Path
     # The pid of the unit's live Claude; None when none runs.
     pid: int | None
+    staff_id: staff.StaffId
 
 
 class WaitingFailure(Exception):
@@ -166,7 +167,7 @@ def units_from_doc(production: Production) -> tuple[Unit, ...]:
         claude = found.claude if found is not None else None
         live = isinstance(claude, unit_lookup.LiveClaude)
         units.append(Unit(name, claude.name if live else "", branch.name, row.worktree.path,
-                          claude.pid if live else None))
+                          claude.pid if live else None, row.id))
     return tuple(units)
 
 
@@ -222,7 +223,7 @@ def eta_requested(seen: JsonMap, key: str) -> EtaRequested | EtaNotYetRequested:
 def eta_request(production: Production, name: str, phase: str, state_dir: Path) -> None:
     unit = named_unit(production, name)
     path = state_dir / "eta_seen.json"
-    key = f"{unit.name}|{phase}"
+    key = f"{unit.staff_id}|{phase}"
 
     def request(seen: JsonMap) -> EtaRequested | EtaNotYetRequested:
         state = eta_requested(seen, key)

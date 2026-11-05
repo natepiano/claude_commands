@@ -362,7 +362,8 @@ class WaitingTests(unittest.TestCase):
 
     def producer_state_block(self, moment: datetime, phases: dict[str, str]) -> str:
         production = production_doc.read_production(self.doc)
-        judgments = tuple(update_registration.UnitJudgment(session, phase, "none")
+        judgments = tuple(update_registration.UnitJudgment(
+                              unit_membership("showrunner-example", session).id, phase, "none")
                           for session, phase in phases.items())
         state = update_registration.ShowrunnerState(judgments, (), update_registration.KeepOutstanding())
         return update_registration.state_block(production, state, moment.strftime("%H:%M %Z"))
@@ -645,7 +646,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
     def test_eta_request_records_requested_alone_once_per_phase(self) -> None:
         seen_path = self.state / "eta_seen.json"
         original = json.dumps({
-            f"{ALPHA}|{PHASE}": {
+            f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {
                 "text": "ETA 14:00",
                 "first_seen": "2026-10-07T01:00",
                 "requested": False,
@@ -657,7 +658,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", first.stdout)
         seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text()))
-        self.assertEqual(seen, {f"{ALPHA}|{PHASE}": {"requested": True}})
+        self.assertEqual(seen, {f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {"requested": True}})
         requested_bytes = seen_path.read_bytes()
         repeated = self.run_waiting("eta-request", ALPHA, "--phase", PHASE,
                                     "--state-dir", str(self.state))
@@ -683,7 +684,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
-        self.assertEqual(set(seen), {f"{ALPHA}|{phase}" for phase in phases})
+        self.assertEqual(set(seen), {f"{unit_membership('showrunner-example', ALPHA).id}|{phase}" for phase in phases})
         self.assertFalse([path for path in self.state.iterdir() if path.suffix == ".tmp"])
 
     def test_parallel_eta_requests_for_one_phase_print_once(self) -> None:
@@ -694,7 +695,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(sum(stdout.count(f"request /unit:eta: {ALPHA}")
                              for stdout, _ in outputs), 1)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
-        self.assertEqual(seen, {f"{ALPHA}|{PHASE}": {"requested": True}})
+        self.assertEqual(seen, {f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {"requested": True}})
 
     def test_eta_request_waits_for_its_state_lock(self) -> None:
         # The child proves it reached the held lock, rather than racing startup

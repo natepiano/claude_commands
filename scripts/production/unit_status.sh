@@ -29,14 +29,27 @@ for line in $units; do
   names+=($fields[1] $fields[4])
 done
 PY=$REPO/scripts/lib/py
-slug=$("$PY" - "$REPO" "${production[@]}" <<'PYTHON'
+staff_lines=$("$PY" - "$REPO" "${production[@]}" <<'PYTHON'
 import sys
 sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from scripts.production import staff, unit_lookup, unit_names
 from scripts.production.showrunners import named, production_slug
 arguments = sys.argv[2:]
-print(production_slug(arguments[1]) if arguments[0] == "--production" else named(arguments[0])["slug"])
+doc = Path(arguments[1]) if arguments[0] == "--production" else Path(named(arguments[0])["doc"])
+print(production_slug(str(doc)))
+for row in unit_lookup.doc_units(doc, staff.snapshot()):
+    for label in {row.name, unit_names.unit_id(row.name)}:
+        print(f"{label}\t{row.id}")
 PYTHON
 ) || exit 1
+staff_rows=("${(@f)staff_lines}")
+slug=$staff_rows[1]
+typeset -A state_keys
+for line in ${staff_rows[2,-1]}; do
+  fields=("${(@ps:\t:)line}")
+  state_keys[$fields[1]]=$fields[2]
+done
 marked_lines=$("$PY" "$REPO/scripts/production/unit_lookup.py" list "$slug") || exit 1
 NOTIFIER=$REPO/scripts/message/notifier.sh
 # Run markers sit under unit/, or delegate/ for a run started before the rename.
@@ -50,24 +63,42 @@ SEEN=$DIR/decisions_seen
 BLOCKS=$DIR/blocks_open
 touch "$SEEN" "$BLOCKS"
 
-# Prints how long unit $1's block, text $2, has been open, counted from the
-# first run that saw it. Each unit keeps one entry; a new block replaces it.
-block_age() {
-  local u=$1 now first
-  now=$(date +%s)
-  first=$(T=$2 awk -F'\t' -v u="$u" '$1 == u && $3 == ENVIRON["T"] { print $2 }' "$BLOCKS")
-  if [[ -z $first ]]; then
-    first=$now
-    awk -F'\t' -v u="$u" '$1 != u' "$BLOCKS" > "$BLOCKS.new"
-    print -r -- "$u"$'\t'"$now"$'\t'"$2" >> "$BLOCKS.new"
-    mv "$BLOCKS.new" "$BLOCKS"
-  fi
-  print -r -- "$(( (now - first) / 3600 ))h$(( (now - first) % 3600 / 60 ))m"
+# Apply each state change through the shared atomic writer.
+state_record() {
+  "$PY" - "$REPO" "$@" <<'PYTHON'
+import sys
+import time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from scripts.lib.atomic_file import write_text_atomic
+action, filename, identity = sys.argv[2:5]
+path = Path(filename)
+content = path.read_text() if path.exists() else ""
+lines = content.splitlines()
+if action == "decision":
+    updated = content + identity + "\n"
+else:
+    text = sys.argv[5] if action == "block" else ""
+    now = int(time.time())
+    first = next((int(parts[1]) for line in lines
+                  if len(parts := line.split("\t", 2)) == 3 and parts[0] == identity and parts[2] == text), now)
+    kept = [line for line in lines if line.split("\t", 1)[0] != identity]
+    if action == "block":
+        kept.append(f"{identity}\t{first}\t{text}")
+        age = now - first
+        print(f"{age // 3600}h{age % 3600 // 60}m")
+    updated = "".join(line + "\n" for line in kept)
+if updated != content:
+    write_text_atomic(path, updated)
+PYTHON
 }
 
-# Drops unit $1's block entry, once its latest turn-end line is no longer one.
+block_age() {
+  state_record block "$BLOCKS" "${state_keys[$1]}" "$2"
+}
+
 clear_block() {
-  awk -F'\t' -v u="$1" '$1 != u' "$BLOCKS" > "$BLOCKS.new" && mv "$BLOCKS.new" "$BLOCKS"
+  state_record clear "$BLOCKS" "${state_keys[$1]}"
 }
 
 # Prints what waits on the user in unit $1, whose pane text is $2.
@@ -101,7 +132,7 @@ waiting_on_user() {
   fi
   clear_block "$u"
   gate_no=${last%%:*}
-  key="$u|${gate_text## #}"
+  key="${state_keys[$u]}|${gate_text## #}"
   if grep -qxF -- "$key" "$SEEN"; then
     echo "STILL WAITING on you, $u:${gate_text}"
     return
@@ -113,13 +144,14 @@ waiting_on_user() {
   echo "=== DECISION for you from $u ==="
   print -r -- "$p" | sed -n "${start},${gate_no}p" | sed 's/[[:space:]]*$//'
   echo "=== end $u ==="
-  print -r -- "$key" >> "$SEEN"
+  state_record decision "$SEEN" "$key"
 }
 
 echo "at $(TZ=$ZONE date '+%H:%M %Z') / $(date -u +%H:%M) UTC"
 for line in $units; do
   fields=("${(@ps:\t:)line}")
   u=$fields[1]
+  [[ -n ${state_keys[$u]:-} ]] || { print -u2 "No staff id for $u"; exit 1; }
   target=$fields[2]
   echo "== $u"
   if [[ -z $target ]]; then echo 'SESSION GONE'; continue; fi

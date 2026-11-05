@@ -200,9 +200,9 @@ selects a private root). On first ledger binding, a production unit's run
 saves explicit production and unit fields in `progress_history_state.json`.
 Plan headers accept both Production forms and resolve former production names.
 Later reads use the saved identity, so moving a worktree does not change owners.
-`rename.py unit` uses the folder move (`unit_move.move_folder`): it pauses
-the unit's workers and starts the same threads with a note that names the new
-folder; see `production-rename.md`.
+`rename_unit.py` changes the unit row and repairs its session and display names.
+An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
+See `unit-rename.md`.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 
@@ -383,9 +383,13 @@ A different caller can resume the role.
 
 **Adoption.** `adopt` needs the authority's `adoption_required` source (`thread_id`, `name`, `mesh`, holder) to match. Steps: first the checks that change no authority state: the binding, the configured model, and the source entry, which must be idle on that thread (a `paused` entry counts as idle when `paused_from` is not busy). The source model and effort come from the roster entry; when it has none, from that thread's launch record (`impl_worker_<slot>.json` with the same `worker_id`, then the `phases/*/impl_agent_<slot>` file whose log names the worker and thread), and last from the source server's `thread/read` reply. Missing, conflicting or different values refuse with `AdoptionRequired:`. A refused adopt therefore leaves no `AdoptionReserved` claim. Then `adopt-reserve`; check the source entry again under its roster lock; write `transition.json` and `transfer.json` and set `transferring_role` on the source entry under its roster lock; on the source server park the queue, require `ThreadIdle` and release the writer; write the destination roster entry (same thread and name, saved prompt, access policy) and carry pending text; `confirm_adoption` resumes the same thread on the destination and requires `ThreadIdle`; set `role_redirect` on the source; write `adoption.json`; `adopt-commit`; write the hold. A retry with the same adoption ID completes from `adoption.json`. `_role_fence` and `transfer_route` make every old route refuse (`TransferringRole: use the destination holder route`), also after the source run folder is gone.
 
-**Unit rename.** `rename_unit.py` `_move_state` calls `design_roles.rename_holder(slug, old, new, old_worktree, new_worktree)` before relaunch: idle required, authority `checkout` then `advance`, holder, checkout, document and binding paths moved, generation +1, `design_context.json` rewritten, roster `cwd` set and `authorized_*` cleared. A failure raises `RenameRefused`; the rename journal retries it. `_state_failures` adds `design_roles.rename_failures`, which flags an old holder, old checkout in live fields or roster `cwd`, or a stale context. `unit_rename_sweep.py` `_history` treats `prompts/`, `replies/`, `adoption.json` and `transfer.json` as history, and `sweep` ignores role `name` and `aliases` in `design.json` and `aliases` in the roster as identity.
+**Unit rename.** `rename_unit.py` changes the staff row and repairs session, tab, and pane names.
+An explicit folder move uses `unit_move.move_folder` and the staff id.
+Role records retain their staff ids and history.
 
-**Unit transfer and production rename.** `rename_holder` is `move_holder(old_holder, new_holder, old_checkout, new_checkout, reason=...)` for one unit. `move_holder` moves every design held by `old_holder` to `new_holder`; when the checkout does not change, it keeps the repository, document, binding paths and roster `cwd`, and skips the `checkout` request. It writes `transition.json`, releases the servers, bumps the generation and clears `authorized_*`; a second call changes nothing. `holder_failures(old_holder, old_checkout='')` flags an old holder, a stale context and, with a checkout, the old checkout. `transfer_unit.py` `_move_state` moves `UnitHolder(from, unit)` to `UnitHolder(to, unit)` and `verify_failures` adds `holder_failures`. Production `rename.py` moves `ShowrunnerHolder(old)` to `ShowrunnerHolder(new)` in apply step 4, and each `UnitHolder(old, unit)` with its worktree paths in unit step 3. Role names keep the old slug: they are thread aliases, kept as history. A failure raises `RenameRefused`.
+**Unit transfer and production rename.** Staff ids keep design ownership stable across row renames and unit transfers.
+The rename commands change no design holder records.
+Role names remain thread aliases.
 
 ### Astra work header
 

@@ -734,6 +734,16 @@ def _parent_kinds(kind: Kind) -> tuple[Kind, ...]:
     return () if kind == "agent" else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
 
 
+def validate_name(kind: Kind, name: str) -> None:
+    """Check a staff name before a caller writes its operation journal."""
+    if not name or _valid_id(name) or name != name.strip() or "/" in name or any(
+        ord(character) < 32 or ord(character) == 127 for character in name
+    ):
+        raise StaffRefused(f"invalid short staff name: {name!r}")
+    if kind == "worker":
+        _ = WorkerName.parse(name)
+
+
 def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = ()) -> None:
     """Check the complete proposed graph before any bytes are replaced."""
     indexed: dict[StaffId, StaffRow] = {}
@@ -761,12 +771,7 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
             worktrees.add(location)
         if row.kind not in _KINDS:
             raise StaffRefused(f"invalid staff kind: {row.kind}")
-        if not row.name or _valid_id(row.name) or row.name != row.name.strip() or "/" in row.name or any(
-            ord(character) < 32 or ord(character) == 127 for character in row.name
-        ):
-            raise StaffRefused(f"invalid short staff name: {row.name!r}")
-        if row.kind == "worker":
-            _ = WorkerName.parse(row.name)
+        validate_name(row.kind, row.name)
         key = (row.kind, None if row.kind == "showrunner" else row.parent, row.name)
         if key in names:
             raise StaffRefused(f"{row.kind} name already exists: {row.name}")

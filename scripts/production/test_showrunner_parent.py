@@ -43,7 +43,7 @@ class ShowrunnerParentTests(StaffTestCase):
         script = Path(showrunners.__file__)
         _ = self.script(script, "attach", "sdlc", "parent")
         self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", staff.ReportsTo(parent.id), current_session=child.id, doc=child.doc))
-        source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "sdlc/parent"
+        source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / child.id / "parent"
         self.assertEqual(source.read_text(), "parent\n")
         _ = self.script(script, "detach", "sdlc")
         self.assertEqual(staff.snapshot().by_id(child.id), child)
@@ -104,8 +104,8 @@ class ShowrunnerParentTests(StaffTestCase):
         self.assertEqual(self.source_files(), before)
 
     def test_notice_recovery_uses_delivery_status_instead_of_output_wording(self) -> None:
-        _ = self.members()
-        pending = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "sdlc/parent_notice.json"
+        child, _ = self.members()
+        pending = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / child.id / "parent_notice.json"
         with mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery(
                 ("delivery deferred",), failed=("sdlc",))), \
                 redirect_stdout(io.StringIO()):
@@ -118,7 +118,7 @@ class ShowrunnerParentTests(StaffTestCase):
 
     def test_parent_change_retries_notices_after_the_source_step(self) -> None:
         child, parent = self.members()
-        source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "sdlc/parent"
+        source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / child.id / "parent"
         pending = source.with_name("parent_notice.json")
         for action in ("attach", "detach"):
             with self.subTest(action=action), redirect_stdout(io.StringIO()):
@@ -141,19 +141,19 @@ class ShowrunnerParentTests(StaffTestCase):
     def test_release_uses_the_capture_after_edges_have_been_removed(self) -> None:
         child_row, parent_row = self.members()
         leaf_doc = self.production("leaf")
-        _ = fixture_member("showrunner", name="leaf", parent=child_row.id, doc=staff.LiveDoc("natedev", leaf_doc))
+        leaf_row = fixture_member("showrunner", name="leaf", parent=child_row.id, doc=staff.LiveDoc("natedev", leaf_doc))
         _ = staff.move(child_row.id, staff.ReportsTo(parent_row.id))
         state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
-        for child, parent in (("sdlc", "parent"), ("leaf", "sdlc")):
-            path = state / child / "parent"
+        for child_id, parent in ((child_row.id, "parent"), (leaf_row.id, "sdlc")):
+            path = state / child_id / "parent"
             path.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(path, parent + "\n")
         capture = showrunner_tree.edges_to_release("sdlc")
         self.assertEqual(capture, showrunner_tree.WrapRelease(showrunner_tree.ReportedTo("parent"), ("leaf",), ()))
         showrunner_tree.release_edges("sdlc", capture)
         showrunner_tree.release_edges("sdlc", capture)
-        self.assertFalse((state / "sdlc/parent").exists())
-        self.assertFalse((state / "leaf/parent").exists())
+        self.assertFalse((state / child_row.id / "parent").exists())
+        self.assertFalse((state / leaf_row.id / "parent").exists())
         self.assertEqual(capture.former_children, ("leaf",))
 
     def test_release_retry_preserves_edges_attached_after_capture(self) -> None:
@@ -162,7 +162,7 @@ class ShowrunnerParentTests(StaffTestCase):
         leaf_row = fixture_member("showrunner", name="leaf", parent=child_row.id, doc=staff.LiveDoc("natedev", leaf_doc))
         _ = staff.move(child_row.id, staff.ReportsTo(parent_row.id))
         state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
-        original = {"sdlc": "parent", "leaf": "sdlc"}
+        original = {child_row.id: "parent", leaf_row.id: "sdlc"}
         for child, parent in original.items():
             write_text_atomic(state / child / "parent", parent + "\n")
         capture = showrunner_tree.edges_to_release("sdlc")
@@ -178,5 +178,5 @@ class ShowrunnerParentTests(StaffTestCase):
         self.assertEqual({child: (state / child / "parent").read_text() for child in original},
                          {child: "replacement\n" for child in original})
         self.assertEqual(len(errors.getvalue().splitlines()), 2)
-        for child in original:
-            self.assertIn(child, errors.getvalue())
+        for child in (child_row, leaf_row):
+            self.assertIn(child.name, errors.getvalue())

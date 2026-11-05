@@ -298,20 +298,26 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "lifecycle@example.invalid", cwd=destination)
         return destination
 
+    def owner_id(self, slug: str = "example") -> staff.StaffId:
+        name = "old-showrunner" if slug == "example" else slug
+        return next(row.id for row in staff.find(kind="showrunner") if row.name == name)
+
     def showrunner(self, slug: str, *, live: bool = False) -> None:
-        """An update timer for `slug`'s showrunner, and with `live` a running session it is addressed to."""
+        """Publish the private owner and its update timer."""
         doc = self.root / f"{slug}-production.md"
         self.write(doc, f"# {slug}\n")
+        owners = [row for row in staff.find(kind="showrunner") if row.name == slug]
+        owner = (staff.set_doc(owners[0].id, staff.LiveDoc("natedev", doc)) if owners
+                 else fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", doc)))
         self.write(self.state / "notifier" / f"showrunner-{slug}" / "conf",
-                   f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {doc}\n")
+                   f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {doc}\n")
         if live:
-            # This test's own process stands in for the session's: it is alive while the lifecycle runs.
             self.write(self.state / "sessions" / f"{os.getpid()}.json",
-                       json.dumps({"pid": os.getpid(), "name": f"{slug}-name", "sessionId": f"{slug}-session",
+                       json.dumps({"pid": os.getpid(), "name": f"{slug}-name", "sessionId": owner.current_session,
                                    "messagingSocketPath": str(self.root / f"{slug}.sock")}))
 
     def reports_to(self, child: str, parent: str) -> Path:
-        path = self.state / "showrunner" / child / "parent"
+        path = self.state / "showrunner" / self.owner_id(child) / "parent"
         self.write(path, parent + "\n")
         return path
 

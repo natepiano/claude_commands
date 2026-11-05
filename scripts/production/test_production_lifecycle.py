@@ -127,10 +127,9 @@ class LifecycleTests(LifecycleFixture):
 
     @override
     def reports_to(self, child: str, parent: str) -> Path:
-        path = super().reports_to(child, parent)
         if "example" in (child, parent):
             self.write(self.state / "notifier/showrunner-example/conf",
-                       f"TARGET=session:example-session\nCHECK=zsh /x/production_check.sh {self.doc}\n")
+                       f"TARGET=session:{self.owner_id()}\nCHECK=zsh /x/production_check.sh {self.doc}\n")
         rows = {row.name: row for row in staff.find(kind="showrunner")}
         parent_name = "old-showrunner" if parent == "example" else parent
         child_name = "old-showrunner" if child == "example" else child
@@ -142,7 +141,7 @@ class LifecycleTests(LifecycleFixture):
             _ = fixture_member("showrunner", name=child_name, parent=above.id)
         elif below.parent != staff.ReportsTo(above.id):
             _ = staff.move(below.id, staff.ReportsTo(above.id))
-        return path
+        return super().reports_to(child, parent)
 
     def test_wrap_child_check_follows_staff_parent_despite_stale_parent_file(self) -> None:
         self.merged_units()
@@ -152,7 +151,7 @@ class LifecycleTests(LifecycleFixture):
         _ = staff.move(child.id, staff.StaffRoot())
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
-        self.assertEqual((self.state / "showrunner/kid/parent").read_text(), "example\n")
+        self.assertEqual((self.state / "showrunner" / self.owner_id("kid") / "parent").read_text(), "example\n")
 
     def staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
         self.merged_units()
@@ -166,7 +165,9 @@ class LifecycleTests(LifecycleFixture):
             self.showrunner(slug, live=slug == "top")
         _ = self.reports_to("example", "top")
         _ = self.reports_to("kid", "example")
-        return runner, alpha, beta, child
+        published_child = staff.by_id(child.id)
+        assert published_child is not None
+        return runner, alpha, beta, published_child
 
     def finish_interrupted_wrap(self, retire_showrunner: bool) -> None:
         runner, alpha, beta, child = self.staff_tree()
@@ -192,7 +193,7 @@ class LifecycleTests(LifecycleFixture):
                                side_effect=interrupted_doc if retire_showrunner else interrupted_worktree):
             first = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
-        self.assertTrue((self.state / "showrunner/example/wrap_release.json").exists())
+        self.assertTrue((self.state / "showrunner" / self.owner_id("example") / "wrap_release.json").exists())
         with mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")):
             result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -307,8 +308,8 @@ class LifecycleTests(LifecycleFixture):
             production_lifecycle.release_edges("example")
             production_lifecycle.release_edges("example")
         self.assertEqual(calls, ["top", "kid", "kid"])
-        self.assertFalse((self.state / "showrunner/example/parent").exists())
-        self.assertFalse((self.state / "showrunner/kid/parent").exists())
+        self.assertFalse((self.state / "showrunner" / self.owner_id("example") / "parent").exists())
+        self.assertFalse((self.state / "showrunner" / self.owner_id("kid") / "parent").exists())
 
     def test_in_process_cli_matches_process_output_and_status(self) -> None:
         for arguments in (("load", "--no-ci", "--resume"), ("wrap", "--no-ci"),
@@ -338,7 +339,7 @@ class LifecycleTests(LifecycleFixture):
         with (self.checkout / common_dir / "info/exclude").open("a", encoding="utf-8") as output:
             _ = output.write("production.log\n")
         self.write(self.log, "# Production log — example\n\n### STATE\nNext: old next item\n")
-        self.write(self.state / "showrunner" / "example" / "session" / "showrunner_state.json",
+        self.write(self.state / "showrunner" / self.owner_id() / "session" / "showrunner_state.json",
                    json.dumps({"next": ["merge alpha", "check beta"]}))
 
         ordinary = self.run_lifecycle("load", "--no-ci")
@@ -353,13 +354,14 @@ class LifecycleTests(LifecycleFixture):
     def test_load_copies_the_scratchpad_state_once_and_never_replaces_it(self) -> None:
         scratch = self.root / "scratch"
         self.write(scratch / "showrunner_state.json", '{"merges_held": ["old"]}\n')
-        self.write(scratch / "unit_status" / "decisions_seen", "alpha-unit|1\n")
-        target = self.state / "showrunner" / "example" / "session"
+        alpha_id = next(row.id for row in staff.find(kind="unit") if row.name == "alpha")
+        self.write(scratch / "unit_status" / "decisions_seen", f"{alpha_id}|1\n")
+        target = self.state / "showrunner" / self.owner_id() / "session"
 
         first = self.run_lifecycle("load", "--no-ci", "--scratch", str(scratch))
         self.assert_step(first, "ok")
         self.assertIn("copied unit_status, showrunner_state.json", first.stdout)
-        self.assertEqual((target / "unit_status" / "decisions_seen").read_text(), "alpha-unit|1\n")
+        self.assertEqual((target / "unit_status" / "decisions_seen").read_text(), f"{alpha_id}|1\n")
 
         self.write(target / "showrunner_state.json", '{"merges_held": ["new"]}\n')
         again = self.run_lifecycle("load", "--no-ci", "--scratch", str(scratch))
@@ -943,6 +945,8 @@ class LifecycleTests(LifecycleFixture):
 
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+        self.write(self.state / "notifier/showrunner-example/conf",
+                   f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
 
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
@@ -969,6 +973,8 @@ class LifecycleTests(LifecycleFixture):
         self.doc = kept
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+        self.write(self.state / "notifier/showrunner-example/conf",
+                   f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
         real_checked = production_lifecycle.checked
 
         def stop_at_commit(checkout: Path, step: str, *arguments: str) -> str:
@@ -1053,17 +1059,20 @@ class LifecycleTests(LifecycleFixture):
     def test_wrap_deletes_its_own_state_files_and_keeps_other_productions(self) -> None:
         self.merged_units()
         state = self.state / "showrunner"
-        own = (state / "footers-off/example", state / "review-paused/example.json",
-               state / "outstanding/example.json", state / "example/prompt.txt")
+        owner = staff.snapshot().by_doc("natedev", self.doc)
+        assert owner is not None
+        owner_id = owner.id
+        own = (state / "footers-off" / owner_id, state / "review-paused" / f"{owner_id}.json",
+               state / "outstanding" / f"{owner_id}.json", state / owner_id / "prompt.txt")
         other = (state / "footers-off/other", state / "outstanding/other.json", state / "other/prompt.txt")
         for path in (*own, *other):
             self.write(path, "[]\n")
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
-        self.assertRegex(result.stdout, r"(?m)^tidy: ok — removed footers-off/example, review-paused/example.json, "
-                         + r"outstanding/example.json, example/$")
+        self.assertRegex(result.stdout, rf"(?m)^tidy: ok — removed footers-off/{owner_id}, review-paused/{owner_id}\.json, "
+                         + rf"outstanding/{owner_id}\.json, {owner_id}/$")
         self.assertFalse(any(path.exists() for path in own))
-        self.assertFalse((state / "example").exists())
+        self.assertFalse((state / owner_id).exists())
         self.assertTrue(all(path.exists() for path in other))
 
     def test_wrap_holds_while_a_child_showrunner_runs(self) -> None:
@@ -1106,9 +1115,10 @@ class LifecycleTests(LifecycleFixture):
         self.write(ledger, "saved ledger and pending hand-offs\n")
         self.showrunner("kid", live=True)
         timer = self.state / "notifier/showrunner-kid/conf"
-        self.write(timer, f"TARGET=session:kid-session\nCHECK=zsh /x/production_check.sh {style_doc}\n")
+        self.write(timer, f"TARGET=session:{self.owner_id("kid")}\nCHECK=zsh /x/production_check.sh {style_doc}\n")
+        _ = staff.set_doc(self.owner_id("kid"), staff.LiveDoc("natedev", style_doc))
         parent = self.reports_to("kid", "example")
-        child_state = self.state / "showrunner/kid/prompt.txt"
+        child_state = self.state / "showrunner" / self.owner_id("kid") / "prompt.txt"
         self.write(child_state, "standing work remains\n")
         preserved = {path: path.read_bytes() for path in (style_doc, plan, pinned, ledger, timer, child_state)}
         style_tip = self.git("rev-parse", "HEAD", cwd=style)

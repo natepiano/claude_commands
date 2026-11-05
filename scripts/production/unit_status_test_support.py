@@ -21,7 +21,7 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1] / name)
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.sessions_test_support import copy_session_modules
-from scripts.production import staff
+from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, showrunner_relationship, unit_membership,
 )
@@ -76,6 +76,7 @@ class UnitStatusFixture(unittest.TestCase):
     fixture_parent: ClassVar[Path]
     fixture_seed: ClassVar[Path]
     fixture_case: ClassVar[Path]
+    unit_ids: dict[str, staff.StaffId] = {}
 
     @classmethod
     @override
@@ -97,7 +98,7 @@ class UnitStatusFixture(unittest.TestCase):
         hooks = root / "scripts/hooks"
         hooks.mkdir()
         _ = (hooks / "direct_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
-        for name in ("production_doc.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py", "unit_config.py"):
+        for name in ("production_doc.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py", "unit_config.py", "store_owner.py"):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
         (root / "scripts/agents").mkdir()
         _ = shutil.copy2(SCRIPT.parents[1] / "agents/worker_lifecycle.py", root / "scripts/agents/worker_lifecycle.py")
@@ -166,6 +167,7 @@ class UnitStatusFixture(unittest.TestCase):
             for unit in units:
                 if unit not in retired_units:
                     _ = unit_membership("example", unit)
+            self.unit_ids = {row.name: row.id for row in staff.initial_snapshot().find(kind="unit")}
             pids: dict[str, int] = {}
             _ = responses_file.write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
             for unit in units:
@@ -259,4 +261,4 @@ class UnitStatusFixture(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "status.txt"
             _ = path.write_text(output, encoding="utf-8")
-            return status_blocks(path, tuple(UnitRow(unit, unit, UnitState.RUNNING) for unit in units))
+            return status_blocks(path, tuple(UnitRow(unit, unit, UnitState.RUNNING, self.unit_ids[unit_names.name(unit)]) for unit in units))

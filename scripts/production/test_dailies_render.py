@@ -28,7 +28,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+    fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
 )
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
@@ -163,7 +163,8 @@ def timeline(lines: list[str]) -> list[str]:
 
 @contextmanager
 def canonical_outstanding(root: Path, entries: list[dict[str, object]]) -> Generator[Path]:
-    environment = source_environment(root / "sources")
+    environment = {**source_environment(root / "sources"), "HOME": str(root / "home"),
+                   "HERDR_BIN": "/nonexistent/herdr"}
     with (isolated_staff_file(root / "staff.json", environment),
           mock.patch.dict(os.environ, environment), production_paths(environment)):
         folder = root / "issues"
@@ -174,7 +175,7 @@ def canonical_outstanding(root: Path, entries: list[dict[str, object]]) -> Gener
         timer = Path(environment["NOTIFIER_STATE_DIR"]) / "showrunner-reader"
         timer.mkdir(parents=True, exist_ok=True)
         _ = (timer / "conf").write_text(f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/check {doc}\n")
-        path = root / "reader.json"
+        path = root / f"{owner.id}.json"
         reminders: list[dict[str, object]] = []
         for index, item in enumerate(entries):
             if "question" not in item and "reviewed" not in item:
@@ -918,13 +919,14 @@ class ChangedPhaseTitleTests(unittest.TestCase):
 class EtaResolutionTests(unittest.TestCase):
     def run_with_state(
         self, fields: dict[str, object], previous: dict[str, object], at: str,
+        *, unit_id: str = "widget-enhancements",
     ) -> tuple[Run, dict[str, object], str]:
         with tempfile.TemporaryDirectory() as scratch:
             input_path = Path(scratch) / "dailies_input.json"
             state_path = Path(scratch) / "dailies_state.json"
             log_path = Path(scratch) / "production.log"
             _ = input_path.write_text(json.dumps(fields), encoding="utf-8")
-            _ = state_path.write_text(json.dumps({"widget-enhancements": previous}), encoding="utf-8")
+            _ = state_path.write_text(json.dumps({unit_id: previous} if previous else {}), encoding="utf-8")
             result = run(
                 [str(input_path), "--at", at, "--state", str(state_path), "--log", str(log_path)],
                 scratch,
@@ -932,6 +934,21 @@ class EtaResolutionTests(unittest.TestCase):
             saved = cast(dict[str, object], json.loads(state_path.read_text(encoding="utf-8")))
             logged = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         return result, saved, logged
+
+    def test_fixed_unit_id_keeps_name_labels_and_log_names(self) -> None:
+        fixed_id = fixture_runtime_id("renderer-owner")
+        entry = {**unit(False), "unit": fixed_id, "name": "panel-ui-unit"}
+        del entry["label"]
+        fields = {**report(False), "units": [entry]}
+        result, saved, logged = self.run_with_state(fields, {}, AT, unit_id=fixed_id)
+        self.assertEqual(result.code, 0, result.error)
+        text = "\n".join(result.lines)
+        self.assertIn("panel-ui", text)
+        self.assertNotIn(fixed_id, text)
+        self.assertIn("panel-ui-unit Phase 2 of 3", logged)
+        self.assertNotIn(fixed_id, logged)
+        self.assertIn(fixed_id, saved)
+        self.assertNotIn("panel-ui-unit", saved)
 
     def test_interrupted_state_publish_preserves_first_eta_and_same_command_reruns(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

@@ -69,4 +69,4 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertNotIn("CLAUDE NOT RUNNING", output)
         self.assertNotIn("SESSION GONE", output)
         self.assertEqual(calls, "health unit-native-run\n" * 2)
-        self.assertEqual(seen, "native|— gate: approve release\n")
+        self.assertEqual(seen, f"{self.unit_ids['native']}|— gate: approve release\n")

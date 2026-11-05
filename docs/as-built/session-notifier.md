@@ -134,15 +134,18 @@ With `HOLD=1`, a tick skips (`skip hold`) while `LAST_SENT > LAST_RESTART`, that
 
 ### The showrunner instance
 
-`/showrunner:produce` owns `UPDATES` = `showrunner-<slug>`, where `<slug>` is the production doc's file name less `-production.md`. A production rename (`rename.py`, `docs/as-built/production-rename.md`) renames the instance directory with the doc and points its `CHECK` at the new doc. In `<StartUpdates>`, at start and on every resume, it runs `update_registration.py register --production <doc> --session <name>`, which writes the filled scheduled-update prompt to `PROMPT_FILE` (`~/.local/state/showrunner/<slug>/prompt.txt`) and runs:
+`/showrunner:produce` owns `UPDATES` = `showrunner-<staff-id>`.
+The staff id keeps the timer instance and saved prompt path stable across a production rename.
+The rename command moves no timer instance.
+At start and resume, `update_registration.py register --production <doc> --session <name>` writes the prompt and registers the timer:
 
-```
-notifier.sh new showrunner-<slug> --to session:$CLAUDE_CODE_SESSION_ID --every <N> \
-  --prompt-file <PROMPT_FILE> --from showrunner-timer-<slug> \
+```sh
+notifier.sh new showrunner-<staff-id> --to session:$CLAUDE_CODE_SESSION_ID --every <N> \
+  --prompt-file <PROMPT_FILE> --from showrunner-timer-<staff-id> \
   --check "zsh $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"
 ```
 
-N comes from the doc's `**Updates:** every N minutes` line, 15 when absent; `on the hour` in that line adds `--aligned`. There is no `--hold`. A repeated `new` on resume retargets the instance to the current session without moving the clock. The instance outlives the session. A tick arrives as a message from `showrunner-timer-<slug>` whose text starts `Scheduled update`; the showrunner treats it as the scheduled prompt and does not reply. A `/showrunner:dailies` the user types saves the `unit_status.sh` output and runs `dailies_input.py --user-run`, which checks the whole input, then runs `restart`, takes `next_due` for the report and appends it to `LOG`, so the next tick is N minutes after that report; a scheduled tick runs the builder without `--user-run` and restarts nothing. Every reply's `next dailies` time is read from `notifier.sh status`. `production_lifecycle.py wrap` runs `remove`, and the check removes the instance on its own once the doc says `wrapped`.
+N comes from the doc's `**Updates:** every N minutes` line, 15 when absent; `on the hour` in that line adds `--aligned`. There is no `--hold`. A repeated `new` on resume retargets the instance to the current session without moving the clock. The instance outlives the session. A tick arrives as a message from `showrunner-timer-<staff-id>` whose text starts `Scheduled update`; the showrunner treats it as the scheduled prompt and does not reply. A `/showrunner:dailies` the user types saves the `unit_status.sh` output and runs `dailies_input.py --user-run`, which checks the whole input, then runs `restart`, takes `next_due` for the report and appends it to `LOG`, so the next tick is N minutes after that report; a scheduled tick runs the builder without `--user-run` and restarts nothing. Every reply's `next dailies` time is read from `notifier.sh status`. `production_lifecycle.py wrap` runs `remove`, and the check removes the instance on its own once the doc says `wrapped`.
 
 ### Unit reports
 
