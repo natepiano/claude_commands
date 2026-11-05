@@ -105,11 +105,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         os.kill(process.pid, signal.SIGTERM)
         self.assertNotEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
 
-        def released() -> bool:
-            with admission.loop_turn():
-                return not admission.server.waiters and not admission.server.reservations
-
-        wait_until(released, admission.state_dir)
+        wait_until(admission.callers_released, admission.state_dir)
         self.assertFalse((board / "locks/cargo.d").exists())
         self.assertEqual(self.live_group_processes(process.pid), [])
         self.assertFalse((self.root / "cargo-calls").exists())
@@ -219,11 +215,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             self.assertEqual(list((board / "token_waiters").glob(f"*.{process.pid}*")), [])
             self.assertFalse((self.root / "cargo-calls").exists())
 
-            def released() -> bool:
-                with admission.loop_turn():
-                    return not admission.server.waiters and not admission.server.reservations
-
-            wait_until(released, admission.state_dir)
+            wait_until(admission.callers_released, admission.state_dir)
         finally:
             if hidden.exists():
                 _ = hidden.rename(admission.socket_path)
@@ -258,9 +250,15 @@ trap observe_attempt_status DEBUG
         admission.free(48 * 1024 ** 3)
         self.wait_for_output(errors, "waiting for the cargo token since", process)
         self.assertEqual(attempts.read_text().splitlines(), ["125"])
+        self.assertIn("lost the cargo token before its step started", errors.read_text())
         self.assertFalse((self.root / "cargo-calls").exists())
         self.assertEqual((lock / "holder_pid").read_text(), str(os.getpid()))
         with admission.loop_turn():
+            # Release the fixture host before checking all reservations.
+            for reservation in admission.scenery_reservations:
+                replies = admission.server.handle_request(wire.ReleaseRequest("finish-host", reservation, 0))
+                self.assertEqual(replies, [wire.Ok()])
+            self.assertEqual(admission.caller_reservations(), {})
             self.assertEqual(admission.server.reservations, {})
         released = subprocess.run(["bash", str(BOARD), "release", str(board), "peer", "cargo",
             "--pid", str(os.getpid())], capture_output=True, text=True,
@@ -294,7 +292,7 @@ trap observe_attempt_status DEBUG
         self.assertEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
         self.assertEqual(second.wait(timeout=TEST_HANG_GUARD_SECS), 0, second_errors.read_text())
         self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
-        self.assertEqual(admission.server.reservations, {})
+        self.assertEqual(admission.caller_reservations(), {})
 
 
 

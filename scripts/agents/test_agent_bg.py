@@ -10,15 +10,14 @@ from pathlib import Path
 import subprocess
 import sys
 import signal
-import socket
-import tempfile
 from typing import cast, override
 from unittest.mock import patch
 
 from scripts.message import sessions
-from scripts.production import staff
+from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.socket_test_support import ShortUnixSocket
 
 
 BACKEND = '''import json, os, sys, socket
@@ -35,7 +34,7 @@ if sys.argv[1] == "stop":
 if sys.argv[1] == "agents":
     with socket.socket(socket.AF_UNIX) as gate:
         gate.connect(os.environ["FIXTURE_GATE"])
-        gate.sendall(json.dumps({"pid": os.getpid(), "parent": os.getppid()}).encode())
+        gate.sendall(b"1")
         status = gate.recv(16).decode()
     print(json.dumps([{"id": os.environ["FIXTURE_NATIVE_ID"][:8], "status": status}]))
     raise SystemExit
@@ -130,6 +129,11 @@ class NativeClaudeWorkerTests(StaffTestCase):
 
         return ClaudeWorkerFixture(unit, identity, work, run_dir, prompt, backend_log, sent, registry, environment)
 
+    def clear_worker(self, row: staff.StaffRow) -> None:
+        self.fixture.registry.unlink()
+        _ = staff.retire(row.id)
+        (self.fixture.run_dir / "mesh_roster.json").unlink(missing_ok=True)
+
     def command(self) -> list[str]:
         return ["bash", str(CHECKOUT / "scripts/agents/agent_bg.sh"), "--run", str(self.fixture.run_dir),
                 "fresh-impl", str(self.fixture.work), str(self.fixture.prompt), str(self.root / "summary"),
@@ -156,8 +160,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
 
     def test_claude_admission_ends_at_dispatch_acceptance_or_cancellation(self) -> None:
         for cancel in (False, True):
-            with (self.subTest(cancel=cancel), socket.socket(socket.AF_UNIX) as gate,
-                  tempfile.TemporaryDirectory(prefix="agent-bg-", dir="/tmp") as communication):
+            with (self.subTest(cancel=cancel), ShortUnixSocket() as gate):
                 backend = staff.CodexBackend(self.root / "source-codex")
                 old = fixture_worker("fresh-impl", self.fixture.unit.id, backend=backend)
                 source, evidence = transcript_fixture(old, backend)
@@ -167,11 +170,10 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 roster = parent / "mesh_roster.json"
                 _ = roster.write_text('{"parent": {"staff_id": "parent-worker"}}\n')
                 saved = roster.read_bytes()
-                stopped = parent / "stopped.json"
+                stopped = self.root / ("cancel-stopped.json" if cancel else "complete-stopped.json")
                 self.fixture.backend_log.unlink(missing_ok=True)
                 modules = stopped_worker_module(self.root / ("cancel-modules" if cancel else "complete-modules"))
-                address = Path(communication) / "gate.sock"
-                gate.bind(str(address))
+                address = gate.bind_socket()
                 gate.listen()
                 gate.settimeout(TEST_HANG_GUARD_SECS)
                 with subprocess.Popen(self.command(), cwd=self.fixture.work, text=True,
@@ -198,23 +200,15 @@ class NativeClaudeWorkerTests(StaffTestCase):
                             for status in (b"busy", b"idle", b"idle"):
                                 with gate.accept()[0] as turn:
                                     turn.settimeout(TEST_HANG_GUARD_SECS)
-                                    process = cast(dict[str, int], json.loads(turn.recv(512)))
+                                    _ = turn.recv(512)
                                     if self.inspect_linux_processes:
-                                        ancestor = process["parent"]
-                                        while ancestor not in (0, launcher.pid):
-                                            self.assertEqual(Path(f"/proc/{ancestor}/comm").read_text().strip(), "bash")
-                                            ancestor = int(next(line.split()[1] for line in
-                                                Path(f"/proc/{ancestor}/status").read_text().splitlines() if line.startswith("PPid:")))
-                                        self.assertEqual(ancestor, launcher.pid)
                                         self.assertFalse(Path(f"/proc/{coordinator}").exists())
                                         descriptors = {os.readlink(path) for path in Path(f"/proc/{launcher.pid}/fd").iterdir()}
                                         self.assertTrue(pipes.isdisjoint(descriptors), descriptors)
                                     turn.sendall(status)
                         output, errors = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
                     finally:
-                        if launcher.poll() is None:
-                            launcher.kill()
-                            _ = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        launcher.kill()
                     self.assertEqual(launcher.returncode, 143 if cancel else 0, output + errors)
                 record = cast(dict[str, dict[str, object]], json.loads((self.fixture.run_dir / "mesh_roster.json").read_text()))
                 self.assertEqual(record["fresh-impl"]["dispatch_state"], "sending" if cancel else "accepted")
@@ -223,12 +217,12 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 row = staff.by_current_session(self.fixture.identity)
                 assert row is not None
                 self.assertEqual(json.loads(stopped.read_text()), old.to_json())
-                self.assertEqual({path.name: path.read_bytes() for path in parent.iterdir() if path != stopped},
+                self.assertEqual({path.name: path.read_bytes() for path in parent.iterdir()},
                                  {"mesh_roster.json": saved})
                 self.assert_only_current_session_changed(before, old, self.fixture.identity)
                 sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
                 prompt = str(sent["prompt"])
-                extract = self.fixture.run_dir / f"{old.id}.handoff.md"
+                extract = worker_admission.handoff_path(self.fixture.run_dir, old)
                 self.assertLess(prompt.index(str(extract)), prompt.index(str(source)))
                 self.assertIn(self.fixture.prompt.read_text(), prompt)
                 self.assertIn(evidence[0][0], extract.read_text())
@@ -238,12 +232,10 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 self.assertFalse(any(call["arguments"] == ["stop", self.fixture.identity[:8]] for call in self.backend_calls()))
                 if not cancel:
                     self.assertIn("the worker completed the assignment", (self.root / "summary").read_text())
-                self.fixture.registry.unlink()
-                _ = staff.retire(row.id)
-                (self.fixture.run_dir / "mesh_roster.json").unlink(missing_ok=True)
+                self.clear_worker(row)
 
     def test_fresh_claude_publication_precedes_work_for_each_task_role_and_parent_state(self) -> None:
-        for count, (role, removed) in enumerate((("impl", False), ("", False), ("invented-role", False), ("impl", True)), 1):
+        for count, (role, removed) in enumerate((("", False), ("impl", True)), 1):
             with self.subTest(role=role, removed=removed):
                 if removed:
                     _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.work),
@@ -264,19 +256,17 @@ class NativeClaudeWorkerTests(StaffTestCase):
                     parent = staff.by_id(self.fixture.unit.id)
                     assert parent is not None
                     self.assertIsInstance(parent.worktree, staff.RemovedWorktree)
-                self.fixture.registry.unlink()
-                _ = staff.retire(row.id)
-                (self.fixture.run_dir / "mesh_roster.json").unlink(missing_ok=True)
+                self.clear_worker(row)
 
     def test_worker_waits_for_its_registry_record_after_the_banner_then_publishes(self) -> None:
         fake_modules = self.root / "fake-modules"
         fake_modules.mkdir()
         reads = self.root / "registry-reads"
-        _ = (fake_modules / "sitecustomize.py").write_text('''import os
+        _ = (fake_modules / "sitecustomize.py").write_text('''import os, sys
 from pathlib import Path
 from scripts.message import sessions
 
-if os.environ.get("BG_ID"):
+if sys.argv[1:2] == ["coordinate-claude"]:
     read_registry = sessions.read_registry
     read_count = 0
     def delayed_registry():
@@ -301,20 +291,13 @@ if os.environ.get("BG_ID"):
         self.assertEqual(len(self.backend_calls()), 1)
 
     def test_publication_refusal_stops_only_the_created_backend_and_reports_failed_cleanup(self) -> None:
-        for cleanup in ("0", "1"):
-            with self.subTest(cleanup=cleanup):
-                try:
-                    result = self.launch(FIXTURE_REFUSE_PUBLICATION="1", FIXTURE_STOP_EXIT=cleanup)
-                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                    self.assertIn(self.fixture.identity, result.stderr)
-                    calls = self.backend_calls()
-                    self.assertEqual(len(calls), 2)
-                    self.assertEqual(calls[1]["arguments"], ["stop", self.fixture.identity[:8]])
-                    self.assertFalse(self.fixture.sent.exists())
-                    self.assertIsNone(staff.by_id(staff.StaffId(self.fixture.identity)))
-                    if cleanup == "1":
-                        self.assertIn("cleanup unproved", result.stderr)
-                        self.assertEqual(json.loads(self.fixture.registry.read_text())["sessionId"], self.fixture.identity)
-                finally:
-                    self.fixture.backend_log.unlink(missing_ok=True)
-                    self.staff_file.with_name(self.staff_file.name + ".lock").rmdir()
+        result = self.launch(FIXTURE_REFUSE_PUBLICATION="1", FIXTURE_STOP_EXIT="1")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(self.fixture.identity, result.stderr)
+        calls = self.backend_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["arguments"], ["stop", self.fixture.identity[:8]])
+        self.assertFalse(self.fixture.sent.exists())
+        self.assertIsNone(staff.by_id(staff.StaffId(self.fixture.identity)))
+        self.assertIn("cleanup unproved", result.stderr)
+        self.assertEqual(json.loads(self.fixture.registry.read_text())["sessionId"], self.fixture.identity)

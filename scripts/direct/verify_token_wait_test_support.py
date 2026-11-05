@@ -6,7 +6,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lint import memory_admit as gate
 from scripts.lib.py_floor_test_support import cache_file_name
 
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
 from collections.abc import Callable
 
@@ -171,7 +171,7 @@ esac
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         # Admission must use this test's memory state, including pressure.
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         # Interpreter selection is independent of token ownership. Seed the
         # shim's normal cache once rather than rediscovering Python per test.
         interpreter = self.root / "cache" / "claude" / cache_file_name()
@@ -389,6 +389,10 @@ esac
 
         verify.sh tees its step output to stdout, so both streams go to `errors`.
         """
+        admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            if not admission.server.reservations and not admission.server.slots:
+                _ = admission.occupy_host()
         with errors.open("wb") as stream:
             process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                        cwd=self.root, env=environment, stdout=stream,

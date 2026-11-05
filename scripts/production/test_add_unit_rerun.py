@@ -22,6 +22,7 @@ import retire_unit
 import atomic_file
 from scripts.production.production_doc import Refusal, read_production
 from scripts.production import staff, unit_config
+from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
 
 
 def setUpModule() -> None:
@@ -55,7 +56,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         before = pending.read_bytes(), pending.stat().st_mtime_ns
         state = self.staff.staff_file.read_bytes(), self.repository_state()
         with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
-              patch.object(unit_lookup, "marked_unit", return_value=None)):
+              patch.object(unit_lookup, "labeled_session", return_value=None)):
             checked = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume",
                                request.session.session_id, "--cwd", str(request.worktree), "--check")
         self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
@@ -78,25 +79,25 @@ class AddUnitRerunTests(AddUnitTestCase):
                 _ = add_unit.preflight(request, selected)
         assert isinstance(request.session, add_unit.ResumedSession)
         with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
-              patch.object(unit_lookup, "marked_unit", return_value=None)):
+              patch.object(unit_lookup, "labeled_session", return_value=None)):
             checked = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume",
                                request.session.session_id, "--cwd", str(wrong), "--check")
         self.assertEqual(checked.returncode, 2, checked.stdout + checked.stderr)
         self.assertIn("its staff row names", checked.stderr)
         self.assertEqual(pending.read_bytes(), before)
 
-    def test_dead_pending_lookup_keeps_the_marked_unit_fallback_and_evidence(self) -> None:
+    def test_dead_pending_lookup_keeps_the_labeled_session_fallback_and_evidence(self) -> None:
         request, pending = self.dead_pending_resume()
         before = pending.read_bytes()
-        marked = unit_lookup.MarkedUnit(
+        marked = unit_lookup.LabeledSession(
             "alpha-unit", unit_lookup.LiveClaude("alpha", self.env["FAKE_CLAUDE_SESSION_ID"], "/fixture", 1234),
             herdr.HerdrPlace("agents", "w1:p1"),
-        )
+            identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
         with (patch.dict(os.environ, self.env),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
-              patch.object(unit_lookup, "marked_unit", return_value=marked) as lookup):
+              patch.object(unit_lookup, "labeled_session", return_value=marked) as lookup):
             found = add_unit.launched_unit(request)
-        self.assertEqual(found, add_unit.MarkedUnitFound(marked))
+        self.assertEqual(found, add_unit.LabeledSessionFound(marked))
         lookup.assert_called_once_with(request.production.slug, request.unit)
         self.assertTrue(pending.exists(), "read-only marked lookup removed the pending opening")
         self.assertEqual(pending.read_bytes(), before)
@@ -106,7 +107,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         before = pending.read_bytes()
         with (patch.dict(os.environ, self.env),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
-              patch.object(unit_lookup, "marked_unit", return_value=None)):
+              patch.object(unit_lookup, "labeled_session", return_value=None)):
             self.assertEqual(add_unit.model_for_resume(request), "")
             self.assertTrue(pending.exists(), "model discovery removed the pending opening")
             self.assertEqual(pending.read_bytes(), before)
@@ -193,12 +194,12 @@ class AddUnitRerunTests(AddUnitTestCase):
         prior.mkdir()
         arguments = ("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
-              patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()),
+              patch.object(add_unit, "launched_unit", return_value=add_unit.NoLabeledSession()),
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli(*arguments)
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
-        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"))
+        marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
         unit = resume_unit.RetiredUnit(read_production(self.doc), "alpha-unit", self.root / "project-alpha",
             "build-followups-alpha", unit_config.PlanFile(Path("docs/plans/given.md")), "62ccbd64-f22e-5647-b20e-7899aa39d766", True)
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
@@ -208,9 +209,9 @@ class AddUnitRerunTests(AddUnitTestCase):
             return self.cli(*argv[4:])
 
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(1234)),
-              patch.object(unit_lookup, "marked_unit", return_value=marked),
-              patch.object(script_unit_lookup, "marked_unit", return_value=marked),
-              patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
+              patch.object(unit_lookup, "labeled_session", return_value=marked),
+              patch.object(script_unit_lookup, "labeled_session", return_value=marked),
+              patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked),
               patch.object(retire_unit, "run", side_effect=run_resume),
               redirect_stdout(output)):
@@ -227,15 +228,15 @@ class AddUnitRerunTests(AddUnitTestCase):
         arguments = ("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior),
                      "--autocompact", "200k")
         with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
-              patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()),
+              patch.object(add_unit, "launched_unit", return_value=add_unit.NoLabeledSession()),
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli(*arguments)
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
-        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"))
+        marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(1234)),
-              patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
+              patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked)):
             finished = self.successful(*arguments)
         self.assertIn("alpha-unit started:", finished.stdout)
@@ -244,14 +245,14 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertFalse((self.checkout / ".git/add-unit-openings/alpha-unit.json").exists())
 
     def test_closed_pending_session_does_not_block_a_different_marked_session(self) -> None:
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()),
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.NoLabeledSession()),
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
-        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "replacement", "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"))
+        marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "replacement", "/fixture", 1234),
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
         before = len(self.herdr_calls())
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive())):
             finished = self.successful("alpha", "--plan", "docs/plans/given.md")
@@ -261,13 +262,13 @@ class AddUnitRerunTests(AddUnitTestCase):
                              for row in self.herdr_calls()[before:]))
 
     def test_other_live_pending_session_is_refused_and_keeps_its_record(self) -> None:
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()),
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.NoLabeledSession()),
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
-        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "replacement", "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"))
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
+        marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "replacement", "/fixture", 1234),
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(5678))):
             refused = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(refused.returncode, 2, refused.stderr)
@@ -275,15 +276,15 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertTrue((self.checkout / ".git/add-unit-openings/alpha-unit.json").exists())
 
     def test_unsubmitted_opening_on_rerun_is_a_refusal_then_can_finish(self) -> None:
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()),
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.NoLabeledSession()),
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         session_id = self.env["FAKE_CLAUDE_SESSION_ID"]
         self.assertNotIn("--session-id", self.agent_arguments())
-        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", session_id, "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"))
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
+        marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", session_id, "/fixture", 1234),
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked)):
             with patch.object(herdr.Herdr, "submit_opening_prompt", return_value=herdr.PromptNotSubmitted("pane busy")):
                 refused = self.cli("alpha", "--plan", "docs/plans/given.md")
@@ -316,14 +317,14 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertEqual(self.git("status", "--porcelain", "--", str(self.doc), str(stubs[0])), "")
 
     def test_started_session_without_opening_gets_its_prompt_on_rerun_without_second_start(self) -> None:
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()),
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.NoLabeledSession()),
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         session_id = self.env["FAKE_CLAUDE_SESSION_ID"]
         self.assertNotIn("--session-id", self.agent_arguments())
-        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", session_id, "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"))
+        marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", session_id, "/fixture", 1234),
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         submitted: list[herdr.OpeningPrompt] = []
 
@@ -332,7 +333,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             submitted.append(opening)
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
 
-        with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked),
               patch.object(herdr.Herdr, "submit_opening_prompt",
                            submit_prompt)):

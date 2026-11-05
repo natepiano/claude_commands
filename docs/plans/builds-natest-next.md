@@ -1,6 +1,6 @@
 # builds-natest — Next
 
-The phase backlog of natest-unit. At each phase end, re-sort with `python3 ~/.claude/scripts/test_times/show.py top`, and the next speed phase takes the top live module that no phase holds.
+The phase backlog of natest-unit. At each phase end, rank modules with `python3 ~/.claude/scripts/test_times/show.py top --repo ~/.claude`. The next speed phase takes the highest ranked live module that no phase holds, subject to the floor rule.
 
 ## Descending sort
 
@@ -22,11 +22,10 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 
 ## Items to consider
 
-- [ ] **Select the next speed targets after Phase 14.**
-  - Target: the highest ranked live modules in `test_times top` that no phase owns, subject to the plan's floor rule.
-  - Why needed: the user's mission takes the next module when the longest one is shorter (2026-11-03). The 2026-11-03 list named `scripts/direct/test_review_launcher_pool.py`, which no longer exists.
-  - Completion condition: each selected module goes through the Speed method with its current path and a measured baseline.
-  - Revealed by: the 2026-11-03 sort; the Phase 11 architect review.
+- [ ] **Select the next speed target after Phase 24.**
+  - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
+  - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
+  - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` (2026-11-05).
 - [ ] **Architecture proposal: the type-check job**
   - Target: `scripts/production/merge_gate.py` (owner sdlc devtools-unit)
   - Why needed: report-unit names `types/basedpyright` among the three highest-CPU gate jobs (2-4 min). One basedpyright job checks every listed folder in each gate.

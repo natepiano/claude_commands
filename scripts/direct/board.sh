@@ -224,6 +224,39 @@ pid_is_gone() {
   fi
 }
 
+owned_group_matches() {
+  local dir="$1"
+  [[ -f "$dir/owned" ]] || return 1
+  python3 - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[1]))
+from scripts.lib.process_start import Gone, Started, Unreadable, process_start, process_start_format
+try:
+    record = json.loads(Path(sys.argv[1]).read_text())
+    group, start = record["group"], record["start"]
+    if type(group) is not int or group <= 1 or not isinstance(start, str) or not start:
+        raise ValueError("invalid owner record")
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+result = process_start(group)
+if record.get("start_format") != process_start_format():
+    # Retain a group with an unknown format unless the group is gone.
+    if not isinstance(result, Gone):
+        sys.exit(0)
+    from scripts.lib.process_group import send_process_group
+    try:
+        send_process_group(group, 0)
+    except ProcessLookupError:
+        sys.exit(1)
+    except PermissionError:
+        pass
+    sys.exit(0)
+sys.exit(0 if isinstance(result, Unreadable) or result == Started(start) else 1)
+PYTHON
+}
+
 lock_stale_reason() {
   local holder_pid
   holder_pid="$(cat "$1/holder_pid" 2>/dev/null || true)"
@@ -232,38 +265,11 @@ lock_stale_reason() {
     return 0
   fi
   if lock_is_expired "$1"; then
-    # A matching live owner keeps its lease after expiry.
-    if [[ "$holder_pid" =~ ^[1-9][0-9]*$ ]] && [[ -f "$1/owned" ]] \
-        && owned_group_matches "$1/owned"; then
-      return 1
-    fi
+    if owned_group_matches "$1"; then return 1; fi
     printf 'expired'
     return 0
   fi
   return 1
-}
-
-owned_group_matches() {
-  python3 - "$1" <<'PY'
-import json
-from pathlib import Path
-import subprocess
-import sys
-
-try:
-    record = json.loads(Path(sys.argv[1]).read_text())
-    group = int(record['group'])
-    if group <= 0:
-        sys.exit(1)
-    try:
-        start = Path(f'/proc/{group}/stat').read_text().rsplit(') ', 1)[1].split()[19]
-    except (OSError, IndexError):
-        start = subprocess.check_output(['ps', '-p', str(group), '-o', 'lstart='],
-                                        text=True, stderr=subprocess.DEVNULL).strip()
-    sys.exit(0 if start == str(record['start']) else 1)
-except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
-    sys.exit(1)
-PY
 }
 
 write_lock_meta() {
@@ -289,18 +295,12 @@ import time
 
 record = Path(sys.argv[1])
 
+sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[1]))
+from scripts.lib.process_start import Started, Zombie, process_start
+
 def identity(pid: int) -> str | None:
-    try:
-        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
-        # A zombie leader still owns its PID, so its start time is safe to
-        # check while live children remain in the group.
-        return fields[19]
-    except (OSError, IndexError):
-        try:
-            return subprocess.check_output(['ps', '-p', str(pid), '-o', 'lstart='],
-                                           text=True, stderr=subprocess.DEVNULL).strip()
-        except subprocess.CalledProcessError:
-            return None
+    result = process_start(pid)
+    return result.start if isinstance(result, (Started, Zombie)) else None
 
 def live_group(group: int) -> bool:
     try:
@@ -388,7 +388,7 @@ cmd_acquire() {
           previous="$(lock_holder "$dir")"
           previous_pid="$(cat "$dir/holder_pid" 2>/dev/null || true)"
           reclaimed_holders="$(cat "$dir/reclaimed_holders" 2>/dev/null || true)"
-          if [[ "$reason" == pid\ * ]] && ! cleanup_owned_group "$dir"; then
+          if ! cleanup_owned_group "$dir"; then
             exec 9>&-
             return 1
           fi

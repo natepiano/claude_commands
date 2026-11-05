@@ -4,7 +4,7 @@
 Usage: unit_effort.py <level> [--check]
 
 Every unit director on this machine, whatever its production, is found by its host's marks
-(`unit_lookup.every_marked_unit`, the enumeration the account swap reads too). Each gets
+(`unit_lookup.every_labeled_session`, the enumeration the account swap reads too). Each gets
 `/effort <level>` through the host's typing interface, never C-c or Escape; typing
 while it is mid-turn is fine. A pane showing a form, prompt or menu, or a draft in its input line,
 is skipped and reported. The registry's `production.director` row keeps its model and takes the
@@ -156,11 +156,13 @@ def send(place: unit_lookup.Place, level: str, *, target: str) -> str:
     return ""
 
 
-def _director_line(marked: unit_lookup.MarkedUnit, level: str, check: bool) -> str:
+def _director_line(marked: unit_lookup.LabeledSession, level: str, check: bool) -> str:
     claude = marked.claude
     if isinstance(claude, unit_lookup.ClaudeUnknown):
         return f"{marked.unit}: skipped — cannot tell whether Claude runs: {claude.reason}"
-    name = claude.name if isinstance(claude, unit_lookup.LiveClaude) and claude.name else marked.unit
+    if isinstance(claude, unit_lookup.ClaudeNotRunning):
+        return f"{marked.unit}: skipped — Claude is not running"
+    name = claude.name or marked.unit
     try:
         captured = read_place(marked.place, ansi=True)
     except (OSError, HerdrFailure) as error:
@@ -170,12 +172,11 @@ def _director_line(marked: unit_lookup.MarkedUnit, level: str, check: bool) -> s
         return f"{name}: skipped — {judged.reason}"
     if check:
         return f"{name}: would send"
-    problem = send(marked.place, level,
-                   target=claude.session_id if isinstance(claude, unit_lookup.LiveClaude) else marked.staff_id)
+    problem = send(marked.place, level, target=claude.session_id)
     return f"{name}: NOT sent — {problem}" if problem else f"{name}: sent"
 
 
-def director_lines(every: unit_lookup.MarkedProductions, level: str, check: bool) -> list[str]:
+def director_lines(every: unit_lookup.LabeledProductions, level: str, check: bool) -> list[str]:
     """One line per running unit director, every production's, then each production left out."""
     lines = [_director_line(marked, level, check)
              for slug in sorted(every.units) for _, marked in sorted(every.units[slug].items())
@@ -204,7 +205,7 @@ def run(level: str, check: bool) -> int:
         print(f"unit_effort: {row.model} takes {', '.join(row.allowed) or 'no effort'}, not {level}", file=sys.stderr)
         return 2
     try:
-        every = unit_lookup.every_marked_unit()
+        every = unit_lookup.every_labeled_session()
     except OSError as error:
         print(f"unit_effort: {error}", file=sys.stderr)
         return 1

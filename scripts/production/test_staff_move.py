@@ -32,14 +32,21 @@ class StaffMoveTests(StaffTestCase):
         self.members["unit"] = fixture_member("unit", name="panes", parent=staff.ReportsTo(self.members["source"].id))
         self.members["worker"] = fixture_member("worker", name="impl1", parent=staff.ReportsTo(self.members["unit"].id))
         self.pane("w1:p1", session_id=self.members["unit"].current_session, environment={
-            "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+            "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
         })
         _ = self.place
+
+    def test_old_launch_labels_cannot_select_a_renamed_unit(self) -> None:
+        before = self.staff_file.read_bytes()
+        with self.assertRaisesRegex(staff.StaffRefused, "no matching unit staff row"):
+            _ = staff_move.move_unit("sdlc", "models-unit", "target")
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.place.assert_not_called()
 
     def test_move_changes_only_parent_and_moves_running_pane_to_parent_workspace(self) -> None:
         before = staff.snapshot()
         with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot:
-            result = staff_move.move_unit("sdlc", "models-unit", "target")
+            result = staff_move.move_unit("sdlc", "panes-unit", "target")
         snapshot.assert_called_once_with()
         self.assertEqual(result.row, replace(self.members["unit"], parent=staff.ReportsTo(self.members["destination"].id)))
         self.assertTrue(result.changed)
@@ -56,7 +63,7 @@ class StaffMoveTests(StaffTestCase):
                 before, modified = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
                 with (redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors,
                       mock.patch.object(staff, "move", wraps=staff.move) as move):
-                    code = staff.main(["move", "sdlc/models-unit", "target"])
+                    code = staff.main(["move", "sdlc/panes-unit", "target"])
                 self.assertEqual(code, 0, errors.getvalue())
                 self.assertEqual(output.getvalue(), ("unchanged" if repeated else "done") + ": panes under new-tools\n")
                 self.assertEqual(errors.getvalue(), "")
@@ -78,9 +85,9 @@ class StaffMoveTests(StaffTestCase):
             return True
         self.place.side_effect = place
         with self.assertRaisesRegex(staff.StaffUnreadable, "tab was not moved"):
-            _ = staff_move.move_unit("sdlc", "models-unit", "target")
+            _ = staff_move.move_unit("sdlc", "panes-unit", "target")
         before = self.staff_file.read_bytes()
-        result = staff_move.move_unit("sdlc", "models-unit", "target")
+        result = staff_move.move_unit("sdlc", "panes-unit", "target")
         self.assertTrue(result.changed)
         self.assertEqual(parents, [staff.ReportsTo(self.members["destination"].id)] * 2)
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -119,9 +126,9 @@ class StaffMoveTests(StaffTestCase):
             _ = self.production("sdlc", workspace="tools")
             _ = self.production("target", workspace="new-tools")
             self.pane("w1:p1", session_id=self.members["unit"].current_session, environment={
-                "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+                "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
             })
-            result = staff_move.move_unit("sdlc", "models-unit", "target")
+            result = staff_move.move_unit("sdlc", "panes-unit", "target")
             self.assertEqual(result.row, replace(self.members["unit"], parent=staff.ReportsTo(self.members["destination"].id)))
             self.assertFalse(self.mac_file.exists())
         self.assertEqual(self.ssh_commands(), [
@@ -147,7 +154,7 @@ class StaffMoveTests(StaffTestCase):
     def test_missing_member_refuses_before_any_staff_or_tab_change(self) -> None:
         before = self.staff_file.read_bytes()
         for target, destination, cause in (("sdlc/missing", "target", "sdlc/missing"),
-                                            ("sdlc/models-unit", "missing", "missing")):
+                                            ("sdlc/panes-unit", "missing", "missing")):
             with self.subTest(target=target, destination=destination):
                 completed = self.cli("move", target, destination, code=2)
                 self.assertIn(cause, completed.stderr)

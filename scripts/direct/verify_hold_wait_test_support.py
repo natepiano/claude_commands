@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_pressure_reading
+
 from scripts.build_queue.admission_test_support import caller_admission
 
 import json
@@ -229,7 +231,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         self.addCleanup(self.fixture_cleanups)
         root = self.fixture.root
         pressure = root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
             "CLAUDE_PYTHON": sys.executable,
@@ -278,6 +280,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         """Keep the real admission client waiting behind a private memory limit."""
         admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
         with admission.loop_turn():
+            _ = admission.occupy_host()
             admission.free(0)
         _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
             'lint_config_enabled() {\n'

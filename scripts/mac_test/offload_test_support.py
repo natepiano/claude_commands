@@ -18,6 +18,12 @@ import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
 
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
+
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import write_config_fixture, config_environment
@@ -588,7 +594,7 @@ raise SystemExit(offload.main())
         self.assertTrue(path.exists())
         record = self.remote_claim()
         self.assertEqual(record["remote_host"], host)
-        self.assertIsNone(mac_test.process_start_time(record["pid"]))
+        self.assertIsInstance(process_identity.process_start(record["pid"]), process_identity.Gone)
         decoded = mac_test.read_run(path)
         self.assertNotIsInstance(decoded, mac_test.NoRun)
         if not isinstance(decoded, mac_test.NoRun):

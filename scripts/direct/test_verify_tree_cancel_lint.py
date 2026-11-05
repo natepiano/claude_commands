@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, cast
 
+from scripts.build_queue import admission_protocol as wire
 from scripts.direct.verify_tree_cancel_test_support import VerifyTreeCancelFixture
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -23,6 +24,7 @@ class CompletedLintRun(TypedDict):
 
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
     def test_group_term_removes_lint_memory_wait_and_all_verify_processes(self) -> None:
+        occupied = self.admission.occupy_host()
         memory = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = memory.write_text("MemAvailable: 0 kB\n")
         process = self.start_supervised_verify("lint")
@@ -49,6 +51,8 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         for group in self.started_groups:
             self.assertEqual(self.live_group_processes(group), [], "lint kept a verify process")
         with self.admission.loop_turn():
+            replies = self.admission.server.handle_request(wire.ReleaseRequest("finish-host", occupied.reservation, 0))
+            self.assertEqual(replies, [wire.Ok()])
             self.assertEqual(self.admission.server.waiters, {}, "lint kept its admission queue place")
             self.assertEqual(self.admission.server.reservations, {}, "lint kept its admission reservation")
         self.assertEqual(list((self.board / "token_waiters").glob("*")), [])

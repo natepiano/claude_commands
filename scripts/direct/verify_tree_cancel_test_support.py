@@ -260,7 +260,7 @@ with (patch.object(mesh_runs, "deliver", return_value="private fixture"),
     def assert_resources_released(self) -> None:
         self.assertFalse((self.board / "locks/cargo.d").exists(), "cancel kept the token")
         self.assertEqual(list((self.board / "token_waiters").glob("*")), [], "cancel kept its queue place")
-        reservations = list(self.admission.server.reservations)
+        reservations = list(self.admission.caller_reservations())
         self.assertEqual(reservations, [], "cancel kept memory admission")
         self.assertEqual(self.admission.server.waiters, {}, "cancel kept a memory queue place")
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [], "cancel kept its active step")

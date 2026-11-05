@@ -3120,13 +3120,14 @@ command = sys.argv[3:]
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
+sys.path.insert(0, str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]).resolve().parents[1]))
+from scripts.lib.process_start import Started, process_start, process_start_format
+
 def identity(pid):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
-        return fields[19]
-    except (OSError, IndexError):
-        return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="],
-                                       text=True, stderr=subprocess.DEVNULL).strip()
+    result = process_start(pid)
+    if not isinstance(result, Started):
+        raise RuntimeError("cannot read the step owner start")
+    return result.start
 
 child = os.fork()
 if child:
@@ -3158,9 +3159,10 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
         lost_file = os.environ.get("VERIFY_TOKEN_LOST_FILE")
         if lost_file:
             Path(lost_file).write_text("lost")
+        print("verify.sh: lost the cargo token before its step started", file=sys.stderr)
         sys.exit(125)
     record = lock / f"owned.{os.getpid()}.tmp"
-    record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))
+    record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
     os.replace(record, lock / "owned")
     fcntl.flock(guard, fcntl.LOCK_UN)
 
@@ -3233,6 +3235,7 @@ buildlog_exec() {
         local TOKEN_RENEWER_PID="" step_status=0
         if ! start_token_renewer; then
             printf lost > "${HOLD_WAIT_DIR:?}/token-lost"
+            printf 'verify.sh: lost the cargo token before its step started\n' >&2
             return 125
         fi
         VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \

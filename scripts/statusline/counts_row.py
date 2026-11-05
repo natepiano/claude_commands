@@ -23,6 +23,8 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(SCRIPTS / "hooks"), str(SCRIPTS / "production")]
 import showrunner_footer  # noqa: E402
+from scripts.production import staff
+from update_registration import QuestionStaff
 
 
 def cache_path(slug: str) -> Path:
@@ -36,7 +38,7 @@ def watched(path: Path) -> Path:
     return path
 
 
-def row(instance: Path) -> tuple[str, str, list[Path]]:
+def row(instance: Path, *, identities: QuestionStaff | None = None) -> tuple[str, str, list[Path]]:
     """The counts line, the epoch second it next changes by the clock, and the files it was read from."""
     sources = [instance / "conf"]
     try:
@@ -49,20 +51,28 @@ def row(instance: Path) -> tuple[str, str, list[Path]]:
     if production is None:
         return "", "", sources
     import footer_counts
-    from update_registration import QuestionStaff
+    from update_registration import QuestionStaff, RegistrationFailure
 
-    identities = QuestionStaff.read()
+    identities = QuestionStaff.read() if identities is None else identities
     sources.extend(footer_counts.sources(production.doc, identities=identities))
     sources.extend(footer_counts.routing_sources(identities.record))
-    sources.append(showrunner_footer.outstanding_path(production.slug))
+    try:
+        owner = identities.owner(production.doc)
+    except (RegistrationFailure, staff.StaffRefused) as error:
+        print(f"questions: unavailable — {error}", file=sys.stderr)
+        line = footer_counts.counts_line(footer_counts.read_counts(production.doc, record=identities.record)) or ""
+        return line, "", sources
+    sources.append(showrunner_footer.outstanding_path(owner.id, identities=identities))
     questions = showrunner_footer.open_questions([production], identities=identities)
     line = footer_counts.counts_line(footer_counts.read_counts(
         production.doc, questions=questions or 0, record=identities.record)) or ""
-    due = showrunner_footer.deferred_until([production.slug], production.zone, identities=identities)
+    due = showrunner_footer.deferred_until([owner.id], production.zone, identities=identities)
     return line, "" if due is None else str(int(due.timestamp())), sources
 
 
 def write(instance: Path) -> Path:
+    cache = cache_path(instance.name.removeprefix("showrunner-"))
+    cache.parent.mkdir(parents=True, exist_ok=True)
     began = time.time_ns()
     try:
         line, due, sources = row(instance)

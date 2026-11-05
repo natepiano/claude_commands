@@ -35,9 +35,12 @@ import conf
 from user_zone import user_zone
 
 if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
     from ..build_targets import target_config
     from ..build_targets.target_config import ConfigError
 else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start as process_identity
     import target_config
     from target_config import ConfigError
 
@@ -909,24 +912,12 @@ def message_time(instant: datetime) -> str:
     return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def process_start_time(pid: int) -> str | None:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    closing_parenthesis = stat.rfind(")")
-    fields_after_name = stat[closing_parenthesis + 1 :].split()
-    if closing_parenthesis < 0 or len(fields_after_name) <= 19:
-        return None
-    return fields_after_name[19]
-
-
 def run_is_live(run: RunRecord) -> bool:
-    return "remote_host" in run or process_start_time(run["pid"]) == run["proc_start"]
+    return "remote_host" in run or process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"])
 
 
 def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
-    return "remote_host" in run and process_start_time(run["pid"]) != run["proc_start"]
+    return "remote_host" in run and process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"])
 
 
 def copy_gives_way(run: RunRecord) -> bool:
@@ -934,7 +925,7 @@ def copy_gives_way(run: RunRecord) -> bool:
 
     A kept copy claim holds leftovers like any other kept claim and never gives way.
     """
-    return run.get("copy") is True and process_start_time(run["pid"]) == run["proc_start"]
+    return run.get("copy") is True and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"])
 
 
 def claim_scope(worktree: str) -> ClaimScope:
@@ -2050,12 +2041,12 @@ def requested_showrunner(name: str) -> Showrunner:
 
 
 def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim) -> ClaimAttempt:
-    proc_start = process_start_time(args.pid)
-    if proc_start is None:
+    proc_start = process_identity.process_start(args.pid)
+    if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
         return ClaimFinished(1)
     kept["pid"] = args.pid
-    kept["proc_start"] = proc_start
+    kept["proc_start"] = proc_start.start
     kept["cleanup_pending"] = True
     if args.copy:
         kept["copy"] = True
@@ -2130,13 +2121,13 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
-    proc_start = process_start_time(args.pid)
-    if proc_start is None:
+    proc_start = process_identity.process_start(args.pid)
+    if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
         return ClaimFinished(1)
     claimed: RunRecord = {
         "pid": args.pid,
-        "proc_start": proc_start,
+        "proc_start": proc_start.start,
         "what": args.what,
         "worktree": args.worktree,
         "since": timestamp(utc_now()),
@@ -2175,7 +2166,7 @@ def copy_yield_seconds() -> float:
 
 def stop_copy(holder: RunRecord) -> None:
     """SIGTERM a copy claim's runner, never a process that reused its pid."""
-    if process_start_time(holder["pid"]) != holder["proc_start"]:
+    if process_identity.process_start(holder["pid"]) != process_identity.Started(holder["proc_start"]):
         return
     try:
         os.kill(holder["pid"], signal.SIGTERM)
@@ -2185,14 +2176,14 @@ def stop_copy(holder: RunRecord) -> None:
 
 def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> ClaimAttempt:
     """Transfer a live reservation under the target lock without releasing capacity."""
-    start = process_start_time(args.pid)
-    if start is None:
+    start = process_identity.process_start(args.pid)
+    if not isinstance(start, process_identity.Started):
         return ClaimFinished(12)
     claims = read_claims(paths)
     owners = [claim for claim in claims if scopes_overlap(claim.scope, scope)
               and claim.record["pid"] == args.from_pid
               and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
-              and process_start_time(args.from_pid) == claim.record["proc_start"]
+              and process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])
               and (claim.record["worktree"] == args.worktree or claim.record.get("cleanup_pending"))]
     if len(owners) != 1 or not isinstance(args.remote, str):
         return ClaimFinished(12)
@@ -2214,7 +2205,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
         record = {**claim.record, "remote_host": args.remote}
         bind_instance_generation(paths, record)
     record["pid"] = args.pid
-    record["proc_start"] = start
+    record["proc_start"] = start.start
     write_json(claim.path, record)
     if isinstance(claim.scope, RepositoryScope) and claim.scope.slot:
         remember_slot(paths, claim.scope, record)

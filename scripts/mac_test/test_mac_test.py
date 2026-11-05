@@ -22,6 +22,12 @@ import unittest
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
+
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -1017,7 +1023,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertEqual(taken.stdout + taken.stderr, "leftovers: previous-mac\n")
         after = self.run_state()
         self.assertEqual(after["pid"], taker.pid)
-        self.assertEqual(after["proc_start"], mac_test.process_start_time(taker.pid))
+        self.assertEqual(process_identity.Started(after["proc_start"]), process_identity.process_start(taker.pid))
         self.assertEqual({key: value for key, value in after.items()
                           if key not in ("pid", "proc_start", "cleanup_pending")},
                          {key: value for key, value in previous.items()
@@ -1065,10 +1071,10 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertEqual(self.run_state()["pid"], taker.pid)
 
     def test_run_record_without_remote_host_still_decodes_with_mapping_access(self) -> None:
-        started = mac_test.process_start_time(os.getpid())
-        self.assertIsNotNone(started)
-        assert started is not None
-        record: RunState = {"pid": os.getpid(), "proc_start": started, "what": "legacy tests",
+        started = process_identity.process_start(os.getpid())
+        self.assertIsInstance(started, process_identity.Started)
+        assert isinstance(started, process_identity.Started)
+        record: RunState = {"pid": os.getpid(), "proc_start": started.start, "what": "legacy tests",
                             "worktree": str(self.root), "since": datetime.now(timezone.utc).isoformat()}
         self.state_directory.mkdir()
         path = self.state_directory / "run.json"
@@ -1293,9 +1299,9 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertIsNone(first.poll())
 
     def write_machine_wide_record(self, owner: int, worktree: Path) -> RunState:
-        started = mac_test.process_start_time(owner)
-        assert started is not None
-        record: RunState = {"pid": owner, "proc_start": started, "what": "older tests",
+        started = process_identity.process_start(owner)
+        assert isinstance(started, process_identity.Started)
+        record: RunState = {"pid": owner, "proc_start": started.start, "what": "older tests",
                             "worktree": str(worktree), "since": datetime.now(timezone.utc).isoformat()}
         self.state_directory.mkdir(exist_ok=True)
         _ = (self.state_directory / "run.json").write_text(json.dumps(record), encoding="utf-8")
@@ -2879,7 +2885,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             "BUILD_HOLD_DIR": str(self.root / "holders"), "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
-        _ = self.enterContext(mock.patch.object(mac_test, "process_start_time", return_value="owner-start"))
+        _ = self.enterContext(mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("owner-start")))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected external command")))
 
@@ -2961,7 +2967,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         _ = record.pop("remote_host")
         _ = self.paths.run.write_text(json.dumps(record))
         before = self.paths.run.read_bytes()
-        with mock.patch.object(mac_test, "process_start_time", return_value="different-process"), \
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("different-process")), \
              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
              mock.patch.object(mac_test, "write_json") as write, \
              mock.patch.object(mac_test, "send_message") as send:
@@ -2977,7 +2983,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         _ = record.pop("remote_host")
         _ = self.paths.run.write_text(json.dumps(record))
         before = self.paths.run.read_bytes()
-        with mock.patch.object(mac_test, "process_start_time", side_effect=["owner-start", "different-process"]), \
+        with mock.patch.object(process_identity, "process_start", side_effect=[process_identity.Started("owner-start"), process_identity.Started("different-process")]), \
              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
              mock.patch.object(mac_test, "write_json") as write, \
              mock.patch.object(mac_test, "send_message") as send:

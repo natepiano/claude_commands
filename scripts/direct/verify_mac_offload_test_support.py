@@ -6,7 +6,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_queue import admission_protocol as wire
 from scripts.lib.py_floor_test_support import cache_file_name
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
 import json
 import os
@@ -779,7 +779,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
         # Admission must use this test's memory state, including pressure.
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         _ = write_config_fixture(self.root / "lint.conf")
         _ = write_config_fixture(self.root / "mac_test.conf")
         settings = self.root / "mac settings.conf"
@@ -1167,6 +1167,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
     def hold_memory(self) -> Path:
         """Keep natedev's memory gate holding until the returned meminfo is rewritten."""
+        _ = caller_admission(self, self.root, self.environment).occupy_host()
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n", encoding="utf-8")
         self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)

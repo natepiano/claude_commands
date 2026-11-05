@@ -19,8 +19,13 @@ from unittest import mock
 from collections.abc import Callable
 from typing import TYPE_CHECKING, TypedDict, cast, final, override
 
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
+
+
 import copy_watch
-import mac_test
 import offload
 if TYPE_CHECKING:
     from ..direct import step_record
@@ -183,6 +188,19 @@ class WakeupTests(unittest.TestCase):
 
 
 class StepProgressTests(unittest.TestCase):
+    def test_darwin_leader_uses_one_start_and_rejects_zombies_and_pid_reuse(self) -> None:
+        start = "Tue Nov  3 23:00:00 2026"
+        with mock.patch.object(sys, "platform", "darwin"), \
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, start + " S\n", "")) as read, \
+                mock.patch.object(os, "getpgid", return_value=42):
+            progress = copy_watch.StepProgress(copy_watch.StepInfo(42, Path("unused")))
+            read.assert_called_once()
+            self.assertTrue(progress.leader_alive())
+            for output in (start + " Z\n", "Wed Nov  4 00:00:00 2026 S\n"):
+                read.return_value = subprocess.CompletedProcess([], 0, output, "")
+                self.assertFalse(progress.leader_alive())
+
+
     def test_linux_only_and_selected_linux_records_never_become_mac_copy_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -324,7 +342,7 @@ class CandidateTests(unittest.TestCase):
         path = self.directory / f"{call_id}.json"
         record: copy_watch.CandidateRecord = {
             "pid": pid,
-            "proc_start": proc_start if proc_start is not None else mac_test.process_start_time(pid) or "",
+            "proc_start": proc_start if proc_start is not None else (identity.start if isinstance(identity := process_identity.process_start(pid), process_identity.Started) else ""),
             "call_started": started,
             "call_id": call_id,
         }
@@ -379,7 +397,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.repo=\n")
         busy: ClaimRecord = {
             "pid": os.getpid(),
-            "proc_start": mac_test.process_start_time(os.getpid()) or "",
+            "proc_start": (identity.start if isinstance(identity := process_identity.process_start(os.getpid()), process_identity.Started) else ""),
             "what": "nextest other",
             "worktree": str(self.repository),
             "since": datetime.now(timezone.utc).isoformat(),
@@ -586,7 +604,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         newer = self.state / "copy_candidates" / "repo" / "v-newer.json"
         newer.parent.mkdir(parents=True)
         record: copy_watch.CandidateRecord = {
-            "pid": os.getpid(), "proc_start": mac_test.process_start_time(os.getpid()) or "",
+            "pid": os.getpid(), "proc_start": (identity.start if isinstance(identity := process_identity.process_start(os.getpid()), process_identity.Started) else ""),
             "call_started": 2000.0, "call_id": "v-newer",
         }
         _ = newer.write_text(json.dumps(record))
