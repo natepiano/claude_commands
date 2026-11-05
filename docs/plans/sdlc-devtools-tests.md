@@ -816,6 +816,89 @@ The plan has one home, `.unit.toml`; staff holds no plan. `unit_config.set_plan`
 **Files:**
 - `scripts/production/proposals_table.py`, `config/proposals_table.conf`, `scripts/production/test_proposals_table.py` — the config reads and a test that a changed width moves the cut.
 
+### Phase 7o — The simplify test calls a function, not a patched exec  · status: todo
+
+Source: builds add-on natest F017, given by sdlc 2026-11-04. Settled `next`, after 3t.
+
+#### Work Order
+
+**Goal:** `test_simplify_lens.py` stops patching the global `os.execvpe`.
+
+**Spec:**
+1. `assign.main` takes the exec function as a parameter (`exec_review`, default `os.execvpe`) and passes it to `execute_simplify`.
+2. The `os.execvpe` patch is only in builds-natest's in-process test (`test_simplify_lens.py:143`, not yet on sdlc). That test passes its `run_review` as `exec_review`; the checkpoint notice tells builds.
+3. Delete more than you add. Add no guards.
+
+**Files:**
+- `scripts/direct/assign.py`.
+
+**Workers:** `1 writer` — `impl`.
+
+**Acceptance gate:** `test_simplify_lens` and the assign launcher suites pass; basedpyright `0 errors, 0 warnings, 0 notes`; one director gate.
+
+### Phase 7p — Gate test modules run in their own roots  · status: todo
+
+Source: sdlc 2026-11-04 (urgent; builds and natedev agree). Two tests wrote live state: fixture rows into the live staff.json, and a 3o launcher test into models-unit's live roster.
+
+#### Work Order
+
+**Goal:** a merge_gate test module cannot write live state.
+
+**Spec:**
+1. `merge_gate.py` gives each test module its own HOME, XDG_STATE_HOME and `/tmp/claude` roots, set in one place (the suite bootstrap).
+2. A test that writes under a live root fails and names the path. The check costs almost nothing per test.
+
+**Files:**
+- `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate.py`.
+
+**Workers:** `1 writer` — `item26`.
+
+**Acceptance gate:** `test_merge_gate` passes, with a test for each rule; basedpyright `0 errors, 0 warnings, 0 notes`; one director gate. Branch `sdlc-devtools-isolate` off main.
+
+### Phase 7q — Unit responsibilities carry the Owns paths  · status: todo
+
+Source: sdlc 2026-11-04 11:2x (urgent 4u defect, found by cargo-liner). Every `.unit.toml` has `responsibilities = []`: the 4u move did not carry the Units table Owns cells. `merge_checkpoint` reads responsibilities, so every scope-checked merge holds "outside responsibilities".
+
+#### Work Order
+
+**Goal:** each unit's `.unit.toml` holds its Owns paths, and an empty carry can never pass in silence.
+
+**Spec:**
+1. `unit_config.responsibilities_from_owns(cell)` turns one Owns cell into responsibilities. A cell that is not a path list (prose, a parenthetical file list) raises `ConfigRefused`. The cell `none — takes what the board leaves free` gives `(unit_config.BOARD_FREE,)`, the string `board-free`.
+2. `owns_fill.py` copies each production doc's Owns cells into its units' `.unit.toml` through `unit_config.write`, keeps short names such as `nightly-review`, prints one line per unit, and refuses a prose cell with its production and unit. A rerun changes nothing.
+3. A test fails when a non-empty Owns cell gives empty responsibilities.
+4. `merge_checkpoint` refuses a unit with empty responsibilities, and the message names `owns_fill.py`. A `board-free` unit permits every changed path; the berth board is its guard.
+
+**Files:**
+- `scripts/production/unit_config.py`, `scripts/production/owns_fill.py` (new) — `item28`.
+- `scripts/production/test_owns_fill.py` (new) — `item29`.
+- `scripts/production/merge_checkpoint.py`, `scripts/production/test_merge_checkpoint.py` — `item30`.
+
+**Workers:** `3 writers` — `item28`, `item29`, `item30`.
+
+**Acceptance gate:** `test_owns_fill`, `test_unit_config` and the `test_merge_checkpoint*` modules pass; basedpyright `0 errors, 0 warnings, 0 notes`; the live fill prints one line per unit on natedev and the Mac. Branch `sdlc-devtools-owns` off origin/sdlc 5e8bc5a52.
+
+### Phase 7r — A merge reuses a gate that already passed its tree  · status: dropped
+
+**Dropped** (sdlc 2026-11-04 13:1x): sdlc moves at each showrunner merge, so a unit's gated tree is almost never the merge tree. The store would add state to skip a gate that it almost never skips. Commit ab7870e7f stays off every branch; no replacement.
+
+Source: sdlc 2026-11-04 11:5x (save gate time). A unit gates a tree that already has origin/sdlc merged in; the showrunner merge then runs the same full gate again.
+
+#### Work Order
+
+**Goal:** a merge whose merge tree already passed a full tests-only gate runs no second full gate.
+
+**Spec:**
+1. `merge_gate.py --tests-only` records each tree it passed: the git tree hash of the checkout and the time. One record store, read and written in one place.
+2. `merge_checkpoint` test step: when the merge tree hash equals a recorded passed tree, skip the test commands and print `test: ok — tree <hash> already passed at <time>`. A tree with no record, or a record of a failed gate, runs the tests as now.
+3. One test for each: a passed tree is recorded; a matching merge tree skips its test step with that line; a different tree runs the tests.
+
+**Files:** `scripts/production/merge_gate.py`, `scripts/production/merge_checkpoint.py` and their test modules — `item34`.
+
+**Workers:** `1 writer` — `item34`.
+
+**Acceptance gate:** the merge_gate and `test_merge_checkpoint*` modules pass; basedpyright `0 errors, 0 warnings, 0 notes`. Branch `sdlc-devtools-passed` off origin/sdlc 5e8bc5a52.
+
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
 Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Starts after herdr-unit's 3s. Scope: the stores only. devtools-unit lands stores 1, 2, 4 and 5 below. Store 3 is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files (`rename.py`, `rename_unit.py`, `rename_outside.py`, `transfer_unit.py`) and removes each store's rewriter there.
@@ -858,59 +941,63 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Sta
 
 **Constraints from prior phases (native ids):** Phase 3h changes a live id and child links only in one locked atomic `staff.json` write. Add no store registry, identity alias or live-rekey journal. Parked files and retired refs belong to stopped units. The one-time identity migration writes reference stores first and staff last; it is safe to rerun and is deleted in Phase 18. This store conversion must test a clear between its reads: resolve current runtime ownership again, report unavailable old-id evidence, and make no unproved write. Do not add a second row to recover an old store key.
 
-### Phase 3t — Production tools read the row and `.unit.toml`  · status: todo
+### Phase 3t — Production tools read the row and `.unit.toml`  · status: done
 
-> **Note (herdr-unit, 2026-11-04):** herdr Phase 4r (`90b975402` on `natedev-herdr`) deletes `staff_check.py` and `test_staff_check.py`. When 4r is on main, drop this phase's checker items and its checker acceptance gate.
+#### As-built
 
-Source: herdr-unit plan Phase 3t, given to devtools-unit by sdlc 2026-11-02. Starts after herdr-unit's 3s and after models-unit's Phase 4 lands.
+Codex workers start one way, and the old ownership paths are gone.
 
-**Depends on:** 3s. Shared gate with 3u/3v over the exact final batch; before the record and deletion stages.
+- `owns_fill.py` and the four one-time migrations (`migrate_proposals`, `migrate_showrunner_settings`, `migrate_showrunner_timers`, `remove_showrunner_parents`) are deleted; their reader tests live in `test_showrunners`. `add_unit` and `unit_config` take responsibilities only from launch options or the saved `.unit.toml`.
+- `stall_watch` builds its watch from the staff row (`watched_staff_unit`). `resume_unit` returns `RetiredUnitRecovery | NoRecoveryRequired`; `RetiredUnitRecovery` holds the row name once.
+- `implement.sh` and `review.sh` run Claude workers only. Both call `models_config.sh agents_resolve_claude_launcher <task> <caller>`, which exits 2 with "<caller>: Codex workers must use assign.sh." before any file is written. `review.sh` first refuses a Codex simplify ("direct.simplify requires a Claude assignment."). Turn records, the tree check and `setsid` run only for simplify reviews.
+- `assign_gate.py` is a leaf: `ASSIGN_LAUNCHERS`, `WORKER_LAUNCHERS`, `assign_role` (the one `impl` → `implement` mapping) and `assign_command` (forces `--role`, `--session-dir`, `--to`; drops `--new-worker`).
+- `progress_history.last_dispatch(worker_id, run) -> RecordedDispatch | NoDispatchRecorded` reads the pass record first, then the role log; a missing field is `DispatchDetailNotRecorded.UNRECORDED`. `resume_message` builds `assign.sh` commands from it only. `progress_history.write_review_turn` is the one review-turn writer.
+- Remaining matches of the old reader search: `showrunners.former_slugs` and its caller `session_staff.py:492` (former names as history) and test fixtures.
+
+**Files:**
+- `scripts/direct/{implement.sh,review.sh,assign.py,assign_gate.py,progress_history.py}` — launchers, gate, dispatch reader.
+- `scripts/agents/{models_config.sh,codex_mesh.py,mesh_runs.py,agent_bg.sh}`, `scripts/lib/resume_message.py`, `scripts/shutdown/inventory.py` — one launch path, resume and account move.
+- `scripts/production/{add_unit,unit_config,stall_watch,resume_unit,retire_unit,worker_admission}.py` — row and `.unit.toml` readers.
+
+**Binds later work:** `assign_gate.py` stays a leaf. `last_dispatch` is the one reader of a worker's role, phase, lens and paths. Only `implement.sh` resolves a repair round today.
+
+**Gotchas:** one unittest process over many modules leaks state and shows false reds; run modules alone or in small groups.
+
+**Ruled out:** a second branch-folder rule; a `Path | None` adapter for the proposals readers.
+
+### Phase 3y — Astra review starts Codex only through assign.sh  · status: todo
+
+**Depends on:** Phase 3t
+
+Source: Phase 3t simplify review (finding F018, 2026-11-05); items 4 and 5 from sdlc [be5de27d] 2026-11-05. User rule: "it should be impossible to start a worker in more than one way".
 
 #### Work Order
 
-**Goal:** the production tools in `scripts/production/` read the worktree, branch, plan, port, retired state, doc and merge branch through the Phase 3s resolver, not from a Units table cell, a retired note, a timer's doc or a doc field.
+**Goal:** Codex workers start only through `assign.sh`, and the `assign.sh` path does everything the old Codex launchers did: it resolves a repair round, and its account-move resume reads the one dispatch reader.
 
 **Spec:**
-1. **Readers.** Every non-test file in `scripts/production/` that this search finds, except the ones later steps rebuild or delete (`rename.py`, `rename_unit.py`, `rename_outside.py`, `rename_checkout.py`, `rename_state.py`, `unit_rename_sweep.py`, `transfer_unit.py`, `showrunner_parent.py`, `showrunner_tree.py`, `production_units.py`, `units_table.py`): `grep -rlE 'unit_table|units_table|## Units|production_units|unit_is_retired|Showrunner session|space_from_text|former_slugs|Formerly|Parent production' scripts/production`. A timer read for session, socket, zone or interval is allowed (decision 16), so the search does not forbid `registered_showrunners`; a timer's doc read is found by the gate test below. At ac680222 it lists `add_showrunner`, `add_unit`, `change_review`, `ci_points`, `codex_winddown`, `completion_receipt`, `footer_counts`, `log_backup`, `merge_checkpoint`, `merge_gate`, `next_item`, `production_lifecycle`, `promote_showrunner`, `proposals_folder`, `proposals_table`, `prune_phase_notes`, `resume_unit`, `retire_unit`, `roles_audit`, `staff_check`, `stall_watch`, `style_units`, `unit_run`, `update_registration`, `waiting`.
-2. Each reader takes membership from one snapshot and facts from the shared resolver. Extend `unit_lookup.plan_worktree` (`unit_lookup.py:93`) for the branch folder; add no second branch-folder rule. Use semantic location types to distinguish the director folder from the branch folder. The director folder comes from staff. A relative Plan names a file there; its branch folder is the director folder without a Git call. An absolute Plan uses its own existing folder's Git root. Missing folders and folders outside Git stay unavailable. When Plan readers move to `.unit.toml`, keep this same rule in the shared resolver. `RowResolver.unit_branch` currently reads Git in the director folder (`session_staff.py:245`); change it to use the shared branch-folder result. Keep `test_checkpoint_uses_the_plan_worktree_when_the_director_runs_elsewhere`. A timer supplies its session, socket, zone, and interval through `showrunners.timer_for` (decision 16). The document comes from the showrunner row. The excluded files keep their `production_units` import until Phase 4c moves it. `resume_unit.py` and `retire_unit.py` read retirement facts from the parked file. `add_unit.py` finds an existing unit through staff membership.
-3. The Owns scope check of `merge_checkpoint.py` (:243-248, :583) is not changed here; Phase 4b deletes it.
-4. History stays history: a reader that reports who owned a past commit or run keeps what the artifact recorded (old 3i rule).
-5. **The resume recovery type states its guarantee (moved here from the Phase 3r closure review, 2026-11-01).** `resume_unit.py:89` holds `recovery: UnitConfig | NoRetiredSession`. A `UnitConfig` can lack the retirement facts, and the sentinel means only that no recovery file is outstanding, so the callers keep the guarantee by procedure. Replace it with one named recovery type whose retirement facts are mandatory, and a separate `NoRecoveryRequired` state. A test pins that a recovery value without the retirement facts cannot be made.
-6. **An unreadable staff record is its own result (Phase 4i review, 2026-11-02).** The question readers that join staff (`scripts/hierarchies/measure.py`, the review sample in `scripts/notify/review.py`) give an explicit incomplete-read result when `staff.json` cannot be read, distinct from confirmed absence. `measure` prints it as one note and never refuses (user, 2026-11-02). The review sample never classifies a stored question as unregistered from an unreadable record. Tests inject an unreadable staff record and show the two results differ.
-
-**Review amendment (Phase 4w plan review, 2026-11-03):** the unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`). Drop every rule that routes by an absolute Plan path or keeps a worker folder copy. Replace the Plan-routing test (`test_merge_checkpoint.py:74`) with assertions on the folder each command runs in.
+1. **Gate in `main`.** Move `assign_gate.require_assign()` from `codex_mesh.py`'s `if __name__ == "__main__"` block (`codex_mesh.py:9657`) into `codex_mesh.main()` (`:9444`) for the start verbs (`start`, `prime`, `follow`). Other verbs (`end`, `send`, status reads) stay open.
+2. **Astra through `assign.sh`.** `astra_review.py` calls `codex_mesh.main(["prime", …])` and `["follow", …]` in its own process (`astra_review.py:111, 122`). Start the review through `assign.sh` instead. The held-design path keeps its one reviewer thread. `codex_mesh.main(["end", …])` (`:133`) stays.
+3. **Guard test.** `test_one_launch_path.py` fails on an in-process start-verb call to `codex_mesh.main` outside `assign.py`.
+4. **Fix rounds resolve.** `assign.py` never reads `UNIT_RESOLVES_ROUND`; only `implement.sh` does (`implement.sh:55`, `findings.py landed` at `:319`, `abandon --edits-landed` at `:342`), and `implement.sh` now refuses Codex. So an `assign.sh --role fix` dispatch leaves its round `repair_in_flight`. Move that resolver into `assign.py` beside its `finish-pass` (`assign.py:634`): with `UNIT_RESOLVES_ROUND=1` on a fix dispatch, a clean exit runs `findings.py landed`, an error runs `abandon --edits-landed`. Keep one resolver: `implement.sh` (Claude workers) and `assign.py` call the same `findings.py` verbs with the same rule.
+5. **Account move uses `last_dispatch`.** `codex_mesh._account_move_command` (`:8806`) and `command_resume_account_move` (`:8815`) read role and lens from the role log by thread id (`task_role`, `agents_log.role_at`). `progress_history.last_dispatch(staff id, run)` reads the pass record first and the same role log second. Switch both reads to `last_dispatch`, with the staff id from the roster entry. Map its role with `assign_gate.assign_role`. Delete the replaced reads.
+6. **Docs.** `commands/unit/direct.md` <FixDispatch/> shows `UNIT_RESOLVES_ROUND=1 implement.sh` for every repair. Change it to the `assign.sh --role fix` form for Codex workers.
+7. Delete more than you add. Add no guards beyond item 3.
 
 **Files:**
-- `scripts/production/{add_showrunner,add_unit,change_review,ci_points,codex_winddown,completion_receipt,footer_counts,log_backup,merge_checkpoint,merge_gate,next_item,production_lifecycle,promote_showrunner,proposals_folder,proposals_table,prune_phase_notes,resume_unit,retire_unit,roles_audit,staff_check,stall_watch,style_units,unit_run,update_registration,waiting}.py` — the readers item 1 lists (ac680222); a reader the search finds at dispatch joins them.
-- `scripts/production/test_{add_showrunner,add_unit,change_review,ci_points,codex_winddown,completion_receipt,footer_counts,log_backup,merge_checkpoint,merge_gate,next_item,production_lifecycle,promote_showrunner,proposals_table,prune_phase_notes,resume_unit,retire_unit,roles_audit,staff_check,stall_watch,style_units,unit_run,update_registration,waiting}.py` — their tests.
-- `scripts/production/{add_unit,production_lifecycle,merge_checkpoint,dailies_input,update_registration,staff}_test_support.py` — fixtures.
-- `scripts/production/unit_lookup.py`, `scripts/production/session_staff.py` — shared branch-folder resolution and its row resolver caller.
-- `scripts/production/test_unit_lookup.py` — distinct director and branch folders; unavailable Plan facts.
-- `scripts/production/test_session_staff.py` — new test module for the shared branch-folder resolver caller.
-- `scripts/production/session_labels.py` — read only.
-- `scripts/hierarchies/measure.py`, `scripts/notify/review.py`, `scripts/hierarchies/test_measure.py`, `scripts/notify/test_review.py` — item 6 (`measure.py` owner: hierarchies-unit; name it in the notice's also-touches line).
-- `scripts/production/tidy_wrapped.py`, `scripts/review_links/change_browser.py`, `scripts/review_links/change_page.py` — `issues_folder` callers (constraint below).
-- `scripts/production/test_proposals_folder.py` — new test module; distinguish unavailable documents from unconfigured proposals and ledgers.
-- `scripts/review_links/test_change_browser.py` — new test module for the proposal-folder caller.
-- `scripts/production/test_tidy_wrapped.py`, `scripts/review_links/test_change_page.py` — proposal and ledger caller outcomes.
+- `scripts/agents/codex_mesh.py`, `scripts/astra/astra_review.py`, `scripts/direct/assign_gate.py` — items 1, 2, 5.
+- `scripts/direct/assign.py`, `commands/unit/direct.md` — items 4, 6.
+- `scripts/direct/test_one_launch_path.py`, `scripts/astra/test_astra_review.py`, `scripts/agents/test_codex_mesh.py`, `scripts/direct/test_assign_launcher.py` — tests.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the non-test files; hub: `scripts/production/production_lifecycle.py` (wrap, attach and the lifecycle reads that others call).
-- `test` — the tests and fixtures.
+**Workers:** `2 writers`
+- `codex` — `codex_mesh.py`, `astra_review.py`, `assign_gate.py` and their tests (items 1, 2, 3, 5).
+- `assign` — `assign.py`, `direct.md` and `test_assign_launcher.py` (items 4, 6).
 
-**State:** none.
+**State:** a fix round now leaves `repair_in_flight` through the launcher on both paths.
 
-**Constraints from prior phases:** keep the Phase 3s resolver, Phase 3r writers, and Delegation Context → Ownership. Phase 4p resolves relative question folders from the staff owner's document through `update_registration.question_folder`. Unreadable ownership is not confirmed absence. Keep the linked-checkout, ambiguous-owner, and shared-question tests. Phase 4s keeps the writers' Worktree cells. Phase 4u removes the column; do not remove it here. Staff rows hold canonical unit names from `unit_names.name`. A missing absolute Plan folder is unavailable (`staff.StaffUnreadable`; `unit_lookup.py:107-108`). A requested checkpoint refuses with the unit and folder; unrelated rows do not block it (`merge_checkpoint.py:277-306`). Read-only consumers report the bad row and keep the other rows. Keep `test_unit_lookup.py`, the requested-checkpoint regressions in `test_merge_checkpoint.py`, and the partial-report regressions.
-- Phase 3h review (2026-11-01): regression: `add_unit --resume --check` with a dead pending opening reports it and writes nothing; the test checks the pending file bytes unchanged. Keep the planned change of `recovery: UnitConfig | NoRetiredSession` to guaranteed retirement facts and `NoRecoveryRequired`.
-- Make `issues_folder` (`proposals_folder.py:41`) return `ProposalsFolder | ProposalsUnconfigured | ProposalsUnavailable`. `ProposalsUnavailable` names the document and read failure. Make `ledger` (`proposals_folder.py:32`) return `ImprovementLedger | LedgerUnconfigured | LedgerUnavailable`, with the same distinction. An unreadable document never proves an unconfigured folder or ledger. Test unreadable documents and confirmed absence as different outcomes.
-- Phase 4i review (2026-11-02): the `issues_folder` (`proposals_folder.py:41`) and `ledger` (`:32`) result change and every caller switch in one commit, with no `Path | None` adapter. Callers at 2f49beff4: `update_registration.py:32`, `tidy_wrapped.py:52,89`, `footer_counts`, `proposals_table`, `next_item`, `change_review`, `review_links/change_browser.py`, `review_links/change_page.py` and `rename_unit.py:1081`. `rename_unit.py` is herdr-unit's file: before dispatch, send the overlap to the showrunner and record its answer.
-- Phase 4j (d671740ef): two more `issues_folder` callers switch in the same commit: `update_registration.question_folder` (`update_registration.py:813`) and `tidy_wrapped.can_hold_questions` (`tidy_wrapped.py:52`). `footer_counts` reads questions through `question_folder`. With no Proposals folder, `question_folder` gives `<state>/<showrunner staff id>/questions`; keep that result.
-- Phase 4i (2f49beff4): `WRAPPED`, the wrapped status line, is defined once in `production_units.py:27`. `tidy_wrapped.py`, `staff_sources.py` (two function-level imports) and `staff_test_support.py` import it there. This phase does not move it. A phase that rebuilds or deletes `production_units.py` (herdr-unit 4c) moves `WRAPPED` to one leaf module and switches all three consumers in the same commit. That module must not import `update_registration` or `tidy_wrapped`: the 4i gate found that import cycle.
-- Phase 3h review (2026-11-01): `add_unit` stops writing the `> **Production:**` header only after 3u's header readers switch; 4b deletes the headers.
+**Constraints from prior phases:** Phase 3t: `assign_gate.py` is a leaf (`ASSIGN_LAUNCHERS`, `WORKER_LAUNCHERS`, `assign_role`, `assign_command`); `implement.sh` and `review.sh` refuse Codex through `models_config.sh agents_resolve_claude_launcher`; `review.sh` refuses a Codex simplify first. `last_dispatch` returns `RecordedDispatch | NoDispatchRecorded`; a missing field is `DispatchDetailNotRecorded.UNRECORDED`. Run test modules alone or in small groups: one process over many modules leaks state and shows false reds.
 
-**Acceptance gate:** the item 1 search finds only the excluded files, read-only `session_labels.py`, and `production_units.WRAPPED` imports. It may also find the Units scope reads that item 3 keeps until Phase 4b. Name each remaining match and its owning phase in the checkpoint notice. The dispatch search includes `bump_gate`, `dailies_input`, `live_units`, `showrunners`, `staff_sources`, `unit_lookup`, `unit_table`, and `worker_admission`. Each joins this phase or has a named owning phase. No other match passes. Use different timer and row documents to prove that every changed reader takes the row's document. Keep `test_checkpoint_uses_the_plan_worktree_when_the_director_runs_elsewhere`, the lookup tests, requested-checkpoint tests, and partial-report tests. Tests distinguish `ProposalsUnavailable` and `LedgerUnavailable` from confirmed absence. Require `0 errors, 0 warnings, 0 notes` from `basedpyright` on changed files and their callers. Each changed module's suite passes. A real `merge_gate.py --tests-only` and `add_unit.py --check` use the correct director and branch folders. A real `resume_unit.py sdlc guild-process-unit --dry-run` passes. The full gate passes. Only reads change.
-
-**Acceptance gate (checker):** `test_staff_check.py` runs with no Units table and no timer doc metadata; rows, git and `.unit.toml` supply current facts. A remote read failure stays uncertain; confirmed absence remains a different diagnostic. This test must pass before 4c removes tables or 4d removes their parser.
+**Acceptance gate:** `/astra_review` on a document runs one review through `assign.sh`; a direct `codex_mesh.main(["start", …])` call from another module refuses. A test shows an `assign.sh --role fix` dispatch with `UNIT_RESOLVES_ROUND=1` leaves its round `landed` on a clean exit and abandoned on an error. A test shows the account-move resume takes its role from `last_dispatch`. basedpyright `0 errors, 0 warnings, 0 notes`. Each changed module's suite passes. One director gate.
 
 ### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: todo
 
