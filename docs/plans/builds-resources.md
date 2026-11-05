@@ -571,7 +571,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
    Give a step's commit a named state: a known full or short sha, or an unknown commit (no sha in the row, no index row). Never a bare `None`.
    Give each ancestry answer a named outcome: after the change, before the change, ambiguous short sha, or unavailable (git failed or the commit is missing). Only before and after place a row on a side.
    A failed peak with no index row yet keeps the admitted step's side until its index row arrives (Spec 1).
-   `admission_client.build_history_generation(configuration: gate.MemoryConfig | None = None)` (:126) becomes two named states: the current configuration read at use, and a supplied configuration. Replace the bare optional.
+   `admission_client.build_history_generation(configuration: gate.MemoryConfig | None = None)` (:135) becomes two named states: the current configuration read at use, and a supplied configuration. Replace the bare optional.
    Run git once per distinct sha. Cache the answers in `admission/build_marks.json`.
    Put the sole cache writer in `memory_admit.step_estimate()`'s estimation path.
    `admission_client.step_request()` invokes that path before sending the admission request.
@@ -585,7 +585,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 6. **Docs.** `docs/as-built/build-memory-admission.md`: the list, the split rule and the replay table.
 
 **Constraints from prior phases:**
-- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :2106). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
+- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :2092). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
   Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
 - Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
   Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
@@ -597,11 +597,11 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
   Report observed waits separately. Do not label an estimate comparison as a queue replay.
 - Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
 - Phase 11's compile split and Phase 60's selection rules apply inside each side. Phase 17 adopted no compile bands.
-- Build history inside each side: `build_expected_peak` (`memory_admit.py` :2195) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1811). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The split removes rows; it changes none of those values, and Phase 11's lower pool never replaces a same-shape `build` promise.
-- `scripts/lint/build_shape.py` holds the one Cargo shape parser (`build_shape()` :64) and the one anon-to-index join (`index_step_evidence` :137; Phase 24 Part A, Phase 11 widens it). Since Phase 60 the join keeps the decoded argv of test steps in `StepEvidence.arguments` and parses no test selection.
-- Phase 62 (`01bf65845`): `_step_index` (`build_shape.py` :129) opens the index read-only for two readers with different grouping rules. `index_step_evidence` keeps its call-and-step join; put the `sha` there. `recorded_output_roots` (:268) keeps host-wide attempt root pairs per workspace, skips rows whose argv sets a target folder or whose `target_folder` differs from `target_directory`, and names each root state (`AbsoluteRecordedRoot`, `UnknownRecordedRoot`, `RelativeRecordedRoot`, `RecordedRootsUnavailable`). Do not merge the two readers. Keep `scripts/lint/test_build_shape.py` recorded-root tests and the floor tests in `scripts/lint/test_sweep.py` green unchanged.
-- Phase 60 (`e88fb841d`): test selection is parsed only by `test_selection()` (`memory_admit.py` :162). `history_selection(item, evidence)` (:2091) is the one resolver of package, scope and filters for an anonymous row: a recorded field wins, and only a missing field is parsed from `arguments`. The side split filters rows after that resolver; add no second selection parser. Keep the tests for recorded-field precedence, missing-field recovery and test-only arguments (`test_indexed_test_arguments_remain_available_for_selection`, `test_missing_test_arguments_keep_the_compile_count`, `test_package_check_keeps_legacy_measured_peaks_without_package_fields`).
-- Phase 60: keep the full-package selection (`memory_admit.py` :2023–2026) and the larger of the exact-filter and package p90 in `filtered_peak` (:2506–2510) on each side of a split.
+- Build history inside each side: `build_expected_peak` (`memory_admit.py` :2181) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1806). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The split removes rows; it changes none of those values, and Phase 11's lower pool never replaces a same-shape `build` promise.
+- `scripts/lint/build_shape.py` holds the one Cargo shape parser (`build_shape()` :61) and the one anon-to-index join (`index_step_evidence` :134; Phase 24 Part A, Phase 11 widens it). Since Phase 60 the join keeps the decoded argv of test steps in `StepEvidence.arguments` and parses no test selection.
+- Phase 62 and Phase 64: `_step_index` (`build_shape.py` :126) opens the index read-only for `index_step_evidence` alone, which keeps its call-and-step join; put the `sha` there. The recorded output reader is `recorded_output_roots` in `scripts/buildlog/step_outputs.py`: it returns each distinct row's facts (`AbsoluteRecordedRoot`, `UnknownRecordedRoot`, `RelativeRecordedRoot`, `TargetFolderOverride`, `RecordedRootsUnavailable`), and sweep applies its own deletion rule. Do not merge the two readers. Keep `scripts/buildlog/test_step_outputs.py` and the floor tests in `scripts/lint/test_sweep.py` green unchanged.
+- Phase 60 (`e88fb841d`): test selection is parsed only by `test_selection()` (`memory_admit.py` :161). `history_selection(item, evidence)` (:2077) is the one resolver of package, scope and filters for an anonymous row: a recorded field wins, and only a missing field is parsed from `arguments`. The side split filters rows after that resolver; add no second selection parser. Keep the tests for recorded-field precedence, missing-field recovery and test-only arguments (`test_indexed_test_arguments_remain_available_for_selection`, `test_missing_test_arguments_keep_the_compile_count`, `test_package_check_keeps_legacy_measured_peaks_without_package_fields`).
+- Phase 60: keep the full-package selection (`memory_admit.py` :2009–2012) and the larger of the exact-filter and package p90 in `filtered_peak` (:2493–2496) on each side of a split.
 - Initial estimates run through `admission_client.step_request()` and `memory_admit.step_estimate()`.
   The service does not run git in its event loop. Phase 8 guards the sole estimate-cache writer before mutation.
   Keep private fixture caches usable and real coordination state inaccessible to tests.
@@ -1707,44 +1707,32 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Ruled out:** Cargo labels for the measured folders (the measurement excludes Cargo targets); a director-recorded text approval (the approval is the user's).
 
 ### Phase 64 — Recorded step outputs have one owner, distinct rows and row facts  · status: done
-**Depends on:** Phase 63 (both change `scripts/lint/sweep.py`); report-unit Phase 20 and its follow-up for `scripts/buildlog/memory.py` (merge `origin/builds` first).
 
-#### Work Order
+#### As-built
 
-**Goal:** one buildlog module reads the recorded step outputs once, returns each distinct row with its facts, and each caller applies its own rule.
-
-**Measured (report-unit Phase 20 review, builds 2026-11-04):**
-- `recorded_output_roots` (`scripts/lint/build_shape.py` :268-293) returns 15,838 pairs on natedev, of which 1,120 are distinct per workspace. Both callers dedupe again. Its own CPU time is about 410 ms; the old `memory.py` SQL took 84 ms.
-- The reader applies sweep's deletion rules (skip a row whose argv sets its own target folder; one workspace key per row) for every caller, also for memory kill classification.
-- The reader lives in lint, but buildlog owns the steps table.
-- `create_step_index` and `record_root_attempt` live in `scripts/lint/test_build_shape.py` :22-30; `test_sweep.py` :42 and the memory tests import them from there.
-
-**Spec:**
-1. Move `recorded_output_roots` and its types into a buildlog module (for example `scripts/buildlog/step_outputs.py`). lint loads the store once.
-2. Return each distinct row once. Keep argv out of `DISTINCT`: a SQL prefilter on `target-dir` marks the override rows. Delete the second dedupe in both callers.
-3. Return row facts (the target-folder override marker, worktree, cwd) instead of applied rules. `sweep.py` applies its own deletion rule. `memory.py` applies its own rule.
-4. Move `create_step_index` and `record_root_attempt` into a test support module under `scripts/buildlog/`. `test_build_shape.py`, `test_sweep.py` and the memory tests import them from there.
-5. Measure the reader's CPU time on natedev before and after.
-
-**Constraints from prior phases:**
-- Keep the Phase 62 floor mapping, its speed and its protections: a target with no recorded evidence is `NoRecordedEvidence` and is never deleted or a floor holder; a row whose argv sets its own target folder gives sweep no evidence; an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>`. Keep the five Phase 62 protected tests in `test_sweep.py` unchanged.
-- `index_step_evidence` keeps its own `_step_index` reader and its results.
-- report-unit edits `memory.py` in its Phase 20 and one follow-up. Make the `memory.py` part of Spec 3 after both merge.
+- `scripts/buildlog/step_outputs.py` owns the recorded-output reader. `recorded_output_roots(index_path, host)` opens the steps index read-only and returns `RecordedStepOutputs(rows)` or `RecordedRootsUnavailable(reason)`. It never creates an index.
+- Each `RecordedStepOutput` holds facts, not rules: worktree, cwd, target folder, build folder and recorded target folder (`AbsoluteRecordedRoot | UnknownRecordedRoot | RelativeRecordedRoot`), plus `TargetFolderOverride` (`ABSENT`/`PRESENT`).
+- The SQL `DISTINCT` covers the row facts only. A `target-dir` prefilter sets the override marker, so argv stays out of `DISTINCT`. `indexed_argv` decodes a stored argv.
+- `scripts/lint/sweep.py` `_recorded_mapping_rows` applies sweep's own rule: skip `PRESENT` rows and rows whose absolute target folder differs; the workspace is the worktree, else the cwd; all three roots must be absolute. One dedupe follows the resolve.
+- `scripts/lib/cargo_target_config.py` has `cargo_config_values(argv)`. `scripts/buildlog/width_trial.py` uses `indexed_argv`. `scripts/lint/build_shape.py` keeps only `index_step_evidence`.
+- Reader CPU on natedev is 117.65 ms (was 400.22 ms) for 1,120 distinct workspace pairs. A floor-only dry run takes 7.57 s.
 
 **Files:**
-- `scripts/buildlog/step_outputs.py`, `scripts/lint/build_shape.py` — the reader and its types; `step_outputs.py` is new.
-- `scripts/lint/sweep.py`, `scripts/buildlog/memory.py` — the callers and their rules.
-- `scripts/buildlog/step_outputs_test_support.py`, `scripts/buildlog/test_step_outputs.py`, `scripts/lint/test_build_shape.py`, `scripts/lint/test_sweep.py` — tests; the support module and the reader tests are new. The memory tests that report-unit Phase 20 adds also import from it after that merge.
+- `scripts/buildlog/step_outputs.py` — the reader and its row-fact types.
+- `scripts/buildlog/step_outputs_test_support.py` — `create_step_index` and `record_root_attempt` for every steps-index test.
+- `scripts/buildlog/test_step_outputs.py` — reader tests.
+- `scripts/lint/sweep.py` — sweep's deletion rule over the facts.
+- `scripts/lib/cargo_target_config.py`, `scripts/buildlog/width_trial.py` — argv decoding through the shared helpers.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns the reader module, `build_shape.py`, `sweep.py` and `memory.py`.
-- `test` owns the test support module and the tests.
+**Binds later work:** Memory kill classification reads these rows and applies its own rule; `scripts/buildlog/memory.py` still calls `build_shape.recorded_output_roots`, and `scripts/buildlog/test_memory_window.py` still imports from `test_build_shape`, until the report-unit memory work merges. The floor's override-row evidence adds a row-time fact to `RecordedStepOutput`; the distinct row count and the reader CPU are measured again.
 
-**Acceptance gate:**
-- Tests prove: the reader returns each distinct row once with its facts; sweep skips an override row and keeps one workspace key per row; memory classification applies its own rule to the same rows.
-- `scripts/lint/test_build_shape.py`, `scripts/lint/test_sweep.py` and the memory tests pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
-- The reader's CPU time on natedev, before and after, is in the checkpoint notice. A floor-only dry run on natedev stays under 30 s.
-- Change-Review line: none — internal reader structure; sweep and memory behavior do not change.
+**Gotchas:**
+- `scripts/buildlog` has no `.` extra path for basedpyright. Import package modules with `if TYPE_CHECKING: from .x import …` else `from scripts.buildlog.x import …`.
+- `create_step_index` keeps each column's declared type word. TEXT for every column breaks the build_shape tests.
+- `scripts/build_queue/head_facts.py:17` loads a second `store` module copy through a bare import. Its owner fixes it.
+- The Phase 62 protections hold: no recorded evidence is `NoRecordedEvidence`, an override row gives sweep no evidence, and an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>`.
+
+**Ruled out:** One reader that applies sweep's deletion rules for every caller (memory classification needs its own rule); argv inside `DISTINCT` (15,838 rows for 1,120 pairs).
 
 ### Phase 65 — Memory kill classification reads the shared step output rows and applies its own rule  · status: todo
 **Depends on:** Phase 64 (the reader moved to `scripts/buildlog/step_outputs.py`); report-unit Phase 20 and its follow-up for `scripts/buildlog/memory.py` on `origin/builds`. Do not merge report's branch; merge `origin/builds` once both are there.
@@ -1756,27 +1744,32 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Measured (Phase 64, 2026-11-05):**
 - Phase 64 moved the reader from `scripts/lint/build_shape.py` to `scripts/buildlog/step_outputs.py`. It returns each distinct row once with its facts (worktree, cwd, target and build folders, target folder, override marker), not applied rules. Reader CPU time fell from 400.22 ms to 117.65 ms.
 - report-unit Phase 20 changes `memory.py` and was not on `origin/builds` at the Phase 64 checkpoint, so Phase 64 Spec 3's `memory.py` part moved here.
+- A trial merge of report's tip `b02e65a6f` on the Phase 64 tree (2026-11-05) showed three breaks: `memory.py:93` calls `build_shape.recorded_output_roots`, which Phase 64 removed; `scripts/buildlog/test_memory_window.py` imports `record_root_attempt` from `scripts/lint/test_build_shape.py`, which no longer holds it; `scripts/lib/cargo_target_config.py` conflicts.
 
 **Spec:**
 1. Make `memory.py` call `step_outputs.recorded_output_roots` and import nothing from `build_shape` for it.
 2. Apply memory's own rule to the row facts in `memory.py`. Delete any second dedupe of the rows.
-3. Make the memory tests build their index with `scripts/buildlog/step_outputs_test_support.py`.
+3. Make `scripts/buildlog/test_memory_window.py` build its index with `scripts/buildlog/step_outputs_test_support.py` (`create_step_index`, `record_root_attempt`).
+4. In `scripts/lib/cargo_target_config.py`, keep report's strict configuration branch and its precedence (`CARGO_BUILD_TARGET_DIR`/`CARGO_BUILD_BUILD_DIR`, then the `--config` values, then `CARGO_TARGET_DIR`), and read the `--config` values only through `cargo_config_values(argv)`.
 
 **Constraints from prior phases:**
+- The unit that lands second resolves the breaks (showrunner, 2026-11-05). When resources-unit lands Phases 63-64 after report-unit Phase 20, that merge carries Spec 1, 3 and 4, so the merged tree passes its tests; this phase then keeps Spec 2. When report-unit lands second, it makes those moves; this phase keeps Spec 2. Never leave a merged tree with the old import.
 - Keep memory kill classification results equal to report-unit Phase 20's results on the same fixture rows.
 - `step_outputs` returns facts only; a caller rule stays in its caller.
+- `scripts/buildlog` has no `.` extra path in `pyrightconfig.json`. Import package modules as `if TYPE_CHECKING: from .x import …` else `from scripts.buildlog.x import …` (see `scripts/buildlog/step_outputs.py`).
 
 **Files:**
-- `scripts/buildlog/memory.py` — the caller and its rule.
-- The memory tests that report-unit Phase 20 adds — tests.
+- `scripts/buildlog/memory.py`, `scripts/lib/cargo_target_config.py` — the caller and its rule; the config reader.
+- `scripts/buildlog/test_memory_window.py`, `scripts/buildlog/test_step_row.py` — tests; `test_step_row.py` holds the configuration precedence tests.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` owns `memory.py`.
-- `test` owns the memory tests.
+- `impl` owns `memory.py` and `cargo_target_config.py`.
+- `test` owns `test_memory_window.py` and `test_step_row.py`.
 
 **Acceptance gate:**
 - Tests prove memory classification applies its own rule to the same rows as before.
-- The memory tests, `scripts/buildlog/test_step_outputs.py` and `scripts/lint/test_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
+- Tests prove the configuration precedence in Spec 4 for each source.
+- `scripts/buildlog/test_memory_window.py`, `scripts/buildlog/test_step_row.py`, `scripts/buildlog/test_step_outputs.py` and `scripts/lint/test_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
 - Change-Review line: none — internal caller structure; memory classification does not change.
 
 ### Phase 66 — The floor takes evidence from target-folder override rows that the fixed recorder wrote  · status: todo
@@ -1791,24 +1784,28 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - report-unit Phase 19 (`2ae242c18`) records those rows' pairs from Cargo metadata with the step's inputs, and skips a pair that differs from the captured target folder. Rows recorded before it stay wrong. Rows carry no recorder version.
 
 **Spec:**
-1. Find the time from which every recorded row comes from the fixed recorder: the time `2ae242c18` reached natedev's installed `~/.claude`. Read it from git, not by hand, and keep it in one named place.
-2. In sweep's rule (after Phase 64, sweep applies its own rule to the row facts): for a row recorded at or after that time, the target-folder check alone decides, and the argv override skip does not apply. An older override row still gives no evidence.
-3. Give the row time to sweep as a row fact from the reader, if the reader does not return it yet.
+1. Find the cut: the time `2ae242c18` reached natedev's installed `~/.claude` checkout. Read it from that checkout's reflog (the first entry whose commit contains `2ae242c18`), never from a commit or author date, and keep it in one named place.
+2. Use each row's `started_at` (the steps table, `scripts/buildlog/index.py`) as its row time. A step that started before the cut can have its pending row published later by `finish_pending_step()` (`scripts/buildlog/record.py`), so publication time proves nothing.
+3. Return the row time from the reader as a named state: a known time, or an unknown time for a missing or unparseable `started_at`. Group the distinct facts and return the newest `started_at` of each group (`GROUP BY` the facts with `MAX(started_at)`), so the row count stays the Phase 64 distinct count.
+4. In sweep's rule: for a fact whose newest row started strictly after the cut, the target-folder check alone decides, and the argv override skip does not apply. An unknown time, or a time at or before the cut, keeps the override skip.
 
 **Constraints from prior phases:**
 - Keep the Phase 62 protections: a target with no recorded evidence is `NoRecordedEvidence` and is never deleted or a floor holder; an absolute `target_folder` that differs from `target_directory` gives no evidence; an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>`.
 - The current rule is safe; it only loses evidence. This phase must not make any old row give evidence.
+- Phase 64: `step_outputs.recorded_output_roots` returns row facts only, with SQL `DISTINCT` and a `target-dir` prefilter; sweep's `_recorded_mapping_rows` applies the rule. Reader CPU was 117.65 ms for 1,120 distinct workspace pairs on natedev.
+- `scripts/buildlog` imports package modules as `if TYPE_CHECKING: from .x import …` else `from scripts.buildlog.x import …`.
 
 **Files:**
 - `scripts/buildlog/step_outputs.py` — the row time as a row fact.
 - `scripts/lint/sweep.py` — the override rule by row time.
-- `scripts/buildlog/test_step_outputs.py`, `scripts/lint/test_sweep.py` — tests.
+- `scripts/buildlog/step_outputs_test_support.py`, `scripts/buildlog/test_step_outputs.py`, `scripts/lint/test_sweep.py` — tests and the shared index fixture.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` owns `step_outputs.py` and `sweep.py`.
-- `test` owns the tests.
+- `test` owns `step_outputs_test_support.py` and the tests.
 
 **Acceptance gate:**
-- Tests prove, with a fixture index: an override row recorded at or after the cut gives evidence when its target folder matches; the same row recorded before the cut gives none; a row whose target folder differs gives none on both sides of the cut.
+- Tests prove, with a fixture index: an override row started after the cut gives evidence when its target folder matches; the same row started at or before the cut gives none; a row whose target folder differs gives none on both sides of the cut; a missing or unparseable `started_at` gives none; a row that started before the cut and was published after it gives none.
+- The reader's CPU time and distinct row count on natedev, before and after, are in the checkpoint notice; the row count does not rise. A floor-only dry run on natedev stays under 30 s.
 - `scripts/buildlog/test_step_outputs.py` and `scripts/lint/test_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
 - Change-Review line: none — the floor finds more recorded targets; nothing the user sees changes.

@@ -28,11 +28,11 @@
   - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
 
 - [ ] **Match trims against each step's recorded Cargo output roots**
-  - Target: `scripts/lint/sweep.py` (`RebuildStep`, `read_rebuild_evidence`, `_rebuild_causes`), `scripts/lint/build_shape.py`, and their tests.
-  - Dependency: Phase 62's shared root types and recorded-root safety rules.
+  - Target: `scripts/lint/sweep.py` (`RebuildStep`, `read_rebuild_evidence`, `_rebuild_causes`), `scripts/buildlog/step_outputs.py`, and their tests.
+  - Dependency: Phase 64's shared root decoding and row facts, with Phase 62's recorded-root safety rules.
   - Why needed: `_rebuild_causes()` still matches trims through saved workspace mappings.
   - Completion condition: retain each attempt's identity and root pair in the existing locked-row reader.
-  - Reuse the shared root decoding. Never infer an attempt's roots from the workspace aggregate returned by `recorded_output_roots`.
+  - Reuse root decoding from `step_outputs.py` while retaining attempt identity in the existing locked-row reader. Do not use host-wide distinct rows or saved workspace mappings as attempt evidence.
   - Keep unknown, relative, and override-affected roots explicit. Do not attribute a trim through an uncertain root.
   - Keep the `store.locked_rows` reads; do not create or refresh the index during rebuild reporting.
   - Test removed copies, changed mappings, repeated attempts with different roots, unknown roots, relative roots, overrides, and a missing index.
