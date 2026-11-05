@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from targets import (
     ANY_ELIGIBLE_TARGET,
     AwsStatusRow,
+    RemovalPending,
     read_aws_status as read_aws_status,
     ConfigError,
     EligibleTarget,
@@ -167,6 +168,9 @@ def format_aws_status(row: AwsStatusRow) -> str:
     state = f'starting since {at(row.starting_at)}' if row.state == 'starting' else row.state
     lines = [f'{row.target}: {state}; evidence {at(row.evidence_at)}; month {monthly} / {cap}',
              f'  spending {row.spending}; decision {at(row.decision_at)}; {display_field(row.reason)}']
+    if isinstance(row.removal, RemovalPending):
+        lines.append('  down incomplete: ' + ', '.join(row.removal.resources)
+                     + f'; storage ${row.removal.storage_usd_per_day:.2f}/day; run deploy.py down --approve-destroy')
     for slots in row.slots:
         lines.append(f'  {slots.repository}: {slots.occupied}/{slots.capacity} slots; '
                      + f'{slots.active} active, {slots.retained} retained pending cleanup')

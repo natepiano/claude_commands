@@ -14,9 +14,12 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import costs
 import index
 import moments
+import record
 import test_moments as fixtures
 from test_index import Record, call, ci_job, ci_run
 from test_holds import hold_event
@@ -29,6 +32,19 @@ class CostTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.moment_fixture(self)
 
+    def test_machine_aliases_read_sync_configuration_once(self) -> None:
+        with (
+            mock.patch.object(record, "configured_targets", return_value=("first", "second")),
+            mock.patch.object(record, "sync_config", return_value={
+                "sync.hosts.first": "first-host", "sync.hosts.second": "second-host",
+                "sync.hosts.extra": "extra-host",
+            }) as read,
+        ):
+            aliases: dict[str, str] = {}
+            self.assertEqual(costs.machine_name(None, "second-host", aliases), "second")
+            self.assertEqual(aliases, {"first-host": "first", "second-host": "second", "extra-host": "extra"})
+            read.assert_called_once_with()
+
     def progress(self, durations: list[tuple[str, float]]) -> None:
         events: list[Record] = []
         for number, (directory, seconds) in enumerate(durations):
@@ -37,6 +53,28 @@ class CostTests(unittest.TestCase):
             events.extend(({**common, "event_type": "phase_started", "timestamp_epoch": finish - seconds},
                            {**common, "event_type": "phase_finished", "timestamp_epoch": finish, "status": "completed", "phase_started_at": finish - seconds}))
         self.fixture.progress(events)
+
+    def test_first_source_uses_a_recorded_event_instead_of_a_month_boundary(self) -> None:
+        self.fixture.fixture.write(fixtures.build("first", -3600, target="mac"),
+                                   fixtures.build("later", 10, target="mac"))
+        path = self.fixture.fixture.root/"mac/2026-10.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = (self.fixture.fixture.root/"natedev/profiles.jsonl").replace(path)
+        _ = index.update()
+        path.unlink()
+        with closing(index.read_only()) as connection:
+            reading = costs.read_costs(connection, fixtures.START, fixtures.END)
+        self.assertEqual(reading.first_sources["mac"], fixtures.START.timestamp()-3600)
+
+    def test_empty_and_eventless_monthly_sources_never_activate_a_machine(self) -> None:
+        path = self.fixture.fixture.root/"aws/2026-11.jsonl"
+        path.parent.mkdir(parents=True)
+        path.touch()
+        eventless = path.with_name("2026-10.jsonl")
+        _ = eventless.write_text('{}\n')
+        with closing(self.fixture.connection(fixtures.build("local", 10, target="natedev"))) as connection:
+            reading = costs.read_costs(connection, fixtures.START, fixtures.END)
+        self.assertNotIn("aws", reading.first_sources)
 
     def test_phase_score_uses_matched_wall_time_and_nearest_rank_p90(self) -> None:
         self.progress([("/r/hana", 60), ("/r/hana", 120), ("/r/tool-based-ui", 180), ("/r/other", 240)])

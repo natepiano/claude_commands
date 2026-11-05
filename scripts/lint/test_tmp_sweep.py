@@ -1034,6 +1034,33 @@ class LogTests(TmpSweepCase):
         self.assertEqual(kept_paths[tmp_sweep.IN_USE], [f"{self.tmp / 'busy'}: pid 10 works in it"])
         self.assertIsInstance(entry["freed_gib"], float)
 
+    def test_due_failure_and_not_due_skip_have_distinct_assessments(self) -> None:
+        self.now = time.time() + 8 * DAY
+        payload = write(self.tmp / "idle-file")
+        unlink = os.unlink
+
+        def refuse_payload(path: str, *, dir_fd: int | None = None) -> None:
+            if path == str(payload):
+                raise PermissionError("private removal failed")
+            unlink(path, dir_fd=dir_fd)
+
+        with (mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
+              mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)),
+              mock.patch.object(os, "unlink", side_effect=refuse_payload) as remove,
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            self.assertEqual(tmp_sweep.run_if_due(False, self.now), tmp_sweep.CompletedSweepAssessment(1))
+            self.assertTrue(payload.is_file())
+            calls = remove.call_count
+            self.assertEqual(tmp_sweep.run_if_due(False, self.now + 1), tmp_sweep.SkippedSweepAssessment())
+            self.assertEqual(remove.call_count, calls)
+        with (mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
+              mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            self.assertEqual(tmp_sweep.run_if_due(False, self.now + tmp_sweep.RUN_INTERVAL_SECONDS),
+                             tmp_sweep.CompletedSweepAssessment(0))
+        self.assertFalse(payload.exists())
+        self.assertEqual(len(self.log()), 2)
+
     def test_a_run_waits_an_hour_after_the_last(self) -> None:
         self.now = time.time() + 8 * DAY
         idle = write(self.tmp / "shots" / "1.png")
@@ -1047,12 +1074,12 @@ class LogTests(TmpSweepCase):
         with (mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
               mock.patch.object(tmp_sweep, "run", side_effect=fixture_run),
               redirect_stdout(io.StringIO())):
-            self.assertEqual(tmp_sweep.run_if_due(False, self.now), 0)
+            self.assertEqual(tmp_sweep.run_if_due(False, self.now), tmp_sweep.CompletedSweepAssessment(0))
             self.assertFalse(idle.exists())
             idle = write(self.tmp / "shots" / "2.png")
-            self.assertEqual(tmp_sweep.run_if_due(False, self.now + 3500), 0)
+            self.assertEqual(tmp_sweep.run_if_due(False, self.now + 3500), tmp_sweep.SkippedSweepAssessment())
             self.assertTrue(idle.is_file())
-            self.assertEqual(tmp_sweep.run_if_due(False, self.now + 3600), 0)
+            self.assertEqual(tmp_sweep.run_if_due(False, self.now + 3600), tmp_sweep.CompletedSweepAssessment(0))
             self.assertFalse(idle.exists())
         self.assertEqual(len(self.log()), 2)
 

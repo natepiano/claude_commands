@@ -2092,13 +2092,15 @@ class StaffAdmissionTests(MeshCommandFixture):
 
         self.server.respond = check
         with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(old.current_session, 987654)):
-            code, errors = self.run_start()
+            with patch.object(codex_mesh, "_accepted_assignment", side_effect=AssertionError("first dispatch read recovery evidence")):
+                code, errors = self.run_start()
         self.assertEqual((code, errors), (0, ""))
         current = staff.by_id(old.id)
         self.assertEqual(observed, [current])
         assert current is not None
         self.assertEqual(current, dataclasses.replace(old, current_session=staff.StaffId(THREAD_ID)))
         params = cast(dict[str, object], self.methods("turn/start")[0]["params"])
+        self.assertNotIn("developerInstructions", params)
         prompt = json.dumps(params["input"])
         extract = self.session_dir / f"{old.id}.handoff.md"
         self.assertLess(prompt.index(str(extract)), prompt.index(str(source)))
@@ -2108,6 +2110,64 @@ class StaffAdmissionTests(MeshCommandFixture):
         self.assertEqual((repeated, errors), (0, ""))
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_interrupted_dispatch_uses_delivery_evidence_before_submission(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        allowed = worker_admission.admit("worker", self.session_dir, role="impl")
+        request = worker_admission.assignment_id(self.session_dir / "prompt.txt")
+        self.assertTrue(request)
+        worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.DISPATCH_DEFERRED)
+        with patch.object(codex_mesh, "_accepted_assignment", side_effect=LookupError("delivery evidence read")) as evidence:
+            with self.assertRaisesRegex(LookupError, "delivery evidence read"):
+                _ = self.run_start()
+        evidence.assert_called_once()
+        self.assertEqual(len(self.methods("turn/start")), 1)
+        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.DISPATCH_DEFERRED)
+
+
+    def test_the_worker_row_is_available_while_its_codex_turn_runs(self) -> None:
+        from scripts.shutdown import stop_resume
+
+        row = fixture_worker("worker", staff.StaffId(os.environ["CODEX_THREAD_ID"]))
+        _ = transcript_fixture(row, staff.ClaudeBackend())
+        self.server.hold_turn_completion = True
+        self.server.held_turn_completes_successfully = True
+        streaming = threading.Event()
+        stream_frames = codex_mesh._stream_frames  # pyright: ignore[reportPrivateUsage]
+
+        def observe(stream: codex_mesh.TurnStream, log: TextIO) -> codex_mesh.FailedWithThread | None:
+            streaming.set()
+            return stream_frames(stream, log)
+
+        with (patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.current_session, 987654)),
+              patch.object(codex_mesh, "_stream_frames", observe),
+              ThreadPoolExecutor(max_workers=1) as executor):
+            running = executor.submit(self.run_start)
+            running.add_done_callback(lambda completed: streaming.set() if completed.done() else None)
+            try:
+                self.server.hang_guard.event(streaming)
+                if running.done():
+                    self.fail(f"worker exited before the live turn: {running.result(TEST_HANG_GUARD_SECS)}")
+                row = staff.by_current_session(THREAD_ID)
+                assert row is not None
+                program = '''import sys
+from scripts.production import staff
+with staff.row_operation(sys.argv[1]):
+    row = staff.by_id(staff.StaffId(sys.argv[1]))
+    assert row is not None
+    print(row.current_session)
+'''
+                contender = subprocess.run([sys.executable, "-c", program, row.id],
+                    env=staff.child_environment(os.environ), capture_output=True, text=True,
+                    timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(contender.returncode, 0, contender.stdout + contender.stderr)
+                self.assertEqual(contender.stdout.strip(), THREAD_ID)
+                self.assertEqual(self.worker_record()["status"], "running")
+                self.assertFalse(running.done())
+            finally:
+                self.server.release_held_turn.set()
+            self.assertEqual(running.result(TEST_HANG_GUARD_SECS), (0, ""))
+        self.assertEqual(self.worker_record()["status"], "done")
 
     def test_no_pane_codex_switch_ends_only_its_loaded_thread_before_claude_dispatch(self) -> None:
         from scripts.production.staff_test_support import fixture_session
@@ -2132,22 +2192,33 @@ class StaffAdmissionTests(MeshCommandFixture):
         self.server.respond = reply
         identity = fixture_runtime_id("Claude after idle end")
         observed: list[staff.StaffRow] = []
+        starts: list[str] = []
 
         def start(handoff: worker_admission.FamilyHandoff) -> str:
             self.assertIsInstance(handoff, worker_admission.TranscriptHandoff)
             self.assertEqual(loaded, {sibling})
             self.assertEqual(staff.by_id(old.id), old)
+            self.assertTrue(worker_admission.dispatch_record(allowed).assignment_id)
+            starts.append(identity)
+            if len(starts) == 1:
+                raise OSError("destination creation failed after source release")
             fixture_session(identity, staff.ClaudeBackend())
             return identity
 
-        def dispatch(published: worker_admission.PublishedWorker) -> None:
+        def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
             self.assertEqual(loaded, {sibling})
             self.assertIsInstance(published.handoff, worker_admission.TranscriptHandoff)
             observed.append(published.row)
+            return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
 
         allowed = worker_admission.admit(old.name, self.session_dir, role="impl")
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text("{}")
         with patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)):
+            with self.assertRaisesRegex(OSError, "destination creation failed after source release"):
+                _ = worker_admission.switch_worker(allowed, "claude", start=start,
+                    dispatch=dispatch, cleanup=lambda native: self.fail("uncreated destination was discarded: " + native))
+            self.assertEqual(staff.by_id(old.id), old)
+            self.assertEqual(observed, [])
+            allowed = worker_admission.admit(old.name, self.session_dir, role="impl", reference=old.id)
             result = worker_admission.switch_worker(allowed, "claude", start=start,
                 dispatch=dispatch, cleanup=lambda native: self.fail("published destination was discarded: " + native))
         self.assertEqual(observed, [result.row])
@@ -2155,6 +2226,68 @@ class StaffAdmissionTests(MeshCommandFixture):
         self.assertEqual([cast(dict[str, object], call["params"])["threadId"]
                           for call in self.methods("thread/unsubscribe")], [THREAD_ID])
         self.assertEqual(loaded, {sibling})
+        self.assertEqual(starts, [identity, identity])
+
+    def test_source_release_requires_identity_and_complete_server_evidence(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        row = session_staff.worker_row(self.worker_record())
+        assert row is not None
+        stopped: dict[str, object] = {"pid": 987654321, "port": 9}
+        cases: tuple[tuple[str, dict[str, object] | None, bool, type[object]], ...] = (
+            ("null current pid", {"pid": None, "port": 9, "previous_servers": [stopped]}, True, worker_admission.SourceReleaseUnknown),
+            ("empty retained record", {"previous_servers": [{}]}, True, worker_admission.SourceReleaseUnknown),
+            ("unrelated server", stopped, False, worker_admission.SourceUnresolved),
+            ("mixed retained records", {"previous_servers": [stopped, {}]}, True, worker_admission.SourceReleaseUnknown),
+            ("missing current pid", {"port": 9, "previous_servers": [stopped]}, True, worker_admission.SourceReleaseUnknown),
+            ("stopped retained servers", {"previous_servers": [stopped]}, True, worker_admission.SourceReleased),
+            ("missing server file", None, True, worker_admission.SourceUnresolved),
+        )
+        for label, evidence, identified, expected in cases:
+            with self.subTest(evidence=label):
+                self.write_pool_roster({"worker": {"staff_id": row.id, "status": "done"}} if identified else {})
+                server = self.session_dir / codex_mesh.SERVER_FILE
+                if evidence is None:
+                    server.unlink(missing_ok=True)
+                else:
+                    _ = server.write_text(json.dumps(evidence))
+                result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
+                self.assertIsInstance(result, expected)
+
+    def test_only_active_records_belong_to_the_matching_launcher(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        owner = codex_mesh.RosterActiveLauncher(THREAD_ID, (os.getpid(),))
+        for status in ("starting", "running", "done"):
+            with self.subTest(status=status):
+                self.assertEqual(owner.owns({**self.worker_record(), "launcher_pid": os.getpid(), "status": status}), status != "done")
+
+    def test_unresolved_or_unknown_source_servers_preserve_the_slot_and_dispatch_nothing(self) -> None:
+        from scripts.shutdown import stop_resume
+
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        old = session_staff.worker_row(self.worker_record())
+        assert old is not None
+        _ = transcript_fixture(old, staff.CodexBackend(agent_accounts.workers_home()))
+        allowed = worker_admission.admit(old.name, self.session_dir, role="impl")
+        server = self.session_dir / codex_mesh.SERVER_FILE
+        for evidence, reason in (("missing", "stop is unresolved"), ("unknown", "worker state unreadable")):
+            with self.subTest(evidence=evidence):
+                if evidence == "missing":
+                    server.unlink()
+                else:
+                    _ = server.write_text("{unknown server state")
+                before = Path(os.environ["STAFF_FILE"]).read_bytes(), self.worker_record()
+
+                def start(handoff: worker_admission.FamilyHandoff) -> str:
+                    self.fail("unproved source release started a destination: " + str(handoff))
+
+                with (patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)),
+                      self.assertRaisesRegex(worker_admission.AdmissionRefused, reason)):
+                    _ = worker_admission.switch_worker(allowed, "claude", start=start,
+                        dispatch=worker_admission.SwitchState.ASSIGNMENT_ACCEPTED,
+                        cleanup=lambda native: self.fail("uncreated destination cleanup: " + native))
+                self.assertEqual((Path(os.environ["STAFF_FILE"]).read_bytes(), self.worker_record()), before)
+                self.assertEqual(self.methods("thread/unsubscribe"), [])
+                self.assertEqual(self.methods("turn/start"), [])
 
     def test_start_uses_staff_worktree_instead_of_caller_or_saved_shell_folder(self) -> None:
         parent = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
@@ -4773,55 +4906,46 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 self.assertEqual(self.roster(), before)
                 self.assertEqual(self.methods("thread/resume"), [])
 
-    def test_fork_supplies_and_copies_the_source_standing_instructions(self) -> None:
+    def test_each_resume_uses_current_instructions_and_refuses_unreadable_content(self) -> None:
+        self.configure_context()
         path = self.standing_instructions()
-        self.seed_instruction_thread(path)
-
-        code, _output, errors = self.run_mesh(["fork", "--from", "worker", "--name", "reviewer"])
-
-        self.assertEqual((code, errors), (0, ""))
-        self.assertEqual(self.methods("thread/fork")[0]["params"], {
-            "threadId": THREAD_ID, "sandbox": "read-only", "approvalPolicy": "never",
-            "cwd": str(self.session_dir),
-            "developerInstructions": path.read_text(encoding="utf-8"),
-        })
-        self.assertEqual(_as_test_dict(self.roster()["reviewer"]).get("instructions_file"), str(path))
-
-    def test_fork_source_resume_supplies_standing_instructions(self) -> None:
-        path = self.standing_instructions()
-        self.seed_instruction_thread(path)
-
-        code, _output, errors = self.run_mesh(["fork", "--from", "worker", "--name", "reviewer"])
-
-        self.assertEqual((code, errors), (0, ""))
-        self.assert_instruction_resume(path)
-
-    def test_follow_resume_supplies_standing_instructions(self) -> None:
-        path = self.standing_instructions()
-        self.seed_instruction_thread(path)
-
-        code, _output, errors = self.run_mesh(self.follow_cli())
-
-        self.assertEqual((code, errors), (0, ""))
-        self.assert_instruction_resume(path)
-
-    def test_compact_resume_supplies_standing_instructions(self) -> None:
-        path = self.standing_instructions()
-        self.seed_instruction_thread(path)
-
-        code, _output, errors = self.run_mesh(["compact", "--to", "worker"])
-
-        self.assertEqual((code, errors), (0, ""))
-        self.assert_instruction_resume(path)
-
-    def test_reset_resume_supplies_standing_instructions(self) -> None:
-        path = self.standing_instructions()
-        self.seed_instruction_thread(path)
-
-        code, _output, errors = self.run_mesh(["reset", "--to", "worker"])
-
-        self.assertEqual((code, errors), (0, ""))
-        self.assert_instruction_resume(path)
+        for evidence in ("present", "absent", "unreadable"):
+            for verb in ("fork", "follow", "compact", "reset"):
+                with self.subTest(evidence=evidence, verb=verb):
+                    selected = path.with_name("missing-standing-instructions.txt") if evidence == "unreadable" else path
+                    self.seed_instruction_thread(selected)
+                    if evidence == "absent":
+                        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done",
+                            "role": "review", "context_tokens": 150000}})
+                    self.server.requests.clear()
+                    arguments = (["fork", "--from", "worker", "--name", "reviewer"] if verb == "fork"
+                                 else self.follow_cli() if verb == "follow" else [verb, "--to", "worker"])
+                    code, output, errors = self.run_mesh(arguments)
+                    if evidence == "unreadable":
+                        self.assertEqual(code, 1, errors)
+                        self.assertEqual(output, "")
+                        label = "natedev · models · code reviewer" if verb == "follow" else "reviewer" if verb == "fork" else "worker"
+                        self.assertTrue(errors.startswith(f"codex_mesh: {label}: "), errors)
+                        self.assertIn(selected.name, errors)
+                        for method in ("turn/start", "thread/compact/start", "thread/revert", "thread/fork"):
+                            self.assertEqual(self.methods(method), [])
+                        continue
+                    self.assertEqual((code, errors), (0, ""), output)
+                    if evidence == "absent":
+                        resumes = self.methods("thread/resume")
+                        self.assertTrue(resumes)
+                        for request in resumes:
+                            self.assertEqual(request["params"], {"threadId": THREAD_ID, "cwd": str(self.session_dir)})
+                    else:
+                        self.assert_instruction_resume(path)
+                        if verb == "fork":
+                            self.assertEqual(self.methods("thread/fork")[0]["params"], {
+                                "threadId": THREAD_ID, "sandbox": "read-only", "approvalPolicy": "never",
+                                "cwd": str(self.session_dir), "developerInstructions": path.read_text(encoding="utf-8")})
+                            self.assertEqual(_as_test_dict(self.roster()["reviewer"]).get("instructions_file"), str(path))
+                        if verb == "follow":
+                            self.assertEqual(self.worker_record()["status"], "done")
+                            self.assertEqual(self.worker_record().get("instructions_file"), str(path))
 
     def test_set_instructions_repoints_an_idle_reviewer_and_its_next_resume_sends_the_new_prompt(self) -> None:
         old = self.standing_instructions()
@@ -4851,57 +4975,6 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         code, _output, errors = self.run_mesh(["set-instructions", "--to", "worker", "--instructions-file", str(old)])
         self.assertEqual(code, 2)
         self.assertIn("instructions unchanged", errors)
-
-    def test_follow_completion_keeps_the_standing_instructions_path(self) -> None:
-        path = self.standing_instructions()
-        self.seed_instruction_thread(path)
-
-        code, _output, errors = self.run_mesh(self.follow_cli())
-
-        self.assertEqual((code, errors), (0, ""))
-        self.assertEqual(self.worker_record()["status"], "done")
-        self.assertEqual(self.worker_record().get("instructions_file"), str(path))
-
-    def test_resume_without_standing_instructions_keeps_the_original_request(self) -> None:
-        cases = [self.follow_cli(), ["compact", "--to", "worker"],
-                 ["reset", "--to", "worker"], ["fork", "--from", "worker", "--name", "reviewer"]]
-        for arguments in cases:
-            with self.subTest(verb=arguments[0]):
-                self.write_pool_roster({"worker": {
-                    "thread_id": THREAD_ID, "status": "done", "role": "review", "context_tokens": 150000,
-                }})
-                self.server.requests.clear()
-
-                code, _output, errors = self.run_mesh(arguments)
-
-                self.assertEqual((code, errors), (0, ""))
-                resumes = self.methods("thread/resume")
-                self.assertTrue(resumes)
-                for request in resumes:
-                    self.assertEqual(request["params"], {"threadId": THREAD_ID, "cwd": str(self.session_dir)})
-
-    def test_unreadable_standing_instructions_fail_before_any_turn(self) -> None:
-        self.configure_context()
-        path = self.session_dir / "missing-standing-instructions.txt"
-        cases = [(self.follow_cli(), "worker"), (["compact", "--to", "worker"], "worker"),
-                 (["reset", "--to", "worker"], "worker"),
-                 (["fork", "--from", "worker", "--name", "reviewer"], "reviewer")]
-        for arguments, name in cases:
-            with self.subTest(verb=arguments[0]):
-                self.seed_instruction_thread(path)
-                self.server.requests.clear()
-
-                code, output, errors = self.run_mesh(arguments)
-
-                self.assertEqual(code, 1, errors)
-                self.assertEqual(output, "")
-                label = "natedev · models · code reviewer" if arguments[0] == "follow" else name
-                self.assertTrue(errors.startswith(f"codex_mesh: {label}: "), errors)
-                self.assertIn(path.name, errors)
-                self.assertEqual(self.methods("turn/start"), [])
-                self.assertEqual(self.methods("thread/compact/start"), [])
-                self.assertEqual(self.methods("thread/revert"), [])
-                self.assertEqual(self.methods("thread/fork"), [])
 
     def claim_review_follow(self) -> bool:
         return codex_mesh._claim_follow(  # pyright: ignore[reportPrivateUsage]
@@ -5495,7 +5568,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_reopen_refuses_missing_thread_or_live_launcher_without_mutation(self) -> None:
         for fields in ({"launcher_pid": os.getpid(), "thread_id": THREAD_ID},
-                       {"launcher_pid": 99999999}):
+                       {"launcher_pid": 99999999, "staff_id": fixture_runtime_id("missing-worker")}):
             with self.subTest(fields=fields):
                 self.write_pool_roster({"worker": {"status": "ended", **fields}})
                 marker = codex_mesh._end_marker_path(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
@@ -7930,7 +8003,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 }))
         args = self.start_args()
         with patch.object(codex_mesh, "_report_quota_refusal", side_effect=move_on_refusal) as report:
-            outcome = codex_mesh._run_worker(args, self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port, staff_admission=worker_admission.admit(cast(str, args.name), self.session_dir, role=cast(str, args.role)), started_here=True)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         report.assert_called_once()
         self.assertIsInstance(reported_stopped_context(report),
@@ -8035,7 +8108,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
             _ = config.write_text(json.dumps({"workers": next_label}))
         with (patch.object(codex_mesh, "_start_server", side_effect=start),
               patch.object(codex_mesh, "_report_quota_refusal", side_effect=move_on_refusal) as report):
-            outcome = codex_mesh._run_worker(self.start_args(), self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(self.start_args(), self.server.port, staff_admission=worker_admission.admit("worker", self.session_dir, role="impl"), started_here=True)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         self.assertEqual(report.call_count, 2)
         self.assertTrue(all(isinstance(call.kwargs.get("stopped", codex_mesh.REFUSAL_WITHOUT_COMMAND_EXIT),
@@ -8182,7 +8255,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(("127.0.0.1", 0))
             port = cast(tuple[str, int], listener.getsockname())[1]
-        outcome = codex_mesh._run_worker(self.start_args(), port)  # pyright: ignore[reportPrivateUsage]
+        outcome = codex_mesh._run_worker(self.start_args(), port, staff_admission=worker_admission.admit("worker", self.session_dir, role="impl"))  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.FailedBeforeThread)
         assert isinstance(outcome, codex_mesh.FailedBeforeThread)
         self.assertIn("refused", outcome.failure.lower())
@@ -9165,7 +9238,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         args = self.start_args()
         args.resident = True
 
-        outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+        outcome = codex_mesh._run_worker(args, self.server.port, staff_admission=worker_admission.admit(cast(str, args.name), self.session_dir, role=cast(str, args.role)))  # pyright: ignore[reportPrivateUsage]
 
         self.assertIsInstance(outcome, codex_mesh.CapacityRetriesExhausted)
         self.assertEqual(self.waits, [30.0, 30.0, 60.0, 120.0, 240.0, 300.0, 300.0, 150.0])
@@ -9999,7 +10072,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         """Retry exhaustion is control state, not failure text."""
         self.outcomes = ["capacity"] * 20
         port = self.server.port
-        outcome = codex_mesh._run_worker(self.start_args(), port)  # pyright: ignore[reportPrivateUsage]
+        outcome = codex_mesh._run_worker(self.start_args(), port, staff_admission=worker_admission.admit("worker", self.session_dir, role="impl"))  # pyright: ignore[reportPrivateUsage]
         assert isinstance(outcome, codex_mesh.CapacityRetriesExhausted)
         self.assertEqual(outcome.thread_id, THREAD_ID)
         self.assertEqual(outcome.retries, len(self.waits))
@@ -10303,7 +10376,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
             deliver(name, index, answer, failure, summary, replies, log)
             _ = (self.session_dir / "worker.end").write_text("end")
         with patch.object(codex_mesh, "_deliver_reply", side_effect=reply) as sent, contextlib.redirect_stdout(io.StringIO()):
-            outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port, staff_admission=worker_admission.admit(cast(str, args.name), self.session_dir, role=cast(str, args.role)))  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         sent.assert_called_once()
         self.assertEqual(self.worker_record()["status"], "done")
@@ -10327,7 +10400,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     _ = (self.session_dir / "worker.end").write_text("end")
             return frame
         with patch.object(codex_mesh.Client, "next_frame", poll), patch.object(codex_mesh, "_move_resident", wraps=codex_mesh._move_resident) as move, contextlib.redirect_stdout(io.StringIO()):  # pyright: ignore[reportPrivateUsage]
-            outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port, staff_admission=worker_admission.admit(cast(str, args.name), self.session_dir, role=cast(str, args.role)))  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         self.assertEqual(empty[0], 3)
         self.assertEqual(move.call_count, 2)
@@ -10423,7 +10496,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
               patch.object(codex_mesh, "_deliver_reply", reply),
               patch.object(codex_mesh, "_stop_unused", return_value=False),
               contextlib.redirect_stdout(io.StringIO())):
-            outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port, staff_admission=worker_admission.admit(cast(str, args.name), self.session_dir, role=cast(str, args.role)))  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         self.assertEqual(resumes, [new.port, new.port])
         self.assertGreater(resume_ticks[1], resume_ticks[0])
@@ -10828,7 +10901,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
             return result
 
         with patch.object(codex_mesh, "_move_resident", side_effect=retry), patch.object(codex_mesh, "_deliver_reply", wraps=delivered) as replies, contextlib.redirect_stdout(io.StringIO()):
-            outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+            outcome = codex_mesh._run_worker(args, self.server.port, staff_admission=worker_admission.admit(cast(str, args.name), self.session_dir, role=cast(str, args.role)))  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         replies.assert_called_once()
         self.assertEqual(attempts[0], 3)
@@ -17542,6 +17615,60 @@ class DevShellServerTests(unittest.TestCase):
         self.launch.assert_called_once()
         log = (self.session_dir / codex_mesh.SERVER_LOG).read_text()
         self.assertEqual(log.count(reason), 1)
+
+
+class LegacyRosterTests(unittest.TestCase):
+    """Resolve old roster entries through the run's unit and worker name."""
+
+    session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    owner: staff.StaffRow  # pyright: ignore[reportUninitializedInstanceVariable]
+    worker: staff.StaffRow  # pyright: ignore[reportUninitializedInstanceVariable]
+    entry: dict[str, object]  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        private_worker_staff(self)
+        self.session_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.owner = unit_membership("legacy-production", "legacy-unit")
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
+            "production": "legacy-production", "unit": self.owner.name,
+        }))
+        self.worker = fixture_worker("legacy-worker", self.owner.id,
+                                     backend=staff.CodexBackend(self.session_dir))
+        self.entry = {
+            "access_policy": {"kind": "WorkerLaunchPolicy"}, "context_tokens": 42,
+            "continuation_owed": False, "effort": "high", "model": "gpt-6",
+            "revision": 3, "status": "done", "task": "Repair the roster.",
+            "thread_id": fixture_runtime_id("obsolete-thread"), "turn_effort": "high",
+            "turn_model": "gpt-6", "unit_ledger": "ledger.json",
+        }
+
+    def write_roster(self, entries: dict[str, object]) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(entries))
+
+    def test_follow_and_write_upgrade_the_worker_reference(self) -> None:
+        self.write_roster({self.worker.name: self.entry})
+        state = codex_mesh._lookup_state(str(self.session_dir), self.worker.name)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(state, codex_mesh.FollowableThread(self.worker.current_session, "done"))
+        direct = unit_workers._read_roster(self.session_dir)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(cast(dict[str, object], direct[self.worker.name])["staff_id"], self.worker.id)
+        self.assertTrue(codex_mesh._update_roster(str(self.session_dir), self.worker.name, {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": self.worker.current_session, "status": "done",
+        }))
+        stored = cast(dict[str, dict[str, object]], json.loads((self.session_dir / codex_mesh.ROSTER_FILE).read_text()))
+        self.assertEqual(stored[self.worker.name]["staff_id"], self.worker.id)
+        self.assertNotIn("thread_id", stored[self.worker.name])
+
+    def test_an_unmatched_worker_keeps_the_missing_thread_result(self) -> None:
+        other = unit_membership("legacy-production", "other-unit")
+        _ = fixture_worker("unmatched-worker", other.id, backend=staff.CodexBackend(self.session_dir))
+        self.write_roster({self.worker.name: self.entry, "unmatched-worker": dict(self.entry)})
+        state = codex_mesh._lookup_state(str(self.session_dir), "unmatched-worker")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(state, codex_mesh.InvalidThread("missing thread id"))
+        with worker_lifecycle.locked_state(self.session_dir / codex_mesh.ROSTER_FILE) as handle:
+            records = codex_mesh._load_roster_for_write(handle)  # pyright: ignore[reportPrivateUsage]
+            self.assertNotIn("staff_id", cast(dict[str, object], records["unmatched-worker"]))
+            self.assertEqual(cast(dict[str, object], records[self.worker.name])["staff_id"], self.worker.id)
 
 
 class ServerRecordTests(unittest.TestCase):

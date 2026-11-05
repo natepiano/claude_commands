@@ -1385,7 +1385,9 @@ class ServiceTests(unittest.TestCase):
             fixture.scoped_peak(grant, 9 * GIB)
             history = fixture.state_dir / "anon_peaks.jsonl"
             store.append_line(history, {"reservation_id": "earlier"})
-            with mock.patch.object(store, "whole_rows", side_effect=AssertionError("normal release scanned history")):
+            scanned = AssertionError("normal release scanned history")
+            with (mock.patch.object(store, "whole_rows", side_effect=scanned),
+                  mock.patch.object(store, "locked_rows", side_effect=scanned)):
                 self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("end", grant.reservation, 0)), [wire.Ok()])
             rows = fixture.history()
             self.assertEqual([row["reservation_id"] for row in rows], ["earlier", grant.reservation])

@@ -154,6 +154,19 @@ The runner uses `rsync -rlp --safe-links` and publishes the completed copy throu
 Files return to `~/.local/state/mac-test/fetched/<call id>/<folder>`. Existing destinations are refused. A failure or signal removes the partial copy.
 A fetch result adds `fetch=fetched|missing|too_large|failed|not_run` to the result file.
 
+After a Linux run reports completion, natedev releases the slot claim before it calls `buildlog.sync.sync_target(target)`.
+The exchange selects one configured peer and preserves the host paths from `sync.hosts.<target>`.
+AWS rows arrive under `~/.local/state/buildlog/aws-build/` on natedev.
+The Linux runner uses `BUILDLOG_SYNC=1` to finish the local recorder write before it reports completion.
+This setting controls the recorder write; the box starts no connection.
+
+The exchange uses the existing sync lock without waiting for another exchange.
+A paused sync or a target without a host mapping causes no exchange.
+The exchange uses `sync.connect_timeout_s`, `sync.reach_timeout_s`, and `sync.rsync_timeout_s` from `config/build_targets.conf`.
+A failed exchange prints one line and leaves the hourly sync to retry.
+The run keeps its result and its measured duration before the exchange.
+The Mac keeps its existing hourly sync path.
+
 Tool parity uses one form for the sender, the probe, execution, and refusal messages.
 The normalizer strips each version line and joins nonempty lines with one space.
 This includes all lines from `cargo nextest --version`.

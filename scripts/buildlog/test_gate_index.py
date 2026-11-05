@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing
 import json
 import os
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -15,7 +16,7 @@ from unittest import mock
 
 import index
 from index import GATE_TABLES
-from test_index import Record, point_root_at, rows, table_rows, use_test_log
+from test_index import Record, configure_cleanup, encode, point_root_at, rows, table_rows, use_test_log
 
 use_test_log()
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -24,12 +25,12 @@ if TYPE_CHECKING:
     from . import record, store
     from ..test_times import gate_record
     from ..test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
-    from ..test_times.gate_record_test_support import gate_run
+    from ..test_times.gate_record_test_support import gate_run, remove_run_measurements
 else:
     from scripts.buildlog import record, store
     from scripts.test_times import gate_record
     from scripts.test_times.gate_record import TYPE_CHECK_JOB, GateRun, ModuleRun
-    from scripts.test_times.gate_record_test_support import gate_run
+    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
 
 EPOCH = 1_793_700_000.0
 STARTED = "2026-11-03T12:00:00.000Z"
@@ -62,7 +63,7 @@ def fixture_run() -> GateRun:
     }
     types: ModuleRun = {
         **missing, "suite": TYPE_CHECK_JOB[0], "module": TYPE_CHECK_JOB[1], "status": 0,
-        "times_missing": "", "tests_run": 999,
+        "times_missing": "", "tests_run": 0,
     }
     return {
         **gate_run(), "ended_at": "2026-11-03T12:00:10.000Z",
@@ -71,7 +72,6 @@ def fixture_run() -> GateRun:
         "suites": [{"suite": "scripts", "wall_s": 6.0, "status": 137},
                    {"suite": "tools", "wall_s": 3.0, "status": 1},
                    {"suite": TYPE_CHECK_JOB[0], "wall_s": 1.0, "status": 0}],
-        # The last attempt comes first to expose order-dependent totals.
         "modules": [final_attempt, held_attempt, other_suite, missing, types],
     }
 
@@ -87,6 +87,7 @@ class GateIndexTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
         point_root_at(self, self.root)
+        _ = configure_cleanup(self, self.root)
 
     def write_run(self, identifier: str, run: GateRun, host: str = "fixture-host") -> str:
         with mock.patch.object(record, "new_id", return_value=identifier), \
@@ -100,7 +101,20 @@ class GateIndexTests(unittest.TestCase):
     def snapshot(self) -> dict[str, list[Record]]:
         return {table: table_rows(table) for table in GATE_TABLES}
 
-    def test_gate_rows_preserve_fields_attempts_and_last_attempt_totals(self) -> None:
+    def test_missing_gate_tables_recover_all_recorded_attempts(self) -> None:
+        source = self.write_run("recovered", fixture_run())
+        self.assertEqual(index.update(), 1)
+        before = self.snapshot()
+        original = (self.root / source).read_bytes()
+        table = GATE_TABLES[0]
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute(f"DROP TABLE {table}")
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(index.update(), 0)
+        self.assertEqual((self.root / source).read_bytes(), original)
+
+    def test_gate_rows_preserve_fields_attempts_and_recorded_attempt_totals(self) -> None:
         run = fixture_run()
         source = self.write_run("gate-one", run)
         self.assertEqual(index.update(), 1)
@@ -108,7 +122,7 @@ class GateIndexTests(unittest.TestCase):
         expected_run: Record = {
             **{key: value for key, value in run.items() if key not in {"suites", "modules"}},
             **common, "id": "gate-one", "aborted": 1, "dirty": 1,
-            "modules_run": 3, "tests_run": 11,
+            "modules_run": 3, "tests_run": 111,
         }
         self.assertEqual(table_rows("gate_runs"), [expected_run])
         child: Record = {**common, "run_id": "gate-one"}
@@ -134,6 +148,19 @@ class GateIndexTests(unittest.TestCase):
                              "An unchanged update must not write the database")
         self.assertEqual(self.snapshot(), before)
 
+    def test_gate_index_reads_absent_run_fields_as_null_without_deriving_them(self) -> None:
+        source = self.write_run("legacy", fixture_run())
+        path = self.root / source
+        entry = next(store.locked_rows(path))
+        remove_run_measurements(entry)
+        _ = path.write_bytes(encode(entry))
+        original = path.read_bytes()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(rows("SELECT slow_test_s, tests_run, modules_run FROM gate_runs"), [(None, None, 3)])
+        self.assertEqual(rows("SELECT tests_run FROM gate_modules WHERE suite = ? AND attempt = ?"
+                              + " AND module = ?", "scripts", 2, "test_shared.py"), [(7,)])
+        self.assertEqual(path.read_bytes(), original)
+
     def test_reused_run_has_zero_counts_and_no_child_rows(self) -> None:
         run = fixture_run()
         run.update({"selection": "reused", "aborted": False, "dirty": False, "suites": [], "modules": []})
@@ -148,7 +175,7 @@ class GateIndexTests(unittest.TestCase):
         removed = self.write_run("remove", fixture_run(), host="first-host")
         kept = self.write_run("keep", fixture_run(), host="second-host")
         self.assertEqual(index.update(), 2)
-        with closing(index.open_for_update()) as connection:
+        with closing(index.open_for_update(index.index_path())) as connection:
             index.forget(connection, removed)
         for table in GATE_TABLES:
             with self.subTest(table=table):

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
@@ -21,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import design_roles
 from scripts.direct import workers
 from scripts.astra.design_role_test_support import designer_fixture
-from scripts.production import staff, unit_config
+from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
 import fake_herdr
@@ -29,6 +30,7 @@ import herdr
 from scripts.shutdown import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
+import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 import merge_checkpoint
 from scripts.production.production_doc import Production, read_production
@@ -39,7 +41,7 @@ import tidy_wrapped
 import unit_move
 import unit_names
 import unit_lookup
-from cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
@@ -102,7 +104,8 @@ class RenameDisplays:
               mock.patch.object(herdr.Herdr, "result", side_effect=self.result),
               mock.patch.object(herdr, "run_program", side_effect=self.native_result),
               mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-                  self.row.current_session, "probe-generation", {})),
+                  herdr.RolloutThread(self.row.current_session) if self.backend == "codex" else
+                  herdr.EnvironmentThread(self.row.current_session), "probe-generation", {})),
               mock.patch.object(herdr, "_LayoutLock"),
               mock.patch.object(herdr.Herdr, "order_tabs", return_value=False),
               mock.patch.object(herdr.Herdr, "save_layout")):
@@ -126,11 +129,21 @@ class FolderMoveBackend:
         self.config: Path = fixture.root / "home" / (".claude4" if kind == "claude" else ".codex2")
 
     def publish_process_state(self) -> None:
-        """Expose the private process and an empty rollout descriptor directory."""
-        process = self.fixture.root / "folder-processes" / str(self.pid)
-        (process / "fd").mkdir(parents=True, exist_ok=True)
+        """Expose the process generation and its current Codex rollout."""
+        environment = {"HERDR_PROC": str(self.fixture.root / "folder-processes")}
+        fake_unit_host.process(environment, self.shell_pid, 1, ["zsh"], {}, cwd=self.cwd)
         arguments = [self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]
-        _ = (process / "cmdline").write_bytes("\0".join(arguments).encode() + b"\0" if self.live else b"")
+        fake_unit_host.process(environment, self.pid, self.shell_pid if self.live else 1, arguments if self.live else [],
+                               self.environment(self.pid), cwd=self.cwd)
+        process = Path(environment["HERDR_PROC"]) / str(self.pid)
+        descriptors = process / "fd"
+        descriptors.mkdir(exist_ok=True)
+        descriptor = descriptors / "4"
+        descriptor.unlink(missing_ok=True)
+        if self.live and self.kind == "codex":
+            record = self.fixture.root / "rollout-folder-current.jsonl"
+            _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.fixture.owner.current_session}}) + "\n")
+            descriptor.symlink_to(record)
 
     def panes(self) -> list[herdr.PaneIdentity]:
         return [
@@ -157,20 +170,47 @@ class FolderMoveBackend:
 
     def result(self, *arguments: str) -> dict[str, object]:
         self.fixture.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
-        argv = [self.kind] if self.live else [sys.executable, "/fixture/accounts.py", "exec", self.config.name]
-        foreground: list[dict[str, object]] = [{"pid": self.pid, "argv": argv, "cwd": str(self.cwd)}]
+        argv = ([self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]) if self.live else ["zsh"]
+        foreground: list[dict[str, object]] = [{"pid": self.pid if self.live else self.shell_pid, "argv": argv, "cwd": str(self.cwd)}]
         return {"process_info": {"shell_pid": self.shell_pid, "cwd": str(self.cwd),
+                                 "foreground_process_group_id": self.pid if self.live else self.shell_pid,
                                  "foreground_processes": foreground}}
 
-    def run_in_pane(self, pane: str, command: list[str]) -> None:
+    def saved_row_tab(self, row_id: str, title: str) -> herdr.ExistingPane:
+        self.fixture.assertEqual((row_id, title), (str(self.fixture.owner.id), self.fixture.owner.name))
+        return herdr.ExistingPane("w1:p1", "kept-terminal")
+
+    def remember_row_tab(self, row_id: str, pane: str) -> None:
+        self.fixture.assertEqual((row_id, pane), (str(self.fixture.owner.id), "w1:p1"))
+
+    def focus_tab_of(self, pane: str) -> None:
         self.fixture.assertEqual(pane, "w1:p1")
+
+    def run_in_pane(self, pane: str, command: list[str], *, terminal: str = "") -> None:
+        self.fixture.assertEqual((pane, terminal), ("w1:p1", "kept-terminal"))
         self.fixture.assertFalse(self.live, "a live session must not start again")
         self.fixture.assertEqual(self.agents(), [])
-        self.cwd = Path(command[command.index("sh") + 4])
+        self.fixture.assertEqual(command[0], "eval")
+        words = shlex.split(command[1])
+        self.cwd = Path(words[words.index("cd") + 2])
         self.fixture.assertTrue(self.cwd.is_dir())
-        self.starts.append((pane, command.copy()))
+
+    def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
+                    timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
+        self.fixture.assertFalse(self.live, "a live session must not start again")
+        self.fixture.assertEqual((name, pane, kind), (self.fixture.owner.name, "w1:p1", self.kind))
+        self.fixture.assertIn(self.fixture.owner.current_session, agent_arguments)
+        self.fixture.assertIsInstance(opening, herdr.NoOpeningPrompt)
+        self.fixture.assertGreater(timeout_ms, 0)
+        self.starts.append((pane, agent_arguments.copy()))
+        entry = pane_record.launch(pane, self.fixture.owner.current_session, str(self.cwd),
+            self.environment(self.pid), [kind, *agent_arguments], kind=self.kind)
+        entry["name"] = name
+        pane_record.write(self.session, entry)
         self.live = True
         self.publish_process_state()
+        return herdr.PromptSubmissionNotRequired()
 
     def close_tab_confirmed(self, pane: str) -> None:
         raise AssertionError(f"a folder resume must keep its pane: {pane}")
@@ -257,7 +297,7 @@ class FolderMoveFixture(StaffTestCase):
         backend = FolderMoveBackend(self, kind, live)
         backend.publish_process_state()
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(
-            os.environ, {"HERDR_PROC": str(self.root / "folder-processes")})))
+            os.environ, {"HERDR_PROC": str(self.root / "folder-processes"), "SHUTDOWN_PROOF_WORKSPACE": "w1"})))
         account_key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
         launch = pane_record.launch("w1:p1", self.owner.id, str(self.old_folder),
             {account_key: str(backend.config)}, [kind, "-n", "kept-name", "--model", "opus"], kind=kind)
@@ -273,6 +313,11 @@ class FolderMoveFixture(StaffTestCase):
             self.assertEqual((pid, started), (backend.pid, "fixture-start"))
             return sessions.LiveSessionProcess(pid) if backend.live else sessions.SessionNotLive()
 
+        def stop_process_liveness(pid: int, started: str) -> stop_sessions.LiveSessionProcess | stop_sessions.SessionNotLive:
+            self.assertEqual((pid, started), (backend.pid, "fixture-start"))
+            return (stop_sessions.LiveSessionProcess(pid) if backend.live
+                    else stop_sessions.SessionNotLive())
+
         def signal_process(pid: int, signal: int) -> None:
             import signal as signals
 
@@ -285,11 +330,15 @@ class FolderMoveFixture(StaffTestCase):
 
         for target, attribute, replacement in (
             (herdr, "Herdr", mock.Mock(return_value=backend)),
+            (herdr, "shared_session", mock.Mock(return_value="agents")),
+            (pane_record, "seed", mock.Mock(return_value=0)),
             (herdr, "herdr_processes", backend.observed_processes),
             (herdr, "process_environment", backend.environment),
             (sessions, "session_liveness", session_liveness),
             (sessions, "process_liveness", process_liveness),
             (sessions, "process_start", mock.Mock(return_value="fixture-start")),
+            (stop_sessions, "process_liveness", stop_process_liveness),
+            (stop_sessions, "process_start", mock.Mock(return_value="fixture-start")),
             (staff, "runtime_id", mock.Mock(return_value=self.owner.current_session)),
             (os, "kill", signal_process),
         ):
@@ -440,7 +489,7 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
         _ = scope.enter_context(mock.patch.object(subprocess, "run", side_effect=run))
-        _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback)))
+        _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback, monotonic=time.monotonic)))
         # Failure injection scripts assign these names just as they do in a CLI
         # subprocess. Each call restores them before another test can observe it.
         for module, names in ((os, ("rename", "replace")),
@@ -699,7 +748,7 @@ class ProductionRenameFixture(StaffTestCase):
 
     def run_rename(self, action: str, destination: str = NEW, *, fail_state: bool = False,
                    source: str = OLD) -> subprocess.CompletedProcess[str]:
-        if self._testMethodName == "test_apply_moves_state_and_commits_documents_on_the_new_merge_branch":
+        if process_boundary_for_case(self):
             return subprocess.run([sys.executable, str(SCRIPT), action, source, destination],
                                   cwd=self.checkout, env=self.env, capture_output=True,
                                   text=True, check=False, timeout=TEST_HANG_GUARD_SECS)

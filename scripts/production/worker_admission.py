@@ -1,9 +1,10 @@
 """Check launch permission, then publish the backend runtime identity."""
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Callable
+from contextlib import contextmanager, ExitStack, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 import io
 import hashlib
 import ast
@@ -73,24 +74,47 @@ class WorkerStartAllowed:
 
 
 @dataclass(frozen=True)
+class SourceReleased:
+    """Every applicable source server released the native session."""
+
+
+@dataclass(frozen=True)
+class SourceUnresolved:
+    reason: str
+
+
+@dataclass(frozen=True)
+class SourceReleaseUnknown:
+    reason: str
+
+
+SourceRelease = SourceReleased | SourceUnresolved | SourceReleaseUnknown
+
+
+class SwitchState(StrEnum):
+    BACKEND_PUBLISHED = "prepared"
+    DISPATCH_DEFERRED = "sending"
+    ASSIGNMENT_ACCEPTED = "accepted"
+
+
+@dataclass(frozen=True)
+class DispatchRecord:
+    assignment_id: str
+    state: SwitchState
+
+
+@dataclass(frozen=True)
 class PublishedWorker:
     """The backend's native identity and membership are durably published."""
 
     row: staff.StaffRow
     handoff: FamilyHandoff = field(default_factory=NoFamilyHandoff)
-
-
-def showrunner_member(record: staff.StaffSnapshot, sources: session_staff.MemberSources,
-                      slug: str
-                      ) -> session_staff.MemberFound | session_staff.NoSuchMember:
-    """Find the showrunner in staff."""
-    selector = session_staff.ShowrunnerMember(slug)
-    return sources.member(selector, record)
+    state: SwitchState = SwitchState.BACKEND_PUBLISHED
 
 
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
-           run: Path | None = None) -> staff.StaffRow:
+           run: Path | None = None, roster: Mapping[str, object] | None = None) -> staff.StaffRow:
     """Resolve the run unit before using the caller or worker parents."""
     if run is not None:
         try:
@@ -110,7 +134,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             if isinstance(found, session_staff.MemberFound):
                 return found.row
     if run is not None:
-        entries = session_staff.read_worker_roster(run / "mesh_roster.json")
+        entries = roster if roster is not None else session_staff.read_worker_roster(run / "mesh_roster.json")
         for raw in entries.values():
             if not isinstance(raw, dict):
                 continue
@@ -124,7 +148,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
     if row is not None and row.kind in ("unit", "showrunner"):
         return row
     sources = sources if sources is not None else session_staff.member_sources()
-    found = showrunner_member(record, sources, production)
+    found = sources.member(session_staff.ShowrunnerMember(production), record)
     if isinstance(found, session_staff.NoSuchMember):
         raise ValueError(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
     return found.row
@@ -133,6 +157,24 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:
     """Find the named worker under its staff parent."""
     return next((row for row in record.find(kind="worker", parent=owner) if row.name == name), None)
+
+
+def resolve_roster(run: Path, entries: dict[str, object]) -> dict[str, object]:
+    """Add staff references to old entries through the run's unit and worker name."""
+    missing = [(name, cast(dict[str, object], raw)) for name, raw in entries.items()
+               if isinstance(raw, dict) and "staff_id" not in raw]
+    if not missing:
+        return entries
+    record = staff.local_snapshot()
+    try:
+        owner = parent(record, staff_id=staff.runtime_id(), run=run, roster=entries)
+    except ValueError:
+        return entries
+    for name, entry in missing:
+        row = find_worker(record, owner.id, name)
+        if row is not None:
+            entry["staff_id"] = row.id
+    return entries
 
 
 def admit(name: str, run: Path, *, role: str, production: str = "", unit: str = "", reference: str = "") -> WorkerStartAllowed:
@@ -261,12 +303,17 @@ def assignment_id(prompt: Path) -> str:
     return hashlib.sha256(str(prompt.resolve()).encode() + str(prompt.stat().st_mtime_ns).encode() + prompt.read_bytes()).hexdigest()
 
 
-def dispatch_record(allowed: WorkerStartAllowed) -> dict[str, object]:
+def dispatch_record(allowed: WorkerStartAllowed) -> DispatchRecord:
     entry = session_staff.read_worker_roster(allowed.run / "mesh_roster.json").get(allowed.name)
-    return cast(dict[str, object], entry) if isinstance(entry, dict) else {}
+    fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
+    try:
+        return DispatchRecord(str(fields.get("assignment_id", "")),
+                              SwitchState(fields.get("dispatch_state", "prepared")))
+    except ValueError as error:
+        raise AdmissionRefused(f"{allowed.name}: invalid dispatch state") from error
 
 
-def record_dispatch(allowed: WorkerStartAllowed, request: str, state: str) -> None:
+def record_dispatch(allowed: WorkerStartAllowed, request: str, state: SwitchState) -> None:
     with worker_lifecycle.locked_state(allowed.run / "mesh_roster.json") as handle:
         entries = handle.read_object()
         previous = entries.get(allowed.name, {})
@@ -278,33 +325,66 @@ def record_dispatch(allowed: WorkerStartAllowed, request: str, state: str) -> No
         session_staff.publish_worker_roster(handle, entries)
 
 
-def switch_worker(allowed: WorkerStartAllowed, family: str, *,
-                  start: Callable[[FamilyHandoff], str],
-                  dispatch: Callable[[PublishedWorker], bool | None],
-                  cleanup: Callable[[str], None], request: str = "") -> PublishedWorker:
-    """Hold the row through publication and dispatch acceptance, then release it."""
+def release_source(row: staff.StaffRow, runs: Callable[[], tuple[Path, ...]], record: staff.StaffSnapshot) -> SourceRelease:
+    """Resolve native stop evidence before creating the destination."""
     stop = cast(Callable[[str], Stopped | NotRunning | StopFailed | SessionNotFound],
                 import_module("scripts.shutdown.stop_resume").stop)
-    with staff.row_operation(allowed.lock_reference):
+    result = stop(row.id)
+    if isinstance(result, SessionNotFound):
+        return SourceUnresolved(f"{row.id}: lifecycle could not resolve the staff reference")
+    if isinstance(result, StopFailed):
+        return SourceReleaseUnknown(result.reason)
+    if isinstance(result, NotRunning) and isinstance(record.backends.get(row.id), staff.CodexBackend):
+        stop_mesh = cast(Callable[[staff.StaffRow, tuple[Path, ...]], SourceRelease],
+                         import_module("scripts.agents.codex_mesh").stop_worker_for_switch)
+        return stop_mesh(row, runs())
+    return SourceReleased()
+
+
+@contextmanager
+def worker_operation(allowed: WorkerStartAllowed) -> Generator[None]:
+    """Lock the existing row or the new slot before checking membership."""
+    try:
+        with ExitStack() as locks:
+            if isinstance(allowed.slot, NewWorkerSlot):
+                key = hashlib.sha256(f"{allowed.parent}:{allowed.name}".encode()).hexdigest()
+                _ = locks.enter_context(staff.slot_operation(key, allowed.name))
+                row = find_worker(staff.local_snapshot(), allowed.parent, allowed.name)
+            else:
+                row = allowed.slot.row
+            if row is not None:
+                _ = locks.enter_context(staff.row_operation(row.id))
+            yield
+    except staff.StaffRefused as error:
+        raise AdmissionRefused(str(error)) from error
+
+
+def switch_worker(allowed: WorkerStartAllowed, family: str, *,
+                  start: Callable[[FamilyHandoff], str],
+                  dispatch: Callable[[PublishedWorker], SwitchState] | SwitchState | None,
+                  cleanup: Callable[[str], None], request: str = "") -> PublishedWorker:
+    """Hold the row through publication and dispatch acceptance, then release it."""
+    with worker_operation(allowed):
         handoff: FamilyHandoff = NoFamilyHandoff()
         row = allowed.slot.row if isinstance(allowed.slot, ExistingWorkerSlot) else None
         record = staff.local_snapshot()
-        row = record.by_id(row.id) if row is not None else None
+        row = record.by_id(row.id) if row is not None else find_worker(record, allowed.parent, allowed.name)
+        if row is not None:
+            allowed = WorkerStartAllowed(row.name, allowed.parent, allowed.run, ExistingWorkerSlot(row))
         if isinstance(allowed.slot, ExistingWorkerSlot) and row is None:
             raise AdmissionRefused(f"{allowed.slot.row.id}: source staff row is missing")
         backend = record.backends.get(row.id) if row is not None else None
-        same = (family == "claude" and isinstance(backend, staff.ClaudeBackend)
-                or family == "codex" and isinstance(backend, staff.CodexBackend))
+        same = row is not None and session_staff.worker_family(record, row.id) == family
         prior = dispatch_record(allowed)
-        request = request or (hashlib.sha256(f"{allowed.slot.row.id}:{allowed.slot.row.current_session}:{family}".encode()).hexdigest()
+        request = request or (hashlib.sha256(f"{allowed.slot.row.id}:{family}".encode()).hexdigest()
                               if isinstance(allowed.slot, ExistingWorkerSlot) else "")
-        retry = bool(request and prior.get("assignment_id") == request)
+        retry = bool(request and prior.assignment_id == request)
         if same and retry:
             assert row is not None
             published = PublishedWorker(row)
-            if prior.get("dispatch_state") == "accepted":
+            if prior.state is SwitchState.ASSIGNMENT_ACCEPTED:
                 print("unchanged")
-                return published
+                return PublishedWorker(row, state=prior.state)
             extract = allowed.run / f"{row.id}.handoff.md"
             try:
                 with extract.open(encoding="utf-8") as saved:
@@ -313,39 +393,30 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
             except OSError as error:
                 print(f"anomaly: {row.name}: transcript extract: {error}".replace("\n", " "), file=sys.stderr)
                 published = PublishedWorker(row, TranscriptUnavailable(str(error)))
-            if dispatch(published) is not False:
-                record_dispatch(allowed, request, "accepted")
-            return published
-        if row is not None and not same:
-            allowed = WorkerStartAllowed(row.name, allowed.parent, allowed.run, ExistingWorkerSlot(row))
-            handoff = extract_transcript(row, allowed.run, backend) if backend is not None else TranscriptUnavailable("backend unavailable")
-            if backend is None:
-                print(f"anomaly: {row.name}: transcript extract: backend unavailable", file=sys.stderr)
-            stopped = stop(row.id)
-            if isinstance(stopped, SessionNotFound):
-                resolved = staff.initial_snapshot().by_member_reference(row.id)
-                reason = "source reference is unresolved" if resolved is None else "lifecycle could not resolve the staff reference"
-                raise AdmissionRefused(f"{row.id}: {reason}")
-            if isinstance(stopped, StopFailed):
-                print(f"anomaly: {row.name}: {stopped.reason}", file=sys.stderr)
-                raise AdmissionRefused(stopped.reason)
-            if isinstance(stopped, NotRunning) and isinstance(backend, staff.CodexBackend):
-                stop_mesh = cast(Callable[[staff.StaffRow, tuple[Path, ...]], None],
-                                 import_module("scripts.agents.codex_mesh").stop_worker_for_switch)
-                stop_mesh(row, (allowed.run, *session_staff.worker_run_index(record).get(row.id, ())))
-            record_dispatch(allowed, request, "prepared")
-            retry = True
-        identity = start(handoff)
-        try:
-            published = publish(allowed, identity)
-        except BaseException:
-            cleanup(identity)
-            raise
-        published = PublishedWorker(published.row, handoff)
-        accepted = dispatch(published)
-        if request and retry and accepted is not False:
-            record_dispatch(allowed, request, "accepted")
-        return published
+        else:
+            if row is not None and not same:
+                allowed = WorkerStartAllowed(row.name, allowed.parent, allowed.run, ExistingWorkerSlot(row))
+                handoff = extract_transcript(row, allowed.run, backend) if backend is not None else TranscriptUnavailable("backend unavailable")
+                if backend is None:
+                    print(f"anomaly: {row.name}: transcript extract: backend unavailable", file=sys.stderr)
+                released = release_source(row, lambda: (allowed.run, *session_staff.worker_run_index(record).get(allowed.lock_reference, ())), record)
+                if not isinstance(released, SourceReleased):
+                    raise AdmissionRefused(released.reason)
+                retry = True
+            if request and retry and prior.assignment_id != request:
+                record_dispatch(allowed, request, SwitchState.BACKEND_PUBLISHED)
+                prior = DispatchRecord(request, SwitchState.BACKEND_PUBLISHED)
+            identity = start(handoff)
+            try:
+                published = publish(allowed, identity)
+            except BaseException:
+                cleanup(identity)
+                raise
+            published = PublishedWorker(published.row, handoff)
+        state = prior.state if dispatch is None else dispatch(published) if callable(dispatch) else dispatch
+        if request and retry:
+            record_dispatch(allowed, request, state)
+        return PublishedWorker(published.row, published.handoff, state)
 
 
 def publish(allowed: WorkerStartAllowed, runtime_id: str) -> PublishedWorker:

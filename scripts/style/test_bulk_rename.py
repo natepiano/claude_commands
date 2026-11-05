@@ -4,6 +4,8 @@ Real LSP and compiler tests use BULK_RENAME_REAL_TOOLS=1; the merge gate never s
 """
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import json
 import os
 import shutil
@@ -27,7 +29,7 @@ from approved_renames import OuterBindingBlocked, OuterBindingUnproved
 import berth_board
 import rules
 import style_ledger
-from ledger_test_support import remove_generation_schema
+from ledger_test_support import remove_generation_schema, style_staff_fixture
 import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -107,6 +109,7 @@ class CargoProjectTests(unittest.TestCase):
         _ = self.git("config", "user.email", "bulk@example.invalid")
         _ = self.git("add", ".")
         _ = self.git("commit", "-qm", "fixture")
+        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
 
     def set_up_tools(self) -> None:
         tools = rust_tool_path(self.root / "tools")
@@ -157,19 +160,19 @@ class CargoProjectTests(unittest.TestCase):
         source = (self.repo / "src/lib.rs").read_text()
         issue = self.root / "decision.md"
         _ = issue.write_text("Approved names")
-        ledger.ticket_add("judging-1", "judging", "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
-        ledger.ticket_assign("judging-1", "main")
-        _ = ledger.ticket_base("judging-1")
+        ledger.ticket_add("15001", ticket_owner_id("judging"), "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
+        ledger.ticket_assign("15001", "main")
+        _ = ledger.ticket_base("15001")
         ids: list[str] = []
         for line, old, new in ((2, "old", "number"), (3, "missing", "replacement")):
             held = ledger.hold(definition.rule_id, "src/lib.rs", line, source.splitlines()[line - 1],
-                               "rename", old, new, definition.blob, "judging-1")
+                               "rename", old, new, definition.blob, "15001")
             ledger.file_held(held.finding_id, issue)
             ids.append(held.finding_id)
-        ledger.ticket_drop("judging-1")
-        ledger.ticket_add("names-1", "names", "proposal", "names", ".", ["src/lib.rs"], [definition.rule_id],
+        ledger.ticket_drop("15001")
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", ".", ["src/lib.rs"], [definition.rule_id],
                           proposal=str(issue), finding_ids=tuple(ids))
-        ledger.ticket_assign("names-1", "main")
+        ledger.ticket_assign("1", "main")
         return ids[0], ids[1]
 
 
@@ -1417,13 +1420,13 @@ class LedgerTests(CargoProjectTests):
               mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
               mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
             with mock.patch.object(style_ledger.Ledger, "bulk_release", stopped):
-                stop_process(lambda: bulk.run_batch(self.repo, "names-1"))
-            self.assertEqual([row.finding_id for row in ledger.bulk_refusals("names-1")], [refused])
+                stop_process(lambda: bulk.run_batch(self.repo, "1"))
+            self.assertEqual([row.finding_id for row in ledger.bulk_refusals("1")], [refused])
             with mock.patch("builtins.print") as output:
-                review = bulk.run_batch(self.repo, "names-1")
+                review = bulk.run_batch(self.repo, "1")
         payload = bulk.object_fields(cast(object, json.loads(review.read_text())))
         self.assertEqual(payload["kept"], [kept])
-        self.assertEqual(payload["refusals"], [dict(finding_id=refused, reason=ledger.bulk_refusals("names-1")[0].reason)])
+        self.assertEqual(payload["refusals"], [dict(finding_id=refused, reason=ledger.bulk_refusals("1")[0].reason)])
         output.assert_called_once_with(f"bulk rename: 1 kept, 1 refused, 0 macro edits; review {review}")
 
     def test_batch_reruns_after_process_loss_on_first_edit(self) -> None:
@@ -1434,9 +1437,9 @@ class LedgerTests(CargoProjectTests):
               mock.patch.object(shutil, "which", return_value="rust-analyzer"),
               mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
               mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
-            stop_after_edit(self.repo / "src/lib.rs", lambda: bulk.run_batch(self.repo, "names-1"))
+            stop_after_edit(self.repo / "src/lib.rs", lambda: bulk.run_batch(self.repo, "1"))
             self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
-            review = bulk.run_batch(self.repo, "names-1")
+            review = bulk.run_batch(self.repo, "1")
         payload = bulk.object_fields(cast(object, json.loads(review.read_text())))
         self.assertEqual(payload["kept"], [kept])
         self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
@@ -1444,23 +1447,23 @@ class LedgerTests(CargoProjectTests):
     def test_migration_and_per_finding_release_are_atomic_idempotent_and_leave_decisions_filed(self) -> None:
         ledger = self.ledger()
         kept, refused = self.ticket(ledger)
-        _ = ledger.bulk_release("names-1", {refused: "not located"})
-        self.assertEqual([finding.finding_id for finding in ledger.bulk_findings("names-1")], [kept])
+        _ = ledger.bulk_release("1", {refused: "not located"})
+        self.assertEqual([finding.finding_id for finding in ledger.bulk_findings("1")], [kept])
         finding, = ledger.named_held((refused,))
         self.assertIsInstance(finding.state, style_ledger.Filed)
         self.assertIsInstance(finding.build_ticket, style_ledger.NoBuildTicket)
-        rows = ledger.bulk_refusals("names-1")
-        self.assertEqual((rows[0].finding_id, rows[0].ticket, rows[0].reason), (refused, "names-1", "not located"))
+        rows = ledger.bulk_refusals("1")
+        self.assertEqual((rows[0].finding_id, rows[0].ticket, rows[0].reason), (refused, "1", "not located"))
         self.assertTrue(rows[0].at)
-        ticket_before = ledger.bulk_ticket("names-1")
-        self.assertEqual(ledger.bulk_release("names-1", {refused: "different"}), rows)
-        self.assertEqual(ledger.bulk_ticket("names-1"), ticket_before)
+        ticket_before = ledger.bulk_ticket("1")
+        self.assertEqual(ledger.bulk_release("1", {refused: "different"}), rows)
+        self.assertEqual(ledger.bulk_ticket("1"), ticket_before)
         with self.assertRaises(style_ledger.LedgerError):
-            _ = ledger.bulk_release("names-1", {kept: "would release", "unknown": "not owned"})
-        self.assertEqual([finding.finding_id for finding in ledger.bulk_findings("names-1")], [kept])
-        self.assertEqual(ledger.bulk_refusals("names-1"), rows)
-        _ = ledger.bulk_release("names-1", {kept: "all refused"})
-        self.assertEqual(ledger.bulk_findings("names-1"), ())
+            _ = ledger.bulk_release("1", {kept: "would release", "unknown": "not owned"})
+        self.assertEqual([finding.finding_id for finding in ledger.bulk_findings("1")], [kept])
+        self.assertEqual(ledger.bulk_refusals("1"), rows)
+        _ = ledger.bulk_release("1", {kept: "all refused"})
+        self.assertEqual(ledger.bulk_findings("1"), ())
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0],
                              max(style_ledger.MIGRATIONS))
@@ -1469,11 +1472,11 @@ class LedgerTests(CargoProjectTests):
         ledger = self.ledger()
         kept, _ = self.ticket(ledger)
         with self.assertRaises(style_ledger.LedgerError):
-            _ = ledger.bulk_release("names-1", {kept: " "})
-        ledger.ticket_drop("names-1")
+            _ = ledger.bulk_release("1", {kept: " "})
+        ledger.ticket_drop("1")
         with self.assertRaises(style_ledger.LedgerError):
-            _ = ledger.bulk_release("names-1", {kept: "stale"})
-        self.assertEqual(ledger.bulk_refusals("names-1"), ())
+            _ = ledger.bulk_release("1", {kept: "stale"})
+        self.assertEqual(ledger.bulk_refusals("1"), ())
 
     def test_batch_publishes_only_proven_verified_edits_and_writes_the_review_sample(self) -> None:
         ledger = self.ledger()
@@ -1483,13 +1486,13 @@ class LedgerTests(CargoProjectTests):
               mock.patch.object(shutil, "which", return_value="rust-analyzer"),
               mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
               mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command")):
-            review = bulk.run_batch(self.repo, "names-1")
+            review = bulk.run_batch(self.repo, "1")
         payload = cast(dict[str, object], json.loads(review.read_text()))
         self.assertEqual(payload["kept"], [kept])
         self.assertEqual(payload["macro_edits"], 0)
         self.assertEqual(len(cast(list[object], payload["sample"])), 1)
         self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
-        self.assertEqual([row.finding_id for row in ledger.bulk_refusals("names-1")], [refused])
+        self.assertEqual([row.finding_id for row in ledger.bulk_refusals("1")], [refused])
         self.assertIsInstance(ledger.named_held((kept,))[0].state, style_ledger.Filed)
 
     def test_failed_crate_releases_its_renames_and_restores_the_file(self) -> None:
@@ -1504,13 +1507,13 @@ class LedgerTests(CargoProjectTests):
               mock.patch.object(shutil, "which", return_value="rust-analyzer"),
               mock.patch.object(bulk, "verification_packages", return_value=("bulk_sample",)),
               mock.patch.object(bulk, "check_available"), mock.patch.object(bulk, "command", side_effect=verify)):
-            review = bulk.run_batch(self.repo, "names-1")
+            review = bulk.run_batch(self.repo, "1")
         payload = cast(dict[str, object], json.loads(review.read_text()))
         self.assertEqual(payload["kept"], [])
         self.assertEqual(payload["sample"], [])
         self.assertEqual((self.repo / "src/lib.rs").read_text(), source)
-        self.assertEqual({row.finding_id for row in ledger.bulk_refusals("names-1")}, {kept, refused})
-        self.assertEqual(ledger.bulk_findings("names-1"), ())
+        self.assertEqual({row.finding_id for row in ledger.bulk_refusals("1")}, {kept, refused})
+        self.assertEqual(ledger.bulk_findings("1"), ())
 
     def test_existing_database_gets_the_refusal_migration(self) -> None:
         ledger = self.ledger()
@@ -1522,7 +1525,7 @@ class LedgerTests(CargoProjectTests):
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
-            self.assertEqual(upgraded.bulk_refusals("names-1"), ())
+            self.assertEqual(upgraded.bulk_refusals("1"), ())
         # The refusal migration also accepts an existing refusal table.
         with closing(sqlite3.connect(ledger.database)) as connection:
             _ = connection.execute("DROP TABLE refill_results")
@@ -1531,13 +1534,13 @@ class LedgerTests(CargoProjectTests):
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as replayed:
-            self.assertEqual(replayed.bulk_refusals("names-1"), ())
+            self.assertEqual(replayed.bulk_refusals("1"), ())
 
     def test_dirty_batch_exits_before_starting_analyzer(self) -> None:
         _ = (self.repo / "src/lib.rs").write_text("dirty\n")
         with mock.patch.object(bulk, "RustAnalyzer") as analyzer:
             with self.assertRaisesRegex(bulk.BulkRenameError, "clean"):
-                _ = bulk.run_batch(self.repo, "names-1")
+                _ = bulk.run_batch(self.repo, "1")
             analyzer.assert_not_called()
 
 
