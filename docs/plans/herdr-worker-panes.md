@@ -2161,39 +2161,32 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
 
 ### Phase 9a — Delivery after an interrupted pane input  · status: done
 
-**Depends on:** Phase 9
+#### As-built
 
-#### Work Order
-
-**Goal:** a rerun of detached-run delivery has one simple rule: it types the result again when the transcript has no result line.
-
-**Spec:**
-
-1. Phase 9 types the result, then writes `pane_result_typed` into the run record under the delivery lock. A stop between the two leaves no mark; a rerun with no transcript line types again (Phase 9 review, F005 and F011). No order of the two writes gives exactly-once delivery over this interface (Astra, 2026-11-05).
-2. sdlc ruling (2026-11-05): "take (a), type it again. It adds no saved mark and no check. The window is a rare stop; a worker that sees one result twice loses nothing."
-3. Delete `pane_result_typed`, its write and its read. A rerun checks the transcript line only; with no line, it types the result again.
-4. Add no other mark, check or holder fallback.
-5. sdlc item (2026-11-05, 9b0650bd): messaging's fix b45d6c1bf gives a bare Codex daemon-client pane a pane record through `pane_record.codex_client_session`. `Herdr._codex_launch` reads that same answer when the pane has no agent session. It is the one source for such a pane: no second lookup.
-   `pane_record.py` imports `herdr.py`, so `herdr.py` must not import it: the gate's basedpyright reports an import cycle. Move the function to a `Herdr.codex_client_session(pane)` method and have `pane_record.seed` call the method.
+- `mesh_runs` delivery checks the transcript for the run's result line. With no line, a rerun types the result again and finishes the run. `pane_result_typed` is gone.
+- `Herdr.codex_client_session(pane)` reads the current thread from the staff row named by the client's tab. It is the one lookup for a bare Codex daemon-client pane.
+- `Herdr._codex_launch` reads that method when the pane has no agent session, and takes the process start and environment from the process. A pane with an agent session keeps the process-evidence path.
+- `pane_record.seed` calls the method, so `pane_record.py` no longer reads staff for this and `herdr.py` does not import it.
+- Source: +19/-25.
 
 **Files:**
 
-- `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py` — delete `pane_result_typed`.
-- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — the `Herdr.codex_client_session` method; `_codex_launch` reads it.
-- `scripts/shutdown/pane_record.py`, `scripts/shutdown/test_pane_record.py`, `scripts/notify/test_auto_silence.py` — `seed` calls the method; the old function goes.
-- `docs/as-built/staff-accessors.md` — `pane_record.py` no longer reads staff for this.
+- `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py` — the mark is gone; three delivery tests state the retype rule.
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — the method and `_codex_launch`; `test_bare_codex_launch_uses_the_tabs_current_staff_thread`.
+- `scripts/shutdown/pane_record.py`, `scripts/shutdown/test_pane_record.py` — `seed` calls the method.
+- `scripts/shutdown/test_pane_restore.py` — the Codex publication fixture answers the pane list.
+- `docs/as-built/herdr-restore.md`, `docs/as-built/staff-accessors.md` — state the current lookup and delivery rule.
 
-**Workers:** `2 writers` — one worker per item.
-- `impl` — `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py` (Spec 1-4).
-- `test` (opens as impl) — `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`, `scripts/shutdown/pane_record.py`, `scripts/shutdown/test_pane_record.py`, `scripts/notify/test_auto_silence.py`, `docs/as-built/staff-accessors.md` (Spec 5).
+**Binds later work:**
 
-**Acceptance gate:**
+- `Herdr.codex_launch` now reads `panes()`. A fixture that patches `result` must answer `pane list` as well as `pane process-info`.
+- A worker can see one result twice after a stop between the pane input and the transcript line. That is the sdlc ruling.
 
-Test: a rerun after a stop between the pane input and the record write types the result once more and finishes the run.
-Change `test_result_queued_during_a_turn_finishes_without_a_transcript_receipt` to the new rule; keep `test_delivery_rerun_after_type_types_nothing` (transcript line present).
-Test: `Herdr.codex_launch` on a bare Codex daemon-client pane returns the thread that the tab's staff row holds, and `pane_record.seed` records the same thread.
-Require basedpyright 0/0 on changed files and every caller module, and the full gate.
-Record added and deleted source lines; require a source decrease.
+**Gotchas:**
+
+- Only the merge gate found the fixture fault; the file-scoped runs did not include `test_pane_restore`.
+
+**Ruled out:** a saved mark or a check (sdlc: "a worker that sees one result twice loses nothing"); a second lookup for a bare pane.
 
 ### Phase 10 — Shutdown and restore of split tabs (shutdown unit)  · status: todo
 
