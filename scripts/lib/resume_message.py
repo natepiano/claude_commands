@@ -57,7 +57,7 @@ def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
         except ValueError:
             pass
     options = {"--role": seat["role"]}
-    dispatch = progress_history.last_dispatch(staff.StaffId(seat["staff_id"]), Path(seat["run_dir"]))
+    dispatch = progress_history.last_dispatch(staff.StaffId(seat["staff_id"]))
     if isinstance(dispatch, progress_history.RecordedDispatch):
         options["--role"] = dispatch.role
         options.update({option: value for option, value in (

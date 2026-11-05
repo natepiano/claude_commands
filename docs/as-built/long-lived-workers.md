@@ -268,7 +268,7 @@ See `unit-rename.md`.
 
 - Codex workers open once per run and end only at `end_session.sh`. A held design role is not a run worker: run end unbinds it and never ends its thread. Phase cleanup never ends a Codex thread. A new worker opens only when no open worker can take the work.
 - Claude workers keep their per-phase lifecycle; this design covers Codex workers only.
-- Only the unit director starts a finished worker's next turn through `implement.sh --to <worker>` or `review.sh --to <worker>`. A peer message sent with `send` is held for that turn, which receives it before its dispatch prompt, so the prompt is the last text the worker reads.
+- Only the unit director starts a finished Codex worker's next turn through `assign.sh --role <role> --to <worker>`. The turn receives held peer messages before its dispatch prompt. Claude workers keep `implement.sh`.
 - Compaction, the worker claim and the identity check run under one launcher lock (`impl_worker_claim.lock`); each mesh operation also holds its worker lifecycle lock. A live compaction turn (exit 3) or changed roster (exit 4) blocks the follow-up. Other compaction failures post one board line and allow the follow-up.
 - A worker's identity file is anchored to the implementation model, whichever launcher opened the worker.
 - A assigned review claims its worker before writing any artifact, and fails if the working tree changed in any of HEAD, status, tracked diff or untracked content.

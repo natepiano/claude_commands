@@ -438,14 +438,14 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   included: that costs a server restart and a notice, never work. Running it
   twice for one change moves nothing the second time. On the Mac the old server
   is stopped by `end_session.sh`, as above.
-- A codex worker's launcher ends with its last turn, while its thread persists.
-  A `send` to a finished codex peer holds the message for its current roster
-  thread. Only the unit director's `implement.sh --to <worker>` or
-  `review.sh --to <worker>` (`codex_mesh.py follow`) starts its next turn,
-  which receives the held messages first and its dispatch prompt last
-  (a held design role is the exception: `implement.sh --to` refuses it, and only `design_roles.py resume` gives it a turn) —
-  `<PhaseMesh/>` in `docs/direct/write_prompt_contract.md` states this, and the register
-  line's `reach=` field is what tells a peer which of the two it is addressing.
+- A Codex worker's launcher ends with its last turn. Its thread stays open.
+  `send` holds messages for that thread.
+  Only the unit director starts its next turn through `assign.sh --role <role> --to <worker>`.
+  The turn receives held messages before its dispatch prompt.
+  A held design role receives turns through `design_roles.py resume`.
+  Claude workers keep `implement.sh`.
+  `<PhaseMesh/>` in `docs/direct/write_prompt_contract.md` states this rule.
+  The register line's `reach=` field identifies the recipient.
 - `/unit:direct` is itself implemented by `scripts/direct/*`, so any rename or signature change to those launchers must land together with the `commands/unit/direct.md` call-site edits in one change.
 - `commands/unit/direct.md` holds the whole `/unit:direct` workflow, and it is a regular file. Call-site edits go in `direct.md`.
 - The `[worker.*]` header still names `/plan:worker`, an older name for `/unit:direct`; it is a comment only. Changes to it belong in the shared registry.
@@ -478,13 +478,12 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **`codex queue --thread` exits 0 for a thread with no live session.** The
   acknowledgement says nothing about delivery — do not use it as a reachability
   test.
-- **A finished codex worker holds messages for its next dispatch.** Its thread
-  persists, and `send` holds messages until the unit director starts its next
-  turn through `implement.sh --to` or `review.sh --to`. That turn receives them
-  first, and its dispatch prompt last. A thread started `--resident` (ask_a_friend's friend) stays
-  `running` across turns, prints each reply as it lands, and ends only on
-  `codex_mesh.py end`. `send` still refuses ended, missing and
-  capacity-exhausted workers.
+- **A finished Codex worker holds messages for its next dispatch.** Its thread stays open.
+  `send` holds messages until the unit director starts a turn through `assign.sh --role <role> --to <worker>`.
+  That turn receives held messages before its dispatch prompt.
+  A resident thread stays `running` across turns and prints each reply.
+  `codex_mesh.py end` ends a resident thread.
+  `send` refuses ended, missing, and capacity-exhausted workers.
 - **`systemError` is not terminal.** The thread stays loaded, and `turn/start` has no status gate, so a resume turn on the same thread is valid. A status outside the protocol's four reads `ThreadStateUnknown`: relaunching a `done` or `capacity_exhausted` entry exits 2, `end` exits 1, and inside the capacity loop the worker ends `failed` with `thread <id>: thread/read failed: unrecognized status <status>`.
 - **Capacity numbers.** The waits run 30, 60, 120, 240, 300, 300 and 150 s, so a spent budget reads `7 retries over 20 min`. The budget counts the measured sleep (`max(wait, elapsed)`), so a late wake spends it, and it counts only waits, not the time refused turns took, so a spell runs longer than 20 min of wall time.
 - **Stub app-server.** In `scripts/agents/test_codex_mesh.py` the stub answers `systemError` after an errored turn (`turn/failed`, or `turn/completed` carrying `error`) until the next `turn/start`, and an explicit `thread_statuses` entry wins. A stub that answered `idle` after a refused turn would hide the crash this guards against. `completed_then_capacity` and `capacity_with_peer` drive the budget-reset tests, and `test_failed_worker_relaunches_when_old_thread_has_unknown_status` uses `retired`, a status the protocol does not define. Workers run the live `~/.claude` copy of `codex_mesh.py`, so a change protects running workers only once it is there.

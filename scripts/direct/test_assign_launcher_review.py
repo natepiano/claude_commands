@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import cast, final
 from unittest.mock import patch
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
+from scripts.astra import astra_roles
 from scripts.direct import assign, workers
-from scripts.production import session_staff
+from scripts.production import session_staff, staff
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
 from scripts.direct.assign_launcher_test_support import ROOT, read_object
 from scripts.direct import assign_launcher_test_support as launcher_fixture
 
@@ -21,6 +23,81 @@ setUpModule = mesh_fixture.setUpModule
 
 @final
 class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
+    def test_account_move_reports_a_missing_dispatch_through_the_shared_reader(self) -> None:
+        member = fixture_worker("recovering", staff.StaffId(os.environ["CODEX_THREAD_ID"]),
+                                runtime_id=fixture_runtime_id("recovery-without-dispatch"))
+        self.write_pool_roster({member.name: {"staff_id": member.id, "status": "failed"}})
+        result = self.launch("review", "--operation", "resume-account-move", "--to", member.name)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("resume refused: worker has no recorded dispatch", result.stderr)
+        self.assertEqual(self.turn_starts, 0)
+
+    def managed_astra_review(self) -> subprocess.CompletedProcess[str]:
+        Path(os.environ["NOTIFIER_SESSIONS_DIR"]).mkdir(parents=True, exist_ok=True)
+        with patch.dict(os.environ, {"PROCESS_TABLE_PS": "true"}):
+            return self.launch("review", "--operation", "astra-review", "--new-worker", "astra-reviewer",
+                               "--model", "gpt-6-astra", "--effort", "xhigh",
+                               "--summary", str(self.session_dir / "astra-review.txt"),
+                               "--log", str(self.session_dir / "astra-turn.log"))
+
+    def test_a_managed_astra_review_publishes_and_holds_one_read_only_reviewer(self) -> None:
+        original = self.server.respond
+        held: list[astra_roles.LiveRole] = []
+        published: list[staff.StaffRow] = []
+        before = self.events()
+
+        @self.hang_guard.callback
+        def observe_review(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = original(request)
+            if request.get("method") == "turn/start":
+                held.extend(astra_roles.live_roles())
+                published.extend(row for row in staff.snapshot().find(kind="worker") if row.name == "astra-reviewer")
+                if frames is not None:
+                    params = cast(dict[str, object], request["params"])
+                    frames.insert(-1, {"jsonrpc": "2.0", "method": "item/completed", "params": {
+                        "threadId": params["threadId"], "turnId": "turn-1",
+                        "item": {"id": "review", "type": "agentMessage", "text": "The document passes."},
+                    }})
+            return frames
+
+        self.server.respond = observe_review
+        with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles")}):
+            result = self.managed_astra_review()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(astra_roles.live_roles(), [])
+        member, = published
+        role, = held
+        self.assertEqual((role["role"], role["staff_id"], role["thread_id"]),
+                         ("reviewer", member.id, member.current_session))
+        self.assertEqual(member.parent, staff.ReportsTo(staff.StaffId(os.environ["CODEX_THREAD_ID"])))
+        self.assertEqual(self.events(), before)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.turn_starts, 1)
+        self.assertEqual(cast(dict[str, object], self.methods("thread/start")[0]["params"])["sandbox"], "read-only")
+        self.assertEqual(cast(dict[str, object], self.methods("turn/start")[0]["params"])["sandboxPolicy"],
+                         {"type": "readOnly", "networkAccess": False})
+        self.assertEqual(self.assignment_records()["astra-reviewer"]["status"], "ended")
+        self.assertEqual((self.session_dir / "astra-review.txt").read_text().strip(), "The document passes.")
+
+    def test_a_failed_managed_astra_turn_ends_its_worker_and_releases_its_role(self) -> None:
+        self.outcomes = ["failed"]
+        with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles")}):
+            result = self.managed_astra_review()
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(astra_roles.live_roles(), [])
+        self.assertEqual(self.assignment_records()["astra-reviewer"]["status"], "ended")
+        self.assertEqual(self.turn_starts, 1)
+
+    def test_a_managed_astra_role_failure_ends_the_published_worker_before_any_turn(self) -> None:
+        blocked = self.session_dir / "blocked-role-store"
+        _ = blocked.write_text("The role store is unavailable.\n")
+        with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(blocked)}):
+            result = self.managed_astra_review()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("reviewer role unavailable", result.stderr)
+        self.assertEqual(self.turn_starts, 0)
+        self.assertEqual(self.assignment_records()["astra-reviewer"]["status"], "ended")
+
     def test_a_claude_review_for_a_named_worker_omits_the_follow_option(self) -> None:
         args = assign.Arguments(role="review", to="project-review", lens="contract", pass_number=2)
         environment = os.environ.copy()

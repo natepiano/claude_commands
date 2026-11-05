@@ -3423,6 +3423,26 @@ with patch.object(fcntl, "flock", admission):
             if event.get("event_type") == event_type
         ]
 
+    def test_last_dispatch_retains_the_finished_pass_when_the_same_slot_starts_again(self) -> None:
+        run = self.start_run("dispatch-history", 20_000, unit_owned=True)
+        parent = staff.local_snapshot().unit_by_worktree("natedev", self.working_dir)
+        assert parent is not None
+        worker = fixture_worker("dispatch-worker", parent.id)
+        self.start_phase(run, 20_010)
+        self.start_slot_pass(run, "impl", "impl", 20_020, "gpt-called", 0,
+                             "--worker-id", worker.id, worker_name=worker.name)
+        opened, = self.pass_events("dispatch-history", "pass_started")
+        self.assertEqual(opened["worker_id"], worker.id)
+        self.finish_slot_pass(run, "impl", "completed", 20_030)
+        _ = staff.rename(worker.id, "renamed-worker")
+        self.start_slot_pass(run, "impl", "test", 20_040, "gpt-called", 0,
+                             "--worker-id", worker.id, worker_name="renamed-worker")
+        with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(self.root)}):
+            dispatch = progress_history.last_dispatch(worker.id)
+        self.assertEqual(dispatch, progress_history.RecordedDispatch(
+            "impl", "3", progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            str(run / "phases/3/files"), str(opened["pass_instance_id"]), "completed"))
+
     def test_a_pass_records_a_digest_of_the_configuration_it_ran_under(self) -> None:
         _ = write_registry(self.models_config_file, {"direct.codex": {"impl": "gpt-called:xhigh"}})
         session_dir = self.start_run("digest", 20_000)
@@ -8089,7 +8109,10 @@ class LastDispatchTests(StaffTestCase):
     def dispatch_fixture(self, passes: dict[str, object]) -> tuple[Path, staff.StaffRow]:
         _, unit, _ = self.tree()
         worker = fixture_worker("dispatch-worker", unit.id)
-        run = self.root / "dispatch-run"
+        run = Path(os.environ["ROSTER_RUN_ROOT"]) / "dispatch-run"
+        for value in passes.values() if "instance_id" not in passes else (passes,):
+            if isinstance(value, dict):
+                _ = cast(dict[str, object], value).setdefault("status", "completed")
         self.write_json(run / unit_runs.STATE_FILE,
                         {"main_agent": {"session_id": unit.current_session}, "pass": passes})
         self.enterContext(patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.root / "usage")}))
@@ -8105,26 +8128,31 @@ class LastDispatchTests(StaffTestCase):
                       "started_at": 3, "phase": {"id": "4"}},
         })
         path = run / unit_runs.STATE_FILE
-        self.write_json(run / "mesh_roster.json", {"former-name": {"staff_id": worker.id}})
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        passes = cast(dict[str, dict[str, object]], state["pass"])
+        for slot in ("impl", "test"):
+            passes[slot]["worker_id"] = worker.id
+        self.write_json(path, state)
+        _ = staff.rename(worker.id, "renamed-worker")
         before = path.read_bytes(), path.stat().st_mtime_ns
         current = staff.native_id(fixture_runtime_id("dispatch-new-session"))
         _ = staff.update_current_session(worker.id, current)
-        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.RecordedDispatch(
-            "test", "3t", progress_history.DispatchDetailNotRecorded.UNRECORDED, "/explicit/paths.txt"))
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "test", "3t", progress_history.DispatchDetailNotRecorded.UNRECORDED, "/explicit/paths.txt", "last", "completed"))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_last_dispatch_reports_no_dispatch_without_a_pass_or_role(self) -> None:
         run, worker = self.dispatch_fixture({})
-        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.NoDispatchRecorded())
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
         (run / unit_runs.STATE_FILE).unlink()
-        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.NoDispatchRecorded())
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
 
     def test_last_dispatch_reads_the_older_single_pass_shape(self) -> None:
         run, worker = self.dispatch_fixture({"instance_id": "old", "worker_name": "dispatch-worker",
                                              "kind": "impl", "phase": {"id": "3t"}})
-        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.RecordedDispatch(
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
             "impl", "3t", progress_history.DispatchDetailNotRecorded.UNRECORDED,
-            str(run / "phases/3t/files")))
+            str(run / "phases/3t/files"), "old", "completed"))
 
     def test_last_dispatch_uses_the_canonical_directory_for_a_phase_with_spaces(self) -> None:
         run, worker = self.dispatch_fixture({"instance_id": "ad-hoc", "worker_name": "dispatch-worker",
@@ -8132,7 +8160,7 @@ class LastDispatchTests(StaffTestCase):
         path = phase_reservation.phase_directory(run, "ad hoc") / phase_reservation.FILES_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text("src/fix.py\n")
-        dispatch = progress_history.last_dispatch(worker.id, run)
+        dispatch = progress_history.last_dispatch(worker.id)
         self.assertIsInstance(dispatch, progress_history.RecordedDispatch)
         assert isinstance(dispatch, progress_history.RecordedDispatch)
         self.assertEqual(dispatch.paths, str(path))
@@ -8140,25 +8168,74 @@ class LastDispatchTests(StaffTestCase):
         self.assertEqual(Path(dispatch.paths).read_text(), "src/fix.py\n")
 
     def test_last_dispatch_has_no_phase_when_the_worker_has_two_phases(self) -> None:
-        run, worker = self.dispatch_fixture({
+        worker = self.dispatch_fixture({
             "impl": {"instance_id": "first", "worker_name": "dispatch-worker", "kind": "impl",
                      "started_at": 1, "phase": {"id": "3t"}},
             "test": {"instance_id": "last", "worker_name": "dispatch-worker", "kind": "test",
                      "started_at": 2, "phase": {"id": "4"}},
-        })
-        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.RecordedDispatch(
+        })[1]
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
             "test", progress_history.DispatchDetailNotRecorded.UNRECORDED,
             progress_history.DispatchDetailNotRecorded.UNRECORDED,
-            progress_history.DispatchDetailNotRecorded.UNRECORDED))
+            progress_history.DispatchDetailNotRecorded.UNRECORDED, "last", "completed"))
 
     def test_last_dispatch_reads_the_review_lens_from_the_shared_role_log(self) -> None:
         from scripts.usage import agents_log
 
-        run, worker = self.dispatch_fixture({"review": {
-            "instance_id": "review", "worker_name": "dispatch-worker", "kind": "review", "phase": {"id": "3t"}}})
+        worker = self.dispatch_fixture({"review": {
+            "instance_id": "review", "worker_name": "dispatch-worker", "kind": "review", "phase": {"id": "3t"}}})[1]
         agents_log.append(worker.current_session, "review", "contract", datetime.now(UTC))
-        self.assertEqual(progress_history.last_dispatch(worker.id, run), progress_history.RecordedDispatch(
-            "review", "3t", "contract", progress_history.DispatchDetailNotRecorded.UNRECORDED))
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "review", "3t", "contract", progress_history.DispatchDetailNotRecorded.UNRECORDED, "review", "completed"))
+
+    def test_last_dispatch_matches_a_name_only_when_the_pass_has_no_worker_id(self) -> None:
+        worker = self.dispatch_fixture({
+            "old": {"instance_id": "legacy", "worker_name": "dispatch-worker", "kind": "test", "started_at": 1},
+            "peer": {"instance_id": "peer", "worker_id": fixture_runtime_id("another-worker"),
+                     "worker_name": "dispatch-worker", "kind": "fix", "started_at": 2},
+        })[1]
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "test", missing, missing, missing, "legacy", "completed"))
+        _ = staff.rename(worker.id, "renamed-worker")
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
+
+    def test_last_dispatch_finds_the_newest_finished_pass_in_another_parent_run(self) -> None:
+        run, worker = self.dispatch_fixture({"first": {
+            "instance_id": "first", "worker_name": "dispatch-worker", "kind": "impl", "started_at": 1}})
+        owner = cast(dict[str, object], json.loads((run / unit_runs.STATE_FILE).read_text()))["main_agent"]
+        second = run.with_name("second-run")
+        self.write_json(second / unit_runs.STATE_FILE, {"main_agent": owner, "pass": {
+            "finished": {"instance_id": "second", "worker_id": worker.id, "kind": "review",
+                         "started_at": 2, "finished_at": 4, "status": "error", "lens": "contract"},
+            "open": {"instance_id": "open", "worker_id": worker.id, "kind": "fix",
+                     "started_at": 5, "status": "active"}}})
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "review", missing, "contract", missing, "second", "error"))
+
+    def test_last_dispatch_filters_another_parent_before_directory_and_history_reads(self) -> None:
+        run, worker = self.dispatch_fixture({"finished": {
+            "instance_id": "finished", "worker_id": "", "worker_name": "dispatch-worker", "kind": "test"}})
+        parent = fixture_member("unit", name="other-parent", parent=fixture_member("showrunner", name="other-owner").id,
+                                worktree=staff.PresentWorktree("natedev", self.root))
+        history = self.root / "unreadable-history.jsonl"
+        _ = history.write_bytes(b"\xff\n")
+        self.write_json(run.with_name("other-run") / unit_runs.STATE_FILE, {
+            "owner_staff_id": parent.id, "main_agent": {"session_id": parent.current_session},
+            "status": "active", "history_file": str(history)})
+        calls = self.root / "git-calls"
+        _ = calls.write_text("")
+        binaries = self.root / "dispatch-bin"
+        binaries.mkdir()
+        git = binaries / "git"
+        _ = git.write_text('#!/bin/sh\nprintf "git\\n" >> "$DISPATCH_GIT_CALLS"\nexit 1\n')
+        git.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": str(binaries), "DISPATCH_GIT_CALLS": str(calls)}):
+            dispatch = progress_history.last_dispatch(worker.id)
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        self.assertEqual(dispatch, progress_history.RecordedDispatch("test", missing, missing, missing, "finished", "completed"))
+        self.assertEqual(calls.read_text(), "")
 
 
 class StaffProgressHistoryTests(StaffTestCase):

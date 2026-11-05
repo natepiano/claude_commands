@@ -1083,6 +1083,8 @@ class RecordedDispatch:
     phase_id: str | DispatchDetailNotRecorded
     lens: str | DispatchDetailNotRecorded
     paths: str | DispatchDetailNotRecorded
+    instance_id: str | DispatchDetailNotRecorded = DispatchDetailNotRecorded.UNRECORDED
+    status: str | DispatchDetailNotRecorded = DispatchDetailNotRecorded.UNRECORDED
 
 
 @dataclass(frozen=True)
@@ -1090,30 +1092,42 @@ class NoDispatchRecorded:
     """The worker has no recorded dispatch."""
 
 
-def last_dispatch(worker_id: staff.StaffId, run: Path) -> RecordedDispatch | NoDispatchRecorded:
-    """Read the worker's dispatch through the shared state and role loaders."""
+def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded:
+    """Read the newest finished dispatch across the staff parent's runs."""
     try:
-        worker = staff.local_snapshot().by_id(worker_id)
+        membership = staff.local_snapshot()
+        worker = membership.by_id(worker_id)
     except staff.StaffUnreadable:
         return NoDispatchRecorded()
     if worker is None or worker.kind != "worker":
         return NoDispatchRecorded()
-    try:
-        state = _read_state(run)
-    except SystemExit:
-        state = {}
-    names = {worker.name}
-    if (run / "mesh_roster.json").is_file():
-        names.update(name for name, entry in session_staff.read_worker_roster(run / "mesh_roster.json").items()
-                     if (_object_dict(entry) or {}).get("staff_id") == worker_id)
-    records = [record for record in _pass_slots(state).values() if record.get("worker_name") in names]
+    parent = membership.parent_of(worker)
+    records: list[tuple[Path, dict[str, object]]] = []
+    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
+        for path in root.glob(f"*/{unit_runs.STATE_FILE}"):
+            try:
+                state = _json_object(path.read_text(encoding="utf-8")) or {}
+                if unit_runs.run_owner(state, membership) != parent:
+                    continue
+            except (OSError, UnicodeError):
+                continue
+            passes = [*_pass_slots(state).values(), *(
+                {**event, "instance_id": event.get("pass_instance_id"), "kind": event.get("pass_kind"),
+                 "started_at": event.get("pass_started_at"), "finished_at": event.get("timestamp_epoch"),
+                 "phase": {"id": event.get("phase_id")}}
+                for event in _run_events(state) if event.get("event_type") == "pass_finished")]
+            records.extend((path.parent, record) for record in passes
+                           if _string(record.get("status")) in {"completed", "error", "canceled", "interrupted"}
+                           and (record.get("worker_id") == worker_id if record.get("worker_id")
+                                else record.get("worker_name") == worker.name))
     task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
                               worker.current_session, datetime.now(UTC))
-    latest = max(records, key=lambda record: _number(record.get("started_at")), default=dict[str, object]())
+    run, latest = max(records, key=lambda item: _number(item[1].get("finished_at"), _number(item[1].get("started_at"))),
+                      default=(Path(), dict[str, object]()))
     role = _string(latest.get("kind")) or (task.role if isinstance(task, agents_log.Assignment) else "")
     if not role:
         return NoDispatchRecorded()
-    phases = {_string((_object_dict(record.get("phase")) or {}).get("id")).strip() for record in records}
+    phases = {_string((_object_dict(item[1].get("phase")) or {}).get("id")).strip() for item in records}
     missing = DispatchDetailNotRecorded.UNRECORDED
     phase = next(iter(phases)) if len(phases) == 1 and "" not in phases else missing
     lens = _string(latest.get("lens")) or (
@@ -1121,7 +1135,8 @@ def last_dispatch(worker_id: staff.StaffId, run: Path) -> RecordedDispatch | NoD
     paths = _string(latest.get("paths")) or (
         str(phase_reservation.phase_directory(run, phase) / phase_reservation.FILES_FILE)
         if isinstance(phase, str) and role != "review" else missing)
-    return RecordedDispatch(role, phase, lens or missing, paths)
+    return RecordedDispatch(role, phase, lens or missing, paths,
+                            _string(latest.get("instance_id")) or missing, _string(latest.get("status")) or missing)
 
 
 def _pass_phase_instance(record: dict[str, object]) -> str:
@@ -1308,6 +1323,7 @@ def _event(
                 "called_agent": current_pass.get("called_agent", {}),
                 "called_task": _string(current_pass.get("called_task")),
                 "worker_name": _string(current_pass.get("worker_name")),
+                "worker_id": _string(current_pass.get("worker_id")),
             }
         )
     activity = _object_dict(state.get("activity")) if phase_record is None else None
@@ -1749,6 +1765,7 @@ def _start_pass(args: argparse.Namespace) -> None:
         "started_at": now,
         "called_task": _arg_string(args, "called_task"),
         "worker_name": _optional_arg(args, "worker_name"),
+        "worker_id": _optional_arg(args, "worker_id"),
         "called_agent": called_agent,
         "team_slot": team_slot,
         "phase": _phase_stamp(phase),
@@ -3798,8 +3815,6 @@ def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[
         roster = worker_lifecycle.read_worker_state(session_dir / "mesh_roster.json")
     except worker_lifecycle.WorkerStateUnreadable:
         return [{**window, "worker": "unavailable"} for window in windows]
-    from scripts.agents.codex_mesh import recorded_turn_settings
-
     slots: dict[str, str] = {}
     for path in session_dir.glob("impl_worker_*.json"):
         try:
@@ -3810,7 +3825,7 @@ def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[
     models: dict[str, str] = {}
     for name, value in roster.items():
         record = _object_dict(value) or {}
-        settings = recorded_turn_settings(record)
+        settings = worker_lifecycle.recorded_turn_settings(record)
         if settings.model:
             slot = slots.get(name) or _string(record.get("slot")) or name
             models[slot] = _agent_display(settings.model, settings.effort)
@@ -6549,6 +6564,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_pass.add_argument("--activity", required=True)
     _ = start_pass.add_argument("--called-task", required=True)
     _ = start_pass.add_argument("--worker-name", default="", help="the worker this pass was launched to")
+    _ = start_pass.add_argument("--worker-id", default="", help="the worker's staff id")
     _ = start_pass.add_argument("--called-family", required=True)
     _ = start_pass.add_argument("--called-model", required=True)
     _ = start_pass.add_argument("--called-effort", default="unset")

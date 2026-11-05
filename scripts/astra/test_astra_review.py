@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -295,8 +296,17 @@ class ManagedAstraReviewTests(mesh_fixture.MeshCommandFixture):
         super().setUp()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles"),
+            "PROCESS_TABLE_PS": "true",
             "CLAUDE_CODE_SESSION_ID": "",
         })))
+        director = self.session_dir.parent / "codex"
+        director.symlink_to(sys.executable)
+        scripts = self.session_dir.parent / "caller-scripts"
+        (scripts / "direct").mkdir(parents=True)
+        command = [str(director), "-c", "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))",
+                   "bash", str(astra_review.SCRIPTS / "direct/assign.sh")]
+        _ = (scripts / "direct/assign.sh").write_text("exec " + shlex.join(command) + ' "$@"\n')
+        _ = self.enterContext(patch.object(astra_review, "SCRIPTS", scripts))
 
     def run_review(self) -> tuple[int, str]:
         document = self.session_dir / "proposal.md"

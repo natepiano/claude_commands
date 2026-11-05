@@ -16,7 +16,7 @@ from scripts.direct.assign_launcher_test_support import ASSIGN, AssignLauncherFi
 from scripts.lib.test_models_registry import write_registry
 from scripts.usage import agents_log
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_session, fixture_worker
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = ROOT / 'scripts/lib/py'
@@ -26,12 +26,14 @@ setUpModule = mesh_fixture.setUpModule
 class AssignGateTests(unittest.TestCase):
     def test_direct_mesh_verbs_refuse_before_argument_validation(self) -> None:
         for verb in ('start', 'follow', 'reopen', 'fork', 'adopt', 'prime', 'resume-account-move'):
-            with self.subTest(verb=verb):
-                result = subprocess.run([str(PYTHON), str(ROOT / 'scripts/agents/codex_mesh.py'), verb],
-                                        text=True, capture_output=True, check=False)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(result.stderr.strip(), assign_gate.REFUSAL)
-                self.assertEqual(result.stdout, '')
+            for command in ([str(PYTHON), str(ROOT / 'scripts/agents/codex_mesh.py'), verb],
+                            [str(PYTHON), '-c',
+                             f'from scripts.agents import codex_mesh; codex_mesh.main([{verb!r}])']):
+                with self.subTest(verb=verb, command=command):
+                    result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stderr.strip(), assign_gate.REFUSAL)
+                    self.assertEqual(result.stdout, '')
 
     def test_direct_shell_launchers_refuse_before_argument_validation(self) -> None:
         for script in ('direct/implement.sh', 'direct/review.sh', 'agents/agent_bg.sh',
@@ -68,6 +70,7 @@ class AssignmentFormsTests(AssignLauncherFixture):
         """Observe a real process after its door and before backend work."""
         trace = self.session_dir.parent / 'operation.json'
         checks = self.session_dir.parent / 'checks.txt'
+        expected_checks = ['admit'] if handler in {'command_adopt', 'command_resume_account_move'} else ['check-launch', 'admit']
         self.instrument_launcher('\n'.join((
             'from pathlib import Path',
             'from scripts.direct import assign',
@@ -99,7 +102,7 @@ class AssignmentFormsTests(AssignLauncherFixture):
                 '            from pathlib import Path',
                 '            from scripts.direct import assign_gate',
                 '            assert assign_gate.called_by_assign()',
-                f'            assert Path({str(checks)!r}).read_text().splitlines() == ["check-launch", "admit"]',
+                f'            assert Path({str(checks)!r}).read_text().splitlines() == {expected_checks!r}',
                 f'            Path({str(trace)!r}).write_text(json.dumps({{key: str(value) for key, value in vars(frame.f_locals["args"]).items()}}))',
                 '            raise SystemExit(0)',
                 '    sys.setprofile(observe)',
@@ -212,6 +215,14 @@ class AssignmentFormsTests(AssignLauncherFixture):
     def test_recovery_uses_the_recorded_context_without_extra_launch_arguments(self) -> None:
         trace = self.capture_operation('command_resume_account_move')
         record = self.recovery_record()
+        worker = staff.by_id(staff.StaffId(str(record['staff_id'])))
+        assert worker is not None
+        current = staff.native_id(fixture_runtime_id('recovery-cleared-session'))
+        fixture_session(current, staff.CodexBackend(Path(os.environ['CODEX_HOME'])))
+        _ = staff.update_current_session(worker.current_session, current)
+        state = read_object(self.session_dir / 'progress_history_state.json')
+        state['pass'] = {'review': {'worker_name': 'existing', 'kind': 'review', 'started_at': 1}}
+        _ = (self.session_dir / 'progress_history_state.json').write_text(json.dumps(state))
         _ = (self.session_dir / 'mesh_roster.json').write_text(json.dumps({'existing': record}))
         result = self.run_launcher(['bash', str(ASSIGN), '--role', 'review', '--operation', 'resume-account-move',
                                     '--session-dir', str(self.session_dir), '--to', 'existing'])

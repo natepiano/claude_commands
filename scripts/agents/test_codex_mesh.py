@@ -67,7 +67,7 @@ from typing import BinaryIO, Callable, Literal, TextIO, TypedDict, cast, final, 
 from unittest.mock import MagicMock, call, patch
 
 from scripts.agents import codex_mesh, mesh_runs, worker_lifecycle
-from scripts.direct import assign, plan_history, progress_history, worker_state, workers as unit_workers
+from scripts.direct import assign, assign_gate, plan_history, progress_history, worker_state, workers as unit_workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib import atomic_file, nix_env, unit_runs
 from scripts.message import process_table, sessions, unit_labels, roster as message_roster
@@ -1019,6 +1019,7 @@ class MeshCommandFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(assign_gate, "called_by_assign", return_value=True))
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         assert_fixture_environment()
         _ = self.enterContext(LauncherHangGuard(self.id()).protect())
@@ -3179,10 +3180,12 @@ class ShutdownDeadlineTests(MeshCommandFixture):
         self.assertIsInstance(result, codex_mesh.SwitchingWorker)
         assert isinstance(result, codex_mesh.SwitchingWorker)
         self.assertIsInstance(result.outcome, codex_mesh.WorkerMoveFailed)
+        self.assertIsInstance(result.outcome, codex_mesh.WorkerMoveResumeRefused)
         marker = _as_test_dict(cast(object, json.loads(codex_mesh._account_move_path(str(self.session_dir), "worker").read_text())))  # pyright: ignore[reportPrivateUsage]
         failure = _as_test_dict(cast(object, json.loads(codex_mesh._account_move_result_path(str(self.session_dir), "worker").read_text())))  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(failure["move_id"], marker["move_id"])
         self.assertIn("after marker", str(failure["error"]))
+        self.assertEqual(result.failure, failure["error"])
         self.assertEqual(pending.read_bytes(), before)
         self.assertEqual(self.queued, queue)
         self.assertEqual(self.live_turn, "live-before-move")
@@ -3541,7 +3544,7 @@ class FixtureHomeSafetyTests(unittest.TestCase):
 @final
 class RecordedTurnSettingsTests(unittest.TestCase):
     def test_accepted_turn_settings_take_precedence_over_legacy_roster_fields(self) -> None:
-        settings = codex_mesh.recorded_turn_settings({
+        settings = worker_lifecycle.recorded_turn_settings({
             "turn_model": "accepted-model", "turn_effort": "high",
             "model": "historical-model", "effort": "low",
         })
@@ -3550,7 +3553,7 @@ class RecordedTurnSettingsTests(unittest.TestCase):
     def test_an_accepted_model_without_effort_does_not_borrow_the_legacy_effort(self) -> None:
         for effort in ({}, {"turn_effort": ""}, {"turn_effort": 123}):
             with self.subTest(effort=effort):
-                settings = codex_mesh.recorded_turn_settings({
+                settings = worker_lifecycle.recorded_turn_settings({
                     "turn_model": "accepted-model", "model": "historical-model", "effort": "max", **effort,
                 })
                 self.assertEqual((settings.model, settings.effort), ("accepted-model", ""))
@@ -3558,7 +3561,7 @@ class RecordedTurnSettingsTests(unittest.TestCase):
     def test_a_missing_or_empty_accepted_model_uses_the_legacy_pair(self) -> None:
         for model in ({}, {"turn_model": ""}, {"turn_model": 123}):
             with self.subTest(model=model):
-                settings = codex_mesh.recorded_turn_settings({
+                settings = worker_lifecycle.recorded_turn_settings({
                     "turn_effort": "max", "model": "historical-model", "effort": "low", **model,
                 })
                 self.assertEqual((settings.model, settings.effort), ("historical-model", "low"))
@@ -3567,7 +3570,7 @@ class RecordedTurnSettingsTests(unittest.TestCase):
         for record, expected in (({}, ("", "")), ({"model": "older-model"}, ("older-model", "")),
                                  ({"model": "older-model", "effort": "medium"}, ("older-model", "medium"))):
             with self.subTest(record=record):
-                settings = codex_mesh.recorded_turn_settings(record)
+                settings = worker_lifecycle.recorded_turn_settings(record)
                 self.assertEqual((settings.model, settings.effort), expected)
 
 
@@ -3622,6 +3625,10 @@ class QueueGraceSettingsTests(unittest.TestCase):
 
 @final
 class MeshParserTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(patch.object(assign_gate, "called_by_assign", return_value=True))
+
     def test_start_parser_accepts_cwd_and_defaults_to_empty(self) -> None:
         for options, directory in (([], ""), (["--cwd", "/requested worktree"], "/requested worktree")):
             with (
@@ -7853,6 +7860,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def assert_director_account_move(
         self, *, recorded_launcher: int, review_lens: agents_log.Lens | None = None,
+        recorded_dispatch: bool = False,
     ) -> None:
         new = self.prepare_running_account_swap()[1]
         self.outcomes = ["completed"]
@@ -7865,6 +7873,14 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
             worker["role"] = "review"
         agents_log.append(THREAD_ID, "review" if review_lens else "impl", review_lens, datetime.now(timezone.utc))
         self.write_pool_roster({"worker": worker})
+        if recorded_dispatch:
+            _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(self.session_dir.parent)})))
+            _ = (self.session_dir / unit_runs.STATE_FILE).write_text(json.dumps({
+                unit_runs.OWNER_FIELD: os.environ["CODEX_THREAD_ID"], "pass": {
+                    "review": {"worker_name": "worker", "worker_id": self.stored_worker_record()["staff_id"],
+                               "kind": "review", "lens": review_lens, "status": "completed",
+                               "started_at": 1, "finished_at": 2, "phase": {"id": "3y"}}}}))
+            agents_log.append(THREAD_ID, "test", None, datetime.now(timezone.utc))
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
             switches = sign_in_moves(self.session_dir)
@@ -7886,6 +7902,77 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
             assert isinstance(assignment, agents_log.Assignment)
             self.assertEqual((assignment.role, assignment.lens), ("review", review_lens))
 
+    def test_account_move_resume_prefers_the_dispatch_role_and_lens_to_the_role_log(self) -> None:
+        self.assert_director_account_move(recorded_launcher=0, review_lens="craft", recorded_dispatch=True)
+
+    def test_account_move_with_a_nonworker_dispatch_role_refuses_without_a_worker_turn(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "failed", "role": "impl",
+                                           "port": self.server.port}})
+        _ = (self.session_dir / unit_runs.STATE_FILE).write_text(json.dumps({
+            unit_runs.OWNER_FIELD: os.environ["CODEX_THREAD_ID"], "pass": {"review": {
+                "worker_id": self.stored_worker_record()["staff_id"], "kind": "director",
+                "status": "completed", "started_at": 1, "finished_at": 2}}}))
+        roster = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            result = codex_mesh.command_resume_account_move(argparse.Namespace(
+                session_dir=str(self.session_dir), to="worker"))
+        self.assertEqual(result, 1)
+        self.assertIn("resume refused: recorded role is not a worker role: director", errors.getvalue())
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), roster)
+
+    def test_account_move_without_staff_id_or_dispatch_refuses_without_a_worker_turn(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "failed", "role": "impl",
+                                           "port": self.server.port}})
+        roster = self.session_dir / codex_mesh.ROSTER_FILE
+        original = roster.read_text()
+        for missing in ("staff id", "recorded dispatch"):
+            with self.subTest(missing=missing), patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.home / "empty-usage")}):
+                _ = roster.write_text(original if missing == "recorded dispatch" else json.dumps({"worker": {"status": "failed"}}))
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    result = codex_mesh.command_resume_account_move(argparse.Namespace(
+                        session_dir=str(self.session_dir), to="worker"))
+                self.assertEqual(result, 1)
+                self.assertIn(f"resume refused: worker has no {missing}", errors.getvalue())
+                self.assertEqual(self.methods("turn/start"), [])
+                self.assertEqual(self.methods("turn/interrupt"), [])
+                self.assertEqual(roster.read_text(), original if missing == "recorded dispatch" else json.dumps({"worker": {"status": "failed"}}))
+
+    def test_account_move_command_keeps_the_dispatch_role_after_a_session_clear(self) -> None:
+        _ = self.prepare_running_account_swap(run_name="cleared session")
+        self.live_turn = "turn-1"
+        self.interrupt_error = "interrupt rejected by app-server"
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "turn_id": "turn-1", "status": "running",
+                                           "role": "impl", "port": self.server.port}})
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(self.session_dir.parent)})))
+        _ = (self.session_dir / unit_runs.STATE_FILE).write_text(json.dumps({
+            unit_runs.OWNER_FIELD: os.environ["CODEX_THREAD_ID"], "pass": {
+                "review": {"worker_name": "worker", "worker_id": self.stored_worker_record()["staff_id"],
+                           "kind": "review", "lens": "craft", "status": "completed", "started_at": 1, "finished_at": 2}}}))
+        worker = staff.by_id(staff.StaffId(str(self.stored_worker_record()["staff_id"])))
+        assert worker is not None
+        current = staff.native_id(fixture_runtime_id("cleared-account-move"))
+        fixture_session(current, staff.CodexBackend(agent_accounts.workers_home()))
+        _ = staff.update_current_session(worker.id, current)
+        moves = sign_in_moves(self.session_dir)
+        self.assertEqual(shlex.split(moves[0].workers[0].resume_command), [
+            "bash", str(Path(codex_mesh.__file__).resolve().parents[1] / "direct/assign.sh"),
+            "--role", "review", "--operation", "resume-account-move",
+            "--session-dir", str(self.session_dir), "--to", "worker"])
+
+    def test_account_move_without_dispatch_reports_a_named_resume_refusal(self) -> None:
+        _ = self.prepare_running_account_swap()
+        self.live_turn = "turn-1"
+        self.interrupt_error = "interrupt rejected by app-server"
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "turn_id": "turn-1", "status": "running",
+                                           "role": "impl", "port": self.server.port}})
+        with patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.home / "empty-usage")}):
+            moves = sign_in_moves(self.session_dir)
+        self.assertIsInstance(moves[0].workers[0].outcome, codex_mesh.WorkerMoveResumeRefused)
+        self.assertEqual(moves[0].workers[0].resume_command, "resume refused: worker has no recorded dispatch")
+        self.assertEqual(self.methods("turn/start"), [])
+
     def test_swap_director_account_move_keeps_the_review_lens(self) -> None:
         self.assert_director_account_move(recorded_launcher=0, review_lens="craft")
 
@@ -7894,6 +7981,11 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_swap_resumes_running_worker_without_launcher_pid_using_director_continuation(self) -> None:
         self.assert_director_account_move(recorded_launcher=0)
+        assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                                        THREAD_ID, datetime.now(timezone.utc))
+        self.assertIsInstance(assignment, agents_log.Assignment)
+        assert isinstance(assignment, agents_log.Assignment)
+        self.assertIsNone(assignment.lens)
 
     def test_account_move_command_uses_the_recorded_role_and_quotes_paths(self) -> None:
         _target, new = self.prepare_running_account_swap(run_name="run with spaces")
@@ -7908,6 +8000,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     "status": "running", "role": role, "port": self.server.port}})
                 switches = sign_in_moves(self.session_dir)
                 worker = switches[0].workers[0]
+                self.assertIsInstance(worker.outcome, codex_mesh.WorkerMoveResumeAvailable)
                 self.assertEqual(shlex.split(worker.resume_command),
                                  ["bash", str(Path(codex_mesh.__file__).resolve().parents[1] / "direct/assign.sh"),
                                   "--role", assigned_role, "--operation", "resume-account-move",

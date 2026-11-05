@@ -38,8 +38,23 @@ def starts_worker(words: list[str]) -> bool:
 
 def python_commands(source: str) -> list[tuple[int, list[str]]]:
     tree = ast.parse(source)
-    assignments = {target.id: node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
-                   for target in node.targets if isinstance(target, ast.Name)}
+    assignments: dict[str, ast.expr] = {}
+    imports: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            assignments.update((target.id, node.value) for target in node.targets if isinstance(target, ast.Name))
+        elif isinstance(node, ast.Import):
+            imports.update((alias.asname or alias.name.split(".")[0],
+                            alias.name if alias.asname else alias.name.split(".")[0]) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            imports.update((alias.asname or alias.name, f"{node.module}.{alias.name}") for alias in node.names)
+
+    def called_name(node: ast.expr) -> str:
+        if isinstance(node, ast.Name):
+            return imports.get(node.id, "")
+        if isinstance(node, ast.Attribute) and (base := called_name(node.value)):
+            return f"{base}.{node.attr}"
+        return ""
 
     def word(node: ast.AST, seen: frozenset[str] = NO_REFERENCES) -> str:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -54,8 +69,17 @@ def python_commands(source: str) -> list[tuple[int, list[str]]]:
             return "".join(word(part, seen) for part in node.values)
         return ""
 
-    return [(node.lineno, [word(element) for element in node.elts])
-            for node in ast.walk(tree) if isinstance(node, (ast.List, ast.Tuple))]
+    commands: list[tuple[int, list[str]]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.List, ast.Tuple)):
+            commands.append((node.lineno, [word(element) for element in node.elts]))
+        elif isinstance(node, ast.Call) and called_name(node.func) == "scripts.agents.codex_mesh.main":
+            arguments = node.args[0] if node.args else next((item.value for item in node.keywords if item.arg == "argv"), None)
+            if isinstance(arguments, ast.Name):
+                arguments = assignments.get(arguments.id, arguments)
+            if isinstance(arguments, (ast.List, ast.Tuple)):
+                commands.append((node.lineno, ["codex_mesh.py", *(word(element) for element in arguments.elts)]))
+    return commands
 
 
 def shell_commands(source: str) -> list[tuple[int, list[str]]]:
@@ -107,6 +131,10 @@ def forbidden_launches(root: Path) -> list[str]:
 
 
 class OneLaunchPathTests(unittest.TestCase):
+    def test_scan_reports_calls_and_sequences_in_traversal_order(self) -> None:
+        commands = python_commands('from scripts.agents import codex_mesh\ncodex_mesh.main(["start"])\nsend(["codex_mesh.py", "follow"])')
+        self.assertEqual([line for line, words in commands if starts_worker(words)], [2, 3])
+
     def test_only_assign_starts_or_follows_workers(self) -> None:
         found = forbidden_launches(ROOT)
         self.assertFalse(found, "Worker launch commands must use assign.sh:\n" + "\n".join(found))
@@ -125,6 +153,34 @@ class OneLaunchPathTests(unittest.TestCase):
                     _ = (root / "caller.py").write_text(f'command = ["bash", str(ROOT / "{launcher}")]\n')
                     _ = (root / "caller.sh").write_text(f'AGENT_BG_ROLE=impl bash "${{DIR}}/{launcher}" --to worker\n')
                     self.assertEqual(forbidden_launches(root), ["caller.py:1", "caller.sh:1"])
+
+    def test_scan_catches_in_process_worker_launches_and_keeps_nonlaunch_verbs_open(self) -> None:
+        forms = (
+            ('from scripts.agents import codex_mesh', 'codex_mesh.main(["{verb}"])'),
+            ('import scripts.agents.codex_mesh', 'scripts.agents.codex_mesh.main(["{verb}"])'),
+            ('import scripts.agents.codex_mesh', 'scripts.agents.codex_mesh.main(argv=["{verb}"])'),
+            ('from scripts.agents import codex_mesh', 'codex_mesh.main(argv=["{verb}"])'),
+            ('import scripts.agents.codex_mesh as mesh', 'mesh.main(argv=["{verb}"])'),
+            ('from scripts.agents.codex_mesh import main as launch', 'launch(argv=["{verb}"])'),
+            ('import scripts.agents.codex_mesh as mesh', 'mesh.main(["{verb}"])'),
+            ('from scripts.agents.codex_mesh import main as launch', 'launch(["{verb}"])'),
+            ('from scripts.agents import codex_mesh as mesh', 'arguments = ["{verb}"]\nmesh.main(arguments)'),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for imports, call in forms:
+                for verb in (*sorted(MESH_STARTS), "end", "send", "list"):
+                    with self.subTest(call=call, verb=verb):
+                        source = imports + "\n" + call.format(verb=verb) + "\n"
+                        path = root / "caller.py"
+                        _ = path.write_text(source)
+                        self.assertEqual(forbidden_launches(root),
+                                         [f"caller.py:{len(source.splitlines())}"] if verb in MESH_STARTS else [])
+                        allowed = root / "scripts/direct/assign.py"
+                        allowed.parent.mkdir(parents=True, exist_ok=True)
+                        path.unlink()
+                        _ = allowed.write_text(source)
+                        self.assertEqual(forbidden_launches(root), [])
 
     def test_hops_require_the_gate_before_the_first_start(self) -> None:
         gate = '"/repo/scripts/lib/py" "/repo/scripts/direct/assign_gate.py"\n'

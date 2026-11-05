@@ -607,7 +607,7 @@ class StopResumeTests(unittest.TestCase):
                     missing if role == "review" else "/saved/paths.txt")
                 with patch.object(progress_history, "last_dispatch", return_value=dispatch) as read:
                     command = shlex.split(stop_resume.resume_worker_command(seat, "/current/tree"))
-                read.assert_called_once_with(staff.StaffId(seat["staff_id"]), run)
+                read.assert_called_once_with(staff.StaffId(seat["staff_id"]))
                 self.assertEqual(command[:2], ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh")])
                 options = dict(zip(command[2::2], command[3::2]))
                 self.assertEqual(options["--role"], role)
