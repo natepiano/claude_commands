@@ -52,9 +52,16 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: the gate's slowdown warning compares with a rolling median, which slowly accepts a slowdown as normal (Astra plan review, 2026-11-04).
   - Completion condition: each module a speed phase improved has its after median stored as a reference; a gate median 20% over it is reported at phase start.
   - Revealed by: Astra plan review; starts after Phase 14 lands (showrunner ruling 2026-11-04).
+- [ ] **Architecture proposal: one injected Git runner in fast_track.py**
+  - Target: `scripts/production/fast_track.py` (owner: production) and `scripts/production/test_fast_track.py`
+  - Why needed: the module's floor is 55 tests at about 3.5 s each of real Git work (Phase 7); the test file alone cannot go lower.
+  - Completion condition: decision tests run against the runner; a few process tests keep real Git; same-load pairs show the gain (about 3 minutes on one module).
+  - Risk: a recorded Git transcript is a second model of Git that can drift from real Git (showrunner, 2026-11-04).
+  - Revealed by: Phase 7; showrunner ruling 2026-11-04 (next, not current).
 
 ## Floors
 
 | Module | Floor (pair median wall s) | Limiting operation | Phase |
 | --- | --- | --- | --- |
 | `direct/test_simplify_lens.py` | 118 | one real review-launcher run per test (3-6 s) | 6 |
+| `production/test_fast_track.py` | 193 | real Git work, about 3.5 s per test | 7 |
