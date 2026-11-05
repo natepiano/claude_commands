@@ -720,7 +720,6 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         raise ValueError('the Linux build folder must stay inside its slot')
     # Finish the recorder write before the completion marker lets natedev pull the records.
     environment = {
-        'BUILDLOG_BUILD_BUDGET_GIB': f'{build_budget:g}',
         'LINT_SWEEP_BUDGET_GIB': f'{budget:g}',
         'BUILDLOG_CALLER': 'verify-linux', 'BUILDLOG_CALL_ID': call_id,
         'BUILDLOG_TARGET': values.get('selected_target', ''),

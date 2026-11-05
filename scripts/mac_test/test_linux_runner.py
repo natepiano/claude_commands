@@ -448,7 +448,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(event["args"][:4], ["nextest", "-p", "hana", "-E"])
         self.assertIn("not (test(gpu))", event["args"][4])
         self.assertEqual(event["args"][5:], list(words[4:]))
-        self.assertEqual(event["environment"].get("BUILDLOG_BUILD_BUDGET_GIB"), "32")
+        self.assertNotIn("BUILDLOG_BUILD_BUDGET_GIB", event["environment"])
         self.assertEqual(event["environment"].get("LINT_SWEEP_BUDGET_GIB"), "31")
         self.assertEqual(event["environment"].get("BUILDLOG_SENT_TREE_KEY"), "sent-tree-key")
         self.assertEqual(event["environment"].get("BUILDLOG_REPO_IDENTITY"), self.identity.key)
@@ -506,7 +506,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertIn("mac_cleanup=0", result.stdout)
         self.assertFalse((self.mirror / "target").exists())
         event = self.events("lint")[-1]
-        self.assertEqual(event["environment"]["BUILDLOG_BUILD_BUDGET_GIB"], "40")
+        self.assertNotIn("BUILDLOG_BUILD_BUDGET_GIB", event["environment"])
         self.assertEqual(event["environment"]["LINT_SWEEP_BUDGET_GIB"], "35")
 
     def test_slot_budget_removes_only_the_selected_build_folder(self) -> None:
