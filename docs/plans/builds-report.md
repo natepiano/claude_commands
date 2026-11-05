@@ -483,3 +483,68 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 - Pooling the `disk.py` timer probes — background wall time only; CPU stays the same.
 - Probing fewer checkouts from recorded pairs or saved roots — the roots go wrong after a Cargo config change.
 - A test that a fractional worker count is refused — it tests only the conf library, which `scripts/lib/test_conf.py` covers.
+
+### Phase 24 — Mac offload reads the repository key without loading memory_admit  · status: todo
+**Depends on:** queue 10z on builds (done, b7ad7675c).
+
+#### Work Order
+
+**Goal:** `offload.repository_identity` gets its key from the recorder's light reader, so a call runs no `memory_admit` code. The keys stay the same. Director amendment 2026-11-05: offload still loads `memory_admit` through top-level imports in `sweep` -> `build_hold` -> `build_queue.admission_service`/`admission_protocol`. Those files belong to other units; that chain went to the builds showrunner.
+
+**Spec:**
+- `scripts/mac_test/offload.py:898-914` `repository_identity(repo_root)` now imports all of `memory_admit` (lazy, line 907-910) and calls `memory_admit.git_identity(["git"], str(source.parent))`. That runs `record.git_directory`, `record.git_facts` (2-3 git processes) and `git remote get-url origin`, then `git rev-list --max-parents=0 --reverse HEAD` when no remote exists. Only `identity.key` is used.
+- Replace that call with `record.recorded_repository_key(["git"], str(source.parent))` (`scripts/buildlog/record.py:530`). It runs `git remote get-url origin`, normalizes with `record.remote_identity` (the same function `git_identity` uses), else returns `"git-root:" + <first root commit>`, else `store.UNKNOWN_IDENTITY`.
+- `store.UNKNOWN_IDENTITY` maps to `KnownRepository(name)` (today's result for `UnknownRepository`). Any other value maps to `KnownRepository(name, key)`.
+- Keep the `sweep.repo_name`, `sweep.git_common_dir`, `sweep.source_git_dir` and `config` checks unchanged.
+- Remove the `memory_admit` import from offload.py when no other use remains. Check with LSP `findReferences`.
+- Import `record` the way offload.py imports its other `scripts/buildlog` modules (`sys.path` already holds `scripts/buildlog`, line 29). Check that importing `record` from offload.py does not form an import cycle.
+
+**Files:**
+- `scripts/mac_test/offload.py` — `repository_identity` uses `record.recorded_repository_key`.
+- `scripts/mac_test/test_target_slots.py` — a test that pins the keys: a repository with an `origin` remote (scp form and https form give one normalized key), and one with no remote (`git-root:<root commit>`). Each expected key is a literal from the fixture, not a call to the code under test. The existing identity tests (lines 160-230, 349) stay unchanged.
+
+**Workers:** 1 writer — nothing splits; `recorder` owns both files.
+
+**State:** none.
+
+**Constraints from prior phases:** The recorder no longer loads `memory_admit` (Phases 16 and 18). `record.recorded_repository_key` and `record.remote_identity` exist (Phase 16). Repository keys must stay unchanged; queue and the Mac copy records key on them.
+
+**Acceptance gate:**
+- `scripts.mac_test.test_target_slots`, `scripts.mac_test.test_offload` (if present), `scripts.mac_test.test_linux_runner`, `scripts.mac_test.test_copy_watch` and `scripts.mac_test.test_audit` green, from the worktree root with and without `PYTHONPATH`.
+- offload.py has no `memory_admit` import, and `repository_identity` calls no `memory_admit` function. The summary names the import chain that still loads `memory_admit` (from `python3 -X importtime`).
+- CPU per call before and after: a fresh process per run, 10 runs each, interleaved, on this worktree and on one checkout with no remote. Report median own+child CPU and wall.
+- `basedpyright` on both files: 0 errors, 0 warnings, 0 notes.
+
+### Phase 25 — A kill counts as a build when its program is under a Cargo target folder  · status: done
+**Depends on:** builds showrunner ruling 2026-11-05 on Phase 23 F011 ("one classifier for a cargo target is the right count").
+
+#### Work Order
+
+**Goal:** `EarlyoomKill.is_build` and `outside_build_gate` classify a program with `sweep.is_cargo_target` on its folders. No `cargo metadata` probe and no index read run.
+
+**Spec:**
+- `scripts/buildlog/memory.py:115-122` `build_output_program(program)`: keep the rule that a relative program is not a build. Resolve the absolute path. Return True when any parent folder of the resolved program satisfies `sweep.is_cargo_target(str(parent))` (`scripts/lint/sweep.py:852`). Stop at the filesystem root.
+- This changes kill counts: a program under any Cargo target folder counts, also a target folder that no recorded step and no current checkout names. The builds showrunner approved this change.
+- Delete `build_output_roots` (memory.py:89-112) with its `lru_cache`, the `ThreadPoolExecutor` import, the lazy `build_shape` import, the `read_cargo_output_roots` and `CargoOutputRoots` imports when unused, and `index.index_path()`/`store.host_name()` uses that only it needed. Check each with LSP `findReferences`.
+- Delete `METADATA_PROBE_WORKERS` and its comment block from `config/buildlog.conf`.
+  Director amendment 2026-11-05: a config key deletion needs the user's go; builds filed the question. The checkpoint leaves the key in place. On a go, the key goes in its own commit; a "keep" answer goes back to builds.
+- Import `sweep` lazily inside `build_output_program` if a top-level import would load it in `buildlog snapshot`; say which and why in the summary.
+- A folder that is gone at classification time is not a Cargo target. Keep `is_cargo_target`'s own rules; do not copy them.
+
+**Files:**
+- `scripts/buildlog/memory.py` — the new `build_output_program`; deletions above.
+- `config/buildlog.conf` — `METADATA_PROBE_WORKERS` removed.
+- `scripts/buildlog/test_memory_window.py` — delete `BuildOutputRootsTests` and its helpers (`probe`, `build_roots`, `configure_workers`, `probes_meet`, the cache clears at lines 793-794). Add tests on fixture folders: a program under a folder with `.rustc_info.json` is a build; a program under a folder whose `CACHEDIR.TAG` has the Cargo tag and a build tree is a build; a program under a plain folder is not; a relative program is not. Both `EarlyoomKill.is_build` and `outside_build_gate` keep their `build_oom_score_adj` rules.
+- `scripts/buildlog/test_memory_records.py:85-95` — replace the resolved-roots test with the target-folder rule. A program under `<base>/target/debug` without Cargo markers is now not a build only because the folder is not a Cargo target.
+- `docs/as-built/buildlog-memory-stalls.md` — the kill classification sentence(s) name `sweep.is_cargo_target`.
+
+**Workers:** 1 writer — nothing splits; `rowcpu` owns all files.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 20 and Phase 23 built the probe path that this phase deletes. Resources Phase 64 moves `build_shape.recorded_output_roots`; after this phase memory.py no longer calls it. `scripts/lint/sweep.py` is resources' file and is read only here.
+
+**Acceptance gate:**
+- `scripts.buildlog.test_memory_window`, `scripts.buildlog.test_memory_records`, `scripts.buildlog.test_report`, `scripts.buildlog.test_sample`, `scripts.lint.test_build_shape`, `scripts.lib.test_conf` green, from the worktree root with and without `PYTHONPATH`, and with a tripwire `cargo` (exit 99) first on PATH.
+- On the live natedev index: the first kill classification in a fresh process, before (5897f0fdf: 1.08 s wall, 5.54 s total CPU) and after. Report the count of earlyoom kills in the live log that each version calls a build, and list each kill whose class changes.
+- `basedpyright` on every changed Python file: 0 errors, 0 warnings, 0 notes.
