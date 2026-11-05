@@ -22,9 +22,10 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "message"))
 if TYPE_CHECKING:
-    from ..message import send_budget
+    from ..message import send_budget, session_send
 else:
     import send_budget
+    from scripts.message import session_send
 sys.path.insert(0, str(SCRIPTS / "mac_test"))
 sys.path.insert(0, str(SCRIPTS / "notify"))
 
@@ -301,8 +302,7 @@ def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = RE
         address = result.stdout.strip()
         if result.returncode != 0 or not address:
             raise ValueError("builds showrunner has no address")
-        command = [sys.executable, str(SCRIPTS / "message/send.py"), "--to", address,
-                   "--from", "Mac idle watch", "--text", text]
+        command = session_send.send_argv("--to", address, "--from", "Mac idle watch", "--text", text)
         if isinstance(identity, OutageMessage):
             window = outage_repeat_minutes(identity.since, identity.now, mac_idle_alert.read_idle_config())
             command.extend(["--key", f"mac-idle-showrunner-{identity.since}", "--repeat-minutes", str(window),

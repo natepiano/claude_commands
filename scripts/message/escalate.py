@@ -512,9 +512,8 @@ def deliver(held: HeldMessage, key: str) -> str:
         return "template revision required"
     rendered = push_texts.render(held.text_id, **dict(held.values))
     command = push_texts.user_send_argv(rendered, sender=JOB, key=user_key(key),
-                                      self_clearing=held.need == "blocked",
+                                      self_clearing=held.need == "blocked", send_script=SEND,
                                       question=held.reference["path"] if held.reference["kind"] == "question" else "")
-    command = session_send.send_argv(*command[2:], send_script=SEND)
     done = subprocess.run(command, capture_output=True, text=True, check=False,
                           timeout=send_budget.user_seconds(review.user_send_seconds()))
     return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"

@@ -37,7 +37,7 @@ from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners
 from ledger_test_support import style_staff_fixture, style_unit_id
-from scripts.message import send_budget
+from scripts.message import send_budget, session_send
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -165,7 +165,7 @@ class StyleSyncTests(unittest.TestCase):
         )
         address = self.root / "address.py"
         _ = address.write_text("print('session:fake-style')\n")
-        _ = self.enterContext(mock.patch.object(style_sync, "SEND", sender))
+        _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", sender))
         _ = self.enterContext(mock.patch.object(style_sync, "SHOWRUNNERS", address))
         _ = self.enterContext(mock.patch.object(showrunners, "production_of", return_value=None))
         self.lint_temp = self.root / "tmp"
@@ -389,7 +389,7 @@ class StyleSyncTests(unittest.TestCase):
 
         def refill_during_send(arguments: list[str], **options: object) -> object:
             nonlocal interleaved
-            if (len(arguments) > 1 and arguments[1] == str(style_sync.SEND)
+            if (len(arguments) > 1 and arguments[1] == str(session_send.SEND_SCRIPT)
                     and options.get("timeout") == send_budget.seconds(style_sync.SEND_SECONDS) and not interleaved):
                 interleaved = True
                 style_sync.wake_waiters(self.repo, "3002")

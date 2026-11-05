@@ -35,12 +35,14 @@ import conf
 from user_zone import user_zone
 
 if TYPE_CHECKING:
+    from ..message import session_send
     from ..lib import process_start as process_identity
     from ..build_targets import target_config
     from ..build_targets.target_config import ConfigError
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.lib import process_start as process_identity
+    from scripts.message import session_send
     import target_config
     from target_config import ConfigError
 
@@ -1092,25 +1094,12 @@ def send_message(
     repeat_minutes: float,
     text: str,
 ) -> bool:
-    send_script = message_script("MAC_TEST_SEND", "send.py")
+    send_script = Path(os.environ.get("MAC_TEST_SEND", str(session_send.SEND_SCRIPT))).expanduser()
     try:
         result = subprocess.run(
-            [
-                sys.executable,
-                str(send_script),
-                "--to",
-                target,
-                "--from",
-                "mac-test",
-                "--summary",
-                summary,
-                "--key",
-                key,
-                "--repeat-minutes",
-                f"{repeat_minutes:g}",
-                "--text",
-                text,
-            ],
+            session_send.send_argv("--to", target, "--from", "mac-test", "--summary", summary,
+                                   "--key", key, "--repeat-minutes", f"{repeat_minutes:g}",
+                                   "--text", text, send_script=send_script),
             capture_output=True,
             text=True,
             check=False,

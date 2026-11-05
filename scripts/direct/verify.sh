@@ -179,12 +179,13 @@
 
 set -euo pipefail
 # Save exported values before script variables replace caller names.
-# The --env rule refuses the VERIFY_ prefix.
+# The --env rule refuses the VERIFY_ prefix. env -0 works in every bash build;
+# a bash built without programmable completion has no compgen.
 VERIFY_CALL_ENVIRONMENT=()
-while IFS= read -r VERIFY_ENV_NAME; do
-    case "$VERIFY_ENV_NAME" in VERIFY_*) continue ;; esac
-    VERIFY_CALL_ENVIRONMENT+=("$VERIFY_ENV_NAME=${!VERIFY_ENV_NAME}")
-done < <(compgen -e)
+while IFS= read -r -d '' VERIFY_ENV_ENTRY; do
+    case "$VERIFY_ENV_ENTRY" in VERIFY_*) continue ;; esac
+    VERIFY_CALL_ENVIRONMENT+=("$VERIFY_ENV_ENTRY")
+done < <(env -0)
 # Trace the helper in its interpreter. CPU time excludes child processes.
 # The normal path starts no extra interpreter.
 VERIFY_START_DIR="${BASH_SOURCE[0]%/*}"

@@ -125,14 +125,17 @@ def write_token_gaps(lines: Sequence[bytes], *, tail: bytes = b"") -> None:
 HEAD_NOW = datetime(2026, 10, 30, 11, 0, tzinfo=UTC).timestamp()
 
 
-def write_process(proc: Path, pid: int, used: int = 0) -> None:
-    """Write the process identity and resident memory consumed by admission."""
+def write_process(proc: Path, pid: int, used: int = 0, *, parent: int = 1,
+                  start: str | None = None, anonymous: int | None = None, swap: int = 0) -> None:
+    """Write private process identity, resident use, anonymous use, and swap."""
     directory = proc / str(pid)
-    directory.mkdir(exist_ok=True)
-    fields = ["S", "1", *(["0"] * 17), str(pid)]
+    directory.mkdir(parents=True, exist_ok=True)
+    fields = ["S", str(parent), *(["0"] * 17), str(pid) if start is None else start]
     if (directory / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n") <= 0:
         raise OSError("empty fixture process")
-    if (directory / "status").write_text(f"VmRSS: {used // 1024} kB\nVmSwap: 0 kB\n") <= 0:
+    anon = used if anonymous is None else anonymous
+    if (directory / "status").write_text(
+            f"VmRSS: {used // 1024} kB\nRssAnon: {anon // 1024} kB\nVmSwap: {swap // 1024} kB\n") <= 0:
         raise OSError("empty fixture memory")
 
 

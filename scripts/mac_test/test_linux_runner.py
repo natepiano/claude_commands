@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import chdir, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
 import hashlib
@@ -241,7 +241,7 @@ class LinuxShellTests(unittest.TestCase):
             if argv[:2] == [sys.executable, "-c"] and "sweep.sweep_workspace" in argv[2]:
                 if not self.use_real_sweep:
                     return subprocess.CompletedProcess(argv, 0, "", "")
-                with mock.patch.dict(os.environ, env or {}), \
+                with chdir(os.getcwd()), mock.patch.dict(os.environ, env or {}), \
                         mock.patch.object(sys, "argv", ["-c", argv[3]]), \
                         mock.patch.object(sweep, "process_uses", side_effect=private_uses), \
                         mock.patch.object(time, "time", return_value=1_793_570_400.0):
