@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast, override
+from unittest import mock
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, worker_lifecycle, test_codex_mesh as mesh_fixture
@@ -624,39 +625,67 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         for boundary in ("admit", "publish"):
             with self.subTest(boundary=boundary):
                 self.open_worker(name="healthy")
-                roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+                roster = self.roster()
                 roster[refused.name] = {"staff_id": refused.id, "status": "failed",
                     "model": "gpt-kept-sol", "effort": "xhigh", "port": self.server.port}
                 self.write_pool_roster(roster)
                 staff_file = Path(os.environ["STAFF_FILE"])
-                before = staff_file.read_bytes(), json_object(self.session_dir / codex_mesh.ROSTER_FILE)[refused.name]
-                original_admit, original_publish = worker_admission.admit, worker_admission.publish
-                attempts: list[str] = []
-
-                def admit(name: str, run: Path, *, role: str) -> worker_admission.WorkerStartAllowed:
-                    attempts.append(name)
-                    if name == refused.name:
-                        raise worker_admission.AdmissionRefused("candidate switch refused")
-                    return original_admit(name, run, role=role)
-
-                def publish(allowed: worker_admission.WorkerStartAllowed, identity: str) -> worker_admission.PublishedWorker:
-                    attempts.append(allowed.name)
-                    if allowed.name == refused.name:
-                        raise worker_admission.AdmissionRefused("candidate switch refused")
-                    return original_publish(allowed, identity)
-
-                with (patch.object(worker_admission, boundary, side_effect=admit if boundary == "admit" else publish),
+                before = staff_file.read_bytes(), self.roster()[refused.name]
+                with (patch.object(worker_admission, boundary, wraps=getattr(worker_admission, boundary),
+                                   side_effect=[worker_admission.AdmissionRefused("candidate switch refused"), cast(object, mock.DEFAULT)]) as attempted,
                       redirect_stderr(io.StringIO()) as errors):
                     selected = workers.resolve(self.session_dir, "impl")
+                attempts = [cast(str, call.args[0]) if boundary == "admit" else cast(worker_admission.WorkerStartAllowed, call.args[0]).name
+                            for call in attempted.call_args_list]
                 self.assertEqual(errors.getvalue().count("candidate switch refused"), 1)
                 self.assertEqual(selected, "healthy")
                 self.assertCountEqual(attempts, [refused.name, "healthy"])
                 self.assertEqual(staff_file.read_bytes(), before[0])
-                after = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+                after = self.roster()
                 self.assertEqual(after[refused.name], before[1])
                 self.assertTrue(workers.allocation_is_live(cast(dict[str, object], after["healthy"])))
                 self.assertEqual(self.methods("thread/start"), [])
                 self.assertEqual(self.methods("turn/start"), [])
+
+    def test_allocation_maps_astra_tasks_and_tolerates_an_unreadable_usage_log(self) -> None:
+        for name, role, unreadable in (("astra-reviewer", "review", False),
+                                       ("astra-designer", "impl", False), ("impl", "impl", True)):
+            with self.subTest(name=name, unreadable=unreadable):
+                row = self.record_worker(name)
+                self.write_pool_roster({name: {"staff_id": row.id, "status": "done",
+                    "model": "gpt-kept-sol", "effort": "xhigh", "port": self.server.port}})
+                history = agents_log.state_dir() / "agents.jsonl"
+                history.parent.mkdir(parents=True, exist_ok=True)
+                history.unlink(missing_ok=True)
+                if unreadable:
+                    history.mkdir()
+                try:
+                    with redirect_stderr(io.StringIO()) as errors:
+                        selected = workers.resolve(self.session_dir, role)
+                    self.assertEqual(selected, name, errors.getvalue())
+                    self.assertEqual(session_staff.worker_row(cast(dict[str, object], self.roster()[name])), row)
+                    self.assertTrue(workers.allocation_is_live(cast(dict[str, object], self.roster()[name])))
+                    self.assertEqual(self.methods("thread/start"), [])
+                finally:
+                    if unreadable:
+                        history.rmdir()
+                    _ = staff.retire(row.id)
+
+    def test_allocation_shares_one_staff_snapshot_across_its_readers(self) -> None:
+        roles: tuple[Literal["impl", "review"], ...] = ("impl", "review")
+        for role in roles:
+            with self.subTest(role=role):
+                self.open_worker(name=role, role=role)
+                try:
+                    with patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as reads:
+                        selected = workers.resolve(self.session_dir, role)
+                    self.assertEqual(selected, role)
+                    self.assertEqual(reads.call_count, 1)
+                    self.assertTrue(workers.allocation_is_live(cast(dict[str, object], self.roster()[role])))
+                    self.assertEqual(self.methods("thread/start"), [])
+                    self.assertEqual(self.methods("turn/start"), [])
+                finally:
+                    _ = staff.retire(staff.native_id(mesh_fixture.THREAD_ID))
 
     def test_two_simultaneous_resolves_in_one_run_reserve_distinct_workers(self) -> None:
         self.open_worker(name="impl")

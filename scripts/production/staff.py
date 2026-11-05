@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, NewType, Protocol, TypeVar, cast
+from typing import ClassVar, Literal, NewType, Protocol, TypeVar, cast
 from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -52,18 +52,18 @@ class StaffRoot:
 @dataclass(frozen=True)
 class ClaudeBackend:
     """The worker runs in Claude."""
+    family: ClassVar[str] = "claude"
 
 
 @dataclass(frozen=True)
 class CodexBackend:
+    family: ClassVar[str] = "codex"
     codex_home: Path
 
 
 @dataclass(frozen=True)
 class BackendUnavailable:
     """No producer proved the worker backend."""
-
-
 
 
 def _seconds(key: str) -> float:
@@ -613,15 +613,22 @@ def operation_fds() -> tuple[int, ...]:
         result.append(int(os.environ["STAFF_OPERATION_FD"]))
     for variable in os.environ:
         if variable.startswith("STAFF_ROW_FD_"):
-            path = _file().parent / "rows" / f"{variable.removeprefix('STAFF_ROW_FD_')}.lock"
+            path, variable = _row_lock(variable.removeprefix("STAFF_ROW_FD_"))
             if _joined_operation(path, variable):
                 result.append(int(os.environ[variable]))
     return tuple(result)
 
 
+def _row_lock(key: str) -> tuple[Path, str]:
+    return _file().parent / "rows" / f"{key}.lock", "STAFF_ROW_FD_" + key
+
+
 @contextmanager
 def row_operation(reference: str) -> Generator[None]:
     """Lock one staff row across lifecycle commands and inherited children."""
+    if _joined_operation(*_row_lock(reference)):
+        yield
+        return
     record = initial_snapshot()
     row = record.by_member_reference(reference)
     if row is None:
@@ -637,8 +644,7 @@ def row_operation(reference: str) -> Generator[None]:
 @contextmanager
 def slot_operation(key: str, name: str) -> Generator[None]:
     """Lock a row or a named worker slot across inherited children."""
-    variable = "STAFF_ROW_FD_" + key
-    path = _file().parent / "rows" / f"{key}.lock"
+    path, variable = _row_lock(key)
     if _joined_operation(path, variable):
         yield
         return
@@ -845,6 +851,11 @@ def _load(*, initial: bool = False) -> StaffSnapshot:
     if type(schema) is not int or schema not in (1, 2):
         raise StaffUnreadable(f"unsupported staff schema: {schema!r}")
     return replace(_snapshot_value(fields), inputs=(str(_file().absolute()),))
+
+
+def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
+    """Find the backend for this row's current session."""
+    return _found_backends((row,)).get(row.id, BACKEND_UNAVAILABLE)
 
 
 def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | CodexBackend]:

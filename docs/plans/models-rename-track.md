@@ -164,10 +164,10 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 - Source release before a family switch has three outcomes: `SourceReleased`, `SourceUnresolved` and `SourceReleaseUnknown`. Unknown server state refuses the switch. A valid record with only `previous_servers` means no current server; a current server without a valid pid is `SourceReleaseUnknown`.
 - A switch records its intent before it creates the destination. The default retry request is `sha256(f"{staff id}:{destination family}")`, so a rerun after publication reuses the published destination.
-- `SwitchState` has named values (backend published, dispatch deferred, assignment accepted). The roster boundary converts stored strings; an unknown stored value refuses admission.
+- `SwitchState` has named values (backend published, dispatch deferred, assignment accepted). The roster boundary converts stored strings. Since 3q an unknown stored value prints one anomaly line and reads as no record.
 - New-slot admission locks by parent and name.
 - `agent_bg.sh` is a Bash parent with a Python coprocess. The Python parent is not in the worker turn.
-- `end_friend.sh` records "ended" only after confirmed absence or a successful stop.
+- The friend stop records "ended" only after confirmed absence or a successful stop. Since 3q, `worker_fill.py end-friend` does this; `end_friend.sh` is deleted.
 - `workers.py` reports a refused candidate and continues with healthy workers.
 
 **Files:**
@@ -175,7 +175,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - `scripts/production/worker_fill.py` — Claude coprocess admission and dispatch.
 - `scripts/agents/agent_bg.sh` — Bash parent of the worker turn.
 - `scripts/agents/codex_mesh.py` — Codex start path and source-release evidence readers.
-- `scripts/ask_a_friend/end_friend.sh` — friend stop and status.
+- `scripts/ask_a_friend/end_friend.sh` — friend stop and status (deleted in 3q).
 
 **Binds later work:** the real-path regression tests `test_default_switch_request_reuses_the_published_destination_after_fresh_admission` and `test_source_release_requires_identity_and_complete_server_evidence` stay, apart from renames. `codex_mesh.py` stops on `SourceReleaseUnknown` and continues after `SourceUnresolved`.
 
@@ -188,7 +188,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - Merging `SourceUnresolved` and `SourceReleaseUnknown`: their consumers differ.
 - Moving launch account setup in `agent_bg.sh`: it adds work before the `unchanged` exit.
 
-### Phase 3q — 3p follow-ups: simplify cuts and the switch-state cleanup  · status: todo
+### Phase 3q — 3p follow-ups: simplify cuts and the switch-state cleanup  · status: done
 
 **Owner:** models-unit. 3p routed these items here under the hard landing rule (repair rounds 7-9, 2026-11-04).
 
@@ -281,6 +281,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 4. For each switch, save the staff row before and after, the transcript extract path, and the destination's first-turn log. Put the evidence under `${PHASE_DIR}/proofs/`.
 5. Stop the worker and remove the fixture unit after the proofs.
 6. A switch defect the proofs find is fixed at its cause, with a real-path regression test. The director assigns that repair.
+7. Before the proofs, after devtools' one-launch-path change is on sdlc: remove the unused `role` parameter of `worker_admission.admit` at every caller (`assign.py`, `implement.sh`, `scripts/astra/design_roles.py`, `workers.py`, `codex_mesh.py`), and remove the `AGENT_BG_ROLE` assignments in `implement.sh` and `launch_friend.sh`. sdlc ruling 2026-11-04: models-unit owns `admit`, so it switches all callers. Ledger 3q F027 and F028.
 
 **Files:**
 - `scripts/production/worker_admission.py`
@@ -289,6 +290,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - `scripts/agents/codex_mesh.py`
 - `scripts/production/test_worker_admission.py`
 - `scripts/agents/test_agent_bg.py`
+- `scripts/direct/assign.py`, `scripts/direct/implement.sh`, `scripts/astra/design_roles.py`, `scripts/ask_a_friend/launch_friend.sh` (Spec item 7)
 
 **Workers:** `1 tester`
 
