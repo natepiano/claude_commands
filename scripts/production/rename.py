@@ -24,6 +24,17 @@ class KeepDocBranch:
 
 
 @dataclass(frozen=True)
+class StagedDocumentBlob:
+    mode: str
+    object_id: str
+
+
+@dataclass(frozen=True)
+class NoStagedDocumentBlob:
+    """The journal has no staged document content to restore."""
+
+
+@dataclass(frozen=True)
 class DocBranchMove:
     source: Path
     destination: Path
@@ -32,6 +43,7 @@ class DocBranchMove:
     branch: str
     digest: str
     tracked: bool
+    staged_blob: StagedDocumentBlob | NoStagedDocumentBlob
 
 
 @dataclass(frozen=True)
@@ -72,9 +84,21 @@ def _saved_move(fields: dict[str, object]) -> DocBranchMove:
         raise RenameRefused("the document move journal is incomplete")
     if not isinstance(fields.get("tracked"), bool):
         raise RenameRefused("the document move journal has no index evidence")
+    blob = fields.get("staged_blob")
+    staged_blob: StagedDocumentBlob | NoStagedDocumentBlob = NoStagedDocumentBlob()
+    if isinstance(blob, dict):
+        blob_fields = cast(dict[str, object], blob)
+        mode = blob_fields.get("mode")
+        object_id = blob_fields.get("object_id")
+        if not isinstance(mode, str) or not mode or not isinstance(object_id, str) or not object_id:
+            raise RenameRefused("the document move journal has an incomplete staged blob")
+        staged_blob = StagedDocumentBlob(mode, object_id)
+    elif "staged_blob" in fields:
+        raise RenameRefused("the document move journal has an incomplete staged blob")
     return DocBranchMove(Path(cast(str, fields["source"])), Path(cast(str, fields["destination"])),
                          Path(cast(str, fields["checkout"])), cast(str, fields["old_branch"]),
-                         cast(str, fields["branch"]), cast(str, fields["digest"]), cast(bool, fields["tracked"]))
+                         cast(str, fields["branch"]), cast(str, fields["digest"]), cast(bool, fields["tracked"]),
+                         staged_blob)
 
 
 def plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> RenamePlan:
@@ -129,17 +153,26 @@ def plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> Rename
         raise RenameRefused(f"branch already exists: {to_branch}")
     if doc.path == destination and branch == to_branch:
         return RenamePlan(row, new, KeepDocBranch())
+    entry = unit_move.git(checkout, "ls-files", "-s", "--", str(doc.path.relative_to(checkout)))
+    staged_blob: StagedDocumentBlob | NoStagedDocumentBlob = NoStagedDocumentBlob()
+    parts = entry.split(maxsplit=3)
+    if len(entry.splitlines()) == 1 and len(parts) == 4 and parts[2] == "0":
+        staged_blob = StagedDocumentBlob(parts[0], parts[1])
     return RenamePlan(row, new, DocBranchMove(doc.path, destination, checkout, branch, to_branch,
                                             hashlib.sha256(doc.path.read_bytes()).hexdigest(),
-                                            bool(unit_move.git(checkout, "ls-files", "--",
-                                                               str(doc.path.relative_to(checkout))))))
+                                            bool(entry), staged_blob))
 
 
 def _journal_fields(request: RenamePlan, move: DocBranchMove, *, done: bool) -> dict[str, object]:
-    return {"staff_id": request.member.id, "name": request.name, "source": str(move.source),
-            "destination": str(move.destination), "checkout": str(move.checkout),
-            "old_branch": move.old_branch, "branch": move.branch, "digest": move.digest,
-            "tracked": move.tracked, "done": done}
+    fields: dict[str, object] = {
+        "staff_id": request.member.id, "name": request.name, "source": str(move.source),
+        "destination": str(move.destination), "checkout": str(move.checkout),
+        "old_branch": move.old_branch, "branch": move.branch, "digest": move.digest,
+        "tracked": move.tracked, "done": done,
+    }
+    if isinstance(move.staged_blob, StagedDocumentBlob):
+        fields["staged_blob"] = {"mode": move.staged_blob.mode, "object_id": move.staged_blob.object_id}
+    return fields
 
 
 def _move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
@@ -163,11 +196,15 @@ def _move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
     if not move.destination.is_file():
         raise RenameRefused(f"{move.destination}: the moved document is unavailable")
     if move.tracked and move.source != move.destination:
+        if not unit_move.git(move.checkout, "ls-files", "--", destination):
+            if isinstance(move.staged_blob, StagedDocumentBlob):
+                _ = unit_move.git(move.checkout, "update-index", "--add", "--cacheinfo",
+                                  f"{move.staged_blob.mode},{move.staged_blob.object_id},{destination}")
+            else:
+                _ = unit_move.git(move.checkout, "add", "--", destination)
+            changed = True
         if unit_move.git(move.checkout, "ls-files", "--", source):
             _ = unit_move.git(move.checkout, "rm", "--cached", "--quiet", "--", source)
-            changed = True
-        if not unit_move.git(move.checkout, "ls-files", "--", destination):
-            _ = unit_move.git(move.checkout, "add", "--", destination)
             changed = True
     row = staff.by_id(request.member.id)
     if row is None or isinstance(row.doc, staff.DocUnfilled):

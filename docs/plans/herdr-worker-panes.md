@@ -1692,33 +1692,51 @@ Fix the input readiness gate (accounts-unit finding, 2026-11-04).
 herdr.py is shared with 3v and 4e writers: post the function you take on the board before you edit it.
 Files: scripts/herdr/herdr.py (`prompt_input_state` and a small helper beside it) and scripts/herdr/test_herdr.py.
 
-### Phase 4x — Rename recovery keeps staged document content  · status: todo
+### Phase 4x — Rename recovery keeps staged document content  · status: done
 
 **Depends on:** 4g Steps C and D (rename.py document move journal).
 
-**Work Order:**
+#### Work Order
 
-Keep a partially staged document's staged version when rename recovers an interrupted move (4g review F010, routed 2026-11-04).
+**Goal:** keep a partially staged document's staged version when rename recovers an interrupted move (4g review F010, routed 2026-11-04).
+
+**Spec:**
 1. Case: `rename.py apply … --to-doc --to-branch` stops after git moved the file and before git updated the index. The source entry is staged with content that differs from the working file.
 2. Today recovery runs the equivalent of `git rm --cached <source>` and `git add <destination>`. The working content is kept; the staged-only version is lost.
 3. Record the staged blob of the source in the journal before the move. On recovery, stage that blob at the destination with `git update-index --cacheinfo`, and keep the working file as it is.
 4. A test interrupts at that step with a partially staged document and checks the staged blob and the working bytes after the rerun.
-Files: scripts/production/rename.py and scripts/production/test_rename.py.
+
+**Acceptance gate:** the new test fails without the change and passes with it; the production suite and basedpyright on both files are green.
+
+**Files:**
+- `scripts/production/rename.py` — journal and recovery.
+- `scripts/production/test_rename.py` — the regression test.
 
 ### Phase 4y — Rename edges after Step B  · status: todo
 
 **Depends on:** 4g Step B (rename_unit.py on the row, journal in unit_move.py).
 
-**Work Order:**
+#### Work Order
 
-Close the Step B review edges routed at repair round 10 (4g review, 2026-11-04). The rename rule stays as sdlc set it.
+**Goal:** close the Step B review edges routed at repair round 10 (4g review, 2026-11-04). The rename rule stays as sdlc set it.
+
+**Spec:**
 1. Recovery identity (F009): `unit_move._recoverable_folder` returns success only when the journal's source, destination and Git admin path all match. Keep the branch checks. A test puts another linked worktree of the same repository on the requested branch at the destination and expects no adoption.
 2. Same name (F017): a row already named `port` with request `port-unit → port` and no journal writes nothing and moves nothing (rule 1).
 3. Output (F018): the printed line follows the operation result. A finished pending move prints `done`; a rerun with nothing to do prints only `unchanged`.
 4. Pending kinds (F019): a folder-only move and a pending rename are distinct journal variants, not `FolderMove.name == ""`.
 5. Order (F020): set the displays before the folder and branch move (rule 2).
-Files: scripts/production/rename_unit.py, scripts/production/unit_move.py and their tests.
+6. Do not change `unit_move.observe()`; shutdown's fix3 owns it.
+
 The restart deadline (F007) moved to shutdown-unit Phase 4l.
+
+**Acceptance gate:** one regression test per item fails without the change; the production suite and basedpyright on the four files are green.
+
+**Files:**
+- `scripts/production/rename_unit.py` — same name, output and display order.
+- `scripts/production/unit_move.py` — recovery identity and journal variants.
+- `scripts/production/test_rename_unit.py` — tests.
+- `scripts/production/test_unit_move.py` — tests.
 
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: moved: shutdown-unit (sdlc, 2026-11-04)
 

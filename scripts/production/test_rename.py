@@ -173,6 +173,28 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         assert renamed is not None
         self.assertEqual(renamed.doc, staff.LiveDoc("natedev", self.new_doc))
 
+    def test_document_move_recovery_keeps_partial_staging(self) -> None:
+        source = self.doc.relative_to(self.checkout).as_posix()
+        destination = self.new_doc.relative_to(self.checkout).as_posix()
+        staged = self.doc.read_bytes() + b"\nThe staged document edit.\n"
+        working = staged + b"\nThe unstaged document edit.\n"
+        _ = self.doc.write_bytes(staged)
+        _ = self.git("add", "--", source)
+        staged_blob = self.git("rev-parse", f":{source}")
+        _ = self.doc.write_bytes(working)
+
+        failed = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc),
+                                  "--to-branch", NEW, wrapper=FAIL_GIT_MOVE_INDEX)
+        self.assertIn("simulated git mv index failure", failed.stderr)
+        self.assertEqual(self.new_doc.read_bytes(), working)
+        self.assertEqual(self.git("rev-parse", f":{source}"), staged_blob)
+
+        self.assert_success(self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.git("rev-parse", f":{destination}"), staged_blob)
+        self.assertEqual(self.new_doc.read_bytes(), working)
+        self.assertEqual(self.git("ls-files", "--", source), "")
+
     def test_document_move_reruns_after_the_index_source_is_removed(self) -> None:
         row = self.production_row()
         failed = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc),
@@ -190,7 +212,8 @@ class ProductionRenameTests(support.ProductionRenameFixture):
             interrupted_move = self.run_command("apply", OLD, NEW,
                 "--to-doc", str(self.new_doc), "--to-branch", NEW)
         self.assertIn("stopped after index removal", interrupted_move.stderr)
-        self.assertEqual(self.git("ls-files", "--", "docs/plans/old-production.md", "docs/plans/new-production.md"), "")
+        self.assertEqual(self.git("ls-files", "--", "docs/plans/old-production.md", "docs/plans/new-production.md"),
+                         "docs/plans/new-production.md")
         self.assert_success(self.run_command("apply", OLD, NEW,
             "--to-doc", str(self.new_doc), "--to-branch", NEW))
         self.assertEqual(self.git("ls-files", "--", "docs/plans/old-production.md", "docs/plans/new-production.md"),
@@ -202,6 +225,59 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assert_success(self.run_command("apply", OLD, NEW,
             "--to-doc", str(self.new_doc), "--to-branch", NEW))
         self.assertEqual(self.file_versions(), before)
+
+    def test_document_move_keeps_the_blob_indexed_before_source_removal(self) -> None:
+        source = self.doc.relative_to(self.checkout).as_posix()
+        destination = self.new_doc.relative_to(self.checkout).as_posix()
+        staged = self.doc.read_bytes() + b"\nThe staged document edit.\n"
+        working = staged + b"\nThe unstaged document edit.\n"
+        _ = self.doc.write_bytes(staged)
+        self.doc.chmod(0o755)
+        _ = self.git("add", "--", source)
+        source_entry = self.git("ls-files", "-s", "--", source).split()[:3]
+        _ = self.doc.write_bytes(working)
+        failed = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc),
+                                  "--to-branch", NEW, wrapper=FAIL_GIT_MOVE_INDEX)
+        self.assertIn("simulated git mv index failure", failed.stderr)
+        git = unit_move.git
+
+        def interrupted(checkout: Path, *arguments: str) -> str:
+            if arguments[0] == "rm":
+                raise OSError("stopped before source index removal")
+            return git(checkout, *arguments)
+
+        with mock.patch.object(unit_move, "git", side_effect=interrupted):
+            interrupted_move = self.run_command("apply", OLD, NEW,
+                "--to-doc", str(self.new_doc), "--to-branch", NEW)
+        self.assertIn("stopped before source index removal", interrupted_move.stderr)
+        self.assertEqual(self.git("ls-files", "-s", "--", destination).split()[:3], source_entry)
+        self.assertEqual(self.git("ls-files", "-s", "--", source).split()[:3], source_entry)
+        self.assertEqual(self.new_doc.read_bytes(), working)
+        self.assert_success(self.run_command("apply", OLD, NEW,
+            "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        self.assertEqual(self.git("ls-files", "-s", "--", destination).split()[:3], source_entry)
+        self.assertEqual(self.new_doc.read_bytes(), working)
+        self.assertEqual(self.git("ls-files", "--", source), "")
+
+    def test_document_move_refuses_an_incomplete_staged_blob(self) -> None:
+        row = self.production_row()
+        failed = self.run_command("apply", OLD, NEW, "--to-doc", str(self.new_doc),
+                                  "--to-branch", NEW, wrapper=FAIL_GIT_MOVE_INDEX)
+        self.assertIn("simulated git mv index failure", failed.stderr)
+        journal = self.state / row.id / "rename.json"
+        fields = cast(dict[str, object], json.loads(journal.read_text()))
+        for blob in ({}, {"mode": 100644, "object_id": "blob"},
+                     {"mode": "100644", "object_id": 7},
+                     {"mode": "", "object_id": ""}, None):
+            with self.subTest(blob=blob):
+                fields["staged_blob"] = blob
+                self.write(journal, json.dumps(fields))
+                before = self.file_versions()
+                refused = self.run_command("apply", OLD, NEW,
+                    "--to-doc", str(self.new_doc), "--to-branch", NEW)
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                self.assertIn("the document move journal has an incomplete staged blob", refused.stderr)
+                self.assertEqual(self.file_versions(), before)
 
     def test_invalid_optional_move_name_leaves_no_journal_and_allows_a_corrected_request(self) -> None:
         row = self.production_row()
