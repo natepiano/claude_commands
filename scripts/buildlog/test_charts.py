@@ -14,7 +14,7 @@ from contextlib import closing
 from io import StringIO
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 from urllib.parse import unquote, urlsplit
@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import charts
+import conf
 import costs
 import index
 import moments
@@ -29,6 +30,10 @@ import record
 import test_moments as fixtures
 from test_holds import hold_event
 from test_index import Record, call, ci_job, ci_run
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import write_config_fixture
+else:
+    from scripts.lint.memory_test_support import write_config_fixture
 
 
 REVIEW_HOST = "100.100.100.100"
@@ -62,6 +67,188 @@ class ChartFixture(unittest.TestCase):
             "REVIEW_LINKS_ROOT": str(self.fixture.fixture.root / "review-links"),
             "REVIEW_LINKS_HOST": REVIEW_HOST,
         })))
+
+
+class PageDataTests(ChartFixture):
+    ZONE: ZoneInfo = ZoneInfo("America/New_York")
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": str(self.ZONE)})))
+        clock = cast(mock.Mock, self.enterContext(mock.patch.object(charts, "datetime", wraps=datetime)))
+        cast(mock.Mock, clock.now).return_value = fixtures.END.astimezone(self.ZONE)
+
+    @property
+    def config_file(self) -> Path:
+        return Path(os.environ["CONF_DIR"]) / "buildlog.conf"
+
+    def configure(self, key: str, value: str) -> None:
+        _ = write_config_fixture(self.config_file, key + "=" + value)
+
+    def rows(self, n: int = 3) -> tuple[charts.TopCost, ...]:
+        result = charts.page_data(7, n)
+        if not isinstance(result, charts.PageData) or isinstance(result.top.rows, charts.NoDataYet):
+            self.fail(f"Expected ranked costs, received {result!r}")
+        return result.top.rows
+
+    def test_top_costs_ranks_and_limits_the_recent_window(self) -> None:
+        with closing(self.fixture.connection(
+            fixtures.build("old", -86400, target="old", mem_wait_s=900000),
+            fixtures.build("wait", 10, mem_wait_s=7200),
+            fixtures.build("failure", 20, target="cloud", status=1, duration_s=3600),
+            fixtures.build("cold", 30, target="mac", crates_compiled=50, duration_s=1800),
+        )):
+            rows = self.rows(2)
+        self.assertEqual([(row.machine, row.cause, row.recent) for row in rows], [
+            ("natedev", "Memory wait", charts.MeasuredCost(7200)),
+            ("cloud", "Failed runs", charts.MeasuredCost(3600)),
+        ])
+
+    def test_top_costs_preserves_missing_waits_and_the_mac_upper_bound(self) -> None:
+        with closing(self.fixture.connection(
+            call("eligible", mac="declined", mac_reason="busy", mac_s=0.0),
+            fixtures.build("wait", 7200, mem_wait_s=3600, call_id="eligible"),
+            fixtures.build("missing", 8000, target="cloud", mem_wait_s=None),
+        )):
+            rows = self.rows(10)
+        values = {(row.machine, row.cause): row for row in rows}
+        self.assertEqual(values["cloud", "Memory wait"].recent, charts.CostUnavailable("1 applicable waits missing"))
+        self.assertEqual(values["mac", "Mac idle while natedev waits"].recent, charts.MacIdleUpperBound(0, 3600))
+        self.assertEqual(values["cloud", "Memory wait"].window, charts.WindowMatchesRecent())
+        self.assertEqual(values["mac", "Mac idle while natedev waits"].window, charts.WindowMatchesRecent())
+
+    def test_window_comparison_uses_daily_rates_and_a_strict_half_threshold(self) -> None:
+        with closing(self.fixture.connection(*[
+            fixtures.build(machine + "-recent", 10, target=machine, mem_wait_s=7200)
+            for machine in ("below", "equal", "above", "lower")
+        ], *[
+            fixtures.build(machine + "-old", -86400, target=machine, mem_wait_s=seconds)
+            for machine, seconds in (("below", 30599), ("equal", 30600), ("above", 30601))
+        ])):
+            values = {row.machine: row.window for row in self.rows(10)}
+        self.assertEqual(values["below"], charts.WindowMatchesRecent())
+        self.assertEqual(values["equal"], charts.WindowMatchesRecent())
+        self.assertEqual(values["above"], charts.WindowDiffers(charts.MeasuredCost(37801 / 7)))
+        self.assertEqual(values["lower"], charts.WindowDiffers(charts.MeasuredCost(7200 / 7)))
+
+    def test_page_window_preserves_older_missing_waits(self) -> None:
+        with closing(self.fixture.connection(
+            fixtures.build("missing", -86400, mem_wait_s=None),
+            fixtures.build("recent", 10, mem_wait_s=3600),
+        )):
+            row = self.rows(1)[0]
+        self.assertEqual(row.recent, charts.MeasuredCost(3600))
+        self.assertEqual(row.window, charts.WindowDiffers(charts.CostUnavailable("1 applicable waits missing")))
+
+    def test_window_comparison_preserves_unavailable_states(self) -> None:
+        unknown = (charts.NoDataYet.VALUE, charts.CostUnavailable("missing coverage"))
+        for recent in (charts.MeasuredCost(3600), charts.MacIdleUpperBound(3600, 7200)):
+            for window in unknown:
+                with self.subTest(recent=recent, window=window):
+                    self.assertEqual(charts.window_value(recent, window, 2, 7), charts.WindowDiffers(window))
+        for recent in unknown:
+            with self.subTest(recent=recent):
+                self.assertEqual(charts.window_value(recent, charts.MeasuredCost(3600), 2, 7), charts.WindowMatchesRecent())
+
+    def test_empty_window_keeps_no_data_and_the_user_zone(self) -> None:
+        with closing(self.fixture.connection(fixtures.build("old", -8 * 86400, mem_wait_s=9000))):
+            data = charts.page_data(7)
+        if not isinstance(data, charts.PageData):
+            self.fail(f"Expected an empty window, received {data!r}")
+        result = data.top
+        self.assertEqual(result.rows, charts.NoDataYet.VALUE)
+        self.assertEqual(result.start, fixtures.START.astimezone(self.ZONE))
+        self.assertEqual(result.end, fixtures.END.astimezone(self.ZONE))
+        self.assertEqual((result.start.tzinfo, result.end.tzinfo), (self.ZONE, self.ZONE))
+        self.assertEqual(result.recent_days, 2)
+
+    def test_actions_and_owners_read_the_fixture_config_at_use(self) -> None:
+        self.configure("COST_ACTION_MEMORY_WAIT", "Reduce the fixture memory wait.")
+        self.configure("COST_OWNER_MEMORY_WAIT", "fixture-owner")
+        with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=3600))):
+            first = self.rows(1)[0]
+            self.configure("COST_ACTION_MEMORY_WAIT", "Reduce the new fixture memory wait.")
+            self.configure("COST_OWNER_MEMORY_WAIT", "new-fixture-owner")
+            second = self.rows(1)[0]
+        self.assertEqual(first.action, charts.CostAction("Reduce the fixture memory wait.", "fixture-owner"))
+        self.assertEqual(second.action, charts.CostAction("Reduce the new fixture memory wait.", "new-fixture-owner"))
+
+    def test_missing_or_empty_action_keys_name_the_config_error(self) -> None:
+        source = self.config_file.read_text()
+        with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=3600))):
+            for key in ("COST_ACTION_MEMORY_WAIT", "COST_OWNER_MEMORY_WAIT"):
+                for missing in (True, False):
+                    with self.subTest(key=key, missing=missing):
+                        _ = self.config_file.write_text(source)
+                        if missing:
+                            _ = self.config_file.write_text("\n".join(
+                                line for line in source.splitlines() if not line.startswith(key + "=")
+                            ) + "\n")
+                        else:
+                            self.configure(key, "")
+                        with self.assertRaisesRegex(conf.Unusable, key):
+                            _ = charts.page_data(7)
+
+    def test_page_data_reads_the_index_once_for_charts_and_costs(self) -> None:
+        with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=3600))), \
+             mock.patch.object(costs, "read_costs", wraps=costs.read_costs) as read, \
+             mock.patch.object(index, "read_only", wraps=index.read_only) as opened:
+            row = self.rows(1)[0]
+        self.assertEqual(row.recent, charts.MeasuredCost(3600))
+        self.assertEqual(row.window, charts.WindowDiffers(charts.MeasuredCost(3600 / 7)))
+        read.assert_called_once_with(mock.ANY, fixtures.END - timedelta(days=7), fixtures.END, boundary_context=True)
+        opened.assert_called_once_with()
+
+    def test_window_lengths_come_from_config(self) -> None:
+        self.configure("TOP_COST_RECENT_DAYS", "1")
+        with closing(self.fixture.connection(
+            fixtures.build("recent", 90000, mem_wait_s=3600),
+            fixtures.build("older", 10, mem_wait_s=7200),
+            fixtures.build("outside", -3 * 86400, mem_wait_s=90000),
+        )):
+            result = charts.page_data(4, 1)
+        if not isinstance(result, charts.PageData) or isinstance(result.top.rows, charts.NoDataYet):
+            self.fail(f"Expected ranked costs, received {result!r}")
+        rows = result.top.rows
+        self.assertEqual(rows[0].recent, charts.MeasuredCost(3600))
+        self.assertEqual(rows[0].window, charts.WindowMatchesRecent())
+
+    def test_recent_window_cannot_exceed_the_page_days(self) -> None:
+        self.configure("TOP_COST_RECENT_DAYS", "4")
+        with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=3600))):
+            with self.assertRaisesRegex(conf.Unusable, r"TOP_COST_RECENT_DAYS.*3"):
+                _ = charts.page_data(3)
+
+    def test_page_data_matches_the_existing_chart_calculation(self) -> None:
+        self.targets.return_value = ("natedev", "unused")
+        with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=3600))) as connection:
+            end = fixtures.END.astimezone(self.ZONE)
+            expected = charts.collect_charts(connection, end - timedelta(days=7), end, self.ZONE)
+            actual = charts.page_data(7)
+        if not isinstance(actual, charts.PageData):
+            self.fail(f"Expected page data, received {actual!r}")
+        self.assertEqual(actual.charts, expected)
+        self.assertEqual(charts.cost_value(expected.buckets[0], "unused", "Memory wait"), charts.NoDataYet.VALUE)
+
+    def test_page_data_returns_the_index_error(self) -> None:
+        database = index.index_path()
+        database.parent.mkdir(parents=True, exist_ok=True)
+        for damage, content, reason in (
+            ("absent", None, "unable to open database"),
+            ("corrupt", b"This file is not a SQLite index.", "not a database"),
+        ):
+            if content is not None:
+                _ = database.write_bytes(content)
+            with self.subTest(damage=damage):
+                result = charts.page_data(7)
+                if not isinstance(result, charts.IndexUnavailable):
+                    self.fail(f"Expected the index error, received {result!r}")
+                self.assertIn(reason, result.reason)
+                stderr = StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    self.assertEqual(charts.main([]), 1)
+                self.assertEqual(stderr.getvalue(), f"buildlog charts: index unavailable: {result.reason}\n")
 
 
 class ChartTests(ChartFixture):
