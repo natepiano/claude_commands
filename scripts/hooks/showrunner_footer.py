@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 import os
-import shlex
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,7 +21,7 @@ from user_zone import user_zone_name  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from update_registration import ReportItem as ReportItem, reports_path as reports_path
 from update_registration import QuestionStaff
-from scripts.production import staff
+from scripts.production import showrunners, staff
 
 DAILIES = Path(__file__).resolve().parent.parent / "production" / "dailies_render.py"
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
@@ -74,13 +73,15 @@ def review_pause_path(slug: str) -> Path:
 
 def targeted_instances(session_id: str) -> list[Path]:
     root = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
+    owner = staff.snapshot().by_current_session(session_id)
+    reference = owner.id if owner is not None else session_id
     matches: list[Path] = []
     try:
         for instance in root.iterdir():
             if not instance.name.startswith("showrunner-") or not instance.is_dir():
                 continue
             try:
-                if f"TARGET=session:{session_id}" in (instance / "conf").read_text().splitlines():
+                if f"TARGET=session:{reference}" in (instance / "conf").read_text().splitlines():
                     matches.append(instance)
             except OSError:
                 continue
@@ -90,9 +91,9 @@ def targeted_instances(session_id: str) -> list[Path]:
 
 
 def production_doc(instance_dir: Path) -> Path | None:
-    """The production doc an update timer checks: the last word of its conf's CHECK line."""
-    check = shlex.split(key_values(instance_dir / "conf").get("CHECK", ""))
-    return Path(check[-1]) if check else None
+    """Read the timer owner's document from staff."""
+    checked = showrunners.checked_doc(instance_dir)
+    return checked.path if isinstance(checked, showrunners.CheckedDoc) else None
 
 
 def read_production(instance_dir: Path) -> Production | None:
@@ -112,7 +113,7 @@ def read_production(instance_dir: Path) -> Production | None:
             state = {}
         schedule = (ScheduledDailies(int(state["NEXT_DUE"])) if state.get("ENABLED") == "1"
                     else NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
-        return Production(instance_dir.name.removeprefix("showrunner-"), doc, zone, schedule)
+        return Production(showrunners.production_slug(str(doc)), doc, zone, schedule)
     except (OSError, ValueError, ZoneInfoNotFoundError, KeyError):
         return None
 

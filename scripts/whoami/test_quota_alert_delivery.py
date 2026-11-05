@@ -110,9 +110,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 self.assertEqual(run.call_args.kwargs["timeout"], send_budget.seconds(limit - quota_alert.KILL_GRACE))
 
     def test_failed_codex_reminder_retries_phone_delivery_without_session_alerts(self) -> None:
-        config = quota_alert.load_config()
-        config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        _ = quota_alert.CONFIG.write_text(quota_alert.CONFIG.read_text().replace("threshold_percent=1", "threshold_percent=2"))
         note = self.note("codex1.md", "active", "2")
         self.push_errors.append(quota_alert.PushFailed("fixture offline"))
         log = self.alert([note], self.now)

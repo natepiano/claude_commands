@@ -448,7 +448,7 @@ class AccountMoveTests(ShutdownTestCase):
             result, output, error = self.batch_cli(dry_run=True)
         self.assertEqual((result, error), (0, ""))
         self.assertEqual(checked.call_count, 1, "preview must reuse registration discovery")
-        self.assertIn("missing-runner", output)
+        self.assertIn("missing: no session runs under the id its update timer names", output)
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", output)
         self.assertIn("in any Claude session on", output)
         self.assertIn("--production " + str(doc), output)

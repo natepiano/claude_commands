@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""Delete a wrapped production's reminder state, counts, reports and state folder.
+"""Delete state for wrapped productions without active timers.
 
-Closed question records remain in the production's question folder.
-
-Usage: tidy_wrapped.py <production doc>...
-
-A production with an update timer or a status other than wrapped keeps its state.
+Closed questions remain in their question folders.
 """
 from __future__ import annotations
 
@@ -17,8 +13,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production import staff, unit_lookup
-from scripts.production.store_owner import showrunner_id  # noqa: E402
+from scripts.production import staff, unit_lookup  # noqa: E402
+from scripts.production.store_owner import document_id, showrunner_id  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
@@ -63,7 +59,8 @@ def owned_paths(slug: str, *, identities: QuestionStaff | None = None) -> tuple[
 
 def can_hold_questions(document: Path) -> bool:
     """Check for question storage before reading the staff record."""
-    return issues_folder(document) is not None or any(
+    folder = issues_folder(document)
+    return folder is not None or any(
         path.is_dir() for path in STATE_DIR.glob("*/questions")
     )
 
@@ -118,11 +115,16 @@ def wrapped_slug(doc: Path) -> str:
     slug = doc.name.removesuffix("-production.md")
     if slug == doc.name:
         raise TidyRefused(f"{doc}: production doc name must end in -production.md")
+    if not SLUG.fullmatch(slug) or slug in SHARED:
+        raise TidyRefused(f"{slug!r} is not a production slug")
     lines = doc.read_text(encoding="utf-8").splitlines()
     status = next((line for line in lines if line.startswith("> **Status:")), "")
     if not status.startswith(WRAPPED):
         raise TidyRefused(f"{doc}: not wrapped")
-    if (NOTIFIER_STATE_DIR / f"showrunner-{slug}").exists():
+    record = staff.snapshot()
+    timers = [f"showrunner-{slug}"]
+    timers.append(f"showrunner-{document_id(doc, record=record)}")
+    if any((NOTIFIER_STATE_DIR / name).exists() for name in timers):
         raise TidyRefused(f"{doc}: {slug} still has an update timer")
     return slug
 

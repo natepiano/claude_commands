@@ -287,7 +287,9 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_a_running_production_keeps_every_file(self) -> None:
         own = self.state_files("live")
-        result = self.run_tidy(self.doc("live", "running"))
+        doc = self.doc("live", "running")
+        (self.root / "staff.json").unlink()
+        result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 1)
         self.assertIn("kept: ", result.stderr)
         self.assertIn("live-production.md: not wrapped", result.stderr)
@@ -304,15 +306,52 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_a_wrapped_doc_whose_timer_remains_keeps_every_file(self) -> None:
         own = self.state_files("done")
-        (self.notifier / "showrunner-done").mkdir()
-        result = self.run_tidy(self.doc("done", "wrapped"))
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("done still has an update timer", result.stderr)
+        doc = self.doc("done", "wrapped")
+        owner = staff.rename(self.owner("done").id, "renamed-owner")
+        for name in (f"showrunner-{owner.id}", "showrunner-done"):
+            with self.subTest(timer=name):
+                timer = self.notifier / name
+                timer.mkdir()
+                result = self.run_tidy(doc)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("done still has an update timer", result.stderr)
+                self.assertTrue(all(path.exists() for path in own))
+                timer.rmdir()
+
+    def test_a_wrapped_production_checks_its_legacy_timer(self) -> None:
+        own = self.state_files("unrecorded")
+        doc = self.doc("unrecorded", "wrapped")
+        timer = self.notifier / "showrunner-unrecorded"
+        timer.mkdir()
+        refused = self.run_tidy(doc)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("unrecorded still has an update timer", refused.stderr)
         self.assertTrue(all(path.exists() for path in own))
+        timer.rmdir()
+        result = self.run_tidy(doc)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(path.exists() for path in own))
+
+    def test_missing_or_unreadable_staff_keeps_every_file(self) -> None:
+        own = self.state_files("done")
+        doc = self.doc("done", "wrapped")
+        record = self.root / "staff.json"
+        record.unlink()
+        for state, reason in (("missing", "No such file"), ("unreadable", "invalid staff JSON:")):
+            with self.subTest(staff=state):
+                if state == "unreadable":
+                    _ = self.write(record, "{invalid")
+                result = self.run_tidy(doc)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("kept: cannot read staff record", result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertTrue(all(path.exists() for path in own))
 
     def test_a_slug_naming_a_shared_folder_deletes_nothing(self) -> None:
         own = self.state_files("live")
-        result = self.run_tidy(self.doc("outstanding", "wrapped"))
+        doc = self.doc("outstanding", "wrapped")
+        (self.root / "staff.json").unlink()
+        result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 1)
         self.assertIn("'outstanding' is not a production slug", result.stderr)
         self.assertTrue(all(path.exists() for path in own))

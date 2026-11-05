@@ -5793,8 +5793,9 @@ class Ledger:
             except UnicodeDecodeError:
                 self._site_rule_families[blob] = "unreadable"
                 continue
-            if match := re.search(r"(?m)^family:[ \t]*(names|values|types|modules)[ \t]*$", source):
-                self._site_rule_families[blob] = match[1]
+            family = rule_catalog.pinned_family(source)
+            if isinstance(family, str):
+                self._site_rule_families[blob] = family
         grouped: dict[tuple[str, str], list[Judgment]] = {}
         self._site_holding_rows.clear()
         self._inactive_site_holders = set(cast(list[tuple[str, str]], self._connection.execute(

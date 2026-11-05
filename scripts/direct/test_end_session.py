@@ -147,6 +147,8 @@ class EndSessionTests(unittest.TestCase):
             owner = next(row for row in membership.find(kind="showrunner") if row.name == "end-owner")
             parent = fixture_member("unit", name="other-unit", parent=owner.id,
                                     runtime_id=fixture_runtime_id(director))
+        _ = (run / "progress_history_state.json").write_text(
+            json.dumps({"owner_staff_id": parent.id}), encoding="utf-8")
         member = fixture_worker(name, parent.id)
         _ = (run / "mesh_roster.json").write_text(json.dumps({name: {"staff_id": member.id, "status": "done"}}))
         return run
