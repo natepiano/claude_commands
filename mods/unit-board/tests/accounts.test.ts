@@ -310,6 +310,44 @@ function hasSensitivePath(paths: readonly string[]) {
   return paths.some(path => /(?:\.claude\.json|auth\.json|id_token)/.test(path));
 }
 describe('accounts table', () => {
+  for (const columns of [140, 50]) {
+    test(`${columns} cells: a partial move shows actual counts and selected empty roles`, async ($, on) => {
+      const fake = accountsHost(on);
+      const data = statusFixture();
+      const base = data.accounts[0]!;
+      data.accounts = [
+        { ...base, label: 'claude2', roles: ['units', 'showrunners'], selected_roles: ['units', 'showrunners'],
+          role_counts: [{ busy: 1, shell: 0, idle: 0, total: 1 }, { busy: 0, shell: 0, idle: 0, total: 0 }] },
+        { ...base, label: 'claude4', roles: ['units'], selected_roles: [],
+          role_counts: [{ busy: 1, shell: 1, idle: 1, total: 3 }] },
+      ];
+      data.problems = [];
+      fake.replace(data);
+      await $.command.run(command());
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane',
+        surface: 'terminal', props: { ...props, bodyColumns: columns } });
+      const tree = await ui.drawn();
+      const selected = normalized(accountLines(tree, 'claude2')).replace(/ · /g, ' ');
+      const previous = normalized(accountLines(tree, 'claude4')).replace(/ · /g, ' ');
+      expect(selected).toContain('units ✓');
+      expect(selected).toContain('showrunners ✓');
+      expect(previous).toContain('units');
+      expect(previous).not.toContain('✓');
+      if (columns === 140) {
+        expect(selected).toContain('units ✓ 1 0 0 1');
+        expect(selected).toContain('showrunners ✓ 0 0 0 0');
+        expect(previous).toContain('units 1 1 1 3');
+      } else {
+        expect(selected).toContain('role units ✓ busy 1 shell 0 idle 0 total 1');
+        expect(selected).toContain('role showrunners ✓ busy 0 shell 0 idle 0 total 0');
+        expect(previous).toContain('role units busy 1 shell 1 idle 1 total 3');
+      }
+      const lines = rowLines(tree);
+      const total = lines.findIndex(line => line.trim().startsWith('total'));
+      expect(normalized(lines.slice(total))).toContain(columns === 140 ? 'total 2 1 1 4' : 'total busy 2 · shell 1 · idle 1 · total 4');
+    });
+  }
+
   for (const upcoming of [
     ['Upcoming moves:', 'showrunners 1: at 1% → claude3, else claude2', '', 'units 1: at 1% → claude4', '', 'workers 1: at 1% → codex2'],
     ['Upcoming moves: none'],

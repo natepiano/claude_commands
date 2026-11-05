@@ -45,8 +45,10 @@ Usage reads use the home that holds the login.
 A noted account without a usable home has a `not set up` row when no home holds its login.
 Each role has a separate row.
 The first role row shows the account's values.
-Later rows show only the role.
-The text table keeps its existing columns and has no session counts.
+Later rows show only the role and its counts.
+The text table puts counts in the Role cell, such as `units ✓ 21 (busy 5, shell 1, idle 15)`.
+A role appears on each account where its members run.
+`✓` marks its selected account, including when it has zero members.
 An account with one role or no role keeps its existing row.
 In a terminal:
 
@@ -58,7 +60,7 @@ In a terminal:
 | --- | --- |
 | Folder | The account folder. |
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
-| Role | One role per row: `units`, `showrunners`, `workers`, or `spare`. |
+| Role | One observed role per row, with activity counts. `✓` marks its selected account. |
 | Weekly left | Percent of the weekly window left. A dash when the account has no weekly window. |
 | Weekly resets | When the weekly window resets. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
@@ -72,7 +74,7 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 `status --json` prints `{"accounts": [...], "upcoming_moves": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the problem lines below the normal table.
 `upcoming_moves` contains the rendered upcoming move lines, including the heading.
 
-Each account has `label`, `tool` (`claude` or `codex`), `roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles are a list, so one Claude account can hold both `units` and `showrunners`; Codex roles are `workers` or `spare`. Each `role_counts` entry counts local members for the role at the same index, as `{busy, shell, idle, total}`: a Claude session takes its session-record state, and a Codex worker is busy while its turn runs or starts, else idle, with a null `shell`. `spare` has a null entry. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
+Each account has `label`, `tool` (`claude` or `codex`), `roles`, `selected_roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles include observed members and selected roles with zero members. `selected_roles` identifies the selected account independently. Codex roles are `workers` or `spare`. Each `role_counts` entry counts local members for the role at the same index, as `{busy, shell, idle, total}`: a Claude session takes its session-record state; a stopped member uses `shell`, and a Codex worker is busy while its turn runs or starts, else idle, with a null `shell`. `spare` has a null entry. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
@@ -82,8 +84,17 @@ The first role row includes all account values.
 Later rows show only the role and its counts.
 For example, `units` can have a busy count of `3`, followed by `showrunners` with `2`.
 Spare counts are blank.
-Claude session records supply `busy`, `shell`, or `idle`.
+Running Claude session records supply `busy` during a turn.
+Other running Claude sessions count as idle, including records with an old `shell` state.
+A missing messaging socket does not make a running Claude session count as shell.
+A stopped staff member counts as `shell` on its last saved launch account.
+Live process account settings take precedence over saved launch accounts.
+The Mac reads those settings through the kernel, without a subprocess for each member.
+Members without an observed account are not assigned to the selected account.
+The detail view uses the same count snapshot as the main table.
 Missing or unknown activity counts as idle.
+Codex workers count only when their recorded port belongs to a live server.
+Old roster entries without a server port do not count.
 Codex workers count as busy for `running` or `starting`, and idle otherwise.
 Codex shell counts are unknown and stay blank.
 The last row sums known counts across all accounts and roles.
@@ -93,7 +104,7 @@ The board has no `in use` or `read` column or fact.
 Failed reads and old readings appear in Problems.
 The dot stays red until the account has a current reading without a read failure.
 
-Counts use local session records, saved launches, staff membership, notifier registrations, and mesh records.
+Counts read local session records, saved launches, staff membership, notifier registrations, and mesh records once per status read.
 `session-counts-read` prints live local counts without a file write.
 Status reads compute local counts without a file write.
 Every board read starts a background fetch of the other machine's counts through the shared role-map transport.

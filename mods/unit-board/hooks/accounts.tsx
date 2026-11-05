@@ -37,7 +37,8 @@ function machineRoleCounts(account: StoredAccount, role: string, index: number):
 
 export function accountDisplay(account: StoredAccount): AccountDisplay {
   return {
-    label: account.label, roles: account.roles,
+    label: account.label, roles: account.roles.map(role =>
+      account.selected_roles?.includes(role) ? `${role} ✓` : role),
     roleCounts: account.roles.map((role, index) => machineRoleCounts(account, role, index)),
     weekly: reading(account.weekly_left_percent), resets: reading(account.resets_at),
     credits: account.credits === null ? { kind: 'unavailable' }
