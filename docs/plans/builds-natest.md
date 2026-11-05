@@ -424,48 +424,28 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 16 — `/test_times top` ranks the slow tests of the calling session's repository  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** In a hana session, `/test_times top` with no arguments ranks hana's slowest nextest tests. In a ~/.claude session it shows today's module view.
-
-**Spec:** The user approved this on 2026-11-04 through the builds showrunner. First consumer: hana's fastest unit (tool-based-ui production), Phase 5c.
-
-The recording exists: `buildlog/parse.test_results` keeps each nextest test that failed, was retried, took over `SLOW_TEST_S` (1.0 s) or was reported SLOW. `buildlog/index.py` puts these rows in the `tests` table, with `step_id`, `host`, `binary`, `test`, `status`, `duration_s`. On 2026-11-04 the index held 1.29 M hana rows from natedev and 294 k Mac rows. Each `steps` row has `repo_identity` (the origin URL key, from `record.recorded_repository_key`).
-
-1. Scope: `show.py top` with no `--repo` finds the repository of the working directory. It uses `buildlog.record.recorded_repository_key` (no copy). When the identity is the ~/.claude repository, `top` shows today's gate module view. Otherwise `top` ranks the nextest tests of steps with that `repo_identity`, on the current host, within `TOP_MAX_AGE_DAYS`.
-2. Rank: one row per `binary` and `test`: the median `duration_s` of its passed runs, the count of runs kept, the count of failed and timed-out runs, and the last run time. Sort by median, descending. A test with only failed runs ranks after the others by its last time. The heading names the repository, the host and the threshold.
-3. Mac rows: a Mac nextest step records `repo_identity` `unknown` (its mirror has no origin). The index gives a Mac step the `repo_identity` of the natedev call it served: `steps.call_id` joins `calls.id`, and `calls` gives `repo_path`; take the identity from the natedev step or `ssh_attempts` row of the same call. Do this at index time, once per row, not in `show.py`.
-4. Speed: `top` for hana answers in under 0.5 s on a warm index. Today a join over `tests` and `steps` takes 1.6 s. Add the column or index the query needs in `index.py`. Measure before and after. Importing `record` adds about 20 ms to `show.py`; when it adds more, report it, so a light module can hold the key function.
-5. Config: `config/test_times.conf` gets `NEXTEST_SLOW_TEST_S=1.0` (the recording threshold) with a basis line. `parse.py` reads it at use, in place of its constant. A new key needs no go; a changed or deleted key goes to the showrunner for the user.
-6. Cost: measure the time that `test_results` and the `tests` insert add to one hana nextest step (a log of about 2,000 tests). Write it in the As-built.
-7. Docs: `commands/test_times.md` says what `top` shows in each kind of repository.
+- `show.py top` with no `--repo` takes the root from `treekey.worktree`, then the identity from `record.recorded_repository_key`. The ~/.claude repository keeps the gate module view. Any other repository ranks its nextest tests for one host (`--host`, default `store.host_name()`).
+- Rank: one row per `binary` and `test`, keyed `(not passed, -median, binary, test)`. A test with no recorded duration shows `DurationNotRecorded`. The heading names the repository, the host and the threshold.
+- `parse.py` reads `NEXTEST_SLOW_TEST_S` (1.0) from `config/test_times.conf` through `nextest_slow_test_s()`.
+- `index.py`: the step owns the identity. `tests.repo_identity`, `tests_step` and `tests_repository_history` are gone. `steps.identity_derived` marks a derived identity. `resolve_mac_repositories(connection, touched_calls)` runs one `UPDATE ... INDEXED BY steps_call` for the calls that the update read: it takes the identity of a recorded step of the same call and `repo_path`, else of the call's `ssh_attempts` row. `open_for_update` recreates missing indexes; `update_in(root)` and `update_lock_in(root)` serve a scratch root.
+- `width_trial.report` builds a missing index through `update_in`.
+- Measured: a 1,939-test hana log keeps 606 rows; `test_results` 11.0 ms plus 7.2 ms insert per step. One Mac step update 33 ms, resolver 0.30 ms. Warm hana top 0.25 s on 1.8 M rows (was 1.6 s). Importing `record` costs 49.7 ms cold in `show.py`.
 
 **Files:**
-- `scripts/test_times/show.py`, `scripts/test_times/test_show.py` — the scope and the ranking
-- `scripts/buildlog/index.py`, `scripts/buildlog/test_index.py` — the Mac identity and the query index
-- `config/test_times.conf` — `NEXTEST_SLOW_TEST_S`
-- `scripts/buildlog/parse.py` — the threshold read (report-unit's file; see the showrunner answer)
-- `scripts/buildlog/test_parse.py` — the parser tests, with a private threshold config
-- `commands/test_times.md` — the doc line
+- `scripts/test_times/show.py`, `scripts/test_times/test_show.py` — scope, host and ranking
+- `scripts/buildlog/index.py`, `scripts/buildlog/test_index.py` — derived identity, query indexes
+- `scripts/buildlog/parse.py`, `scripts/buildlog/test_parse.py` — the threshold read
+- `scripts/buildlog/width_trial.py`, `scripts/buildlog/test_width_trial.py` — missing index build
+- `config/test_times.conf`, `config/README.md`, `commands/test_times.md` — key and docs
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `show.py`, `index.py`, `parse.py`, `config/test_times.conf`, `commands/test_times.md`
-- `test` — `test_show.py`, `test_index.py`, `scripts/buildlog/test_parse.py` (a private config fixture for `NEXTEST_SLOW_TEST_S`), from the Spec: a fixture index with steps of two repositories ranks only the calling repository; a ~/.claude working directory keeps the module view; a Mac step whose call came from a hana natedev call ranks under hana; a test with only failed runs ranks last
+**Binds later work:**
+- Keep the derived-identity rule for old rows. A step with a recorded identity has `identity_derived = 0`, and the resolver never changes it.
+- A query that looks up steps by call uses `INDEXED BY steps_call`.
 
-**State:** `steps.repo_identity` for Mac rows changes from `unknown` to the served call's identity. The `tests` table gains what the query needs. A schema change makes a new index file (Phase 10), so the first command after the merge rebuilds the index.
-
-**Constraints from prior phases:**
-- Phase 10: each schema keeps its own index file.
-- Phase 14: `top` ranks gate modules by the median of valid runs; `TOP_RUNS`, `TOP_CHECKOUT` and `TOP_MAX_AGE_DAYS` are in `config/test_times.conf`.
-- Phase 17: keep `remove_index()` (sidecars first, main file last), `LEGACY_INDEX_NAME`, `cleanup_unused_indexes(root, current, settings)` and the hourly mtime stamp in `update()`. The cleanup, sidecar and interrupted-removal tests in `test_index.py` stay green.
-- A live `show.py top` that rebuilds or updates the index holds the live `index.lock`. A run on 2026-11-04 held it 35 minutes. Acceptance runs never use the live root without a timeout.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/test_times -p 'test_show.py'` green
-- `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` green
-- `python3 -m unittest discover -s scripts/buildlog -p 'test_parse.py'` green
-- from `~/rust/hana`, the candidate checkout's `show.py top` against a scratch `BUILDLOG_DIR` with copied logs, under `timeout 600`: measure the rebuild once, then the warm query lists hana nextest tests in under 0.5 s
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- A correlated identity lookup per call planned through `steps_host_started` and held the live `index.lock` for 5 s and more. The resolver now reads only touched calls.
 
 ### Phase 17 — The build log keeps only the index files that a checkout used in the last day  · status: done
 
