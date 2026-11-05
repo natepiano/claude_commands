@@ -37,7 +37,8 @@ function machineRoleCounts(account: StoredAccount, role: string, index: number):
 
 export function accountDisplay(account: StoredAccount): AccountDisplay {
   return {
-    label: account.label, roles: account.roles,
+    label: account.label, roles: account.roles.map(role =>
+      account.selected_roles?.includes(role) ? `${role} ✓` : role),
     roleCounts: account.roles.map((role, index) => machineRoleCounts(account, role, index)),
     weekly: reading(account.weekly_left_percent), resets: reading(account.resets_at),
     credits: account.credits === null ? { kind: 'unavailable' }
@@ -246,6 +247,9 @@ export function AccountsView(elements: PaneElements, columns: number, status: St
   </Box>;
   return <Box flexDirection="column">
     {rows.map(drawLine)}
+    {status.upcoming_moves && <Box flexDirection="column" marginTop={1}>
+      {status.upcoming_moves.flatMap(line => line ? wrapLine([span(line)], width) : [[]]).map(drawLine)}
+    </Box>}
     {status.problems.length > 0 && <Box flexDirection="column" marginTop={1}>
       {wrapLine([span('Problems', 'default', 'bold')], width).map(drawLine)}
       {status.problems.flatMap(problem => wrapLine([span(`• ${problem}`, 'warning')], width)).map(drawLine)}
