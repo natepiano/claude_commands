@@ -144,6 +144,7 @@ class RemoveWorkersTest(unittest.TestCase):
             STUB_ACCOUNTS=str(self.account_log),
             CLAUDE_CODE_SESSION_ID=fixture_runtime_id(caller) if caller else "",
             SHUTDOWN_STATE_DIR=str(self.state_root),
+            PROCESS_TABLE_PS="true",
         )
         command = [sys.executable, str(SCRIPT), "--run-root", str(self.root)]
         for run in [session_dir] if isinstance(session_dir, Path) else session_dir or []:
