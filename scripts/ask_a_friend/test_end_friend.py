@@ -1,71 +1,115 @@
 """Consultation status requires confirmed absence or a successful stop."""
 from __future__ import annotations
 
+import argparse
+import io
 import os
-from pathlib import Path
-import shutil
-import subprocess
-from typing import override
+from contextlib import redirect_stderr, redirect_stdout
+from typing import cast
+from unittest.mock import patch
 
-from scripts.production import staff
-from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_session
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.agents import codex_mesh
+from scripts.production import staff, worker_fill
+from scripts.production.staff_test_support import StaffTestCase, fixture_worker
+from scripts.shutdown import stop_resume
 
 
 class EndFriendTests(StaffTestCase):
-    scripts: Path = Path()
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.scripts = self.root / "scripts"
-        for folder in ("ask_a_friend", "lib", "production", "agents", "shutdown"):
-            (self.scripts / folder).mkdir(parents=True)
-        _ = shutil.copyfile(CHECKOUT / "scripts/ask_a_friend/end_friend.sh", self.scripts / "ask_a_friend/end_friend.sh")
-        for name in ("lib/py", "production/worker_fill.py"):
-            (self.scripts / name).symlink_to(CHECKOUT / "scripts" / name)
-        for name in ("agents/codex_mesh.py", "shutdown/shutdown.py"):
-            _ = (self.scripts / name).write_text('''import os, sys
-from pathlib import Path
-with Path(os.environ["STOP_LOG"]).open("a") as output:
-    output.write(sys.argv[1] + "\\n")
-raise SystemExit(1 if sys.argv[1] == "stop" else 0)
-''')
-
     def test_status_changes_only_after_confirmed_absence_or_successful_stop(self) -> None:
-        _, unit, worker = self.tree()
-        for case in ("absent", "unreadable", "claude-stop-failed", "codex-stop-failed"):
+        _, unit, _ = self.tree()
+        for case in ("absent", "unreadable", "claude-stop-failed", "codex-stop-failed", "claude-stopped", "codex-stopped"):
             with self.subTest(case=case):
+                backend = staff.CodexBackend(self.root / "codex") if case.startswith("codex") else staff.ClaudeBackend()
+                worker = fixture_worker("friend-" + case, unit.id, backend=backend)
                 run = self.root / case
                 run.mkdir()
                 _ = (run / "consult_agent").write_text("launched\n")
                 _ = (run / "friend_name").write_text("missing" if case == "absent" else worker.name)
                 status = run / "status"
                 _ = status.write_text("running\n")
-                stop_log = run / "stop-log"
+                stopped: list[str] = []
                 before = self.staff_file.read_bytes()
                 if case == "unreadable":
                     _ = self.staff_file.write_text("{broken")
-                elif case == "codex-stop-failed":
-                    fixture_session(worker.current_session, staff.CodexBackend(self.root / "codex"))
-                else:
-                    fixture_session(worker.current_session, staff.ClaudeBackend())
+
+                def stop(reference: str) -> stop_resume.Stopped | stop_resume.StopFailed:
+                    self.assertEqual(reference, worker.id)
+                    self.assertEqual(status.read_text(), "running\n")
+                    stopped.append("stop")
+                    return (stop_resume.StopFailed(reference, "fixture stop failed") if case.endswith("failed")
+                            else stop_resume.Stopped(worker.current_session, 987654))
+
+                def end(args: argparse.Namespace) -> int:
+                    self.assertEqual((cast(str, args.session_dir), cast(str, args.to)), (str(run), worker.name))
+                    self.assertEqual(status.read_text(), "running\n")
+                    stopped.append("end")
+                    return 0
+
+                def stop_server(args: argparse.Namespace) -> int:
+                    self.assertEqual(cast(str, args.session_dir), str(run))
+                    self.assertEqual(status.read_text(), "running\n")
+                    stopped.append("stop")
+                    return int(case.endswith("failed"))
+
                 try:
-                    result = subprocess.run(["bash", str(self.scripts / "ask_a_friend/end_friend.sh"), str(run)],
-                        env={**os.environ, "CODEX_THREAD_ID": unit.current_session, "STOP_LOG": str(stop_log)},
-                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
-                    self.assertEqual(result.returncode == 0, case == "absent", result.stdout + result.stderr)
-                    self.assertEqual(status.read_text(), "ended\n" if case == "absent" else "running\n")
-                    self.assertEqual(stop_log.exists(), case.endswith("stop-failed"))
+                    with (patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session}),
+                          patch.object(stop_resume, "stop", side_effect=stop),
+                          patch.object(codex_mesh, "command_end", side_effect=end),
+                          patch.object(codex_mesh, "command_stop", side_effect=stop_server),
+                          redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                        code = worker_fill.main(["end-friend", "--run", str(run)])
+                    ended = case == "absent" or case.endswith("stopped")
+                    self.assertEqual(code == 0, ended, output.getvalue() + errors.getvalue())
+                    self.assertEqual(status.read_text(), "ended\n" if ended else "running\n")
+                    self.assertEqual(stopped, [] if case in ("absent", "unreadable")
+                                     else ["end", "stop"] if case.startswith("codex") else ["stop"])
                 finally:
                     _ = self.staff_file.write_bytes(before)
 
-    def test_member_without_absence_option_still_refuses_a_missing_worker(self) -> None:
+    def test_codex_cleanup_retries_the_server_stop_after_the_worker_end_fails(self) -> None:
         _, unit, _ = self.tree()
-        result = subprocess.run([str(CHECKOUT / "scripts/lib/py"),
-            str(CHECKOUT / "scripts/production/worker_fill.py"), "member", "--name", "missing"],
-            env={**os.environ, "CODEX_THREAD_ID": unit.current_session}, capture_output=True,
-            text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stdout, "")
-        self.assertIn("no worker staff row", result.stderr)
+        for retired in (False, True):
+            with self.subTest(retired=retired):
+                worker = fixture_worker("friend-retry-" + str(retired), unit.id,
+                                        backend=staff.CodexBackend(self.root / "codex"))
+                run = self.root / worker.name
+                run.mkdir()
+                _ = (run / "consult_agent").write_text("launched\n")
+                _ = (run / "friend_name").write_text(worker.name)
+                _ = (run / codex_mesh.SERVER_FILE).write_text('{"pid":987654,"port":4101}')
+                status = run / "status"
+                _ = status.write_text("running\n")
+                stops: list[str] = []
+
+                def end(args: argparse.Namespace) -> int:
+                    self.assertEqual(cast(str, args.to), worker.name)
+                    if retired:
+                        _ = staff.retire(worker.id)
+                        return 0
+                    raise SystemExit("codex_mesh: fixture worker has no roster entry")
+
+                def stop_server(args: argparse.Namespace) -> int:
+                    self.assertEqual(cast(str, args.session_dir), str(run))
+                    self.assertEqual(status.read_text(), "running\n")
+                    stops.append("stop")
+                    return int(len(stops) == 1)
+
+                with (patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session}),
+                      patch.object(codex_mesh, "command_end", side_effect=end),
+                      patch.object(codex_mesh, "command_stop", side_effect=stop_server),
+                      redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                    self.assertEqual(worker_fill.main(["end-friend", "--run", str(run)]), 1)
+                    self.assertEqual(status.read_text(), "running\n")
+                    self.assertEqual(stops, ["stop"])
+                    self.assertEqual(worker_fill.main(["end-friend", "--run", str(run)]), 0)
+                self.assertEqual(stops, ["stop", "stop"])
+                self.assertEqual(status.read_text(), "ended\n")
+
+    def test_member_refuses_a_missing_worker(self) -> None:
+        _, unit, _ = self.tree()
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session}),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = worker_fill.main(["member", "--name", "missing"])
+        self.assertEqual(code, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("no worker staff row", errors.getvalue())

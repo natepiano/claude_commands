@@ -57,39 +57,35 @@ if [[ ! "${MESH_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
 fi
 
 WORKER_FILL="$(dirname "${BASH_SOURCE[0]}")/../production/worker_fill.py"
-OPENING_ROLE="${AGENT_BG_ROLE:-${UNIT_TEAM_ROLE:-}}"
+close_switch_fds() { exec {SWITCH_READ}<&- {SWITCH_WRITE}>&-; }
 switch_signal() {
   printf '%s\n' "$1" >&"$SWITCH_WRITE"
   if [[ "$1" == dispatched ]]; then
-    exec {SWITCH_READ}<&- {SWITCH_WRITE}>&-
+    close_switch_fds
     wait "$SWITCH_PID" || return "$?"
     trap - EXIT INT TERM HUP
-    ADMISSION_ACTIVE=0
+    SWITCH_PID=""
   else
     local reply
-    read -r -u "$SWITCH_READ" reply || return 2
-    if [[ "$reply" == failed ]]; then
-      wait "$SWITCH_PID" || return "$?"
-      return 2
-    fi
+    read -r -u "$SWITCH_READ" reply NATIVE_ID || { wait "$SWITCH_PID"; return 2; }
     [[ "$reply" == published ]] || return 2
     WORKER_PUBLISHED=1
   fi
 }
 
-ADMISSION_ACTIVE=0
+SWITCH_PID=""
 WORKER_PUBLISHED=0
 if [[ "$ATTACH" == 0 ]]; then
   coproc ADMISSION { exec "$PY" "$WORKER_FILL" coordinate-claude --name "$MESH_NAME" --run "$ADMISSION_RUN" \
-    --role "$OPENING_ROLE" --prompt "$PROMPT_FILE" --staff-id "${WORKER_STAFF_ID:-}"; }
+    --prompt "$PROMPT_FILE" --staff-id "${WORKER_STAFF_ID:-}"; }
   SWITCH_PID=$ADMISSION_PID
   exec {SWITCH_READ}<&"${ADMISSION[0]}" {SWITCH_WRITE}>&"${ADMISSION[1]}"
   close_switch() {
     local status=$?
-    exec {SWITCH_READ}<&- {SWITCH_WRITE}>&-
+    close_switch_fds
     kill "$SWITCH_PID" 2>/dev/null || true
     wait "$SWITCH_PID" 2>/dev/null || true
-    if [[ "$ATTACH" == 0 && "$WORKER_PUBLISHED" == 0 && -n "${BG_ID:-}" ]]; then
+    if [[ "$WORKER_PUBLISHED" == 0 && -n "${BG_ID:-}" ]]; then
       "$CLAUDE_BIN" stop "$BG_ID" || echo "staff: ${MESH_NAME}: ${BG_ID}: cleanup unproved" >&2
     fi
     exit "$status"
@@ -106,51 +102,15 @@ if [[ "$ATTACH" == 0 ]]; then
     *) exit 2 ;;
   esac
   read -r -u "$SWITCH_READ" PROMPT_FILE || exit 2
-  ADMISSION_ACTIVE=1
 fi
 
-publish_worker() {
-  # The launch banner can arrive before the registry entry.
-  source "$NIX_ENV_LIB/conf.sh"
-  local register_wait
-  register_wait="$(conf_value direct CLAUDE_WORKER_REGISTER_WAIT_SECS)" || return 2
-  NATIVE_ID="$(BG_ID="$BG_ID" "$PY" - "$WORKER_FILL" "$register_wait" <<'PYREG'
-import sys
-import os
-import time
-from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
-from scripts.message import sessions
-from scripts.production import staff
-wait_seconds = int(sys.argv[2])
-deadline = time.monotonic() + wait_seconds
-while True:
-    registry = sessions.read_registry()
-    if registry.unreadable:
-        raise SystemExit("staff: registry is incomplete; native identity not published")
-    found = [item.record for item in registry.entries
-             if item.record["sessionId"].startswith(os.environ["BG_ID"])
-             and sessions.running_session(item.record)]
-    remaining = deadline - time.monotonic()
-    if found or remaining <= 0:
-        break
-    time.sleep(min(0.1, remaining))
-if len(found) != 1:
-    waited = f" (waited {wait_seconds}s)" if not found else ""
-    raise SystemExit("staff: backend has no unique live registry identity" + waited)
-row = found[0]
-if staff.runtime_id(row["pid"]) != row["sessionId"]:
-    raise SystemExit("staff: Claude process changed during publication")
-print(row["sessionId"])
-PYREG
-)" || return 2
-  switch_signal "$NATIVE_ID"
-}
-
 if [[ "${ATTACH}" == "1" ]]; then
-  read -r FAMILY NATIVE_ID REFERENCE < <("$PY" "$WORKER_FILL" member --run "$ADMISSION_RUN" --name "$MESH_NAME" --staff-id "${WORKER_STAFF_ID:-}")
-  [[ "$FAMILY" == claude ]] || exit 2
-  [[ "$ADMISSION_ACTIVE" == 0 ]] || switch_signal "$NATIVE_ID"
+  if [[ -n "$SWITCH_PID" ]]; then
+    switch_signal attached
+  else
+    read -r FAMILY NATIVE_ID < <("$PY" "$WORKER_FILL" member --run "$ADMISSION_RUN" --name "$MESH_NAME" --staff-id "${WORKER_STAFF_ID:-}")
+    [[ "$FAMILY" == claude ]] || exit 2
+  fi
   BG_ID="${NATIVE_ID:0:8}"
   transcript_count() {
     NATIVE_ID="${NATIVE_ID}" "$PY" - <<'PY'
@@ -223,7 +183,7 @@ if [[ -n "${EFFORT}" ]]; then
   launch_args+=(--effort "${EFFORT}")
 fi
 
-banner="$(if [[ "$ADMISSION_ACTIVE" == 1 ]]; then exec {SWITCH_READ}<&- {SWITCH_WRITE}>&-; fi
+banner="$(close_switch_fds
           cd "${WORKING_DIR}" \
             && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u MODELS_CONFIG_FILE \
                    -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS -u CLAUDE_CODE_CHILD_SESSION \
@@ -239,9 +199,7 @@ if [[ -z "${BG_ID}" ]]; then
   printf '%s\n' "${banner}" >&2
   exit 1
 fi
-if ! publish_worker; then
-  exit 2
-fi
+switch_signal "$BG_ID" || exit 2
 fi
 
 SEND_SCRIPT="${AGENT_BG_SEND_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/../message/send.py}"
@@ -251,7 +209,7 @@ if [[ "$delivery" != SENT:* && "$delivery" != SKIPPED:* ]]; then
   exit 2
 fi
 
-[[ "$ADMISSION_ACTIVE" == 0 ]] || switch_signal dispatched || exit 2
+[[ -z "$SWITCH_PID" ]] || switch_signal dispatched || exit 2
 
 if [[ "$ATTACH" == 1 ]]; then
   if [[ -n "${UNIT_RUN_DIR:-}" && -n "${UNIT_TEAM_ROLE:-}" ]]; then
@@ -299,14 +257,9 @@ except (json.JSONDecodeError, ValueError):
     sys.exit(0)
 for row in rows:
     if row.get("id") == wanted:
-        # Prefer current busy state over an older lifecycle state.
-        status = row.get("status")
-        if status:
-            print(status)
-        else:
-            state = row.get("state")
-            print({"working": "busy", "done": "idle", "blocked": "idle"}.get(
-                state, state or "unknown"))
+        state = row.get("state")
+        print(row.get("status") or {"working": "busy", "done": "idle", "blocked": "idle"}.get(
+            state, state or "unknown"))
         break
 else:
     print("gone")

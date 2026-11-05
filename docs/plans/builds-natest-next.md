@@ -1,6 +1,6 @@
 # builds-natest — Next
 
-The phase backlog of natest-unit. At each phase end, re-sort with `python3 ~/.claude/scripts/test_times/show.py top`, and the next speed phase takes the top live module that no phase holds.
+The phase backlog of natest-unit. At each phase end, rank modules with `python3 ~/.claude/scripts/test_times/show.py top --repo ~/.claude`. The next speed phase takes the highest ranked live module that no phase holds, subject to the floor rule.
 
 ## Descending sort
 
