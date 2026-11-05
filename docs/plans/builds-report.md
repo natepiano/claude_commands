@@ -595,3 +595,57 @@ Director decision: a record with no pair is unknown for both columns, old record
 - A test through `build_shape.recorded_output_roots` on an index built by `index.update()` proves that such a row adds no `(folder, folder)` pair.
 - `scripts.buildlog.test_index`, `test_step_row`, `test_record`, `test_disk` and `scripts.lint.test_build_shape` green with and without `PYTHONPATH`.
 - `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py`: 0 errors, 0 warnings, 0 notes.
+
+### Phase 28 — A verify.sh step takes its output folders from verify.sh's Cargo metadata  · status: done
+**Depends on:** Phase 19 (the reader), the verify remake on builds (in 4e99c554b)
+
+From next items ("The recorder takes the build folders from verify.sh", source Phase 16 simplify item 11). From the builds showrunner (not the user), 2026-11-05: start it from 4e99c554b; report-unit owns both sides, verify.sh included. Tell verify-unit at the start.
+
+Director decisions:
+- The evidence is one fingerprint of the Cargo inputs that decide the two folders. verify.sh computes it once beside its metadata read; the recorder computes it again at step end for the step's own command. Equal fingerprints mean the step would read the same metadata; any difference uses the Phase 19 reader.
+- `invoke.sh` does not change: the recorder reads the exported value directly.
+- From the user (via the showrunner), 2026-11-05: "keep the check." (Question: keep the folder-match check in the build step recorder?)
+- `rustc -V` stays as it is. This phase removes only the `cargo metadata` read.
+- Merge gate (2026-11-05): suite tests start no real Cargo; `merge_gate.py` puts a Cargo tripwire first on `PATH`, and 12 `VerifyOutputEvidenceTests` cases failed on it. These cases use a fake `cargo` that logs each call and answers `cargo metadata` with fixed folders, as `StepOutputFolderTests` does. Real-Cargo runs stay in the worker's evidence, outside the suite.
+- Review round 1 (2026-11-05): the export is made only at a real `cargo metadata` read; a reuse of the saved metadata keeps that export. The check moves into `step_output_roots`, and its helpers are private. A step with `--manifest-path`, `--config` or `--target-dir` never matches, because the export comes from a plain `cargo metadata`; so the evidence reads no manifest folder and no `--config` file. The metadata decode and the Cargo config folder list each have one home in `scripts/lib`.
+
+#### Work Order
+
+**Goal:** A step that verify.sh runs takes `workspace_root`, `target_directory` and `build_directory` from the metadata verify.sh already read, when the step's Cargo inputs match the inputs of that read. Otherwise the recorder reads them as Phase 19 does.
+
+**Spec:**
+- `scripts/buildlog/step_context.py`:
+  - private `_output_evidence(argv, cwd, environment) -> str`: a hash over the inputs that decide the folders, read through `cargo_command_context`:
+    1. the resolved working folder;
+    2. the `+toolchain` word, if present;
+    3. each `--manifest-path`, `--config` and `--target-dir` argument, as written;
+    4. the values of `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, `CARGO_BUILD_BUILD_DIR`, `CARGO_HOME`, `HOME` and `RUSTUP_TOOLCHAIN` in the effective environment;
+    5. the content (or absence) of each file that Cargo reads for these folders: `Cargo.toml`, `rust-toolchain` and `rust-toolchain.toml` in the working folder and each parent, and `config`/`config.toml` in each Cargo config folder from `cargo_target_config.cargo_config_folders` (each parent's `.cargo` and Cargo home).
+  - A verb `output-roots` reads metadata on stdin and prints one line `<evidence>\t<workspace_root>\t<target_directory>\t<build_directory>` for the current process's folder and environment, with argv `cargo metadata`. It prints nothing when the metadata has no absolute `workspace_root` and `target_directory`. It decodes the metadata with `cargo_output.cargo_metadata_output_roots`, which `read_cargo_output_roots` also uses, so `build_directory` falls back to `target_directory` in one place.
+  - `step_output_roots` reads `BUILDLOG_OUTPUT_ROOTS` first: when its evidence equals the step's evidence, it returns those roots (resolved); else it reads metadata as Phase 19 does.
+- `scripts/direct/verify.sh`: one function runs `cargo metadata`, sets `GATE_METADATA` and exports `BUILDLOG_OUTPUT_ROOTS` from `output-roots`. Every real metadata read (`load_metadata` and the test read near line 2689) calls it; a reuse of the saved `GATE_METADATA` keeps the export of the read that made it. An empty or failed `output-roots` exports an empty value.
+- `scripts/buildlog/record.py` `step()` (line 1009) keeps its one `step_context.step_output_roots` call. Keep the `sweep` rule, the target-folder mismatch diagnostic, and the pairs saved in pending records.
+- Name the evidence inputs once, in `step_context.py`; `verify.sh` gets them only through `output-roots`.
+
+**Files:**
+- `scripts/buildlog/step_context.py` — `_output_evidence`, `output-roots`, the export read in `step_output_roots`.
+- `scripts/buildlog/record.py` — no change after review round 1.
+- `scripts/lib/cargo_output.py` and `scripts/lib/test_cargo_output.py` — `cargo_metadata_output_roots`.
+- `scripts/lib/cargo_target_config.py` — `cargo_config_folders`.
+- `scripts/direct/verify.sh` — the metadata function and export.
+- `scripts/buildlog/test_step_row.py` and `scripts/buildlog/test_record.py` — recorder tests.
+- `scripts/direct/test_verify_python_starts.py` — the verify.sh export test (or the verify test module that already covers `GATE_METADATA`).
+
+**Workers:** 1 writer — `recorder` owns all files.
+
+**State:** none (the row fields keep their meaning).
+
+**Constraints from prior phases:** Do not edit `scripts/buildlog/store.py`, `scripts/lint/build_shape.py`, `scripts/lint/sweep.py`, `scripts/buildlog/test_index_rerun.py`, `scripts/lint/invoke.sh` or `scripts/buildlog/index.py` (Phase 27). Run tests through `copies.py run`.
+
+**Acceptance gate:**
+- For each case, the pair from `BUILDLOG_OUTPUT_ROOTS` equals the pair from `step_output_roots`, or the evidence differs and the recorder uses `step_output_roots`: a plain step in the metadata folder (uses the export); an env wrapper that sets `CARGO_TARGET_DIR` or `CARGO_BUILD_BUILD_DIR`; `--manifest-path` to another workspace; `--config build.target-dir=…`; `--target-dir`; a `.cargo/config.toml` written between the metadata read and the step; a `Cargo.toml` change between them; a step in another folder. Real Cargo runs, temporary workspaces.
+- A recorder test proves a matching export starts no `cargo metadata` process.
+- A verify.sh test proves the export is set after the metadata read, empty when the read fails, and unchanged when `load_metadata` reuses the saved metadata after a config change.
+- CPU per step, interleaved A/B against 4e99c554b on one loaded machine with the Phase 19 driver (`cpu_ab.py`): report terminal and tee, before → after.
+- Suites: `scripts.buildlog.test_step_row`, `test_record`, `test_index`, `scripts.lib.test_cargo_output`, the verify test module, and every test module that imports `cargo_output` or `cargo_target_config`, with and without `PYTHONPATH`.
+- `basedpyright` over every changed Python file and each module that imports `cargo_output` or `cargo_target_config`: 0 errors, 0 warnings, 0 notes.
