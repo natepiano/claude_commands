@@ -1701,31 +1701,10 @@ One bad entry in a run marker folder keeps only its own session's runs; every ot
 **Ruled out:** a test that counts director reads (it needs a configured mock).
 
 ### Phase 73 — Measure what drops the warm hana_rigging prelude build, and propose one fix  · status: done
-**Depends on:** none. Showrunner go 2026-11-05 (next item after Phase 72, from hana's fastest unit). Its report is in the run folder.
+#### As-built
+A measurement only; no repository code changed. The report is in the unit run folder (`phases/73/prelude_cold_report.md`).
+- The test is `production_prelude_compiles_without_test_support` (hana `crates/hana_rigging/tests/external_client.rs:1931`); lines 1946-1948 put its build in `<target>/external-client`. A warm folder is 1.3 GB.
+- 2026-11-02 to 11-05 13:24 EST: the floor sweep removed one `external-client` folder (11-02 01:01, `hana_catalyst-hana-migration`, 1.5 GB). Three CI points in fresh clones ran the test cold on 11-02 (101, 117 and 99 s). One Mac run on 11-05 12:00 took 162 s with no matched cause.
+- The fresh-clone CI cause is gone: `ci_start` now uses standing copies (`scripts/production/ci_points.py`).
 
-#### Work Order
-
-**Goal:** count how often each cause drops the warm `target/external-client` build of the hana_rigging prelude compile test, and propose one fix at the cause.
-
-**Measured:**
-1. hana's fastest unit measured the prelude compile test: 108-162 s cold, 0.3-5.9 s warm.
-2. The cold cost comes from a lost `target/external-client`. Fresh clones start without it, and the disk-floor sweeper (`scripts/lint/sweep.py`) can delete it.
-3. A full gate in a new clone pays about 110 s on one test thread.
-
-**Spec:**
-1. Find the test and the code that sets `target/external-client` in the hana repository. Quote file:line for both. Give the folder's size in one warm checkout.
-2. For 2026-11-02 00:00 EST to the phase start, count each cause separately, per day: sweeper deletions of the folder (or of a target folder that held it), and fresh hana checkouts that ran the test without it. For each cold run found, give the test time and the cause before it. Name each source read and each source not found; write `not measured` with the reason, never an estimate.
-3. Propose one fix at the cause: the code that changes (file:line), the one rule it adds, the seconds saved per gate from the step 2 counts, and the disk cost. Name each config key it adds, renames or deletes; a renamed or deleted key needs the user's approval. Name one rejected fix with one clause why.
-4. Read live natedev state files read-only. Run a tool that can write state only on a copies.py copy. Change no repository file and no config.
-5. Send the proposal to builds before any build. Add no guard, refusal or check this Work Order does not ask for.
-
-**Files:**
-- `phases/73/prelude_cold_report.md` — in the unit run folder: the facts, the per-day cause table and the proposal.
-
-**Workers:** `1 writer`
-- `impl` reads the sources and writes the report.
-
-**Acceptance gate:**
-- The report quotes the test and the folder code with file:line and gives the folder size.
-- The report gives a per-day count for each cause, or `not measured` with the reason.
-- The proposal names the changed code, the seconds saved per gate, the disk cost and every config key it touches.
+**Ruled out:** a floor rule that keeps hana `target/external-client` — the builds showrunner dropped it on 2026-11-05: the fresh-clone cause is gone, and 1 eviction in 3 days does not pay for 1.3 GB per checkout. The Mac cold run is a next item.
