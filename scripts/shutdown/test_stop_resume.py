@@ -429,6 +429,7 @@ class StopResumeTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = self.enterContext(redirect_stderr(io.StringIO()))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
         _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
             "claude3", self.root / ".claude3")))
