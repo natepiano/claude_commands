@@ -354,7 +354,7 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 
 **Ruled out:** a join on equal `at` text between the two writers (a miss showed the slice as absent).
 
-### Phase 18 — Each test step's row records the memory charge admission gave its test phase  · status: todo
+### Phase 18 — Each test step's row records the memory charge admission gave its test phase  · status: done
 **Depends on:** none (from next items; showrunner 2026-11-04: natest P10 is on builds, the index.py freeze has ended, start now)
 
 Admission now saves the charge it gave a test phase: `memory_admit.read_test_phase_charge_use` returns `TestPhaseChargeUse` (`bytes`, `selected_at`, `reservation_id`, `need`) or `NoTestPhaseChargeUse`, and finalization copies it into the admission history row as `test_phase_charge_use`. The step row still writes `test_phase_charge: null` (`record.py` `test_phase_context`), and the index has no column for it.

@@ -1996,6 +1996,54 @@ class TestPhaseChargeTests(MemoryQueueFixture):
 
 
 
+    def test_charge_wire_types_have_one_shared_owner(self) -> None:
+        import test_phase
+
+        pairs = (
+            (gate.TestPhaseChargeUse, test_phase.TestPhaseChargeUse),
+            (gate.NoTestPhaseChargeUse, test_phase.NoTestPhaseChargeUse),
+            (gate.CallRecord, test_phase.CallRecord),
+            (gate.NoCallRecord, test_phase.NoCallRecord),
+        )
+        for exported, shared in pairs:
+            with self.subTest(name=exported.__name__):
+                self.assertIs(exported, shared)
+
+    def test_shared_charge_check_rejects_invalid_fields(self) -> None:
+        import test_phase
+
+        evidence: dict[str, object] = {
+            "bytes": 8192, "selected_at": 123, "reservation_id": "own",
+            "need": gate.test_phase_need_record(self.phase_need),
+        }
+        self.assertEqual(test_phase.parse_test_phase_charge_use(evidence), evidence)
+        self.assertIsInstance(test_phase.parse_test_phase_charge_use(evidence)["selected_at"], float)
+        changes: tuple[dict[str, object], ...] = (
+            {"bytes": "broken"}, {"bytes": True}, {"bytes": 0},
+            {"selected_at": True}, {"selected_at": "123"}, {"selected_at": float("nan")},
+            {"selected_at": float("inf")}, {"selected_at": -float("inf")}, {"selected_at": 10 ** 400},
+            {"reservation_id": None}, {"need": []},
+        )
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                _ = test_phase.parse_test_phase_charge_use({**evidence, **change})
+
+    def test_saved_charge_keeps_admission_need_validation(self) -> None:
+        import test_phase
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reservation.json"
+            evidence: dict[str, object] = {
+                "bytes": 8192, "selected_at": 123, "reservation_id": "own", "need": {},
+            }
+            _ = test_phase.parse_test_phase_charge_use(evidence)
+            _ = path.with_suffix(".test-phase-charge.json").write_text(json.dumps(evidence))
+            self.assertIsInstance(gate.read_test_phase_charge_use(path, "own"), gate.NoTestPhaseChargeUse)
+            evidence["need"] = gate.test_phase_need_record(self.phase_need)
+            _ = path.with_suffix(".test-phase-charge.json").write_text(json.dumps(evidence))
+            self.assertEqual(gate.read_test_phase_charge_use(path, "own"), evidence)
+            self.assertIsInstance(gate.read_test_phase_charge_use(path, "other"), gate.NoTestPhaseChargeUse)
+
     def charge_evidence(self, row: Mapping[str, object]) -> dict[str, object]:
         evidence = row.get("test_phase_charge_use")
         if not isinstance(evidence, dict):

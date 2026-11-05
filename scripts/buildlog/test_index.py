@@ -565,6 +565,29 @@ class IndexTests(unittest.TestCase):
                 ("unknown", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
             ])
 
+    def test_test_phase_charge_bytes_rank_steps_and_preserve_null_for_older_rows(self) -> None:
+        self.write(self.host_file,
+                   step("large", test_phase_charge={"bytes": 8192}),
+                   step("small", test_phase_charge={"bytes": 1024}),
+                   step("no-charge", test_phase_charge=None),
+                   step("legacy"))
+        original = self.host_file.read_bytes()
+        self.assertEqual(index.update(), 4)
+        query = "SELECT id, test_phase_charge_bytes FROM steps ORDER BY test_phase_charge_bytes DESC, id"
+        expected = [("large", 8192), ("small", 1024), ("legacy", None), ("no-charge", None)]
+        self.assertEqual(self.rows(query), expected)
+        self.assertEqual(index.reindex(), 4)
+        self.assertEqual(self.rows(query), expected)
+        self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_charge_column_rejects_boolean_and_text_bytes(self) -> None:
+        self.write(self.host_file,
+                   step("boolean", test_phase_charge={"bytes": True}),
+                   step("text", test_phase_charge={"bytes": "8192"}))
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(self.rows("SELECT id, test_phase_charge_bytes FROM steps ORDER BY id"),
+                         [("boolean", None), ("text", None)])
+
     def test_schema_twenty_three_rebuilds_history_build_keys_without_rewriting_logs(self) -> None:
         self.write(self.host_file, step("legacy", seat="impl", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana"]))
         original = self.host_file.read_bytes()

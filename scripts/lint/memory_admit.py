@@ -43,6 +43,11 @@ import conf
 
 
 from test_phase import (
+    CallRecord as CallRecord,
+    NoCallRecord as NoCallRecord,
+    TestPhaseChargeUse as TestPhaseChargeUse,
+    NoTestPhaseChargeUse as NoTestPhaseChargeUse,
+    parse_test_phase_charge_use,
     ObservedTestPhase,
     TestPhaseRecord,
     UnobservedTestPhase,
@@ -414,18 +419,6 @@ NO_STEP_EVIDENCE = StepEvidence(NoBuildShape(), CompileCountUnknown())
 OUTCOME_NOT_RECORDED = OutcomeNotRecorded()
 
 
-class TestPhaseChargeUse(TypedDict):
-    bytes: int
-    selected_at: float
-    reservation_id: str
-    need: dict[str, object]
-
-
-@dataclass(frozen=True)
-class NoTestPhaseChargeUse:
-    pass
-
-
 @dataclass(frozen=True)
 class StepEnd:
     pass
@@ -543,16 +536,6 @@ class NoTestWidth:
 
 
 TestWidth = RequestedTestWidth | UnspecifiedTestWidth | NoTestWidth
-
-
-@dataclass(frozen=True)
-class CallRecord:
-    call_id: str
-
-
-@dataclass(frozen=True)
-class NoCallRecord:
-    pass
 
 
 Call = CallRecord | NoCallRecord
@@ -4255,15 +4238,10 @@ def read_test_phase_charge_use(path: Path, reservation_id: str) -> TestPhaseChar
         raw = cast(object, json.loads(path.with_suffix(".test-phase-charge.json").read_text()))
         if not isinstance(raw, dict):
             return NoTestPhaseChargeUse()
-        evidence = cast(dict[str, object], raw)
-        amount, selected_at = evidence.get("bytes"), evidence.get("selected_at")
-        need = read_test_phase_need(evidence.get("need"))
-        if (evidence.get("reservation_id") == reservation_id
-                and type(amount) is int and amount > 0
-                and isinstance(selected_at, (int, float)) and not isinstance(selected_at, bool)
-                and math.isfinite(selected_at) and isinstance(need, TestPhaseNeed)):
-            return {"bytes": amount, "selected_at": float(selected_at),
-                    "reservation_id": reservation_id, "need": test_phase_need_record(need)}
+        evidence = parse_test_phase_charge_use(cast(dict[str, object], raw))
+        need = read_test_phase_need(evidence["need"])
+        if evidence["reservation_id"] == reservation_id and isinstance(need, TestPhaseNeed):
+            return {**evidence, "need": test_phase_need_record(need)}
     except (OSError, ValueError, TypeError):
         pass
     return NoTestPhaseChargeUse()
