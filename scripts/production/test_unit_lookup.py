@@ -475,7 +475,13 @@ print(observed.row.id)
         for name in ("trunk", "other", "first", "second", "third"):
             _ = unit_membership("new", name)
         doc = self.root / "new-production.md"
-        _ = doc.write_text("# Production\n\n## Production Context\n\n- **Formerly:** `old`\n")
+        _ = doc.write_text("# Production\n")
+        state = self.root / "showrunner-state"
+        journal = state / "new" / "rename.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "old", "new": "new"}))
+        _ = self.enterContext(mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state))
+        self.environment["SHOWRUNNER_STATE_DIR"] = str(state)
         instance = self.root / "notifier/showrunner-new"
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
@@ -552,7 +558,7 @@ print(observed.row.id)
                 self.assertEqual(listed.stdout.split("\t")[:6],
                                  ["trunk", "herdr:still-old:w4:p1", "still-old", "live", "still-old", unit_membership("new", "trunk").id])
 
-    def test_grouping_resolves_former_slugs_without_discovering_processes(self) -> None:
+    def test_grouping_resolves_journal_names_without_discovering_processes(self) -> None:
         self.renamed_production()
         unit = unit_lookup.LabeledSession("trunk", LiveClaude("report", "report-id", "/fixture.sock", 123),
                                       herdr.HerdrPlace("old-pane", "w4:p1"), identity=session_staff.LiveSession(unit_membership("new", "trunk").current_session))

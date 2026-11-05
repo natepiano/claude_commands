@@ -33,7 +33,6 @@ import merge_checkpoint
 from scripts.production.production_doc import Production, read_production
 import rename
 from scripts.production import showrunners
-import stall_watch
 import tidy_wrapped
 import unit_move
 import unit_names
@@ -396,7 +395,6 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
                            "SHOWRUNNER_STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"])}),
             (tidy_wrapped, {"STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"]),
                             "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"])}),
-            (stall_watch, {"STATE_DIR": Path(environment["STALL_WATCH_STATE_DIR"])}),
         ):
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
@@ -503,7 +501,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.new_doc: Path = Path()
         self.notifier: Path = Path()
         self.state: Path = Path()
-        self.stall: Path = Path()
         self.worktrees: Path = Path()
         self.env: dict[str, str] = {}
         self.old_tip: str = ""
@@ -554,7 +551,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.new_doc = self.doc.with_name("new-production.md")
         self.notifier = self.root / "state/notifier"
         self.state = self.root / "state/showrunner"
-        self.stall = self.root / "state/stall-watch"
         self.worktrees = self.home / "worktrees"
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
@@ -569,7 +565,6 @@ class ProductionRenameFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
-            "STALL_WATCH_STATE_DIR": str(self.stall),
             "SHOWRUNNERS_CONFIG": str(self.home / ".claude/showrunners.json"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -585,7 +580,7 @@ class ProductionRenameFixture(StaffTestCase):
         })
 
     def build_fixture(self) -> None:
-        for path in (self.home, self.checkout, self.notifier, self.stall, self.worktrees):
+        for path in (self.home, self.checkout, self.notifier, self.worktrees):
             path.mkdir(parents=True)
         config = self.home / ".claude"
         config.mkdir()

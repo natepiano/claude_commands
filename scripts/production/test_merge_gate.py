@@ -20,7 +20,7 @@ from scripts.production.gate_modules import GateRefused
 from scripts.lint import memory_admit
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
-    fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+    fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
 )
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
@@ -30,6 +30,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = fixture_member("showrunner", name="unrelated")
         environment = source_environment(self.root / "staff-sources")
         environment["NOTIFIER_STATE_DIR"] = self.environment["NOTIFIER_STATE_DIR"]
         self.environment.update(environment)
@@ -42,10 +44,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
         exclude = Path(self.git(self.unit, "rev-parse", "--git-path", "info/exclude"))
         exclude = exclude if exclude.is_absolute() else self.unit / exclude
         self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
-        path = Path(self.environment["HOME"]) / ".local/state/staff/staff.json"
-        with isolated_staff_file(path, self.environment):
-            runner = recorded_showrunner("fixture-showrunner", doc)
-            unit = fixture_unit_location(runner, "fixture-unit", self.unit)
+        runner = recorded_showrunner("fixture-showrunner", doc)
+        self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
+        unit = fixture_unit_location(runner, "fixture-unit", self.unit)
         return unit.id
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
@@ -348,7 +349,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
-        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | production | {producer} |" for day in days}
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {producer} | {producer} |" for day in days}
         self.assertIn(written, rows)
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
@@ -373,9 +374,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
     def test_without_production_the_calling_showrunners_list_takes_the_rows(self) -> None:
         review, doc = self.review_list()
         producer = self.review_producer(doc)
-        timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / "showrunner-fixture"
+        runner = staff.by_id(producer)
+        assert runner is not None and isinstance(runner.parent, staff.ReportsTo)
+        timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.parent.id}"
         timer.mkdir(parents=True)
-        self.write(timer / "conf", "TARGET=session:fixture-showrunner\n"
+        self.write(timer / "conf", f"TARGET=session:{runner.parent.id}\n"
                    + f"CHECK=bash /scripts/production/production_check.sh {doc}\n")
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
@@ -534,7 +537,7 @@ class MergeGateProducerTests(ProducerFixture):
             merge_gate.record_changes(self.repo, self.listing, self.doc,
                                       change_review.publication_changes(commits, self.doc), "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
-        self.assertEqual(change_review.pending(self.listing)[0]["Production"], "top")
+        self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.id)
 
     def test_record_changes_keeps_an_unknown_producer_empty_and_prints_one_named_note(self) -> None:
         merged = self.merge()
