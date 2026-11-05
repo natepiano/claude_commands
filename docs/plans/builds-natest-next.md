@@ -23,6 +23,11 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 ## Items to consider
 
 - [x] **One path to `send.py`.** 29 production modules build their own `send.py` path in place of `session_send`. The Phase 21 guard covers every path in tests, so this is a duplicate-code cleanup only. Sent to the showrunner on 2026-11-05 with the owner of each file; the showrunner routes it (recommended owner: natedev-messaging). No natest work remains.
+- [ ] **The test runner guards every module from the real `send.py`.**
+  - Target: `scripts/test_times/module_run.py`, `scripts/message/session_send_test_support.py`
+  - Why needed: after Phase 26, only the four modules that call `forbid_real_sender()` are guarded, and the runner finds the marker through that module's stored record. A module that never installs the guard, or a marker variable inherited from a parent, is not checked (Phase 26 adversary round 2). No module in the gate takes either path today.
+  - Completion condition: the runner sets one marker path before `unittest.main` for every module and checks that path after it; the four installs reuse it; the gate shows which modules, if any, start the real `send.py`.
+  - Revealed by: Phase 26 adversary review round 2, 2026-11-05.
 - [ ] **Select the next speed target after Phase 24.**
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
