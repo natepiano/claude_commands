@@ -59,27 +59,27 @@ class RenamePlan:
     move: KeepDocBranch | DocBranchMove
 
 
-@dataclass(frozen=True)
-class MissingStaffReference:
-    """The reference matches no staff row."""
-
-
-def _member(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow | MissingStaffReference:
-    row = record.by_member_reference(reference)
-    if row is None and "/" in reference:
-        slug, _, name = reference.rpartition("/")
-        row = record.by_path(reference) or record.by_path(f"{slug}/{name.removesuffix('-unit')}")
-    if row is not None:
-        return row
-    matches = [row for row in record.rows if row.kind in {"showrunner", "unit"}
-               and (row.name == reference or row.kind == "unit" and row.name == reference.removesuffix("-unit"))]
+def _member(old: str, new: str, record: staff.StaffSnapshot) -> staff.StaffRow:
+    references = (old, f"{old.rpartition('/')[0]}/{new}" if "/" in old else new)
+    for reference in references:
+        row = record.by_member_reference(reference)
+        if row is None and "/" in reference:
+            row = record.by_path(reference) or record.by_path(reference.removesuffix("-unit"))
+        if row is not None:
+            return row
+    rows = [row for row in record.rows if row.kind in {"showrunner", "unit"}]
     caller = record.by_current_session(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
-    if caller is not None and caller.kind == "showrunner":
-        local = [row for row in matches if row.id == caller.id or row.parent == staff.ReportsTo(caller.id)]
-        matches = local or matches
-    if len(matches) > 1:
-        raise staff.StaffRefused(f"{reference}: several rows match; use slug/name or the staff id")
-    return matches[0] if matches else MissingStaffReference()
+    local = ([row for row in rows if row.id == caller.id or row.parent == staff.ReportsTo(caller.id)]
+             if caller is not None and caller.kind == "showrunner" else [])
+    for scope in (local, rows):
+        for reference in references:
+            matches = [row for row in scope if row.name == reference or
+                       row.kind == "unit" and row.name == reference.removesuffix("-unit")]
+            if len(matches) > 1:
+                raise staff.StaffRefused(f"{old}: several rows match; use slug/name or the staff id")
+            if matches:
+                return matches[0]
+    raise staff.StaffRefused(f"{old}: no showrunner or unit staff row")
 
 
 def _saved_move(fields: dict[str, object]) -> DocBranchMove:
@@ -110,12 +110,7 @@ def plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> Rename
     if bool(to_doc) != bool(to_branch):
         raise RenameRefused("--to-doc and --to-branch are required together")
     record = staff.snapshot()
-    renamed = f"{old.rpartition('/')[0]}/{new}" if "/" in old else new
-    row = _member(old, record)
-    if isinstance(row, MissingStaffReference):
-        row = _member(renamed, record)
-    if isinstance(row, MissingStaffReference):
-        raise staff.StaffRefused(f"{old}: no showrunner or unit staff row")
+    row = _member(old, new, record)
     if row.kind != "showrunner" and (row.kind != "unit" or to_doc):
         raise staff.StaffRefused(f"{old}: the staff row is a {row.kind}, not a showrunner")
     if row.kind == "unit":

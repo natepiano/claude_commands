@@ -30,7 +30,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual(renamed.worktree, staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma"))
         self.assertEqual(self.git("branch", "--show-current", cwd=self.rust / "claude-demo-gamma"), "demo-gamma")
 
-    def test_bare_unit_name_selects_the_calling_showrunners_unit(self) -> None:
+    def test_bare_unit_rename_rerun_keeps_the_callers_unit_and_leaves_the_foreign_unit_unchanged(self) -> None:
         parent = next(row for row in staff.find(kind="showrunner") if row.name == "demo")
         own = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         foreign_parent = fixture_member("showrunner", name="foreign")
@@ -38,6 +38,11 @@ class UnitRenameTests(UnitRenameFixture):
         self.env["CLAUDE_CODE_SESSION_ID"] = parent.current_session
         with RenameDisplays(own).installed():
             self.assert_ok(self.invoke(["apply", "alpha", "gamma"]))
+            before = final_files(self.root)
+            rerun = self.invoke(["apply", "alpha", "gamma"])
+            self.assert_ok(rerun)
+            self.assertEqual(rerun.stdout.strip(), "unchanged")
+            self.assertEqual(final_files(self.root), before)
         renamed = staff.by_id(own.id)
         assert renamed is not None
         self.assertEqual(renamed.name, "gamma")
@@ -211,7 +216,6 @@ class UnitRenameTests(UnitRenameFixture):
         new = self.rust / "claude-demo-gamma"
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=new), tip)
         self.assertEqual((new / "draft.md").read_text(), "a new file\n")
-
 
     def test_a_mid_phase_rename_keeps_the_commits_and_the_uncommitted_work(self) -> None:
         source = self.rust / "claude-demo-alpha"
