@@ -2139,32 +2139,6 @@ def owned_notes(production: ProductionIdentity | str, unit: str) -> list[Path]:
             if _owns_note(_note_ownership(candidate), identity, unit)]
 
 
-def rename_unit(production: ProductionIdentity, old: str, new: str) -> list[Path]:
-    """Point a renamed unit's generated phase notes at its new id, so prune keeps them.
-
-    Only the `unit:` key changes; the unit's next refresh rewrites the rest of each note.
-    """
-    renamed: list[Path] = []
-    for candidate in owned_notes(production, old):
-        try:
-            lines = candidate.read_text(encoding="utf-8").splitlines(keepends=True)
-        except (OSError, UnicodeError) as error:
-            raise Refusal(f"cannot read phase note {candidate}: {error}") from error
-        end = next(index for index, line in enumerate(lines[1:], 1) if line.rstrip("\n") == "---")
-        lines[1:end] = [f"unit: {new}\n" if line.startswith("unit:") else line for line in lines[1:end]]
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", dir=candidate.parent, prefix=f".{candidate.name}.", delete=False
-            ) as handle:
-                _ = handle.write("".join(lines))
-                os.fchmod(handle.fileno(), 0o644)
-            os.replace(handle.name, candidate)
-        except OSError as error:
-            raise Refusal(f"cannot write phase note {candidate}: {error}") from error
-        renamed.append(candidate)
-    return renamed
-
-
 def refresh(session_dir: Path) -> None:
     """Rewrite a production unit's generated phase note, when it has one."""
     resolver = session_staff.RowResolver(staff.snapshot())
