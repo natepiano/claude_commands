@@ -66,8 +66,7 @@ def json_object(path: Path) -> dict[str, object]:
 
 class WorkerScriptTests(unittest.TestCase):
     def test_worker_script_starts_outside_the_repository(self) -> None:
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
         with tempfile.TemporaryDirectory(prefix="workers-script-") as directory:
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "--help"], cwd=directory,
