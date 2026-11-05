@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from collections.abc import Mapping
@@ -11,12 +10,10 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
 if __package__:
-    from . import parse, store
+    from . import parse
 else:
     import parse
-    import store
 
 
 @dataclass(frozen=True)
@@ -59,6 +56,8 @@ def metadata_target_folder(metadata: str, argv: list[str], cwd: str) -> StepTarg
     """Accept metadata only for the selected manifest or working folder."""
     if not metadata.strip():
         return UnresolvedTargetFolder()
+    import json
+
     try:
         decoded = cast(object, json.loads(metadata))
     except ValueError:
@@ -90,6 +89,8 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
     words, directory, effective = parse.command_context(argv, cwd, environment)
     if not words or Path(words[0]).name != "cargo" or parse.step_name(words) == "fmt":
         return NoTargetFolder()
+    from cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
+
     arguments = words[2:] if parse.toolchain(words) else words[1:]
     arguments = arguments[:arguments.index("--")] if "--" in arguments else arguments
     try:
@@ -108,6 +109,11 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
         workspace = cargo_workspace_manifest(arguments, directory, cargo_home_folder(directory, effective))
         return CargoTargetFolder(workspace.resolve().parent / "target")
     except (OSError, ValueError) as error:
+        if __package__:
+            from . import store
+        else:
+            import store
+
         store.note_error(f"target folder: {error}")
         return UnresolvedTargetFolder()
 

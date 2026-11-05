@@ -858,12 +858,7 @@ def configured_ssh_target(target: str) -> target_config.SshTarget:
 
 def ssh_target_state_directory(target: str) -> Path:
     """Return the state path without requiring target registration."""
-    if target in (".", "..") or Path(target).name != target:
-        raise target_config.ConfigError(f"invalid target name: {target}")
-    if target != "mac":
-        return Path.home() / ".local/state/build-targets" / target
-    configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
-    return Path(configured).expanduser()
+    return target_config.ssh_target_state_directory(target)
 
 
 def state_directory(target: str = "mac") -> Path:
@@ -888,7 +883,8 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     config = conf.read(settings)
     values = config.values()
     return OffloadConfig(
-        enabled=config.text("offload") == "on",
+        enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
+                 else config.text("offload") == "on"),
         connection=connection_settings(config),
         probe_timeout_s=config.number("probe_timeout_s"),
         unreachable_backoff_s=config.number("unreachable_backoff_s"),
@@ -1703,6 +1699,7 @@ def claimed_run(
     started: float,
 ) -> MacOffloadResult:
     release_allowed = True
+    sync_after_release = False
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
     try:
@@ -1807,6 +1804,7 @@ def claimed_run(
             report_leftover_check(checked, request)
         else:
             release_allowed = True
+        sync_after_release = linux
         if linux and remote_status.status == 75:
             return declined("state", started)
         if remote_status.status == 0:
@@ -1828,6 +1826,12 @@ def claimed_run(
             evidence.unresolved_count = 0
         if release_allowed:
             release_claim(controller, request.target)
+            if sync_after_release:
+                if TYPE_CHECKING:
+                    from ..buildlog import sync as buildlog_sync
+                else:
+                    import sync as buildlog_sync
+                buildlog_sync.sync_target(request.target)
 
 
 @dataclass(frozen=True)

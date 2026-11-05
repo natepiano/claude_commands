@@ -57,16 +57,16 @@ class AssignLauncherTests(AssignLauncherFixture):
         _ = self.successful("review", "--lens", "rerun", "--pass", "1")
         starts = self.methods("thread/start")
         self.assertEqual(cast(dict[str, object], starts[0]["params"])["sandbox"], "read-only")
-        self.assertTrue((self.session_dir / "phases/7/review_status_rerun_1").exists())
+        self.assertTrue((self.session_dir / "phases/7/project-review_status_rerun_1").exists())
 
     def test_recorder_ad_hoc_phase_dispatches_into_adhoc_directory(self) -> None:
         self.record("start-phase", "--phase-id", "ad hoc", "--phase-title", "Ad hoc review")
         self.write_phase_prompt("ad hoc", "Ad hoc review")
         _ = self.successful("review", "--phase", "ad hoc")
         phase = self.session_dir / "phases/adhoc"
-        self.assertEqual((phase / "review_status_1").read_text(), "done\n")
+        self.assertEqual((phase / "project-review_status_1").read_text(), "done\n")
         self.assertTrue((phase / "dispatch_1_prompt.txt").is_file())
-        self.assertTrue((phase / "review_summary_1.txt").read_text().strip())
+        self.assertTrue((phase / "project-review_summary_1.txt").read_text().strip())
         self.assertFalse((self.session_dir / "phases/ad hoc").exists())
         self.assertEqual(cast(dict[str, object], self.methods("thread/start")[0]["params"])["sandbox"], "read-only")
         self.assertEqual(len(self.methods("turn/start")), 1)
@@ -150,7 +150,7 @@ class AssignLauncherTests(AssignLauncherFixture):
             self.assertNotIn(f"({name})", shown)
         board = (self.session_dir / "board.log").read_text()
         self.assertIn(names[-1], board)
-        self.assertTrue((self.session_dir / "phases/7/review_status_contract_1").exists())
+        self.assertTrue((self.session_dir / "phases/7/project-review_status_contract_1").exists())
 
     def test_style_assignment_is_prepared_and_captured_through_assign_on_retry(self) -> None:
         self.prepare_style_project()
@@ -190,7 +190,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         _ = self.successful("review", "--to", name, "--pass", "2", "--style-since", "HEAD")
         self.assertEqual(read_object(phase / "style_review_state.json")["state"], "complete")
         self.assertIn("Style review: Findings", (phase / "phase_style_review.md").read_text())
-        self.assertIn("fixture finding", (phase / "review_summary_2.txt").read_text())
+        self.assertIn("fixture finding", (phase / "project-review_summary_2.txt").read_text())
         self.assertNotEqual(prepared[0].parent, prepared[1].parent)
         self.assertEqual(prepared[0].read_bytes(), before)
         self.assertIn("+fn second", prepared[1].read_text())
@@ -205,7 +205,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         phase = self.session_dir / "phases/7"
         self.assertEqual(read_object(phase / "style_review_state.json")["state"], "owed")
         self.assertIn("invalid baseline", (phase / "phase_style_review.md").read_text())
-        self.assertEqual((phase / "review_status_1").read_text().strip(), "done")
+        self.assertEqual((phase / "project-review_status_1").read_text().strip(), "done")
         self.assertEqual(len(self.methods("turn/start")), 1)
 
     def test_assign_style_range_excludes_other_work_in_flight(self) -> None:

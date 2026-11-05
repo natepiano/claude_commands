@@ -82,7 +82,7 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 - The caller's width wins: a width flag before `--`, or `NEXTEST_TEST_THREADS`, means `invoke.sh` adds nothing. Such a run takes no marker and is not counted by others.
 - No counter: a run is in flight while its marker is locked, and nothing a killed run leaves behind is counted.
 - Width selection never fails, prints or changes a status; an unreadable core count adds no flag, and a failed claim runs at the full width.
-- `invoke.sh` adds its width before the caller's arguments, and `memory_admit.test_threads` and `width_trial` read the first width in argv. Change both or neither.
+- `invoke.sh` adds its width before the caller's arguments, and `parse.test_threads` (admission calls it as `memory_admit.test_threads`) and `width_trial` read the first width in argv. Change both or neither.
 - The trial block in `nextest_width_arm` (6000 s) equals `BLOCK_S` in `width_trial.py`.
 - `invoke.sh`'s ungated set (`buildlog_step_compiles`) and `width_trial._uses_memory_gate` decide which steps count as gated; they must agree. Both exempt `cargo [+tc] fmt`, `*/sweep.py` and `taplo`, so none of those counts in the all-steps gated-wait row.
 - The build log and `anon_peaks.jsonl` are evidence: nothing edits or deletes their records. A width filter replaces any need to drop stale records.

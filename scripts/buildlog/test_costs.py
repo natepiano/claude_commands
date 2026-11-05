@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import costs
 import index
 import moments
+import record
 import test_moments as fixtures
 from test_index import Record, call, ci_job, ci_run
 from test_holds import hold_event
@@ -30,6 +31,19 @@ class CostTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.fixture = fixtures.moment_fixture(self)
+
+    def test_machine_aliases_read_sync_configuration_once(self) -> None:
+        with (
+            mock.patch.object(record, "configured_targets", return_value=("first", "second")),
+            mock.patch.object(record, "sync_config", return_value={
+                "sync.hosts.first": "first-host", "sync.hosts.second": "second-host",
+                "sync.hosts.extra": "extra-host",
+            }) as read,
+        ):
+            aliases: dict[str, str] = {}
+            self.assertEqual(costs.machine_name(None, "second-host", aliases), "second")
+            self.assertEqual(aliases, {"first-host": "first", "second-host": "second", "extra-host": "extra"})
+            read.assert_called_once_with()
 
     def progress(self, durations: list[tuple[str, float]]) -> None:
         events: list[Record] = []

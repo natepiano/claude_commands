@@ -304,6 +304,7 @@ class LinuxShellTests(unittest.TestCase):
             event = self.assert_ran(self.request())
         self.assertEqual(event["environment"]["BUILDLOG_TARGET"], "aws")
         self.assertEqual(event["environment"]["BUILDLOG_PINNED_TARGET"], "aws")
+        self.assertEqual(event["environment"]["BUILDLOG_SYNC"], "1")
         self.assertEqual(event["cwd"], str(self.mirror))
 
     def test_sigterm_prints_one_interruption_marker_and_preserves_the_child_status(self) -> None:

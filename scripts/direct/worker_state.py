@@ -14,7 +14,7 @@ if not __package__:
 from scripts.agents import worker_lifecycle
 
 
-def worker_record_path(run: Path, name: str, slot: str, *, role: str = "") -> Path:
+def worker_record_path(run: Path, name: str, slot: str) -> Path:
     """Find task settings through the fixed staff reference."""
     reference = _worker_reference(run, name)
     for path in sorted(run.glob("impl_worker_*.json")):
@@ -24,7 +24,7 @@ def worker_record_path(run: Path, name: str, slot: str, *, role: str = "") -> Pa
             continue
         if reference and isinstance(value, dict) and cast(dict[str, object], value).get("staff_id") == reference:
             return path
-    return run / f"impl_worker_{'fix' if role == 'fix' else slot}.json"
+    return run / f"impl_worker_{slot}.json"
 
 
 def _worker_reference(run: Path, name: str) -> str:

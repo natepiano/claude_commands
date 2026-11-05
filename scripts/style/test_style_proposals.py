@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import errno
 import io
 import json
@@ -35,6 +37,7 @@ import footer_counts
 import proposal_issue
 import proposals_table
 from issues import Issue, frontmatter, open_issues
+from ledger_test_support import style_staff_fixture, style_unit_id
 from style_proposals import FilingResult
 from scripts.production.staff_test_support import isolated_staff_file, recorded_unit
 
@@ -115,6 +118,7 @@ class StyleProposalsTests(unittest.TestCase):
         self.template = self.root / "issue.yaml"
         _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
         self.catalog.mkdir(parents=True)
+        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
         _ = self.template.write_text(TEMPLATE)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
@@ -211,8 +215,8 @@ class StyleProposalsTests(unittest.TestCase):
             return style_proposals.file_proposals(ledger, self.proposals, "parent").filed
 
     def assign_ticket(self, ledger: style_ledger.Ledger, unit: str) -> str:
-        ticket = f"{unit}-1"
-        ledger.ticket_add(ticket, unit, "read", "names", "alpha", ["alpha/src/lib.rs"], [self.rename])
+        ticket = ledger.next_ticket_id()
+        ledger.ticket_add(ticket, ticket_owner_id(unit), "read", "names", "alpha", ["alpha/src/lib.rs"], [self.rename])
         ledger.ticket_assign(ticket, "main")
         return ticket
 
@@ -535,14 +539,14 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             old = self.legacy_issue(ledger, "old", finding)
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename],
                               proposal=str(old), finding_ids=(finding.finding_id,))
             with closing(sqlite3.connect(ledger.database)) as connection, connection:
                 _ = connection.execute("UPDATE tickets SET finding_ids='[]'")
                 _ = connection.execute("UPDATE held_findings SET build_ticket=''")
             before = old.read_bytes()
             self.assertEqual(self.migration_lines(ledger, dry_run=False),
-                             [f"refused {old}: live build ticket names-unit-1 (queued)", "totals: create 0, move 0, close 0, off-rule 0"])
+                             [f"refused {old}: live build ticket 1 (queued)", "totals: create 0, move 0, close 0, off-rule 0"])
             self.assertEqual(old.read_bytes(), before)
             self.assertEqual(ledger.proposal_findings(old)[0].finding_id, finding.finding_id)
 
@@ -592,11 +596,11 @@ class StyleProposalsTests(unittest.TestCase):
             finding = self.hold(ledger)
             decision = self.file(ledger)[0]
             self.issue_command("approve", str(decision), "--by", "user", "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename],
                               proposal=str(decision), finding_ids=(finding.finding_id,))
-            ledger.ticket_assign("names-unit-1", "main")
-            ledger.ticket_checkpoint("names-unit-1", self.tip)
-            _ = ledger.ticket_merge("names-unit-1")
+            ledger.ticket_assign("1", "main")
+            ledger.ticket_checkpoint("1", self.tip)
+            _ = ledger.ticket_merge("1")
             style_proposals.complete(ledger)
             self.assertEqual(style_proposals.approved_decisions(self.proposals, "names-unit"), ())
             later = self.hold(ledger, line=2)
@@ -625,18 +629,18 @@ class StyleProposalsTests(unittest.TestCase):
             decision = next(self.proposals.glob("style *.md"))
             self.assertEqual(ledger.proposal_findings(decision)[0].state, style_ledger.Filed(decision))
             self.assertEqual(frontmatter(old)["status"], ["open"])
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename],
                               proposal=str(decision), finding_ids=(finding.finding_id,))
-            ledger.ticket_assign("names-unit-1", "main")
-            ledger.ticket_checkpoint("names-unit-1", self.tip)
-            _ = ledger.ticket_merge("names-unit-1")
+            ledger.ticket_assign("1", "main")
+            ledger.ticket_checkpoint("1", self.tip)
+            _ = ledger.ticket_merge("1")
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
             self.assertEqual(frontmatter(decision)["status"], ["closed"])
             lines = self.migration_lines(ledger, dry_run=False)
             self.assertNotIn(f"reopen {decision}", lines)
             self.assertEqual(frontmatter(decision)["status"], ["closed"])
-            self.assertEqual(frontmatter(decision)["reason"], ["built in names-unit-1"])
+            self.assertEqual(frontmatter(decision)["reason"], ["built in 1"])
             self.assertEqual(frontmatter(old)["status"], ["closed"])
             self.assertNotIn("reopen", [call[0] for call in self.calls])
 
@@ -674,8 +678,8 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             old = self.legacy_issue(ledger, "old", finding)
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename], proposal=str(old), finding_ids=(finding.finding_id,))
-            ledger.ticket_assign("names-unit-1", "main")
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename], proposal=str(old), finding_ids=(finding.finding_id,))
+            ledger.ticket_assign("1", "main")
             before = old.read_bytes()
             with redirect_stdout(io.StringIO()) as output:
                 style_proposals.migrate(ledger, self.proposals, "parent")
@@ -688,27 +692,27 @@ class StyleProposalsTests(unittest.TestCase):
             first, second = self.hold(ledger), self.hold(ledger, line=2)
             issue = self.file(ledger)[0]
             self.issue_command("approve", str(issue), "--by", "user", "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [first.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [first.path], [self.rename],
                               proposal=str(issue), finding_ids=(first.finding_id,))
-            ledger.ticket_assign("names-unit-1", "main")
-            ledger.ticket_checkpoint("names-unit-1", self.tip)
-            _ = ledger.ticket_merge("names-unit-1")
+            ledger.ticket_assign("1", "main")
+            ledger.ticket_checkpoint("1", self.tip)
+            _ = ledger.ticket_merge("1")
             style_proposals.complete(ledger)
             self.assertEqual(frontmatter(issue)["status"], ["open"])
             _ = ledger.decline_findings((second.finding_id,), "Keep the second", style_ledger.WaiveByPerson("user"))
             style_proposals.complete(ledger)
             self.assertEqual(frontmatter(issue)["status"], ["closed"])
-            self.assertIn("names-unit-1", frontmatter(issue)["reason"][0])
+            self.assertIn("1", frontmatter(issue)["reason"][0])
 
     def test_declining_a_partly_built_decision_keeps_built_findings_and_waives_filed_ones(self) -> None:
         with self.ledger() as ledger:
             first, second = self.hold(ledger), self.hold(ledger, line=2)
             issue = self.file(ledger)[0]
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [first.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [first.path], [self.rename],
                               proposal=str(issue), finding_ids=(first.finding_id,))
-            ledger.ticket_assign("names-unit-1", "main")
-            ledger.ticket_checkpoint("names-unit-1", self.tip)
-            _ = ledger.ticket_merge("names-unit-1")
+            ledger.ticket_assign("1", "main")
+            ledger.ticket_checkpoint("1", self.tip)
+            _ = ledger.ticket_merge("1")
             style_proposals.decline(ledger, issue, "Keep the current code")
             states = {finding.finding_id: type(finding.state) for finding in ledger.proposal_findings(issue)}
             self.assertEqual(states, {first.finding_id: style_ledger.Built, second.finding_id: style_ledger.Waived})
@@ -725,11 +729,11 @@ class StyleProposalsTests(unittest.TestCase):
             finding = self.hold(ledger)
             issue = self.file(ledger)[0]
             self.issue_command("approve", str(issue), "--by", "user", "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename],
                               proposal=str(issue), finding_ids=(finding.finding_id,))
-            ledger.ticket_assign("names-unit-1", "main")
-            ledger.ticket_checkpoint("names-unit-1", self.tip)
-            _ = ledger.ticket_merge("names-unit-1")
+            ledger.ticket_assign("1", "main")
+            ledger.ticket_checkpoint("1", self.tip)
+            _ = ledger.ticket_merge("1")
             style_proposals.complete(ledger)
             self.assertEqual(frontmatter(issue)["status"], ["closed"])
             _ = self.hold(ledger, line=2)
@@ -804,7 +808,7 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             issue = self.approved_decision(ledger, finding)
-            _ = self.merge_ticket(ledger, "names-unit-1", issue, finding)
+            _ = self.merge_ticket(ledger, "1", issue, finding)
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
             # Before approve set the stage, a built decision closed at stage backlog.
@@ -820,7 +824,7 @@ class StyleProposalsTests(unittest.TestCase):
             first, second = self.hold(ledger), self.hold(ledger, line=2)
             issue = self.approved_decision(ledger, first, second)
             self.assertEqual(self.progress(issue), (["active"], proposal_issue.InProgress()))
-            _ = self.merge_ticket(ledger, "names-unit-1", issue, first, second)
+            _ = self.merge_ticket(ledger, "1", issue, first, second)
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
             self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["stage"]), (["closed"], ["active"]))
@@ -955,7 +959,7 @@ class StyleProposalsTests(unittest.TestCase):
     def judge_types(self, ledger: style_ledger.Ledger, path: str) -> None:
         """The types work on path is done: its cell is judged at the tip."""
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.types)
-        ledger.record(self.types, path, self.tip, blob, "clean", ticket="types-unit-1", worker="test",
+        ledger.record(self.types, path, self.tip, blob, "clean", ticket="2001", worker="test",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
 
     def ranked_hold_at_changed_file(self, ledger: style_ledger.Ledger) -> style_ledger.HeldFinding:
@@ -981,11 +985,11 @@ class StyleProposalsTests(unittest.TestCase):
     def test_a_lower_rank_finding_at_a_changed_file_is_filed_once_the_judgment_of_that_file_holds_it_again(self) -> None:
         with self.ledger() as ledger:
             finding = self.ranked_hold_at_changed_file(ledger)
-            ledger.ticket_add("names-unit-2", "names-unit", "read", "names", "alpha", [finding.path], [self.rename])
-            ledger.ticket_assign("names-unit-2", "main")
-            _ = ledger.ticket_base("names-unit-2")
-            _ = self.hold(ledger, ticket="names-unit-2", kind="restructure")
-            ledger.ticket_drop("names-unit-2")
+            ledger.ticket_add("2", ticket_owner_id("names-unit"), "read", "names", "alpha", [finding.path], [self.rename])
+            ledger.ticket_assign("2", "main")
+            _ = ledger.ticket_base("2")
+            _ = self.hold(ledger, ticket="2", kind="restructure")
+            ledger.ticket_drop("2")
             issue, = self.file(ledger)
             self.assertEqual([row.finding_id for row in ledger.proposal_findings(issue)], [finding.finding_id])
 
@@ -993,7 +997,7 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             finding = self.ranked_hold_at_changed_file(ledger)
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.rename)
-            ledger.record(self.rename, finding.path, self.tip, blob, "clean", ticket="names-unit-2", worker="test",
+            ledger.record(self.rename, finding.path, self.tip, blob, "clean", ticket="2", worker="test",
                           input_scope=style_ledger.DeclaredInputScope.RULE)
             result, lines = self.file_lines(ledger)
             self.assertEqual(result.filed, ())
@@ -1151,7 +1155,7 @@ class StyleProposalsTests(unittest.TestCase):
 
     def merge_ticket(self, ledger: style_ledger.Ledger, ticket: str, issue: Path,
                      *findings: style_ledger.HeldFinding) -> tuple[style_ledger.FindingNotBuilt, ...]:
-        ledger.ticket_add(ticket, "names-unit", "proposal", "names", "alpha", ["alpha/src/lib.rs"], [self.rename],
+        ledger.ticket_add(ticket, ticket_owner_id("names-unit"), "proposal", "names", "alpha", ["alpha/src/lib.rs"], [self.rename],
                           proposal=str(issue), finding_ids=tuple(finding.finding_id for finding in findings))
         ledger.ticket_assign(ticket, "main")
         ledger.ticket_checkpoint(ticket, self.tip)
@@ -1162,7 +1166,7 @@ class StyleProposalsTests(unittest.TestCase):
         findings = (self.hold(ledger), self.hold(ledger, line=2, before="Kind::Size", after="Kind::Length"),
                     self.hold(ledger, line=3, before="Kind::Rate", after="Kind::Speed"))
         issue = self.approved_decision(ledger, *findings)
-        _ = self.merge_ticket(ledger, "names-unit-1", issue, *findings)
+        _ = self.merge_ticket(ledger, "1", issue, *findings)
         self.built_before_the_check(ledger, *findings[1:])
         with redirect_stdout(io.StringIO()):
             style_proposals.complete(ledger)
@@ -1176,7 +1180,7 @@ class StyleProposalsTests(unittest.TestCase):
         missing = self.hold(ledger, crate=crate, line=2, before="Kind::Size", after="Kind::Length")
         old = self.legacy_issue(ledger, "old", applied, missing)
         self.built_before_the_check(ledger, applied, missing)
-        self.issue_command("close", str(old), "--reason", "built in names-unit-1")
+        self.issue_command("close", str(old), "--reason", "built in 1")
         return old, applied, missing
 
     def built_before_the_check(self, ledger: style_ledger.Ledger, *findings: style_ledger.HeldFinding) -> None:
@@ -1247,7 +1251,7 @@ class StyleProposalsTests(unittest.TestCase):
             first, second = self.hold(ledger), self.hold(ledger, line=2)
             issue = self.approved_decision(ledger, first, second)
             self.built_before_the_check(ledger, first)
-            self.issue_command("close", str(issue), "--reason", "built in names-unit-1")
+            self.issue_command("close", str(issue), "--reason", "built in 1")
             later = self.hold(ledger, line=3)
             before = issue.read_bytes()
         output, errors = io.StringIO(), io.StringIO()
@@ -1298,7 +1302,7 @@ class StyleProposalsTests(unittest.TestCase):
             first, second = self.hold(ledger), self.hold(ledger, line=2)
             issue = self.approved_decision(ledger, first, second)
             self.built_before_the_check(ledger, first)
-            self.issue_command("close", str(issue), "--reason", "built in names-unit-1")
+            self.issue_command("close", str(issue), "--reason", "built in 1")
             later = self.hold(ledger, line=3)
             _ = self.legacy_issue(ledger, "old", later)
             before = self.written(ledger)
@@ -1315,7 +1319,7 @@ class StyleProposalsTests(unittest.TestCase):
             applied = self.hold(ledger)
             missing = self.hold(ledger, line=2, before="Kind::Size", after="Kind::Length")
             issue = self.approved_decision(ledger, applied, missing)
-            self.assertEqual(self.merge_ticket(ledger, "names-unit-1", issue, applied, missing),
+            self.assertEqual(self.merge_ticket(ledger, "1", issue, applied, missing),
                              (style_ledger.FindingNotBuilt(missing.finding_id, approved_renames.RenameNotApplied(missing.path)),))
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
@@ -1325,11 +1329,11 @@ class StyleProposalsTests(unittest.TestCase):
             self.tip = self.git("rev-parse", "HEAD")
             _ = self.git("update-ref", "refs/heads/style/main", self.tip)
             ledger.set_tip(self.tip, "style/main")
-            self.assertEqual(self.merge_ticket(ledger, "names-unit-2", issue, missing), ())
+            self.assertEqual(self.merge_ticket(ledger, "2", issue, missing), ())
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
             self.assertEqual(frontmatter(issue)["status"], ["closed"])
-            self.assertIn("names-unit-2", frontmatter(issue)["reason"][0])
+            self.assertIn("2", frontmatter(issue)["reason"][0])
 
     def test_reopen_files_again_the_renames_a_built_decision_lacks_and_opens_it_approved(self) -> None:
         with self.ledger() as ledger:
@@ -1407,12 +1411,12 @@ class StyleProposalsTests(unittest.TestCase):
                 style_proposals.migrate(ledger, self.proposals, "parent")
             moved_to, = (path for path in self.proposals.glob("style *.md"))
             self.assertEqual([item.finding_id for item in ledger.proposal_findings(moved_to)], [other.finding_id])
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "beta", [other.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "beta", [other.path], [self.rename],
                               proposal=str(moved_to), finding_ids=(other.finding_id,))
             with redirect_stdout(io.StringIO()) as output:
                 _ = style_proposals.reopen(ledger, old, "parent", dry_run=True)
             self.assertEqual(output.getvalue().count(f"filed again {missing.finding_id} in "), 1)
-            ledger.ticket_drop("names-unit-1")
+            ledger.ticket_drop("1")
             style_proposals.decline(ledger, moved_to, "not now")
             output = self.reopen_output(ledger, old)
             decision, = (path for path in self.proposals.glob("style *.md") if path != moved_to)
@@ -1429,7 +1433,7 @@ class StyleProposalsTests(unittest.TestCase):
             missing = self.hold(ledger, line=5, before="Kind::Rate", after="Kind::Speed")
             old = self.legacy_issue(ledger, "old", applied, missing)
             self.built_before_the_check(ledger, applied, missing)
-            self.issue_command("close", str(old), "--reason", "built in names-unit-1")
+            self.issue_command("close", str(old), "--reason", "built in 1")
 
             def stop_at_reopen(*arguments: str) -> None:
                 if arguments[0] == "reopen":
@@ -1456,12 +1460,12 @@ class StyleProposalsTests(unittest.TestCase):
             _ = self.git("commit", "-qam", "Rename Size to Length")
             self.tip = self.git("rev-parse", "HEAD")
             _ = self.git("update-ref", "refs/heads/style/main", self.tip)
-            self.assertEqual(self.merge_ticket(ledger, "names-unit-1", issue, missing), ())
+            self.assertEqual(self.merge_ticket(ledger, "1", issue, missing), ())
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
             before = self.written(ledger)
             with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(
-                    f"{issue}: merged ticket names-unit-1 is not in synced commit {synced[:7]}; sync first")):
+                    f"{issue}: merged ticket 1 is not in synced commit {synced[:7]}; sync first")):
                 _ = style_proposals.reopen(ledger, issue, "parent")
             self.assertEqual(self.written(ledger), before)
             ledger.set_tip(self.tip, "style/main")
@@ -1496,17 +1500,17 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             finding = self.hold(ledger, before="Kind::Size", after="Kind::Length")
             issue = self.approved_decision(ledger, finding)
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename],
                               proposal=str(issue), finding_ids=(finding.finding_id,))
-            with self.assertRaisesRegex(style_ledger.LedgerError, "open ticket names-unit-1 builds it"):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "open ticket 1 builds it"):
                 _ = style_proposals.reopen(ledger, issue, "parent")
-            self.assertEqual(ledger.proposal_findings(issue)[0].build_ticket, style_ledger.BuildTicket("names-unit-1"))
+            self.assertEqual(ledger.proposal_findings(issue)[0].build_ticket, style_ledger.BuildTicket("1"))
 
     def test_reopen_prints_the_nothing_line_when_every_built_rename_is_applied(self) -> None:
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             issue = self.approved_decision(ledger, finding)
-            self.assertEqual(self.merge_ticket(ledger, "names-unit-1", issue, finding), ())
+            self.assertEqual(self.merge_ticket(ledger, "1", issue, finding), ())
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
             self.assertEqual(self.reopen_output(ledger, issue), "nothing to reopen: every built finding is applied\n")
@@ -1547,11 +1551,11 @@ class StyleProposalsTests(unittest.TestCase):
             refused, _, kept = self.built_decision(ledger, "beta")
             later = self.hold(ledger, crate="beta", line=3, before="Kind::Rate", after="Kind::Speed")
             self.assertEqual(self.file(ledger), (refused,))
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "beta", [later.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "beta", [later.path], [self.rename],
                               proposal=str(refused), finding_ids=(later.finding_id,))
         # Decisions run in path order, and the alpha decision's name sorts first.
         self.assertEqual(self.reopen_all(), (1, [self.filed_again_line(reopened, missing),
-                                                 f"skipped {refused}: open ticket names-unit-1 builds it",
+                                                 f"skipped {refused}: open ticket 1 builds it",
                                                  "totals: reopen 1, filed again 1, cannot check 0, restructure not checked 0, skipped 1"],
                                              "style_proposals: skipped 1 issues\n"))
         with self.ledger() as ledger:
@@ -1746,11 +1750,11 @@ class StyleProposalsTests(unittest.TestCase):
         self.assertEqual(self.reopen_issue(issue, "--finding", unchecked.finding_id, "--by", "nate")[0], 0)
         with self.ledger() as ledger:
             self.assertEqual(ledger.proposal_findings(issue)[1].reading, style_ledger.ReadByPerson("nate"))
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "beta", [unchecked.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "beta", [unchecked.path], [self.rename],
                               proposal=str(issue), finding_ids=(unchecked.finding_id,))
-            ledger.ticket_assign("names-unit-1", "main")
-            ledger.ticket_checkpoint("names-unit-1", self.tip)
-            self.assertEqual(ledger.ticket_merge("names-unit-1"),
+            ledger.ticket_assign("1", "main")
+            ledger.ticket_checkpoint("1", self.tip)
+            self.assertEqual(ledger.ticket_merge("1"),
                              (style_ledger.FindingNotBuilt(unchecked.finding_id, approved_renames.NoAppliedCheck("rename")),))
             ledger.mark_built(unchecked.finding_id)
             rebuilt = ledger.proposal_findings(issue)[1]
@@ -1795,7 +1799,7 @@ class StyleProposalsTests(unittest.TestCase):
                          for line in (2, 3))
             old = self.legacy_issue(ledger, "old", *read)
             self.built_before_the_check(ledger, *read)
-            self.issue_command("close", str(old), "--reason", "built in names-unit-1")
+            self.issue_command("close", str(old), "--reason", "built in 1")
             before = self.written(ledger)
         arguments = ("--finding", read[0].finding_id, "--finding", read[1].finding_id, "--by", "nate")
         code, lines, _ = self.reopen_issue(old, *arguments, "--dry-run")
@@ -1851,7 +1855,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertIn(f"{finding.finding_id} filed alpha/src/lib.rs:1", output.getvalue())
             self.assertIn("Before: Kind::Value\nAfter: Kind::Count", output.getvalue())
             self.assertEqual(output.getvalue().count("Consider a new rule"), 1)
-            self.assertIn("beta/src/lib.rs:3 — candidate-1 (candidate)", output.getvalue())
+            self.assertIn("beta/src/lib.rs:3 — 1 (candidate)", output.getvalue())
             self.assertEqual(len(tuple(self.proposals.glob("*.md"))), 1)
 
     def test_drop_candidate_removes_each_candidate_with_the_idea_and_refuses_an_unknown_idea(self) -> None:
@@ -2405,10 +2409,10 @@ class StyleProposalsTests(unittest.TestCase):
             finding = self.hold(ledger)
             issue = self.file(ledger)[0]
             self.issue_command("approve", str(issue), "--by", "user", "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename], proposal=str(issue), finding_ids=(finding.finding_id,))
-            ledger.ticket_assign("names-unit-1", "main")
-            ledger.ticket_checkpoint("names-unit-1", self.tip)
-            _ = ledger.ticket_merge("names-unit-1")
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename], proposal=str(issue), finding_ids=(finding.finding_id,))
+            ledger.ticket_assign("1", "main")
+            ledger.ticket_checkpoint("1", self.tip)
+            _ = ledger.ticket_merge("1")
             with mock.patch.object(style_proposals, "renumber", side_effect=[style_ledger.LedgerError("renumber failed"), None]) as renumber:
                 with self.assertRaisesRegex(style_ledger.LedgerError, "renumber failed"):
                     style_proposals.complete(ledger)
@@ -2593,30 +2597,30 @@ class StyleProposalsTests(unittest.TestCase):
             finding = self.hold(ledger)
             issue = self.proposals / "approved.md"
             with self.assertRaisesRegex(style_ledger.LedgerError, "filed findings"):
-                ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename], proposal=str(issue), finding_ids=(finding.finding_id,))
+                ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename], proposal=str(issue), finding_ids=(finding.finding_id,))
             issue = self.file(ledger)[0]
             self.issue_command("approve", str(issue), "--by", "user", "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename], proposal=str(issue), finding_ids=(finding.finding_id,))
-            origin = ledger.ticket_origin("names-unit-1")
-            self.assertEqual(origin, style_ledger.ApprovedProposal(issue, "names-unit", (finding.finding_id,)))
-            ledger.ticket_assign("names-unit-1", "main")
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename], proposal=str(issue), finding_ids=(finding.finding_id,))
+            origin = ledger.ticket_origin("1")
+            self.assertEqual(origin, style_ledger.ApprovedProposal(issue, style_unit_id("names"), (finding.finding_id,)))
+            ledger.ticket_assign("1", "main")
             self.write(finding.path, APPLIED + "fn value() -> u32 { 2 }\n")
             _ = self.git("add", "--all")
             _ = self.git("commit", "-qm", "Approved behavior change")
             checkpoint = self.git("rev-parse", "HEAD")
-            ledger.ticket_checkpoint("names-unit-1", checkpoint)
+            ledger.ticket_checkpoint("1", checkpoint)
             with self.assertRaisesRegex(style_ledger.LedgerError, "not on"):
-                _ = ledger.ticket_merge("names-unit-1")
+                _ = ledger.ticket_merge("1")
             self.assertEqual(len(ledger.held_findings(style_ledger.HeldFindingsInState("filed"))), 1)
             _ = self.git("branch", "-f", "style/main", checkpoint)
-            _ = ledger.ticket_merge("names-unit-1")
+            _ = ledger.ticket_merge("1")
             self.assertEqual(len(ledger.held_findings(style_ledger.HeldFindingsInState("built"))), 1)
             self.assertEqual(ledger.summary().proposals, 0)
             style_proposals.complete(ledger)
-            self.assertEqual(frontmatter(issue)["reason"], ["built in names-unit-1"])
+            self.assertEqual(frontmatter(issue)["reason"], ["built in 1"])
             self.assertEqual(frontmatter(issue)["status"], ["closed"])
             calls = len(self.calls)
-            _ = ledger.ticket_merge("names-unit-1")
+            _ = ledger.ticket_merge("1")
             style_proposals.complete(ledger)
             self.assertEqual(len(self.calls), calls)
 
@@ -2733,7 +2737,7 @@ class StyleProposalsTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as output:
                 _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
             self.assertNotIn(f"held for open ticket {ticket}", output.getvalue())
-            self.assertEqual(ledger.ticket_open("names-unit"), ())
+            self.assertEqual(ledger.ticket_open(ticket_owner_id("names-unit")), ())
             self.assertIn("totals: withdraw 1, kept 0, close 0", output.getvalue())
             unchanged, = ledger.held_findings(style_ledger.AllHeldFindings())
             self.assertIsInstance(unchanged.state, style_ledger.Withdrawn)
@@ -2890,7 +2894,7 @@ class StyleProposalsTests(unittest.TestCase):
             finding = self.hold(ledger)
             issue = self.file(ledger)[0]
             self.issue_command("approve", str(issue), "--by", "user", "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename],
                               proposal=str(issue), finding_ids=(finding.finding_id,))
             blob = self.newer_rule_text()
             _ = self.newer_verdict(ledger, blob, "exception")
@@ -2899,7 +2903,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertIn("totals: withdraw 1, kept 0, close 1", output)
             self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Withdrawn(issue, style_ledger.RuleBodyChanged(blob)))
             with self.assertRaises(style_ledger.LedgerError):
-                ledger.ticket_assign("names-unit-1", "main")
+                ledger.ticket_assign("1", "main")
             self.assertEqual(frontmatter(issue)["status"], ["closed"])
 
     def test_rule_body_change_withdraws_every_cell_of_a_decision(self) -> None:
@@ -3020,13 +3024,13 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             issue, _, bare = self.bare_duplicate_decision(ledger)
             self.issue_command("approve", str(issue), "--by", "user", "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [bare.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [bare.path], [self.rename],
                               proposal=str(issue), finding_ids=(bare.finding_id,))
             before = self.written(ledger)
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(style_proposals.main(["drop-duplicates", "--repo", str(self.repo)]), 1)
         self.assertEqual(output.getvalue().splitlines(),
-                         [f"skipped {issue}: open ticket names-unit-1 holds {bare.finding_id}", "totals: drop 0, skipped 1"])
+                         [f"skipped {issue}: open ticket 1 holds {bare.finding_id}", "totals: drop 0, skipped 1"])
         self.assertEqual(errors.getvalue(), "style_proposals: skipped 1 decisions\n")
         with self.ledger() as ledger:
             self.assertEqual(self.written(ledger), before)
@@ -3099,7 +3103,7 @@ class StyleProposalsTests(unittest.TestCase):
             ledger.record(self.rename, withdrawn.path, self.tip, built.rule_blob, "held", ticket="outside", worker="test",
                           input_scope=style_ledger.DeclaredInputScope.RULE)
             issue = self.approved_decision(ledger, withdrawn, built)
-            self.assertEqual(self.merge_ticket(ledger, "names-unit-1", issue, built), ())
+            self.assertEqual(self.merge_ticket(ledger, "1", issue, built), ())
             blob = self.newer_rule_text()
             self.assertIn("totals: withdraw 1, kept 0, close 0", self.withdraw(ledger))
             self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
@@ -3107,7 +3111,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(frontmatter(issue)["status"], ["open"])
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
-            self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], ["built in names-unit-1"]))
+            self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], ["built in 1"]))
 
     def test_a_decision_that_withdrawal_cannot_close_is_skipped_and_the_others_still_file(self) -> None:
         with self.ledger() as ledger:
@@ -3177,9 +3181,9 @@ class StyleProposalsTests(unittest.TestCase):
               kind: style_ledger.FindingKind = "rename", before: str = "Parent::old",
               after: str = "Parent::new") -> tuple[style_ledger.HeldFinding, ...]:
         """Findings at sites that a read ticket judged at the head of branch; the ticket is then dropped."""
-        ticket = f"judge-{len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
+        ticket = f"{4000 + len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.rename)
-        ledger.ticket_add(ticket, "judge", "read", "names", "alpha", sorted({path for path, _, _ in sites}), [self.rename])
+        ledger.ticket_add(ticket, ticket_owner_id("judge"), "read", "names", "alpha", sorted({path for path, _, _ in sites}), [self.rename])
         ledger.ticket_assign(ticket, branch)
         _ = ledger.ticket_base(ticket)
         findings = tuple(ledger.hold(self.rename, path, line, text, kind, before, after, blob, ticket) for path, line, text in sites)
@@ -3646,12 +3650,12 @@ class StyleProposalsTests(unittest.TestCase):
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT})
             finding, = self.judge(ledger, (("alpha/src/a.rs", 2, "old: u32,"),))
             issue = self.approved_decision(ledger, finding)
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "alpha", [finding.path], [self.rename],
                               proposal=str(issue), finding_ids=(finding.finding_id,))
-            ledger.ticket_assign("names-unit-1", "main")
+            ledger.ticket_assign("1", "main")
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": "pub fn other() {}\n", "alpha/src/b.rs": PARENT})
             before = self.written(ledger)
-            self.assertEqual(self.follow(), (0, f"kept {finding.finding_id} {self.rename} alpha/src/a.rs:2: open ticket names-unit-1 "
+            self.assertEqual(self.follow(), (0, f"kept {finding.finding_id} {self.rename} alpha/src/a.rs:2: open ticket 1 "
                                                 + "builds it\ntotals: follow 0, built 0, withdraw 0, left 0, kept 1, close 0\n"))
             self.assertEqual(self.written(ledger), before)
 

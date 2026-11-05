@@ -957,10 +957,18 @@ def candidates(ledger: style_ledger.Ledger) -> None:
     groups: dict[str, list[style_ledger.RuleCandidate]] = defaultdict(list)
     for candidate in ledger.rule_candidates():
         groups[candidate.idea].append(candidate)
+    unavailable: set[str] = set()
     for idea, items in sorted(groups.items()):
         print(idea)
         for item in items:
-            print(f"  {item.path}:{item.line} — {item.ticket} ({item.unit})")
+            try:
+                owner = ledger.unit_name(item.unit)
+            except style_ledger.LedgerError as error:
+                if item.ticket not in unavailable:
+                    print(f"anomaly: ticket {item.ticket}: " + " ".join(str(error).splitlines()))
+                    unavailable.add(item.ticket)
+                continue
+            print(f"  {item.path}:{item.line} — {item.ticket} ({owner})")
 
 
 def drop_candidate(ledger: style_ledger.Ledger, idea: str) -> None:
