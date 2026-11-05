@@ -103,7 +103,6 @@ Both commands are safe to repeat. They stop no process. Rename, move, retire and
 | `scripts/production/migrate_showrunner_timers.py` | read | snapshot, StaffId |
 | `scripts/production/migrate_staff_ids.py` | read | _file, is_owner, native_id, operation, publish_native_ids, runtime_id, snapshot |
 | `scripts/production/next_item.py` | read | snapshot |
-| `scripts/production/owns_fill.py` | read | snapshot, PresentWorktree, RemovedWorktree |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
