@@ -48,7 +48,7 @@
 
 - [ ] **A stopped sweep plan ends with one line, and a plan run prints a short summary**
   - Target: `scripts/lint/tmp_sweep.py` (`--plan`), its tests
-  - Why needed: Ctrl-C during `tmp_sweep.py --plan` prints a Python traceback, and a plan run prints 79,530 lines, so the plan cannot be read on screen
+  - Why needed: Ctrl-C during `tmp_sweep.py --plan` prints a Python traceback. `write_cleanup_plan()` prints every entry. Phase 72 changed the kept entries; the current output line count is not measured.
   - Completion condition: Ctrl-C ends with one line and exit 130; a plan run prints a short summary (counts and bytes per group) and the path of the full plan file; a test pins both
   - Revealed by: builds C617 (builds showrunner 2026-10-30: next)
 
