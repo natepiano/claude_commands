@@ -165,6 +165,8 @@ export async function loadAccounts(
   try {
     const status = JSON.parse(result.stdout) as StoredAccountsStatus;
     if (!Array.isArray(status.accounts) || !Array.isArray(status.problems)) throw new Error();
+    if (status.upcoming_moves !== undefined && (!Array.isArray(status.upcoming_moves)
+      || !status.upcoming_moves.every(line => typeof line === 'string'))) throw new Error();
     if (status.session_inputs) {
       if (!Array.isArray(status.session_inputs) || !status.session_inputs.every(path => typeof path === 'string')) throw new Error();
       refreshLiveness = status.session_inputs.length > 0;

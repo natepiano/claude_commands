@@ -310,6 +310,29 @@ function hasSensitivePath(paths: readonly string[]) {
   return paths.some(path => /(?:\.claude\.json|auth\.json|id_token)/.test(path));
 }
 describe('accounts table', () => {
+  for (const upcoming of [
+    ['Upcoming moves:', 'showrunners 1: at 1% → claude3, else claude2', '', 'units 1: at 1% → claude4', '', 'workers 1: at 1% → codex2'],
+    ['Upcoming moves: none'],
+    ['Upcoming moves: unavailable from natedev; next: remote list failed: fixture host unreachable'],
+  ]) {
+    test(`upcoming moves appear under the table: ${upcoming[0]}`, async ($, on) => {
+      const fake = accountsHost(on);
+      const data = statusFixture();
+      data.upcoming_moves = upcoming;
+      fake.replace(data);
+      await $.command.run(command());
+      const ui = await mount($);
+      const lines = rowLines(await ui.drawn());
+      const heading = lines.indexOf(upcoming[0]!);
+      const total = lines.findIndex(line => line.trim().startsWith('total'));
+      const problems = lines.indexOf('Problems');
+      expect(heading).toBeGreaterThan(total);
+      expect(problems).toBeGreaterThan(heading);
+      expect(lines.slice(heading, heading + upcoming.length)).toEqual(upcoming);
+      expect(fake.accountRuns()).toEqual([ARGV]);
+    });
+  }
+
   for (const columns of [140, 60, 30]) {
     test(`${columns} cells: the next role has only its own role and counts`, async ($, on) => {
       const fake = accountsHost(on);

@@ -3755,6 +3755,7 @@ class StatusReading:
     checked_at: datetime
     represented_stderr: tuple[str, ...] = ()
     session_inputs: tuple[str, ...] = ()
+    upcoming_moves: tuple[str, ...] = ()
 
 
 class StatusAccountDocument(TypedDict):
@@ -3773,6 +3774,7 @@ class StatusAccountDocument(TypedDict):
 
 
 class StatusDocument(TypedDict):
+    upcoming_moves: list[str]
     session_inputs: list[str]
     accounts: list[StatusAccountDocument]
     problems: list[str]
@@ -3899,7 +3901,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
                 agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
             credits_in_use=row.on_credits == "yes")
         accounts.append(item)
-    return json.dumps(StatusDocument(session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
+    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -4089,7 +4091,7 @@ def render_status_table(reading: StatusReading, *, account_config: conf.ConfigRe
         rows.append(cells)
         rows.extend(tuple(role if index == 2 else "" for index in range(len(cells))) for role in row.roles[1:])
     return "\n".join([_render_table(rows), "",
-        *reading.notes, *reading.detail_lines])
+        *reading.upcoming_moves, *(("",) if reading.upcoming_moves else ()), *reading.notes, *reading.detail_lines])
 
 
 def _render_table(rows: list[tuple[str, ...]]) -> str:
@@ -4671,10 +4673,20 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
+def _with_upcoming_moves(reading: StatusReading) -> StatusReading:
+    try:
+        upcoming = next_moves.list_next_moves()
+        lines = ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
+    except (next_moves.NextMoveError, ValueError) as error:
+        lines = (f"Upcoming moves: unavailable from {role_map.ROLE_MAP_HOST}; {str(error).splitlines()[0]}",)
+    return replace(reading, upcoming_moves=lines)
+
+
 def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_USAGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
-    """The account table, with optional session, worker and move details."""
+    """Show upcoming moves between the account table and its problems."""
     account_config = read_account_settings(account_config)
-    return render_status_table(read_status(source=source, detail=detail, account_config=account_config), account_config=account_config)
+    reading = _with_upcoming_moves(read_status(source=source, detail=detail, account_config=account_config))
+    return render_status_table(reading, account_config=account_config)
 
 
 # Run folders under unit/, and under delegate/ for a run started before the rename.
@@ -5313,7 +5325,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
             held = DiagnosticStream(sys.stderr)
             try:
                 with redirect_stderr(held):
-                    rendered = (render_status_json(read_status(source=source, detail=options.detail, account_config=account_config), account_config=account_config)
+                    rendered = (render_status_json(_with_upcoming_moves(read_status(source=source, detail=options.detail, account_config=account_config)), account_config=account_config)
                                 if options.as_json else status_report(source=source, detail=options.detail, account_config=account_config))
                 print(rendered)
             except BaseException as error:

@@ -24,4 +24,5 @@ export interface StoredAccountsStatus {
   accounts: StoredAccount[];
   problems: string[];
   session_inputs?: string[];
+  upcoming_moves?: string[];
 }

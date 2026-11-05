@@ -3271,7 +3271,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                       patch.object(role_map, "ssh_role_map", side_effect=failure) as fetch):
                     code, output, error = self.run_cli("status", *flags)
                 self.assertEqual((code, error), (0, ""))
-                fetch.assert_called_once()
+                self.assertEqual(fetch.call_args_list, [call(("role-map-read",)), call(("next", "list"))])
                 lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
                 problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
                 self.assertEqual(len(problems), 1)
@@ -3286,12 +3286,13 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             "groups": {}, "workers": "codex1"}}))
         for flags in ((), ("--json",)):
             with (self.subTest(flags=flags), patch.object(role_map, "is_role_map_host", return_value=False),
-                  patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored read fetched"))):
+                  patch.object(role_map, "ssh_role_map", return_value="nothing set up\n") as fetch):
                 code, output, error = self.run_cli("status", "--stored", *flags)
             self.assertEqual((code, error), (0, ""))
             lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
             problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
             self.assertEqual(problems, [])
+            fetch.assert_called_once_with(("next", "list"))
 
     def test_piped_status_replays_held_warning_before_the_final_error(self) -> None:
         def failed_read(*_args: object, **_kwargs: object) -> accounts.StatusReading:
@@ -3525,7 +3526,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 code, output, error = self.run_cli("status", "--stored", *flags)
                 self.assertEqual((code, error), (0, ""))
                 expected = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
-                            else output.split("\n\n", 1)[1].strip().splitlines())
+                            else output.split("\n\n", 2)[2].strip().splitlines())
                 self.assertEqual(len(expected), 2)
                 self.assertTrue(any("test wrote" in line for line in expected))
                 for later in ("read", "render"):
@@ -3866,7 +3867,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                     code, output, error = self.run_cli("status", "--stored", *flags)
                     self.assertEqual((code, error), (0, ""))
                     lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
-                             else output.split("\n\n", 1)[1].strip().splitlines())
+                             else output.split("\n\n", 2)[2].strip().splitlines())
                     expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>"]
                     for label in ("claude2", "claude3"):
                         roles = "units" if label == "claude2" and different else "showrunners" if different else "units, showrunners" if label == "claude2" else ""
@@ -3904,7 +3905,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                     code, output, error = self.run_cli("status", "--stored", *flags)
                 self.assertEqual((code, error), (0, ""))
                 lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
-                         else output.split("\n\n", 1)[1].strip().splitlines())
+                         else output.split("\n\n", 2)[2].strip().splitlines())
                 self.assertCountEqual(lines, expected)
 
     def test_failed_codex_save_and_render_keep_the_good_reading_diagnostic(self) -> None:
@@ -4984,6 +4985,60 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual([cell.strip() for cell in lines[index + 1].strip("|").split("|")],
                          ["", "", "showrunners", "", "", "", "", ""])
 
+    def test_board_shows_upcoming_moves_between_the_table_and_problems(self) -> None:
+        _ = next_moves.add_next_move("units", 1, "claude4")
+        _ = next_moves.add_next_move("showrunners", 1, "claude3", fallback_targets=("claude2",))
+        _ = next_moves.add_next_move("workers", 1, "codex2")
+        expected = next_moves.list_next_moves()
+        before = next_moves.next_moves_file().read_bytes()
+        reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
+        with patch.object(accounts, "read_status", return_value=reading):
+            code, output, error = self.run_cli()
+        self.assertEqual((code, error), (0, ""))
+        table, upcoming, problems = output.rstrip().split("\n\n", 2)
+        self.assertTrue(table.startswith("| Folder"))
+        self.assertEqual(upcoming + "\n\n" + problems,
+                         "Upcoming moves:\n" + expected + "\n\nFixture problem.")
+        with patch.object(accounts, "read_status", return_value=reading):
+            code, document, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(document)["upcoming_moves"], ["Upcoming moves:", *expected.splitlines()])
+        self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+
+    def test_board_shows_none_when_no_upcoming_moves_exist(self) -> None:
+        reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
+        with patch.object(accounts, "read_status", return_value=reading):
+            code, output, error = self.run_cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(output.endswith("\n\nUpcoming moves: none\n\nFixture problem.\n"))
+        with patch.object(accounts, "read_status", return_value=reading):
+            code, document, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(document)["upcoming_moves"], ["Upcoming moves: none"])
+        self.assertFalse(next_moves.next_moves_file().exists())
+
+    def test_board_reads_upcoming_moves_from_natedev_on_the_mac_without_failing_when_unreachable(self) -> None:
+        reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
+        for reply in ("showrunners 1: at 1% → claude3, else claude2\n", "nothing set up\n",
+                      OSError("fixture host unreachable")):
+            for arguments in ((), ("status", "--stored", "--json")):
+                with (self.subTest(reply=reply, arguments=arguments), patch.object(accounts, "read_status", return_value=reading),
+                      patch.object(role_map, "is_role_map_host", return_value=False),
+                      patch.object(role_map, "ssh_role_map", side_effect=[reply]) as fetch):
+                    code, output, error = self.run_cli(*arguments)
+                self.assertEqual((code, error), (0, ""))
+                fetch.assert_called_once_with(("next", "list"))
+                if arguments:
+                    output = "\n".join(cast(accounts.StatusDocument, json.loads(output))["upcoming_moves"]) + "\n"
+                else:
+                    self.assertTrue(output.endswith("\n\nFixture problem.\n"))
+                if isinstance(reply, OSError):
+                    self.assertIn("Upcoming moves: unavailable from natedev; next: remote list failed: fixture host unreachable", output)
+                elif reply == "nothing set up\n":
+                    self.assertIn("Upcoming moves: none", output)
+                else:
+                    self.assertIn("Upcoming moves:\n" + reply, output)
+
     def json_status_fixture(self) -> tuple[datetime, datetime]:
         self.login_directory("claude2", "main@example.invalid")
         self.login_directory("claude3", "unit@example.invalid")
@@ -5068,7 +5123,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 code, output, error = self.run_cli(*arguments)
                 self.assertEqual((code, error), (0, ""))
                 notes = (cast(list[str], json.loads(output)["problems"]) if "--json" in arguments
-                         else output.split("\n\n", 1)[1].strip().splitlines())
+                         else output.split("\n\n", 2)[2].strip().splitlines())
                 for line in expected:
                     self.assertEqual(notes.count(line), 1)
                 self.assertFalse(any(note.startswith(("* claude2:", "* claude3:", "* codex1:")) for note in notes))
@@ -5081,7 +5136,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("status", "--json")
         self.assertEqual((code, error), (0, ""))
         document = cast(dict[str, object], json.loads(output))
-        self.assertEqual(set(document), {"accounts", "problems", "session_inputs"})
+        self.assertEqual(set(document), {"accounts", "problems", "session_inputs", "upcoming_moves"})
         rows = cast(list[dict[str, object]], document["accounts"])
         keys = {"label", "tool", "roles", "role_counts", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
@@ -5099,7 +5154,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual([tuple(row[field] for field in fields) for row in rows], expected)
         self.assertEqual([row["read_ok"] for row in rows], [False, True, True, False, True, False, True])
         self.assertEqual([row["credits_in_use"] for row in rows], [False, False, False, False, True, False, False])
-        notes = table.split("\n\n", 1)[1].strip().splitlines()
+        notes = table.split("\n\n", 2)[2].strip().splitlines()
         self.assertIn("accounts.py setup codex2", "\n".join(notes))
         self.assertEqual(document["problems"], [note.removeprefix("* ") for note in notes])
         self.assertTrue(any(note.startswith("* ") for note in notes))

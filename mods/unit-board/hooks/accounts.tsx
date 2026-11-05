@@ -246,6 +246,9 @@ export function AccountsView(elements: PaneElements, columns: number, status: St
   </Box>;
   return <Box flexDirection="column">
     {rows.map(drawLine)}
+    {status.upcoming_moves && <Box flexDirection="column" marginTop={1}>
+      {status.upcoming_moves.flatMap(line => line ? wrapLine([span(line)], width) : [[]]).map(drawLine)}
+    </Box>}
     {status.problems.length > 0 && <Box flexDirection="column" marginTop={1}>
       {wrapLine([span('Problems', 'default', 'bold')], width).map(drawLine)}
       {status.problems.flatMap(problem => wrapLine([span(`• ${problem}`, 'warning')], width)).map(drawLine)}
