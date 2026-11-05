@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership, fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -73,6 +73,7 @@ class NativeClaudeUnitTests(StaffTestCase):
         self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
         self.assertEqual(launch.call_args.args[2], "row-name")
         self.assertNotIn("STAFF_ID", cast(dict[str, str], launch.call_args.args[4]))
+        self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in cast(dict[str, str], launch.call_args.args[4])))
 
     def test_fresh_unit_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
         document = self.production("demo")
@@ -101,6 +102,7 @@ class NativeClaudeUnitTests(StaffTestCase):
         self.assertNotIn("--session-id", backend.arguments)
         self.assertNotIn("--resume", backend.arguments)
         self.assertNotIn("STAFF_ID", backend.environment)
+        self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in backend.environment))
 
 
 @final
@@ -335,16 +337,20 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.git("rev-parse", "HEAD")),
                          (document, data, head))
 
-    def test_new_row_with_a_running_marked_unit_refuses_before_any_write(self) -> None:
+    def test_new_row_with_a_running_labeled_session_refuses_before_any_write(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
+        owner = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        owner = staff.update_current_session(owner.current_session,
+            staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
+        owner = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", prior), expected=owner.worktree)
         document = self.doc.read_bytes()
         repository = self.repository_state()
         head = self.git("rev-parse", "build-followups")
         plans = {path: path.read_bytes() for path in self.plan.parent.iterdir() if path.is_file()}
-        marked = unit_lookup.MarkedUnit("alpha-unit",
-            unit_lookup.LiveClaude("alpha", "running-id", "/fixture/socket", 4242),
-            HerdrPlace("running-host", "w1:p1"))
+        marked = unit_lookup.LabeledSession("alpha-unit",
+            unit_lookup.LiveClaude("alpha", owner.current_session, "/fixture/socket", 4242),
+            HerdrPlace("running-host", "w1:p1"), identity=unit_lookup.LiveSession(owner.current_session))
         modes = (("--plan", "docs/plans/given.md"), ("--brief", "Write the missing plan."),
                  ("--standby",), ("--permanent",))
         for mode in modes:
@@ -353,7 +359,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
             for flags in launches:
                 with self.subTest(mode=mode, flags=flags):
                     arguments = ["--production", str(self.doc), "alpha", *mode, *flags]
-                    with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
+                    with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
                           patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
                           patch.object(add_unit, "launch_session") as launched,
                           patch.object(add_unit, "wait_for_remote_control", return_value=marked) as waited,
@@ -395,8 +401,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_new_work_launch_still_waits_for_remote_control(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
-            result, error, commands, launches, _writes = self.run_with_marked_unit(
-                unit_lookup.ClaudeNotRunning(), already_marked=False
+            result, error, commands, launches, _writes = self.run_with_labeled_session(
+                unit_lookup.ClaudeNotRunning(), already_labeled=False
             )
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
@@ -421,11 +427,13 @@ class AddUnitLaunchTests(AddUnitTestCase):
                                     ("beta", True, "prompt typed 1 times")):
             with self.subTest(typed=typed):
                 place = herdr.HerdrPlace(SHARED, "w1:p1")
-                found = add_unit.MarkedUnitFound(unit_lookup.MarkedUnit(f"{unit}-unit", unit_lookup.ClaudeNotRunning(), place))
+                found = add_unit.LabeledSessionFound(unit_lookup.LabeledSession(f"{unit}-unit",
+                    unit_lookup.ClaudeNotRunning(), place,
+                    identity=unit_lookup.LiveSession(fixture_runtime_id("unsubmitted:" + unit))))
                 outcome = herdr.PromptNotSubmitted("destination never became ready for input"
                                                    + ("; prompt typed 1 times" if typed else ""), never_typed=not typed)
                 with (patch.object(herdr, "start_agent", return_value=outcome),
-                      patch.object(add_unit, "launched_unit", side_effect=[add_unit.NoMarkedUnit(), found]),
+                      patch.object(add_unit, "launched_unit", side_effect=[add_unit.NoLabeledSession(), found]),
                       patch.object(herdr, "close_agent") as closed):
                     result = self.cli(unit, "--plan", "docs/plans/given.md")
                 self.assertEqual(result.returncode, 1, result.stderr)
@@ -501,7 +509,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertFalse((worktree / "docs/plans/build-followups-alpha.md").exists())
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
-        self.assertEqual({key: value for key, value in self.pane_environment().items() if key.startswith("SHOWRUNNER_")}, {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        self.assertEqual({key: value for key, value in self.pane_environment().items() if key.startswith("SHOWRUNNER_")}, {})
         command = self.opening_prompt()
         prompt = (f"You are alpha-unit in production build-followups (doc {self.doc}), "
                   "under the showrunner, whose `SendMessage` address `~/.claude/scripts/lib/py "
@@ -584,8 +592,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", "alpha"], self.herdr_calls())
         self.assertEqual({key: value for key, value in self.pane_environment().items()
                           if key.startswith(("SHOWRUNNER_", "CLAUDE_", "HERDR_")) or key == "ENABLE_TOOL_SEARCH"},
-                         {"SHOWRUNNER_UNIT": "build-followups",
-            "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
+                         {"ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
             "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
             "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path(self.env["HOME"]) / ".claude")})
         arguments = self.agent_arguments()
@@ -813,11 +820,11 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), self.git("rev-parse", f"{head}^{{tree}}"))
         self.assertIn("added alpha-unit (plan)", self.log.read_text())
         prompts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]]
-        marked = unit_lookup.MarkedUnit("alpha-unit",
+        marked = unit_lookup.LabeledSession("alpha-unit",
             unit_lookup.LiveClaude("alpha", "plan-session-id", "/fixture/socket", 4242),
-            HerdrPlace("plan-host", "w1:p1"))
+            HerdrPlace("plan-host", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
 
-        with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
+        with patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)), \
                 patch.object(add_unit, "wait_for_remote_control", return_value=marked):
             retry = self.successful("alpha", "--plan", "docs/plans/build-followups-alpha.md")
 
@@ -844,6 +851,10 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_running_brief_refuses_plan_mode_before_any_write(self) -> None:
         stub = self.commit_brief_row()
         worktree = self.root / "project-alpha"
+        owner = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        owner = staff.update_current_session(owner.current_session,
+            staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
+        owner = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", worktree), expected=owner.worktree)
         marker = worktree / "in-progress.txt"
         _ = marker.write_text("Work from the brief.\n", encoding="utf-8")
         _ = self.log.write_text("The brief is still running.\n", encoding="utf-8")
@@ -855,15 +866,15 @@ class AddUnitLaunchTests(AddUnitTestCase):
             worktree / "docs/plans/build-followups-production.md",
             worktree / "docs/plans/build-followups-alpha.md",
         )}
-        marked = unit_lookup.MarkedUnit("alpha-unit",
-            unit_lookup.LiveClaude("alpha", "brief-session-id", "/fixture/socket", 4242),
-            HerdrPlace("brief-host", "w1:p1"))
+        marked = unit_lookup.LabeledSession("alpha-unit",
+            unit_lookup.LiveClaude("alpha", owner.current_session, "/fixture/socket", 4242),
+            HerdrPlace("brief-host", "w1:p1"), identity=unit_lookup.LiveSession(owner.current_session))
 
         launches = ((), ("--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(worktree)))
         for plan in ("docs/plans/given.md", "docs/plans/build-followups-alpha.md"):
             for flags in launches:
                 with self.subTest(plan=plan, flags=flags):
-                    with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
+                    with patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)), \
                             patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()), \
                             patch.object(add_unit, "wait_for_remote_control", return_value=marked) as waited:
                         result = self.cli("alpha", "--plan", plan, *flags)
@@ -895,7 +906,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
             worktree / "docs/plans/build-followups-alpha.md",
         )}
 
-        with patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()), \
+        with patch.object(add_unit, "launched_unit", return_value=add_unit.NoLabeledSession()), \
                 patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
             result = self.cli("alpha", "--plan", "docs/plans/missing.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                               "--cwd", str(worktree))
@@ -1018,12 +1029,12 @@ class AddUnitLaunchTests(AddUnitTestCase):
         )
         for place in (HerdrPlace("native", "w1:p1"),):
             with self.subTest(place=place):
-                marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(), place)
-                with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
+                marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(), place, identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+                with patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)), \
                         patch.object(session_pane, "read_place", return_value="/remote-control is active") as read:
                     self.assertEqual(add_unit.wait_for_remote_control(request), marked)
                 read.assert_called_once_with(place)
-                with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
+                with patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)), \
                         patch.object(session_pane, "read_place", side_effect=session_pane.HerdrFailure("unreadable")):
                     with self.assertRaisesRegex(RuntimeError, "did not become active\\nunreadable"):
                         _ = add_unit.wait_for_remote_control(request)
@@ -1038,8 +1049,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         registry.mkdir()
         place = HerdrPlace("native", "w1:p1")
         live = unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/socket", 4242)
-        starting = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(), place)
-        marked = unit_lookup.MarkedUnit("alpha-unit", live, place)
+        starting = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(), place, identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+        marked = unit_lookup.LabeledSession("alpha-unit", live, place, identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
         busy_pane = "⏺ Reading the plan\n  ⎿  Read 400 lines"
         cases: tuple[tuple[str, dict[str, str], bool], ...] = (
             ("bridged", {"bridgeSessionId": "session_bridge"}, True),
@@ -1054,7 +1065,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 # The first lookup finds the mark before the record names the live Claude.
                 with patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}), \
                         patch.object(add_unit, "launched_unit", side_effect=[
-                            add_unit.MarkedUnitFound(starting), add_unit.MarkedUnitFound(marked)]), \
+                            add_unit.LabeledSessionFound(starting), add_unit.LabeledSessionFound(marked)]), \
                         patch.object(session_pane, "read_place", return_value=busy_pane):
                     if active:
                         self.assertEqual(add_unit.wait_for_remote_control(request), marked)

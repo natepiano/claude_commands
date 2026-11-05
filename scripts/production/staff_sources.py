@@ -91,7 +91,7 @@ def showrunner_members(record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]
 
 
 def unit_parent(unit: str, session_id: str = "") -> UnitProduction:
-    """Resolve the current staff edge; old launch marks supply identity only."""
+    """Resolve the current staff edge through the stored member reference."""
     reference = session_staff.StoredReference(session_id) if session_id else session_staff.BY_NAME
     return unit_lookup.unit_parent(unit, reference, record=staff.snapshot(), sources=_member_sources())
 
@@ -221,13 +221,6 @@ def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources
             continue
         if record.by_member_reference(launch["session_id"]) is not None:
             return True
-        environment = launch["environment"]
-        production = environment.get("SHOWRUNNER_UNIT", "")
-        unit = environment.get("SHOWRUNNER_UNIT_ID", "")
-        if production and unit:
-            found = sources.member(UnitMember(production, unit), record)
-            if isinstance(found, MemberFound):
-                return True
     return False
 
 
@@ -670,13 +663,12 @@ class _LiveFillSources(_FillSources):
             owner = record.by_member_reference(launch["session_id"])
             if launch.get("ended") or owner is None or owner.current_session not in self.running:
                 continue
-            environment = launch["environment"]
             identity = owner.current_session
             if owner.kind == "showrunner":
                 self.row_sessions.setdefault(owner.id, []).append(self.running[identity])
                 continue
             try:
-                found = sources.member(ObservedUnit(environment.get("SHOWRUNNER_UNIT_ID", ""),
+                found = sources.member(ObservedUnit("",
                                                    session_staff.LiveSession(identity)), record)
             except (ValueError, staff.StaffUnreadable):
                 continue

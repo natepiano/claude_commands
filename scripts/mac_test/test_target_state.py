@@ -14,6 +14,12 @@ import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING, Self, TypedDict, cast, override
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
+
 import unittest
 from unittest import mock
 
@@ -111,7 +117,7 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.enterContext(mock.patch.object(time, "monotonic", return_value=100.0))
         _ = self.enterContext(mock.patch.object(build_hold, "datetime", HoldClock))
-        _ = self.enterContext(mock.patch.object(mac_test, "process_start_time", return_value="fake-start"))
+        _ = self.enterContext(mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("fake-start")))
         _ = self.enterContext(mock.patch.object(offload, "repository_identity",
                                               return_value=offload.KnownRepository("project")))
         _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
@@ -459,7 +465,7 @@ class TargetStateTests(IsolatedTargetState):
         result = self.block("aws")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         before = self.snapshot()
-        with mock.patch.object(mac_test, "process_start_time", return_value=None), \
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()), \
                 mock.patch.object(targets, "utc_now", return_value=NOW + timedelta(days=1)):
             self.assertIsInstance(targets.target_state(self.selected_target("linux-two")), targets.Free)
             state = targets.target_state(self.selected_target("aws"))

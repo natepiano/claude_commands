@@ -908,7 +908,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Ruled out:** a `STAFF_READ_SECONDS` limit for the status line (the staff read is a local file; a `conf.py` read costs 0.058 s against a 0.0165 s line).
 
-### Phase 3v — Readers in other units' files read the row  · status: todo
+### Phase 3v — Readers in other units' files read the row  · status: done
 
 **Owner:** each owner of the files it reads (sdlc split, 2026-11-02 08:23).
 
@@ -1014,7 +1014,7 @@ It supports reruns and is deleted in Phase 18.
 Test a `/clear` during migration: resolve current ownership again, report unavailable evidence, and preserve fixed store keys.
 Make no unproved write and create no second row.
 
-### Phase 3y — Middle stores keyed by staff id  · status: todo
+### Phase 3y — Middle stores keyed by staff id  · status: done
 
 **Store landing (devtools-unit 4i, via sdlc, 2026-11-02):** devtools 3x lands stores 1, 2, 4 and 5 only. A store lands after 3y removes its rewriter, or after a test shows the old rewriter leaves the staff-id key alone and a real rename exits 0. Each store notice names its rewriter.
 
@@ -1061,6 +1061,10 @@ Make no unproved write and create no second row.
 
 **Shared rename files:** this writer owns the rename-file changes for 3x, 3z, and 4a, including their tests and fixtures.
 Each change lands inside its store's landing, with the migration and rewriter removal.
+
+### Phase 3d — Store migrations continue past anomalies  · status: done
+
+**As built:** `migrate_showrunner_state.py` and `migrate_middle_stores.py` follow staff-lifecycle.md section 4. A unit reference with no staff row prints one `anomaly:` line and the file goes on; `dailies_judgment.json` drops the entry (its reader refuses unknown units), every other file keeps the old text. One file never stops its folder. A folder, report or outstanding file with no showrunner row stays in place. Two old names with one staff id merge `*.history.jsonl` and `*.answered.jsonl` by their `time` field; an empty `.lock` goes. Both end with `moved N; left in place M; unavailable K` and exit 1 only for real read or write errors of an owned item. Rehearsal on copies: natedev showrunner_state moved 3454 (cargo-tile, demo left in place), outstanding moved 30 (nested-g1, nested-g2, hanadocs-info left in place), unavailable 0; the Mac has no showrunner state.
 
 ### Phase 3z — Shutdown and style stores keyed by staff id  · status: done
 
@@ -1438,7 +1442,7 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 **Acceptance gate (identity and consumers):** require the 3h completeness proof on a fresh snapshot with no unresolved runtime identity or unfilled location before deleting fallbacks. Admission and worker-fill tests resolve a renamed holder using its journal with no Formerly field, and refuse ambiguous or absent journal evidence. Consume 4c's completed handoff without reading removed tables; remove that handoff and helper only after all removals are proved.
 
-### Phase 4e — Legacy pane marks deleted; native runtime ids select rows  · status: todo
+### Phase 4e — Legacy pane marks deleted; native runtime ids select rows  · status: done
 
 **Depends on:** 3v and every reader of the marks; 4d (fallback removal); 3h's native-id and location completeness proof.
 
@@ -1579,7 +1583,7 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 **Acceptance gate:** `git grep -n '"ad-hoc"' -- scripts` finds nothing outside a test that proves the name is gone; a throwaway standalone session opens in a workspace with its tab name; a restart of a throwaway standalone session and a throwaway unit puts each in its rule's workspace; a rerun of each opens no second tab; full gate green.
 
-### Phase 4g — Rename rebuilt on the row  · status: todo
+### Phase 4g — Rename rebuilt on the row  · status: done
 
 **Depends on:** 4o, 4c, 4d, 4e, 4h, 4i, and the records stage (3x, 3y, 3z, 4a). Last step of the rename track. No pane phase waits for it. Hash 3f8339f5 stays unmerged; reuse only its tab retitle, kept-pane resume and finished-journal rerun.
 
@@ -1589,12 +1593,12 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 **Spec:**
 1. **Unit rename** (`rename_unit.py`): `staff.rename` of the row, `Herdr.retitle` of the tab and pane, and the session name at the next launch (Phase 4). No store, doc, prose or Units cell is rewritten: they hold the staff id. Hub files, Gates and plan headers are deleted before this phase (4c, 4o), so nothing lists them (`EDITED_COLUMNS` :82 and `_plan_text` :497 go). Same-name rename is the repair path: it changes only the parts that differ and prints `unchanged` when all match.
-2. **Folder and branch move** (`rename_unit.py --move-worktree --to-folder <path> --to-branch <name>`), rebuilt on staff and process evidence (sdlc, 2026-11-04):
-   Require both arguments. Use the current devtools `unit_move.move_folder` operation (phase 4h): stop the session found by `current_session`, `git worktree move`, `staff.set_worktree`, then `restart.start_row`.
-   Run `git branch -m` while the session is stopped. A rerun reads the folder and the branch from git and the row; no move journal, launch-record `cwd`, retained launch kind or `PendingFolderStartup` exists.
+2. **Folder and branch move** (as built, sdlc rule 2026-11-04, from the user): a new name moves the folder and the branch by `unit_names.swap_stem` in the same parent (`cargo-liner-port` becomes `cargo-liner-x`). A folder or branch that does not end with the old name keeps its place and prints one anomaly line. `--move-worktree`, `--to-folder` and `--to-branch` are deleted.
+   `unit_move.move_folder` stops the session found by `current_session`, runs `git worktree move` and `git branch -m`, calls `staff.set_worktree`, then `restart.start_row`. A journal (target name, destination, branch, Git admin path) is written before the first staff name write; a rerun finishes a pending journal first.
+   Same name means the name is equal and no rename journal is pending. A rerun after a complete rename prints only `unchanged`.
    A stopped unit updates its row and stays stopped.
-   Each interrupted step finishes on rerun; a finished move prints `unchanged`.
-   The only refusals are the 5 in `staff-lifecycle.md` section 4 (target folder exists, same-row concurrent operation, a second copy of a running session, uncommitted work deleted, a signal to a non-target process). Section 3 item 5: the move is optional and runs only on `--move-worktree`.
+   Restart recovery is by hand (herdr-unit, 2026-11-04, Astra review of F006; no stored intent): when the move stops a row and cannot start it again, it prints one anomaly line with `shutdown.py restart --only <staff-id>` at once. A rerun cannot tell why a row is stopped, so it prints one information line with that command for each stopped row of the unit and starts nothing. A row stopped before the move stays stopped.
+   The only refusals are the 5 in `staff-lifecycle.md` section 4 (target folder exists, same-row concurrent operation, a second copy of a running session, uncommitted work deleted, a signal to a non-target process).
 3. **Showrunner rename** (`rename.py`): `staff.rename` and the workspace and tab names; timers and stores already hold the id. A rename to the name the row already holds still repairs a live session name, tab or workspace that differs from the row (sdlc, 2026-11-01, from the user on C48: the fps row's session runs as `performance`; the user runs `rename fps fps`, not a unit). It prints `unchanged` only when the row, session name, tab and workspace all agree. The same rule holds for a unit rename. Moving the doc file and merge branch is the same optional further step, with `--to-doc <path>` and `--to-branch <name>` journaled first and `staff.set_doc` after the move.
 4. **Tunables.** `rename_unit.py`'s `LIVE_WAIT_SECONDS` (:86, with its `RENAME_UNIT_LIVE_WAIT` environment override, which goes), `RUN_STOP_WAIT_SECONDS` (:89), `POLL_SECONDS` (:90) and the 900 s subprocess timeout (:671) move to `config/production.conf`, read at use through `tunables`, each as `min(configured limit, remaining deadline)` with a changed-config test.
 5. **Delete** `unit_rename_sweep.py` and its test, the `verify` sweep of `rename_unit.py`, `rename_state.py`'s rewriters, `rename_outside.py` and every move step left in `rename.py` and `rename_unit.py`; the rename journal keeps only the steps above.
@@ -1688,22 +1692,57 @@ Fix the input readiness gate (accounts-unit finding, 2026-11-04).
 herdr.py is shared with 3v and 4e writers: post the function you take on the board before you edit it.
 Files: scripts/herdr/herdr.py (`prompt_input_state` and a small helper beside it) and scripts/herdr/test_herdr.py.
 
+### Phase 4x — Rename recovery keeps staged document content  · status: done
+
+**Depends on:** 4g Steps C and D (rename.py document move journal).
+
+#### Work Order
+
+**Goal:** keep a partially staged document's staged version when rename recovers an interrupted move (4g review F010, routed 2026-11-04).
+
+**Spec:**
+1. Case: `rename.py apply … --to-doc --to-branch` stops after git moved the file and before git updated the index. The source entry is staged with content that differs from the working file.
+2. Today recovery runs the equivalent of `git rm --cached <source>` and `git add <destination>`. The working content is kept; the staged-only version is lost.
+3. Record the staged blob of the source in the journal before the move. On recovery, stage that blob at the destination with `git update-index --cacheinfo`, and keep the working file as it is.
+4. A test interrupts at that step with a partially staged document and checks the staged blob and the working bytes after the rerun.
+
+**Acceptance gate:** the new test fails without the change and passes with it; the production suite and basedpyright on both files are green.
+
+**Files:**
+- `scripts/production/rename.py` — journal and recovery.
+- `scripts/production/test_rename.py` — the regression test.
+
 ### Phase 4y — Rename edges after Step B  · status: todo
 
 **Depends on:** 4g Step B (rename_unit.py on the row, journal in unit_move.py).
 
-**Work Order:**
+#### Work Order
 
-Close the Step B review edges routed at repair round 10 (4g review, 2026-11-04). The rename rule stays as sdlc set it.
+**Goal:** close the Step B review edges routed at repair round 10 (4g review, 2026-11-04). The rename rule stays as sdlc set it.
+
+**Spec:**
 1. Recovery identity (F009): `unit_move._recoverable_folder` returns success only when the journal's source, destination and Git admin path all match. Keep the branch checks. A test puts another linked worktree of the same repository on the requested branch at the destination and expects no adoption.
 2. Same name (F017): a row already named `port` with request `port-unit → port` and no journal writes nothing and moves nothing (rule 1).
 3. Output (F018): the printed line follows the operation result. A finished pending move prints `done`; a rerun with nothing to do prints only `unchanged`.
 4. Pending kinds (F019): a folder-only move and a pending rename are distinct journal variants, not `FolderMove.name == ""`.
 5. Order (F020): set the displays before the folder and branch move (rule 2).
-Files: scripts/production/rename_unit.py, scripts/production/unit_move.py and their tests.
+6. Do not change `unit_move.observe()`; shutdown's fix3 owns it.
+7. Hana owner (sdlc merge gate on 63ba5e6a6, 2026-11-04): 4e removed `SHOWRUNNER_UNIT_ID`. `hana_shot.launch` sets `HANA_TEST_OWNER` from `--owner`, else from the caller's staff row: the caller's unit name (a worker's parent unit), found by `staff.runtime_id()` in the local staff record. No row or an unreadable record gives an empty owner. `hana_instances.is_test_hana` keeps `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` as agent markers. The tests change with it.
+
 The restart deadline (F007) moved to shutdown-unit Phase 4l.
 
-### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: todo
+**Acceptance gate:** one regression test per item fails without the change; the production suite and basedpyright on the four files are green.
+
+**Files:**
+- `scripts/production/rename_unit.py` — same name, output and display order.
+- `scripts/production/unit_move.py` — recovery identity and journal variants.
+- `scripts/production/test_rename_unit.py` — tests.
+- `scripts/production/test_unit_move.py` — tests.
+- `scripts/hana_shot/hana_shot.py`, `scripts/hana_shot/test_hana_shot.py` — owner from the staff row (item 7).
+- `scripts/hana_instances/test_hana_instances.py` — native agent markers (item 7).
+- `docs/as-built/hana-test-windows.md` — owner and marker text (item 7).
+
+### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: moved: shutdown-unit (sdlc, 2026-11-04)
 
 **Depends on:** 4h (its `_session_without_foreground_agent` in `unit_move.py` is the model) and 4g (the user put rename first; sdlc ruling 2026-11-02 07:03). No ETA yet.
 

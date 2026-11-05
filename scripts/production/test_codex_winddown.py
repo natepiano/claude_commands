@@ -1,6 +1,8 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
 
+from scripts.production.fake_unit_host import labeled as labeled_host
+
 import json
 import os
 import io
@@ -579,7 +581,7 @@ class MessageTests(unittest.TestCase):
         _ = unit_membership("show", "trunk-unit")
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
         fake_unit_host.write({**os.environ, **self.environment}, [
-            fake_unit_host.HostedUnit("trunk", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "trunk-unit"})])
+            labeled_host("trunk", "w1:p1", "trunk-unit", slug="show")])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")
         self.set_processes()
 
