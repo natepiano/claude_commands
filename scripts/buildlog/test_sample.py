@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
 import cli
+import index
 import sample
 import store
 from cgroup_test_support import CPU, write_cgroup
@@ -471,7 +472,7 @@ class SampleTests(unittest.TestCase):
         for field in ("mem_used_bytes", "swap_used_bytes", "stall_some_us", "stall_full_us"):
             self.assertIsInstance(record[field], int)
             self.assertGreaterEqual(cast(int, record[field]), 0)
-        self.assertFalse((self.root / "index.sqlite").exists())
+        self.assertFalse(index.index_path_in(self.root).exists())
         snapshot = cast(Record, json.loads(lines[1]))
         self.assertEqual(snapshot["kind"], "memory_snapshot")
         self.assertEqual(snapshot["at"], record["at"])

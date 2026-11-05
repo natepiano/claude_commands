@@ -92,6 +92,7 @@ from scripts.lib.agent_scope import agent_scope_prefix
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
 from scripts.lib import build_folders, nix_env, process_group, unit_runs
+from scripts.lib.unit_runs import SERVER_FILE as SERVER_FILE
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import staff, worker_admission, session_staff
 from scripts.production.worker_admission import WorkerStartAllowed
@@ -272,7 +273,6 @@ def _serving_request(
                                   thread_id=_as_str(params.get("threadId")), stopped=stopped)
         raise ServingRequestFailure(detail, serving, proven) from error
 
-SERVER_FILE = "mesh_server.json"
 DEV_SHELL_FILE = "mesh_dev_shell.json"
 FAILED_DEV_SHELL_FILE = "mesh_failed_dev_shell.json"
 SERVER_START_FILE = "mesh_server_start.json"
@@ -1398,7 +1398,8 @@ def _session_path(session_dir: str, filename: str) -> Path:
 def _read_json_object(path: Path) -> dict[str, object]:
     if path.name == ROSTER_FILE or path.name.endswith(".pending.json"):
         with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as state:
-            return state.read_object()
+            records = state.read_object()
+        return worker_admission.resolve_roster(path.parent, records) if path.name == ROSTER_FILE else records
     return worker_lifecycle.read_worker_state(path)
 
 
@@ -1563,8 +1564,7 @@ def _store_reviewer_policy(entry: dict[str, object], *, new_reviewer: bool = Fal
 
 
 def _load_roster_for_write(handle: worker_lifecycle.WorkerStateFile) -> dict[str, object]:
-    records = handle.read_object()
-    return records
+    return worker_admission.resolve_roster(handle.path.parent, handle.read_object())
 
 
 def _write_roster_record(handle: worker_lifecycle.WorkerStateFile, roster: dict[str, object], name: str,

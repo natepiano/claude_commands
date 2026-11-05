@@ -181,7 +181,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
             if arguments[:2] == ("pane", "list"):
                 place = self.marked["demo-unit"].place
                 assert isinstance(place, herdr.HerdrPlace)
-                return {"panes": [{"pane_id": place.pane, "workspace_id": place.pane.split(":")[0]}]}
+                return {"panes": [{"pane_id": place.pane, "terminal_id": "unit-terminal",
+                                   "workspace_id": place.pane.split(":")[0]}]}
             if arguments[:2] == ("pane", "process-info"):
                 return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": PID,
                     "foreground_processes": [{"pid": PID, "name": "claude", "argv": ["claude"]}]}}

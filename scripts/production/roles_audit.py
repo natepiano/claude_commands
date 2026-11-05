@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import subprocess
 import sys
 import tomllib
 import tokenize
@@ -889,9 +890,19 @@ def read_live_file(root: Path, retired: re.Pattern[str], select_candidates: bool
 
 
 def read_live_sources(root: Path, *, retired_forms: tuple[str, ...] = (), fixed_forms: tuple[str, ...] = ()) -> LiveSources:
-    paths: set[Path] = {root / "CLAUDE.md"} if (root / "CLAUDE.md").is_file() else set()
-    for folder in ("commands", "docs", "skills", "scripts"):
-        paths.update(path for path in (root / folder).rglob("*") if path.is_file())
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z",
+         "--", "commands/", "docs/", "skills/", "scripts/", "CLAUDE.md"],
+        capture_output=True, text=True, check=False)
+    if listed.returncode == 0:
+        paths: set[Path] = {root / name for name in listed.stdout.split("\0") if name and (root / name).is_file()}
+    elif "not a git repository" in listed.stderr:
+        # Fixture callers also audit source folders outside Git trees.
+        paths = {root / "CLAUDE.md"} if (root / "CLAUDE.md").is_file() else set()
+        for folder in ("commands", "docs", "skills", "scripts"):
+            paths.update(path for path in (root / folder).rglob("*") if path.is_file())
+    else:
+        raise ValueError(f"cannot list audit sources through git: {listed.stderr.strip()}")
     selected: list[Path] = []
     # No word boundaries: even a raw match inside an identifier selects extraction.
     retired = re.compile("|".join(re.escape(name) for name in retired_forms) if retired_forms else r"(?!)", re.IGNORECASE)

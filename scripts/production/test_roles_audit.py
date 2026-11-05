@@ -18,7 +18,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import roles_audit as audit
+from scripts.production import roles_audit as audit
 from scripts.production import showrunners, staff
 from scripts.lib.test_names import NAMES_TOML
 from scripts.shutdown import remote
@@ -622,6 +622,22 @@ class SourceCheckTests(unittest.TestCase):
             self.assertEqual(audit.check_sources(root), expected)
             _ = subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True)
             self.assertEqual(audit.check_sources(root), expected)
+
+    def test_reader_does_not_read_ignored_binary_build_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_check_root(root, {"scripts/current.py": 'print("Dispatch a worker.")\n'})
+            _ = subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True)
+            _ = (root / "scripts/.gitignore").write_text("target/\n", encoding="utf-8")
+            target = root / "scripts/target"
+            target.mkdir()
+            _ = (target / "binary").write_bytes(b"\x80")
+            _ = subprocess.run(["git", "-C", str(root), "add", "scripts/current.py"],
+                               check=True, capture_output=True)
+            _ = (root / "scripts/untracked.py").write_text('print("Ready.")\n', encoding="utf-8")
+            sources = audit.read_live_sources(root)
+            self.assertEqual([file.path for file in sources.files], ["scripts/current.py", "scripts/untracked.py"])
+            self.assertEqual(sources.unread_sources, ())
 
     def test_repository_candidate_check_matches_full_extraction(self) -> None:
         repository = Path(__file__).resolve().parents[2]

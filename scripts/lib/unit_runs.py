@@ -44,6 +44,7 @@ LIVE_HEARTBEAT_SECS = 600
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
 OWNER_FIELD = "owner_staff_id"
+SERVER_FILE = "mesh_server.json"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
 # `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
 # UNIT_HISTORY_DIR. Both sit under the state folder, read at each call, since a caller may change HOME.

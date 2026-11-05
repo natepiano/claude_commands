@@ -22,7 +22,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
     def test_same_name_keeps_a_pane_with_another_native_session(self) -> None:
         row = self.production_row()
         displays = support.RenameDisplays(row)
-        other = herdr.NativeAgentProcess(fixture_runtime_id("another-live-session"), "probe-generation", {})
+        other = herdr.NativeAgentProcess(herdr.EnvironmentThread(fixture_runtime_id("another-live-session")), "probe-generation", {})
         with (displays.installed(), mock.patch.object(herdr, "native_process", return_value=other)):
             result = self.run_command("apply", row.name, row.name)
         self.assert_success(result)

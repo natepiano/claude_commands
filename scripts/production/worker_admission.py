@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 import io
 import hashlib
@@ -90,13 +90,8 @@ def showrunner_member(record: staff.StaffSnapshot, sources: session_staff.Member
 
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
-           run: Path | None = None) -> staff.StaffRow:
-    """Resolve the caller or recorded director before using production names."""
-    row = record.by_current_session(staff_id) if staff_id else None
-    if row is not None and row.kind == "worker":
-        row = record.parent_of(row)
-    if row is not None and row.kind in ("unit", "showrunner"):
-        return row
+           run: Path | None = None, roster: Mapping[str, object] | None = None) -> staff.StaffRow:
+    """Resolve the recorded run owner or run unit before the roster and caller."""
     if run is not None:
         try:
             state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
@@ -118,7 +113,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             if isinstance(found, session_staff.MemberFound):
                 return found.row
     if run is not None:
-        entries = session_staff.read_worker_roster(run / "mesh_roster.json")
+        entries = roster if roster is not None else session_staff.read_worker_roster(run / "mesh_roster.json")
         for raw in entries.values():
             if not isinstance(raw, dict):
                 continue
@@ -126,6 +121,11 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             owner = record.parent_of(child) if child is not None else None
             if owner is not None:
                 return owner
+    row = record.by_current_session(staff_id) if staff_id else None
+    if row is not None and row.kind == "worker":
+        row = record.parent_of(row)
+    if row is not None and row.kind in ("unit", "showrunner"):
+        return row
     sources = sources if sources is not None else session_staff.member_sources()
     found = showrunner_member(record, sources, production)
     if isinstance(found, session_staff.NoSuchMember):
@@ -136,6 +136,24 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:
     """Find the named worker under its staff parent."""
     return next((row for row in record.find(kind="worker", parent=owner) if row.name == name), None)
+
+
+def resolve_roster(run: Path, entries: dict[str, object]) -> dict[str, object]:
+    """Add staff references to old entries through the run's unit and worker name."""
+    missing = [(name, cast(dict[str, object], raw)) for name, raw in entries.items()
+               if isinstance(raw, dict) and "staff_id" not in raw]
+    if not missing:
+        return entries
+    record = staff.local_snapshot()
+    try:
+        owner = parent(record, staff_id=staff.runtime_id(), run=run, roster=entries)
+    except ValueError:
+        return entries
+    for name, entry in missing:
+        row = find_worker(record, owner.id, name)
+        if row is not None:
+            entry["staff_id"] = row.id
+    return entries
 
 
 def admit(name: str, run: Path, *, role: str, production: str = "", unit: str = "", reference: str = "") -> WorkerStartAllowed:

@@ -39,7 +39,9 @@ Each operation is a short list of plain steps. A rerun with nothing to change pr
 2. **Start:** resume `current_session` in `worktree`. Claude: `claude --resume <id>`. Codex: thread resume by id, with cwd = `worktree`.
 3. **Stop all, restart all** (user, 2026-10-08): one loop. Stop each live row, then start each.
 4. **Folder move:** stop the unit and its workers. Run `git worktree move`. Write `worktree`. Start each.
-5. **Rename:** write `name`. Move the folder to `~/worktrees/<name>` (step 4). Run `git branch -m`. Set the displays.
+5. **Rename** (user, 2026-11-04): write `name`. A same-name rename only sets the displays. A new name replaces the old name at the end of the folder name and the branch name; the prefix and the parent folder stay. Move the folder (step 4). Run `git branch -m`. Set the displays. A folder or branch that does not end with the old name prints one anomaly line and keeps its name.
+   - A new unit folder is `<checkout>-<unit>` next to its production checkout: `~/rust/cargo-liner-port`, `~/worktrees/claude-natedev-builds-aws`.
+   - The sdlc units and organon sit at `~/worktrees/<unit>` with no prefix. They keep those folders.
 6. **Transfer:** write `parent`. Move its herdr tab, and its workers' tabs, into the new production's group (a display; step 3 restores the same order).
 7. **`/clear`:** write `current_session`.
 8. **Family switch:** start a session of the other family in the same slot, with the transcript extract. Write `current_session`. `id` and `name` stay.

@@ -77,7 +77,7 @@ class IndexStepEvidenceTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.directory = tempfile.TemporaryDirectory()
-        self.index = Path(self.directory.name) / "index.sqlite"
+        self.index = Path(self.directory.name) / "steps.sqlite"
         self.before = datetime(2026, 10, 30, 9, tzinfo=UTC)
         self.cutoff = self.before - timedelta(days=14)
 
@@ -144,6 +144,23 @@ class IndexStepEvidenceTests(unittest.TestCase):
             ("both", "build"): StepEvidence(build_shape(arguments), CompiledCrates(8)),
             ("count-only", "build"): StepEvidence(NoBuildShape(), NoCratesCompiled()),
             ("shape-only", "build"): StepEvidence(build_shape(arguments), CompileCountUnknown()),
+        })
+
+    def test_indexed_test_arguments_remain_available_for_selection(self) -> None:
+        filtered = ["cargo", "nextest", "run", "-E",
+                    "package(cargo-handler) & (test(zeta) | test(alpha) | test(zeta))"]
+        full = ["cargo", "nextest", "run", "-E", "package(cargo-handler)"]
+        self.row("filtered", filtered, step="nextest")
+        self.row("full", full, step="nextest")
+        self.assertEqual(index_step_evidence(self.index, "natedev", "nextest", self.cutoff, self.before), {
+            ("filtered", "nextest"): StepEvidence(build_shape(filtered), CompiledCrates(3), tuple(filtered)),
+            ("full", "nextest"): StepEvidence(build_shape(full), CompiledCrates(3), tuple(full)),
+        })
+
+    def test_missing_test_arguments_keep_the_compile_count(self) -> None:
+        self.row("count-only", None, step="nextest", crates=7)
+        self.assertEqual(index_step_evidence(self.index, "natedev", "nextest", self.cutoff, self.before), {
+            ("count-only", "nextest"): StepEvidence(NoBuildShape(), CompiledCrates(7), ()),
         })
 
     def test_repeated_attempts_combine_compile_states_in_either_order(self) -> None:

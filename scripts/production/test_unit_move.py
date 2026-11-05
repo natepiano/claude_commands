@@ -164,8 +164,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
         set_worktree = staff.set_worktree
         resume = backend.run_in_pane
 
-        def stopped(row: staff.StaffRow, launch: unit_move.FolderLaunch) -> bool:
-            result = stop(row, launch)
+        def stopped(row: staff.StaffRow, launch: unit_move.FolderLaunch, *, reported_unknown: str = "") -> bool:
+            result = stop(row, launch, reported_unknown=reported_unknown)
             self.assertTrue(result)
             events.append("stop")
             return result
@@ -385,7 +385,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assert_moved(backend)
         self.assertEqual((backend.stops, backend.starts, backend.live), ([], [], True))
 
-    def test_unsafe_resume_leaves_the_pane_untouched_and_prints_the_command(self) -> None:
+    def test_unsafe_resume_keeps_the_pane_and_reports_the_reason(self) -> None:
         backend = self.folder_backend()
         launch = unit_move.folder_launch(self.owner)
         assert isinstance(launch, unit_move.FolderLaunch)
@@ -393,18 +393,115 @@ class UnitFolderMoveTests(FolderMoveFixture):
         for reason in ("occupied-pane", "session-elsewhere"):
             with self.subTest(reason=reason):
                 output = io.StringIO()
-                activity = herdr.PaneRunning(("editor",)) if reason == "occupied-pane" else herdr.PaneAtShell()
+                info = {"process_info": {"shell_pid": backend.shell_pid,
+                    "foreground_process_group_id": 998099,
+                    "foreground_processes": [{"pid": 998099, "argv": ["editor"]}]}}
                 live = sessions.SessionNotLive() if reason == "occupied-pane" else sessions.LiveSessionProcess(998099)
-                with (mock.patch.object(backend, "pane_activity", return_value=activity),
+                with (mock.patch.object(backend, "result", return_value=info),
                       mock.patch.object(sessions, "session_liveness", return_value=live),
                       mock.patch.object(backend, "run_in_pane") as typed,
                       redirect_stderr(output)):
                     unit_move.resume_folder_session(self.owner, launch, self.old_folder, self.old_folder, ())
                 typed.assert_not_called()
                 self.assertEqual(len(output.getvalue().splitlines()), 1)
-                self.assertIn("--resume " + self.owner.current_session, output.getvalue())
-                self.assertIn(str(self.old_folder), output.getvalue())
+                self.assertIn("other live work" if reason == "occupied-pane" else "conversation already runs", output.getvalue())
                 self.assertEqual((self.records / "agents.json").read_bytes(), before)
+
+    def test_complete_unknown_folder_move_reports_once_with_or_without_a_launch(self) -> None:
+        for kind in ("claude", "codex"):
+            for has_launch in (True, False):
+                with self.subTest(kind=kind, has_launch=has_launch):
+                    backend = self.folder_backend(kind)
+                    launch = unit_move.folder_launch(self.owner) if has_launch else unit_move.NoFolderLaunch()
+                    with (mock.patch.object(herdr, "read_conversation", return_value=herdr.UnknownConversation(
+                              "kept-name (conversation unreadable)")) as read,
+                          mock.patch.object(unit_move, "folder_launch", return_value=launch),
+                          mock.patch.object(os, "kill") as killed):
+                        result = self.move_folder()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr.splitlines(), [
+                        "anomaly: kept-name (conversation unreadable); not blocking"])
+                    self.assertEqual(read.call_count, 3 if has_launch else 1)
+                    killed.assert_not_called()
+                    self.assertFalse(self.old_folder.exists())
+                    self.assertTrue(self.new_folder.exists())
+                    self.assertEqual(staff.by_id(self.owner.id), replace(self.owner,
+                        worktree=staff.PresentWorktree("natedev", self.new_folder)))
+                    self.assertEqual(backend.stops, [])
+                    self.assertEqual(len(backend.starts), 1 if has_launch else 0)
+                    _ = self.folder_git(self.new_folder, "worktree", "move", str(self.new_folder), str(self.old_folder))
+                    _ = staff.set_worktree(self.owner.id, staff.PresentWorktree("natedev", self.old_folder),
+                        expected=staff.PresentWorktree("natedev", self.new_folder))
+
+    def test_unknown_folder_reader_never_proves_stopped_or_authorizes_a_signal(self) -> None:
+        for kind in ("claude", "codex"):
+            with self.subTest(kind=kind):
+                backend = self.folder_backend(kind, live=True)
+                launch = unit_move.folder_launch(self.owner)
+                assert isinstance(launch, unit_move.FolderLaunch)
+                before = (self.records / "agents.json").read_bytes()
+                with (mock.patch.object(herdr, "read_conversation", return_value=herdr.UnknownConversation(
+                          "kept-name (conversation unreadable)")) as read,
+                      mock.patch.object(os, "kill") as killed,
+                      redirect_stderr(io.StringIO()) as output):
+                    self.assertFalse(unit_move.stop_folder_session(self.owner, launch))
+                read.assert_called_once_with(self.owner.current_session, kind)
+                killed.assert_not_called()
+                self.assertEqual(output.getvalue().splitlines(), [
+                    "anomaly: kept-name (conversation unreadable); not blocking"])
+                self.assertEqual((self.records / "agents.json").read_bytes(), before)
+                self.assertEqual((backend.stops, backend.starts, backend.live), ([], [], True))
+
+    def test_unknown_folder_resume_continues_only_through_the_target_guard(self) -> None:
+        for kind in ("claude", "codex"):
+            with self.subTest(kind=kind):
+                backend = self.folder_backend(kind)
+                launch = unit_move.folder_launch(self.owner)
+                assert isinstance(launch, unit_move.FolderLaunch)
+                with (mock.patch.object(herdr, "read_conversation", return_value=herdr.UnknownConversation(
+                          "kept-name (conversation unreadable)")) as read,
+                      mock.patch.object(herdr, "check_target", wraps=herdr.check_target) as guard,
+                      redirect_stderr(io.StringIO()) as output):
+                    unit_move.resume_folder_session(self.owner, launch, self.old_folder, self.old_folder, ())
+                read.assert_called_once_with(self.owner.current_session, kind)
+                guard.assert_called_once_with("", action="keys", place=herdr.HerdrPlace("agents", "w1:p1"), client=backend)
+                self.assertEqual(output.getvalue().splitlines(), [
+                    "anomaly: kept-name (conversation unreadable); not blocking"])
+                self.assertEqual(len(backend.starts), 1)
+                self.assertEqual(backend.starts[0][0], "w1:p1")
+                self.assertTrue(backend.live)
+
+    def test_unknown_folder_resume_retains_a_pane_without_a_terminal(self) -> None:
+        for kind in ("claude", "codex"):
+            with self.subTest(kind=kind):
+                backend = self.folder_backend(kind)
+                launch = unit_move.folder_launch(self.owner)
+                assert isinstance(launch, unit_move.FolderLaunch)
+                panes = backend.panes()
+                _ = panes[0].pop("terminal_id")
+                before = (self.records / "agents.json").read_bytes()
+                with (mock.patch.object(herdr, "read_conversation", return_value=herdr.UnknownConversation(
+                          "kept-name (conversation unreadable)")),
+                      mock.patch.object(backend, "panes", return_value=panes),
+                      mock.patch.object(backend, "run_in_pane") as typed,
+                      redirect_stderr(io.StringIO()) as output):
+                    unit_move.resume_folder_session(self.owner, launch, self.old_folder, self.old_folder, ())
+                typed.assert_not_called()
+                self.assertEqual(output.getvalue().count("anomaly: kept-name"), 1)
+                self.assertIn("terminal is unknown; target retained", output.getvalue())
+                self.assertEqual((self.records / "agents.json").read_bytes(), before)
+
+    def test_stopped_folder_reader_sends_no_signal_for_either_runtime(self) -> None:
+        for kind in ("claude", "codex"):
+            with self.subTest(kind=kind):
+                backend = self.folder_backend(kind)
+                launch = unit_move.folder_launch(self.owner)
+                assert isinstance(launch, unit_move.FolderLaunch)
+                with mock.patch.object(os, "kill") as killed, redirect_stderr(io.StringIO()) as output:
+                    self.assertFalse(unit_move.stop_folder_session(self.owner, launch))
+                killed.assert_not_called()
+                self.assertEqual(output.getvalue(), "")
+                self.assertFalse(backend.live)
 
     def test_missing_source_does_not_adopt_a_repository_with_another_common_directory(self) -> None:
         backend = self.folder_backend()
@@ -463,6 +560,24 @@ class UnitFolderMoveTests(FolderMoveFixture):
                          entries)
         self.assertEqual((backend.starts, backend.stops), ([], []))
 
+    def test_live_codex_folder_move_keeps_thread_pane_and_terminal_despite_old_launch_marks(self) -> None:
+        backend = self.folder_backend("codex", live=True)
+        before = backend.panes()[0].copy()
+        with mock.patch.object(backend, "environment", return_value={
+                "CODEX_HOME": str(backend.config), "CODEX_THREAD_ID": str(self.owner.id)}):
+            result = self.move_folder()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assert_moved(backend)
+        self.assertEqual(backend.stops, [self.owner.current_session])
+        (pane, command), = backend.starts
+        self.assertEqual(pane, before["pane_id"])
+        self.assertEqual(backend.panes()[0].get("terminal_id"), before.get("terminal_id"))
+        self.assertEqual(backend.panes()[0]["session_id"], self.owner.current_session)
+        self.assertEqual(command[command.index("resume", command.index("exec")) + 1], self.owner.current_session)
+        self.assertEqual(backend.cwd, self.new_folder)
+        self.assertTrue(backend.live)
+        self.assert_finished_rerun(backend)
+
     def test_normal_codex_launch_moves_without_a_claude_launch_record(self) -> None:
         client_type = herdr.Herdr
         backend = self.folder_backend("codex")
@@ -493,15 +608,15 @@ class UnitFolderMoveTests(FolderMoveFixture):
         entry = pane_record.read("agents")[launched.pane]
         self.assertEqual((entry["cwd"], entry["session_id"], entry["config_dir"]),
                          (str(self.old_folder), self.owner.id, str(backend.config)))
-        with mock.patch.object(os, "kill") as killed:
-            result = self.move_folder()
-        killed.assert_not_called()
-        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.move_folder()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assert_moved(backend)
-        self.assertEqual((backend.stops, backend.starts), ([], []))
+        self.assertEqual(backend.stops, [self.owner.current_session])
+        (pane, command), = backend.starts
+        self.assertEqual(pane, "w1:p1")
+        self.assertEqual(command[command.index("resume", command.index("exec")) + 1], self.owner.current_session)
         self.assertTrue(backend.live)
-        self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertIn(f"codex resume {self.owner.current_session}", result.stderr)
+        self.assertEqual(backend.cwd, self.new_folder)
         self.assertEqual(pane_record.read("agents")[launched.pane]["config_dir"], str(backend.config))
         self.assert_finished_rerun(backend)
 
@@ -581,8 +696,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
         backend = self.folder_backend(live=True)
         stop = unit_move.stop_folder_session
 
-        def incomplete(row: staff.StaffRow, launch: unit_move.FolderLaunch) -> bool:
-            _ = stop(row, launch)
+        def incomplete(row: staff.StaffRow, launch: unit_move.FolderLaunch, *, reported_unknown: str = "") -> bool:
+            _ = stop(row, launch, reported_unknown=reported_unknown)
             raise ValueError("session stop is incomplete")
 
         with mock.patch.object(unit_move, "stop_folder_session", side_effect=incomplete):

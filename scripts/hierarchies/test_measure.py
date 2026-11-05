@@ -16,6 +16,7 @@ import subprocess
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.buildlog.index import index_path_in
 from scripts.hierarchies import measure as m, log_records, push_audit as audit
 from scripts.hierarchies.test_log_records import phone_overflow_lines, read_report_blocks, summary_lines
 from scripts.lib.user_zone import user_zone
@@ -2446,7 +2447,7 @@ class ComparisonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             before_window, after_window = self.covered_before_window, self.covered_after_window
-            path = home / ".local/state/buildlog/index.sqlite"
+            path = index_path_in(home / ".local/state/buildlog")
             path.parent.mkdir(parents=True)
             with closing(sqlite3.connect(path)) as db:
                 _ = db.execute("CREATE TABLE steps(repo,step,started_at,duration_s,host)")
@@ -2465,7 +2466,7 @@ class ComparisonTest(unittest.TestCase):
                                   + '"\nevidence="fixture writer enabled"\n')
             before, after = self.load_fixture_home(home, (before_window, after_window))
             for part, minutes in ((before, "2.0"), (after, "4.0")):
-                problems = [problem for problem in part.sources.problems if problem.source == str(path)]
+                problems = [problem for problem in part.sources.problems if problem.source == "buildlog index"]
                 self.assertEqual(len(problems), 1)
                 self.assertIn("invalid build rows skipped: 2", problems[0].reason)
                 self.assertIn("seconds: expected a finite number", problems[0].reason)
@@ -2476,7 +2477,7 @@ class ComparisonTest(unittest.TestCase):
                 baseline = read_report_blocks(m.render(part.sources, part.window, self.after_window.until, full=True))
                 total = next(row for row in baseline if row.measure == "build/check minutes / hana")
                 self.assertEqual((total.value, total.n), (minutes, 1))
-                diagnostic = [row for row in baseline if row.measure == "source unavailable" and row.source == str(path)]
+                diagnostic = [row for row in baseline if row.measure == "source unavailable" and row.source == "buildlog index"]
                 self.assertEqual(len(diagnostic), 1)
                 self.assertEqual(diagnostic[0].value, problems[0].reason)
             compared = self.rows(before, after)["build/check minutes / hana"]
@@ -2487,7 +2488,7 @@ class ComparisonTest(unittest.TestCase):
             self.assertEqual(compared.n, 1)
             output = m.render_compare(before, after, self.after_window.until, full=True)
             diagnostic = [row for row in read_report_blocks(output)
-                          if row.measure == "source unavailable" and row.source == str(path)]
+                          if row.measure == "source unavailable" and row.source == "buildlog index"]
             self.assertEqual(len(diagnostic), 1)
             self.assertIn("invalid build rows skipped: 2", diagnostic[0].value)
             self.assertEqual(phone_overflow_lines(output), [])

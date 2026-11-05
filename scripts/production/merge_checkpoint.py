@@ -764,10 +764,27 @@ class CheckpointTestStep(NamedTuple):
     folder: Path
 
 
+class CargoPackage(NamedTuple):
+    folder: Path
+    name: str
+
+
+class CargoWorkspace(NamedTuple):
+    pass
+
+
+def read_cargo_package(folder: Path) -> CargoPackage | CargoWorkspace:
+    manifest = tomllib.loads((folder / "Cargo.toml").read_text(encoding="utf-8"))
+    if "package" not in manifest:
+        # A workspace root's manifest names no package, so paths under it have no package tests.
+        return CargoWorkspace()
+    return CargoPackage(folder, cast(str, manifest["package"]["name"]))
+
+
 def test_steps(production: Production, paths: tuple[str, ...],
                merge_tests: tuple[tuple[str, ...], ...]) -> list[CheckpointTestStep]:
     checkout = production.checkout
-    packages: set[Path] = set()
+    packages: set[CargoPackage] = set()
     examples: set[tuple[str, str]] = set()
     for raw in paths:
         path = checkout / raw
@@ -776,16 +793,20 @@ def test_steps(production: Production, paths: tuple[str, ...],
                 break
             manifest = parent / "Cargo.toml"
             if manifest.exists():
-                # A workspace root's manifest names no package: a path under it, such as docs, has no tests.
-                if "package" in tomllib.loads(manifest.read_text(encoding="utf-8")):
-                    packages.add(parent)
+                package = read_cargo_package(parent)
+                if isinstance(package, CargoPackage):
+                    packages.add(package)
                 break
         match = re.search(r"(?:^|/)crates/([^/]+)/examples/([^/.]+)", raw)
         if match:
-            examples.add((match.group(1), match.group(2)))
+            folder = checkout / "crates" / match.group(1)
+            if (folder / "Cargo.toml").exists():
+                package = read_cargo_package(folder)
+                if isinstance(package, CargoPackage):
+                    examples.add((package.name, match.group(2)))
     verify = tool("verify.sh", Path.home() / ".claude/scripts/direct/verify.sh", "MERGE_CHECKPOINT_VERIFY")
     verify_command = [verify] if os.access(verify, os.X_OK) else ["bash", verify]
-    steps = [CheckpointTestStep(f"package {package.name}", [*verify_command, "test", package.name], package)
+    steps = [CheckpointTestStep(f"package {package.name}", [*verify_command, "test", package.name], package.folder)
              for package in sorted(packages)]
     steps.extend(CheckpointTestStep(f"example {package}/{name}", [*verify_command, "example", package, name], checkout)
                  for package, name in sorted(examples))

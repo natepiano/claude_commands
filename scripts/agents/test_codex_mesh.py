@@ -5535,7 +5535,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_reopen_refuses_missing_thread_or_live_launcher_without_mutation(self) -> None:
         for fields in ({"launcher_pid": os.getpid(), "thread_id": THREAD_ID},
-                       {"launcher_pid": 99999999}):
+                       {"launcher_pid": 99999999, "staff_id": fixture_runtime_id("missing-worker")}):
             with self.subTest(fields=fields):
                 self.write_pool_roster({"worker": {"status": "ended", **fields}})
                 marker = codex_mesh._end_marker_path(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
@@ -18246,6 +18246,60 @@ class DevShellServerTests(unittest.TestCase):
         self.launch.assert_called_once()
         log = (self.session_dir / codex_mesh.SERVER_LOG).read_text()
         self.assertEqual(log.count(reason), 1)
+
+
+class LegacyRosterTests(unittest.TestCase):
+    """Resolve old roster entries through the run's unit and worker name."""
+
+    session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    owner: staff.StaffRow  # pyright: ignore[reportUninitializedInstanceVariable]
+    worker: staff.StaffRow  # pyright: ignore[reportUninitializedInstanceVariable]
+    entry: dict[str, object]  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        private_worker_staff(self)
+        self.session_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.owner = unit_membership("legacy-production", "legacy-unit")
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
+            "production": "legacy-production", "unit": self.owner.name,
+        }))
+        self.worker = fixture_worker("legacy-worker", self.owner.id,
+                                     backend=staff.CodexBackend(self.session_dir))
+        self.entry = {
+            "access_policy": {"kind": "WorkerLaunchPolicy"}, "context_tokens": 42,
+            "continuation_owed": False, "effort": "high", "model": "gpt-6",
+            "revision": 3, "status": "done", "task": "Repair the roster.",
+            "thread_id": fixture_runtime_id("obsolete-thread"), "turn_effort": "high",
+            "turn_model": "gpt-6", "unit_ledger": "ledger.json",
+        }
+
+    def write_roster(self, entries: dict[str, object]) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(entries))
+
+    def test_follow_and_write_upgrade_the_worker_reference(self) -> None:
+        self.write_roster({self.worker.name: self.entry})
+        state = codex_mesh._lookup_state(str(self.session_dir), self.worker.name)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(state, codex_mesh.FollowableThread(self.worker.current_session, "done"))
+        direct = unit_workers._read_roster(self.session_dir)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(cast(dict[str, object], direct[self.worker.name])["staff_id"], self.worker.id)
+        self.assertTrue(codex_mesh._update_roster(str(self.session_dir), self.worker.name, {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": self.worker.current_session, "status": "done",
+        }))
+        stored = cast(dict[str, dict[str, object]], json.loads((self.session_dir / codex_mesh.ROSTER_FILE).read_text()))
+        self.assertEqual(stored[self.worker.name]["staff_id"], self.worker.id)
+        self.assertNotIn("thread_id", stored[self.worker.name])
+
+    def test_an_unmatched_worker_keeps_the_missing_thread_result(self) -> None:
+        other = unit_membership("legacy-production", "other-unit")
+        _ = fixture_worker("unmatched-worker", other.id, backend=staff.CodexBackend(self.session_dir))
+        self.write_roster({self.worker.name: self.entry, "unmatched-worker": dict(self.entry)})
+        state = codex_mesh._lookup_state(str(self.session_dir), "unmatched-worker")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(state, codex_mesh.InvalidThread("missing thread id"))
+        with worker_lifecycle.locked_state(self.session_dir / codex_mesh.ROSTER_FILE) as handle:
+            records = codex_mesh._load_roster_for_write(handle)  # pyright: ignore[reportPrivateUsage]
+            self.assertNotIn("staff_id", cast(dict[str, object], records["unmatched-worker"]))
+            self.assertEqual(cast(dict[str, object], records[self.worker.name])["staff_id"], self.worker.id)
 
 
 class ServerRecordTests(unittest.TestCase):

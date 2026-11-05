@@ -348,6 +348,31 @@ The old `[census] hierarchy_command` setting has no effect.
 - **Unit directors default to `opus:xhigh`** (the user, 2026-10-07, moved back from `sonnet:xhigh`). Test fixtures write their own rows, so they test that a row changes the launch, not the live default.
 - **The showrunner settles a unit's designs and add-ons (user, 2026-10-12: "when it comes to designs you absolutely should be able to tell units what to do and change. I do not have to be the one to approve").** A unit in a production brings a design choice, a Pending decision about how something is built, and its pending add-ons to the showrunner, whose answer settles them; the showrunner may also change a unit's design unasked. The user keeps two kinds: an action that cannot be undone, and a choice only they know the answer to. The rule is written once per reader: `docs/production_format.md` → `<ProductionUnit/>` item 2 for the unit, `/unit:add_ons` → `<ReviewPendingAddOns/>` for the add-on message and its answer, and `/showrunner:produce` → Throughout → Designs and add-ons for the showrunner. A run outside a production still asks the user. `docs/decision_criteria.md` is unchanged.
 - **Open questions show only as a count (user, 2026-10-12; the reply side changed 2026-10-18).** A showrunner records each question in `open_for_user` before it asks, then asks it once in full with its reviewed text. After that only the status line's counts row (`For you: …`, `docs/as-built/shutdown-and-restart.md`) shows them, as a count of the `OUTSTANDING` items now due across the productions its session runs. No reply carries a footer or a `Waiting on:` block. The full list is given only when the user asks (`update_registration.py open`). The dailies' sections on what needs the user are unchanged.
+- **Rebuild items share one cache with Morty.** The `For you:` row shows `rebuild natedev` and `rebuild mac` after questions and changes.
+  The background check compares each running system outPath with the system from the configured main ref.
+  A matching outPath clears that machine's item after the next check.
+  A failed evaluation or an unreachable machine produces no item for that machine.
+  `config/statusline.conf` sets `rebuild.cache=~/.local/state/showrunner/rebuilds`.
+  The reader expands `~` to the current user's home directory each time it reads the setting.
+  The cache extends the counts cache format.
+  Line 1 contains `rebuild natedev, rebuild mac`, one rebuild item, or an empty string.
+  Line 2 contains the next refresh time as an epoch second.
+  Line 3 contains the configuration source path.
+  Line 4 contains JSON with `commit`, `source`, `natedev`, and `mac` fields.
+  `commit` identifies the evaluated ref commit.
+  `source` records the repository, ref, and configuration names used for that evaluation.
+  `natedev` and `mac` contain the expected system outPaths, or empty strings when evaluation fails.
+  Each refresh resolves the ref with `git rev-parse` and reads both running system paths.
+  One Nix evaluation computes both expected paths when the commit or evaluation source changes.
+  An unchanged commit and source reuse the cached expected paths.
+  The reader keeps the last answer visible while the background refresh runs.
+  The answer changes only when a refresh writes a new result.
+  Read the machines with `python3 /home/natepiano/.claude/scripts/statusline/rebuild_row.py read`.
+  This command prints one machine per line, or nothing when no machine needs a rebuild.
+  Both results return exit 0.
+  The command and the status line use `rebuild_row.read` to read the same file.
+  Missing, invalid, or unreadable answers produce no machines.
+  Only the status line starts a background refresh.
 - **One source for the zone (2026-10-12).** The user's zone is `config/user_zone.conf`, read through `scripts/lib/user_zone.py`, and nothing else. A production doc's `- **User zone:**` line was parsed in three places: `showrunners.py` (the registry's zone), `add_unit.py` (`Production.zone`, which `merge_checkpoint`, `ci_points`, the dailies builder, `waiting`, `stall_watch` and `update_registration` use) and `hooks/showrunner_footer.py`. Each now returns the setting. A doc that still carries the line loads as before and the line is ignored; a doc without it registers, where before it was refused. `/producer:to_production` no longer writes the line. `progress_history.py eta` reads a typed time in the setting's zone and no longer in the process `TZ`, so `/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`. The shell displays in `message/notifier.sh` (`next_due`), `validate_and_push/ci_tick.sh` and `production/smoke_launch.sh` read the helper as well. Tests whose expected times are Pacific pin `USER_ZONE` at module level.
 - **LOG backups (2026-10-12).** On every scheduled update tick `production_check.sh` runs `scripts/production/log_backup.py <doc>` for a running production, so every production is covered with no setup of its own. `backup(log: Path, directory: Path, now: datetime) -> Path | None` copies LOG to `<SHOWRUNNER_STATE_DIR or ~/.local/state/showrunner>/<slug>/log-backups/log-<YYYYmmddTHHMM>.md`, stamped in the production's zone, and keeps the newest 48 (`KEEP`). An empty or missing LOG is not copied, and neither is one unchanged since the newest copy. A failed copy prints `log_backup: <reason>` to the tick's stderr and leaves the check's exit code alone. To restore, copy the wanted file back over LOG. Added after a LOG was emptied by mistake with no copy anywhere.
 - **`dailies_render.py --footer --nothing-needed`** replaced a scan for an invented `needed` key.
