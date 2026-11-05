@@ -265,7 +265,7 @@ class RegistrationTests(RegistrationFixture):
                          [f"relay: to the showrunner of kid, for kid-unit (staff {self.fixture_staff_id('kid-unit', 'kid')})",
                           "answer: ok — kid: merge today?"],
                          answered.stdout + answered.stderr)
-        self.assertEqual(json.loads(self.outstanding().with_name("kid.json").read_text()), [])
+        self.assertEqual(json.loads(self.outstanding().with_name(f"{self.fixture_staff_id(slug='kid')}.json").read_text()), [])
         self.assertEqual(self.run_command("answer", "--item", "ship it?").returncode, 2)
 
     def test_below_production_answer_uses_the_configured_role_name_on_first_send_and_replay(self) -> None:
@@ -286,7 +286,7 @@ class RegistrationTests(RegistrationFixture):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("relay: to the showrunner of kid, for coordinator", result.stdout)
         self.assertIn("already answered", repeated.stdout)
-        saved = cast(dict[str, object], json.loads(self.outstanding().with_name("kid.answered.jsonl").read_text()))
+        saved = cast(dict[str, object], json.loads(self.outstanding().with_name(f"{self.fixture_staff_id(slug='kid')}.answered.jsonl").read_text()))
         self.assertEqual(saved["asked_by"], self.fixture_staff_id("showrunner", "kid"))
 
     def test_below_production_answer_keeps_a_relay_when_names_cannot_be_read(self) -> None:

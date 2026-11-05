@@ -229,12 +229,12 @@ def _start_recovery(source: RecoverySource, job: RecoveryJob, timeout: float) ->
 
 
 @herdr.process_action()
-def _fresh_units() -> unit_lookup.MarkedProductions:
-    return unit_lookup.every_marked_unit()
+def _fresh_units() -> unit_lookup.LabeledProductions:
+    return unit_lookup.every_labeled_session()
 
 
 # Recovery decisions share one fresh observation, independent of earlier reports.
-_recovery_observations: ContextVar[Callable[[], unit_lookup.MarkedProductions]] = ContextVar(
+_recovery_observations: ContextVar[Callable[[], unit_lookup.LabeledProductions]] = ContextVar(
     "watchdog_recovery_observations", default=_fresh_units)
 
 
@@ -301,8 +301,8 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
         observed_at = time.time()
 
         @cache
-        def unit_observations() -> unit_lookup.MarkedProductions:
-            return unit_lookup.every_marked_unit()
+        def unit_observations() -> unit_lookup.LabeledProductions:
+            return unit_lookup.every_labeled_session()
 
         retained = dict(state)
         for runner in runners:

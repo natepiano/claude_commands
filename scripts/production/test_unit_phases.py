@@ -37,7 +37,7 @@ from scripts.direct import plan_history
 def unit(name: str, claude: unit_lookup.Claude | None) -> live_units.LiveUnit:
     if claude is None:
         return live_units.LiveUnit(name, None)
-    return live_units.LiveUnit(name, unit_lookup.MarkedUnit(name, claude, HerdrPlace(f"label-of-{name}", "w1:p1")))
+    return live_units.LiveUnit(name, unit_lookup.LabeledSession(name, claude, HerdrPlace(f"label-of-{name}", "w1:p1")))
 
 
 def live(name: str) -> unit_lookup.LiveClaude:

@@ -49,7 +49,7 @@ class RegistrationTests(RegistrationFixture):
         _ = outstanding.write_text(json.dumps([{"since": "2026-10-04T10:00", "text": "review colors"}]) + "\n",
                                    encoding="utf-8")
         state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"units": [{"unit": "alpha-unit", "phase": "Phase 2 of 3: panels",
+        _ = state.write_text(json.dumps({"units": [{"unit": self.fixture_staff_id("alpha-unit"), "phase": "Phase 2 of 3: panels",
                                                     "wait": "review"}],
                                            "merges_held": ["alpha phase 2"],
                                            "open_for_user": ["stale state item"],
@@ -73,10 +73,11 @@ class RegistrationTests(RegistrationFixture):
         (scratch / "unit_status").mkdir(parents=True)
         _ = (scratch / "unit_status" / "blocks_open").write_text("alpha-unit\n", encoding="utf-8")
         _ = (scratch / "showrunner_state.json").write_text('{"merges_held": ["from scratch"]}\n', encoding="utf-8")
-        target = self.state / "showrunner" / slug / "session"
+        owner = self.fixture_staff_id()
+        target = self.state / "showrunner" / owner / "session"
         target.mkdir(parents=True)
         _ = (target / "showrunner_state.json").write_text('{"merges_held": ["kept"]}\n', encoding="utf-8")
-        prompt = self.state / "showrunner" / slug / "prompt.txt"
+        prompt = self.state / "showrunner" / owner / "prompt.txt"
         _ = prompt.write_text("an old prompt with <SCRATCH>/unit_status\n", encoding="utf-8")
         env = {**self.env, "SHOWRUNNER_SCRATCH_ROOT": str(self.root / "tmp")}
 

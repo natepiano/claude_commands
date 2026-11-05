@@ -44,7 +44,7 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertNotIn("CLAUDE NOT RUNNING", output)
         self.assertEqual(calls, "health unit-test-run\n")
 
-    def test_no_live_claude_record_reports_not_running(self) -> None:
+    def test_native_shell_without_a_live_claude_record_reports_not_running(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0, stopped_units=("hook",))
         self.assertIn("CLAUDE NOT RUNNING", output)
         self.assertNotIn("CLAUDE STATE UNKNOWN", output)
@@ -58,3 +58,14 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertIn("CLAUDE STATE UNKNOWN", outputs[0].splitlines())
         self.assertNotIn("CLAUDE NOT RUNNING", outputs[0])
         self.assertIsNone(calls)
+
+    def test_duplicate_holders_report_unknown_and_preserve_healthy_status(self) -> None:
+        for stopped in ((), ("hook",)):
+            with self.subTest(stopped=stopped):
+                outputs, _, _ = self.run_statuses(
+                    None, "ok", 0, panes=({"hook": "", "healthy": "— holding: ready\n"},),
+                    units=("hook", "healthy"), stopped_units=stopped, duplicate_units=("hook",),
+                )
+                self.assertIn("CLAUDE STATE UNKNOWN", self.unit_text(outputs[0], "hook"))
+                self.assertNotIn("CLAUDE STATE UNKNOWN", self.unit_text(outputs[0], "healthy"))
+                self.assertNotIn("SESSION GONE", outputs[0])
