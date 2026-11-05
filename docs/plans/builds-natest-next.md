@@ -87,7 +87,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **Three scripts start Python through `scripts/lib/py`, not bare `python3`.**
   - Target: `scripts/build_hold/cargo:59`, `scripts/hooks/pre-tool-use-brp-launch-gate.sh:5`, `:12` and `:35`, `scripts/lint/lint:75`
   - Why needed: on a Mac with Apple's Python 3.9 first on PATH, a bare `python3` can start the wrong interpreter. Phase 32 fixed the same fault in `conf.sh` (simplify lens, Phase 32).
-  - Priority: Phase 36, after the Producer fix (showrunner, 2026-11-05).
+  - Priority: Phase 38, after the Producer fix (showrunner, 2026-11-05).
   - Steps: 1. Run the hook and lint routes on the Mac. 2. Run the cargo hold route on Linux (`cargo:38` skips that route on the Mac). 3. Switch every listed start to `scripts/lib/py`, as one owner of the interpreter rule.
   - Ownership: `scripts/build_hold/cargo` is in builds; natest takes it. Before an edit to the hook or `scripts/lint/lint`, send the file to the showrunner, who checks the holder.
   - Completion condition: every listed start goes through `scripts/lib/py`; the notice carries the Mac result. Add no new check.
@@ -104,6 +104,8 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Owners (showrunner, 2026-11-05): the lazy `admission_service` import in `build_hold.py` goes to queue-unit with the admission client start, after the `build_hold.py` freeze (measured 9.6 s on this module). A platform column in the `eligible` answer goes to verify-unit as its next item 3.
   - Completion condition: natest measures `test_verify_ssh_targets_routing.py` again in same-load pairs when each change is on builds.
   - Revealed by: Phase 24, 2026-11-05.
+
+- [x] **Phase notes stopped updating.** Text: `phase table not written: phase note target is not owned by builds/natest-unit: ~/rust/hanadocs/showrunners/builds/natest.md`. Cause: `_note_ownership` in `scripts/direct/phase_table.py` looks up the note's `unit:` field as a staff id, and the notes still hold the older `unit: natest-unit` header (queue, report and fastest also). So each write refuses. Fix: run the one-off `phase_table.py migrate-notes`, which reads `*/*.md` below `--vault-root` and rewrites the header to the staff id. Done 2026-11-05: the showrunner assigned the builds notes to natest; `phase_table.py migrate-notes` rewrote natest, queue, report, resources and verify. natedev has the fastest note.
 
 ## Floors
 

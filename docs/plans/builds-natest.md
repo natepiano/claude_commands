@@ -809,36 +809,174 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 35 — A checkpoint merge writes its unit as the Producer of each change-review row  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** each change-review row that `merge_checkpoint.py` writes for a unit merge names that unit's staff id in Producer, whatever the checkpoint subject slug says.
-
-**Spec:** defect from the user through natedev and the showrunner (2026-11-05). The builds merge of `f05b9fcc2` (aws nextest-parity) wrote row C1017 with an empty Producer.
-- Cause: `change_review.publication_changes` finds the unit only from the subject slug `checkpoint(<slug>):`, through branch, plan stem, unit name and worktree name. aws's slugs are `builds-aws-plan` and `builds-aws-up`, its branch is `builds-aws` and its plan is `standby`. No alias matches, so Producer stays empty.
-- Fix at the source: `merge_checkpoint.py` already knows the unit it merges. `unit_from_row` reads the unit's staff row, so `Unit` carries the row's `staff.StaffId`. Pass that id to `publication_changes` for every merge of a unit. Each row of that merge then gets that id as Producer. The slug lookup stays only for callers that do not know the unit (the child hand-off path, `change_review.py` command line).
-- Keep the row owner (production doc) as it is today.
-- Test (asked by the showrunner for this defect): a unit merge whose checkpoint subject slug matches no alias writes the unit's staff id in Producer.
-- `merge_gate.py:1445` has the same fault: it calls `publication_changes` with no unit, although it has `args.unit`. Pass that unit's staff id in the same call (showrunner hold for this one call, 2026-11-05), through `change_review.unit_producer`. It searches only the merging production's units; with no unique match the slug lookup runs as before, so the gate gains no refusal (F001). Queue Phase 12 also edits `merge_gate.py`; merge `origin/builds` before the gate if it lands first.
-- Add no other guard, refusal or check (user rule, 2026-11-05).
+- `merge_checkpoint.Unit` carries a required `staff_id` from `unit_from_row`. `record_changes` and the pre-push read pass it to `change_review.publication_changes(known_producer=...)`, and every row of the merge gets it. Producer no longer depends on the checkpoint subject slug.
+- `merge_gate.py` passes `change_review.unit_producer(args.unit)`. It calls `unit_lookup.unit_row`, which reads the whole staff record, for a bare or a `-unit` name. With no row, more than one row or an unreadable staff record, it returns `UNKNOWN_PRODUCER`, and the branch lookup runs, so the gate gains no refusal.
+- `publication_changes` reads `_publication_branches`: the merging production's units first, then every other unit on this machine, with live rows before retired rows. A checkpoint on any unit's branch writes that unit's id and its own Production, also when the production document path differs from the staff path. `unit_branches` and its other readers stay scoped.
+- The `change_review.py add` command line takes Producer from `--repo`. natedev's rows came out empty because its merge script ran `add` from `/etc/nixos` with no `--repo`; natedev fixed its script. Rows already on the list stay as they are.
+- New test `test_unit_merge_with_an_unmatched_slug_writes_the_units_staff_id` fails on the base and passes on the phase. `test_a_successful_publication_notes_an_unregistered_unit_once` became `test_a_merge_keeps_its_units_producer_after_the_staff_row_goes`, because it expected the defect.
+- Six more tests pin the wider lookup: an unrelated unit, a different production path, bare and canonical names, duplicate and absent names, a scoped alias, and a live unit over a retired unit on one branch.
+- The rows with Production builds and an empty Producer went to the showrunner; the list is unchanged.
 
 **Files:**
-- `scripts/production/merge_checkpoint.py` — `Unit` gains the staff id; `unit_from_row`; `record_changes`, `record_publication_changes` and the `ChangesReadBeforePush` call pass it (owner outside builds; the showrunner holds it for this fix)
-- `scripts/production/change_review.py` — `publication_changes` takes the known producer (owner outside builds; the showrunner holds it for this fix)
-- `scripts/production/test_merge_checkpoint*.py`, `scripts/production/test_change_review.py` — the new test and each `Unit(...)` fixture that needs the new field
-- `scripts/production/test_waiting.py` — the `producer_merge_line` fixture builds `merge_checkpoint.Unit` (line 354)
-- `scripts/production/merge_gate.py` — the `publication_changes` call at line ~1445 (devtools-owned; the showrunner holds it for this one call)
-- `scripts/production/test_merge_checkpoint_rerun.py` — `test_a_successful_publication_notes_an_unregistered_unit_once` expects the old slug-only Producer; it changes to the merged unit's id
+- `scripts/production/merge_checkpoint.py`, `scripts/production/change_review.py`, `scripts/production/merge_gate.py` — the fix
+- `scripts/production/test_change_review.py`, `scripts/production/test_merge_checkpoint_rerun.py`, `scripts/production/test_waiting.py` — the tests and one fixture
 
-**Workers:** 1 writer (two files and their tests; too small to split)
+**Gotchas:**
+- `merge_gate.py` has no test of its own for an unmatched slug; the showrunner asked for one test, on the merge path.
+
+**Ruled out:**
+- A staff snapshot passed from the gate lookup through `publication_changes` in this phase. The merge of builds at 3145e7df3 brought that `record` keyword. `publication_changes` now takes both `record` and `known_producer`, and `merge_checkpoint.py` passes both.
+
+### Phase 36 — A unit's run is a full test, and only a merge is a merge gate  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a unit's run before a checkpoint is named `full test` and selects the modules its change reaches. The showrunner's merge gate runs all modules. The user asked for this through the showrunner, 2026-11-05.
+
+**Spec:** the user's words: "if they're not the showrunner they are not a merge gate - and it's the full tests taht should be limited to what they're changing and the actual merge gate would make sense to run all tsets." In the 24 hours to 2026-11-05 17:00 EST, all 204 runs used `merge_gate.py --tests-only`: 115 from units (112 full, 55 red) and 89 from merge branches (80 full, 25 red).
+1. Add `scripts/production/full_test.py --checkout <tree> [--full]`. It selects affected modules with today's selection code and records its own step name. It shares the suite runner in `merge_gate.py`: no copy of the runner.
+2. `merge_gate.py --tests-only` always runs all modules. It never calls `select_affected`. A full pass on the exact same tree stays reusable. An affected pass never certifies a tree, as today.
+3. The step name and the shown name come from config (Names through config). The step is `full-test`; the shown name is `full test`. Find each reader of the step `merge-gate` and of the path `merge_gate.py`, and make each one treat the new step: the queue page, `queue_place`, the buildlog records and index, build folders, memory admission, build holds.
+4. Keep old records as history. No code reads the old name for a unit's run.
+5. Switch all callers in this phase (One owner switches all callers):
+   - every doc and command that tells a unit to run the gate;
+   - the memory `shared-module-full-gate.md`;
+   - at the end, a `/unit:announce`-form broadcast to the units on both productions, with the new command.
+   `**Merge tests:**` lines stay as they are.
+6. An unswitched caller of `merge_gate.py --tests-only` gets a correct all-module run under the merge name. Do not refuse it.
+7. Add no guard, refusal or check (user rule, 2026-11-05). The nightly full run stays.
+8. `scripts/build_hold/build_hold.py` is on hold until the showrunner sends natedev messaging's main hash. If it needs an edit, tell the director; the director asks the showrunner.
+9. When a run finds a dirty checkout, its record writes the dirty paths. This is a record only, with no refusal (showrunner, 2026-11-05: 22 of 104 replayed runs had an unknown dirty cause).
+
+**Files:**
+- `scripts/production/full_test.py` — new command
+- `scripts/production/test_full_test.py` — new tests
+- `scripts/production/merge_gate.py`, `scripts/production/merge_gate_test_support.py`, `scripts/production/merge_gate_suites_test_support.py`, `scripts/production/test_merge_gate.py`, `scripts/production/test_merge_gate_suites.py` — all modules, step name
+- `scripts/test_times/gate_record.py` — the step and dirty paths in the record
+- `scripts/build_queue/admission_client.py`, `scripts/build_queue/admission_code.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/scope_activity.py` — the new step (owner: queue unit)
+- `scripts/buildlog/index.py`, `scripts/buildlog/test_gate_index.py` — the new step
+- `scripts/build_hold/hold_enforcer.py`, `scripts/hooks/pre-tool-use-build-hold-guard.py`, `scripts/hooks/pre-tool-use-build-hold-guard.sh` — the new step
+- `config/build_folders.conf`, `config/build_admission.conf` — the step's prefix and peak hold; the shown name
+- `docs/direct/write_prompt_contract.md`, `docs/as-built/` — the command, where a page names the unit's run
+
+**Workers:** 1 writer on slot `impl3` (the step name crosses every file; slot `impl` holds the Phase 37 replay)
+- `impl3` — all files above
+
+**Constraints from prior phases:**
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+- The admission service restart fault (queue unit, 2026-11-05): merge `origin/builds` with its fix before the live check.
+
+**Acceptance gate:**
+- A test runs `full_test.py` on a small change: it selects a subset, and the record carries step `full-test`.
+- A test runs `merge_gate.py --tests-only` on the same change: it runs all modules, and the record carries step `merge-gate`.
+- Live check on natedev: a `full_test.py` run shows as `full test` on the queue page. The director reads the page and quotes the line in the notice.
+- `grep` finds no doc that tells a unit to run `merge_gate.py`.
+- Each caller module of the changed files green in the gate form, and `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`.
+- The checkpoint carries a Change-Review line: the user opens the queue page during a unit's run and sees `full test`.
+
+### Phase 37 — A unit's full test runs under 40% of the test modules  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a unit's full test selects only the modules its change reaches, and natedev spends less CPU on gates. The user asked for this through the queue unit, 2026-11-05.
+
+**Spec:** a missed module now costs one red merge, not a red branch, because Phase 36 makes the merge gate run all modules. In the 24 hours to 2026-11-05 17:00 EST, 194 of 207 gate runs were full suites, at about 25 minutes and 13 CPU cores all day. Reasons: 73 more than 40% of modules, 58 shared gate input, 31 Python file deleted, 20 tree not clean, 7 no certified base, 4 `--full`, 1 last nightly red. Replay on main's graph: the median test module has 404 input files, and 168 with imports only. 320 of 673 non-test files reach more than 40% of modules.
+1. Replay first, and change no code. Use the gate records in `~/.local/state/buildlog` and the certified bases in `~/.local/state/merge-gate/passed-trees.jsonl`. For each full run whose commit exists, count the modules selected under each variant:
+   - filename mentions match only a path-shaped token, so `unit`, `py`, `cargo`, `lint` and `resume` match no ordinary word;
+   - `staff_test_support.py` no longer imports `unit_move.py`;
+   - both together;
+   - the next imports, ranked by fan-in times fan-out.
+2. In the same replay, test a deleted Python file: select its dependents from the graph at the base instead of a full run. Report whether this is sound: every module that imported the file at the base is in the selection. Also test dropping the full-run triggers for `scripts/lib/`, for a renamed Python file and for the 40% limit: each path selects its dependents. For each variant, count the red modules of the red unit runs that the selection would have missed.
+3. Find why a gate tree is not clean in the 20 `tree not clean` runs, and name the cause. Fix it in the phase if it is in this repository.
+4. The director sends the replay numbers to the showrunner before any cut. The cuts below follow what the replay proves.
+5. Make the proved cuts in `scripts/production/affected_modules.py` and the support files. Add each support file the replay names to the phase's files list. If the tree-not-clean cause is in `merge_gate.py`, fix it after the Phase 36 checkpoint. Bump `EXTRACTOR_VERSION` if source facts change. Move only an import that the support file does not need at import time.
+6. Do not target `scripts/agents/test_codex_mesh.py`: the user removes it within 48 hours.
+7. Add no guard, refusal or check (user rule, 2026-11-05). The nightly full run stays.
+8. If closures fall enough, send the showrunner a pass cache proposal with a new estimate. It saves 13% of CPU at today's closures.
+
+**Files:**
+- `scripts/production/affected_modules.py` — filename match, deleted-file selection
+- `scripts/production/test_affected_modules.py` — tests
+- `scripts/production/staff_test_support.py` — imports
+
+**Workers:** 1 writer (the replay decides the edits, and they share one graph)
 - `impl` — all files above
 - `test` — opens as impl
 
 **Constraints from prior phases:**
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
+- Speed work keeps coverage: a module that a change breaks must stay selected.
 
 **Acceptance gate:**
-- the new test fails on the base commit and passes on the phase commit
-- `test_change_review.py`, `test_change_routing.py`, `test_merge_gate.py` and every `test_merge_checkpoint*.py` green in the gate form `python3 scripts/test_times/module_run.py scripts/production <module>`
+- Replay of the same unit runs on the final code: the count of `more than 40%` runs, the count of all full runs, the median modules selected and the missed red modules, before and after, in the checkpoint notice.
+- For each filename edge removed, a test shows that a path-shaped mention still selects its dependents.
+- `python3 -m unittest discover -s scripts/production -p 'test_affected_modules.py'` and `test_merge_gate.py` green in the gate form, and the full gate green.
+
+### Phase 38 — Three scripts start Python through `scripts/lib/py`  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** every bare `python3` start in `scripts/build_hold/cargo`, `scripts/hooks/pre-tool-use-brp-launch-gate.sh` and `scripts/lint/lint` goes through `scripts/lib/py`.
+
+**Spec:** on a Mac with Apple's Python 3.9 first on PATH, a bare `python3` can start the wrong interpreter. Phase 32 fixed the same fault in `conf.sh`.
+1. The starts: `cargo:59`; `pre-tool-use-brp-launch-gate.sh:5`, `:12` and `:35`; `lint:75`.
+2. Before the edit, run the hook and lint routes on the Mac and record whether each fails today. Run the cargo hold route on Linux: `cargo:38` skips that route on the Mac.
+3. Switch every listed start to `scripts/lib/py`. Keep each start's arguments, stdin and exit status.
+4. The showrunner holds all three files for the natest unit. Before the first edit, tell the resources unit (the hook) and the verify unit (`scripts/lint/lint`) in one line each.
+5. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/build_hold/cargo` — line 59
+- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — lines 5, 12 and 35
+- `scripts/lint/lint` — line 75
+
+**Workers:** 1 writer (five lines in three scripts; too small to split)
+- `impl` — all files above
+- `test` — opens as impl
+
+**Constraints from prior phases:**
+- Phase 32: `conf.sh` starts its reader through `scripts/lib/py`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green
+- each caller module of the hook and of `scripts/lint/lint` green in the gate form
+- the Mac result of step 2 and of the same routes after the edit, in the checkpoint notice
+- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
+
+### Phase 39 — `test_verify_mac_only.py` runs in half its time  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_verify_mac_only.py` (rank 3 in `test_times top` at 263.4 s median, 188.0 CPU s, 17 tests, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method. The module is free since verify's Mac retry hang fix landed on builds at 0380fb6ea (showrunner, 2026-11-05). Ranks 1 and 2 are `agents/test_codex_mesh.py` (excluded) and `direct/test_verify_lint_judgment.py` (Phase 31 floor).
+1. Merge `origin/builds` first. Profile before any edit, and take a new baseline: the hang fix may change the cost.
+2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
+3. A cut in `verify.sh`, `verify_mac_offload_test_support.py` or another file the verify unit owns goes to the showrunner first, with the measured gain. A support-file change keeps every importer green; name each one in the final run.
+4. Keep every test name and assertion. Add no guard, refusal or check that this Work Order does not name (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_verify_mac_only.py` — the module
+- `scripts/direct/verify_mac_offload_test_support.py` — only for a shared cut the profile names, after the showrunner's answer
+
+**Workers:** 1 writer (one module and its fixture; the files do not split)
+- `impl` — all files above
+- `test` — opens as impl
+
+**Constraints from prior phases:**
+- Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/direct -p 'test_verify_mac_only.py'` green, with the same test names and assertions
+- each importer in Spec step 3 green when a support file changes, with its before and after time in same-load pairs
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
 - `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
