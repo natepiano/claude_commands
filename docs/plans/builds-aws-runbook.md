@@ -258,6 +258,8 @@ Never paste its secret into a command, log, or tracked file.
 2. Confirm the clean `main` checkout at `nixos_configuration_directory` contains the reviewed box configuration.
 3. Run `python3 scripts/aws_target/deploy.py up --approve-resources` yourself.
 
+Device names in `config/aws-build-tailscale.json` must equal a machine name (first label of `DNSName` in `tailscale status`); `up` checks this first.
+
 The policy stage prints each change to `tag:build-aws` rules.
 It preserves unrelated rules and refuses a broad outbound rule that needs policy review.
 The join stage waits for SSM and sends one short-lived auth key through SSM stdin.

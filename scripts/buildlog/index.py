@@ -20,7 +20,7 @@ import sqlite3
 import time
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -60,6 +60,9 @@ LOCK_NAME = "index.lock"
 INDEX_PREFIX = "index"
 INDEX_SUFFIX = ".sqlite"
 INDEX_PATTERN = re.compile(rf"{INDEX_PREFIX}(-[0-9a-f]{{64}})?{re.escape(INDEX_SUFFIX)}")
+# No current code opens this name. Remove this rule when no host holds the file.
+LEGACY_INDEX_NAME = f"{INDEX_PREFIX}{INDEX_SUFFIX}"
+INDEX_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 BOOKKEEPING_TABLES = {
     "meta": "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)",
     "files": "CREATE TABLE files (path TEXT PRIMARY KEY, offset INTEGER, marks TEXT)",
@@ -160,6 +163,7 @@ STEP_COLUMNS: list[Column] = [
     ("target_directory", "TEXT NOT NULL", "resolved Cargo artifact root, or unknown for older records"),
     ("build_directory", "TEXT NOT NULL", "resolved Cargo intermediate root; artifact root for legacy records"),
     ("build_history_group", "TEXT", "real folder or legacy checkout group; NULL for none or unresolved"),
+    ("identity_derived", "INTEGER NOT NULL DEFAULT 0", "1 when the index derives the repository key from the call"),
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -496,7 +500,7 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "tests": (
         TEST_COLUMNS,
         "PRIMARY KEY (step_id, binary, test)",
-        "per-test rows of a nextest step, kept only for tests that failed, were retried, took over 1 s or hit SLOW",
+        "nextest rows that failed, were retried, took over NEXTEST_SLOW_TEST_S (config/test_times.conf), or hit SLOW",
     ),
     "calls": (
         CALL_COLUMNS,
@@ -596,7 +600,13 @@ def read_only_uri(root: Path) -> str:
 
 @contextmanager
 def update_lock() -> Generator[None]:
-    lock = store.root() / LOCK_NAME
+    with update_lock_in(store.root()):
+        yield
+
+
+@contextmanager
+def update_lock_in(root: Path) -> Generator[None]:
+    lock = root / LOCK_NAME
     lock.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
     try:
@@ -621,7 +631,7 @@ def schema_statements() -> list[str]:
     statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
     statements.append("CREATE INDEX steps_call ON steps (call_id)")
-    statements.append("CREATE INDEX tests_step ON tests (step_id)")
+    statements.append("CREATE INDEX ssh_attempts_call ON ssh_attempts (call_id)")
     statements.append("CREATE INDEX gate_runs_started ON gate_runs (started_at)")
     statements.append("CREATE INDEX gate_suites_suite ON gate_suites (suite, started_at)")
     statements.append("CREATE INDEX gate_modules_key ON gate_modules (suite, module, started_at)")
@@ -642,8 +652,15 @@ def create_schema(connection: sqlite3.Connection) -> None:
     _ = connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
+def remove_index(path: Path) -> None:
+    """Remove the SQLite sidecars before the index file."""
+    for suffix in INDEX_SIDECAR_SUFFIXES:
+        Path(str(path) + suffix).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+
+
 def open_for_update(path: Path) -> sqlite3.Connection:
-    """Open the current schema file and rebuild it when its version or tables differ."""
+    """Open the schema, rebuild invalid tables, and restore missing indexes."""
     connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
     version = cast(tuple[int], connection.execute("PRAGMA user_version").fetchone())[0]
     tables = {row[0] for row in cast(list[tuple[str]], connection.execute(
@@ -651,11 +668,17 @@ def open_for_update(path: Path) -> sqlite3.Connection:
     ).fetchall())}
     if version != SCHEMA_VERSION or not (set(TABLES) | set(BOOKKEEPING_TABLES)).issubset(tables):
         connection.close()
-        path.unlink(missing_ok=True)
+        remove_index(path)
         connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
         _ = connection.execute("BEGIN IMMEDIATE")
         create_schema(connection)
         _ = connection.execute("COMMIT")
+    indexes = {row[0] for row in cast(list[tuple[str]], connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'"
+    ).fetchall())}
+    for statement in schema_statements():
+        if statement.startswith("CREATE INDEX") and statement.split(" ON ", 1)[0].split()[-1] not in indexes:
+            _ = connection.execute(statement)
     _ = connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 
@@ -820,6 +843,7 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
         "target_directory": target_directory,
         "build_directory": record.get("build_directory") or target_directory,
         "repo_identity": record.get("repo_identity") or store.UNKNOWN_IDENTITY,
+        "identity_derived": 0,
         "target_folder": folder,
         "build_history_group": ("folder:" + folder if folder else
                                 "legacy:" + str(checkout) if checkout and target_dir in ("unknown", "unset") else None),
@@ -1001,7 +1025,8 @@ def marks(handle: BinaryIO, offset: int) -> str:
     return head.hex() + ":" + handle.read(offset - start).hex()
 
 
-def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple[int, str] | None) -> int:
+def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple[int, str] | None,
+              touched_calls: set[str]) -> int:
     """Index the complete lines past the stored offset; returns the lines read."""
     with path.open("rb") as handle:
         size = os.fstat(handle.fileno()).st_size
@@ -1036,6 +1061,11 @@ def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple
             if adder is not None:
                 adder(connection, typed, src)
                 lines += 1
+                kind = typed.get("kind")
+                if kind in ("step", "call", "ssh_attempt"):
+                    call_id = typed.get("id" if kind == "call" else "call_id")
+                    if isinstance(call_id, str) and call_id:
+                        touched_calls.add(call_id)
         new_offset = offset + end
         stored = marks(handle, new_offset)
     _ = connection.execute(
@@ -1044,31 +1074,69 @@ def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple
     return lines
 
 
-def cleanup_unused_indexes(root: Path, current: Path) -> None:
-    """Delete old schema files; deletion between stat and unlink costs only one rebuild."""
-    candidates = [path for path in root.iterdir()
-                  if path != current and INDEX_PATTERN.fullmatch(path.name)]
+def cleanup_unused_indexes(root: Path, current: Path, settings: conf.ConfigRead) -> None:
+    """Remove unused indexes and orphan sidecars.
+
+    A file removed between a peer's stat and open costs that peer one rebuild.
+    """
+    candidates: set[Path] = set()
+    for path in root.iterdir():
+        for suffix in INDEX_SIDECAR_SUFFIXES:
+            if path.name.endswith(suffix):
+                path = path.with_name(path.name.removesuffix(suffix))
+                break
+        if path != current and INDEX_PATTERN.fullmatch(path.name):
+            candidates.add(path)
     if not candidates:
         return
-    unused_days = conf.read("buildlog").number("INDEX_UNUSED_DAYS")
+    unused_days = settings.number("INDEX_UNUSED_DAYS")
     cutoff = time.time() - unused_days * 24 * 60 * 60
     for path in candidates:
-        with suppress(FileNotFoundError):
+        try:
             changed = path.stat()
-            if max(changed.st_atime, changed.st_mtime) < cutoff:
-                path.unlink()
+        except FileNotFoundError:
+            remove_index(path)
+        else:
+            if path.name == LEGACY_INDEX_NAME or max(changed.st_atime, changed.st_mtime) < cutoff:
+                remove_index(path)
+
+
+def resolve_mac_repositories(connection: sqlite3.Connection, touched_calls: set[str]) -> None:
+    """Recompute derived step identities only for calls with new identity evidence."""
+    _ = connection.execute("""
+        UPDATE steps INDEXED BY steps_call
+        SET repo_identity = COALESCE(
+            (SELECT s.repo_identity FROM steps s INDEXED BY steps_call
+             WHERE s.call_id = steps.call_id AND s.repo_identity != :unknown
+               AND s.identity_derived = 0
+               AND s.repo_path = (SELECT repo_path FROM calls WHERE id = steps.call_id)
+             ORDER BY s.started_at DESC, s.id DESC LIMIT 1),
+            (SELECT a.repo_identity FROM ssh_attempts a
+             WHERE a.call_id = steps.call_id AND a.repo_identity != :unknown
+             ORDER BY a.at DESC, a.id DESC LIMIT 1),
+            repo_identity),
+            identity_derived = 1
+        WHERE call_id IN (SELECT value FROM json_each(:call_ids))
+          AND (repo_identity = :unknown OR identity_derived = 1)
+    """, {"unknown": store.UNKNOWN_IDENTITY, "call_ids": json.dumps(sorted(touched_calls))})
 
 
 def update() -> int:
     """Bring the index up to date with the JSON lines; returns the lines read."""
-    root = store.root()
+    return update_in(store.root())
+
+
+def update_in(root: Path) -> int:
+    """Update the index in the selected build log root."""
     root.mkdir(parents=True, exist_ok=True)
-    with update_lock():
+    with update_lock_in(root):
         current = index_path_in(root)
         connection = open_for_update(current)
         try:
             now = time.time()
-            if now - current.stat().st_mtime > 86400:
+            settings = conf.read("buildlog")
+            touch_minutes = settings.number("INDEX_TOUCH_MINUTES")
+            if now - current.stat().st_mtime > touch_minutes * 60:
                 os.utime(current, (now, now))
             _ = connection.execute("BEGIN IMMEDIATE")
             known = {
@@ -1081,13 +1149,16 @@ def update() -> int:
             if stored_root != (str(root),):
                 _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('root', ?)", (str(root),))
             lines = 0
+            touched_calls: set[str] = set()
             present: set[str] = set()
             for path in sorted(root.glob("*/*.jsonl")):
                 src = path.relative_to(root).as_posix()
                 present.add(src)
-                lines += read_file(connection, path, src, known.get(src))
+                lines += read_file(connection, path, src, known.get(src), touched_calls)
             for gone in set(known) - present:
                 forget(connection, gone)
+            if touched_calls:
+                resolve_mac_repositories(connection, touched_calls)
             _ = connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -1095,13 +1166,13 @@ def update() -> int:
             raise
         finally:
             connection.close()
-        cleanup_unused_indexes(root, current)
+        cleanup_unused_indexes(root, current, settings)
     return lines
 
 
 def reindex() -> int:
     with update_lock():
-        index_path().unlink(missing_ok=True)
+        remove_index(index_path())
     return update()
 
 
