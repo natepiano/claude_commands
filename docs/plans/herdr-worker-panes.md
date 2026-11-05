@@ -1744,7 +1744,7 @@ Each save makes one `pane process-info` call per listed pane.
 
 **Gotchas:** Unknown evidence does not refresh the saved `seen` time of a binding; Phase 5c keeps such a binding past the age limit.
 
-### Phase 5c — Unknown pane evidence keeps the saved place past the age limit  · status: todo
+### Phase 5c — Unknown pane evidence keeps the saved place past the age limit  · status: done
 
 **Depends on:** 5b (the saved layout binds rows from the native process scan).
 
@@ -1771,7 +1771,7 @@ Each save makes one `pane process-info` call per listed pane.
 **Acceptance gate:**
 1. A test saves a layout with a tab binding seen more than `LAYOUT_KEEP_SECONDS` ago, beside a proved live row and one pane whose process-info read fails: the old binding stays, in its place, and stderr says the placement was retained.
 2. A test with every pane known and the same old binding: the binding is dropped, as before.
-3. Both tests fail without the change. The herdr, title and shutdown suites pass; basedpyright 0/0 on the changed files.
+3. Test 1 fails without the change; test 2 passes with and without it. The herdr, title and shutdown suites pass; basedpyright 0/0 on the changed files.
 4. Record added and deleted source lines in the checkpoint message.
 
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: moved: shutdown-unit (sdlc, 2026-11-04)

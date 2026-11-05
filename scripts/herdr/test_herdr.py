@@ -5314,6 +5314,58 @@ class RowTabTests(StaffTestCase):
         self.assertEqual(herdr.saved_layout("fixture")["workspaces"][0], saved)
         self.assertIn("pane evidence is unknown", errors.getvalue())
 
+    def test_unknown_pane_evidence_keeps_old_workspace_and_tab_bindings(self) -> None:
+        self.client.tabs = self.client.tabs[:2]
+        self.client.tabs[1]["session_id"] = self.rows["stopped"].current_session
+        self.client.unknown.add(self.client.tabs[1]["pane_id"])
+        now = time.time()
+        old = now - herdr.LAYOUT_KEEP_SECONDS - 1
+        remembered = herdr.SavedSpace(name="remembered", seen=old, tabs=[
+            herdr.SavedName(name=self.rows["worker"].id, seen=old, terminal_id="old-workspace-terminal")])
+        stopped = herdr.SavedName(name=self.rows["stopped"].id, seen=old, terminal_id="old-tab-terminal")
+        saved = herdr.SavedLayout(at=old, workspaces=[remembered,
+            herdr.SavedSpace(name="old-production", seen=old, tabs=[
+                herdr.SavedName(name=self.rows["unit"].id, seen=old), stopped])])
+        path = herdr.layout_path("fixture")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(saved))
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.client.record_layout()
+
+        result = herdr.saved_layout("fixture")
+        self.assertEqual(self.bindings(), [("remembered", self.rows["worker"].id),
+            ("old-production", self.rows["unit"].id), ("old-production", self.rows["stopped"].id)])
+        self.assertEqual(result["workspaces"][0], remembered)
+        self.assertEqual(result["workspaces"][1]["tabs"][1], stopped)
+        self.assertGreaterEqual(result["workspaces"][1]["tabs"][0]["seen"], now)
+        self.assertIn("pane evidence is unknown", errors.getvalue())
+        self.assertIn("row placement retained", errors.getvalue())
+
+    def test_known_pane_evidence_expires_old_workspace_and_tab_bindings(self) -> None:
+        self.client.tabs = self.client.tabs[:2]
+        del self.client.tabs[1]["session_id"]
+        now = time.time()
+        old = now - herdr.LAYOUT_KEEP_SECONDS - 1
+        saved = herdr.SavedLayout(at=old, workspaces=[
+            herdr.SavedSpace(name="remembered", seen=old, tabs=[
+                herdr.SavedName(name=self.rows["worker"].id, seen=old, terminal_id="old-workspace-terminal")]),
+            herdr.SavedSpace(name="old-production", seen=old, tabs=[
+                herdr.SavedName(name=self.rows["unit"].id, seen=old),
+                herdr.SavedName(name=self.rows["stopped"].id, seen=old, terminal_id="old-tab-terminal")])])
+        path = herdr.layout_path("fixture")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(saved))
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.client.record_layout()
+
+        self.assertEqual(self.bindings(), [("old-production", self.rows["unit"].id)])
+        tabs = herdr.saved_layout("fixture")["workspaces"][0]["tabs"]
+        for tab in tabs:
+            self.assertGreaterEqual(tab["seen"], now)
+        self.assertEqual(errors.getvalue(), "")
+
     def test_transfer_preserves_shared_tabs_separate_tabs_and_nested_grid_splits(self) -> None:
         initial = [dict(pane) for pane in self.client.tabs]
         for grid in (False, True):

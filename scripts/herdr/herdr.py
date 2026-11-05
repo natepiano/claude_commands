@@ -1043,10 +1043,10 @@ def _saved_name(value: object) -> SavedName:
     return result
 
 
-def merged_order(saved: list[SavedName], live: list[str], now: float) -> list[SavedName]:
+def merged_order(saved: list[SavedName], live: list[str], now: float, *, expire: bool = True) -> list[SavedName]:
     """Live names in live order, seen now; a saved name not live stays after the saved name before it.
 
-    A saved name unseen for longer than LAYOUT_KEEP_SECONDS is dropped.
+    With expire, a saved name unseen for longer than LAYOUT_KEEP_SECONDS is dropped.
     """
     known = {entry["name"]: entry for entry in saved}
     result: list[SavedName] = []
@@ -1056,7 +1056,7 @@ def merged_order(saved: list[SavedName], live: list[str], now: float) -> list[Sa
         result.append(entry)
     placed = set(live)
     for index, entry in enumerate(saved):
-        if entry["name"] in placed or now - entry["seen"] > LAYOUT_KEEP_SECONDS:
+        if entry["name"] in placed or (expire and now - entry["seen"] > LAYOUT_KEEP_SECONDS):
             continue
         before = next((earlier["name"] for earlier in reversed(saved[:index]) if earlier["name"] in placed), None)
         at = 0 if before is None else next(place for place, item in enumerate(result) if item["name"] == before) + 1
@@ -1096,15 +1096,15 @@ def _bind_row_tab(saved: SavedLayout, workspace: str, row_id: str,
     return True
 
 
-def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float) -> SavedLayout:
-    """The saved layout with the live one laid over it: live order wins, gone entries keep their places."""
+def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float, *, expire: bool = True) -> SavedLayout:
+    """Merge the live layout into the saved layout and preserve absent entries until they expire."""
     tabs = {space["name"]: space["tabs"] for space in saved["workspaces"]}
     live_tabs = {space.label: space.tabs for space in live}
     order = merged_order([SavedName(name=space["name"], seen=space["seen"]) for space in saved["workspaces"]],
-                         [space.label for space in live], now)
+                         [space.label for space in live], now, expire=expire)
     return SavedLayout(at=now, workspaces=[
         SavedSpace(name=entry["name"], seen=entry["seen"],
-                   tabs=merged_order(tabs.get(entry["name"], []), live_tabs.get(entry["name"], []), now))
+                   tabs=merged_order(tabs.get(entry["name"], []), live_tabs.get(entry["name"], []), now, expire=expire))
         for entry in order])
 
 
@@ -1415,7 +1415,7 @@ class Herdr:
             if known:
                 for space in saved["workspaces"]:
                     space["tabs"] = [item for item in space["tabs"] if record.by_id(staff.StaffId(item["name"])) is not None]
-            _write_layout(self.session, merged_layout(saved, live, time.time()))
+            _write_layout(self.session, merged_layout(saved, live, time.time(), expire=known))
 
     def pane_tab(self, pane: str) -> tuple[str, int, SavedName]:
         """Read the current workspace, tab position, and terminal for one pane."""
