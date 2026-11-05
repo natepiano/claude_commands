@@ -538,7 +538,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Compile-count bands for nextest promises: they raise under-half promises in ten repositories.
 - Landing reader facts with no caller: each fact lands with its first reader.
 
-### Phase 18 — History splits on the dylib feature and each step's commit, not on a time  · status: todo
+### Phase 18 — History splits on the dylib feature and each step's commit, not on a time  · status: done
 **Depends on:** Phases 11 and 60. Phase 17 measured compile bands and did not adopt them, so this phase needs no band. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its Spec 7 import repair lands before Phase 8, because both change `build_hold.py`. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).
@@ -1809,3 +1809,40 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - The reader's CPU time and distinct row count on natedev, before and after, are in the checkpoint notice; the row count does not rise. A floor-only dry run on natedev stays under 30 s.
 - `scripts/buildlog/test_step_outputs.py` and `scripts/lint/test_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
 - Change-Review line: none — the floor finds more recorded targets; nothing the user sees changes.
+
+### Phase 67 — Importing offload or sweep loads no build coordination modules  · status: todo
+**Depends on:** Phase 64 (on `builds-resources` at `9c2ee6eab`). It lands with or after Phases 63-64 (showrunner, 2026-11-05).
+
+#### Work Order
+
+**Goal:** a short query that imports `scripts/mac_test/offload.py` or `scripts/lint/sweep.py` does not load `build_hold`, `scripts.build_queue` or `memory_admit`.
+
+**Measured (2026-11-05, tree `689b87c5f`):**
+- `sweep.py` imports `build_hold` at module level (the `if TYPE_CHECKING:` block above `BuildHoldTarget`). `build_hold` imports `scripts.build_queue.admission_service`, which loads `admission_protocol`, the other `scripts.build_queue` modules and `scripts.lint.memory_admit`.
+- `build_hold_targets()` is the only user of `build_hold` in `sweep.py`.
+- `python3 -X importtime` of `import offload`: 455.6, 349.3 and 379.9 ms cumulative over three runs. The `build_hold` subtree was 173.5 ms and 223.1 ms, and `memory_admit` alone 93.6 ms.
+- Rule (showrunner, 2026-11-05): a short query must not import the coordination stack. Cut it at `sweep.py`.
+
+**Spec:**
+1. In `sweep.py`, import `build_hold` only inside `build_hold_targets()`. Keep the `TYPE_CHECKING` import for basedpyright.
+2. Keep the `sessions` import at module level and working. It must not depend on the `build_hold` path insert.
+3. Keep `test_sweep.py`'s patch of `build_hold.live_sessions` valid: the function must use the `build_hold` module object in `sys.modules`.
+4. Add a test that runs a fresh interpreter, imports `offload` the way `scripts/mac_test/offload.py` is run, and asserts that no `build_hold`, `scripts.build_queue*`, `memory_admit` or `scripts.lint.memory_admit` module is loaded. Add the same check for `import sweep`.
+
+**Constraints from prior phases:**
+- Make no edit to `scripts/build_hold/build_hold.py` (messaging send.py freeze) or `scripts/mac_test/offload.py` (natest Phase 24).
+- Keep the Phase 58-64 floor and hold behavior: `build_hold_targets()` returns the same targets for the same holders.
+
+**Files:**
+- `scripts/lint/sweep.py` — the import cut.
+- `scripts/lint/test_sweep.py` — the import tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `sweep.py`.
+- `test` owns `test_sweep.py`.
+
+**Acceptance gate:**
+- The import test passes and fails on the pre-phase tree.
+- `python3 -X importtime` of `import offload`, three runs before and three after on natedev, is in the checkpoint notice; the median falls.
+- `scripts/lint/test_sweep.py` and `scripts/mac_test/test_offload.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
+- Change-Review line: none — imports only; no behavior the user sees changes.

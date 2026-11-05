@@ -8,6 +8,7 @@ Rows without valid arguments prove no shape.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Generator, Sequence
 from contextlib import closing, contextmanager
@@ -116,10 +117,34 @@ def combine_compile_counts(first: CompiledCrates | NoCratesCompiled | CompileCou
 
 
 @dataclass(frozen=True)
+class KnownStepCommit:
+    """The indexed step records a full or short commit sha."""
+
+    sha: str
+
+
+@dataclass(frozen=True)
+class UnknownStepCommit:
+    """The indexed step records no usable commit sha."""
+
+
+UNKNOWN_STEP_COMMIT = UnknownStepCommit()
+
+
+_STEP_COMMIT = re.compile(r"[0-9a-fA-F]{4,40}")
+
+
+def step_commit(raw: object) -> KnownStepCommit | UnknownStepCommit:
+    """Decode a full or short hexadecimal commit at the index boundary."""
+    return KnownStepCommit(raw) if isinstance(raw, str) and _STEP_COMMIT.fullmatch(raw) else UNKNOWN_STEP_COMMIT
+
+
+@dataclass(frozen=True)
 class StepEvidence:
     shape: BuildShape | NoBuildShape
     compilation: CompiledCrates | NoCratesCompiled | CompileCountUnknown
     arguments: tuple[str, ...] = ()
+    commit: KnownStepCommit | UnknownStepCommit = UNKNOWN_STEP_COMMIT
 
 
 @contextmanager
@@ -144,12 +169,13 @@ def index_step_evidence(index_path: Path, host: str, step: str,
     try:
         with _step_index(index_path) as (connection, columns):
             argv_column = "argv" if "argv" in columns else "NULL"
+            sha_column = "sha" if "sha" in columns else "NULL"
             count_column = "crates_compiled" if "crates_compiled" in columns else "NULL"
             rows = cast(list[tuple[object, ...]], connection.execute(
-                f"SELECT call_id, step, {argv_column}, started_at, {count_column} "
+                f"SELECT call_id, step, {argv_column}, started_at, {count_column}, {sha_column} "
                 + "FROM steps WHERE host=? AND step=?", (host, step),
             ).fetchall())
-        for call_id, name, raw_argv, started_at, count in rows:
+        for call_id, name, raw_argv, started_at, count, raw_sha in rows:
             if not isinstance(call_id, str) or not call_id or not isinstance(name, str):
                 continue
             dated = False
@@ -182,6 +208,7 @@ def index_step_evidence(index_path: Path, host: str, step: str,
                         shape = build_shape(decoded_arguments)
             except (ValueError, TypeError):
                 pass
+            commit = step_commit(raw_sha)
             previous = evidence.get((call_id, name))
             if previous is not None:
                 compilation = combine_compile_counts(previous.compilation, compilation)
@@ -189,7 +216,9 @@ def index_step_evidence(index_path: Path, host: str, step: str,
                     shape = previous.shape
                 if not arguments:
                     arguments = previous.arguments
-            evidence[call_id, name] = StepEvidence(shape, compilation, arguments)
+                if isinstance(commit, UnknownStepCommit):
+                    commit = previous.commit
+            evidence[call_id, name] = StepEvidence(shape, compilation, arguments, commit)
     except (OSError, sqlite3.Error):
         pass
     return evidence

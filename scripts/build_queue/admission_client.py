@@ -132,10 +132,11 @@ class EstimateConnection:
 _ESTIMATE_CONNECTION: ContextVar[EstimateConnection | None] = ContextVar("estimate_connection", default=None)
 
 
-def build_history_generation(configuration: gate.MemoryConfig | None = None) -> gate.BuildHistoryGeneration:
+def build_history_generation(configuration: gate.MemoryConfig | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                             ) -> gate.BuildHistoryGeneration:
     """Read the generation before reading build history."""
     reply = _call(wire.BuildHistoryRequest(), lambda _wait: None, channel=_ESTIMATE_CONNECTION.get(),
-                  configuration=configuration)
+                  configuration=configuration if isinstance(configuration, gate.MemoryConfig) else None)
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Refused):

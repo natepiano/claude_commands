@@ -4,8 +4,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+from datetime import UTC, datetime
 import errno
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -27,6 +29,8 @@ from scripts.build_queue.admission_test_support import (
 )
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
+from scripts.lint.build_change_test_support import BuildChangeRepository, index_step
+from scripts.buildlog.step_outputs_test_support import create_step_index
 
 WAIT = wait_reply(gate.NeedsMemory(), 1, "head", "free memory")
 EXPIRED = wait_reply(gate.EstimateExpired(1), 1, "head", "estimate expired")
@@ -34,6 +38,70 @@ GRANTED = admitted_reply("stem", GIB, "new-source", "stem.max", "stem.wave")
 
 
 class ClientTests(unittest.TestCase):
+    def test_history_generation_reads_current_configuration_at_use(self) -> None:
+        with AdmissionFixture() as fixture:
+            transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(7))))
+            with mock.patch.object(gate, "read_memory_config", wraps=gate.read_memory_config) as read:
+                generation = client.build_history_generation(conf.UseConfiguredValue.CURRENT)
+            self.assertEqual(generation, gate.BuildHistoryGeneration(7))
+            self.assertEqual(len(transport.requests), 1)
+            self.assertIsInstance(transport.requests[0], wire.BuildHistoryRequest)
+            read.assert_called_once()
+
+    def test_history_generation_uses_supplied_configuration_without_another_read(self) -> None:
+        with AdmissionFixture() as fixture:
+            configuration = gate.read_memory_config()
+            transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(8))))
+            with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("supplied configuration was not used")):
+                generation = client.build_history_generation(configuration)
+            self.assertEqual(generation, gate.BuildHistoryGeneration(8))
+            self.assertEqual(len(transport.requests), 1)
+            self.assertIsInstance(transport.requests[0], wire.BuildHistoryRequest)
+
+    def test_history_generation_refuses_an_unusable_current_configuration(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", silence_seconds="invalid")
+            with redirect_stderr(io.StringIO()), self.assertRaises(client.CheckerFailure) as error:
+                _ = client.build_history_generation(conf.UseConfiguredValue.CURRENT)
+            self.assertIn("silence_seconds", str(error.exception))
+
+    def test_initial_and_refreshed_requests_save_commit_marks_before_admission(self) -> None:
+        with AdmissionFixture() as fixture:
+            repository = BuildChangeRepository(fixture.root / "hana")
+            changes = fixture.root / "build_changes.json"
+            identity = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
+            _ = changes.write_text(json.dumps([{"repository": identity.key, "kind": "commit",
+                "sha": repository.change, "note": "private split"}]))
+            index_path = gate.file_marks.index_path_in(fixture.state_dir.parent)
+            create_step_index(index_path)
+            index_step(index_path, host="test-host", repository="hana", repository_identity=identity.key,
+                       step="nextest", call_id="own", started_at=datetime(2026, 10, 31, 11, 59, tzinfo=UTC),
+                       arguments=["cargo", "nextest", "run"], sha=repository.after)
+            _ = (fixture.state_dir / "anon_peaks.jsonl").write_text(json.dumps({
+                "host": "test-host", "repo": "hana", "repo_identity": identity.key,
+                "step": "nextest", "call_id": "own", "ended_at": "2026-10-31T11:59:01+00:00",
+                "anon_peak_bytes": 3 * GIB}) + "\n")
+            owner = fixture.request()
+            with mock.patch.object(gate, "BUILD_CHANGES_PATH", changes), \
+                    mock.patch.object(client, "CLOCK", fixture.clock), \
+                    mock.patch.object(gate.store, "host_name", return_value="test-host"):
+                first = client.step_request(["cargo", "nextest", "run"], str(repository.path), owner.owner,
+                    owner.since, "", owner.episode)
+                cache = fixture.state_dir / "build_marks.json"
+                saved = cache.read_bytes()
+                assert isinstance(first.profile, gate.StepProfile)
+                self.assertEqual(first.profile.peak.bytes, 3 * GIB)
+                later = repository.commit("a later admitted head")
+                fixture.clock.advance(gate.read_memory_config().policy.timing.head_seconds + 1)
+                refreshed = client.step_request(list(first.argv), first.cwd, first.owner, first.since,
+                    first.sidecar, first.episode, first.profile)
+            assert isinstance(refreshed.profile, gate.StepProfile)
+            self.assertEqual(refreshed.profile.peak.bytes, 3 * GIB)
+            self.assertEqual((refreshed.owner, refreshed.episode, refreshed.since),
+                             (first.owner, first.episode, first.since))
+            self.assertNotEqual(cache.read_bytes(), saved)
+            self.assertIn(later, cache.read_text())
+
     def test_unit_override_retries_a_strict_main_service_without_the_new_field(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()

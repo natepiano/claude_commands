@@ -296,6 +296,127 @@ The 1 GiB filtered floor applies when the repository has no usable compile histo
 Fresh nextest estimates retain `fresh_test_peak` and its 1 GiB floor.
 Freshness still requires both Cargo output roots to survive.
 
+#### History sides for build changes
+
+`config/build_changes.json` is the one list of build changes.
+Each row names its repository, kind, value and note.
+An `argv_feature` row names a feature. A `commit` row names a full commit sha.
+`enabled: false` retains a measured change without applying its split.
+An unusable file prints one diagnostic and preserves estimates without a split.
+
+`step_estimate` resolves the admitted argv and HEAD before admission connects.
+The one Cargo shape parser reads all feature spellings.
+The shared call-and-step join returns `KnownStepCommit` or `UnknownStepCommit`.
+No second join or test-selection parser exists.
+`compiling_history` resolves each test selection before the side filter.
+It filters rows before `repository_history` counts any tier.
+
+The active dylib split keeps only matching feature sides in every estimate tier.
+Profile fallback and indexed fallback keep the same split.
+A missing index row proves no side for a completed peak.
+A failed peak without an index row must match its recorded features.
+Its missing commit stays on the admitted side until its row arrives.
+A known zero-compile result still removes that peak from compile history.
+
+Commit changes apply only to dev and test profiles.
+Release detection uses `BuildShape.profile`, including both release spellings.
+Ancestry has four outcomes: after, before, ambiguous short sha and unavailable.
+Only after and before place an indexed row on a side.
+One git query reads each distinct sha for all pending commit changes.
+The cache stores resolved and ambiguous answers in `admission/build_marks.json`.
+An unavailable answer causes another query on the next estimate.
+Each estimate reads the cache once when it has commit changes.
+It writes only when it adds an answer.
+Each estimate loads the shared evidence map once per step name.
+Git receives only HEAD and the repository’s commits inside the estimate window.
+`write_build_marks` is the sole writer. Only `step_estimate` calls it.
+Initial and refreshed client estimates use that path before admission.
+The writer is the estimate-cache guard boundary for the installed-copy policy.
+Git runs outside the service event loop and its shared locks.
+
+The split changes no headroom rule, failed-peak floor or cap.
+Each replay estimate keeps the historical budget of its step.
+Both replay modes use the same headroom configuration.
+
+The measurement covers 2026-10-22T06:37:45.303901+00:00 through 2026-11-05T06:37:45.303901+00:00.
+The feature sides have 7,999 before and 676 after indexed steps.
+The commit sides have 5,829 before and 2,833 after indexed steps.
+Five indexed steps have no sha. Eight have an unavailable commit.
+There are 116 anonymous hana peaks without a usable call-and-step index match.
+Rows without side evidence count on neither side.
+
+| Change | Side | Step | Anonymous rows | p90 GiB | Peak GiB |
+|---|---|---|---:|---:|---:|
+| commit | after | build | 12 | 11.4767 | 12.3511 |
+| commit | after | check | 172 | 2.8342 | 5.3592 |
+| commit | after | clippy | 438 | 6.0676 | 10.4292 |
+| commit | after | doc | 74 | 6.4562 | 7.8990 |
+| commit | after | mend | 263 | 7.7340 | 9.4363 |
+| commit | after | nextest | 393 | 11.7306 | 14.3407 |
+| commit | before | build | 50 | 10.7413 | 16.3911 |
+| commit | before | check | 336 | 2.9964 | 6.8447 |
+| commit | before | clippy | 917 | 6.7595 | 10.6649 |
+| commit | before | doc | 197 | 5.1981 | 7.2304 |
+| commit | before | mend | 446 | 7.9430 | 10.7579 |
+| commit | before | nextest | 989 | 12.6297 | 27.0160 |
+| feature | after | build | 6 | 5.9483 | 5.9483 |
+| feature | after | check | 190 | 2.8342 | 5.3592 |
+| feature | after | doc | 72 | 6.4085 | 7.8990 |
+| feature | after | nextest | 395 | 11.5317 | 14.3407 |
+| feature | before | build | 56 | 11.4767 | 16.3911 |
+| feature | before | check | 318 | 3.0087 | 6.8447 |
+| feature | before | clippy | 1355 | 6.5276 | 10.6649 |
+| feature | before | doc | 199 | 5.1998 | 7.7288 |
+| feature | before | mend | 709 | 7.8625 | 10.7579 |
+| feature | before | nextest | 987 | 12.6297 | 27.0160 |
+
+The opt-level split is disabled because the dev/test peaks do not separate.
+Within dylib nextest history, commit-before p90 is 11.1573 GiB from 15 rows.
+Commit-after p90 is 11.7306 GiB from 380 rows.
+The measurement does not establish a memory reduction from that commit.
+
+The initial estimate comparison includes 1064 anonymous peaks with a known historical budget.
+It omits 3,283 peaks with no known historical budget and 116 without a usable index match.
+Every included step has a 24 GiB budget from its historical configuration.
+The comparison uses completed index facts and does not reconstruct index publication delays.
+Both modes use the current headroom settings and the historical budget.
+
+| Step | Rows | Budget GiB | Mean GiB, before → after | Below half the peak | Above three times the peak | Peak above promise |
+|---|---:|---:|---:|---:|---:|---:|
+| build | 4 | 24 | 15.306 → 15.306 | 0 → 0 | 0 → 0 | 0 → 0 |
+| check | 160 | 24 | 2.798 → 2.808 | 0 → 0 | 28 → 28 | 19 → 20 |
+| clippy | 331 | 24 | 6.095 → 6.096 | 0 → 0 | 19 → 19 | 23 → 23 |
+| doc | 61 | 24 | 6.915 → 6.636 | 0 → 0 | 7 → 7 | 4 → 6 |
+| mend | 204 | 24 | 7.802 → 7.835 | 0 → 0 | 39 → 39 | 18 → 15 |
+| nextest | 304 | 24 | 9.935 → 9.890 | 6 → 10 | 73 → 77 | 42 → 45 |
+
+The initial feature split adds 0.111, 0.046, 0.039 ms in three preparation measurements.
+The best added preparation time is 0.039 ms.
+The comparison reports no memory safety gain for all steps.
+The nextest count above its promise increases from 42 to 45.
+The split enforces matching build history; it does not change a headroom rule.
+
+Observed waits use distinct indexed attempts across the full fourteen-day window.
+An unknown wait contributes no measured minutes.
+
+| Step | Attempts | Unknown waits | Measured wait minutes |
+|---|---:|---:|---:|
+| build | 62 | 0 | 935.40 |
+| check | 570 | 0 | 4635.68 |
+| clippy | 1386 | 0 | 19243.10 |
+| doc | 290 | 0 | 3338.03 |
+| fmt | 1401 | 0 | 0.00 |
+| launch | 1 | 1 | 0.00 |
+| mend | 727 | 0 | 12333.72 |
+| nextest | 1398 | 0 | 24623.85 |
+| sweep | 2213 | 0 | 0.00 |
+| taplo | 622 | 0 | 0.00 |
+| test | 1 | 0 | 0.00 |
+
+Modeled wait savings remain unavailable because queue calibration has not succeeded.
+The replay reports observed waits separately from estimate comparisons.
+The post-merge check compares steps above their promise and observed wait minutes after 24 hours.
+
 #### Phase 11 replay comparison
 
 The replay covers 2026-10-21 through 2026-11-04 with the same frozen inputs.

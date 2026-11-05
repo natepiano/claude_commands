@@ -1,0 +1,15 @@
+[
+  {
+    "repository": "https://github.com/natepiano/hana",
+    "kind": "argv_feature",
+    "feature": "hana/dynamic_linking",
+    "note": "Keep dynamic-linking history separate from static-linking history."
+  },
+  {
+    "repository": "https://github.com/natepiano/hana",
+    "kind": "commit",
+    "sha": "ad25f045ff4fd4820b56ce65eebadb94cea6bb58",
+    "enabled": false,
+    "note": "Dev and test opt-level peaks do not separate in the 2026-11-05 measurement."
+  }
+]

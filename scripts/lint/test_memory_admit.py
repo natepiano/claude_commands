@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from functools import cached_property
 from typing import TYPE_CHECKING, BinaryIO, Literal, cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -37,7 +39,9 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue.admission_test_support import AdmissionFixture, InjectedCrash, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, write_recovery_fixture, fixture_queue_inputs, write_process
 import nextest_budget as budget
-from build_shape import BuildShape, build_shape
+from build_shape import BuildShape, KnownStepCommit, build_shape
+from build_change_test_support import BuildChangeRepository, index_step
+from scripts.buildlog.step_outputs_test_support import create_step_index
 from memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
 if TYPE_CHECKING:
     from ..buildlog import store
@@ -392,6 +396,315 @@ class DecisionTests(unittest.TestCase):
 
 
 
+class BuildChangeHistoryTests(unittest.TestCase):
+    root: Path = Path()
+    changes: Path = Path()
+    host: str = "test-host"
+
+    @cached_property
+    def repository(self) -> BuildChangeRepository:
+        return BuildChangeRepository(self.root / "hana")
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
+        self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}))
+        self.changes = self.root / "build_changes.json"
+        (self.root / "admission").mkdir()
+        create_step_index(file_marks.index_path_in(self.root))
+        _ = self.enterContext(patch.object(store, "host_name", return_value=self.host))
+
+    def change(self, kind: str) -> None:
+        entry = {"repository": HANA.key, "kind": kind, "note": "private history split"}
+        entry["feature" if kind == "argv_feature" else "sha"] = (
+            "hana/dynamic_linking" if kind == "argv_feature" else self.repository.change)
+        _ = self.changes.write_text(json.dumps([entry]))
+        _ = self.enterContext(patch.object(gate, "BUILD_CHANGES_PATH", self.changes))
+
+    def sample(self, call: str, peak: int, arguments: list[str], *, sha: str = "",
+               indexed: bool = True, outcome: str = "completed", need: int = 0,
+               at: datetime = HISTORY_AT, keyed: bool = True) -> None:
+        step = "nextest" if "nextest" in arguments else "build"
+        row: dict[str, object] = {
+            "call_id": call, "host": self.host, "repo": HANA.name, "repo_identity": HANA.key if keyed else "",
+            "step": step, "ended_at": at.isoformat(), "anon_peak_bytes": peak,
+            "shape": build_shape(arguments).key, "outcome": outcome, "need": need,
+        }
+        write_history_rows(self.root, [row])
+        if indexed:
+            self.index(call, arguments, sha, step=step)
+
+    def index(self, call: str, arguments: list[str], sha: str, *, step: str) -> None:
+        index_step(file_marks.index_path_in(self.root), host=self.host, repository=HANA.name,
+                   repository_identity=HANA.key, step=step, call_id=call,
+                   started_at=HISTORY_AT - timedelta(seconds=1), arguments=arguments, sha=sha)
+
+    def estimate(self, arguments: list[str]) -> gate.ExpectedPeak:
+        config = gate.read_memory_config(report=False)
+        result = gate.step_estimate(arguments, str(self.repository.path), gate.INFER_FROM_ARGV,
+            NOW, self.root, config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
+            budget=config.build_budget_bytes)
+        assert isinstance(result.profile, gate.StepProfile)
+        return result.profile.peak
+
+    def test_each_dylib_feature_form_uses_only_dylib_history(self) -> None:
+        self.change("argv_feature")
+        plain = ["cargo", "nextest", "run"]
+        dylib = [*plain, "--features", "hana/dynamic_linking,hana/hotpatching"]
+        for index in range(5):
+            self.sample(f"dylib-{index}", 2 * GIB, dylib)
+            self.sample(f"plain-{index}", 18 * GIB, plain)
+        for flags in (("--features", "hana/dynamic_linking,hana/hotpatching"),
+                      ("--features=hana/hotpatching,hana/dynamic_linking",),
+                      ("-F", "hana/dynamic_linking", "--features", "hana/hotpatching")):
+            with self.subTest(flags=flags):
+                self.assertEqual(self.estimate([*plain, *flags]), gate.ExpectedPeak(2 * GIB, "measured", 5))
+        self.assertEqual(self.estimate(plain), gate.ExpectedPeak(18 * GIB, "measured", 5))
+
+    def test_each_steps_commit_selects_history_on_the_same_side(self) -> None:
+        self.change("commit")
+        arguments = ["cargo", "nextest", "run"]
+        for index in range(5):
+            self.sample(f"before-{index}", 17 * GIB, arguments, sha=self.repository.before[:10])
+            self.sample(f"after-{index}", 3 * GIB, arguments, sha=self.repository.after[:10])
+        for head, expected in ((self.repository.before, 17), (self.repository.change, 3),
+                               (self.repository.after, 3)):
+            with self.subTest(head=head):
+                _ = self.repository.git("checkout", "-q", head)
+                self.assertEqual(self.estimate(arguments), gate.ExpectedPeak(expected * GIB, "measured", 5))
+
+    def test_unknown_ambiguous_and_unavailable_commits_count_on_neither_side(self) -> None:
+        self.change("commit")
+        arguments = ["cargo", "nextest", "run"]
+        for index in range(5):
+            self.sample(f"after-{index}", 3 * GIB, arguments, sha=self.repository.after)
+            self.sample(f"before-{index}", 8 * GIB, arguments, sha=self.repository.before)
+        for label, sha in (("unknown", ""), ("ambiguous", self.repository.ambiguous_commit_prefix()),
+                           ("unavailable", "f" * 40)):
+            self.sample(label, 50 * GIB, arguments, sha=sha)
+        self.sample("no-index", 50 * GIB, arguments, indexed=False)
+        for head, expected in ((self.repository.after, 3), (self.repository.before, 8)):
+            with self.subTest(head=head):
+                _ = self.repository.git("checkout", "-q", head)
+                self.assertEqual(self.estimate(arguments), gate.ExpectedPeak(expected * GIB, "measured", 5))
+
+    def test_other_side_rows_never_fill_a_small_history_tier(self) -> None:
+        self.change("commit")
+        arguments = ["cargo", "nextest", "run"]
+        self.sample("own-one", 2 * GIB, arguments, sha=self.repository.after)
+        self.sample("own-two", 4 * GIB, arguments, sha=self.repository.after)
+        for index in range(10):
+            self.sample(f"old-{index}", 15 * GIB, arguments, sha=self.repository.before)
+        self.assertEqual(self.estimate(arguments), gate.ExpectedPeak(4 * GIB, "measured", 2))
+
+    def test_failed_peak_keeps_the_admitted_side_until_its_index_row_arrives(self) -> None:
+        self.change("commit")
+        arguments = ["cargo", "nextest", "run"]
+        for index in range(5):
+            self.sample(f"after-{index}", 2 * GIB, arguments, sha=self.repository.after)
+        self.sample("failed-before-index", 9 * GIB, arguments, indexed=False, outcome="failed", need=GIB)
+        self.assertEqual(self.estimate(arguments), gate.ExpectedPeak(9 * GIB, "measured", 6))
+        self.index("failed-before-index", arguments, self.repository.before, step="nextest")
+        self.assertEqual(self.estimate(arguments), gate.ExpectedPeak(2 * GIB, "measured", 5))
+
+    def test_saved_commit_marks_avoid_repeated_ancestry_queries(self) -> None:
+        self.change("commit")
+        arguments = ["cargo", "nextest", "run"]
+        for index in range(5):
+            self.sample(f"after-{index}", 3 * GIB, arguments, sha=self.repository.after)
+        with patch.object(subprocess, "run", wraps=subprocess.run) as run:
+            first = self.estimate(arguments)
+        ancestry = [call for call in run.call_args_list if "rev-list" in call.args[0]]
+        self.assertEqual(len(ancestry), 1)
+        cache = self.root / "admission/build_marks.json"
+        saved = cache.read_bytes()
+        with patch.object(subprocess, "run", wraps=subprocess.run) as run:
+            second = self.estimate(arguments)
+        self.assertEqual(first, gate.ExpectedPeak(3 * GIB, "measured", 5))
+        self.assertEqual(second, first)
+        self.assertEqual([call for call in run.call_args_list if "rev-list" in call.args[0]], [])
+        self.assertEqual(cache.read_bytes(), saved)
+
+    def test_every_change_must_match_before_a_row_enters_history(self) -> None:
+        self.change("commit")
+        entries = cast(list[dict[str, object]], json.loads(self.changes.read_text()))
+        entries.append({"repository": HANA.key, "kind": "argv_feature",
+                        "feature": "hana/dynamic_linking", "note": "private feature change"})
+        _ = self.changes.write_text(json.dumps(entries))
+        arguments = ["cargo", "nextest", "run", "--features=hana/dynamic_linking"]
+        for index in range(5):
+            self.sample(f"matching-{index}", 2 * GIB, arguments, sha=self.repository.after)
+            self.sample(f"old-commit-{index}", 15 * GIB, arguments, sha=self.repository.before)
+            self.sample(f"old-feature-{index}", 20 * GIB, ["cargo", "nextest", "run"], sha=self.repository.after)
+        self.assertEqual(self.estimate(arguments), gate.ExpectedPeak(2 * GIB, "measured", 5))
+
+    def test_history_readers_use_commit_marks_without_writing_the_cache(self) -> None:
+        self.change("commit")
+        arguments = ["cargo", "nextest", "run"]
+        for index in range(5):
+            self.sample(f"own-{index}", 3 * GIB, arguments, sha=self.repository.after)
+            self.sample(f"old-{index}", 15 * GIB, arguments, sha=self.repository.before)
+        cache = self.root / "admission/build_marks.json"
+        _ = cache.write_text(json.dumps({"version": 1, "marks": {}}) + "\n")
+        saved = cache.read_bytes()
+        split = gate.prepare_history_split(HANA, arguments, str(self.repository.path), NOW, self.root,
+            step="nextest", host=self.host, shape=build_shape(arguments), scope="full", package="")
+        config = gate.read_memory_config(report=False)
+        peak = gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
+            history_split=split, first_peak_bytes=config.program_first_peaks["cargo"],
+            budget=config.build_budget_bytes)
+        self.assertEqual(peak, gate.ExpectedPeak(3 * GIB, "measured", 5))
+        self.assertEqual(cache.read_bytes(), saved)
+        self.assertEqual(self.estimate(arguments), peak)
+        self.assertNotEqual(cache.read_bytes(), saved)
+        self.assertIn(self.repository.after, cache.read_text())
+
+    def test_release_spellings_keep_shape_tiers_floor_headroom_and_cap_on_the_feature_side(self) -> None:
+        self.change("argv_feature")
+        config = gate.read_memory_config(report=False)
+        for release in (("--release",), ("--profile", "release")):
+            with self.subTest(release=release):
+                arguments = ["cargo", "build", *release, "--bin", "hana", "--features=hana/dynamic_linking"]
+                plain = ["cargo", "build", *release, "--bin", "hana"]
+                history = self.root / "admission/anon_peaks.jsonl"
+                _ = history.write_text("")
+                with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as connection, connection:
+                    _ = connection.execute("DELETE FROM steps")
+                for index in range(10):
+                    self.sample(f"own-{index}", (index + 1) * GIB, arguments)
+                    self.sample(f"other-{index}", 40 * GIB, plain)
+                peak = self.estimate(arguments)
+                self.assertIsInstance(peak.basis, gate.ShapeP90)
+                self.assertEqual(peak.count, 10)
+                self.assertEqual(peak.bytes, min(math.ceil(9 * GIB * config.release_headroom), config.build_budget_bytes))
+                self.sample("overrun", 12 * GIB, arguments, need=GIB, outcome="failed")
+                peak = self.estimate(arguments)
+                assert isinstance(peak.basis, gate.ShapeP90)
+                self.assertEqual(peak.basis.factor, gate.ReleaseHeadroom(config.release_headroom))
+                self.assertEqual(peak.basis.floor, gate.FailedPeakFloor(12 * GIB, store.utc_iso(HISTORY_AT.timestamp())))
+                self.assertEqual(peak.bytes, min(math.ceil(12 * GIB * config.release_headroom), config.build_budget_bytes))
+                self.sample("cap", config.build_budget_bytes * 2, arguments, need=GIB, outcome="failed",
+                            at=NOW - timedelta(microseconds=1))
+                capped = self.estimate(arguments)
+                assert isinstance(capped.basis, gate.ShapeP90)
+                self.assertEqual(capped.bytes, config.build_budget_bytes)
+                self.assertEqual(capped.basis.cap, gate.CappedAtBudget(
+                    math.ceil(config.build_budget_bytes * 2 * config.release_headroom), config.build_budget_bytes))
+
+    def test_release_build_ignores_the_dev_commit_change(self) -> None:
+        self.change("commit")
+        config = gate.read_memory_config(report=False)
+        for flags in (("--release",), ("--profile", "release")):
+            with self.subTest(flags=flags):
+                arguments = ["cargo", "build", *flags]
+                _ = (self.root / "admission/anon_peaks.jsonl").write_text("")
+                for index in range(3):
+                    self.sample(f"before-{flags[0]}-{index}", 4 * GIB, arguments, sha=self.repository.before)
+                self.sample(f"after-{flags[0]}", 2 * GIB, arguments, sha=self.repository.after)
+                peak = self.estimate(arguments)
+                self.assertEqual(peak.count, 4)
+                self.assertIsInstance(peak.basis, gate.ShapeLargest)
+                self.assertEqual(peak.bytes, min(math.ceil(4 * GIB * config.release_headroom), config.build_budget_bytes))
+
+    def test_filtered_history_uses_eligible_legacy_rows_before_counting_keyed_rows(self) -> None:
+        self.change("argv_feature")
+        selected = ["cargo", "nextest", "run", "--features=hana/dynamic_linking",
+                    "-E", "package(hana) & test(exact)"]
+        other = ["cargo", "nextest", "run", "-E", "package(hana) & test(exact)"]
+        for index in range(5):
+            self.sample(f"other-{index}", 30 * GIB, other)
+            self.sample(f"legacy-{index}", 8 * GIB, selected, keyed=False)
+        self.assertEqual(self.estimate(selected), gate.ExpectedPeak(8 * GIB, "measured", 5))
+
+    def test_estimate_retries_git_after_a_temporary_ancestry_failure(self) -> None:
+        self.change("commit")
+        arguments = ["cargo", "nextest", "run"]
+        for index in range(5):
+            self.sample(f"own-{index}", 3 * GIB, arguments, sha=self.repository.after)
+        git = shutil.which("git")
+        assert git is not None
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        failing_git = binaries / "git"
+        _ = failing_git.write_text(
+            f"#!{sys.executable}\nimport os, sys\n"
+            + "if 'rev-list' in sys.argv: sys.exit(128)\n"
+            + f"os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n")
+        failing_git.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": str(binaries) + os.pathsep + os.environ["PATH"]}):
+            failed = self.estimate(arguments)
+        with patch.object(subprocess, "run", wraps=subprocess.run) as run:
+            recovered = self.estimate(arguments)
+        self.assertNotEqual(failed, recovered)
+        self.assertEqual(recovered, gate.ExpectedPeak(3 * GIB, "measured", 5))
+        self.assertTrue(any("rev-list" in call.args[0] for call in run.call_args_list))
+        self.assertNotIn(gate.AncestryOutcome.UNAVAILABLE, gate.read_build_marks(self.root).values())
+
+    def test_unindexed_static_build_failure_does_not_raise_a_dylib_promise(self) -> None:
+        self.change("argv_feature")
+        dylib = ["cargo", "build", "--features=hana/dynamic_linking"]
+        before = self.estimate(dylib)
+        self.sample("static-failure", 40 * GIB, ["cargo", "build"],
+                    indexed=False, outcome="failed", need=GIB)
+        self.assertEqual(self.estimate(dylib), before)
+
+    def test_unusable_build_changes_keep_the_estimate_and_print_one_diagnostic(self) -> None:
+        self.change("argv_feature")
+        arguments = ["cargo", "nextest", "run", "--features=hana/dynamic_linking"]
+        for index in range(5):
+            self.sample(f"own-{index}", 2 * GIB, arguments)
+            self.sample(f"other-{index}", 18 * GIB, ["cargo", "nextest", "run"])
+        _ = self.changes.write_text("[]")
+        baseline = self.estimate(arguments)
+        for state in ("missing", "bad-entry"):
+            with self.subTest(state=state):
+                if state == "missing":
+                    self.changes.unlink()
+                else:
+                    _ = self.changes.write_text(json.dumps([
+                        {"repository": HANA.key, "kind": "argv_feature", "feature": "hana/dynamic_linking"}]))
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    estimate = self.estimate(arguments)
+                self.assertEqual(estimate, baseline)
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertTrue(errors.getvalue().startswith("memory admit: build changes unusable:"))
+
+    def test_missing_short_commit_is_unavailable_and_a_real_collision_is_ambiguous(self) -> None:
+        change = gate.CommitChange(HANA.key, self.repository.change, "private commit change")
+        for sha, expected in (("f" * 12, gate.AncestryOutcome.UNAVAILABLE),
+                              (self.repository.ambiguous_commit_prefix(), gate.AncestryOutcome.AMBIGUOUS_SHORT_SHA)):
+            with self.subTest(sha=sha):
+                outcomes = gate.ancestry_outcomes(str(self.repository.path), KnownStepCommit(sha), (change,))
+                self.assertEqual(outcomes, {change.sha: expected})
+
+    def test_disabled_changes_leave_history_on_both_sides_available(self) -> None:
+        self.change("argv_feature")
+        arguments = ["cargo", "nextest", "run", "--features=hana/dynamic_linking"]
+        for index in range(5):
+            self.sample(f"own-{index}", 2 * GIB, arguments, sha=self.repository.after)
+            self.sample(f"other-{index}", 18 * GIB, ["cargo", "nextest", "run"], sha=self.repository.before)
+        for kind, value in (("argv_feature", "hana/dynamic_linking"), ("commit", self.repository.change)):
+            with self.subTest(kind=kind):
+                entry: dict[str, object] = {"repository": HANA.key, "kind": kind, "note": "disabled change",
+                                            "enabled": False, "feature" if kind == "argv_feature" else "sha": value}
+                _ = self.changes.write_text(json.dumps([entry]))
+                self.assertEqual(self.estimate(arguments), gate.ExpectedPeak(18 * GIB, "measured", 10))
+
+    def test_filtered_test_history_uses_the_larger_package_peak_on_its_feature_side(self) -> None:
+        self.change("argv_feature")
+        full = ["cargo", "nextest", "run", "--features=hana/dynamic_linking"]
+        selected = [*full, "-E", "package(hana) & test(exact)"]
+        wider = [*full, "-E", "package(hana) & test(other)"]
+        for index in range(5):
+            self.sample(f"exact-{index}", 2 * GIB, selected)
+            self.sample(f"package-{index}", 4 * GIB, wider)
+            self.sample(f"old-{index}", 30 * GIB, ["cargo", "nextest", "run", "-E", "package(hana) & test(exact)"])
+        peak = self.estimate(selected)
+        self.assertEqual(peak, gate.ExpectedPeak(4 * GIB, "measured", 10))
+
+
+
 class HistoryTests(unittest.TestCase):
     root: Path = Path()
     admission: Path = Path()
@@ -428,7 +741,7 @@ class HistoryTests(unittest.TestCase):
                                (self.host, "hana", "nextest", store.utc_iso(at.timestamp()), (index + 1) * GIB))
 
     def peak(self) -> gate.ExpectedPeak:
-        return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
+        return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
 
     def test_unfinished_rows_do_not_change_the_full_suite_estimate(self) -> None:
         self.add_measured(5)
@@ -472,18 +785,18 @@ class HistoryTests(unittest.TestCase):
         config = admission_configuration_fixture()
         peak = gate.expected_peak(HANA, "clippy", self.host, NOW, self.root,
                                   first_peak_bytes=config.program_first_peaks["cargo"],
-                                  budget=config.build_budget_bytes)
+                                  budget=config.build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
         self.assertEqual(peak, gate.ExpectedPeak(int(4 * GIB * gate.ANON_SHARE), "buildlog", 5))
 
     def test_measured_history_pools_every_width_unless_one_is_named(self) -> None:
         self.add_measured(5, test_threads=16)
         self.add_measured(5, test_threads=4, start_gib=6)
         self.assertEqual(
-            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, test_threads=16, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, test_threads=16, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
             gate.ExpectedPeak(5 * GIB, "measured", 5),
         )
         self.assertEqual(
-            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
             gate.ExpectedPeak(9 * GIB, "measured", 10),
         )
 
@@ -508,13 +821,13 @@ class HistoryTests(unittest.TestCase):
                                (self.host, "hana", "nextest", store.utc_iso(HISTORY_AT.timestamp()), 2 * GIB,
                                 json.dumps(["cargo", "nextest", "run", "-E", "test(one)"])))
         self.assertEqual(self.peak(), gate.ExpectedPeak(int(5 * GIB * gate.ANON_SHARE), "buildlog", 5))
-        self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope="filtered", first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+        self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope="filtered", first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
                          gate.ExpectedPeak(int(2 * GIB * gate.ANON_SHARE), "buildlog", 5))
 
     def test_scratch_checkout_cannot_take_legacy_buildlog_samples_by_repository_name(self) -> None:
         self.add_index()
         scratch = gate.RepositoryIdentity(HANA.key, HANA.name)
-        self.assertEqual(gate.expected_peak(scratch, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes).source,
+        self.assertEqual(gate.expected_peak(scratch, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT).source,
                          "fallback")
 
 
@@ -542,7 +855,8 @@ class FilteredPromiseTests(unittest.TestCase):
         estimate = gate.expected_peak(
             HANA, "check", self.host, NOW, self.root,
             package=gate.test_package(arguments), scope=gate.test_scope(arguments),
-            first_peak_bytes=config.program_first_peaks["cargo"], budget=config.build_budget_bytes)
+            first_peak_bytes=config.program_first_peaks["cargo"], budget=config.build_budget_bytes,
+            history_split=gate.NO_HISTORY_SPLIT)
         self.assertEqual(estimate, gate.ExpectedPeak(2 * GIB, "measured", 5))
 
     def samples(self, peaks: list[int], *, package: str = "hana", filters: tuple[str, ...] = (),
@@ -642,12 +956,12 @@ class FilteredPromiseTests(unittest.TestCase):
         self.samples([2 * GIB] * 4, scope="full")
         before = gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
                                     first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"],
-                                    budget=admission_configuration_fixture().build_budget_bytes)
+                                    budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
         self.assertEqual((before.bytes, before.count), (19 * GIB, 14))
         self.samples([2 * GIB], scope="full")
         after = gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
                                    first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"],
-                                   budget=admission_configuration_fixture().build_budget_bytes)
+                                   budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
         self.assertEqual((after.bytes, after.count), (2 * GIB, 5))
 
     def test_sparse_repository_history_uses_own_largest_or_a_lower_pool(self) -> None:
@@ -662,7 +976,7 @@ class FilteredPromiseTests(unittest.TestCase):
                     self.samples([pool * GIB] * 50, scope="full", repository=other)
                     peak = gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
                                               first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"],
-                                              budget=admission_configuration_fixture().build_budget_bytes)
+                                              budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
                     self.assertEqual(peak.bytes, expected * GIB)
         self.root = parent
 
@@ -690,7 +1004,7 @@ class FilteredPromiseTests(unittest.TestCase):
                 (self.host, "hana", "nextest", HISTORY_AT.isoformat(), 8 * GIB, json.dumps(arguments))
             ] * 5)
         peak = gate.filtered_peak(HANA, "nextest", self.host, NOW, self.root,
-                                  None, ("native_rate",), "hana")
+                                  None, ("native_rate",), "hana", history_split=gate.NO_HISTORY_SPLIT)
         self.assertEqual(peak, gate.ExpectedPeak(int(8 * GIB * gate.ANON_SHARE), "buildlog", 5))
 
     def test_missing_call_and_step_matches_keep_peaks_until_classification(self) -> None:
@@ -715,7 +1029,7 @@ class FilteredPromiseTests(unittest.TestCase):
         before = path.read_bytes()
         peak = gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
                                   first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"],
-                                  budget=admission_configuration_fixture().build_budget_bytes)
+                                  budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
         self.assertEqual(peak, gate.ExpectedPeak(3 * GIB, "measured", 5))
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(sum(row["step"] == "merge-gate" for row in gate.anonymous_history_rows(path)), 10)
@@ -727,14 +1041,14 @@ class FilteredPromiseTests(unittest.TestCase):
         return gate.expected_peak(repository, "nextest", self.host, NOW, self.root,
                                   scope=scope, package=package, filters=filters,
                                   first_peak_bytes=config.program_first_peaks["cargo"],
-                                  budget=config.build_budget_bytes)
+                                  budget=config.build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
 
     def test_unfinished_rows_do_not_change_the_filtered_estimate(self) -> None:
         self.samples([3 * GIB], filters=("native_rate",))
         assert_unfinished_history_ignored(
             self, self.root / "admission/anon_peaks.jsonl",
             lambda: gate.filtered_peak(HANA, "nextest", self.host, NOW, self.root,
-                                       None, ("native_rate",), "hana"))
+                                       None, ("native_rate",), "hana", history_split=gate.NO_HISTORY_SPLIT))
 
     def test_filter_name_order_keeps_the_larger_exact_p90(self) -> None:
         self.samples([number * GIB for number in range(11, 21)], filters=("render", "native_rate"))
@@ -829,7 +1143,7 @@ class FilteredPromiseTests(unittest.TestCase):
         self.samples([number * GIB for number in range(1, 11)], scope="full")
         self.samples([19 * GIB] * 10, filters=("native_rate",))
         self.samples([20 * GIB] * 10, step="check", scope="full")
-        self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+        self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
                          gate.ExpectedPeak(9 * GIB, "measured", 10))
 
     def test_non_verify_expressions_have_no_exact_package_or_filter_key(self) -> None:
@@ -866,7 +1180,7 @@ class FilteredPromiseTests(unittest.TestCase):
         argv = ["cargo", "nextest", "run", "-E", "package(hana) & not test(native_rate)"]
         self.assertEqual(
             gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope=gate.test_scope(argv),
-                               package=gate.test_package(argv), filters=gate.test_filters(argv), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+                               package=gate.test_package(argv), filters=gate.test_filters(argv), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
             gate.ExpectedPeak(15 * GIB, "measured", 10),
         )
 
@@ -885,7 +1199,7 @@ class FilteredPromiseTests(unittest.TestCase):
         argv = ["cargo", "nextest", "run", "--workspace", "-E", "test(native_rate)"]
         self.assertEqual(
             gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope=gate.test_scope(argv),
-                               package=gate.test_package(argv), filters=gate.test_filters(argv), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+                               package=gate.test_package(argv), filters=gate.test_filters(argv), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
             gate.ExpectedPeak(12 * GIB, "fallback", 0),
         )
 
@@ -893,7 +1207,7 @@ class FilteredPromiseTests(unittest.TestCase):
         self.samples([2 * GIB], package="", filters=("native_rate",))
         self.assertEqual(
             gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
-                               scope="filtered", filters=("native_rate",), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+                               scope="filtered", filters=("native_rate",), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
             gate.ExpectedPeak(2 * GIB, "measured", 1),
         )
 
@@ -902,7 +1216,7 @@ class FilteredPromiseTests(unittest.TestCase):
         other = gate.RepositoryIdentity("https://example.org/nate/other", "other", "other")
         self.samples([9 * GIB] * 5, package="", repository=other)
         self.assertEqual(
-            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope="filtered", first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+            gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope="filtered", first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
             gate.ExpectedPeak(2 * GIB, "measured", 3),
         )
 
@@ -947,10 +1261,10 @@ class FilteredPromiseTests(unittest.TestCase):
             with self.subTest(filters=filters):
                 self.assertEqual(
                     gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
-                                       scope="filtered", package="hana_diegetic", filters=filters, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+                                       scope="filtered", package="hana_diegetic", filters=filters, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
                     gate.ExpectedPeak(int(30 * GIB * gate.ANON_SHARE), "buildlog", 66),
                 )
-        self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+        self.assertEqual(gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
                          gate.ExpectedPeak(12 * GIB, "measured", 5))
 
     def test_exact_compile_measurements_can_exceed_the_full_suite_promise(self) -> None:
@@ -979,7 +1293,7 @@ class FilteredPromiseTests(unittest.TestCase):
                 }], indexed=True)
         self.assertEqual(
             gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, test_threads=16,
-                               scope="filtered", package="hana", filters=("native_rate",), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes),
+                               scope="filtered", package="hana", filters=("native_rate",), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT),
             gate.ExpectedPeak(20 * GIB, "measured", 1),
         )
 
@@ -1088,7 +1402,7 @@ class FreshTestPromiseTests(unittest.TestCase):
     def promise(self, *, key: str = "current-key", scope: gate.TestScope = "filtered",
                 filters: tuple[str, ...] = ("native_rate",)) -> gate.ExpectedPeak:
         return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope=scope,
-                                  package="hana", filters=filters, fresh=self.fresh(key=key, scope=scope), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
+                                  package="hana", filters=filters, fresh=self.fresh(key=key, scope=scope), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
 
     def test_same_tree_native_rate_run_uses_zero_compile_anon_p90_joined_by_call(self) -> None:
         self.samples([number * GIB // 4 for number in range(1, 11)])
@@ -1103,7 +1417,7 @@ class FreshTestPromiseTests(unittest.TestCase):
             self, self.root / "admission/anon_peaks.jsonl",
             lambda: gate.fresh_test_peak(HANA, "nextest", self.host, NOW, self.root, None,
                                          "filtered", ("native_rate",), "hana",
-                                         gate.ExpectedPeak(10 * GIB, "measured", 10)))
+                                         gate.ExpectedPeak(10 * GIB, "measured", 10), history_split=gate.NO_HISTORY_SPLIT))
 
     def test_fresh_exact_filter_set_is_sorted_and_precedes_broader_package_history(self) -> None:
         self.samples([2 * GIB], filters=("render", "native_rate"))
@@ -1436,7 +1750,7 @@ class RepositoryHistoryTests(unittest.TestCase):
         } for _ in range(5)), indexed=True)
 
     def estimate(self, repository: gate.Repository, scope: gate.TestScope = "full") -> gate.ExpectedPeak:
-        return gate.expected_peak(repository, "nextest", self.host, NOW, self.root, scope=scope, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
+        return gate.expected_peak(repository, "nextest", self.host, NOW, self.root, scope=scope, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
 
     def test_unrelated_repositories_named_repo_use_their_own_peaks(self) -> None:
         first = self.identity(self.checkout("one/repo", "git@example.org:nate/first.git"))
@@ -2543,7 +2857,7 @@ class BuildPromiseFixture(MemoryQueueFixture):
                                     call_id, json.dumps(arguments), 0, crates))
 
     def estimate(self, shape: BuildShape = RELEASE_SHAPE, *, now: datetime = NOW) -> gate.ExpectedPeak:
-        return gate.expected_peak(HANA, "build", "test-host", now, self.root, shape=shape, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
+        return gate.expected_peak(HANA, "build", "test-host", now, self.root, shape=shape, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
 
     def same_shape_basis(self, peak: gate.ExpectedPeak) -> gate.ShapeP90 | gate.ShapeLargest:
         if not isinstance(peak.basis, (gate.ShapeP90, gate.ShapeLargest)):
@@ -2695,7 +3009,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.sample(3)
         assert_unfinished_history_ignored(
             self, self.root / "admission/anon_peaks.jsonl",
-            lambda: gate.build_peaks(HANA, "test-host", NOW, self.root))
+            lambda: gate.build_peaks(HANA, "test-host", NOW, self.root, history_split=gate.NO_HISTORY_SPLIT))
 
     def test_builds_without_same_shape_history_keep_the_unfactored_fallback(self) -> None:
         for arguments in (RELEASE_BUILD, ["cargo", "build", "--bin", "hana"]):
@@ -3007,7 +3321,7 @@ class BuildFinalizerTests(BuildPromiseFixture):
             fixture.scoped_peak(grant, 16 * GIB)
             owner = fixture.fixture_owner(400, "next")
 
-            def delayed_generation(configuration: gate.MemoryConfig | None = None) -> gate.BuildHistoryGeneration:
+            def delayed_generation(configuration: object = conf.UseConfiguredValue.CURRENT) -> gate.BuildHistoryGeneration:
                 self.assertIsInstance(configuration, gate.MemoryConfig)
                 fixture.clock.advance(10)
                 self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
@@ -5927,7 +6241,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         for peak in (7, 13):
             with self.subTest(peak=peak):
                 self.write_config(**{"program_first_peak_gib.cargo": str(peak)})
-                result = gate.expected_peak(HANA, "clippy", "test-host", NOW, self.root, first_peak_bytes=gate.read_memory_config().program_first_peaks["cargo"], budget=gate.read_memory_config().build_budget_bytes)
+                result = gate.expected_peak(HANA, "clippy", "test-host", NOW, self.root, first_peak_bytes=gate.read_memory_config().program_first_peaks["cargo"], budget=gate.read_memory_config().build_budget_bytes, history_split=gate.NO_HISTORY_SPLIT)
                 self.assertEqual(result.bytes, peak * GIB)
                 self.assertEqual(result.source, "fallback")
 
