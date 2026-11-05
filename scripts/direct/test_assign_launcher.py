@@ -21,6 +21,19 @@ def setUpModule() -> None:
 
 @final
 class AssignLauncherTests(AssignLauncherFixture):
+    def test_herdr_assignment_retains_unknown_workers_without_a_mesh_backend(self) -> None:
+        _ = (self.session_dir / "worker_transport").write_text("herdr\n")
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        prompt = self.prompt.read_bytes()
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            result = self.launch(execution=LauncherScript(ASSIGN))
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertEqual(self.prompt.read_bytes(), prompt)
+        self.assertEqual((self.session_dir / "phases/7/impl_status").read_text(), "error\n")
+
     def test_dispatch_has_a_durable_worker_row_before_submitting_work(self) -> None:
         from scripts.production import staff
         _ = self.successful()

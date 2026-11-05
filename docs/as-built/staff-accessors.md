@@ -127,6 +127,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/update_registration.py` | read | snapshot |
 | `scripts/production/update_registration_test_support.py` | write | by_id, initial_snapshot, set_doc |
 | `scripts/production/waiting.py` | read | snapshot |
+| `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
 | `scripts/production/worker_fill.py` | write | ensure_worker, native_id, snapshot |
 | `scripts/review_links/change_browser.py` | read | none (ReportsTo type) |
@@ -159,7 +160,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-144 accessors: 26 write, 117 read, 1 owner.
+145 accessors: 27 write, 117 read, 1 owner.
 
 ## Approved copies
 

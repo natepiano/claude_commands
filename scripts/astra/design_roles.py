@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import unit_runs
 from scripts.production import staff, session_staff, worker_admission
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -580,6 +581,17 @@ def _idle(design: HeldDesign) -> None:
             raise RoleRefused('role is busy; finish its turn first')
 
 
+def _pane_recovery_idle(lifecycle: HeldWorker) -> None:
+    result = _worker_command(['list', '--json'])
+    listing = cast(list[object], json.loads(result.stdout))
+    fields = next((_object(value) for value in listing if _object(value).get('id') == lifecycle.staff_id),
+                  dict[str, object]())
+    if fields.get('state') not in ('OpenWorker', 'StoppedWorker', 'ClosedWorker'):
+        raise RoleRefused('role process evidence is unavailable; worker is retained')
+    if fields.get('state') == 'OpenWorker' and fields.get('activity') not in ('idle', 'done'):
+        raise RoleRefused('role is busy; finish its turn first')
+
+
 def _prompt(design: HeldDesign, role: Role, text: str) -> tuple[Path, Path]:
     directory = design_directory(design.placement.design_id)
     token = f'{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}-{uuid4()}'
@@ -619,6 +631,20 @@ def _mesh_context_fields(design: HeldDesign) -> dict[str, object]:
             'binding': _design_fields(design)['binding'], 'cwd': design.repository}
 
 
+def _pane_binding(design: HeldDesign) -> Binding:
+    """Return the phase binding when its run uses panes."""
+    if (isinstance(design.binding, DesignBoundToPhase)
+            and unit_runs.worker_transport(Path(design.binding.run_directory)) == 'herdr'):
+        return design.binding
+    return UNBOUND
+
+
+def _worker_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    """Use the shared command without another worker selector."""
+    return subprocess.run([sys.executable, str(ROOT / 'scripts/production/worker.py'), *arguments],
+                          capture_output=True, text=True, check=False)
+
+
 def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effort: str, *,
                   admitted: worker_admission.WorkerStartAllowed) -> str:
     """Start the reserved thread and keep its creation claim if the result is uncertain."""
@@ -643,6 +669,21 @@ def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effo
 
 def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path, model: str, effort: str) -> None:
     """Submit one turn outside store locks and save its reply at the header's path."""
+    if isinstance(binding := _pane_binding(design), DesignBoundToPhase):
+        run = Path(binding.run_directory)
+        result = _worker_command(['assign', 'astra-' + role, str(prompt), '--session-dir', str(run),
+            '--name', _instance(design, role).name, '--slot', _instance(design, role).name,
+            '--phase', binding.phase, '--kind', 'astra', '--reply', str(reply),
+            '--launcher-command', json.dumps([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])])
+        if result.returncode:
+            raise RoleRefused(result.stderr.strip() or f'held dispatch exited {result.returncode}; pending input is retained')
+        environment = dict(os.environ, UNIT_PASS_OWNER='launcher', UNIT_TEAM_ROLE=_instance(design, role).name)
+        finished = subprocess.run([sys.executable, str(ROOT / 'scripts/direct/progress_history.py'),
+            'finish-pass', '--session-dir', str(run), '--status', 'completed'], env=environment,
+            capture_output=True, text=True, check=False)
+        if finished.returncode:
+            raise RoleRefused(finished.stderr.strip() or 'held dispatch completion could not be recorded')
+        return
     mesh = mesh_directory(design.placement.design_id)
     result = subprocess.run([sys.executable, str(ROOT / 'scripts/agents/codex_mesh.py'), 'follow',
                              '--session-dir', str(mesh), '--to', _instance(design, role).name,
@@ -704,11 +745,29 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
         instance = _instance(design, role)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
-        if not isinstance(instance.lifecycle, RoleNotOpened) or instance.lifecycle.claim:
+        if not isinstance(instance.lifecycle, RoleNotOpened) or (instance.lifecycle.claim and instance.lifecycle.claim != 'pane-start'):
             if not isinstance(instance.lifecycle, RoleNotOpened):
                 _project_hold(design, role, staff.snapshot())
             return design
         _validate_binding(design.binding, design.repository, role)
+    if isinstance(pane_binding := _pane_binding(design), DesignBoundToPhase):
+        name = 'astra-' + role + '-' + design_id[:8]
+        with _lock(directory):
+            current = read_design(design_id)
+            design = replace(current, roles=tuple(replace(value, name=name, lifecycle=RoleNotOpened('pane-start'))
+                if value.role == role else value for value in current.roles))
+            _save(design)
+        result = _worker_command(['add', 'astra-' + role, '--name', name, '--json',
+                                  '--session-dir', pane_binding.run_directory])
+        if result.returncode:
+            raise RoleRefused(result.stderr.strip() or 'held worker startup did not complete; creation claim is retained')
+        fields = _object(cast(object, json.loads(result.stdout)))
+        row_id = staff.StaffId(_text(fields, 'id'))
+        with _lock(directory):
+            design = _set_lifecycle(read_design(design_id), role, RoleOpen(row_id))
+            _save(design)
+        _project_hold(design, role, staff.snapshot())
+        return design
     model, effort = resolve_model(role)
     prompt, _ = _prompt(design, role, '')
     admitted = worker_admission.admit(
@@ -738,7 +797,6 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
 
 def recover(instance_id: str) -> HeldDesign:
     """Prove the recorded thread idle before clearing an uncertain local claim."""
-    codex_mesh = _mesh_transport()
     design_id, role_text = instance_id.split('/')
     if role_text not in ('designer', 'reviewer'):
         raise RoleRefused('unknown role')
@@ -749,6 +807,16 @@ def recover(instance_id: str) -> HeldDesign:
         instance = _instance(design, role)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
+        if isinstance(_pane_binding(design), DesignBoundToPhase):
+            if isinstance(instance.lifecycle, RoleNotOpened):
+                raise RoleRefused('startup is incomplete; repeat the original open command')
+            observed = replace(design, roles=tuple(replace(value, assignment_claim='') if value.role == role else value
+                                                   for value in design.roles))
+            _pane_recovery_idle(instance.lifecycle)
+            updated = _set_lifecycle(observed, role, RoleOpen(instance.lifecycle.staff_id))
+            _save(updated)
+            return updated
+        codex_mesh = _mesh_transport()
         with worker_lifecycle.membership_operation(mesh_directory(design_id)), worker_lifecycle.lock_worker(mesh_directory(design_id), instance.name):
             entry = _object(_roster(design).get(instance.name))
             thread = session_staff.worker_session(entry)
@@ -823,18 +891,23 @@ def resume(instance_id: str, prompt_file: str | Path) -> Path:
             raise RoleRefused('role changed before dispatch')
         if (directory / 'transition.json').exists():
             raise RoleRefused('binding transition is incomplete')
-        with worker_lifecycle.lock_worker(mesh_directory(design_id), instance.name), _edit_roster(design_id) as roster:
-            entry = _object(roster.get(instance.name))
-            if session_staff.worker_session(entry) != instance.lifecycle.thread_id or entry.get('status') in BUSY:
-                raise RoleRefused('RoleNeedsRecovery: roster thread or idle state changed')
-            entry.update({'authorized_prompt': str(prompt), 'authorized_generation': generation,
-                          'access_policy': _tag(access_policy(current, role)),
-                          'held_design_id': design_id, 'held_role': role})
-            roster[instance.name] = entry
+        if isinstance(_pane_binding(current), DesignBoundToPhase):
             current = replace(current, roles=tuple(replace(value, assignment_claim=str(prompt)) if value.role == role else value
                                                    for value in current.roles))
             _save(current)
-            _mesh_context(current)
+        else:
+            with worker_lifecycle.lock_worker(mesh_directory(design_id), instance.name), _edit_roster(design_id) as roster:
+                entry = _object(roster.get(instance.name))
+                if session_staff.worker_session(entry) != instance.lifecycle.thread_id or entry.get('status') in BUSY:
+                    raise RoleRefused('RoleNeedsRecovery: roster thread or idle state changed')
+                entry.update({'authorized_prompt': str(prompt), 'authorized_generation': generation,
+                              'access_policy': _tag(access_policy(current, role)),
+                              'held_design_id': design_id, 'held_role': role})
+                roster[instance.name] = entry
+                current = replace(current, roles=tuple(replace(value, assignment_claim=str(prompt)) if value.role == role else value
+                                                       for value in current.roles))
+                _save(current)
+                _mesh_context(current)
 
     try:
         dispatch_turn(design, role, prompt, reply, model, effort)
@@ -858,6 +931,8 @@ def resume(instance_id: str, prompt_file: str | Path) -> Path:
 
 def release_servers(design: HeldDesign) -> None:
     """Release only proven-idle threads; queue parking precedes server cleanup."""
+    if isinstance(_pane_binding(design), DesignBoundToPhase):
+        return
     codex_mesh = _mesh_transport()
     codex_mesh._release_held_server(str(mesh_directory(design.placement.design_id)))  # pyright: ignore[reportPrivateUsage]
 
@@ -980,6 +1055,19 @@ def end(instance_id: str) -> HeldDesign:
             raise RoleRefused('role changed before end')
         _idle(current)
         _atomic(directory / 'transition.json', {'generation': current.placement.generation, 'reason': 'explicit end'})
+    if isinstance(_pane_binding(design), DesignBoundToPhase):
+        result = _worker_command(['end', instance.name])
+        if result.returncode:
+            (directory / 'transition.json').unlink(missing_ok=True)
+            raise RoleRefused(result.stderr.strip() or f'held worker end exited {result.returncode}')
+        with _lock(directory):
+            updated = _set_lifecycle(read_design(design_id), role, RoleEnded(
+                instance.lifecycle.staff_id if not isinstance(instance.lifecycle, RoleNotOpened) else staff.StaffId('')))
+            _save(updated)
+            (directory / 'transition.json').unlink(missing_ok=True)
+        if not isinstance(instance.lifecycle, RoleNotOpened):
+            _census_projection().release(instance.lifecycle.staff_id)
+        return updated
     mesh = mesh_directory(design_id)
     result = subprocess.run([sys.executable, str(ROOT / 'scripts/agents/codex_mesh.py'), 'end',
                              '--session-dir', str(mesh), '--to', instance.name], capture_output=True, text=True, check=False)

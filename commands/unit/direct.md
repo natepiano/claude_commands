@@ -136,18 +136,30 @@ the director neither prepares style inputs nor pastes a style assignment.
 </TagReferenceContract>
 
 <LongLivedWorkers>
-Unit workers persist across phases and plans. Dispatch with `assign.sh --role
-implement|test|fix|review --prompt <path> --cwd <worktree>`. The unit owns its
-read-only `review` worker; a concurrent review uses `review2`.
+Read the run's transport through `unit_runs.worker_transport(run)` once.
+Use the pinned transport for <WorkerRuns/>, <WorkerLaunchFailure/>, <FixDispatch/>, and <PhaseCleanup/>.
+The default remains `mesh`. A mesh-pinned run finishes on the mesh.
 
-Keep each worker's thread. Pause, move and end it with the unit ledger as
-`docs/as-built/long-lived-workers.md` describes. Never open a fresh reviewer
-while its thread exists. Every review prompt names `config/review/code.md`
-under <ReviewPromptContract/>. Other prompts carry the Three Gods and Type
-Design Contract under <WritePromptContract/>.
+For `herdr`, dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
+The launcher calls `worker.py assign` with the explicit role.
+Use `worker.py list` to inspect workers and `worker.py restore` to resume retained workers.
+Use `worker.py end <name>` only for permanent removal.
+The worker command selects idle workers and reuses stopped workers.
+Keep every busy or unknown worker unchanged.
+The transcript records prompt submission and the matching `DONE <dispatch id>` reply.
+Only exit 0 completes a pass.
+Exit 3 means no DONE reply. Exit 4 means blocked. Exit 5 means stalled.
+Exit 6 means busy. Exit 7 means retained. Exit 8 means uncertain.
+Inspect the named pane before another dispatch after an incomplete result.
+Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
-The launcher compacts a worker above `UNIT_COMPACT_ABOVE_TOKENS`, then resumes
-it. A failed compaction leaves the thread available for its own compaction.
+For `mesh`, keep each worker's thread through the existing unit ledger.
+Use `docs/as-built/long-lived-workers.md` for pause, move, end, and compaction.
+A failed compaction keeps the thread available for its own compaction.
+Never create another reviewer while its retained thread exists.
+
+Every review prompt names `config/review/code.md` under <ReviewPromptContract/>.
+Other prompts carry the Three Gods and Type Design Contract under <WritePromptContract/>.
 </LongLivedWorkers>
 
 <CoreContract>
@@ -302,6 +314,9 @@ Applies to every implementation, test, fix, and review launcher.
 </DispatchContract>
 
 <WorkerRuns>
+For `herdr`, keep the pane and native session during detached work.
+Use the detached-run result without sending another dispatch prompt.
+The following mesh attachment and delivery rules apply only to `mesh`.
 A Codex worker runs only commands that finish within one call and never makes
 an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
 started with `mesh_runs.py start`, detaches and pushes its own result to the
@@ -338,6 +353,10 @@ only to complete a report.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
+For `herdr`, inspect `worker.py list` and the named pane.
+Keep incomplete, unpublished, busy, and unknown workers unchanged.
+Resume the same pass through its saved launcher command.
+The following mesh recovery rules apply only to `mesh`.
 A dispatch that dies in seconds never reached the provider, and a provider
 message it prints is a message some earlier call received. Workers launched
 together that fail within seconds of each other carrying **byte-identical text,
@@ -1201,7 +1220,9 @@ For the 30-phase P5 trial on all repairs, carry those checks in
 evidence. Dispatch refuses an empty value; its event records the list. A value
 without `none:` records P5 exposure (the user, 2026-10-28).
 
-Dispatch every open worker with `implement.sh --to <full-worker-name>` before the
+For `herdr`, dispatch repairs through `assign.sh --role fix --prompt <path> --cwd <worktree> --fix-cause "<defect>"`.
+The worker command selects the worker and keeps its native session.
+For `mesh`, dispatch every open worker with `implement.sh --to <full-worker-name>` before the
 usual positional arguments; the prompt file is the follow-up message. Omit
 `--to` only for a new worker allowed by <LongLivedWorkers/>. Messages without the
 launcher are for questions only.
@@ -1504,6 +1525,9 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 </ShrinkCommit>
 
 <PhaseCleanup>
+For `herdr`, retain worker rows and panes for the next phase.
+Use `worker.py end <name>` only when permanent removal is required.
+The following Claude and mesh cleanup rules apply only to `mesh`.
 In `single`, run both halves under <ExecutionSteps/> step 9.
 At <PhaseEnd/>'s worker cleanup point, run
 `python3 ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.

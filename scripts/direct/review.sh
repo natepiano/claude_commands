@@ -54,6 +54,7 @@
 #                                        open phase (review_tree.py).
 
 set -euo pipefail
+LAUNCHER_COMMAND=(bash "${BASH_SOURCE[0]}" "$@")
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
@@ -189,6 +190,14 @@ fi
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.12.
 PY="${SCRIPT_DIR}/../lib/py"
+TRANSPORT="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" worker-transport "${SESSION_DIR}")"
+if [[ "${TASK}" == direct.simplify ]]; then
+  # Simplify uses its Claude launch path for either run transport.
+  TRANSPORT=mesh
+fi
+if [[ "${TRANSPORT}" == herdr ]]; then
+  REVIEW_WORKER="${FOLLOW_TO:-${NEW_SLOT}}"
+fi
 MESH_SESSION_DIR="${SESSION_DIR}"
 MESH_CLAIMED=0
 TURN_THREAD_ID=""
@@ -226,12 +235,13 @@ HEARTBEAT_INTERVAL_SECS=60
 REVIEW_FAILURE_REASON=""
 
 write_review_status() {
-  local temporary
-  temporary="$(mktemp "${ARTIFACT_DIR}/.review-status.XXXXXX")" || return 1
-  if ! { printf '%s\n' "$1" > "${temporary}" && mv -f -- "${temporary}" "${STATUS_FILE}"; }; then
-    rm -f -- "${temporary}"
-    return 1
-  fi
+  "$PY" - "${SCRIPT_DIR}" "${STATUS_FILE}" "$1" <<'PYWRITE'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[1]))
+from scripts.lib.atomic_file import write_text_atomic
+write_text_atomic(Path(sys.argv[2]), sys.argv[3] + "\n")
+PYWRITE
 }
 
 review_error() {
@@ -528,14 +538,12 @@ sys.path.insert(0, os.environ["UNIT_LIB_DIR"])
 from unit_runs import history_root
 root = history_root() / "review_turns" / Path(session).name
 root.mkdir(parents=True, exist_ok=True)
+from atomic_file import write_text_atomic
 for sequence in itertools.count():
-    try:
-        output = (root / f"{started}-{pid}-{sequence}.json").open("x", encoding="utf-8")
-    except FileExistsError:
+    path = root / f"{started}-{pid}-{sequence}.json"
+    if path.exists():
         continue
-    with output:
-        json.dump(record, output, ensure_ascii=False)
-        output.write("\n")
+    write_text_atomic(path, json.dumps(record, ensure_ascii=False) + "\n")
     break
 PY
 }
@@ -584,7 +592,7 @@ finish_review_exit() {
 interrupt_review() {
   TURN_RECORD_STATUS="canceled"
   # A fresh reviewer owns its process group. Persistent workers retain their turns.
-  if [[ -z "${REVIEW_WORKER}" && -n "${AGENT_PID:-}" ]]; then
+  if [[ "${TRANSPORT}" == mesh && -z "${REVIEW_WORKER}" && -n "${AGENT_PID:-}" ]]; then
     "$PY" "${SCRIPT_DIR}/../lib/process_group.py" "${AGENT_PID}" TERM || true
     wait "${AGENT_PID}" 2>/dev/null || true
   fi
@@ -661,7 +669,7 @@ fi
 # first role switch back to implementation rejects its own retained thread.
 # shellcheck disable=SC2153  # agents_resolve sets AGENT_MODEL.
 DURABLE_WORKER_MODEL="${AGENT_MODEL}"
-if [[ -n "${NEW_SLOT}" ]]; then
+if [[ "${TRANSPORT}" == mesh && -n "${NEW_SLOT}" ]]; then
   IMPLEMENTATION_PAIR="$(_models_registry_get "direct.${AGENT_FAMILY}" implementation)"
   if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
     IMPLEMENTATION_PAIR="$(_models_registry_get "direct.${AGENT_FAMILY}" impl)"
@@ -676,7 +684,7 @@ fi
 TREE_BASELINE_READY=0
 TURN_IMAGE_ARGS=()
 
-if [[ -n "${REVIEW_WORKER}" ]]; then
+if [[ "${TRANSPORT}" == mesh && -n "${REVIEW_WORKER}" ]]; then
   if [[ "${AGENT_FAMILY}" != "codex" ]]; then
     echo "ERROR: review worker ${REVIEW_WORKER} requires the Codex mesh." >&2
     exit 2
@@ -697,7 +705,10 @@ initialize_review_artifacts
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
-if [[ -n "${REVIEW_WORKER}" ]]; then
+if [[ "${TRANSPORT}" == herdr ]]; then
+  MESH_FIELD="transport=herdr; reach=worker.py"
+  LAUNCH_NOTE="up"
+elif [[ -n "${REVIEW_WORKER}" ]]; then
   MESH_FIELD="mesh=${REVIEW_WORKER}; reach=codex_mesh.py"
   if [[ -n "${FOLLOW_TO}" ]]; then
     LAUNCH_NOTE="follow-up to ${REVIEW_WORKER}"
@@ -713,7 +724,7 @@ board_post register \
 
 record_pass_start() {
   # UX time belongs to the director's activity, including early launches.
-  [[ "${LENS}" != ux ]] || return 0
+  [[ "${TRANSPORT}" == mesh && "${LENS}" != ux ]] || return 0
   [[ -f "${PROGRESS_STATE}" ]] || return 0
   if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
@@ -746,7 +757,7 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMI
 # sentinel exists, then sends Stage 2 as the reviewer's next message; the live
 # run keeps the reviewer's launcher attached until then. It exits 1, sending
 # nothing, if this script exits first.
-if [[ -n "${EARLY_READY_FILE}" && -n "${REVIEW_WORKER}" ]]; then
+if [[ "${TRANSPORT}" == mesh && -n "${EARLY_READY_FILE}" && -n "${REVIEW_WORKER}" ]]; then
   STAGE_TWO_FILE="${ARTIFACT_DIR}/review_stage2_${PASS_INDEX}${SUFFIX}.$$.txt"
   printf 'Stage 2: the final diff is at %s; review it per your prompt'"'"'s Stage 2.\n' \
     "${EARLY_READY_FILE%.ready}.diff" > "${STAGE_TWO_FILE}"
@@ -800,7 +811,14 @@ PY
 fi
 
 TURN_WORKTREE_ARGS=(--cwd "${WORKING_DIR}" --read-only)
-if [[ -n "${FOLLOW_TO}" ]]; then
+if [[ "${TRANSPORT}" == herdr ]]; then
+  WORKER_ARGS=(assign review "${PROMPT_FILE}" --session-dir "${SESSION_DIR}"
+    --slot "${TEAM_SLOT:-review}" --phase "${PHASE_ID}" --kind review --reply "${FINDINGS_FILE}"
+    --lens "${LENS}" --activity "${PASS_ACTIVITY}")
+  [[ -z "${FOLLOW_TO}" ]] || WORKER_ARGS+=(--name "${FOLLOW_TO}")
+  [[ -z "${EARLY_READY_FILE}" ]] || WORKER_ARGS+=(--early-ready "${EARLY_READY_FILE}")
+  "$PY" "${SCRIPT_DIR}/../production/worker.py" "${WORKER_ARGS[@]}" --launcher-command "$("$PY" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${LAUNCHER_COMMAND[@]}")" >>"${LOG_FILE}" 2>&1 &
+elif [[ -n "${FOLLOW_TO}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
     --session-dir "${MESH_SESSION_DIR}" --to "${FOLLOW_TO}" \
     --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review "${LENS_ARGS[@]}" "${TURN_WORKTREE_ARGS[@]}" "${TURN_IMAGE_ARGS[@]}" \
@@ -859,8 +877,11 @@ fi
 
 AGENT_CODE=0
 wait "${AGENT_PID}" || AGENT_CODE=$?
+if [[ "${TRANSPORT}" == herdr && "${AGENT_CODE}" -eq 0 ]]; then
+  PASS_STARTED=1
+fi
 
-if [[ -n "${NEW_SLOT}" ]] && ! record_new_worker_identity; then
+if [[ "${TRANSPORT}" == mesh && -n "${NEW_SLOT}" ]] && ! record_new_worker_identity; then
   echo "ERROR: review worker ${REVIEW_WORKER} has no durable worker identity." >&2
   AGENT_CODE=1
 fi

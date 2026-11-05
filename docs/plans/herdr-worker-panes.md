@@ -2057,7 +2057,7 @@ def launch_settings(section: str, key: str) -> LaunchSettings
 
 **Ruled out:** `PaneConversation` and `NoPaneConversation`; `Herdr.split_ratio`; an alias for `Herdr._row_panes`; a second role or launch-policy store.
 
-### Phase 8 — Dispatch and the launcher switch, landed dark  · status: todo
+### Phase 8 — Dispatch and the launcher switch, landed dark  · status: done
 
 **Depends on:** Phase 7
 

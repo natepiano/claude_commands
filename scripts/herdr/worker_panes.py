@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import cast, final
@@ -103,7 +105,12 @@ WorkerStart = OpenWorker | IncompleteStart | AdmissionRefused | UnpublishedWorke
 
 @dataclass(frozen=True)
 class Closed:
-    """The requested close is complete, or all close checks permit it."""
+    """The requested close is complete."""
+
+
+@dataclass(frozen=True)
+class CloseAllowed:
+    """The close checks permit closure; the pane remains open."""
 
 
 @dataclass(frozen=True)
@@ -119,6 +126,10 @@ class WorkerRoleUnavailable:
 class ExitCode(IntEnum):
     OK = 0
     REFUSED = 2
+    NO_DONE = 3
+    BLOCKED = 4
+    STALLED = 5
+    BUSY = 6
     KEPT = 7
     UNCERTAIN = 8
 
@@ -130,6 +141,70 @@ class ConfiguredWorkerAccount(Enum):
 @dataclass(frozen=True)
 class DestinationWorkerAccount:
     label: str
+
+
+class WorkerLockAtUse(Enum):
+    ACQUIRE = "acquire the worker lock"
+
+
+def _worker_lock_path(key: str) -> Path:
+    return staff.record_path().parent / "locks" / f"{key}.lock"
+
+
+@final
+class WorkerLockHold:
+    """Hold the worker's fixed-id lock through startup and dispatch."""
+
+    def __init__(self, parent: StaffId, name: WorkerName, operations: ExitStack, *, blocking: bool) -> None:
+        self.parent = parent
+        self.name = name
+        self._operations = operations
+        self._held: set[StaffId] = set()
+        self._blocking = blocking
+        self.active = True
+
+    def bind(self, row: staff.StaffRow) -> None:
+        """Acquire the fixed-id lock before creation serialization ends."""
+        if not self.active or not row.reports_to(self.parent) or row.name != self.name.value:
+            raise ValueError("worker lock does not own this worker")
+        if row.id not in self._held:
+            path = _worker_lock_path(row.id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = self._operations.enter_context(path.open("a"))
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if self._blocking else fcntl.LOCK_NB))
+            self._held.add(row.id)
+
+    def owns(self, row: staff.StaffRow) -> bool:
+        return self.active and row.id in self._held
+
+
+@contextmanager
+def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) -> Generator[WorkerLockHold | Kept]:
+    """Serialize creation, then hold the published worker's fixed-id lock."""
+    with ExitStack() as operations:
+        record = staff.snapshot()
+        row = worker_admission.find_worker(record, parent, name.value)
+        if row is None:
+            path = _worker_lock_path(f"{parent}-{name.value}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            creation = operations.enter_context(path.open("a"))
+            try:
+                fcntl.flock(creation, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                yield Kept("worker creation lock is held")
+                return
+            row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
+        hold = WorkerLockHold(parent, name, operations, blocking=blocking)
+        try:
+            if row is not None:
+                hold.bind(row)
+        except BlockingIOError:
+            yield Kept("dispatch lock is held")
+            return
+        try:
+            yield hold
+        finally:
+            hold.active = False
 
 
 @dataclass(frozen=True)
@@ -253,26 +328,52 @@ def _worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
                  or item.get("team_slot") == row.name), no_pass)
 
 
-def _idle_checks(row: staff.StaffRow, run: Path) -> Closed | Kept:
-    for lock in (*run.glob("dispatch.lock"), *(run / "phases").glob("*/dispatch.lock")):
-        with lock.open("r") as handle:
+def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
+    """Read the worker's recorded role through the current shared pass reader."""
+    parent = staff.snapshot().parent_of(row)
+    if parent is None:
+        return WorkerRoleUnavailable("worker parent is unavailable")
+    role = _worker_pass(row, _run(parent)).get("kind")
+    return role if isinstance(role, str) and role in staff.WORKER_ROLES else WorkerRoleUnavailable("dispatch role is unavailable")
+
+
+def _idle_checks(row: staff.StaffRow, run: Path,
+                 lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
+    if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
+        path = _worker_lock_path(row.id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as handle:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return Kept("dispatch lock is held")
+    legacy = (*run.glob("dispatch.lock"), *(run / "phases").glob("*/dispatch.lock"))
+    if legacy and unit_runs.worker_transport(run) == "mesh":
+        for path in legacy:
+            with path.open("r") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return Kept("dispatch lock is held")
     from scripts.agents import mesh_runs
     if mesh_runs.live_runs(run / "mesh_runs", row.name):
         return Kept("a detached run is live")
-    return Closed()
+    return CloseAllowed()
 
 
-def can_close(worker: OpenWorker | StoppedWorker) -> Closed | Kept:
+def stage_two_completion_id(dispatch_id: str) -> str:
+    """Return the completion id for the second review stage."""
+    return dispatch_id + "-2"
+
+
+def can_close(worker: OpenWorker | StoppedWorker, *,
+              lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
     record = staff.snapshot()
     parent = record.parent_of(worker.row)
     if parent is None:
         return Kept("worker parent is unavailable")
     run = _run(parent)
-    idle = _idle_checks(worker.row, run)
+    idle = _idle_checks(worker.row, run, lock)
     if isinstance(idle, Kept) or isinstance(worker, StoppedWorker):
         return idle
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
@@ -292,11 +393,12 @@ def can_close(worker: OpenWorker | StoppedWorker) -> Closed | Kept:
         dispatch = passed.get("dispatch_id", passed.get("instance_id"))
         if (not isinstance(dispatch, str) or not dispatch or not messages
                 or not messages[-1].startswith("assistant:\n")
-                or messages[-1].rstrip().splitlines()[-1] != f"DONE {dispatch}"):
+                or messages[-1].rstrip().splitlines()[-1] not in
+                (f"DONE {dispatch}", f"DONE {stage_two_completion_id(dispatch)}")):
             return Kept("last turn does not end with the dispatch DONE line")
     except (OSError, ValueError) as error:
         return Kept(f"completion evidence is unavailable: {error}")
-    return Closed()
+    return CloseAllowed()
 
 
 def _registry_row(role: WorkerRole) -> LaunchPolicy:
@@ -416,7 +518,8 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
 
 
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
-                    account: ConfiguredWorkerAccount | DestinationWorkerAccount = ConfiguredWorkerAccount.CURRENT) -> WorkerStart:
+                    account: ConfiguredWorkerAccount | DestinationWorkerAccount = ConfiguredWorkerAccount.CURRENT,
+                    lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
     if role not in staff.WORKER_ROLES:
@@ -434,20 +537,28 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     try:
-        with worker_admission.worker_operation(allowed):
-            return _start_locked(owner, name, role, policy, account, allowed)
+        with ExitStack() as operations:
+            held = operations.enter_context(worker_lock(parent, name, blocking=existing is None)) if isinstance(lock, WorkerLockAtUse) else lock
+            if isinstance(held, Kept):
+                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, held.blocker)
+            if not held.active or held.parent != parent or held.name != name:
+                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "worker lock does not own this worker")
+            with worker_admission.worker_operation(allowed):
+                return _start_locked(owner, name, role, policy, account, allowed, held)
     except (worker_admission.AdmissionRefused, staff.StaffRefused) as error:
         return AdmissionRefused(str(error))
 
 
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount,
-                  allowed: worker_admission.WorkerStartAllowed) -> WorkerStart:
+                  allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold) -> WorkerStart:
     client = _client()
     record = staff.snapshot()
     evidence = _evidence(owner.id, record, client)
     current = next((state for state in evidence.states if state.row.name == name.value), None)
     row = current.row if current is not None else None
+    if row is not None:
+        lock.bind(row)
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
         return current
     if current is None:
@@ -468,6 +579,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 try:
                     native = client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
                     row = worker_admission.publish(allowed, native).row
+                    lock.bind(row)
                 except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError) as error:
                     return UnpublishedWorker(identity, str(error))
                 recovered = _evidence(owner.id, staff.snapshot(), client)
@@ -486,7 +598,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if matches:
             _layout(owner.id, evidence)
             return current
-        closable = can_close(current)
+        closable = can_close(current, lock=lock)
         if isinstance(closable, Kept):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
     environment = _account_environment(policy, account, row is not None)
@@ -535,6 +647,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return _uncertain(row, "launch proves another native session; pane retained")
         if row is None:
             row = worker_admission.publish(allowed, identity).row
+            lock.bind(row)
     except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError) as error:
         return (_uncertain(row, f"launch proof is incomplete: {error}") if row is not None
                 else UnpublishedWorker(launched.pane, str(error)))
@@ -554,43 +667,50 @@ def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.Staff
             pane_launch.retire_launch(path, pane, entry)
 
 
-def close(parent: StaffId, name: WorkerName) -> Closed | Kept | UncertainWorker:
+def close(parent: StaffId, name: WorkerName, *,
+          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> Closed | Kept | UncertainWorker:
     record = staff.snapshot()
     row = worker_admission.find_worker(record, parent, name.value)
     if row is None:
         _layout(parent, _evidence(parent, record, _client()))
         return Closed()
-    with staff.row_operation(str(row.id)):
-        client = _client()
-        record = staff.snapshot()
-        evidence = _evidence(parent, record, client)
-        observed = next((item for item in evidence.states if item.row.id == row.id), ClosedWorker(row))
-        row = observed.row
-        if isinstance(observed, UncertainWorker):
-            return observed
-        if isinstance(observed, ClosedWorker):
+    with ExitStack() as operations:
+        held = operations.enter_context(worker_lock(parent, name)) if isinstance(lock, WorkerLockAtUse) else lock
+        if isinstance(held, Kept):
+            return held
+        if not held.active or held.parent != parent or held.name != name or not held.owns(row):
+            return Kept("worker lock does not own this worker")
+        with staff.row_operation(str(row.id)):
+            client = _client()
+            record = staff.snapshot()
+            evidence = _evidence(parent, record, client)
+            observed = next((item for item in evidence.states if item.row.id == row.id), ClosedWorker(row))
+            row = observed.row
+            if isinstance(observed, UncertainWorker):
+                return observed
+            if isinstance(observed, ClosedWorker):
+                _retire_launch(row, client, record)
+                _layout(parent, evidence)
+                return Closed()
+            owner = record.parent_of(row)
+            closable = (_idle_checks(row, _run(owner), held) if isinstance(observed, ProcessUnknownWorker) and owner is not None
+                        else can_close(observed, lock=held) if isinstance(observed, (OpenWorker, StoppedWorker))
+                        else Kept("worker parent is unavailable"))
+            if isinstance(closable, Kept):
+                return closable
+            if isinstance(observed, OpenWorker) and not restart.stop_row(observed.row, client):
+                return _uncertain(row, "agent stop is incomplete; pane retained")
+            panes = client.panes()
+            matches = [pane for pane in panes if pane.get("terminal_id") == observed.terminal]
+            if len(matches) != 1 or matches[0]["pane_id"] != observed.pane:
+                return _uncertain(row, "terminal moved, disappeared, or duplicated before close")
+            if not isinstance(client.pane_activity(observed.pane), herdr.PaneAtShell):
+                return _uncertain(row, "terminal became busy before close")
+            if not client.close_tab_confirmed(observed.pane, target=str(row.current_session), terminal=observed.terminal):
+                return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)
             _layout(parent, evidence)
             return Closed()
-        owner = record.parent_of(row)
-        closable = (_idle_checks(row, _run(owner)) if isinstance(observed, ProcessUnknownWorker) and owner is not None
-                    else can_close(observed) if isinstance(observed, (OpenWorker, StoppedWorker))
-                    else Kept("worker parent is unavailable"))
-        if isinstance(closable, Kept):
-            return closable
-        if isinstance(observed, OpenWorker) and not restart.stop_row(observed.row, client):
-            return _uncertain(row, "agent stop is incomplete; pane retained")
-        panes = client.panes()
-        matches = [pane for pane in panes if pane.get("terminal_id") == observed.terminal]
-        if len(matches) != 1 or matches[0]["pane_id"] != observed.pane:
-            return _uncertain(row, "terminal moved, disappeared, or duplicated before close")
-        if not isinstance(client.pane_activity(observed.pane), herdr.PaneAtShell):
-            return _uncertain(row, "terminal became busy before close")
-        if not client.close_tab_confirmed(observed.pane, target=str(row.current_session), terminal=observed.terminal):
-            return _uncertain(row, "pane close is incomplete")
-        _retire_launch(row, client, record)
-        _layout(parent, evidence)
-        return Closed()
 
 
 def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
