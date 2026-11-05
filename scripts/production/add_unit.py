@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff, owns_fill, production_doc
+from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
 from scripts.shutdown import remote
 from scripts.lib import git_exclude
 
@@ -1150,23 +1150,8 @@ def set_autocompact(request: RequestedUnitLaunch, session_id: str, value: str, c
     print(f"{request.unit}: {setting} {verb} to session {session_id} at its next restart")
 
 
-def owned_responsibilities(production: Production, unit: str) -> tuple[str, ...]:
-    """Read the unit's Owns cell with the shared parsers."""
-    rows = owns_fill.units_table(production.doc.read_text(encoding="utf-8"))
-    if not isinstance(rows, owns_fill.NoUnitsTable):
-        for cells in rows:
-            name = production_doc.cell_value(cells.get("Unit", ""))
-            if unit_names.unit_id(name) == unit:
-                try:
-                    return unit_config.responsibilities_from_owns(cells.get("Owns", ""))
-                except unit_config.ConfigRefused:
-                    break
-    raise Refusal(f"production {production.slug}, unit {unit}: fill the Owns cell "
-                  + f"in {production.doc} with owned paths or 'none — board-free'")
-
-
 def configuration_for(request: UnitLaunch) -> unit_config.UnitConfig:
-    """Keep saved responsibilities and read Owns only for a new configuration."""
+    """Keep saved responsibilities or use explicit launch responsibilities."""
     existing = unit_config.read(request.worktree, cleanup=False)
     if isinstance(request.session, ResumedSession) and isinstance(existing, unit_config.UnitConfig):
         return existing
@@ -1178,8 +1163,7 @@ def configuration_for(request: UnitLaunch) -> unit_config.UnitConfig:
     except unit_config.ConfigRefused as error:
         raise Refusal(f"unit {request.unit_id}: {error}") from error
     responsibilities = (existing.responsibilities if isinstance(existing, unit_config.UnitConfig) else
-                        tuple(dict.fromkeys((*request.responsibilities,
-                                             *owned_responsibilities(request.production, request.unit_id)))))
+                        tuple(dict.fromkeys(request.responsibilities)))
     config = unit_config.UnitConfig(plan, port, responsibilities)
     if isinstance(existing, unit_config.UnitConfig):
         comparable = existing

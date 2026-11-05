@@ -462,17 +462,12 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = write_registry(self.agent_config, overrides)
 
     def production_doc(self, merge_branch: str = "build-followups") -> str:
-        units = "".join(f"| {name}-unit | none — board-free |\n" for name in
-                        ("alpha", "beta", "review", "lfo", "mul_add", "mul-add", "nightly-review", "trunk"))
         return ("# Production\n\n"
                 f"- **Merge branch:** `{merge_branch}` — unit checkpoints merge here\n"
                 f"- **Showrunner checkout:** `{self.checkout}`\n"
                 "- **Showrunner session:** director\n"
                 "- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n"
-                "- **User zone:** America/Los_Angeles — reports use PDT\n\n"
-                "## Units\n\n"
-                "| Unit | Owns |\n| --- | --- |\n"
-                f"{units}")
+                "- **User zone:** America/Los_Angeles — reports use PDT\n")
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
