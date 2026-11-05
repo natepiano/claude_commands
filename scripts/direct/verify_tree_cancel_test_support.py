@@ -5,14 +5,17 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, caller_
 from scripts.lint.memory_test_support import write_config_fixture
 
 import json
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import cast, override
 
+from scripts.agents.mesh_runs import RunRecord
 from scripts.direct.test_tree_watch import write_workspace
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
@@ -186,7 +189,36 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         path.chmod(0o755)
 
     def start_verify(self, command: str, **extra: str) -> subprocess.Popen[str]:
-        process = subprocess.Popen(["bash", str(VERIFY), command, "sample"],
+        return self._start_verify(command, False, extra)
+
+    def start_supervised_verify(self, command: str, **extra: str) -> subprocess.Popen[str]:
+        return self._start_verify(command, True, extra)
+
+    def _start_verify(self, command: str, supervised: bool, extra: dict[str, str]) -> subprocess.Popen[str]:
+        arguments = ["bash", str(VERIFY), command, "sample"]
+        if supervised:
+            record_path = self.control / "lint-run.json"
+            record: RunRecord = {
+                "run_id": "lint-run", "status": "running", "session_dir": str(self.board),
+                "worker": "test", "staff_id": "fixture", "label": "lint cancellation",
+                "command": arguments,
+                "log": str(self.control / "lint-run.log"), "started_at": time.time(),
+                "pid": 0, "director_dir": str(self.board), "done_message_file": "",
+            }
+            _ = record_path.write_text(json.dumps(record))
+            # Use the real supervisor. Keep result delivery inside this fixture.
+            supervisor = """
+import os
+import sys
+from unittest.mock import patch
+from scripts.agents import mesh_runs
+with (patch.object(mesh_runs, "deliver", return_value="private fixture"),
+      patch.object(mesh_runs.staff, "local_snapshot", return_value=mesh_runs.staff.StaffSnapshot(())),
+      patch.object(mesh_runs.session_staff, "worker_directory", return_value=os.environ["PACKAGE_ROOT"])):
+    raise SystemExit(mesh_runs.main(["supervise", sys.argv[1]]))
+"""
+            arguments = [sys.executable, "-c", supervisor, str(record_path)]
+        process = subprocess.Popen(arguments,
                                    cwd=self.workspace, env={**self.environment, **extra},
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
@@ -221,6 +253,9 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.assertTrue((self.board / "locks/cargo.d").is_dir(), "test did not take the cargo token")
         self.assertTrue(self.admission.server.reservations,
                         "test did not take memory admission")
+        # The token owner starts a separate session. Register it for test cleanup.
+        descendant = int((self.control / "descendant.pid").read_text())
+        self.started_groups.add(os.getpgid(descendant))
 
     def assert_resources_released(self) -> None:
         self.assertFalse((self.board / "locks/cargo.d").exists(), "cancel kept the token")
