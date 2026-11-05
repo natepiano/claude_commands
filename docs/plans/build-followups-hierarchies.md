@@ -548,20 +548,17 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 20 — A unit transfer tells the moved unit, and its tab takes its place in the new showrunner's tab order  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+- When a transfer changes the staff parent, `transfer_unit.py apply` sends the moved unit one message: "Your unit now belongs to production <slug>." It goes to `staff:<member id>` with the key `transfer:<member id>:<parent id>`, from the `showrunners` sender. A rerun that changes nothing sends no message.
+- The message goes after the staff parent changes and before `staff_move.move_unit`. If the tab move fails, the unit still gets the message.
+- The status line reads the staff parent at each run. Claude Code runs it again when the conversation changes, so the message makes it show the new production.
+- `herdr._bind_row_tab` places a newly bound tab by the `tab_order` rule (showrunner first, unit directors A-Z, other tabs A-Z). Before, it was put at the end of the saved order. It reads staff at use, or the record that `move_row_tabs` passes. Other saved tabs keep their order.
+- No other check, guard or refusal is added.
 
-**Goal:** after `transfer_unit.py apply`, the moved unit's status line shows its new production, and its herdr tab sits in its place among the new showrunner's unit-director tabs (the user's transfer enhancements, from herdr's queue, given to this unit by sdlc on 2026-11-05).
+**Files:**
+- `scripts/production/transfer_unit.py`, `scripts/production/transfer_unit_test_support.py`, `scripts/production/test_transfer_unit.py`.
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
+- `scripts/hooks/test_showrunner_footer.py` — one test of the deleted hierarchy measure is deleted.
 
-**Proof before code (done by the unit director):** the status line reads the staff parent at each run (`scripts/statusline/assignment.py`: "for <parent name>"), and Claude Code runs the status-line command when the conversation changes. One message to the moved unit is a new turn, so its status line shows the new production.
-
-**Spec:**
-1. `scripts/production/transfer_unit.py` `apply`: when the staff parent changed, send the moved unit one message that names its new production. Use the existing message sender (`scripts/message/send.py`) and the same sender name an existing staff script uses. A rerun that changes nothing sends no message. Print the send result.
-2. `scripts/production/staff_move.py` `move_unit` (through `herdr.Herdr.move_row_tabs`): the moved tab goes to its place by the existing rule of `tab_order`: the showrunner tab first, then unit directors A-Z, then other tabs A-Z. Today the moved tab is bound into the saved layout, and saved order can keep it at the end. Fix that at its cause in `scripts/herdr/herdr.py`.
-3. Add no other check, guard or refusal. Do not edit `scripts/production/unit_lookup.py` (shutdown edits it now).
-
-**Acceptance gate:**
-- A test in `scripts/production/test_transfer_unit.py`: a transfer that changes the parent sends one message to the moved unit with the new production name; a rerun sends none.
-- A test in the herdr tests: a moved unit tab lands between the new showrunner's unit-director tabs by A-Z, not at the end, also when the workspace has a saved tab order.
-- The unittest modules of every changed test file pass, and basedpyright on every changed file ends `0 errors, 0 warnings, 0 notes`.
+**Gotchas:** in a workspace with no showrunner tab and no saved order, the moved tab goes first. This was the same before the phase.
