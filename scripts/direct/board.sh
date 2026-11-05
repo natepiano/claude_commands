@@ -223,12 +223,12 @@ except (OSError, ValueError, KeyError, TypeError):
     sys.exit(1)
 result = process_start(group)
 if record.get("start_format") != process_start_format():
-    # A legacy or unknown format cannot prove that the group is stale.
+    # Retain a group with an unknown format unless the group is gone.
     if not isinstance(result, Gone):
         sys.exit(0)
-    import os
+    from scripts.lib.process_group import send_process_group
     try:
-        os.killpg(group, 0)
+        send_process_group(group, 0)
     except ProcessLookupError:
         sys.exit(1)
     except PermissionError:
@@ -277,7 +277,7 @@ import time
 record = Path(sys.argv[1])
 
 sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[1]))
-from scripts.lib.process_start import Started, Zombie, process_start, process_start_format
+from scripts.lib.process_start import Started, Zombie, process_start
 
 def identity(pid: int) -> str | None:
     result = process_start(pid)
@@ -301,7 +301,7 @@ except (OSError, ValueError, KeyError, TypeError):
     print('board.sh: invalid step ownership record', file=sys.stderr)
     sys.exit(1)
 
-if saved.get("start_format") != process_start_format() or identity(group) != start:
+if identity(group) != start:
     if live_group(group):
         print('board.sh: step group leader identity changed', file=sys.stderr)
         sys.exit(1)
