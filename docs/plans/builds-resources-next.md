@@ -56,3 +56,17 @@
   - Completion condition: typed `/build:queue bump <unit>` from any pane sets or replaces persistent priority through the existing writer, without a session-role check on the plugin route; tests cover a non-showrunner pane and replacement, while direct priority commands retain their existing caller checks.
   - Revealed by: Phase 26; approved by builds in `S/next_items_pending.md`.
 
+
+- [ ] **Scripts that use the build hold no longer pay for the build queue import**
+  - Target: `scripts/build_hold/build_hold.py` (the `admission_service` and `store` imports at :38-44) and `scripts/build_hold/test_build_hold.py`.
+  - Why needed: six modules import `build_hold` at module level, and each one loads the build queue modules that only `admitted_processes()` uses.
+  - Completion condition: the two imports are inside `admitted_processes()`; a fresh-interpreter test shows that `import build_hold` loads no build queue module.
+  - Start: when natedev says the send.py freeze on `build_hold.py` ends (the showrunner tells us).
+  - Revealed by: Phase 67 (builds showrunner 2026-11-05: next)
+
+- [ ] **The offload script loads its git helpers without the whole sweep**
+  - Target: `scripts/lint/sweep.py:4162-4203` (`repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir`, `local_origin_git_dir`), a new git-helper module, `scripts/mac_test/offload.py`.
+  - Why needed: `offload` imports all of `sweep` for five small git helpers.
+  - Completion condition: the helpers are in one module; `sweep` and `offload` import it; `test_sweep.py` and `test_offload.py` pass.
+  - Start: after natest Phase 24 merges, because it holds `offload.py` (the showrunner tells us).
+  - Revealed by: Phase 67 (builds showrunner 2026-11-05: next)
