@@ -17,7 +17,7 @@ from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.fake_unit_host import PaneShellFixture
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import unit_move
-import herdr
+from scripts.herdr import herdr
 import unit_lookup
 from rename_state import RenameRefused
 

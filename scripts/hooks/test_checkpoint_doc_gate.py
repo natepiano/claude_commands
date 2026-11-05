@@ -973,7 +973,7 @@ class CheckpointDocGateTests(unittest.TestCase):
         _ = shutil.copyfile(HOOK, isolated)
         for command in ("ls", "echo commit", CHECKPOINT):
             payload = {"tool_name": "Bash", "cwd": str(self.root / "commit-cache"), "tool_input": {"command": command}}
-            result = subprocess.run([sys.executable, str(isolated)], input=json.dumps(payload),
+            result = subprocess.run([sys.executable, "-I", str(isolated)], input=json.dumps(payload),
                                     env=self.environment, capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
             if command != CHECKPOINT:
                 self.assertEqual(result.stdout, "")

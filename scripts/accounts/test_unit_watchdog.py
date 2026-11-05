@@ -44,12 +44,12 @@ if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.production import unit_lookup
 else:
-    pane_record = import_module("pane_record")
-    herdr = import_module("herdr")
-    inventory = import_module("inventory")
-    sessions = import_module("sessions")
-    unit_lookup = import_module("unit_lookup")
-import quota_alert
+    pane_record = import_module("scripts.shutdown.pane_record")
+    herdr = import_module("scripts.herdr.herdr")
+    inventory = import_module("scripts.shutdown.inventory")
+    sessions = import_module("scripts.message.sessions")
+    unit_lookup = import_module("scripts.production.unit_lookup")
+from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
 NOW = fixtures.NOW
 
@@ -58,8 +58,8 @@ class RecoveryChildImportTests(unittest.TestCase):
     def test_recovery_child_imports_with_only_home_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as home:
             child = subprocess.run(
-                [sys.executable, "-m", "scripts.accounts.unit_watchdog", "--recover"],
-                cwd=Path(__file__).resolve().parents[2],
+                [str(Path(unit_watchdog.__file__).resolve().parents[1] / "lib/py"), "-m", "scripts.accounts.unit_watchdog", "--recover"],
+                cwd="/",
                 env={"HOME": home, "PATH": os.environ["PATH"]},
                 capture_output=True, text=True, timeout=10, check=False,
             )
@@ -405,7 +405,7 @@ class UnitWatchdogTests(unittest.TestCase):
             with (patch.object(stop_resume, "_start_session", side_effect=start),
                   patch.object(herdr.Herdr, "retitle", return_value=False) as retitle,
                   patch.object(staff, "initial_snapshot", return_value=record),
-                  patch.object(stop_resume, "_detach"), patch("unit_runs.held", return_value=[]),
+                  patch.object(stop_resume, "_detach"), patch("scripts.lib.unit_runs.held", return_value=[]),
                   patch.object(herdr, "heal_claude_trust", return_value=herdr.Trusted(
                       Path(cast(str, owner["cwd"])), config / ".claude.json", Path(cast(str, owner["cwd"]))))):
                 result = self.shared_resume("alpha", why="maintenance complete")

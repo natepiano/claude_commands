@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 from datetime import date
-from pathlib import Path
-import sys
 from typing import override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 

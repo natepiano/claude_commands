@@ -33,7 +33,7 @@ Codex review prompts also include section 3's command block.
    write_stdin poll, for any command, build or not. Anything longer runs
    detached: each verify.sh line as listed, which detaches itself, or any
    other command as
-   `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
    A successful start returns at once with the run, its pid and its log.
    A live twin takes priority over config/mesh_runs.conf LIVE_RUN_LIMIT.
    Exit 4 refuses a new run at that limit and names the live runs.
@@ -225,7 +225,7 @@ mid-run, without waiting for a phase to end.
   - `reach=codex_mesh.py` — a codex member, running as a thread on the run's
     `codex app-server`. Two calls, both with
     `--session-dir <concrete SESSION_DIR> --to <name>`:
-    `python3 ~/.claude/scripts/agents/codex_mesh.py send --message "<text>"`
+    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/codex_mesh.py send --message "<text>"`
     queues the message and it lands at the start of that worker's next turn;
     `… steer --message "<text>"` interrupts the turn it is running right now.
     Send by default. Steer only when the work in flight is work you need

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Build the semantic input snapshot used by the Hanadocs rank watcher."""
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import cast
 
-import renumber  # pyright: ignore[reportImplicitRelativeImport]
+from scripts.prioritize import renumber
 
 
 ISSUES_DIR = Path.home() / "rust/hanadocs/issues"

@@ -18,11 +18,10 @@ from typing import TYPE_CHECKING, cast, final
 from unittest import mock
 
 if TYPE_CHECKING:
-    import herdr
     import unit_lookup
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-import herdr
+from scripts.herdr import herdr
 from fake_herdr import CommandResponse, herdr_listener
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -32,7 +31,7 @@ PANE_RESULT = herdr.Herdr.result
 @contextmanager
 def private_process_registry() -> Generator[None]:
     """Read private process generations and retain normal reads for other processes."""
-    import sessions
+    from scripts.message import sessions
     from scripts.message import sessions as runtime_sessions
 
     original_start = runtime_sessions.process_start
@@ -256,7 +255,6 @@ class PaneShellFixture:
     def __init__(self, case: unittest.TestCase, worktree: Path, process_root: Path, *,
                  live: bool, slug: str = "demo", unit: str = "alpha-unit",
                  env: dict[str, str] | None = None) -> None:
-        import herdr
         import unit_lookup
         import unit_move
         self.slug: str = slug
@@ -368,7 +366,6 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
     """A shutdown boundary that records a clean stop and one native relaunch."""
     import rename_unit
     import unit_lookup
-    import herdr
     stopped_event = threading.Event()
     del path
     pane.environment['RENAME_UNIT_STOP_WAIT'] = str(TEST_HANG_GUARD_SECS)

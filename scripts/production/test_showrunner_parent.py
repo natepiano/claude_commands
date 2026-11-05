@@ -20,7 +20,7 @@ from scripts.production.staff_test_support import StaffTestCase
 from scripts.production.rename_test_support import stop_at_staff_write
 import showrunner_parent
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 
 
 class ShowrunnerParentTests(StaffTestCase):

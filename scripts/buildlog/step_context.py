@@ -13,10 +13,7 @@ if TYPE_CHECKING:
     from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-if __package__:
-    from . import parse
-else:
-    import parse
+from scripts.buildlog import parse
 
 
 @dataclass(frozen=True)
@@ -104,7 +101,7 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
     program, arguments, directory, effective = cargo_command_context(argv, cwd, environment)
     if not program or parse.step_name([*program, *arguments]) == "fmt":
         return NoTargetFolder()
-    from cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
+    from scripts.lib.cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
 
     try:
         settings = cargo_folder_settings(arguments, directory, effective, policy=CargoConfigPolicy.CURRENT_STRICT)
@@ -122,10 +119,7 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
         workspace = cargo_workspace_manifest(arguments, directory, cargo_home_folder(directory, effective))
         return CargoTargetFolder(workspace.resolve().parent / "target")
     except (OSError, ValueError) as error:
-        if __package__:
-            from . import store
-        else:
-            import store
+        from scripts.buildlog import store
 
         store.note_error(f"target folder: {error}")
         return UnresolvedTargetFolder()
@@ -134,7 +128,7 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
 def step_output_roots(argv: list[str], cwd: str) -> CargoOutputRoots | CargoOutputUnavailable:
     """Read output folders with the step command's Cargo inputs."""
     import json
-    from cargo_target_config import cargo_path_argument
+    from scripts.lib.cargo_target_config import cargo_path_argument
     if not TYPE_CHECKING:
         from scripts.lib.cargo_output import read_cargo_output_roots
 
@@ -155,10 +149,7 @@ def step_output_roots(argv: list[str], cwd: str) -> CargoOutputRoots | CargoOutp
 
 
 def step_context(argv: list[str], metadata: str) -> None:
-    if __package__:
-        from . import treekey
-    else:
-        import treekey
+    from scripts.buildlog import treekey
 
     cwd = os.getcwd()
     print(treekey.tree_key(git_directory(argv, cwd)) or "")

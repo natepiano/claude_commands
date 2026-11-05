@@ -33,16 +33,16 @@ from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 
 import add_showrunner
 from scripts.production import showrunners
-import unit_effort
+from scripts.production import unit_effort
 import unit_lookup
-import sessions
+from scripts.message import sessions
 import unit_runs
-import herdr
-from session_pane import HerdrFailure, read_place, type_place, where_place
+from scripts.herdr import herdr
+from scripts.production.session_pane import HerdrFailure, read_place, type_place, where_place
 from scripts.production.production_doc import Production, Refusal, read_production
 
 STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)

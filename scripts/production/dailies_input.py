@@ -19,24 +19,24 @@ from scripts.lib.process_failure import failure_detail
 from zoneinfo import ZoneInfo
 
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 import unit_lookup
 from scripts.production import staff, unit_names
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
 from scripts.production.store_owner import document_id, showrunner_id
-from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
+from scripts.production.dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
                             parse_style_summary)
 from merge_checkpoint import ChildHandoffEntry, NoMerge, git, merge_branch_history
-from update_registration import (QuestionStaff, read_open_items, RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
+from scripts.production.update_registration import (QuestionStaff, read_open_items, RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
                                  update_schedule)
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-from build_hold import ActiveHolders, read_holders
+from scripts.build_hold.build_hold import ActiveHolders, read_holders
 import override_guard
 
 JsonMap = dict[str, object]

@@ -26,7 +26,7 @@ from scripts.production.rename_unit_test_support import FolderRenameFixture, Fol
 from scripts.production.rename_rerun_test_support import file_versions, saved_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
 from scripts.shutdown import pane_record, restart, shutdown_record
-import herdr
+from scripts.herdr import herdr
 
 
 class AddUnitResumeFolderTests(AddUnitTestCase):
@@ -186,7 +186,6 @@ class UnitFolderMoveTests(FolderRenameFixture):
             self.assert_finished_rerun(backend)
 
     def test_real_restart_resumes_each_family_in_the_destination_and_keeps_the_terminal(self) -> None:
-        import herdr
         from scripts.message import sessions
         from scripts.accounts import accounts
         from scripts.shutdown import stop_resume
@@ -257,7 +256,6 @@ class UnitFolderMoveTests(FolderRenameFixture):
                 restore()
 
     def test_a_foreign_native_session_receives_no_stop_signal(self) -> None:
-        import herdr
         from scripts.shutdown import stop_resume
 
         client = herdr.Herdr("agents")
@@ -291,8 +289,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual((backend.starts, backend.stops), ([], []))
 
     def test_move_reads_only_members_and_resumes_their_current_sessions(self) -> None:
-        import herdr
-        import sessions
+        from scripts.message import sessions
 
         worker = fixture_worker("impl1", self.owner.id)
         other = fixture_member("unit", name="other-unit", parent=self.owner.parent,
@@ -351,7 +348,6 @@ class UnitFolderMoveTests(FolderRenameFixture):
         kill.assert_not_called()
 
     def test_unsafe_resume_sends_no_keystroke_or_second_session(self) -> None:
-        import herdr
         from scripts.message import sessions as native_sessions
         from scripts.accounts import accounts
         from scripts.shutdown import stop_resume
@@ -489,7 +485,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
               mock.patch.object(herdr, "running_codex_threads", return_value=set()),
               mock.patch.object(os, "kill") as killed, redirect_stderr(io.StringIO()) as output):
             self.assertEqual(restart.live_rows(staff.StaffSnapshot((self.owner,)), client), [])
-        read.assert_called_once_with(self.owner.current_session)
+        read.assert_called_once_with(self.owner.current_session, codex=herdr.CodexConversations({}, ()))
         killed.assert_not_called()
         self.assertEqual(output.getvalue().splitlines(), [
             "anomaly: source (conversation unreadable); not blocking"])

@@ -28,12 +28,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import write_config_fixture, config_environment
 else:
-    from memory_test_support import write_config_fixture, config_environment
+    from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
-import offload
-import mac_test
-import treekey
-from offload_test_commands import COMMAND_STUB, write_shell
+from scripts.mac_test import offload, mac_test
+from scripts.buildlog import treekey
+from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
     from ..lib.process_group import send_process_group
@@ -45,7 +44,7 @@ if TYPE_CHECKING:
     from ..production.cli_fixture import invoke_cli
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-    from cli_fixture import invoke_cli
+    from scripts.production.cli_fixture import invoke_cli
 
 SCRIPT = Path(__file__).with_name("offload.py")
 
@@ -353,7 +352,7 @@ class OffloadCommandFixture(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
-            sys.executable,
+            str(SCRIPT.resolve().parents[1] / "lib/py"),
             str(SCRIPT),
             "run",
             "--repo-root",
@@ -395,8 +394,7 @@ class OffloadCommandFixture(unittest.TestCase):
         program = r'''
 import subprocess
 import sys
-sys.path.insert(0, sys.argv.pop(1))
-import offload
+from scripts.mac_test import offload
 
 clock = [100.0]
 offload.time.monotonic = lambda: clock[0]
@@ -435,7 +433,7 @@ subprocess.run = run
 raise SystemExit(offload.main())
 '''
         return subprocess.run(
-            [sys.executable, "-c", program, str(SCRIPT.parent), "run",
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "-c", program, "run",
              "--repo-root", str(self.repository), "--package", "hana",
              "--call-id", "call-17", "--result", str(self.result_path), "--"],
             cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
@@ -455,7 +453,7 @@ raise SystemExit(offload.main())
     ) -> subprocess.Popen[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
-            sys.executable,
+            str(SCRIPT.resolve().parents[1] / "lib/py"),
             str(script),
             "run",
             "--repo-root",
@@ -496,6 +494,7 @@ raise SystemExit(offload.main())
         _ = shutil.copyfile(SCRIPT, runner)
         _ = shutil.copyfile(SCRIPT.with_name("cargo_manifest.py"), runner_directory / "cargo_manifest.py")
         self.write_executable(runner_directory / "mac_test.py", CLAIM_STUB)
+        (scripts_directory / "lib").symlink_to(SCRIPT.parent.parent / "lib", target_is_directory=True)
         (scripts_directory / "lint").symlink_to(
             SCRIPT.parent.parent / "lint", target_is_directory=True
         )
@@ -507,7 +506,7 @@ raise SystemExit(offload.main())
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(STATE_SCRIPT), *arguments],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(STATE_SCRIPT), *arguments],
             cwd=self.root,
             env=self.environment,
             capture_output=True,

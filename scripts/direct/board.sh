@@ -170,7 +170,7 @@ lock_guard() {
     return 2
   fi
   local status
-  if python3 -c 'import fcntl, sys
+  if "${BASH_SOURCE[0]%/*}/../lib/py" -c 'import fcntl, sys
 try:
     fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
@@ -227,7 +227,7 @@ pid_is_gone() {
 owned_group_matches() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 1
-  python3 - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PYTHON'
+  "${BASH_SOURCE[0]%/*}/../lib/py" - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PYTHON'
 import json
 from pathlib import Path
 import sys
@@ -284,7 +284,7 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  python3 - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
+  "${BASH_SOURCE[0]%/*}/../lib/py" - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
 from __future__ import annotations
 
 import json

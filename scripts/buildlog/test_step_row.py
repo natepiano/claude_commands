@@ -16,13 +16,13 @@ from unittest import mock
 from typing import TYPE_CHECKING, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import record
-import repository
-import step_context
-import treekey
-import store
-from test_index import use_test_log
-from test_record import START, NEXTEST
+from scripts.buildlog import record
+from scripts.buildlog import repository
+from scripts.buildlog import step_context
+from scripts.buildlog import treekey
+from scripts.buildlog import store
+from scripts.buildlog.test_index import use_test_log
+from scripts.buildlog.test_record import START, NEXTEST
 
 use_test_log()
 
@@ -127,7 +127,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_invalid_target_configuration_records_the_error(self) -> None:
-        import cargo_target_config
+        from scripts.lib import cargo_target_config
 
         with (
             mock.patch.object(cargo_target_config, "cargo_folder_settings", side_effect=ValueError("invalid")),

@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-import store
+from scripts.buildlog import store
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
@@ -24,7 +24,7 @@ sys.path.insert(0, str(SCRIPTS / "message"))
 if TYPE_CHECKING:
     from ..message import send_budget
 else:
-    import send_budget
+    from scripts.message import send_budget
 sys.path.insert(0, str(SCRIPTS / "mac_test"))
 sys.path.insert(0, str(SCRIPTS / "notify"))
 
@@ -43,8 +43,8 @@ else:
     from scripts.lint import memory_admit
     from scripts.build_queue import admission_client, admission_protocol
     from scripts.direct import step_record
-    import mac_test
-    import push_texts
+    from scripts.mac_test import mac_test
+    from scripts.notify import push_texts
     from scripts.notify.push_catalog import mac_idle_reservation
     from scripts.buildlog import mac_idle_alert
     from scripts.lib.process_failure import failure_detail
@@ -296,12 +296,12 @@ def outage_repeat_minutes(since: float, now: float, settings: mac_idle_alert.Mac
 
 def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = REPAIR_MESSAGE) -> bool:
     try:
-        result = subprocess.run([sys.executable, str(SCRIPTS / "production/showrunners.py"), "address", "builds"],
+        result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "production/showrunners.py"), "address", "builds"],
                                 capture_output=True, text=True, timeout=send_budget.seconds(), check=False)
         address = result.stdout.strip()
         if result.returncode != 0 or not address:
             raise ValueError("builds showrunner has no address")
-        command = [sys.executable, str(SCRIPTS / "message/send.py"), "--to", address,
+        command = [str(SCRIPTS / "lib/py"), str(SCRIPTS / "message/send.py"), "--to", address,
                    "--from", "Mac idle watch", "--text", text]
         if isinstance(identity, OutageMessage):
             window = outage_repeat_minutes(identity.since, identity.now, mac_idle_alert.read_idle_config())

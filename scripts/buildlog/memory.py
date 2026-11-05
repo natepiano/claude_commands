@@ -17,20 +17,20 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
-import index
-import cgroup_capture
-from cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePresent, SliceCollection as SliceCollection
-import store
+from scripts.buildlog import index
+from scripts.buildlog import cgroup_capture
+from scripts.buildlog.cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePresent, SliceCollection as SliceCollection
+from scripts.buildlog import store
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.queue_evidence import room_text
 from scripts.lint import memory_admit as gate
 
-import conf
-from cargo_output import CargoOutputRoots, read_cargo_output_roots
+from scripts.lib import conf
+from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
 
 GIB = 2**30
 SNAPSHOT_DISTANCE_S = 120

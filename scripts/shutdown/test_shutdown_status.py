@@ -19,13 +19,13 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, final, override
 from unittest.mock import Mock, patch
 
-from test_support import ShutdownSendLeaf, ShutdownTestCase
-import shutdown
-import inventory
+from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.shutdown import shutdown
+from scripts.shutdown import inventory
 from scripts.production import staff
 from scripts.agents import codex_mesh
 from scripts.whoami.account import UnreadableAccount
-from inventory import Inventory
+from scripts.shutdown.inventory import Inventory
 
 
 LOGIN = "owner@example.com"

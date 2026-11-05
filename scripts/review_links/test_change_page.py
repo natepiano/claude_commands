@@ -6,7 +6,6 @@ import os
 import re
 import json
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -218,7 +217,7 @@ class ChangePageTests(unittest.TestCase):
         }))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.temporary / "notifier"))
         _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=self.temporary))
-        _ = self.enterContext(patch("change_review.lists_directory", return_value=self.temporary))
+        _ = self.enterContext(patch("scripts.production.change_review.lists_directory", return_value=self.temporary))
         _ = fixture_member("showrunner", name="demo")
         _ = self.git("init", "-b", "main")
         _ = self.git("config", "user.name", "Review test")
@@ -960,7 +959,7 @@ class ChangePageTests(unittest.TestCase):
         if not question_id:
             question = change_page.DeliveryStatus(self.root).slots(self.page, row).question
             question_id = question.question_id if not isinstance(question, change_page.NoQuestion) else "unknown"
-        return subprocess.run([sys.executable, change_page.__file__, "answer-question", "--production", str(self.production),
+        return subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), change_page.__file__, "answer-question", "--production", str(self.production),
                                "--list", str(self.review_list), "--row", row, "--question", question_id, "--text", text],
                               capture_output=True, text=True, check=False)
 
@@ -1984,7 +1983,7 @@ class ChangePageTests(unittest.TestCase):
     def test_command_publishes_one_row_and_a_batch_through_the_same_path(self) -> None:
         for rows in (["C1"], ["C1", "C2", "C3"]):
             with self.subTest(rows=rows):
-                result = subprocess.run([sys.executable, change_page.__file__, "--production", str(self.production),
+                result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), change_page.__file__, "--production", str(self.production),
                                          "--list", str(self.review_list), *rows],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual((result.returncode, result.stderr), (0, ""))
@@ -2008,7 +2007,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(len(self.messages), 0)
 
     def feature_command(self, *arguments: str) -> None:
-        result = subprocess.run([sys.executable, feature_log.__file__, *arguments],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), feature_log.__file__, *arguments],
                                 capture_output=True, text=True, check=False)
         self.assertEqual((result.returncode, result.stderr), (0, ""))
 
@@ -2029,10 +2028,10 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual((reply.status, reply.location), (303, self.page_path))
         invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
         self.assertEqual([args[2] for args in invocations], ["project-of", "add", "verdict"])
-        self.assertEqual(invocations[1], [sys.executable, feature_log.__file__, "add", "--review",
+        self.assertEqual(invocations[1], [str(Path(change_page.__file__).resolve().parents[1] / "lib/py"), feature_log.__file__, "add", "--review",
                                           "page-owner/C1", "--if-proposed"])
         self.assertEqual(invocations[2],
-                         [sys.executable, str(Path(change_review.__file__)), "verdict", "--production",
+                         [str(Path(change_page.__file__).resolve().parents[1] / "lib/py"), str(Path(change_review.__file__)), "verdict", "--production",
                           str(self.production), "--list", str(self.review_list), "--row", "C1", "--verdict=works"])
         saved = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C1")
         self.assertEqual(saved["Verdict"], "works")

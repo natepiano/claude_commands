@@ -26,7 +26,7 @@ from scripts.production.production_doc import Production, Refusal, production_fi
 
 import rules
 import style_ledger
-from atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 
 FAMILIES: tuple[rules.Family, ...] = ("names", "values", "types", "modules")
 PLAN_DIRECTORY = Path("docs/style-production/units")

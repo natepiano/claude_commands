@@ -20,7 +20,7 @@ from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_unt
 
 from scripts.production.store_owner import showrunner_id
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 import tidy_wrapped
 import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
@@ -30,11 +30,11 @@ from merge_checkpoint import (CodeCheckpoint, MergeEntry, NoMerge,
                               git, good, merge_branch_history, promote_local_checkout,
                               pull_mac_checkout, report)
 from scripts.production import production_doc
-from update_registration import QuestionStaff, RegistrationFailure, judgment_state
+from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from atomic_file import write_text_atomic
-from process_failure import failure_detail
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_failure import failure_detail
 import berth_board
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"

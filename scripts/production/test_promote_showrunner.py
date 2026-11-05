@@ -26,14 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_showrunner
 import promote_showrunner
 from scripts.production import showrunners
-import showrunner_tree
-import unit_effort
+from scripts.production import showrunner_tree
+from scripts.production import unit_effort
 import unit_lookup
-import herdr
-import sessions
+from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.accounts import accounts
-from scripts.herdr import herdr as trust_reader
 from scripts.whoami import account
 
 from scripts.production.staff_test_support import StaffTestCase
@@ -694,7 +693,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                 mock.patch.object(showrunner_tree, "descendants_of", return_value=[]), \
                 mock.patch.object(add_showrunner, "running", return_value=False), \
                 mock.patch.object(add_showrunner, "herdr_tab_open", return_value=True) as live, \
-                mock.patch.object(trust_reader, "claude_trust", return_value=trust_reader.Trusted(
+                mock.patch.object(herdr, "claude_trust", return_value=herdr.Trusted(
                     self.worktree, self.root / ".claude.json", self.worktree)):
             code, _out, err = self.run_main()
         self.assertEqual(code, 2, err)
@@ -714,7 +713,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(herdr, "live_sessions", return_value=[herdr.SessionEntry(
                   name="agents", running=True, default=False, session_dir="/fixture", socket_path="/sock")]),
               mock.patch.object(herdr.Herdr, "panes", return_value=[{"pane_id": PANE, "label": "child"}]),
-              mock.patch.object(trust_reader, "claude_trust", return_value=trust_reader.Trusted(
+              mock.patch.object(herdr, "claude_trust", return_value=herdr.Trusted(
                   self.worktree, self.root / ".claude.json", self.worktree))):
             code, out, err = self.run_main("--check")
         self.assertEqual(code, 0, err)

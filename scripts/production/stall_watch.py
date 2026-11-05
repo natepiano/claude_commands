@@ -39,17 +39,17 @@ from scripts.lib.process_group import send_process_group
 
 from scripts.production import showrunners, staff, unit_names, session_staff
 import unit_lookup
-from session_pane import HerdrFailure, agent_status, read_place
+from scripts.production.session_pane import HerdrFailure, agent_status, read_place
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 import context_usage  # noqa: E402
-import push_texts  # noqa: E402
+from scripts.notify import push_texts  # noqa: E402
 import rca  # noqa: E402
-import sessions  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 
-import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
+from scripts.herdr import herdr  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Iterator

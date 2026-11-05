@@ -25,9 +25,9 @@ from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
 from scripts.shutdown import remote
 from scripts.production.showrunners import canonical_slug
-from sessions import SessionRecord
-from place import HerdrPlace
-from pane_launch import PaneLaunch
+from scripts.message.sessions import SessionRecord
+from scripts.herdr.place import HerdrPlace
+from scripts.herdr.pane_launch import PaneLaunch
 import unit_names
 
 
@@ -527,7 +527,7 @@ class MemberSources:
 def member_sources(*, dependencies: Callable[[Path], None] | None = None,
                    record: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
                    unreadable: showrunners.UnreadableTimerPolicy = showrunners.UnreadableTimerPolicy.SKIP) -> MemberSources:
-    import herdr
+    from scripts.herdr import herdr
     from scripts.shutdown import pane_record
 
     session = herdr.shared_session(dependencies=dependencies)
@@ -658,7 +658,7 @@ def retained_session_labels(marked: Iterable[LabeledSession], row: staff.StaffRo
 
 def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.StaffSnapshot,
                         membership: dict[str, tuple[staff.StaffRow, ...]], launches: tuple[PaneLaunch, ...]) -> LabeledProductions:
-    import herdr
+    from scripts.herdr import herdr
 
     shared_session = herdr.shared_session()
     parents = {row.id: slug for slug, rows in membership.items() for row in rows}
@@ -795,7 +795,7 @@ class RepairedSessionLabels:
 
 def repair_marks() -> list[RepairedSessionLabels]:
     """Repair retained identities in place; never launch or change a conversation."""
-    import sessions
+    from scripts.message import sessions
     from scripts.shutdown import pane_record
 
     membership = LaunchMembership.read()
@@ -805,7 +805,7 @@ def repair_marks() -> list[RepairedSessionLabels]:
     live = sessions.running_sessions()
     repaired: list[RepairedSessionLabels] = []
     if live:
-        import herdr
+        from scripts.herdr import herdr
 
         by_pid = {entry["pid"]: entry for entry in live}
         seen: set[str] = set()

@@ -16,18 +16,18 @@ from unittest.mock import call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import inventory
-import herdr
-import sessions
-import restart
-import shutdown
-from unit_staff_test_support import unit_host
+from scripts.shutdown import inventory
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.shutdown import restart
+from scripts.shutdown import shutdown
+from scripts.shutdown.unit_staff_test_support import unit_host
 from scripts.production import fake_unit_host, session_staff, staff
 from scripts.accounts import accounts
 from scripts.message import codex_daemon
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.lib import unit_runs
-from test_support import ShutdownTestCase, registry_confirmation
+from scripts.shutdown.test_support import ShutdownTestCase, registry_confirmation
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 STOP_SESSION = stop_resume.stop
@@ -215,7 +215,7 @@ class SessionLaunchTests(ShutdownTestCase):
         (project / f"{identity}.jsonl").touch()
         output = io.StringIO()
         with (patch.object(pane_record, "RECORD_DIR", records),
-              patch("restart.sessions.config_dirs", return_value=[config]),
+              patch("scripts.shutdown.restart.sessions.config_dirs", return_value=[config]),
               patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
               redirect_stderr(output)):
             kind, environment, arguments = restart.session_launch(identity, "current-name")

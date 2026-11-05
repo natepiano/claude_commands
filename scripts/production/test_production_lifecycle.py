@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fake_unit_host
 import production_lifecycle
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 from fake_unit_host import HostedUnit
 
 
@@ -1061,7 +1061,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(owner_after_wrap.id, runner.id)
 
     def test_wrap_reuses_its_staff_context_for_question_cleanup(self) -> None:
-        from update_registration import QuestionStaff
+        from scripts.production.update_registration import QuestionStaff
 
         with mock.patch.object(QuestionStaff, "read", side_effect=AssertionError("Reuse the wrap staff context")):
             self.test_wrap_closes_document_owned_questions_after_its_timer_stops()

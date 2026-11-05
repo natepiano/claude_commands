@@ -10,7 +10,7 @@ description: Report skill run, stage, and phase times.
 Run:
 
 ```bash
-python3 ~/.claude/scripts/history/history.py $ARGUMENTS
+~/.claude/scripts/lib/py ~/.claude/scripts/history/history.py $ARGUMENTS
 ```
 
 Empty `$ARGUMENTS` → run `summary`. A first word that is not one of the nine

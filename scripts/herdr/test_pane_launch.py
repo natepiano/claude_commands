@@ -9,12 +9,12 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pane_launch
+from scripts.herdr import pane_launch
 from scripts.production import session_labels, staff
 from scripts.lib import legacy_identity
 from scripts.message import sessions
 from scripts.shutdown import pane_record
-import herdr
+from scripts.herdr import herdr
 
 
 class LaunchEnvironmentTests(unittest.TestCase):

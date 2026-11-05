@@ -32,37 +32,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
-import send
-import repeat_guard
-from relay_identity import relay_session_name
-from relay_test_support import write_relay_record
+from scripts.message import send
+from scripts.message import repeat_guard
+from scripts.message.relay_identity import relay_session_name
+from scripts.message.relay_test_support import write_relay_record
 from scripts.lib import names
 from scripts.production import staff
 from scripts.whoami import account
-import process_table
+from scripts.message import process_table
 from scripts.message import send_result
 from scripts.message.unit_labels import LiveRun, NoRunningDirector, StaffRowAnomaly
 from scripts.message.recipient_test_support import staff_child_command
 from scripts.lib.test_names import fixture_names
-import rca
+from scripts.message import rca
 
-import review
-import push_texts
-import push_reference
-import postmaster
-import silence
-from test_postmaster import FakeClock
-import codex_daemon
-from codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
-import roster
-import sessions
+from scripts.notify import review
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.message import postmaster
+from scripts.notify import silence
+from scripts.message.test_postmaster import FakeClock
+from scripts.message import codex_daemon
+from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
+from scripts.message import roster
+from scripts.message import sessions
 if TYPE_CHECKING:
     from ..accounts import accounts
 else:
     from scripts.accounts import accounts
-from test_support import ShutdownTestCase
-from user_zone import user_zone
-from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
+from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.lib.user_zone import user_zone
+from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -4424,7 +4424,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 self.assertEqual(failed.message, "Session: Owner\nAction: stop Owner\nReason: waiting.")
 
     def test_catalog_session_is_kept_when_delivery_fails_before_review(self) -> None:
-        import push_texts
+        from scripts.notify import push_texts
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
             push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
             (push_texts.PushExample("typical", {}),), purpose="Test.", session=push_texts.SessionTemplate("Owner"))
@@ -5269,8 +5269,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         _ = executable.write_text(
             f"#!{sys.executable}\n"
             + "import json, socket, sys\n"
-            + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
-            + "from test_send import INIT, OK, answer, call, stream\n"
+            + "from scripts.message.test_send import INIT, OK, answer, call, stream\n"
             + "prompt = sys.stdin.read()\n"
             + "target = json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith('- to: ')))\n"
             + "text = prompt.split('----- BEGIN MESSAGE -----\\n', 1)[1].rsplit('\\n----- END MESSAGE -----', 1)[0]\n"

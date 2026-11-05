@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 else:
     from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
-from user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
+from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
                          NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)
 
 Need = Literal["note", "decision", "blocked"]
@@ -99,7 +99,7 @@ class RenderedPush:
 
 
 def catalog() -> tuple[PushText, ...]:
-    module = importlib.import_module("push_catalog")
+    module = importlib.import_module('scripts.notify.push_catalog')
     entries = cast(tuple[PushText, ...], module.ENTRIES)
     if len({entry.id for entry in entries}) != len(entries):
         raise ValueError("duplicate push text id")

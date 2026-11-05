@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Serve review snapshots only on this machine's Tailscale IPv4 address."""
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import BinaryIO, cast, override
 from urllib.parse import parse_qs, unquote, urlsplit
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.production import change_routing
 from scripts.review_links import change_page, change_browser

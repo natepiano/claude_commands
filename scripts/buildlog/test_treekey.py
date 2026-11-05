@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-import treekey
-from test_index import use_test_log
+from scripts.buildlog import treekey
+from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
@@ -113,7 +113,7 @@ class TreeKeyTests(unittest.TestCase):
         source = self.repo / "src" / "new.rs"
         _ = source.write_text("pub fn two() {}\n")
         self.assertNotEqual(key(self.repo), self.clean)
-        with patch("treekey.open", side_effect=FileNotFoundError("file removed")) as read:
+        with patch("scripts.buildlog.treekey.open", side_effect=FileNotFoundError("file removed")) as read:
             self.assertIsNone(treekey.tree_key(str(self.repo)))
         read.assert_called_once_with(os.fsencode(source), "rb")
 
@@ -122,7 +122,7 @@ class TreeKeyTests(unittest.TestCase):
         link.unlink()
         link.symlink_to("src/lib.rs")
         self.assertNotEqual(key(self.repo), self.clean)
-        with patch("treekey.os.readlink", side_effect=OSError("link replaced")) as read:
+        with patch("scripts.buildlog.treekey.os.readlink", side_effect=OSError("link replaced")) as read:
             self.assertIsNone(treekey.tree_key(str(self.repo)))
         read.assert_called_once_with(os.fsencode(link))
 

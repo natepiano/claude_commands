@@ -16,11 +16,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from user_zone import user_zone_name  # noqa: E402
+from scripts.lib.user_zone import user_zone_name  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-from update_registration import ReportItem as ReportItem, reports_path as reports_path
-from update_registration import QuestionStaff
+from scripts.production.update_registration import ReportItem as ReportItem, reports_path as reports_path
+from scripts.production.update_registration import QuestionStaff
 from scripts.production import showrunners, staff
 
 DAILIES = Path(__file__).resolve().parent.parent / "production" / "dailies_render.py"
@@ -58,7 +58,7 @@ def key_values(path: Path) -> dict[str, str]:
 
 
 def outstanding_path(slug: str, *, identities: QuestionStaff | None = None) -> Path:
-    from update_registration import outstanding_file
+    from scripts.production.update_registration import outstanding_file
 
     return outstanding_file(slug, identities=identities)
 
@@ -121,8 +121,8 @@ def read_production(instance_dir: Path) -> Production | None:
 def open_questions(productions: list[Production], *, identities: QuestionStaff | None = None) -> int | None:
     """Count due questions and report unavailable ownership or unreadable records."""
     sys.path.insert(0, str(DAILIES.parent))
-    from update_registration import RegistrationFailure, read_open_items
-    from dailies_render import InputError, due
+    from scripts.production.update_registration import RegistrationFailure, read_open_items
+    from scripts.production.dailies_render import InputError, due
 
     try:
         identities = identities if identities is not None else QuestionStaff.read()
@@ -153,8 +153,8 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
 def deferred_until(slugs: list[str], zone: str, *, identities: QuestionStaff | None = None) -> datetime | None:
     """Return the first deferred time from readable stores and report unavailable stores."""
     sys.path.insert(0, str(DAILIES.parent))
-    from update_registration import RegistrationFailure, read_open_items
-    from dailies_render import InputError, DeferredUntil
+    from scripts.production.update_registration import RegistrationFailure, read_open_items
+    from scripts.production.dailies_render import InputError, DeferredUntil
 
     try:
         identities = identities if identities is not None else QuestionStaff.read()

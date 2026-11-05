@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from scripts.lib import conf
 else:
-    import conf
+    from scripts.lib import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import queue_evidence
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply

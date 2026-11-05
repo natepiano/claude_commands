@@ -22,7 +22,7 @@ from scripts.lib.test_models_registry import registry_text, write_registry
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami import note_file
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import CodexHomeSource, Quota, Report
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
@@ -31,8 +31,8 @@ from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker
 from scripts.shutdown import stop_resume
 from scripts.whoami import usage_store
-from push_texts import RenderedPush, catalog, render_entry
-from user_action import ActionRequired
+from scripts.notify.push_texts import RenderedPush, catalog, render_entry
+from scripts.notify.user_action import ActionRequired
 from test_quota_alert import REGISTRY
 
 CURRENT_READING_AGE = timedelta()
@@ -1191,7 +1191,7 @@ always=director
         self.assertEqual(agent_accounts.workers_home(), a.home)
 
     def test_paid_credits_catalog_entries_use_exact_values_and_queued_advice(self) -> None:
-        from push_texts import catalog, render_entry
+        from scripts.notify.push_texts import catalog, render_entry
         ids = {"quota.paid_credits", "quota.paid_credits_queued"}
         entries = [entry for entry in catalog() if entry.id in ids]
         self.assertEqual({entry.id for entry in entries}, ids)

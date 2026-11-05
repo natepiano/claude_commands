@@ -245,7 +245,7 @@ class _WorkerSources:
         self.native_running: dict[str, dict[str, str]] = {
             identity: {"claude": identity} for identity in self.running}
         from scripts.message import process_table
-        import herdr
+        from scripts.herdr import herdr
         try:
             for process in process_table.snapshot().values():
                 try:
@@ -546,7 +546,7 @@ def migration_peer_identities(record: staff.StaffSnapshot) -> tuple[dict[staff.S
 def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tuple[str, ...]]:
     """Read only stored production documents and non-scratch launch evidence."""
     problems: list[str] = []
-    import herdr
+    from scripts.herdr import herdr
     from scripts.shutdown import pane_record
     launches = pane_record.read_strict(herdr.shared_session())
     permitted: list[pane_record.PaneLaunch] = []

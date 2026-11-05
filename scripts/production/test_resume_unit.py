@@ -26,13 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import resume_unit
 import add_unit
 import retire_unit
-import sessions as retirement_sessions
+from scripts.message import sessions as retirement_sessions
 import unit_lookup
 import unit_move
 import test_retire_unit
 from scripts.production.production_doc import Production, read_production
 import pane_record
-from herdr import HerdrPlace
+from scripts.herdr.herdr import HerdrPlace
 
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic

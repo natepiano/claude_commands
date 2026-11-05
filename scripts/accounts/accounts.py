@@ -2267,7 +2267,7 @@ def live_group_members(*, registrations: ShowrunnerRegistrations | Literal["read
     if TYPE_CHECKING:
         from scripts.shutdown import inventory
     else:
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
     members: dict[ClaudeGroup, list[ListedSession]] = {"units": [], "showrunners": []}
     for session in inventory.listing(registrations=registrations):
         group = session_group(session)
@@ -2700,7 +2700,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, account_config
     if TYPE_CHECKING:
         from scripts.shutdown import inventory
     else:
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
 
     checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
     if isinstance(checked, MoveRefused):
@@ -2916,7 +2916,7 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     if TYPE_CHECKING:
         from scripts.shutdown import inventory
     else:
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
     registrations = inventory.showrunner_registrations()
     members = live_group_members(registrations=registrations)[group]
     selected = [session for session in members if not session_on_account(session, target)]
@@ -2967,7 +2967,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
     if TYPE_CHECKING:
         from scripts.shutdown import inventory
     else:
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
     try:
         now = datetime.now(timezone.utc)
         checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)

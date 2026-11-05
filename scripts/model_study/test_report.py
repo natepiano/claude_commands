@@ -16,9 +16,9 @@ from typing import cast
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-import compare
-import model_study
-from compare import (
+from scripts.model_study import compare
+from scripts.model_study import model_study
+from scripts.model_study.compare import (
     ArmCounts,
     ComparisonReport,
     CompactionComparison,
@@ -30,8 +30,8 @@ from compare import (
     DropSummary,
     TurnClassStatistics,
 )
-from phases import PhaseComparison, PhaseDifference, PhaseReport, PhaseRow
-from report import ExtractReport, ExtractSession, SAMPLE_DEADLINE_PDT, message, ready, recommendation_line, render, verdict
+from scripts.model_study.phases import PhaseComparison, PhaseDifference, PhaseReport, PhaseRow
+from scripts.model_study.report import ExtractReport, ExtractSession, SAMPLE_DEADLINE_PDT, message, ready, recommendation_line, render, verdict
 
 
 NOW = datetime(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles"))

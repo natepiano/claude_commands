@@ -29,12 +29,12 @@ from merge_checkpoint import NoMerge, merge_branch_history, report
 
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup, unit_names
 from scripts.production.session_labels import StaffLabels
-from proposals_folder import issues_folder, slug_of
+from scripts.production.proposals_folder import issues_folder, slug_of
 from scripts.production.store_owner import document_id, showrunner_id
-from issues import Issue, frontmatter
-import urgency
-from urgency import Urgency, UrgencyError
-from atomic_file import write_text_atomic
+from scripts.production.issues import Issue, frontmatter
+from scripts.lib import urgency
+from scripts.lib.urgency import Urgency, UrgencyError
+from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from ..usage import agents_log
@@ -1423,7 +1423,7 @@ def review_open_question(slug: str, item: QuestionForReview) -> AcceptedQuestion
     if TYPE_CHECKING:
         from ..notify import review
     else:
-        import review
+        from scripts.notify import review
     outcome = review.review_question(review.QuestionKey(slug, item.text), item.question)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)

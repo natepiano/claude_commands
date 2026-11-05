@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_unit_host
 from scripts.production import session_staff, showrunners, staff_sources
-from sessions import SessionRecord
+from scripts.message.sessions import SessionRecord
 from fake_unit_host import HostedUnit
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff

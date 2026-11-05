@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
-from targets import (
+from scripts.build_targets.targets import (
     ANY_ELIGIBLE_TARGET,
     AwsStatusRow,
     RemovalPending,
@@ -52,14 +52,13 @@ from targets import (
     target_state,
     target_eligibility,
 )
-from target_config import is_aws_target
-import offload
-import mac_test
-import conf
-from atomic_file import write_text_atomic
-import build_hold
-import override_guard
-from user_zone import user_zone
+from scripts.build_targets.target_config import is_aws_target
+from scripts.mac_test import mac_test, offload
+from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_hold import build_hold
+from scripts.build_hold import override_guard
+from scripts.lib.user_zone import user_zone
 if TYPE_CHECKING:
     from ..lib import process_start as process_identity
     from ..direct.step_record import Pinned, ROUTED, TargetSelection

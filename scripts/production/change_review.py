@@ -34,16 +34,16 @@ from typing import TypeVar, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from atomic_file import write_text_atomic  # noqa: E402
-import scratch  # noqa: E402
-import urgency  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
+from scripts.lib import scratch  # noqa: E402
+from scripts.lib import urgency  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 # The merge gate imports this module as scripts.production.change_review; its siblings still resolve.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import issues  # noqa: E402
-from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
-from scripts.production import change_routing, session_staff, staff, unit_config, unit_lookup, unit_names
+from scripts.production import issues  # noqa: E402
+from scripts.production.proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
+from scripts.production import change_routing, session_staff, showrunner_tree, staff, unit_config, unit_lookup, unit_names
 from scripts.production.production_doc import Refusal, production_field
 from scripts.shutdown import remote
 
@@ -630,7 +630,6 @@ def pending(path: Path) -> list[dict[str, str]]:
 def scope_list(doc: Path) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
     from scripts.production import showrunners
-    import showrunner_tree
 
     if doc.is_file() and (value := _line_value(doc)):
         return Path(value).expanduser()
@@ -663,7 +662,6 @@ class ScopedReviewEntry:
 
 def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionReviewList, ...]:
     """The current list and each scoped production's own earlier list, once per path."""
-    import showrunner_tree
 
     owner = _owner(path) if path.name.startswith(PREFIX) else showrunner_tree.root_of(slug_of(doc))
     lists = {path.absolute(): ProductionReviewList(path, owner)}
@@ -780,7 +778,6 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
         return ChangeQueue(queue(path), row_entries(change_routing.waiting_rows(path, pending(path))))
-    import showrunner_tree
 
     slug = slug_of(scope)
     name = queue(path) if slug == showrunner_tree.root_of(slug) else f"{queue(path)}-{slug}"
@@ -915,7 +912,6 @@ def producer_at(directory: Path, record: staff.StaffSnapshot) -> staff.StaffId |
 def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Path]:
     """Resolve child production documents with the held staff snapshot."""
     from scripts.production import showrunners
-    import showrunner_tree
 
     docs = showrunners.timer_docs()
     children = showrunner_tree.descendants_of(slug_of(production), record=record)
@@ -1048,7 +1044,6 @@ def trace(row: dict[str, str], tree: Tree) -> Path | str:
 
 def list_tree(path: Path, docs: Iterable[Path]) -> Tree:
     """The productions whose root keeps the list `path`, with every production below each root."""
-    import showrunner_tree
 
     owned: list[Path] = []
     for doc in docs:
@@ -1380,7 +1375,6 @@ def showrunner_of(doc: Path, *,
     name as it is now, never the production slug, so it is read only while that showrunner runs.
     """
     from scripts.production import showrunners
-    import showrunner_tree
 
     try:
         slug = showrunners.production_slug(str(doc))
@@ -1452,7 +1446,6 @@ def foreign_units(production: Path, *,
     Empty when the productions cannot be read: drift then counts every checkpoint.
     """
     from scripts.production import showrunners
-    import showrunner_tree
 
     try:
         record = staff.snapshot() if record is None else record

@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import unittest
 
-import push_texts
-from user_action import ActionRequired, NoActionRequired, action_conflicts
+from scripts.notify import push_texts
+from scripts.notify.user_action import ActionRequired, NoActionRequired, action_conflicts
 
 TILE = ActionRequired("On natedev, in the tile pane, approve the prompt or add an allow rule")
 

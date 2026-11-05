@@ -18,13 +18,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import store
+from scripts.buildlog import store
 from scripts.message import send_budget, session_send
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
+from scripts.lib import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-import override_guard
+from scripts.build_hold import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
     from ..copies import copies
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 else:
     from scripts.copies import copies
     from scripts.lib import cargo_output, scratch
-    import review
+    from scripts.notify import review
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 HANA = Path.home() / "rust/hana"
@@ -185,7 +185,7 @@ def send_release_text(push: RenderedPush) -> bool:
     if TYPE_CHECKING:
         from ..notify.push_texts import user_send_argv
     else:
-        from push_texts import user_send_argv
+        from scripts.notify.push_texts import user_send_argv
 
     command = session_send.send_argv(*user_send_argv(push)[2:])
     result = subprocess.run(command, capture_output=True, text=True,
@@ -424,7 +424,7 @@ def release_push(version: str, pin: str, trial: TrialOutcome) -> RenderedPush:
     if TYPE_CHECKING:
         from ..notify.push_texts import render
     else:
-        from push_texts import render
+        from scripts.notify.push_texts import render
 
     if trial["status"] != "finished":
         raise ValueError("incomplete compiler trials are log notes, not user pushes")

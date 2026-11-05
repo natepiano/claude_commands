@@ -33,8 +33,8 @@ from scripts.message import send_result
 from scripts.message import send_budget
 from scripts.production import showrunners, unit_names
 import style_ledger
-from process_failure import failure_detail
-import scratch
+from scripts.lib.process_failure import failure_detail
+from scripts.lib import scratch
 
 PYTHON = SCRIPTS / "lib/py"
 SEND = SCRIPTS / "message/send.py"

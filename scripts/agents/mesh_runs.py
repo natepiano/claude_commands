@@ -395,7 +395,7 @@ def command_start(args: argparse.Namespace) -> int:
         _write_record(record_path, record)
         with log_path.open("ab") as log:
             supervisor = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "supervise", str(record_path)],
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True, cwd=cwd,
             )

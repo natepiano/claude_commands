@@ -909,6 +909,52 @@ Source: sdlc 2026-11-04 11:5x (save gate time). A unit gates a tree that already
 
 **Acceptance gate:** the merge_gate and `test_merge_checkpoint*` modules pass; basedpyright `0 errors, 0 warnings, 0 notes`. Branch `sdlc-devtools-passed` off origin/sdlc 5e8bc5a52.
 
+### Phase 7s — review.sh keeps no tree check  · status: done (ecbae525c)
+
+Source: sdlc [e0265011], 2026-11-05. The tree check failed a review for the third time with no reviewer write (2026-10-12, 10-15, 11-05: the director's own plan write ran during the review). User rule 2026-11-05: a fix for a broken guard deletes the guard.
+
+**Depends on:** none. It lands as its own hash from the sdlc tip.
+
+#### Work Order
+
+**Goal:** `review.sh` makes no before and after tree fingerprint and reports no "changed the working tree" error.
+
+**Spec:**
+1. Delete the baseline and changes calls in `review.sh`, their variables, their error and board posts, and the status branch that the error sets.
+2. Delete `review_tree.py` and `test_review_tree.py`.
+3. Delete the tests that pin only the tree check. Keep every other test in those files.
+4. Delete the tree check text in `docs/as-built/long-lived-workers.md`.
+5. Add nothing in its place.
+
+**Files:** `scripts/direct/review.sh`, `scripts/direct/review_tree.py`, `scripts/direct/test_review_tree.py`, `scripts/direct/test_review_launcher_trees.py`, `scripts/direct/review_launcher_test_support.py`, `scripts/direct/test_simplify_lens.py`, `docs/as-built/long-lived-workers.md`.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:** no file names `review_tree` or "changed the working tree"; the direct review suites pass; the full gate passes; source net negative.
+
+### Phase 7t — Withdraw an open question whose cause is gone  · status: done (bb5854152)
+
+Source: sdlc [e93bf7b3], 2026-11-05, for natedev. First user: report-unit's hanadocs sync question. It lands as its own hash on top of 4fa36df93.
+
+**Depends on:** none.
+
+#### Work Order
+
+**Goal:** `update_registration.py withdraw --item <text>` removes one open item, records it in the question history as withdrawn, and prints no relay line.
+
+**Spec:**
+1. Move the open-item removal in `answer` into one function. `answer` and `withdraw` both call it. Do not copy it.
+2. `withdraw` matches one open item by its exact text, in the same lists that `answer` reads.
+3. `withdraw` writes the item to `<slug>.history.jsonl` with a `withdrawn` time. It writes nothing to `<slug>.answered.jsonl`.
+4. `withdraw` prints no `relay:` line.
+5. Add no other guard or check.
+
+**Files:** `scripts/production/update_registration.py`, `scripts/production/test_update_registration_answers.py`, `commands/showrunner/produce.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/message-clarity.md`.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:** a withdraw test removes the item, writes the history record, writes no answered record, and prints no relay line; the answer tests pass unchanged; the production suite passes.
+
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
 Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Reduced by the Phase 3t architect review (2026-11-05): the store migrations already shipped (`change_review.py:1118`, `phase_table.py:1939`, `board_json.py:462`), with tests for interruption, reruns and ownership changes, and proposal readers already resolve staff ids. Store 3 (saved tab titles) is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files and removes each store's rewriter there.
@@ -993,10 +1039,10 @@ Codex workers start only through `assign.sh`, and that path does what the old Co
 ### Phase 3z — One import rule  · status: todo
 
 **Approved** (user via sdlc [93de1898] 2026-11-05: "duplication removal is something i approve of. there is no quiet time - figure out how to sequence it correctly and do it"). No guard test (sdlc [e00ba3f9]; Spec item 6 dropped). Land it in small hashes, each net negative, which sdlc merges at once:
-1. Shared step: the `scripts/lib/py` shim sets the package root, and every managed entry (Spec item 4, outside callers on both machines included) runs through it. Old `sys.path` lines stay until their folder converts. Commit the rewrite script here.
+1. Shared step: the `scripts/lib/py` shim sets the package root, and every managed entry (Spec item 4, outside callers on both machines included) runs through it. Old `sys.path` lines stay until their folder converts. Commit the rewrite script here. This hash also converts the `remaining` group, `scripts/lint` and `scripts/settings`, so it is net negative.
 2. One hash per folder group (the 8 groups below). Each converts that group's imports and deletes its `sys.path` lines. Run the script on the newest sdlc tip just before each hash.
 3. Group order: before each hash, check the open unit branches (all productions on `~/.claude`) for changes in the group's folders. Convert untouched groups first. Convert a group a unit is changing right after that unit's merge lands. Measured at 3y's end (live worktree branches, 2 days): `remaining` 0 branches, `accounts` 2, `style` 2, `production` 4, `sessions` 5, `workers` 8, `build` 12.
-4. Last step: delete the rewrite script when no `sys.path` line is left.
+4. Last step: convert `scripts/lib` and the other shared files (`hook_dispatch`, `merge_gate`, `fast_track`, `module_run`), because every folder imports `scripts/lib`. Then delete the rewrite script, when no `sys.path` line is left.
 
 **Depends on:** Phase 3y
 

@@ -10,8 +10,8 @@ from types import ModuleType
 import dailies_input
 import fake_unit_host
 import fake_herdr
-import dailies_render
-from cli_fixture import ImmutableGitSeed, invoke_cli, production_paths
+from scripts.production import dailies_render
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli, production_paths
 import os
 import subprocess
 import sys

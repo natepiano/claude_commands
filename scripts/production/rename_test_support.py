@@ -23,11 +23,11 @@ from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
 import fake_herdr
-import herdr
+from scripts.herdr import herdr
 from scripts.shutdown import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
-import sessions as stop_sessions
+from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 import merge_checkpoint
 from scripts.production.production_doc import Production, read_production

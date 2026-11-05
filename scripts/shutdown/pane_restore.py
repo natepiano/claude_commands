@@ -19,9 +19,8 @@ for dependency in ("whoami", "message", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import herdr  # noqa: E402
-import pane_launch  # noqa: E402
-import pane_record  # noqa: E402
+from scripts.herdr import herdr, pane_launch  # noqa: E402
+from scripts.shutdown import pane_record  # noqa: E402
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.production import staff  # noqa: E402

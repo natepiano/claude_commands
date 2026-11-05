@@ -39,8 +39,8 @@ from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, Decl
                             UnansweredDecision, staff_reference, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from unit_files import file_text, git, unit_file_holders
 from unit_plans import PilotScope, crate_in_scope, family_pilot_scopes
-from process_failure import failure_detail
-from user_zone import user_zone
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone
 
 
 def proposal_command(*arguments: str) -> None:

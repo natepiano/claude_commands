@@ -20,29 +20,29 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import change_review
+from scripts.production import change_review
 import footer_counts
 import next_item
 from scripts.production.production_doc import Production
-import proposals_folder
+from scripts.production import proposals_folder
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
 )
 from scripts.production.test_change_review import producer_rows
-from change_review import Visible
+from scripts.production.change_review import Visible
 from next_item import NextError, Queue
 
 # Importable once next_item has put scripts/lib and scripts/nightly_review on the path.
-import urgency
-from urgency import Entry, Urgency
+from scripts.lib import urgency
+from scripts.lib.urgency import Entry, Urgency
 
 if TYPE_CHECKING:
     from ..nightly_review import candidates
 else:
-    import candidates
+    from scripts.nightly_review import candidates
 
 PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
 # The production an item in the tree test belongs to: each item's text holds `<slug>-item`.

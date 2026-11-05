@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Expected process-memory peaks and atomic build admission."""
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from dataclasses import MISSING, dataclass, field, fields, is_dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
 from functools import lru_cache
 from itertools import chain
@@ -31,18 +30,15 @@ from zoneinfo import ZoneInfo
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
-from build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
+from scripts.lint.build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
                          StepEvidence, TEST_STEPS, build_shape, index_step_evidence, recorded_build_shape)
-from atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
-import conf
+from scripts.lib import conf
 
 
-from test_phase import (
+from scripts.lib.test_phase import (
     CallRecord as CallRecord,
     NoCallRecord as NoCallRecord,
     TestPhaseChargeUse as TestPhaseChargeUse,
@@ -54,16 +50,16 @@ from test_phase import (
 )
 
 if TYPE_CHECKING:
-    from ..buildlog import parse
-    from ..buildlog import record as record
-    from ..buildlog import store as store
-    from ..buildlog import index
+    from scripts.buildlog import parse
+    from scripts.buildlog import record as record
+    from scripts.buildlog import store as store
+    from scripts.buildlog import index
     file_marks = index
 else:
-    import parse
-    import record
-    import store
-    import index as file_marks
+    from scripts.buildlog import parse
+    from scripts.buildlog import record
+    from scripts.buildlog import store
+    from scripts.buildlog import index as file_marks
 
 GIB = 1 << 30
 # 111 natedev filtered single-test runs with no recompilation in the 14 days
@@ -977,7 +973,6 @@ class PriorityRoster(Protocol):
 
 
 def priority_labels(session_ids: list[str] | RosterUnits) -> Mapping[str, UnitMembership]:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     roster = cast(PriorityRoster, cast(object, importlib.import_module("scripts.message.roster")))
     if isinstance(session_ids, RosterUnits):
         labels = roster.unit_labels(roster.roster(os.environ, roster.ThisMachine()).entries)

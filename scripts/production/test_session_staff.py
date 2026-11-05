@@ -8,8 +8,8 @@ from unittest import mock
 
 from scripts.production import session_staff as labels, staff
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
-import herdr
-from pane_launch import PaneLaunch
+from scripts.herdr import herdr
+from scripts.herdr.pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):

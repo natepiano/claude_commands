@@ -20,7 +20,6 @@ from unittest.mock import patch
 
 from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.review_links import serve
 from scripts.lib import atomic_file, conf
@@ -492,8 +491,9 @@ class ServerStartupTests(unittest.TestCase):
             _ = tailscale.write_text("#!/bin/sh\necho 'Tailscale is down' >&2\nexit 1\n", encoding="utf-8")
             tailscale.chmod(0o755)
             result = subprocess.run(
-                [sys.executable, str(Path(__file__).with_name("serve.py")), "--port", "0"],
-                env={**os.environ, "PATH": str(root), "REVIEW_LINKS_ROOT": str(root / "snapshots")},
+                ["/bin/bash", str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("serve.py")), "--port", "0"],
+                env={**os.environ, "PATH": str(root), "CLAUDE_PYTHON": sys.executable,
+                     "REVIEW_LINKS_ROOT": str(root / "snapshots")},
                 text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertNotEqual(result.returncode, 0)

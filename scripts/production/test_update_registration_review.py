@@ -15,7 +15,7 @@ from unittest import mock
 
 from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, dailies_render, read_production, review
 from scripts.production.cli_fixture import production_paths
-import showrunner_tree
+from scripts.production import showrunner_tree
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 

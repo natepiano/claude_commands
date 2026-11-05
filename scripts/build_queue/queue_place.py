@@ -14,18 +14,13 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
+from typing import BinaryIO, TypedDict, Unpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
 import uuid
-
-if TYPE_CHECKING:
-    from scripts.lib import conf
-else:
-    import conf
 
 
 @dataclass(frozen=True)
@@ -306,7 +301,7 @@ class QueuePlace:
         holder_start = memory_admit.process_start_time(holder_pid)
         if holder_start is None:
             raise QueuePlaceRefused("the queue place holder has no live process identity")
-        command = ([*prefix, sys.executable, str(Path(__file__).resolve()), "--scope-start", str(self.sidecar),
+        command = ([*prefix, str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "--scope-start", str(self.sidecar),
                     str(holder_pid), holder_start, *argv]
                    if prefix else list(argv))
         with defer_start_signals():

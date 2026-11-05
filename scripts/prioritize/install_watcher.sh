@@ -7,7 +7,7 @@ LABEL="com.natemccoy.hanadocs-prioritize"
 # by VERSION rather than by path. These scripts used to pin "$PY" --
 # Apple 3.9 on the Mac, nonexistent on NixOS. The pin was never load-bearing:
 # the tests in tests/ import typing.override and cannot run under 3.9 at all.
-PY="$HOME/.claude/scripts/lib/py"
+PY="${BASH_SOURCE[0]%/*}/../lib/py"
 # This script installs a launchd .plist, which only means anything on macOS.
 # On NixOS the same daemon is declared in /etc/nixos/modules/hanadocs-prioritize.nix
 # and installed by `rebuild`, so exit cleanly and say where to look rather than

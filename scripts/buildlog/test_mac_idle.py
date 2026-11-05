@@ -22,10 +22,9 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import cli
-import index
-import mac_idle
-import sample
+from scripts.buildlog import cli
+from scripts.buildlog import index
+from scripts.buildlog import mac_idle, sample
 if TYPE_CHECKING:
     from ..build_queue import admission_protocol as wire
     from ..build_queue import admission_client
@@ -43,14 +42,14 @@ else:
     from scripts.build_queue import admission_client
     from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
     from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance
-    import mac_test
+    from scripts.mac_test import mac_test
     from scripts.direct import step_record
     from scripts.lib import conf
     from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings
     from scripts.notify.push_texts import catalog, render_entry
     from scripts.notify.push_catalog import mac_idle_reservation
     from scripts.message import send
-from test_index import use_test_log
+from scripts.buildlog.test_index import use_test_log
 if TYPE_CHECKING:
     from ..lib.process_group import send_process_group
 else:
@@ -899,7 +898,7 @@ done
             subprocess.CompletedProcess[str]([], 1, "QUEUED: socket", "")]) as run:
             self.assertTrue(mac_idle.notify_showrunner("Mac idle watch: idle_with_waiter"))
         self.assertEqual(run.call_args_list[0].args[0],
-                         [sys.executable, str(mac_idle.SCRIPTS / "production/showrunners.py"), "address", "builds"])
+                         [str(mac_idle.SCRIPTS / "lib/py"), str(mac_idle.SCRIPTS / "production/showrunners.py"), "address", "builds"])
         command = cast(list[str], run.call_args_list[1].args[0])
         self.assertEqual(command[command.index("--to") + 1], "uds:/tmp/builds.sock")
         self.assertEqual(command[command.index("--text") + 1], "Mac idle watch: idle_with_waiter")

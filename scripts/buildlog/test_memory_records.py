@@ -19,13 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment
 else:
-    from memory_test_support import config_environment
+    from scripts.lint.memory_test_support import config_environment
 
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 else:
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from test_index import Record, call, encode, point_root_at, sample, step
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, sample, step
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -61,7 +61,7 @@ class MemoryRecordTests(unittest.TestCase):
 
     def run_script(self, script: Path, *args: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(script), *args],
+            [str(HERE.parent / "lib/py"), str(script), *args],
             cwd=self.base,
             env=self.env(**(extra or {})),
             capture_output=True,
@@ -82,8 +82,8 @@ class MemoryRecordTests(unittest.TestCase):
         _ = path.write_bytes(b"".join(encode(record) for record in records))
 
     def test_build_program_matches_resolved_roots_not_target_name(self) -> None:
-        import memory
-        from cargo_output import CargoOutputRoots
+        from scripts.buildlog import memory
+        from scripts.lib.cargo_output import CargoOutputRoots
 
         roots = CargoOutputRoots(self.base, self.base / "artifacts", self.base / "intermediates")
         _ = (self.base / "Cargo.toml").write_text("[workspace]\n")

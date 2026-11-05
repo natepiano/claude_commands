@@ -26,15 +26,15 @@ if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment, write_config_fixture
     from ..lint.test_build_shape import create_step_index, record_root_attempt
 else:
-    from memory_test_support import config_environment, write_config_fixture
-    from test_build_shape import create_step_index, record_root_attempt
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+    from scripts.lint.test_build_shape import create_step_index, record_root_attempt
 
-import index
-import memory
-from cargo_output import CargoOutputRoots, CargoOutputUnavailable
-from cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
-import store
-from test_index import Record, call, encode, point_root_at, sample, step
+from scripts.buildlog import index
+from scripts.buildlog import memory
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
+from scripts.buildlog.cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
+from scripts.buildlog import store
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, sample, step
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -158,7 +158,7 @@ class MemoryWindowTests(unittest.TestCase):
 
     def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(CLI), *args],
+            [str(CLI.resolve().parents[1] / "lib/py"), str(CLI), *args],
             cwd=self.base,
             env=self.env(),
             capture_output=True,
@@ -600,7 +600,7 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertIn("kernel OOM kills: 0", empty.stdout)
 
     def test_missing_journal_command_is_unavailable(self) -> None:
-        with patch("memory.subprocess.run", side_effect=FileNotFoundError):
+        with patch("scripts.buildlog.memory.subprocess.run", side_effect=FileNotFoundError):
             result = memory.journal_messages([], datetime.fromisoformat(START), datetime.fromisoformat(END))
         self.assertIs(result, memory.JournalUnavailable.VALUE)
 

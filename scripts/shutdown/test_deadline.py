@@ -16,8 +16,8 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import herdr
-import restart
+from scripts.herdr import herdr
+from scripts.shutdown import restart
 from scripts.lib import operation_deadline
 from scripts.production import staff
 from scripts.shutdown import stop_resume

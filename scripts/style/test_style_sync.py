@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
-
 import errno
 import fcntl
 import io
@@ -30,13 +28,13 @@ from unittest import mock
 import style_sync
 from add_style import NoStyleProduction
 from scripts.copies import copies
-import scratch
+from scripts.lib import scratch
 import style_ledger
 import style_rules
 from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners
-from ledger_test_support import style_staff_fixture, style_unit_id
+from ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id
 from scripts.message import send_budget
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS

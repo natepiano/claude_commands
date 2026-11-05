@@ -24,10 +24,10 @@ MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
 sys.path.insert(0, str(MESSAGE.parent / "herdr"))
 sys.path.insert(0, str(MESSAGE.parents[1]))
-import herdr  # noqa: E402
-import sessions  # noqa: E402
-from herdr import HerdrPlace  # noqa: E402
-from sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
+from scripts.message import sessions  # noqa: E402
+from scripts.herdr.herdr import HerdrPlace  # noqa: E402
+from scripts.message.sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
 from scripts.production import staff, showrunners, session_staff, unit_config  # noqa: E402
 from scripts.production.session_labels import StaffLabels
 from scripts.shutdown import remote

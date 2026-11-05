@@ -157,7 +157,7 @@ class WasteWatchTests(unittest.TestCase):
             "- impl codex rker-one: 14% of 1,050,000 weighted",
             "- impl codex rker-two: 100% of 51,000 weighted",
             "Most common waiting action: sleep (2 requests).",
-            "See more: python3 ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
+            "See more: ~/.claude/scripts/lib/py ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
             + "--since 2026-10-16T10:00:00+00:00",
         ])
         self.assertEqual(self.alert_times(), {"alpha": NOW.isoformat()})
@@ -284,7 +284,7 @@ class WasteWatchTests(unittest.TestCase):
             + "250,000 tokens for 5 or more requests in a row in the last 2 hours",
             "Context above 250,000 tokens, so compaction is not happening:",
             "- impl codex k-worker: 5 requests in a row, peak 300,000 tokens",
-            "See more: python3 ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
+            "See more: ~/.claude/scripts/lib/py ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
             + "--since 2026-10-16T10:00:00+00:00",
         ])
 

@@ -67,6 +67,6 @@ conf_value() {
         fi
     fi
     if [[ "$valid" == 1 ]]; then printf '%s\n' "$value"
-    else python3 "$_CONF_READER" get "$file" "$key"
+    else "${_CONF_READER%/*}/py" "$_CONF_READER" get "$file" "$key"
     fi
 }

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Memory admission with only temporary history, cgroups, and ledgers."""
 
 from __future__ import annotations
@@ -23,35 +23,27 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal, cast, override
+from typing import BinaryIO, Literal, cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-import conf
+from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
 from scripts.build_queue.admission_test_support import AdmissionFixture, InjectedCrash, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, write_process
-import nextest_budget as budget
-from build_shape import BuildShape, build_shape
-from memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
-if TYPE_CHECKING:
-    from ..buildlog import store
-    from ..buildlog import record as buildlog_record
-    from ..buildlog import index as file_marks
-    from ..lib import test_hang_guard
-    from ..message.roster import UnitLabels
-else:
-    import store
-    import record as buildlog_record
-    import index as file_marks
-    from scripts.lib import test_hang_guard
-    from scripts.message.roster import UnitLabels
+from scripts.lint import nextest_budget as budget
+from scripts.lint.build_shape import BuildShape, build_shape
+from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
+from scripts.buildlog import store
+from scripts.buildlog import record as buildlog_record
+from scripts.buildlog import index as file_marks
+from scripts.lib import test_hang_guard
+from scripts.message.roster import UnitLabels
 
 READY_FOR_ADMISSION = gate.ReadyForAdmission()
 
@@ -1249,7 +1241,7 @@ class FreshTestPromiseTests(unittest.TestCase):
                     "BUILDLOG_TREE_START": "same-source", "BUILDLOG_TEST_BUILD_KEY": "current-key"}), \
                     patch.object(buildlog_record, "git_directory", return_value=str(self.worktree)), \
                     patch.object(buildlog_record, "git_facts", return_value={"worktree": str(self.worktree)}), \
-                    patch("treekey.tree_key", return_value=ending_source), \
+                    patch("scripts.buildlog.treekey.tree_key", return_value=ending_source), \
                     patch.object(buildlog_record, "rustc_version", return_value="rustc fixture"), \
                     patch.object(store, "host_name", return_value=self.host), \
                     patch.object(store, "host_file", return_value=path):
@@ -1958,7 +1950,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
 
 
     def test_charge_wire_types_have_one_shared_owner(self) -> None:
-        import test_phase
+        from scripts.lib import test_phase
 
         pairs = (
             (gate.TestPhaseChargeUse, test_phase.TestPhaseChargeUse),
@@ -1971,7 +1963,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 self.assertIs(exported, shared)
 
     def test_shared_charge_check_rejects_invalid_fields(self) -> None:
-        import test_phase
+        from scripts.lib import test_phase
 
         evidence: dict[str, object] = {
             "bytes": 8192, "selected_at": 123, "reservation_id": "own",
@@ -1990,7 +1982,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 _ = test_phase.parse_test_phase_charge_use({**evidence, **change})
 
     def test_saved_charge_keeps_admission_need_validation(self) -> None:
-        import test_phase
+        from scripts.lib import test_phase
 
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "reservation.json"

@@ -29,13 +29,13 @@ sys.path.insert(0, str(SCRIPTS.parent))
 for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-import herdr
+from scripts.herdr import herdr
 from scripts.lib import operation_deadline
 from scripts.message import session_send
-import pane_record
+from scripts.shutdown import pane_record
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
-import pane_launch
+from scripts.herdr import pane_launch
 from scripts.lib.resume_message import (
     ResumeWorkers as ResumeWorkers,
     NO_WORKERS as NO_WORKERS,
@@ -48,7 +48,7 @@ from scripts.shutdown.stop_results import (
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
     ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
 )
-import sessions
+from scripts.message import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
@@ -375,7 +375,7 @@ def _member_machine(member: StaffRow) -> str:
 
 def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
     """Select close names from local units and showrunners."""
-    import remote
+    from scripts.shutdown import remote
 
     machine = remote.local_machine()
     return sorted({row.name for row in names.tab_record.rows
@@ -399,7 +399,7 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
     if len(matches) > 1:
         return ResumeFailed(session, f"ambiguous name; candidates: {candidates}")
     if matches:
-        import remote
+        from scripts.shutdown import remote
 
         member = matches[0]
         machine = _member_machine(member)
@@ -468,8 +468,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry = entry.copy()
         entry["session_id"] = identity
         entry["environment"] = names.environment(entry)
-        from inventory import codex_seats
-        import unit_runs
+        from scripts.shutdown.inventory import codex_seats
+        from scripts.lib import unit_runs
 
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
@@ -615,9 +615,9 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     from scripts.accounts import unit_watchdog
     from scripts.notify.push_texts import render
     from datetime import datetime, timezone
-    import quota_alert
-    from probe_session import PROBE_ENV
-    import remote
+    from scripts.whoami import quota_alert
+    from scripts.lib.probe_session import PROBE_ENV
+    from scripts.shutdown import remote
 
     try:
         record = staff.snapshot()

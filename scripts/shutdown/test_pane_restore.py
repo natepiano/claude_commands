@@ -21,14 +21,13 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.message import sessions as runtime_sessions
-import unit_move
+from scripts.production import unit_move
 
-import pane_restore  # first: it puts the herdr scripts on the path
-import herdr  # noqa: E402
-import pane_record  # noqa: E402
-import pane_launch
-import sessions  # noqa: E402
-from test_support import conversation_liveness
+from scripts.shutdown import pane_restore  # first: it puts the herdr scripts on the path
+from scripts.herdr import herdr  # noqa: E402
+from scripts.shutdown import pane_record  # noqa: E402
+from scripts.herdr import pane_launch
+from scripts.message import sessions  # noqa: E402
 
 END_HOOK = Path(__file__).resolve().parent.parent / "hooks/session-end-pane-record.py"
 SETTINGS = '{"disableAgentView": true}'
@@ -202,7 +201,6 @@ class PaneRestoreTests(unittest.TestCase):
                         mock.patch.dict(os.environ, {"HOME": str(self.root),
                             "HERDR_PANE_RECORD_DIR": str(self.root / "herdr-panes")}),
                         mock.patch.object(sessions, "session_liveness", side_effect=session_liveness),
-                        mock.patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness),
                         mock.patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
                         mock.patch.object(sessions, "running_sessions", list),
                         mock.patch.object(herdr, "open_tab", self.open_tab)):

@@ -38,11 +38,11 @@ if TYPE_CHECKING:
     from scripts.shutdown import pane_record
     from scripts.message import sessions
 else:
-    herdr = import_module("herdr")
-    live_units = import_module("live_units")
-    unit_lookup = import_module("unit_lookup")
-    pane_record = import_module("pane_record")
-    sessions = import_module("sessions")
+    herdr = import_module("scripts.herdr.herdr")
+    live_units = import_module("scripts.production.live_units")
+    unit_lookup = import_module("scripts.production.unit_lookup")
+    pane_record = import_module("scripts.shutdown.pane_record")
+    sessions = import_module("scripts.message.sessions")
 from scripts.lib.user_zone import user_zone
 
 
@@ -216,7 +216,7 @@ def _start_recovery(source: RecoverySource, job: RecoveryJob, timeout: float) ->
     # The child resolves the staff reference before the start.
     command = [os.environ.get("SHUTDOWN_SYSTEMD_RUN", "systemd-run"), "--user", "--collect", "--quiet", "--no-block",
         "--property=RuntimeMaxSec=" + str(_recovery_seconds()), "--working-directory=" + str(SCRIPTS.parent),
-        "--", sys.executable, "-m", "scripts.accounts.unit_watchdog", "--recover",
+        "--", str(SCRIPTS / "lib/py"), "-m", "scripts.accounts.unit_watchdog", "--recover",
         source.label, source.identity, job["result"], source.identity]
     try:
         child = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,

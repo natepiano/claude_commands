@@ -41,12 +41,12 @@ from scripts.production.staff_test_support import isolated_staff_file, showrunne
 import fake_unit_host
 from fake_unit_host import HostedUnit
 import fake_herdr
-import herdr
+from scripts.herdr import herdr
 import stall_watch
-from session_pane import HerdrFailure, read_place, agent_status
+from scripts.production.session_pane import HerdrFailure, read_place, agent_status
 import context_usage
 import rca
-from cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli
 from test_showrunners import stalled_session_reader
 import unit_lookup
 
@@ -1226,7 +1226,6 @@ always=natedev
     def test_stop_retires_a_transferred_units_current_production_key(self) -> None:
         import pane_record
         from scripts.shutdown import pane_record as staff_launches
-        import herdr
 
         self.configure({"showrunner": ["unit-one"], "receiver": []})
         row = unit_membership("showrunner", "unit-one")
@@ -1798,7 +1797,7 @@ always=natedev
 
     def test_a_helpers_pending_bash_call_names_its_command_cut_to_90_characters(self) -> None:
         import stall_watch
-        import push_texts
+        from scripts.notify import push_texts
         helpers = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee" / "subagents"
         helpers.mkdir(parents=True)
         _ = (self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl").write_text(

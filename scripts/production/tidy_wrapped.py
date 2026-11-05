@@ -18,10 +18,10 @@ from scripts.production.store_owner import document_id, showrunner_id  # noqa: E
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
-from proposals_folder import issues_folder  # noqa: E402
+from scripts.production.proposals_folder import issues_folder  # noqa: E402
 
 if TYPE_CHECKING:
-    from update_registration import QuestionStaff
+    from scripts.production.update_registration import QuestionStaff
 
 STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -43,7 +43,7 @@ def outstanding_path(slug: str, *, identities: QuestionStaff | None = None) -> P
 
 
 def owned_paths(slug: str, *, identities: QuestionStaff | None = None) -> tuple[Path, ...]:
-    from update_registration import QuestionStaff
+    from scripts.production.update_registration import QuestionStaff
 
     if not SLUG.fullmatch(slug) or slug in SHARED:
         raise TidyRefused(f"{slug!r} is not a production slug")
@@ -67,7 +67,7 @@ def can_hold_questions(document: Path) -> bool:
 
 def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:
     """Close the production's questions and delete its state files."""
-    from update_registration import QuestionFolder, QuestionStaff, close_questions, question_folder
+    from scripts.production.update_registration import QuestionFolder, QuestionStaff, close_questions, question_folder
 
     if not SLUG.fullmatch(slug) or slug in SHARED:
         raise TidyRefused(f"{slug!r} is not a production slug")
@@ -131,7 +131,7 @@ def main(argv: list[str]) -> int:
     if not argv:
         print("usage: tidy_wrapped.py <production doc>...", file=sys.stderr)
         return 2
-    from update_registration import QuestionStaff, RegistrationFailure
+    from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 
     identities: QuestionStaff | None = None
     failed = False

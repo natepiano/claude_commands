@@ -18,10 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 from scripts.production import staff, unit_config
 import unit_lookup
-import sessions
+from scripts.message import sessions
 from scripts.shutdown import stop_resume
-import herdr
-from herdr import HerdrPlace
+from scripts.herdr import herdr
+from scripts.herdr.herdr import HerdrPlace
 from test_support import ShutdownTestCase
 
 

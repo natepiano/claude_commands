@@ -27,17 +27,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.process_test_support import OwnedTestProcesses
-import push_texts  # noqa: E402
-import rca  # noqa: E402
-import review  # noqa: E402
-import send  # noqa: E402
-import sessions  # noqa: E402
+from scripts.notify import push_texts  # noqa: E402
+from scripts.message import rca  # noqa: E402
+from scripts.notify import review  # noqa: E402
+from scripts.message import send  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.production import session_staff  # noqa: E402
 from scripts.production import showrunners, staff, fake_showrunner  # noqa: E402
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, fixture_member  # noqa: E402
-from test_showrunners import stalled_session_reader  # noqa: E402
-import silence  # noqa: E402
-from user_action import NoActionRequired  # noqa: E402
+from scripts.production.test_showrunners import stalled_session_reader  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.notify.user_action import NoActionRequired  # noqa: E402
 
 OPENED = datetime(2026, 10, 23, 13, 30, tzinfo=timezone.utc)
 SHOWRUNNER = "uds:/tmp/cargo-liner-show.sock"
@@ -343,7 +343,7 @@ subprocess.run([sys.executable, '-c',
 
     def test_native_identity_uses_the_shared_member_resolver(self) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-        import unit_lookup
+        from scripts.production import unit_lookup
         self.assertIs(session_staff.member_sources, unit_lookup.member_sources)
 
     def test_a_by_hand_open_takes_the_newest_transcript_of_the_session_it_names(self) -> None:

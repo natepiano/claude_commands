@@ -19,11 +19,11 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-import costs
-import index
-import moments
-from user_zone import user_zone
-from costs import CostUnavailable as CostUnavailable
+from scripts.buildlog import costs
+from scripts.buildlog import index
+from scripts.buildlog import moments
+from scripts.lib.user_zone import user_zone
+from scripts.buildlog.costs import CostUnavailable as CostUnavailable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
@@ -144,7 +144,7 @@ def collect_charts(connection: sqlite3.Connection, start: datetime, end: datetim
     _ = connection.execute("BEGIN")
     try:
         reading = costs.read_costs(connection, start, end, boundary_context=True)
-        import record
+        from scripts.buildlog import record
 
         return build_series(reading, start, end, zone, record.configured_targets())
     finally:
@@ -264,7 +264,7 @@ def present_page(series: ChartSet, path: Path, no_open: bool) -> int:
 
 
 def main(args: list[str]) -> int:
-    from number_option import positive_window
+    from scripts.buildlog.number_option import positive_window
 
     no_open = "--no-open" in args or os.environ.get("BUILDLOG_CHARTS_NO_OPEN") == "1"
     words = [word for word in args if word != "--no-open"]

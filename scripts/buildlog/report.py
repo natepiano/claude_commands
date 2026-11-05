@@ -18,21 +18,15 @@ from decimal import Decimal
 import time
 from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
-import ci
-import holds
-import index
-import disk
-import health
-import memory
-import moments
-from moments import COLD_BUILD_MIN_CRATES
-import store
-import record
-import sync
-import rust_release
-import aws_report
-import mac_test
-from mac_outcome import (
+from scripts.buildlog import ci, holds
+from scripts.buildlog import index
+from scripts.buildlog import disk, health, memory, moments
+from scripts.buildlog.moments import COLD_BUILD_MIN_CRATES
+from scripts.buildlog import store
+from scripts.buildlog import record
+from scripts.buildlog import sync, rust_release, aws_report
+from scripts.mac_test import mac_test
+from scripts.buildlog.mac_outcome import (
     DECLINE_REASONS,
     CacheReuse,
     DurationNotRecorded,
@@ -59,8 +53,8 @@ from mac_outcome import (
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import conf
-from user_zone import user_zone  # noqa: E402
+from scripts.lib import conf
+from scripts.lib.user_zone import user_zone  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
     from ..aws_target import measurement

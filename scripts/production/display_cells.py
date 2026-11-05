@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import NamedTuple, cast
 
-import live_units
+from scripts.production import live_units
 import unit_lookup
 
 NONE = "—"

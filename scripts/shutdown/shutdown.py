@@ -18,10 +18,10 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "production", "lib"
 from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.production import staff
 from scripts.agents import codex_mesh
-import herdr
-from inventory import CheckoutState, Host, InvalidInventory, Inventory, Session, inventory, parse_inventory
-from remote import other_machine, run_remote as run_remote
-import remote_control
+from scripts.herdr import herdr
+from scripts.shutdown.inventory import CheckoutState, Host, InvalidInventory, Inventory, Session, inventory, parse_inventory
+from scripts.shutdown.remote import other_machine, run_remote as run_remote
+from scripts.shutdown import remote_control
 from scripts.whoami.account import Account, UnknownAccountName, UnreadableAccount, named_claude_account, own_claude_account
 
 

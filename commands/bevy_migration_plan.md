@@ -62,7 +62,7 @@ PRODUCTION_DOC = [the one `*-production.md` under ${CODEBASE}/docs (`find "${COD
 PLAYBOOK = ${CODEBASE}/docs/bevy_migration/playbook.md (earlier upgrades' lessons; may not exist)
 ```
 
-**Production and watch:** "a project in a production" below means PRODUCTION_DOC exists. The `/showrunner:bevy_upgrade` watch is open for it when `python3 ~/.claude/scripts/bevy_upgrade/bevy_upgrade.py --production "${PRODUCTION_DOC}" status` prints its record; `no Bevy upgrade is tracked` means no watch is open. The printed record holds the watch's current dependency table.
+**Production and watch:** "a project in a production" below means PRODUCTION_DOC exists. The `/showrunner:bevy_upgrade` watch is open for it when `~/.claude/scripts/lib/py ~/.claude/scripts/bevy_upgrade/bevy_upgrade.py --production "${PRODUCTION_DOC}" status` prints its record; `no Bevy upgrade is tracked` means no watch is open. The printed record holds the watch's current dependency table.
 
 **Path Expansion Note:**
 - When constructing bash commands, ensure tildes are expanded to actual paths

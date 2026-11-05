@@ -15,12 +15,11 @@ from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-import override_guard
+from scripts.build_hold import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import conf
+from scripts.lib import conf
 
-import cargo_manifest
-import offload
+from scripts.mac_test import cargo_manifest, offload
 
 
 ListingStatus = Literal["yes", "no", "unknown"]

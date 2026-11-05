@@ -30,7 +30,7 @@ changes no file.
      The task notification is the wait. Never poll it, sleep or read its output
      before then. A review at xhigh can take many minutes.
    - **Codex mesh worker:** start it with
-     `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
+     `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
      and end your turn; the result is your next message. Exit 3 means you are
      not a mesh worker: run the command attached in one call instead.
      A live twin takes priority over `config/mesh_runs.conf` `LIVE_RUN_LIMIT`.

@@ -25,7 +25,7 @@ from merge_checkpoint import check_parallel
 from scripts.production.production_doc import Refusal
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
-import scratch
+from scripts.lib import scratch
 
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, STUB, TRIAL, configure_test_environment
 
@@ -244,7 +244,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         return doc
 
     def test_scope_rerun_leaves_out_another_productions_paths(self) -> None:
-        import change_review
+        from scripts.production import change_review
 
         doc = self.import_production_paths()
         sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
@@ -303,7 +303,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
 
     def test_same_checkpoint_rerun_skips_another_productions_reviewed_commits(self) -> None:
-        import change_review
+        from scripts.production import change_review
 
         self.write(self.other, "crates/alpha/imported.txt", "other production\n")
         _ = self.git("add", "crates/alpha/imported.txt", cwd=self.other)

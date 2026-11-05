@@ -14,7 +14,7 @@ from scripts.production import staff
 from scripts.production.store_owner import showrunner_id
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import urgency
+from scripts.lib import urgency
 
 KINDS = ("next", "proposal", "question")
 

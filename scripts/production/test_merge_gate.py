@@ -10,7 +10,6 @@ import io
 import os
 from pathlib import Path
 import re
-import sys
 import tempfile
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
@@ -40,7 +39,9 @@ class ModuleRootTests(unittest.TestCase):
             environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
             with mock.patch.object(merge_gate, "LIVE_ROOTS", (str(live),)):
                 job = merge_gate.start_gate_job(
-                    "fixture", module, [sys.executable, str(merge_gate.RUNNER), str(root), module.name],
+                    "fixture", module, [str(Path(merge_gate.__file__).parents[1] / "lib/py"),
+                                        str(Path(merge_gate.__file__).parents[1] / "test_times/module_run.py"),
+                                        str(root), module.name],
                     root, environment, job_root / "output.log")
             status = job.process.wait(timeout=30)
             result = merge_gate.finish_gate_job(job, status)
@@ -89,11 +90,9 @@ class Roots(unittest.TestCase):
     def test_a_push_attempt_fails_and_names_the_module_and_push(self) -> None:
         with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary, \
              mock.patch.dict(os.environ, {"PUSHOVER_USER": "fixture-user", "PUSHOVER_TOKEN": "fixture-token"}):
-            notify = Path(__file__).resolve().parents[1] / "notify"
             result = self.run_module(f'''import os, sys
 from unittest import mock
-sys.path.insert(0, {str(notify)!r})
-import pushover
+from scripts.notify import pushover
 class Roots(unittest.TestCase):
     def test_push(self):
         self.assertNotIn("PUSHOVER_USER", os.environ)

@@ -306,7 +306,7 @@ class StaffRoutingTests(unittest.TestCase):
     def test_the_page_and_footer_count_each_producer_state_the_same_way(self) -> None:
         from scripts.production import footer_counts, showrunners
         from scripts.review_links import change_browser, change_page
-        import change_review as cli_review
+        from scripts.production import change_review as cli_review
 
         docs = {name: self.root / f"{name}-production.md" for name in ("top", "child")}
         listing = self.root / "change-review - top.md"
@@ -400,7 +400,7 @@ class StaffRoutingTests(unittest.TestCase):
                     written[0].replace("| C2 |", "| C777 |"),
                     written[0].replace("| C2 |", "| C777 |").replace(str(runner.id), "builds")))
                 _ = staff.move(runner.id, staff.ReportsTo(parent.id))
-                import change_review as cli_review
+                from scripts.production import change_review as cli_review
                 with (mock.patch.object(change_review, "lists_directory", return_value=root), mock.patch.object(cli_review, "lists_directory", return_value=root),
                       mock.patch.object(showrunners, "timer_docs", return_value=docs)):
                     browser = change_page.ReviewBrowser("secret")

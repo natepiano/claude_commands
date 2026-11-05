@@ -26,7 +26,7 @@ from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 from banned_words_lib import (
     PROSE_LOG,
     Violation,

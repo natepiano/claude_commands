@@ -7,7 +7,6 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 import unittest
 from unittest import mock
 from contextlib import closing
@@ -110,13 +109,13 @@ class ReportFixture(OutcomeFixture):
         return environment
 
     def report(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(REPORT), "--db", str(self.db_path),
+        return subprocess.run([str(REPOSITORY / "scripts/lib/py"), str(REPORT), "--db", str(self.db_path),
                                "--production-docs", str(self.production_docs), *arguments],
                               env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def report_script(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, "-c", script, "--db", str(self.db_path),
+        return subprocess.run([str(REPOSITORY / "scripts/lib/py"), "-c", script, "--db", str(self.db_path),
                                "--production-docs", str(self.production_docs), *arguments],
                               env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -168,7 +167,8 @@ class ReportFixture(OutcomeFixture):
             (self.root / "outside-checkout").mkdir()
             (self.root / "bin").mkdir()
             ssh = self.root / "bin/ssh"
-            _ = shutil.copyfile(COLLECT_FIXTURES / "mac/fake_ssh.py", ssh)
+            _ = ssh.write_text((COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().replace(
+                "${HOME}/.claude/scripts/lib/py", str(REPOSITORY / "scripts/lib/py")))
             ssh.chmod(0o700)
         report_path = self.root / "ssh-report.json"
         self.assertFalse(report_path.exists())
@@ -572,7 +572,7 @@ METRICS['turn_count'] = Metric('turn_count', 'Stored turn count',
                              TurnAggregate('turns', 'count(*)'), format=ReportFormat.COUNT)
 raise SystemExit(main(sys.argv[1:]))
 """
-        result = subprocess.run([sys.executable, "-c", script, "--db", str(self.db_path),
+        result = subprocess.run([str(REPOSITORY / "scripts/lib/py"), "-c", script, "--db", str(self.db_path),
                                  "--production-docs", str(self.production_docs), "turn_count"],
                                 env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)

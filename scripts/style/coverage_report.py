@@ -24,7 +24,7 @@ sys.path.insert(0, str(SCRIPTS.parent))
 import rules
 import style_ledger
 from scripts.production import staff, unit_lookup, unit_names
-from user_zone import user_zone
+from scripts.lib.user_zone import user_zone
 
 
 class RuleSnapshot(TypedDict):

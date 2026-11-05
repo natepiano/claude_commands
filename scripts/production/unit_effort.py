@@ -18,8 +18,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-import unit_lookup
-from session_pane import HerdrFailure, read_place, type_place
+from scripts.production import unit_lookup
+from scripts.production.session_pane import HerdrFailure, read_place, type_place
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 ROW = "production.director"

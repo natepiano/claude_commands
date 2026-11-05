@@ -35,7 +35,7 @@ completes.
    both carry the inline Three Gods sentence and the Type Design Contract or
    its allowed pointer.
 5. Apply <LongLivedWorkers/>. For Codex, run
-   `python3 ~/.claude/scripts/agents/codex_mesh.py list --session-dir
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/codex_mesh.py list --session-dir
    "${SESSION_DIR}"`. Launch both in one message, `impl` first, each under
    <ToolingContract/>. When the slot has an open worker, pass its full roster name
    with `--to`; the phase prompt is its follow-up message. Omit `--to` only for

@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami.note_file import note_name
 
-import inventory
-import sessions
+from scripts.shutdown import inventory
+from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
@@ -32,8 +32,8 @@ from scripts.accounts import accounts, refusals
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.shutdown import stop_resume
-from test_restart import showrunner, top_level, unit
-from test_support import ShutdownTestCase
+from scripts.shutdown.test_restart import showrunner, top_level, unit
+from scripts.shutdown.test_support import ShutdownTestCase
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
 HANG_GUARD_SECONDS = 300

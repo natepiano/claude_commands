@@ -22,3 +22,13 @@
   - Why needed: `add_unit.py` already accepts and records both fields (`add_unit.py:1297`, `test_add_unit.py:216`). The documented launch command (`produce.md:420`) does not carry them from planning.
   - Completion condition: preserve both fields through the planning handoff. Pass `--port` and repeated `--responsibility` options to `add_unit.py`. Keep saved `.unit.toml` precedence. Test the handoff and final record.
   - Revealed by: herdr-unit (sdlc [16a2cfa0], [7694b0f3]); Phase 3y architect review.
+- [ ] **Delete `PausedSeat.turn_live`**
+  - Target: `scripts/lib/resume_message.py:97` (`PausedSeat.turn_live`) and its readers at lines 38 and 54.
+  - Why needed: the field repeats the Resumable/Idle tag. The only production caller passes only Resumable seats, so it is always true.
+  - Completion condition: the field is deleted; resume output is unchanged for every caller.
+  - Revealed by: models-unit Phase 3s simplify lens (sdlc [89f9ddb9]): do it in the next phase that touches `resume_worker_command`; leave 3t 738d508a3 as is.
+- [ ] **Cut the Git process starts in fast_track and the copies refresh**
+  - Target: `scripts/direct/fast_track.py` (`reconcile` and its Git calls), `scripts/direct/test_fast_track.py`, `scripts/copies/copies.py` (remote refresh).
+  - Why needed: build speed is a top priority. The natest P33 profile measured: `test_fast_track.py` drives 2937 Git calls in `fast_track.py` (27.6 s). `reconcile` repeats `rev-parse` (898), `update-ref` (777) and `cat-file` (283). The `copies.py` remote refresh makes 403 fetches (870 calls, 10.1 s).
+  - Completion condition: one injected Git runner serves `fast_track.py`, so tests start fewer processes. `reconcile` reads each ref and object once. The remote refresh fetches each remote once. Fewer measured Git calls and less time in a new profile. Add no check.
+  - Revealed by: builds natest P33 profile (sdlc [125256f1]); after 3t/3y.

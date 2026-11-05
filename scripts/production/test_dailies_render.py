@@ -20,9 +20,9 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import dailies_render
-from cli_fixture import invoke_cli
-from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
+from scripts.production import dailies_render
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, last_report, load_state)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -283,16 +283,15 @@ class ReportFooterTests(unittest.TestCase):
             program = '''import os, sys
 from pathlib import Path
 from types import ModuleType
-sys.path.insert(0, str(Path.cwd()))
-from cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli
 assert "scripts.production.showrunners" not in sys.modules
-assert "dailies_render" not in sys.modules
+assert "scripts.production.dailies_render" not in sys.modules
 caller = Path.home()
 caller_path = sys.path.copy()
 command = ModuleType("fixture_command")
 command.__file__ = "fixture_command.py"
 def paths(home):
-    import dailies_render
+    from scripts.production import dailies_render
     from scripts.production import showrunners
     from scripts.whoami import note_file
     assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
@@ -314,7 +313,7 @@ for name in ("first", "second"):
     assert sys.path == caller_path
     paths(caller)
 '''
-            result = subprocess.run([sys.executable, "-c", program], env=environment,
+            result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), "-c", program], env=environment,
                                     cwd=SCRIPT.parent, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -967,7 +966,7 @@ class EtaResolutionTests(unittest.TestCase):
             self.assertEqual(expected.code, 0, expected.error)
             complete_state = state.read_bytes()
             _ = state.write_text(original, encoding="utf-8")
-            with mock.patch("atomic_file.os.replace", side_effect=OSError("stopped while saving")):
+            with mock.patch("scripts.lib.atomic_file.os.replace", side_effect=OSError("stopped while saving")):
                 stopped = run(arguments, scratch)
             self.assertNotEqual(stopped.code, 0)
             self.assertEqual(state.read_text(), original)

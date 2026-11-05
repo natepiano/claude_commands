@@ -29,12 +29,12 @@ from scripts.lint import memory_admit as gate
 if TYPE_CHECKING:
     from scripts.buildlog import store
 else:
-    import store
+    from scripts.buildlog import store
 
 if TYPE_CHECKING:
     from scripts.lib import conf
 else:
-    import conf
+    from scripts.lib import conf
 
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
 LOADED_ADMISSION_CODE_VERSION = os.environ.get("BUILDLOG_ADMISSION_CODE_VERSION") or admission_code.admission_code_version()

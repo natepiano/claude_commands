@@ -30,8 +30,8 @@ from typing import Literal, NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import change_review
-import scratch  # on the path once change_review has put scripts/lib there
+from scripts.production import change_review
+from scripts.lib import scratch  # on the path once change_review has put scripts/lib there
 from scripts.production.showrunners import canonical_slug
 from scripts.production.production_doc import Production, Refusal, cell_value, production_field, read_production
 
@@ -40,7 +40,7 @@ from scripts.production import merge_gate, production_doc, session_staff, staff,
 from scripts.shutdown import remote  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
-import sessions  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import conf  # noqa: E402
 

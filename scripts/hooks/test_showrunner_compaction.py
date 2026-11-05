@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import io
 import json
 import os
@@ -14,6 +13,7 @@ import unittest
 from pathlib import Path
 from typing import Protocol, cast, final, override
 from unittest.mock import patch
+from scripts.lib.file_module import load_file_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 from scripts.production import staff
@@ -99,11 +99,10 @@ class ShowrunnerCompactionTests(unittest.TestCase):
 
 class ContextNoticeTests(unittest.TestCase):
     def test_a_showrunner_is_told_to_fill_next_and_not_to_write_a_handoff(self) -> None:
-        spec = importlib.util.spec_from_file_location(
+        module = load_file_module(
             "post_tool_use_context_usage", Path(__file__).resolve().parent / "post-tool-use-context-usage.py")
+        spec = module.__spec__
         assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
         state = Path("/state/example/session/showrunner_state.json")
         notice = cast(str, module.build_context(249_000, 283_800, False, state))  # pyright: ignore[reportAny]
         self.assertIn("write no handoff doc", notice)
@@ -124,10 +123,9 @@ class ContextMessageSwitchTests(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        spec = importlib.util.spec_from_file_location("context_message_switch", HOOK.with_name("post-tool-use-context-usage.py"))
+        module = load_file_module("context_message_switch", HOOK.with_name("post-tool-use-context-usage.py"))
+        spec = module.__spec__
         assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
         self.hook: ContextMessageHook = cast(ContextMessageHook, cast(object, module))
 
     @override

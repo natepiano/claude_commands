@@ -14,6 +14,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 |---|---|---|
 | `commands/showrunner/promote_unit.md` | read | staff.py get (shell) |
 | `docs/associate-producer/operations.md` | read | staff.json (shell) |
+| `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
@@ -36,11 +37,13 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/direct/board_json.py` | read | active, snapshot |
 | `scripts/direct/implement.sh` | read | local_snapshot |
 | `scripts/direct/implement_launcher_test_support.py` | read | staff.json path |
+| `scripts/direct/phase_reservation.py` | read | snapshot |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
 | `scripts/direct/progress_history.py` | read | active, initial_snapshot, snapshot |
 | `scripts/direct/recorder_fixture.py` | read | PresentWorktree |
 | `scripts/direct/remove_workers.py` | write | local_snapshot, retire |
+| `scripts/direct/review.sh` | read | local_snapshot |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
 | `scripts/direct/workers.py` | read | initial_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
@@ -49,12 +52,16 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
 | `scripts/hierarchies/measure.py` | read | active, snapshot |
 | `scripts/hierarchies/push_audit.py` | read | active, snapshot |
+| `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation |
 | `scripts/hierarchies/worker_owners.py` | read | local_snapshot |
+| `scripts/hooks/conversation_pause.py` | read | none (LiveDoc, WrappedDoc types) |
+| `scripts/hooks/conversation_pause_test_support.py` | read | none (LiveDoc type) |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
 | `scripts/hooks/post-tool-use-sendmessage-miss.py` | read | snapshot |
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/lib/resume_message.py` | read | none (StaffId type) |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, record_path |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
@@ -91,6 +98,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
+| `scripts/production/proposal_issue.py` | read | snapshot |
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
 | `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, set_doc, snapshot |
@@ -159,7 +167,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-145 accessors: 26 write, 118 read, 1 owner.
+153 accessors: 26 write, 126 read, 1 owner.
 
 ## Approved copies
 

@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 import progress_history  # noqa: E402
 import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
-import herdr  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
 import pane_record  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402

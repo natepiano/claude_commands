@@ -19,10 +19,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import live_units
+from scripts.production import live_units
 from scripts.production import showrunners
 import unit_lookup
-from herdr import HerdrPlace
+from scripts.herdr.herdr import HerdrPlace
 import unit_phases
 import style_units
 import style_ledger

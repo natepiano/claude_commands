@@ -11,23 +11,19 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, final, override
+from typing import cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pins
-import upgrade_record
+from scripts.bevy_upgrade import pins
+from scripts.bevy_upgrade import upgrade_record
 from scripts.production.production_doc import Production, read_production
 from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_staff_file,
 )
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
 LATER = datetime(2026, 10, 13, 1, 2, 3, tzinfo=timezone.utc)
@@ -121,7 +117,7 @@ class RecordTests(unittest.TestCase):
         return source, job
 
     def test_watch_migration_recovers_job_after_clear_and_preserves_finished_rerun(self) -> None:
-        import migrate_bevy_watch
+        from scripts.bevy_upgrade import migrate_bevy_watch
 
         source, job = self.legacy_watch()
         with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.root / "notifier")}):
@@ -153,7 +149,7 @@ class RecordTests(unittest.TestCase):
         return renamed
 
     def test_watch_migration_resolves_former_document_for_record_archive_and_job(self) -> None:
-        import migrate_bevy_watch
+        from scripts.bevy_upgrade import migrate_bevy_watch
 
         source, job = self.legacy_watch()
         archive = source.with_name("demo.0.20.closed.json")
@@ -180,7 +176,7 @@ class RecordTests(unittest.TestCase):
             self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
     def test_finished_watch_migration_after_rename_needs_no_document_resolution(self) -> None:
-        import migrate_bevy_watch
+        from scripts.bevy_upgrade import migrate_bevy_watch
 
         current = self.begin()
         archive = upgrade_record.record_path(self.owner.id).with_name(f"{self.owner.id}.0.20.closed.json")
@@ -197,7 +193,7 @@ class RecordTests(unittest.TestCase):
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
     def test_watch_migration_reports_ambiguous_former_document_and_continues(self) -> None:
-        import migrate_bevy_watch
+        from scripts.bevy_upgrade import migrate_bevy_watch
 
         source, job = self.legacy_watch()
         renamed = self.rename_production_document()
@@ -224,9 +220,9 @@ class RecordTests(unittest.TestCase):
         self.assertTrue(upgrade_record.record_path(unaffected.id).exists())
 
     def test_watch_migration_reconciles_job_created_by_status(self) -> None:
-        import bevy_upgrade
-        import migrate_bevy_watch
-        import upgrade_schedule
+        from scripts.bevy_upgrade import bevy_upgrade
+        from scripts.bevy_upgrade import migrate_bevy_watch
+        from scripts.bevy_upgrade import upgrade_schedule
 
         source, job = self.legacy_watch()
         schedule = "ENABLED=0\nNEXT_DUE=123\nLAST_SENT=45\nLAST_RESTART=67\nLAST_TARGET=\nPAUSED=1\n"
@@ -257,9 +253,9 @@ class RecordTests(unittest.TestCase):
             self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
     def test_watch_migration_finishes_cleanup_after_conf_delete(self) -> None:
-        import bevy_upgrade
-        import migrate_bevy_watch
-        import upgrade_schedule
+        from scripts.bevy_upgrade import bevy_upgrade
+        from scripts.bevy_upgrade import migrate_bevy_watch
+        from scripts.bevy_upgrade import upgrade_schedule
 
         _, job = self.legacy_watch()
         remove_directory = Path.rmdir
@@ -287,8 +283,8 @@ class RecordTests(unittest.TestCase):
             self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
     def test_watch_migration_refuses_job_destination_with_another_owner(self) -> None:
-        import migrate_bevy_watch
-        import upgrade_schedule
+        from scripts.bevy_upgrade import migrate_bevy_watch
+        from scripts.bevy_upgrade import upgrade_schedule
 
         _, job = self.legacy_watch()
         other = fixture_member("showrunner", name="other-owner")
@@ -304,7 +300,7 @@ class RecordTests(unittest.TestCase):
             self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
     def test_watch_migration_refuses_unavailable_owner_without_changing_files(self) -> None:
-        import migrate_bevy_watch
+        from scripts.bevy_upgrade import migrate_bevy_watch
 
         source, job = self.legacy_watch()
         value = cast(dict[str, object], json.loads(source.read_text()))
@@ -325,14 +321,14 @@ class RecordTests(unittest.TestCase):
         shutdown = directory.parent / "shutdown"
         script = (
             "import sys\nfrom pathlib import Path\n"
-            + "sys.path.insert(0, sys.argv[1])\nsys.path.insert(0, sys.argv[2])\n"
-            + "import shutdown_record\nimport upgrade_record\nimport upgrade_report\n"
+            + "from scripts.shutdown import shutdown_record\nfrom scripts.bevy_upgrade import upgrade_record, upgrade_report\n"
             + "assert Path(shutdown_record.__file__).resolve() == Path(sys.argv[2]) / 'shutdown_record.py'\n"
             + "assert Path(upgrade_record.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_record.py'\n"
             + "assert Path(upgrade_report.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_report.py'\n"
         )
         result = subprocess.run([sys.executable, "-c", script, str(directory), str(shutdown)],
-                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                                     "PYTHONPATH": os.pathsep.join((str(shutdown), str(directory.parents[1])))},
                                 capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 

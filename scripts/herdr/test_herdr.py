@@ -28,11 +28,11 @@ from unittest.mock import Mock, call, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import herdr
-import pane_launch
-import fake_herdr
+from scripts.herdr import herdr
+from scripts.herdr import pane_launch
+from scripts.herdr import fake_herdr
 from scripts.message import codex_daemon
-from fake_herdr import CommandResponse
+from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1972,7 +1972,7 @@ class HerdrTests(unittest.TestCase):
             yield
 
     def test_failed_source_record_prevents_prompt_submission(self) -> None:
-        import script_prompts
+        from scripts.lib import script_prompts
 
         client = self.herdr
         with (self.prompt_target(client, "w1:p1", "fixture-submission"),
@@ -1984,7 +1984,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_timed_out_prose_keeps_its_source_in_the_delayed_hook(self) -> None:
         from scripts.hooks import conversation_pause
-        import script_prompts
+        from scripts.lib import script_prompts
 
         for error in (subprocess.TimeoutExpired("herdr", 10),
                       herdr.HerdrFailure("input can still arrive", "agent_prompt_stalled")):
@@ -2004,7 +2004,7 @@ class HerdrTests(unittest.TestCase):
                 self.assertIs(source, conversation_pause.PromptSource.SCHEDULED)
 
     def test_timed_out_slash_command_keeps_its_source_record(self) -> None:
-        import script_prompts
+        from scripts.lib import script_prompts
 
         for error in (subprocess.TimeoutExpired("herdr", 10),
                       herdr.HerdrFailure("input can still arrive", "agent_prompt_stalled")):
@@ -4159,7 +4159,7 @@ class HerdrTests(unittest.TestCase):
             "CLAUDE_CODE_SESSION_ID": unit.current_session,
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex", "CODEX_THREAD_ID": codex.current_session})
-        import unit_lookup as lookup
+        from scripts.production import unit_lookup as lookup
         from scripts.production import session_staff
 
         def current_slug(slug: str) -> str:

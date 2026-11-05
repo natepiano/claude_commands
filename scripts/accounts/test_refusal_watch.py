@@ -36,7 +36,7 @@ from scripts.whoami import run_out
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.whoami import usage_store
-import quota_alert
+from scripts.whoami import quota_alert
 
 send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPrivateUsage]
 deliver_notice_jobs = quota_alert.deliver_and_record
@@ -46,12 +46,12 @@ if TYPE_CHECKING:
     from scripts.shutdown import inventory, shutdown_record, restart_support, pane_record
     from scripts.message import sessions
 else:
-    from unit_staff_test_support import isolated_parents, unit_host
-    inventory = import_module("inventory")
-    shutdown_record = import_module("shutdown_record")
-    restart_support = import_module("restart_support")
-    sessions = import_module("sessions")
-    pane_record = import_module("pane_record")
+    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
+    inventory = import_module("scripts.shutdown.inventory")
+    shutdown_record = import_module("scripts.shutdown.shutdown_record")
+    restart_support = import_module("scripts.shutdown.restart_support")
+    sessions = import_module('scripts.message.sessions')
+    pane_record = import_module("scripts.shutdown.pane_record")
 
 
 def setUpModule() -> None:
@@ -1039,7 +1039,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         _ = self.groups()
         _ = self.owner("new-unit", host="unit")
@@ -1064,7 +1064,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         _ = self.groups(units="claude3")
         processes: list[herdr.HerdrProcess] = []
@@ -1090,7 +1090,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         _ = self.groups(units="claude1")
         _ = self.owner("unit", host="unit")
@@ -1115,7 +1115,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
         _ = self.groups(units="claude1")
         _ = self.owner("unit", host="unit")
         def observed(login: str | None = None, *,
@@ -1140,7 +1140,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         path = self.groups()
         owner = self.owner("new-unit", host="unit")

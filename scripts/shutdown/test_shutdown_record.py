@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.shutdown import shutdown_record
-from test_support import ShutdownTestCase
+from scripts.shutdown.test_support import ShutdownTestCase
 
 
 class ShutdownRecordTests(ShutdownTestCase):

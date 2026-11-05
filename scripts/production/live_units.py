@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import showrunners, staff, unit_names
 from scripts.shutdown import remote
-import unit_lookup
+from scripts.production import unit_lookup
 
 
 class LiveUnit(NamedTuple):

@@ -19,16 +19,15 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import build_targets
+from scripts.build_targets import build_targets
 if TYPE_CHECKING:
     from ..lib import process_start as process_identity
 else:
     from scripts.lib import process_start as process_identity
 
-import build_hold
-import offload
-import mac_test
-import targets
+from scripts.build_hold import build_hold
+from scripts.mac_test import mac_test, offload
+from scripts.build_targets import targets
 if TYPE_CHECKING:
     from ..buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
     from ..message import roster
@@ -36,13 +35,13 @@ if TYPE_CHECKING:
 else:
     from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
     from scripts.message import roster
-    import record
-    import store
-from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
+    from scripts.buildlog import record
+    from scripts.buildlog import store
+from scripts.build_targets.test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
 if TYPE_CHECKING:
     from ..lint.memory_test_support import write_config_fixture
 else:
-    from memory_test_support import write_config_fixture
+    from scripts.lint.memory_test_support import write_config_fixture
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -76,8 +75,8 @@ def pacific_zone() -> Generator[None, None, None]:
 class FolderInvocationTests(NotificationGuardedTestCase):
     def test_clean_target_import_loads_mac_test_once(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-        result = REAL_SUBPROCESS_RUN([sys.executable, "-c",
-            "import sys; import build_targets; "
+        result = REAL_SUBPROCESS_RUN([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
+            "import sys; from scripts.build_targets import build_targets; "
             + "names=[n for n,m in list(sys.modules.items()) if getattr(m,'__file__','') "
             + "and m.__file__.endswith('/mac_test/mac_test.py')]; "
             + "assert len(names)==1, names"], cwd=Path(__file__).parent, env=environment,
@@ -86,8 +85,8 @@ class FolderInvocationTests(NotificationGuardedTestCase):
 
     def test_folder_invocation_records_hold_events(self) -> None:
         result = subprocess.run(
-            [sys.executable, "-m", "unittest",
-             "test_build_targets.WaitLocalTests.test_hold_and_release_write_temp_log_without_writing_real_log"],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-m", "unittest",
+             "scripts.build_targets.test_build_targets.WaitLocalTests.test_hold_and_release_write_temp_log_without_writing_real_log"],
             cwd=Path(__file__).resolve().parent,
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
@@ -755,7 +754,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             try:
                 for index in range(3):
                     process = subprocess.Popen(
-                        [sys.executable, build_targets.__file__, "wait-local", "--call-id", f"call-{index}"],
+                        [str(Path(__file__).resolve().parents[1] / "lib/py"), build_targets.__file__, "wait-local", "--call-id", f"call-{index}"],
                         env={**os.environ, "BUILDLOG_HOLD_WAITER_FILE": str(self.root / f"waiter-{index}"),
                              "BUILDLOG_HOLD_WAIT_FILE": "", "BUILD_TARGETS_POLL_S": "3600"},
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

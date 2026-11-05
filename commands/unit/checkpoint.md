@@ -227,7 +227,7 @@ Loop/verbose only:
    A hook refuses the commit without it and the merge refuses the checkpoint;
    the merge turns each visible line into a row on the change-review list.
 
-   After every successful checkpoint commit, enrolled or not, run `python3 ~/.claude/scripts/direct/progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase <phase id> --commit <full hash>`.
+   After every successful checkpoint commit, enrolled or not, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase <phase id> --commit <full hash>`.
    A failed commit is an unsuccessful ending: do not invoke release, leave
    `Active` untouched, and apply <RetainPhaseReservation/>. After a
    successful commit from `Active`, immediately capture the full output of
@@ -337,8 +337,8 @@ Loop/verbose only:
    `Checkpoint <short hash> — phase N: <title>.` with its push note, if any.
    This report follows successful release when the phase was active.
 9. In a production unit, run
-   `python3 ~/.claude/scripts/direct/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
-   and `python3 ~/.claude/scripts/direct/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
+   and `~/.claude/scripts/lib/py ~/.claude/scripts/direct/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
    and keep both lines for <ProductionUnit/> item 3's checkpoint notice.
 </CheckpointCommit>
 

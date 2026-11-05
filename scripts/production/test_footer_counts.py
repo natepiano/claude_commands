@@ -15,13 +15,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import change_review
+from scripts.production import change_review
 import footer_counts
 import next_item
-import proposal_issue
-import proposals_folder
+from scripts.production import proposal_issue
+from scripts.production import proposals_folder
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 from scripts.production import staff
 from scripts.production.test_change_review import producer_rows
 from scripts.statusline import counts_row

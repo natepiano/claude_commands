@@ -19,12 +19,12 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from code_kind import is_test_code  # noqa: E402
+from scripts.lib.code_kind import is_test_code  # noqa: E402
 
-import gpu_xid
-import push_texts
-from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
-from user_action import ActionRequired, NO_SESSION_LINE, SessionLine
+from scripts.notify import gpu_xid
+from scripts.notify import push_texts
+from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
+from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
 ROOT = Path(__file__).resolve().parents[2]
 EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py"}

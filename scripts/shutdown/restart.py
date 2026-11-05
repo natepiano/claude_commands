@@ -17,8 +17,8 @@ sys.path.insert(0, str(SCRIPTS.parent))
 for dependency in ("herdr", "message", "lib", "shutdown"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-import herdr
-import sessions
+from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production import staff, session_staff
 from scripts.lib import nix_env, operation_deadline
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
@@ -114,7 +114,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if isinstance(live, herdr.UnknownConversation):
             herdr.conversation_note(live)
         machine, folder = shutdown_record.row_folder(row, record, resolver=resolver)
-        import remote
+        from scripts.shutdown import remote
         if machine != remote.local_machine():
             raise ValueError(f"{row.name}: session is on {machine}")
         kind, environment, arguments = session_launch(str(row.current_session), row.name)
@@ -182,7 +182,7 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
                  resolver: session_staff.RowResolver | None = None,
                  codex: herdr.CodexConversations | None = None) -> list[staff.StaffRow]:
     """Read only the supplied rows and return their live local conversations."""
-    import remote
+    from scripts.shutdown import remote
 
     selected: list[staff.StaffRow] = []
     shared_unknown = 0

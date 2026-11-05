@@ -105,7 +105,7 @@ Ask the user, numbered:
 ### SendToFriend
 
 - claude: `SendMessage` with `to` = `FRIEND` (the bare name) and the message text.
-- codex: `python3 ~/.claude/scripts/agents/codex_mesh.py send --session-dir "${SESSION_DIR}" --to "${FRIEND}" --message-file "${SESSION_DIR}/message_<ROUND>.md"`. Use `steer` in place of `send` only when the friend is mid-answer and must change course now — it costs whatever the friend was working on.
+- codex: `~/.claude/scripts/lib/py ~/.claude/scripts/agents/codex_mesh.py send --session-dir "${SESSION_DIR}" --to "${FRIEND}" --message-file "${SESSION_DIR}/message_<ROUND>.md"`. Use `steer` in place of `send` only when the friend is mid-answer and must change course now — it costs whatever the friend was working on.
 
 ### ReviewFriendImplementation
 

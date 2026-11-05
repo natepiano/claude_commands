@@ -134,7 +134,8 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
         self.assertEqual(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
         if os.environ.get("MERGE_GATE_TEST_ISOLATION") == "1":
-            self.assertEqual(os.environ.get("PYTHONPATH"), os.environ.get("MERGE_GATE_TEST_PYTHONPATH"))
+            self.assertEqual(os.environ.get("PYTHONPATH"),
+                             os.environ["MERGE_GATE_TEST_REPO"] + os.pathsep + os.environ["MERGE_GATE_TEST_PYTHONPATH"])
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
         death = state / ("signal-" + suite)

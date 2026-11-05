@@ -37,17 +37,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 from scripts.production import staff, unit_config
-from cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
 import unit_lookup
-import sessions
+from scripts.message import sessions
 import inventory
 import restart
-from herdr import HerdrPlace
+from scripts.herdr.herdr import HerdrPlace
 from scripts.production.production_doc import Refusal, read_production
 from scripts.accounts import accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
-import herdr
+from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import confirm_tab_close, process as write_process, private_process_registry
 from scripts.whoami.account_test_support import stored_room

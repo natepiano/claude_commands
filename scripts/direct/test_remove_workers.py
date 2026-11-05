@@ -145,7 +145,7 @@ class RemoveWorkersTest(unittest.TestCase):
             CLAUDE_CODE_SESSION_ID=fixture_runtime_id(caller) if caller else "",
             SHUTDOWN_STATE_DIR=str(self.state_root),
         )
-        command = [sys.executable, str(SCRIPT), "--run-root", str(self.root)]
+        command = [str(SCRIPT.parent.parent / "lib/py"), str(SCRIPT), "--run-root", str(self.root)]
         for run in [session_dir] if isinstance(session_dir, Path) else session_dir or []:
             command += ["--session-dir", str(run)]
         result = subprocess.run(
@@ -207,7 +207,8 @@ class RemoveWorkersTest(unittest.TestCase):
         self.list_rows([row("own1", "p-impl")])
         config_dir = str(Path.home() / "account with 'quotes' and $()")
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": config_dir}):
-            self.assertEqual(self.remove_workers(own), (0, ["own1"]))
+            result, removed = self.run_remove_workers(own)
+            self.assertEqual((result.returncode, removed), (0, ["own1"]), result.stdout + result.stderr)
         self.assertEqual(
             self.account_log.read_text(encoding="utf-8").splitlines(),
             [f"agents\t{config_dir}", f"rm\t{config_dir}"],
@@ -237,7 +238,8 @@ class RemoveWorkersTest(unittest.TestCase):
         for run in (side, other):
             _ = (run / "heartbeat.log").write_text("beat\n", encoding="utf-8")
         self.list_rows([row("mark1", "a-impl"), row("side1", "b-impl"), row("other1", "c-impl")])
-        self.assertEqual(self.remove_workers([marked, side]), (0, ["mark1", "side1"]))
+        result, removed = self.run_remove_workers([marked, side])
+        self.assertEqual((result.returncode, removed), (0, ["mark1", "side1"]), result.stdout + result.stderr)
 
     def test_live_run_is_kept_and_dead_runs_are_swept(self) -> None:
         _ = self.run_dir("live", ["live1"], orchestrator=ORCHESTRATOR)

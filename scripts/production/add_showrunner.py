@@ -37,9 +37,9 @@ from scripts.production import completion_receipt, staff
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
 
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 from scripts.production.production_doc import Production, Refusal, read_production
-import herdr
+from scripts.herdr import herdr
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount

@@ -291,9 +291,9 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.12.
 if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
-    export VERIFY_TRACE_REAL_PY="${HOME}/.claude/scripts/lib/py"
+    export VERIFY_TRACE_REAL_PY="$VERIFY_START_DIR/../lib/py"
 else
-    PY="${HOME}/.claude/scripts/lib/py"
+    PY="$VERIFY_START_DIR/../lib/py"
 fi
 
 hash_stream() {

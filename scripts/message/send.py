@@ -134,7 +134,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, Ty
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import process_group
+from scripts.lib import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_names
 from scripts.lib import conf
@@ -146,23 +146,23 @@ from scripts.message.send_result import (
     ConfirmedSendOutcome as ConfirmedSendOutcome, UnconfirmedSendOutcome as UnconfirmedSendOutcome,
     send_outcome as send_outcome,
 )
-import sessions  # noqa: E402
-from relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
-import postmaster  # noqa: E402
-import codex_daemon  # noqa: E402
+from scripts.message import sessions  # noqa: E402
+from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
+from scripts.message import postmaster  # noqa: E402
+from scripts.message import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
-    import roster
+    from scripts.message import roster
     from ..accounts import accounts
     from ..whoami.account import named_account_environment
-import push_texts  # noqa: E402
-import push_reference
-import rca  # noqa: E402
-import repeat_guard  # noqa: E402
-import review  # noqa: E402
-import silence  # noqa: E402
-from user_zone import user_zone  # noqa: E402
-from probe_session import PROBE_ENV  # noqa: E402
-from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
+from scripts.notify import push_texts  # noqa: E402
+from scripts.notify import push_reference
+from scripts.message import rca  # noqa: E402
+from scripts.message import repeat_guard  # noqa: E402
+from scripts.notify import review  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
                          UserAction, NoActionRequired, action_conflicts, first_line, named_places, parse_user_action,
                          SessionLine, split_session, session_prefix, typed_texts)  # noqa: E402
 
@@ -234,7 +234,7 @@ PERMISSION_MODE = "auto"
 RELAY_EXEC = f"""import os, sys
 from pathlib import Path
 sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
-from relay_identity import publish_relay_identity
+from scripts.message.relay_identity import publish_relay_identity
 publish_relay_identity(os.getpid(), sys.argv[2], Path(sys.argv[1]))
 os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 """
@@ -1333,7 +1333,7 @@ def user_emergency_key(sender: str, title: str) -> str:
 def emergency_lifetime() -> timedelta:
     """How long Pushover repeats an emergency push that the user does not acknowledge."""
     # Imported here: only an emergency send reads it, and pushover's imports cost about 20 ms.
-    from pushover import EXPIRE_S
+    from scripts.notify.pushover import EXPIRE_S
     return timedelta(seconds=EXPIRE_S)
 
 
@@ -1703,7 +1703,7 @@ def _print_roster_problems(
 
 
 def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
-    import roster
+    from scripts.message import roster
 
     if not isinstance(entry.reach, roster.Messageable):
         raise AssertionError("a messageable recipient needs an address")
@@ -1725,13 +1725,13 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
 
 
 def _cannot_receive_message(entry: roster.RosterEntry) -> NoReturn:
-    import roster
+    from scripts.message import roster
 
     usage_error(roster.cannot_receive_message_text(entry))
 
 
 def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
-    import roster
+    from scripts.message import roster
 
     lines = [f"{name} matches {len(entries)} sessions:"]
     for entry in entries:
@@ -1751,7 +1751,7 @@ def resolve_staff_recipient(
     observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (),
 ) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
     """Select one staff identity before any transport lookup."""
-    import roster
+    from scripts.message import roster
 
     reference = target
     if target.startswith("worker:"):
@@ -1809,7 +1809,7 @@ def resolve_staff_recipient(
 
 
 def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
-    import roster
+    from scripts.message import roster
 
     return [entry for entry in entries if (
         isinstance(entry.session, roster.ClaudeSession) and entry.session.session_id == member.current_session
@@ -1820,7 +1820,7 @@ def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.Roster
 
 
 def _sender_label_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
-    import roster
+    from scripts.message import roster
 
     if to.startswith(("session:", "worker:", "codex:")):
         return [entry for entry in entries
@@ -1831,7 +1831,7 @@ def _sender_label_matches(to: str, entries: list[roster.RosterEntry]) -> list[ro
 def _matched_recipient(
     to: str, matches: list[roster.RosterEntry], destination: LocalOnly | NamedMachine,
 ) -> SessionRecipient | RemoteDelivery:
-    import roster
+    from scripts.message import roster
 
     if len(matches) > 1:
         _ambiguous_name(to, matches)
@@ -1848,7 +1848,7 @@ def matching_recipients(
     membership: staff.StaffSnapshot | None = None,
 ) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed:
     """Find rows without delivering or exiting; ask the peer only after a local miss."""
-    import roster
+    from scripts.message import roster
 
     membership = staff.snapshot() if membership is None else membership
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
@@ -2618,7 +2618,7 @@ def parse(argv: list[str]) -> Options:
     if text_id:
         if to != USER:
             parser.error("--text-id goes with --to user")
-        import push_texts
+        from scripts.notify import push_texts
         values: dict[str, str] = {}
         for value in raw_values:
             key, separator, item = value.partition("=")
@@ -2768,7 +2768,7 @@ def body_text(options: Options) -> str:
 
 def sender_shown_name(sender: str, observed: roster.Roster) -> str:
     """Resolve display text without changing sender keys or reply addresses."""
-    import roster
+    from scripts.message import roster
 
     matches = _sender_label_matches(sender, observed.entries)
     if len(matches) == 1:
@@ -2778,7 +2778,7 @@ def sender_shown_name(sender: str, observed: roster.Roster) -> str:
 
 def sender_stamp() -> SenderStamp:
     """Read the native sender identity independently of the display name."""
-    import roster
+    from scripts.message import roster
 
     identity = roster.sender_identity(os.environ)
     if isinstance(identity, roster.ClaudeSession):
@@ -2875,7 +2875,7 @@ def send(options: Options) -> Result:
 
 
 def _send(options: Options) -> Result:
-    import roster
+    from scripts.message import roster
 
     if options.to == USER and not options.text_id:
         return Result("refused", push_texts.TEMPLATE_REQUIRED)

@@ -28,18 +28,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.whoami import account
-from probe_session import PROBE_ENV
-import unit_runs
-import herdr
-import sessions
-from sessions import process_start as _process_start
+from scripts.lib.probe_session import PROBE_ENV
+from scripts.lib import unit_runs
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.message.sessions import process_start as _process_start
 from scripts.production import showrunners, staff, session_staff
 from scripts.usage import agents_log
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.whoami.account import Account, label_for
 
 
-from session_types import (
+from scripts.shutdown.session_types import (
     InvalidInventory as InvalidInventory,
     parse_session as parse_session,
     wire_object as _wire_object,

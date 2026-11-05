@@ -27,10 +27,10 @@ from scripts.lib.socket_test_support import short_socket_directory
 import fake_unit_host
 from scripts.production import showrunners
 import unit_lookup
-import herdr
-import sessions
+from scripts.herdr import herdr
+from scripts.message import sessions
 from fake_unit_host import HostedUnit, labeled
-from sessions import SessionRecord
+from scripts.message.sessions import SessionRecord
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 from scripts.production import staff, session_staff, unit_config
 from scripts.shutdown import remote
@@ -369,7 +369,7 @@ print(observed.row.id)
     def test_restarted_unit_without_process_marks_uses_its_repaired_pane_record(self) -> None:
         from scripts.shutdown import pane_record
         from scripts.production import session_staff
-        import session_pane
+        from scripts.production import session_pane
 
         owner = unit_membership("show", "alpha")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
@@ -392,7 +392,7 @@ print(observed.row.id)
     def test_live_staffed_session_without_any_launch_agrees_across_readers_and_worker_queue(self) -> None:
         from scripts.production import session_staff
         from scripts.message import unit_labels
-        import session_pane
+        from scripts.production import session_pane
 
         doc = self.root / "production.md"
         _ = doc.write_text("# show\n")

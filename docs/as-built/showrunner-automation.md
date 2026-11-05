@@ -366,7 +366,7 @@ Copied pane marks do not select rows.
   An unchanged commit and source reuse the cached expected paths.
   The reader keeps the last answer visible while the background refresh runs.
   The answer changes only when a refresh writes a new result.
-  Read the machines with `python3 /home/natepiano/.claude/scripts/statusline/rebuild_row.py read`.
+  Read the machines with `/home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/statusline/rebuild_row.py read`.
   This command prints one machine per line, or nothing when no machine needs a rebuild.
   Both results return exit 0.
   The command and the status line use `rebuild_row.read` to read the same file.

@@ -15,9 +15,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import fake_showrunner
-import fake_unit_host
-from fake_unit_host import HostedUnit, labeled as marked
+from scripts.production import fake_showrunner
+from scripts.production import fake_unit_host
+from scripts.production.fake_unit_host import HostedUnit, labeled as marked
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, unit_membership, showrunner_relationship
 
@@ -42,7 +42,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
                     (fixture.worktree / ".unit.toml").unlink()
                 errors = io.StringIO()
                 with (redirect_stderr(errors),
-                      mock.patch("unit_lookup.every_labeled_session", return_value=every)):
+                      mock.patch("scripts.production.unit_lookup.every_labeled_session", return_value=every)):
                     units = live_units.units_of_doc(fixture.doc)
                 self.assertEqual([item.unit for item in units], ["member-unit"])
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)

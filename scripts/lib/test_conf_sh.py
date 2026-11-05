@@ -34,8 +34,13 @@ class ShellConfTests(unittest.TestCase):
             + f"exec {shlex.quote(sys.executable)} \"$@\"\n",
         )
         python.chmod(0o755)
+        (programs / "bash").symlink_to("/bin/bash")
+        cache = self.root / "home/.cache/claude"
+        cache.mkdir(parents=True)
+        _ = (cache / "python3-3.12").write_text(str(python) + "\n")
         self.env = {
             "PATH": str(programs), "HOME": str(self.root / "home"),
+            "XDG_CACHE_HOME": str(cache.parent),
             "CONF_DIR": str(self.config), "HOSTNAME": socket.gethostname(),
             "FORK_LOG": str(self.root / "python.log"),
             "SUBSHELL_LOG": str(self.root / "subshell.log"),

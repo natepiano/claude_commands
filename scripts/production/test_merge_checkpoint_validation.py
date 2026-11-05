@@ -98,7 +98,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
     def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
-        import change_review
+        from scripts.production import change_review
 
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades")
         result = self.run_checkpoint(sha)

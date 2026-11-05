@@ -718,7 +718,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
                            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUSERBASE": str(userbase)}
             for name in ("PUSHOVER_USER", "PUSHOVER_TOKEN", "PYTHONNOUSERSITE"):
                 _ = environment.pop(name, None)
-        process = subprocess.Popen([sys.executable, "-c", SUITE_BOOTSTRAP, *argv],
+        process = subprocess.Popen([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", SUITE_BOOTSTRAP, *argv],
                                    cwd=repo, env=environment, stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=subprocess.STDOUT, text=True,
                                    start_new_session=True)
@@ -1067,7 +1067,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     maximum_load = starting_load
     began = time.monotonic()
     started_at = datetime.now(UTC).timestamp()
-    python = os.environ.get("MERGE_GATE_PYTHON", sys.executable)
+    python = os.environ.get("MERGE_GATE_PYTHON", str(Path(__file__).resolve().parents[1] / "lib/py"))
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
 

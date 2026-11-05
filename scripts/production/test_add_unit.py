@@ -26,9 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import unit_lookup
-import sessions
-from herdr import HerdrPlace
-import herdr
+from scripts.message import sessions
+from scripts.herdr.herdr import HerdrPlace
+from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
 

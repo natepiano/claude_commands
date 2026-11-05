@@ -4,7 +4,6 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-import importlib
 import io
 import json
 import os
@@ -17,23 +16,22 @@ from typing import Protocol, cast, override
 
 
 # Reuse the existing scratch policy behind this combined front.
-HOOKS = Path(__file__).resolve().parents[1] / "hooks"
-sys.path.insert(0, str(HOOKS))
-sys.path.insert(0, str(HOOKS.parents[1]))
 
 from scripts.copies import shell_syntax as syntax
+from scripts.lib.file_module import load_file_module
 
 
 class ShellCommands(Protocol):
     def main(self) -> None: ...
 
 
-SHELL = cast(ShellCommands, cast(object, importlib.import_module("pre-tool-use-scratch-guard")))
+SHELL = cast(ShellCommands, cast(object, load_file_module(
+    "scratch_guard", Path(__file__).resolve().parents[1] / "hooks/pre-tool-use-scratch-guard.py")))
 # Fixture repositories are disposable test inputs, never operational gate checkouts.
 TEST_INPUT_REASON = "Tests and fixture/support modules construct isolated disposable repository inputs."
 REFUSAL = (
     "Repository trees must be made by copies.py run. "
-    + "Example: python3 ~/.claude/scripts/copies/copies.py run --owner verify-unit "
+    + "Example: ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --owner verify-unit "
     + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover"
 )
 GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"})

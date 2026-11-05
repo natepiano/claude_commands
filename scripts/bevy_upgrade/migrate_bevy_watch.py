@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Move Bevy records and notifier jobs to staff ids. Delete this migration in Phase 18."""
 from __future__ import annotations
 
@@ -11,14 +11,12 @@ import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lib.atomic_file import sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.production import staff, store_owner
 from scripts.shutdown.remote import local_machine
-import upgrade_record
-import upgrade_schedule
+from scripts.bevy_upgrade import upgrade_record
+from scripts.bevy_upgrade import upgrade_schedule
 
 
 def _owner(document: Path) -> staff.StaffId:

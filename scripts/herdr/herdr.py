@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pane_launch
+from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
 from scripts.lib import operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
@@ -53,10 +53,10 @@ from scripts.lib.script_envelope import script_prompt
 from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
-from process_failure import failure_detail
-import nix_env as nix_env
-from place import HerdrPlace as HerdrPlace
-from pane_launch import RecordedLabels, StaffLabelsRead
+from scripts.lib.process_failure import failure_detail
+from scripts.lib import nix_env as nix_env
+from scripts.herdr.place import HerdrPlace as HerdrPlace
+from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
 
 NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 
@@ -534,7 +534,7 @@ def _composer_input(screen: str) -> ComposerInput | NoComposer:
 
 def prompt_recipient_process(session_id: str) -> PromptRecipientProcess | PromptRecipientUnavailable:
     """Identify the process receiving input, including before its socket opens."""
-    import sessions
+    from scripts.message import sessions
 
     try:
         identities = {PromptRecipientProcess(row["pid"], row.get("procStart", ""))
@@ -2248,7 +2248,7 @@ class Herdr:
         self._prompt(pane, text)
 
     def _prompt(self, pane: str, text: str) -> None:
-        import script_prompts
+        from scripts.lib import script_prompts
 
         text = script_prompt(text)
         if text.lstrip().startswith("/"):
@@ -2739,7 +2739,7 @@ def _server_start_failure(name: str) -> HerdrFailure:
 
 
 def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
-    from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
+    from scripts.lib.detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + operation_deadline.remaining(min(10.0, timeout_ms / 1000))
     try:

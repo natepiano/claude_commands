@@ -28,7 +28,7 @@ chmod +x "$CLAUDE_BIN"
 export PATH="$TEST_DIR/bin:$PATH"
 export AGENT_NOTES_DIR="$TEST_DIR/notes"
 mkdir -p "$AGENT_NOTES_DIR"
-python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
+"${BASH_SOURCE[0]%/*}/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import json, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -103,7 +103,7 @@ run_dry() {
 }
 
 # Keep command discovery independent of the machine's installed Claude binary.
-claude_command="$HOME/.claude/scripts/lib/py $SCRIPT_DIR/../lib/nix_env.py exec $TEST_DIR/bin/claude"
+claude_command="$SCRIPT_DIR/../lib/py $SCRIPT_DIR/../lib/nix_env.py exec $TEST_DIR/bin/claude"
 
 codex_write="$(run_dry codex_case.task write)"
 assert_equal "codex write command is wrong" \
@@ -126,7 +126,7 @@ assert_equal "claude readonly command is wrong" \
     "$claude_readonly"
 
 simplify_readonly="$(run_dry direct.simplify readonly)"
-python3 - "$simplify_readonly" <<'PYTHON'
+"${BASH_SOURCE[0]%/*}/../lib/py" - "$simplify_readonly" <<'PYTHON'
 import shlex
 import sys
 arguments = shlex.split(sys.argv[1])
@@ -142,7 +142,7 @@ assert "--dangerously-skip-permissions" not in arguments, arguments
 PYTHON
 [[ ! -e "$LOG_FILE" ]] || fail "simplify dry run wrote a log"
 simplify_session="$(AGENT_EXEC_EXTRA_ARGS='--session-id abcdef12-0000-4000-8000-000000000001' run_dry direct.simplify readonly)"
-python3 - "$simplify_session" <<'PYTHON'
+"${BASH_SOURCE[0]%/*}/../lib/py" - "$simplify_session" <<'PYTHON'
 import shlex
 import sys
 arguments = shlex.split(sys.argv[1])
@@ -202,7 +202,7 @@ CODEX_HOME="$TEST_DIR/caller" agents_exec_main \
 assert_equal "fallback followed its caller instead of the workers role" "$HOME/.codex1" "$(cat "$TEST_CODEX_HOME_FILE")"
 
 # A named Claude route applies only to worker launches and lasts until it closes.
-python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
+"${BASH_SOURCE[0]%/*}/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -280,7 +280,7 @@ export STAFF_FILE="$TEST_DIR/staff.json"
 export AGENT_BG_ROLE=impl
 export FAKE_CLAUDE_PID=$$
 export FIXTURE_CHECKOUT="$SCRIPT_DIR/../.."
-python3 - "$TEST_DIR" <<'PYTHON'
+"${BASH_SOURCE[0]%/*}/../lib/py" - "$TEST_DIR" <<'PYTHON'
 import os, shlex, sys
 from pathlib import Path
 sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
@@ -318,7 +318,7 @@ cat > "$TEST_DIR/bin/claude-bg" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
 printf '%s\n' "${AGENT_BG_WORKERS+set}" > "$TEST_CLAUDE_WORKERS_FLAG_FILE"
-python3 - <<'PYTHON'
+"$FIXTURE_CHECKOUT/scripts/lib/py" - <<'PYTHON'
 import os, sys
 sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production.staff_test_support import record_fixture_claude_start
@@ -349,7 +349,7 @@ cp "$MODELS_CONFIG_FILE" "$TEST_DIR/cli.conf"
 write_test_registry "$TEST_DIR/cli.conf" --update assignments/cli.commit_prep=claude
 MODELS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" commit_prep < /dev/null > "$TEST_DIR/cli-output"
 assert_equal "CLI worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
-python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
+"${BASH_SOURCE[0]%/*}/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]).resolve()))

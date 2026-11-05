@@ -8,7 +8,7 @@ argument-hint: "<old> <new>"
 Run the command from the owning showrunner session:
 
 ```sh
-python3 ~/.claude/scripts/production/rename_unit.py <plan|apply|verify> <slug> <old> <new>
+~/.claude/scripts/lib/py ~/.claude/scripts/production/rename_unit.py <plan|apply|verify> <slug> <old> <new>
 ```
 
 The command reads the unit from its staff row.
@@ -42,7 +42,7 @@ Run the reported restart command when you want that row to start.
 Use the folder-only command to keep the branch:
 
 ```sh
-python3 ~/.claude/scripts/production/unit_move.py move-folder --unit <staff id> --to <path>
+~/.claude/scripts/lib/py ~/.claude/scripts/production/unit_move.py move-folder --unit <staff id> --to <path>
 ```
 
 The command refuses an existing destination or a concurrent row operation.

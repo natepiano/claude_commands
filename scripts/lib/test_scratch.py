@@ -904,8 +904,8 @@ print(scratch.target('gate:proof', 'tree', False))
             (repo / ".git").mkdir(parents=True)
         with (
             mock.patch.dict(os.environ, config_environment(self.base / "config")),
-            mock.patch("scratch.conf.ConfigRead.whole", side_effect=conf.read("scratch").whole) as whole,
-            mock.patch("scratch.conf.ConfigRead.words", side_effect=conf.read("scratch").words) as words,
+            mock.patch("scripts.lib.scratch.conf.ConfigRead.whole", side_effect=conf.read("scratch").whole) as whole,
+            mock.patch("scripts.lib.scratch.conf.ConfigRead.words", side_effect=conf.read("scratch").words) as words,
         ):
             self.assertEqual(scratch.repos(root), repositories)
         self.assertEqual(whole.call_args_list, [mock.call("repo_depth")])

@@ -564,7 +564,7 @@ recording the result.
 </VerificationNarration>
 
 <FindingsLedger>
-Use `python3 ~/.claude/scripts/direct/findings.py <command> --session-dir
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/direct/findings.py <command> --session-dir
 "${SESSION_DIR}" --phase "<phase id>"` after <Synthesize/> confirms an issue,
 including a reviewer's style finding. Each open phase has
 its own ledger, and `--phase` names which one: with two phases open, a call
@@ -1080,7 +1080,7 @@ At an eligible point, in that same turn:
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
 
    Pass the same lens and phase the launch carries, and no lens where the
    launch carries none: the marker names the status and pid files it will watch for, and a
@@ -1108,7 +1108,7 @@ always may — early launch is opportunistic, never required.
 Every path that ends an early launch before its real pass starts also drops the
 row it was given:
 
-`python3 ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
+`~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
 
 Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}`, `${EARLY_REVIEW_SLOT}`,
 and `EARLY_REVIEW`. The
@@ -1509,7 +1509,7 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 <PhaseCleanup>
 In `single`, run both halves under <ExecutionSteps/> step 9.
 At <PhaseEnd/>'s worker cleanup point, run
-`python3 ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
+`~/.claude/scripts/lib/py ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
 It removes the completed phase's Claude workers and any worker a dead run left
 alive; a failure is one line in the report, never a stop. Under
 <LongLivedWorkers/>, do not end this run's Codex workers: their turns finish, their

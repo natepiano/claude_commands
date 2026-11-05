@@ -17,7 +17,7 @@ from merge_checkpoint import (
     run_checkpoint_test_steps, save_record,
 )
 from scripts.production.production_doc import Production
-import sessions
+from scripts.message import sessions
 
 
 def run_gate(path: Path) -> int:

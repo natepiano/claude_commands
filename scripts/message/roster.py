@@ -25,11 +25,11 @@ for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "herdr"
         sys.path.insert(0, str(_directory))
 
 from scripts.production import showrunners  # noqa: E402
-import unit_runs  # noqa: E402
-import herdr  # noqa: E402
-import codex_daemon  # noqa: E402
-import process_table  # noqa: E402
-import sessions  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
+from scripts.message import codex_daemon  # noqa: E402
+from scripts.message import process_table  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff, session_staff, worker_admission
 from scripts.usage import agents_log
@@ -60,7 +60,7 @@ else:
     agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
     note_file = _lazy_module("scripts.whoami.note_file")
 from scripts.shutdown import remote as remote  # noqa: E402
-from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
+from scripts.message.sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 
 Kind = Literal["claude", "codex"]
 Role = Literal["showrunner", "unit director", "worker", "freestanding", "astra-designer", "astra-reviewer"]

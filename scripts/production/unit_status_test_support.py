@@ -31,7 +31,7 @@ from dailies_input import StatusBlock, UnitRow, status_blocks
 from unit_lookup import UnitState
 import fake_unit_host
 from fake_unit_host import HostedUnit
-from sessions import SessionRecord
+from scripts.message.sessions import SessionRecord
 from fake_herdr import CommandResponse, pane_list
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 

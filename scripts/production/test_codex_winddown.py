@@ -21,15 +21,15 @@ from typing import cast, override
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import broadcast
-import codex_winddown
-import fake_unit_host
-import fake_showrunner
+from scripts.production import broadcast
+from scripts.production import codex_winddown
+from scripts.production import fake_unit_host
+from scripts.production import fake_showrunner
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
-import roster
-from process_table import Process
-from sessions import SessionRecord
+from scripts.message import roster
+from scripts.message.process_table import Process
+from scripts.message.sessions import SessionRecord
 from scripts.production.showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
@@ -111,7 +111,7 @@ class NoticeRetryTests(unittest.TestCase):
             codex_winddown.announce_quiet(1)
             return [sys.executable, str(self.state / "fake-send.py")]
 
-        with (mock.patch("push_texts.user_send_argv", side_effect=prepare),
+        with (mock.patch("scripts.notify.push_texts.user_send_argv", side_effect=prepare),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", ""))):
             codex_winddown.announce_quiet(0)
         self.assertFalse((self.state / codex_winddown.QUIET).exists())
@@ -235,7 +235,7 @@ class NoticeRetryTests(unittest.TestCase):
                 self.assertEqual(codex_winddown.read_projections(), {
                     "unit": codex_winddown.ZeroNoticeOwed(codex_winddown.ProjectionAnswerOwed()),
                 })
-                with mock.patch("codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
+                with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
                     self.assertEqual(codex_winddown.record_eta("unit", answer), 0)
                 self.assertEqual(codex_winddown.read_projections(), {"unit": codex_winddown.ZeroNoticeOwed(expected)})
                 with mock.patch.object(broadcast, "send", return_value="") as send:
@@ -298,7 +298,7 @@ class NoticeRetryTests(unittest.TestCase):
                         showrunner="runner", agents=1, script=SCRIPT.resolve(), unit="unit")),
                     mock.call("unit", "runner", zero_notice),
                 ])
-                with mock.patch("codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
+                with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
                     self.assertEqual(codex_winddown.record_eta("unit", "5"), 0)
             return observed
 
@@ -316,7 +316,7 @@ class NoticeRetryTests(unittest.TestCase):
 
     def test_an_eta_recorded_during_ask_is_not_replaced_with_answer_owed(self) -> None:
         def answer_during_send(_unit: str, _sender: str, _message: str) -> str:
-            with mock.patch("codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
+            with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
                 self.assertEqual(codex_winddown.record_eta("unit", "5"), 0)
             return ""
 

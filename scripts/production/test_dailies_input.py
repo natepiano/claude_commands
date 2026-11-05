@@ -17,9 +17,9 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import dailies_input
-import dailies_render
+from scripts.production import dailies_render
 from scripts.production.production_doc import read_production
-from dailies_render import LENGTHS
+from scripts.production.dailies_render import LENGTHS
 from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
 import unit_lookup

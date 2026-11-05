@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run gates in one warm checkout per owner, with a second checkout when busy."""
 from __future__ import annotations
 
@@ -21,8 +21,6 @@ import time
 from threading import Event, Thread
 from typing import NoReturn, cast, override
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import conf, copy_record, file_lock, scratch
 from scripts.lib.conf import UseConfiguredValue

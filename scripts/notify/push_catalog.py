@@ -1,6 +1,6 @@
 """Script phone texts and named cases reviewed before delivery."""
-from gpu_xid import XID_MEANINGS
-from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate, decision_values
+from scripts.notify.gpu_xid import XID_MEANINGS
+from scripts.notify.push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate, decision_values
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.

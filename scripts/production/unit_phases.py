@@ -18,7 +18,7 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import live_units
+from scripts.production import live_units
 from scripts.production import showrunners, staff, unit_lookup, unit_names
 from scripts.production.production_doc import Refusal, production_field
 from scripts.shutdown import remote

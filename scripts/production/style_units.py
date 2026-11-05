@@ -15,13 +15,13 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
 
-import live_units
+from scripts.production import live_units
 import rules
 import style_ledger
 import display_cells
 from scripts.production import staff, session_staff, unit_lookup, unit_names
-from issues import Issue, frontmatter
-from proposal_issue import ApprovedDecision, decision_answer, proposal_unit
+from scripts.production.issues import Issue, frontmatter
+from scripts.production.proposal_issue import ApprovedDecision, decision_answer, proposal_unit
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 

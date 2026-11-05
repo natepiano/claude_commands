@@ -37,10 +37,9 @@ if TYPE_CHECKING:
     from ..build_targets import targets
     from ..lint.memory_test_support import config_environment, write_config_fixture
 else:
-    import mac_test
-    import offload
-    import build_hold
-    import targets
+    from scripts.mac_test import mac_test, offload
+    from scripts.build_hold import build_hold
+    from scripts.build_targets import targets
     from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 

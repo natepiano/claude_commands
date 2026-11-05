@@ -35,7 +35,7 @@ sys.path.insert(0, str(SCRIPTS.parent))
 for directory in ("lib", "production", "message", "direct", "nightly_review"):
     sys.path.insert(0, str(SCRIPTS / directory))
 
-from user_zone import user_zone
+from scripts.lib.user_zone import user_zone
 from scripts.accounts.role_map import stored_role_map
 from scripts.hierarchies import log_records, push_audit
 from scripts.hierarchies.log_records import EventSource as EventSource

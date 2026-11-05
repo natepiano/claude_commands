@@ -21,19 +21,19 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import change_review
+from scripts.production import change_review
 from scripts.lib import atomic_file, copy_record
 from scripts.production import showrunners, staff, change_routing, merge_checkpoint
 from scripts.shutdown import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit
-import showrunner_tree
-from change_review import Invisible, Malformed, Visible
+from scripts.production import showrunner_tree
+from scripts.production.change_review import Invisible, Malformed, Visible
 
 # Importable once change_review has put scripts/lib on the path.
-import scratch
-import urgency
+from scripts.lib import scratch
+from scripts.lib import urgency
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 LIST = """# Change review list

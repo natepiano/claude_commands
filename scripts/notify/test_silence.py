@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import silence
-from user_zone import user_zone
+from scripts.notify import silence
+from scripts.lib.user_zone import user_zone
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
                           "message": "No action needed.\nThe build passed.", "detail": "", "key": "", "text_id": ""}
@@ -96,7 +96,7 @@ class SilenceTests(unittest.TestCase):
         self.assertEqual(silence.read_kept(), [])
 
     def test_manual_off_keeps_automatic_silence_when_the_end_log_fails(self) -> None:
-        import auto_silence
+        from scripts.notify import auto_silence
 
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
                                          "timer": None, "auto": True}
@@ -113,7 +113,7 @@ class SilenceTests(unittest.TestCase):
         self.assertEqual(silence.kept_file().read_bytes(), kept)
 
     def test_manual_on_preserves_automatic_silence_when_its_end_log_fails(self) -> None:
-        import auto_silence
+        from scripts.notify import auto_silence
 
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
                                          "timer": None, "auto": True}

@@ -32,7 +32,7 @@ from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from code_kind import is_test_code  # noqa: E402
-from user_zone import user_zone, user_zone_name  # noqa: E402
+from scripts.lib.user_zone import user_zone, user_zone_name  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
 
 TermKind = Literal["role", "document", "step", "record"]
