@@ -195,7 +195,8 @@ class VerifyNixShellTests(NixFixture):
         configuration = self.root / "user_zone.conf"
         _ = configuration.write_text("zone=Europe/Paris\n", encoding="utf-8")
         result = subprocess.run(["bash", str(clock)], cwd=self.work,
-                                env={**self.env, "USER_ZONE_CONF": str(configuration)},
+                                env={**self.env, "PY": str(self.bin / "python3"),
+                                     "USER_ZONE_CONF": str(configuration)},
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Europe/Paris\n")

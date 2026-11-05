@@ -46,7 +46,7 @@ capture.write_text(json.dumps(rows))
         shell = self.root / "observe.sh"
         _ = shell.write_text('''set -T
 observe_admission() {
-    if [[ "${FUNCNAME[1]:-}" == buildlog_wait_for_memory && "$BASH_COMMAND" == 'buildlog_wait_for_memory_only "$@"' ]]; then
+    if [[ "${FUNCNAME[1]:-}" == buildlog_wait_for_memory && "$BASH_COMMAND" == 'with_token_renewal buildlog_wait_for_memory_only "$@"' ]]; then
         python3 "$TEST_TOKEN_OBSERVER" admission || exit 95
     fi
 }
