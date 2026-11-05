@@ -1628,7 +1628,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** named availability states for `StepEvidence.arguments` — `history_selection` reads an empty argv and a missing one the same way.
 
-### Phase 61 — Workspace and temporary-sweep failures reach natedev once, and the Phase 58 floor code has one copy of each rule  · status: todo
+### Phase 61 — Workspace and temporary-sweep failures reach natedev once, and the Phase 58 floor code has one copy of each rule  · status: done
 **Depends on:** Phase 62 (both change `scripts/lint/sweep.py`; builds ruling 2026-11-04: Phase 62 runs first).
 
 #### Work Order
