@@ -53,12 +53,3 @@
   - Completion condition: typed `/build:queue bump <unit>` from any pane sets or replaces persistent priority through the existing writer, without a session-role check on the plugin route; tests cover a non-showrunner pane and replacement, while direct priority commands retain their existing caller checks.
   - Revealed by: Phase 26; approved by builds in `S/next_items_pending.md`.
 
-- [ ] **The floor sweep takes its target folders from recorded step rows**
-  - Target: `scripts/lint/sweep.py` (`discover_cargo_outputs`, `_hold_floor`), the shared step-evidence reader and their tests.
-  - Dependency: follow Phase 58's C1008 fix and preserve its 30-second limit.
-  - Why needed: the build queue owns build folders (user, 2026-11-03). Output discovery still runs Cargo metadata for checkouts, although step rows record Cargo output roots.
-  - Completion condition: use both recorded roots through the shared reader and run no `cargo metadata` during the floor pass.
-  - Add reader fields only with their first consumer; reuse fields that another consumer already added.
-  - Represent missing folder evidence with a named state and preserve existing deletion protections.
-  - Test the evidence source and missing evidence; require a successful natedev floor-only dry run below 30 seconds.
-  - Revealed by: Phase 58 part B and C1008 (builds showrunner 2026-11-04: next, after the Phase 58 fix)

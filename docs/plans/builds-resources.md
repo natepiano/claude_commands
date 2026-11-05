@@ -1564,12 +1564,12 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - The follow-up notice records the Phase 20 deployment time and the due time 24 hours later.
 - Spec 7: the build hold, head facts and memory admission tests pass on this branch and with `origin/builds-queue` merged in a copy. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the four Spec 7 files.
 
-### Phase 58 — The disk floor alert stays silent during a live sweep, and the floor pass finishes quickly  · status: todo
+### Phase 58 — The disk floor alert stays silent during a live sweep, and the floor pass finishes quickly  · status: done
 **Depends on:** none. Runs beside Phase 60 (showrunner request 2026-11-04 09:45 EST). Its files do not overlap the Phase 60 files.
 
 #### Work Order
 
-**Goal:** the floor lock alert reports only a real block, an unreadable holder included, and a floor-only dry run on natedev finishes in under 30 seconds.
+**Goal:** the user's phone gets a disk push only for a real problem; the floor lock alert reports only a real block, an unreadable holder included; and a floor-only dry run on natedev finishes in under 30 seconds.
 
 **Measured:**
 1. At 09:45 EST on 2026-11-04, natedev had 291.5 GiB free, under the 300 GiB floor.
@@ -1584,7 +1584,15 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Measured after Part B (C1008):** on main `a428277ba`, `sweep.py --floor-only --dry-run` on natedev exited 0 in 110.7 s (284.1 GiB free, would remove 15.9 GiB). The limit is 30 s. The speed work is not done.
 
+**Measured (phone push):** at 16:2x EST on 2026-11-04 the phone got `sweep.disk_floor` "Builds need more disk space" at 282.7 GiB free, asking the user to name paths. The user: "This kind of msg is just noise. It's not actionable and sweeps work. I do not need these sent to me unless there is an actual problem."
+
 **Spec:**
+0. **The phone push only for a real problem** (user 2026-11-04; rule from natedev through the builds showrunner). This part goes first.
+   - Free space under the floor after the idle output is gone sends no phone push. It sends the alert to natedev only (`FloorAlertChannels.NATEDEV`), with the busy paths.
+   - A phone push goes only for a real problem: the sweep itself fails, or free space falls under a new `config/lint.conf` key `sweep_phone_floor_gib` (value 150, set by natedev). Read the key at use; write no code constant.
+   - Send one push for each crossing. Send no repeat until free space rises above the line again. Keep the crossing in the floor record as named states (above the line, under the line and pushed), never a bare flag.
+   - Update the `sweep.disk_floor` push text, its `scripts/notify/push_catalog.py` entry and the 2026-10-05 and 2026-10-21 comments in `sweep.py` to this rule. A changed push text gets a fresh entry in `scripts/notify/push_texts_reviewed.json` through the existing review.
+   - Builds ruling 2026-11-04 18:32 EST: the low-space phone text failed the plain text review, so the crossing alert and the sweep-failure alert go to natedev only, with no phone push. `sweep.disk_floor` and `sweep.disk_cleanup_failed` leave the catalog, with their old approval records. Phase 63 brings back the low-space phone push with a text that passes the review.
 1. An `UnreadableFloorLockHolder` gets the alert after `floor_lock_alert_minutes`, like any holder that is not a live sweep. The message names its pid and command when they are readable.
    `UnreadableFloorLockHolder` (`sweep.py` :534) holds only a pid, so it has no clock. Add a named observation state that records when this unreadable hold was first observed.
    Reset the clock when the holder pid changes or the lock is free. Keep it when a delivery fails, so the next pass retries.
@@ -1596,19 +1604,23 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Do not kill or signal a live sweep. Do not delete a target to test the fix; use `--dry-run` or private fixtures.
 
 **Files:**
-- `scripts/lint/sweep.py` — the alert condition, the observation state and the floor pass speed.
+- `scripts/lint/sweep.py` — the phone-push rule, the alert condition, the observation state and the floor pass speed.
 - `scripts/lint/test_sweep.py` — its tests.
+- `config/lint.conf` — `sweep_phone_floor_gib=150`.
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — the `sweep.disk_floor` text and its review.
 
 **Workers:** `1 writer`
-- `impl` owns the code, the tests, the speed fix and the natedev timing run.
+- `impl` owns the code, the tests, the config key, the push text, the speed fix and the natedev timing run.
 
 **Acceptance gate:**
+- Tests prove: under the floor and above the alert line, natedev gets the floor alert and the phone gets nothing; a fall under the alert line sends one natedev alert; a second pass still under the line sends none; a rise above the line and a new fall sends one more; a failed sweep sends one natedev alert per failure episode, and a failed delivery is sent again. `scripts/notify/test_push_texts.py` passes.
+- Change-Review line: the phone gets no disk push | read the phone pushes after the next natedev floor pass under 300 GiB free | no disk push arrives on the phone; the natedev session gets the floor alert.
 - Tests prove: an unreadable holder gets the alert after the configured minutes; repeated observations keep the first-observed time; a new holder pid resets it; a failed delivery retries; a live sweep holder gets none.
 - Run `sweep.py --floor-only --dry-run` on natedev through the detached runner.
-- Require exit status 0 and elapsed wall time below 30 seconds.
+- Require exit status 0 and elapsed wall time below 30 seconds on a warm run (the sweep ran in the last few minutes). Builds ruling 2026-11-04: the gate is accepted on warm runs; a cold run is the next phase's bar.
 - Record the command, commit, elapsed time and complete log in the checkpoint notice.
 - `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the two changed files.
-- Change-Review line: the floor scan completes within its time limit | on natedev, time `~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --dry-run` | exit status is 0 and elapsed wall time is below 30 seconds.
+- Change-Review line: the floor scan is faster | on natedev, time `~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --dry-run` | exit status is 0; the run takes 23 to 46 s, depending on machine load and on whether a sweep ran in the last few minutes.
 
 ### Phase 59 — Idle hana runners hold no swap: the runner home moves from tmpfs to disk  · status: todo
 **Depends on:** none. Runs beside Phases 11 and 58 (showrunner request 2026-11-04 10:1x EST). It changes only the nixos repository.
@@ -1672,3 +1684,118 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Each `compiling_history` call decodes the whole `anon_peaks.jsonl`; `filtered_peak` calls it three times.
 
 **Ruled out:** named availability states for `StepEvidence.arguments` — `history_selection` reads an empty argv and a missing one the same way.
+
+### Phase 61 — Workspace and temporary-sweep failures reach natedev once, and the Phase 58 floor code has one copy of each rule  · status: todo
+**Depends on:** Phase 62 (both change `scripts/lint/sweep.py`; builds ruling 2026-11-04: Phase 62 runs first). Runs beside Phase 59.
+
+#### Work Order
+
+**Goal:** a workspace or temporary-sweep failure sends one natedev alert through the Phase 58 failure-episode states, and the floor code that Phase 58 added has one copy of each rule and named states for each record.
+
+**Measured (Phase 58 review pass 1, repair round 8, landing rule):** these findings moved here from Phase 58. None is a regression, and none fails a test or gate. F003 was there before Phase 58 (`2925d6453^` has the same status aggregation); this deferral is an exception to the Phase 58 rule that a failed sweep sends a push.
+- F003: `main()` returns status 1 for a workspace or temporary-sweep failure and sends no notification (`scripts/lint/sweep.py` ~:3342).
+- F010: `scan_floor_roots` forces one scan worker in code; one config key has two meanings.
+- F011: `ObservedUnreadableFloorHold.alert_delivered` is a bare flag.
+- F012: `send_floor_alert` returns a different fact for each channel.
+- F013: `alert_floor_lock` writes the record at up to five sites; the reset block has four copies.
+- F014: the `phone_crossing` strings are written in two places, in two forms.
+- F015: the default `FloorRecord` fallback is copied.
+- F016: `read_floor_record` copies the pid check.
+- F017: the cmdline decode is copied.
+- F018: the `holders` parameter of `page_paths` is dead; `closing` is a one-item list.
+- F019: the natedev closing line states a policy, not this event's phone result.
+- F020: two comments repeat other text.
+- F021: `target_dirs` pushes branches back only for `visit` to pop them.
+- F022: `discover_cargo_outputs` nests two executors and shares `refreshed`.
+- F023: build trees and `roots_for` are computed more than once per target.
+- F024: the new tests copy their setup and add patches inside `subTest` loops.
+Full detail: `findings.py status --phase 58` in the resources run folder.
+
+**Spec:**
+1. Route workspace and temporary-sweep failures through the Phase 58 failure-episode finalizer, each with its own failure scope. Send one natedev alert for each failure run (builds ruling 2026-11-04 18:32 EST: sweep failures go to natedev only).
+2. Add `sweep_scan_workers.natedev=1` to `config/lint.conf` and a separate `sweep_discovery_workers` key. Delete the code override and the unused `map` branch.
+3. Replace `alert_delivered` with two states: `ObservedUnreadableFloorHold` and `ReportedUnreadableFloorHold`.
+4. Return `FloorAlertDelivery(natedev, phone)` from `send_floor_alert`.
+5. Add one pure transition `next_lock_alert(previous, holder, live_sweep, now)`. Write once, only when the state changed. Use it at lock acquisition too.
+6. Use `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, and one `_command_text(bytes)` helper.
+7. Change `page_paths` to `page_paths(measurement)`. Put the closing string in the `render` list. State the phone result of the event in the natedev closing line.
+8. Remove the two repeated comments.
+9. Simplify `target_dirs` (one loop over a named 3-level constant, `visit(search, directory, depth)`, no `len < 2` case) and `discover_cargo_outputs` (one executor, local `refreshed`).
+10. Compute `roots_for` once per distinct root. Pass found markers to `is_cargo_target`. Fill `known_trees` from discovery.
+11. Add `phone_calls(send)`, `record=` on `locked_floor` and `saved_lock_alert()` test helpers. Move patches above loops. Keep one status-1 channel assert.
+
+**Constraints from prior phases:**
+- Keep the Phase 58 alert rule (natedev only), its notification finalizer, the failure-episode and crossing states, and the dry-run result. Phase 50 and 53 own the floor rules, Mac claims and outside caches.
+- Keep the warm floor-only dry run on natedev under 30 s.
+
+**Files:**
+- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`, `config/lint.conf`.
+
+**Workers:** `1 writer`
+
+**Acceptance gate:**
+- Tests prove: a workspace failure and a temporary-sweep failure each send one natedev alert per failure run, and a clean pass of the same scope ends the episode.
+- `scripts/lint/test_sweep.py`, `scripts/lint/test_tmp_sweep.py` and `scripts/notify/test_push_texts.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
+- `sweep.py --floor-only --dry-run` on natedev exits 0 in under 30 s on a warm run, with the same result as before the phase.
+- Change-Review line: a failed workspace sweep reaches natedev once | read the natedev session after a workspace sweep failure | one alert arrives, with the failure status.
+
+### Phase 62 — The floor sweep takes its target folders from recorded step rows  · status: todo
+**Depends on:** Phase 58 (its checkpoint). Runs beside Phase 59. Runs before Phase 61 (builds ruling 2026-11-04).
+
+#### Work Order
+
+**Goal:** the floor pass finds build output from the build queue's recorded step rows and runs no `cargo metadata`, so a cold floor-only dry run on natedev finishes in under 30 seconds.
+
+**Measured (Phase 58 checkpoint):** `sweep.py --floor-only --dry-run` on natedev took 42.6 s on the first run after a pause (load 56-71), and 24.0-25.3 s on warm runs. After the last Phase 58 repair, three runs in a row took 30.0 s, 45.9 s and 22.9 s at load 45-60 on 32 cores: a warm run can also pass 30 s under load. Output discovery runs Cargo metadata for each checkout; a warm run reuses its cached answers.
+
+**Why:** the build queue owns build folders (user, 2026-11-03). Step rows already record the Cargo output roots.
+
+**Spec:**
+1. Read both recorded output roots of each step through the shared step-evidence reader. Run no `cargo metadata` in the floor pass.
+2. Add a reader field only with its first consumer. Reuse a field that another consumer already added.
+3. Give a folder with no recorded evidence a named state. Keep every existing deletion protection for it.
+4. Keep the floor rules, active-build protections, Mac claims and outside-cache handling (Phases 50, 53 and 58).
+
+**Constraints from prior phases:**
+- Keep the Phase 58 alert rule, its notification finalizer and its failure-episode and crossing states.
+- Do not kill or signal a live sweep. Do not delete a target to test the fix; use `--dry-run` or private fixtures.
+
+**Files:**
+- `scripts/lint/sweep.py` (`discover_cargo_outputs`, `_hold_floor`), the shared step-evidence reader, and their tests.
+
+**Workers:** `1 writer`
+
+**Acceptance gate:**
+- Tests prove: the floor pass takes its folders from step rows; a folder with no evidence keeps its protection; no `cargo metadata` call runs during the floor pass.
+- `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass, with the tests of the step-evidence reader. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
+- On natedev, `sweep.py --floor-only --dry-run` exits 0 in under 30 s on a cold run (the first run after at least 30 minutes with no sweep) and on three warm runs in a row, at natedev's normal build load (load 45-70), with the same targets as a run before the phase. Record the command, commit, load and time of each run in the checkpoint notice.
+- Change-Review line: the floor scan is fast after a pause | on natedev, wait 30 minutes after a sweep, then time `~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --dry-run` | exit status is 0, and the run finishes in under 30 s.
+
+### Phase 63 — The phone gets one low-disk push under the alert line, with a text that passes the review  · status: todo
+**Depends on:** Phase 61 (both change `scripts/lint/sweep.py`).
+
+#### Work Order
+
+**Goal:** when natedev free space falls under `sweep_phone_floor_gib`, the phone gets one push that passes the plain text review, and natedev still gets its alert.
+
+**Measured (Phase 58, builds ruling 2026-11-04 18:32 EST):** the plain review (`review.py texts --id sweep.disk_floor`, run 20261104T184217-1376377-29bf) failed both examples. Objections:
+- `typical`: every-choice-says-what-it-does and reader-starts-cold on the folder list. The reviewer asked which folder to delete and why, what the scratch folders hold, and what each deletion changes.
+- `no_free_space`: every-choice-says-what-it-does on the list total, and short-plain-sentences on "Deleting a folder removes its files."
+The rejected texts and the reviewer's suggested rewrites are in the resources run folder, `phases/58/impl_summary_floor-impl.txt`. Phase 58 sends the crossing to natedev only.
+
+**Spec:**
+1. Write the `sweep.disk_floor` text with the builds ruled header ("natedev disk is low; builds can fail"), action ("In the natedev Claude session, say which folders to delete.") and last line ("natedev checks your choice before it deletes anything."). Each listed folder says what it holds and what deleting it changes. Recommend one choice.
+2. Send the wording to the builds showrunner before the review (item 12). Run the plain review; record the approval with `review.py texts --id sweep.disk_floor --approve` only when every example passes. Never use `--user-spec`, and never write an approval record by hand.
+3. Send the push with the natedev alert on a crossing (`FloorAlertChannels.NATEDEV_AND_PHONE`). Keep one push per crossing.
+4. Use `sweep_push_text_limit` and `sweep_page_paths` in `config/lint.conf`, or remove them and their `config/README.md` rows. Phase 58 left them with no reader.
+5. If the text still fails the review, keep the alert natedev only and ask the builds showrunner.
+
+**Files:**
+- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `config/lint.conf`, `config/README.md`.
+
+**Workers:** `1 writer`
+
+**Acceptance gate:**
+- Tests prove: a fall under the alert line sends one push and one natedev alert; a second pass under the line sends none; a rise above the line and a new fall sends one more.
+- `scripts/notify/test_push_texts.py` passes with a normal approval record. `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
+- Change-Review line: the phone gets one low-disk push | read the phone pushes after natedev free space falls under 150 GiB | one push arrives that says which folders to delete and what each one holds.
