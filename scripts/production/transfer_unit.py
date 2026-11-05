@@ -52,7 +52,7 @@ def apply(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
         if changed:
             _ = staff.move(request.member.id, staff.ReportsTo(request.parent.id))
             notice = showrunners.send_to_address(
-                f"staff:{request.member.id}", f"transfer:{request.member.id}:{request.parent.id}",
+                str(request.member.id), f"transfer:{request.member.id}:{request.parent.id}",
                 f"Your unit now belongs to production {request.receiving.slug}.", recipient=request.unit)
             for line in notice.lines:
                 print(line)
