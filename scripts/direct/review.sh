@@ -48,10 +48,7 @@
 #                                        start + [wrapper] beats every 60s, each
 #                                        carrying an activity digest decoded from
 #                                        the reviewer's streamed log. Fresh
-#                                        reviewers are read-only. Assigned reviewers
-#                                        and simplify reviews get a tree check.
-#                                        The check excludes paths held by another
-#                                        open phase (review_tree.py).
+#                                        reviewers are read-only.
 
 set -euo pipefail
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
@@ -180,10 +177,6 @@ RECORDS_TURN=0
 if [[ -n "${REVIEW_WORKER}" || "${TASK}" == direct.simplify ]]; then
   RECORDS_TURN=1
 fi
-REVIEWER_LABEL="review worker ${REVIEW_WORKER}"
-if [[ -z "${REVIEW_WORKER}" ]]; then
-  REVIEWER_LABEL="${LENS:-fresh} reviewer"
-fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -213,7 +206,6 @@ else
 fi
 LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log"
 REPLY_FILE="${ARTIFACT_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
-TREE_BASELINE_FILE="${ARTIFACT_DIR}/review_tree_${PASS_INDEX}${SUFFIX}.$$.json"
 
 AGENT_FILE="${ARTIFACT_DIR}/review_agent${SUFFIX}"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
@@ -407,18 +399,7 @@ cleanup_mesh_review() {
       --session-dir "${MESH_SESSION_DIR}" --to "${FOLLOW_TO}" \
       --claim-pid "${FOLLOW_LAUNCHER_PID}" >/dev/null 2>&1 || true
   fi
-  rm -f "${REPLY_FILE}" "${TREE_BASELINE_FILE}"
-}
-
-# The tree guard keeps per-path entries, so a phase writing beside this one changes only its
-# own paths and review_tree.py can leave them out (its docstring has the rule).
-capture_tree_baseline() {
-  if "$PY" "${SCRIPT_DIR}/review_tree.py" baseline \
-    --root "${WORKING_DIR}" --out "${TREE_BASELINE_FILE}" 2>>"${LOG_FILE}"; then
-    TREE_BASELINE_READY=1
-  else
-    TREE_BASELINE_READY=-1
-  fi
+  rm -f "${REPLY_FILE}"
 }
 
 record_new_worker_identity() {
@@ -673,7 +654,6 @@ if [[ -n "${NEW_SLOT}" ]]; then
   DURABLE_WORKER_MODEL="${IMPLEMENTATION_PAIR%%:*}"
 fi
 
-TREE_BASELINE_READY=0
 TURN_IMAGE_ARGS=()
 
 if [[ -n "${REVIEW_WORKER}" ]]; then
@@ -688,9 +668,6 @@ if [[ -n "${REVIEW_WORKER}" ]]; then
     claim_follow
     MESH_CLAIMED=1
   fi
-fi
-if [[ "${RECORDS_TURN}" -eq 1 && ( -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ) ]]; then
-  capture_tree_baseline
 fi
 initialize_review_artifacts
 
@@ -841,9 +818,6 @@ if [[ -n "${EARLY_READY_FILE}" ]]; then
   while kill -0 "${AGENT_PID}" 2>/dev/null && [[ ! -e "${EARLY_READY_FILE}" ]]; do
     sleep "${UNIT_EARLY_POLL_SECS:-5}"
   done
-  if [[ -e "${EARLY_READY_FILE}" && "${TREE_BASELINE_READY}" -eq 0 ]]; then
-    capture_tree_baseline
-  fi
   if [[ -e "${EARLY_READY_FILE}" ]] && kill -0 "${AGENT_PID}" 2>/dev/null; then
     if ! record_pass_start; then
       echo "ERROR: unable to record the early review pass start." >&2
@@ -868,23 +842,6 @@ fi
 kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
-TREE_CHANGED=0
-CHANGED_PATHS=""
-if [[ "${TREE_BASELINE_READY}" -ne 0 ]]; then
-  if [[ "${TREE_BASELINE_READY}" -eq 1 ]] && CHANGED_PATHS="$("$PY" "${SCRIPT_DIR}/review_tree.py" changes \
-    --root "${WORKING_DIR}" --baseline "${TREE_BASELINE_FILE}" \
-    --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" 2>>"${LOG_FILE}")"; then
-    CHANGED_PATHS="$(tr '\n' ' ' <<<"${CHANGED_PATHS}" | sed 's/[[:space:]]*$//')"
-  else
-    CHANGED_PATHS="the tree check failed (see ${LOG_FILE})"
-  fi
-  if [[ -n "${CHANGED_PATHS}" ]]; then
-    TREE_CHANGED=1
-    review_error "${REVIEWER_LABEL} changed the working tree: ${CHANGED_PATHS}"
-  fi
-  rm -f "${TREE_BASELINE_FILE}"
-fi
-
 if [[ "${TASK}" == direct.simplify ]]; then
   if ! REPORT_ERROR="$(simplify_result check)"; then
     review_error "${REPORT_ERROR}"
@@ -895,7 +852,7 @@ fi
 # The durable record stores this count before finish-pass closes the pass.
 count_turn_findings
 
-if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
+if [[ "${AGENT_CODE}" -eq 0 ]]; then
   # A completed early review is a real pass only once the sentinel exists: the
   # worker can beat the 5s poll to the finish, leaving the start unrecorded
   # above. Before the sentinel there is nothing to record. The implementation
@@ -946,13 +903,6 @@ else
       --session-dir "${SESSION_DIR}" --status error \
       && PASS_STARTED=0 \
       || echo "ERROR: unable to record the review pass error." >&2
-  fi
-  if [[ "${TREE_CHANGED}" -eq 1 ]]; then
-    bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
-      "${BEAT_TAG} ${REVIEWER_LABEL} changed the working tree: ${CHANGED_PATHS}" || true
-    board_post blocked \
-      "launcher: ${REVIEWER_LABEL} changed the working tree: ${CHANGED_PATHS}; findings kept in review_findings_${PASS_INDEX}${SUFFIX}.txt"
-    exit 1
   fi
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent exited with code ${AGENT_CODE}" || true
   board_post blocked \

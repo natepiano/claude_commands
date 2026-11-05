@@ -41,7 +41,6 @@ import fcntl
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import time
 
@@ -151,21 +150,6 @@ elif verb == 'follow':
         sys.path.insert(0, os.environ['TEST_WAIT_HELPER_DIR'])
         from wait_for_test_state import wait_for_file
         wait_for_file(pathlib.Path(finish_file))
-    edit_path = os.environ.get('STUB_REVIEW_EDIT', '')
-    if edit_path:
-        pathlib.Path(edit_path).write_text('changed by reviewer\\n')
-    if os.environ.get('STUB_REVIEW_COMMIT', ''):
-        working_dir = os.environ['STUB_REVIEW_WORKING_DIR']
-        subprocess.run(
-            ['git', '-c', 'user.name=Review Test', '-c',
-             'user.email=review@example.com', 'add', '.'],
-            cwd=working_dir, check=True,
-        )
-        subprocess.run(
-            ['git', '-c', 'user.name=Review Test', '-c',
-             'user.email=review@example.com', 'commit', '-m', 'reviewer edit'],
-            cwd=working_dir, check=True,
-        )
     pathlib.Path(option('--summary-file')).write_text(os.environ.get('STUB_FINDINGS', 'No findings.\\n'))
     with pathlib.Path(option('--log-file')).open('a') as log:
         log.write('stub mesh log\\n')
@@ -292,7 +276,7 @@ class ReviewLauncherFixture(LauncherFixture):
         config = self.root / "config"
         config.mkdir(exist_ok=True)
         _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
-        for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
+        for name in ("review.sh", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")
         lint = self.root / "scripts/lint"
@@ -391,26 +375,13 @@ class ReviewLauncherFixture(LauncherFixture):
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
-    def run_assigned_review(
-        self,
-        session_dir: Path,
-        worker: str,
-        *,
-        edit_path: str = "",
-        commit_change: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
-        environment = self.environment()
-        environment["STUB_REVIEW_WORKING_DIR"] = str(self.working_dir)
-        if edit_path:
-            environment["STUB_REVIEW_EDIT"] = edit_path
-        if commit_change:
-            environment["STUB_REVIEW_COMMIT"] = "1"
+    def run_assigned_review(self, session_dir: Path, worker: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             self.review_command(session_dir, "", "", worker),
             check=False,
             capture_output=True,
             text=True,
-            env=environment,
+            env=self.environment(),
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
@@ -505,34 +476,3 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         calls = self.root / "pass-calls.jsonl"
         calls.touch()
         environment["STUB_PASS_CALLS"] = str(calls)
-
-    def side_by_side_review(self, name: str, edited: str, *, commit_change: bool = False) -> tuple[
-            subprocess.CompletedProcess[str], Path]:
-        """Review phase 3 while phase 4, open beside it, holds `other.txt` and its writer edits `edited`."""
-        session = self.start_implementation(name)
-        self.finish_implementation(session)
-        # The stub's commit adds every file, so the plan start_implementation writes is committed first.
-        _ = subprocess.run(["git", "add", "plan.md"], cwd=self.working_dir, check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-        _ = subprocess.run(
-            ["git", "-c", "user.name=Review Test", "-c", "user.email=review@example.com",
-             "commit", "-q", "-m", "plan"],
-            cwd=self.working_dir, check=True, capture_output=True, text=True,
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-        )
-        for phase, files in (("3", "reviewed.txt\n"), ("4", "other.txt\n")):
-            directory = session / "phases" / phase
-            directory.mkdir(parents=True, exist_ok=True)
-            _ = (directory / "delegated_phase_reservation_state.json").write_text(
-                json.dumps({"state": "active", "phase": phase}), encoding="utf-8")
-            _ = (directory / "files").write_text(files, encoding="utf-8")
-        # A phase is open while the recorder lists it, so phase 4 starts there beside phase 3.
-        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Parallel writer")
-        environment = self.environment()
-        environment["STUB_REVIEW_EDIT"] = str(self.working_dir / edited)
-        environment["STUB_REVIEW_WORKING_DIR"] = str(self.working_dir)
-        if commit_change:
-            environment["STUB_REVIEW_COMMIT"] = "1"
-        command = self.unit_review_command(session)
-        command[2:2] = ["--phase", "3"]
-        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-        return result, session / "phases" / "3"

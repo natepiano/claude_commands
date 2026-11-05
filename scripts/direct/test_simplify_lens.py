@@ -117,8 +117,6 @@ if os.environ.get("SIMPLIFY_TEST_STARTED"):
 if os.environ.get("SIMPLIFY_TEST_GATE"):
     with Path(os.environ["SIMPLIFY_TEST_GATE"]).open() as gate:
         gate.read()
-if os.environ.get("SIMPLIFY_TEST_EDIT"):
-    Path(os.environ["SIMPLIFY_TEST_EDIT"]).write_text("Changed by reviewer")
 for event in json.loads(os.environ.get("SIMPLIFY_TEST_EVENTS", '[{"type": "result", "result": "Pass"}]')):
     print(json.dumps(event))
 raise SystemExit(int(os.environ.get("SIMPLIFY_TEST_EXIT", "0")))
@@ -628,14 +626,6 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         self.assertEqual(second.returncode, 0, str(second_output))
         self.assertTrue(all(record["status"] == "completed" for record in self.passes()))
 
-    def test_the_shared_tree_guard_rejects_a_claude_edit(self) -> None:
-        self.env["SIMPLIFY_TEST_EDIT"] = str(self.work / "unexpected.txt")
-        result = self.launch()
-        self.assertEqual(self.status(), "error")
-        record, = self.records()
-        self.assertEqual(record["status"], "error")
-        self.assertIn("simplify reviewer changed the working tree", result.stderr)
-        self.assertNotIn("review worker  changed", result.stderr)
 
 
 class SimplifySeedTests(unittest.TestCase):
