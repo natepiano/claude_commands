@@ -494,81 +494,15 @@ Acceptance gate: basedpyright 0/0 on changed files and every caller module; name
 
 **One assign command (user, 2026-10-31).** `assign` (`scripts/direct/assign.py`, `assign.sh`) is the only way a worker is added to a unit or a showrunner. It writes the staff row first and starts nothing when it cannot. A Codex or Claude agent started any other way is not a worker: it gets no row, and the staff check ignores it. The old launch scripts go (user, 2026-10-31: "we get rid of the former (ancient) delegate or review or whatever other scripts exist"): after 3m, one step lists every script that starts or dispatches a worker, moves its callers and command docs to `assign`, and deletes it.
 
-### Phase 3n — Workers on the staff record (call sites)  · status: todo
+### Phase 3n — Workers on the staff record (call sites)  · status: done (models-unit, 19e69a3eb; shrink d963d30aa)
 
-**Owner:** models-unit, after its Phase 4 and 4m (sdlc, 2026-11-02). `staff.py` and `staff_sources.py` keep one writer at a time: herdr-unit and models-unit settle each window on the berth board.
+#### As-built
 
-**Depends on:** 3h, 3l, 3p, 3q (staff storage schema changes with roles; live output remains schema 3), and the models unit's F024 checkpoint 3b67af71 on `origin/natedev-models` (the lock order, `worker_lifecycle.acquire_flock` and the `stop` path): merge it before any edit.
-
-Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3l.
-
-#### Work Order
-
-**Goal:** keep Phase 3h's native-id admission and finish worker roles, permanent end, adoption, backend metadata, deadlines and reader conversion. The handler reads who reports to whom from the 3l staff command. A Codex worker is stopped and resumed by the same path as a Claude session, by name or staff id. `production_tree.py` has no caller left; Phase 4b deletes it.
-
-**Spec:**
-
-1. **Remaining call sites.** A worker lives as long as its unit director, across runs (user 2026-10-28). Each call site finds a worker through its staff row, also from a later run of the same director; a finished run never makes the row wrong (sdlc ruling, 2026-11-02 08:44). Preserve the existing shared admission in `worker_admission.py`; do not build a second open path. All starters already switch together in 3h. Integrate its `WorkerStartAllowed` and `PublishedWorker` types with the remaining role, adoption and permanent-end work:
-   - Codex: open `codex_mesh.open_unit_worker` and `start`; permanent end `codex_mesh end` and `workers.end_unit`; a resumable `stop` keeps the row; adoption `workers.adopt` calls the staff adoption below.
-   - Claude workers: their one open point in `implement.sh` / `assign.sh` and their one end point, `remove_workers.py`.
-   - Astra roles: `design_roles.open_role` and `design_roles.end`. A showrunner-held Astra role is a worker row under its showrunner (3l seeds and shows it).
-   **The recorded role is on the worker's staff row.** `staff.WorkerRole` (new: `impl | test | review | fix | astra-designer | astra-reviewer`). `ensure_worker(native_id: StaffId, name: str, parent: StaffId, role: WorkerRole) -> StaffRow` publishes it at the 3h boundary; each admission point passes the role its producer records today (the board role, the ledger entry's `role`, the design role). The role is set once, like the name: an `ensure_worker` of an existing row with another role raises `StaffRefused` and changes nothing. `StaffRow` gains `role: WorkerRole | NotAWorker`, where the singleton `NotAWorker` is the value of every showrunner and unit row. In `staff.json` only a worker row carries a `"role"` key; `from_json` requires it on a worker row and refuses it on any other row, and the conversion happens only there. The record goes to the next schema (the staff file is schema 2 before this role change; `live()` already emits schema 3). The first seed run after this phase reads the 3q schema file, gives each worker row its role from the same producer records in one transaction and writes the next schema; a worker row with no recorded role in any producer stops that seed with one line naming the row and writes nothing. A second seed run changes nothing. `staff_sources.LiveRole` becomes `WorkerRole | Literal["showrunner", "unit"]`, and `live()` takes a worker's role from its row, so `_role` (`staff_sources.py:206`) goes. No code parses a role from a name: `WorkerName.parse` (`staff.py:63`) checks shape only.
-   **Locks (models checkpoint 3b67af71).** The order is "unit ledger, design/pool, membership, lifecycle, server, inbox, roster"; the pool lock goes with the pool in Phase 3p, so the order is "unit ledger, design, membership, ..." from then on. At each admission and retirement point, `ensure_worker` / `retire` run while the run-level membership lock is held, after the lifecycle, server, inbox and roster locks are released, so a bulk stop cannot run between the roster write and the staff row. A staff lock is never held while membership is taken; the lock-order guard in `test_codex_mesh` checks it. Every lock wait uses `worker_lifecycle.acquire_flock` with the operation deadline; `_server_lock(session_dir, *, deadline=NO_LOCK_DEADLINE)` takes it the same way, and in a shutdown an omitted deadline takes the operation deadline (`effective_deadline`). Only `OperationDeadlineExpired` is re-raised; an ordinary socket timeout keeps its recovery.
-   **The staff transaction obeys the deadline.** `staff._record_transaction` (`staff.py:532`) takes `staff.json.lock` with a blocking `fcntl.flock` today (:537); it moves to `worker_lifecycle.acquire_flock` with the operation deadline. Every time limit in `staff.py` moves to `config/staff.conf`, read at each use through `tunables.number`, and each wait uses `min(configured limit, remaining operation deadline)`, so a deadline only shortens a wait: `OPERATION_LOCK_SECONDS` (today `OPERATION_LOCK_TIMEOUT_SECONDS = 30.0`, :28) for `staff.operation()`'s wait (`_wait_for_operation_lock`, :281); `OPERATION_POLL_SECONDS` for that wait's poll interval; `REMOTE_SECONDS` for the Mac's ssh call (`_remote`, :439, `timeout=20` today), which also bounds the ssh connect time. Each value has a changed-config test.
-   **One adoption operation.** `staff.adopt_worker(worker: StaffId, new_parent: StaffId) -> StaffRow` changes only the worker row's parent and keeps its id and name, in one staff transaction, run under both runs' membership locks (`worker_lifecycle.lock_memberships(source, destination)`) with the lock rules above. `staff.move` keeps refusing a worker (`staff.py:624`). A rerun after the parent changed changes nothing, prints `unchanged` and exits 0.
-   **The tunables reader** is Phase 3q's `scripts/lib/tunables.py` (moved there on 2026-10-31, packaging: 3q, 3r and 3u read config through it). `STAFF_CONFIG` is the test override for `config/staff.conf`.
-   **Semantic types** (`~/.claude/docs/type_design.md`). `StaffRow.parent` becomes `ReportsTo(id: StaffId) | StaffRoot`, where `StaffRoot` means a top showrunner; `ensure` and `move` take that type where they take `StaffId | None` today; `find(parent=)` keeps its `StaffId` filter. `WorkerObservation.identity` becomes `ClaudeSession(session_id) | CodexThread(thread_id) | BackendUnavailable`. Nulls and dicts convert only at the JSON boundary (`StaffRow.to_json` / `from_json`, `live()`); `live()` keeps its existing schema 3 wire fields and meanings; the staff file schema is a separate contract. Pin both decoders with fixtures before the role change.
-2. **One record holds a worker's backend identity (sdlc showrunner, 2026-10-31).** The backend identities are one `"backends"` section of `staff.json`, keyed by staff id, beside `"rows"`; they cover unit and showrunner-held workers. One file is one atomic publish: `_record_transaction` writes rows and backends in the one `write_text_atomic`, and `staff.snapshot()` reads both from the one file, so no reader sees a row and a backend from two generations. (Two files beside each other cannot be replaced together; a second file would need a generation protocol for no gain.) The section is written only by the staff worker writer (`ensure_worker`, a backend replace for a replaced thread, and `retire`, in the same staff transaction). It holds backend details only: the Codex home, keyed by the native row id. No backend kind is stored: the family comes from `current_session` (staff-lifecycle.md section 2; sdlc, 2026-11-04); no second session or thread id value; no name, parent, kind or role, which stay on the row in `staff.json`. The role migration fills it from proved producer evidence under the 3h publication rules; a second run changes nothing. Missing facts stay listed, never inferred from names. When a reader moves to it, no other live copy of the thread id stays in a roster or ledger; history events may keep theirs. The herdr unit switches all callers (holders listed by the models unit):
-   - `staff_sources.live` and the seed: identities from the record.
-   - the unit ledger: keeps `replaced` / `ended` events as history only.
-   - the run roster (`mesh_roster.json`): staff id, server and run details; no thread id.
-   - the held-message inbox (`_pending_for_thread`, one file per thread today; a mismatch drops held messages with no error): one file per staff id.
-   - `mesh_retired.json`: removed. A replaced or ended thread is a `replaced` / `ended` history event in the unit ledger (`note_backend` already logs `replaced`), and run end reads the threads to close from those events.
-   - detached runs (`mesh_runs.py:155` matches `CODEX_THREAD_ID`): the caller's runtime id selects its row directly; no extra identity copy is stored.
-   - the design roles' held threads (`design_roles.py:139-149`, `:1288`): staff id.
-   - the shutdown pause records (`shutdown_record.py:486`): staff id.
-   - the direct readers of a roster entry's `thread_id`: `roster.py:1279` (worker threads of the roster), `hierarchies/worker_owners.py:498` (it reports a missing identity as a problem) and `shutdown/inventory.py:930` (the paused seats of a shutdown): each uses the native row id as the session or thread identity and reads only backend details from the backend section. `roster.py` is the messaging unit's file and `inventory.py` the shutdown unit's; each agrees its change first.
-   **Every consumer moves before any live copy goes.** Before the first roster or ledger copy of a thread id is removed, `grep -rnE "thread_id|CODEX_THREAD_ID|_pending_for_thread|held_thread" scripts --include=*.py` (non-test files) lists every field read and every decoder; each one reads the backend section, or is a history reader that the checkpoint notice names. The copies go in the same landing as the last reader's switch.
-   Two copies stay, both Codex's own and outside these scripts: the app-server's thread store, and the `CODEX_THREAD_ID` that Codex sets in its worker's environment. progress_history and usage keep old thread ids as history, not as a live fact.
-3. **Busy and idle are read live, never stored:** the server pid and the Astra exec pid. `astra_roles.py:248` reads a stored roster status today; that stops.
-4. **Owner fields go.** The rosters and the unit ledger keep thread and run details only. The run `director` file and the Astra record's `manager` stop answering who owns a worker; staff answers it.
-5. **One stop and one resume path, per member.** `shutdown.py stop <name|staff id>` and `resume <name|staff id>` (`stop_resume.stop` :97, `resume` :216) take a worker as they take a Claude session. For a Codex worker, stop pauses its thread and resume follows or reopens it on its account. This replaces the seat commands in `scripts/lib/resume_message.py`'s `resume_message` (`implement.sh --to <seat>`). It also replaces `workers.pause_run`, `pause_unit`, `codex_mesh reopen`, and `resume-account-move --to` as public paths. `move_sessions` (:405) and `move` (:463) go through the same per-member path. The split-tab shutdown record and restore are Phase 10's work, not this phase's. The old commands stay as internals only: no user or skill text names them, no second caller reaches them, and a check fails on any new caller. Each stop and each resume is safe to run twice: the rerun changes nothing, keeps the same tab, pane and terminal, and exits 0 (user, 2026-10-31); the proof shows the rerun.
-6. **Handler switch.** The handler switches its reader in step (`cargo-handler` `hierarchy.rs:602-690`, the exact argv match at `command_inputs.rs:212-217`, `[census] hierarchy_command` in `~/.config/cargo-handler/config.toml`, which names `production_tree.py --json` today).
-   - **Live refresh.** Busy and idle change with no file change (a server pid or an Astra exec pid ends), so the handler reruns the command at an interval read from its config at run time (a new `[census]` key, handler-unit's file), and also on a change to any `inputs` path. The watch covers the remote owner's inputs and a missing input file that appears later.
-   - **Partial results are shown.** `live()` today prints a problem on stderr and leaves out a worker whose backend is unavailable or whose parent has no identity. Each of these shows in the handler as visibly incomplete, never as a silent omission. The exact output form is agreed with handler-unit before dispatch.
-7. **`production_tree.py` loses its last callers.** The `design_roles.py:517` import goes (`showrunner_sessions` moves to the staff live read), and the handler reads `staff.py show --json --live` (item 6). The file stays, unread, until Phase 4b deletes it with its check, so the handler keeps a working reader until its switch has landed.
-
-**Owners:** `codex_mesh.py`, `worker_lifecycle.py` and `workers.py` are the models unit's: herdr workers write the call sites, and models reviews the diff before the merge. `stop` / `_mark_all_roster_ended` overlaps models' F024, so tell models before that function changes. `stop_resume.py` and `shutdown.py` are the shutdown unit's: shutdown writes its side against the herdr resolver (name or staff id → Claude session | Codex worker | not found). The handler reader and its config are handler-unit's.
-
-**Files:**
-- `scripts/production/staff.py` — the deadline, `adopt_worker`, `WorkerRole` and the row's `role`, `ensure_worker(native_id, name, parent, role)`, `ReportsTo | StaffRoot`, the backend-identity record writer, `OPERATION_LOCK_SECONDS` read.
-- `scripts/production/staff_sources.py` — `live()` and the seed read the backend-identity record and the row's role; identity types; partial results.
-- `config/staff.conf` — new (`OPERATION_LOCK_SECONDS=30`, `OPERATION_POLL_SECONDS`, `REMOTE_SECONDS=20`).
-- `scripts/direct/assign.py`, `scripts/direct/implement.sh`, `scripts/direct/remove_workers.py`, `scripts/direct/workers.py` — call sites and readers.
-- `scripts/agents/codex_mesh.py`, `scripts/agents/mesh_runs.py` — call sites and thread holders.
-- `scripts/astra/design_roles.py`, `scripts/astra/astra_roles.py` — call sites, held threads, live busy state.
-- `scripts/message/roster.py`, `scripts/hierarchies/worker_owners.py`, `scripts/shutdown/inventory.py` — `thread_id` readers move to the backend section (messaging and shutdown units agree their parts).
-- `scripts/message/test_roster.py`, `scripts/hierarchies/test_worker_owners.py`, `scripts/shutdown/test_inventory.py` — their tests.
-- `scripts/production/staff_test_support.py`, `scripts/production/test_staff.py`, `scripts/production/test_staff_operation.py`, `scripts/production/test_staff_sources.py`, `scripts/agents/test_codex_mesh.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_design_roles.py` — fixtures and regressions.
-- `scripts/production/staff_move.py`, `scripts/production/test_staff_move.py` — `move_unit` placement keeps backend metadata; its regression.
-- `scripts/production/worker_admission.py` — integrate 3h permission and publication with role and adoption.
-- `scripts/production/session_staff.py` — current identity join; preserve retained cleanup evidence.
-- `scripts/agents/worker_lifecycle.py` — read only.
-- `scripts/shutdown/stop_resume.py`, `scripts/shutdown/shutdown.py`, `scripts/shutdown/shutdown_record.py` — the shutdown unit's stage-two work; the `cargo-handler` reader and config are handler-unit's.
-
-**Workers:** `1 writer + 1 tester` — stage one, this unit.
-- `impl` — source integration: every non-test file above in this repository except the other units' files; hub: `scripts/production/staff.py` (every call site needs its writer API).
-- `test` — fixtures and regressions: `staff_test_support.py` and the `test_*.py` files above.
-- Stage two is other units' work: the shutdown unit's stop and resume side, and handler-unit's reader switch.
-
-**Constraints from prior phases:** Phase 3h: native row ids, `WorkerStartAllowed` and `PublishedWorker`, with no copied identity. Phase 3q: `tunables.py`. Phase 3l: worker `retire`, `WorkerName.parse` (shape only), `staff.py show --json --live` (schema 3 with `inputs`; staff storage has its own version before this role change), the seed; `staff_sources.WorkerObservation`, `BackendUnavailable`. Phase 3p: the review pool is gone. Delegation Context → One identity join, No hard-coded config, Lifecycle reruns keep the pane. Phase 4f: `staff_move.move_unit` builds its placement snapshot from rows; keep backend metadata through it and test that placement leaves that metadata unchanged (add `staff_move.py` to the consumer inventory).
-- Phase 3h review (2026-11-01): item 2's roster, hierarchy and shutdown consumers take the runtime session from `current_session`; the fixed `id` stays the `"backends"` key and the inbox key. `ensure_worker` today is `ensure_worker(name, parent, *, runtime_id)` with `id` from the first runtime id; update every signature and line reference against today's `staff.py`. Keep 3h's admission boundary (`worker_admission.py`); do not reopen starters. Test a Codex thread replacement: worker ownership and held messages unchanged.
-- Phase 3s review (2026-11-02): `staff.json` has an outside reader, cargo-liner. The role and backend schema change sends a notice to that reader and adds a representative stored-record fixture to its consumer check. The live-output contract stays separate.
-- Phase 3s review (2026-11-02): the handler reads `staff.json` directly and live pane state from herdr commands. No work on staff read speed (user, 2026-11-02: "herdr shouldn't focus on making staff fast - we should just read the staff page directly").
-
-**Acceptance gate:** `grep -rn production_tree scripts commands ~/.config/cargo-handler` finds only `production_tree.py`, `test_production_tree.py` and history docs; the item 2 search finds no live reader of a roster or ledger thread id; the affected suites pass; basedpyright 0/0 on changed files and every caller module; a test stops a write between rows and backends and shows that the file holds both old or both new, for admission, a backend replace and a retire; a test holds `staff.json.lock` during an interrupted stop and the stop ends at its deadline with `OperationDeadlineExpired`; a changed `OPERATION_LOCK_SECONDS`, `OPERATION_POLL_SECONDS` and `REMOTE_SECONDS` each take effect with no code change, and a deadline shorter than `REMOTE_SECONDS` ends the ssh call at the deadline while a longer one leaves `REMOTE_SECONDS`; `adopt_worker` stopped after its staff write, then rerun, ends as one clean adoption, and a rerun of a finished one changes nothing and exits 0; a launcher name whose recorded role differs from its name suffix (row `impl2` with role `review`) keeps its recorded role in its row and in `live()`; an `ensure_worker` of that row with another role is refused and changes nothing; a schema test reads a worker row with `"role"` and refuses a worker row without it and a unit row with it; a showrunner-held Astra worker keeps its row and identity; a test of a partial hierarchy shows it as incomplete; a real handler test shows busy become idle after a pid exit; watch tests for a remote owner input and a missing input that appears later; the real handler pane shows every session and worker correct after a real unit move and a real new worker; one real Codex worker is stopped and resumed by name and by staff id, and each rerun changes nothing, keeps the same tab, pane and terminal, and exits 0.
-
-**Acceptance gate (admission and observation):** tests keep the exact exit-2 admission refusal and prove no dispatch on failed publication. Preserve `live()` schema 3 and its partial-result surface; do not use its version as the staff storage version. Keep `skipped N not current`; unresolved current workers stay listed with exit 1. A resumable stop keeps the row. Permanent end removes it only after stopped evidence; adoption keeps the native id.
+models-unit built this phase to the staff-lifecycle spec. Its as-built is the Phase 3n section of `docs/plans/models-rename-track.md`. In short:
+- The staff row is the one record of a worker. Rosters, the worker ledger, run records, inboxes and design-role records store no thread id, cwd, owner or family.
+- `StaffRow.parent` is `ReportsTo(id) | StaffRoot`. `staff.ensure_worker(identity, name, parent)` publishes a worker at the `worker_admission.py` boundary. Adoption is one write of the worker row's `parent`.
+- No row carries a role, no `"backends"` section is stored, the storage schema stays 2, and there is no `adopt_worker`. `StaffSnapshot.backends` finds a backend from `current_session`.
+- `config/staff.conf` holds `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS`; each wait uses the smaller of the configured limit and the remaining operation deadline.
 
 ### Phase 3p — Review pool deleted  · status: done
 
@@ -844,9 +778,11 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Ruled out:** a problem line only where a reader lists units — the row is the authority, so each reader prints the line.
 
-### Phase 3t — Production tools read the row and `.unit.toml`  · status: todo
+### Phase 3t — Production tools read the row and `.unit.toml`  · status: moved: devtools-unit (sdlc, 2026-11-05)
 
 **Owner:** devtools-unit (sdlc split, 2026-11-02 08:23).
+
+**Progress (sdlc, 2026-11-05):** the first part is cc5723bd5 in devtools' combined hash. On sdlc 4441fbcfe devtools finds only `add_unit.py:1155`, `owns_fill.py` and `resume_unit.RetiredUnit` left. The item 1 file list below is from ac680222 and is stale.
 
 **Depends on:** 3s and Phase 4. Lands alone; before the record and deletion stages.
 
@@ -1663,18 +1599,28 @@ Files: scripts/production/staff.py (only the write path and a new copy function)
 
 ### Phase 4t — A test keeps the staff accessor list complete  · status: todo
 
-**Depends on:** sdlc's docs/as-built/staff-accessors.md for its final run; the test is built first.
+**Depends on:** sdlc's `docs/as-built/staff-accessors.md` (in the tree since sdlc 4441fbcfe).
 
-**Work Order:**
+#### Work Order
 
-Write a test that fails when docs/as-built/staff-accessors.md misses a file that reads or writes the staff record (sdlc, 2026-11-04).
-1. sdlc commits docs/as-built/staff-accessors.md soon. It is not in the tree yet. Build the test now against the rules below; the unit director merges the doc when it lands and tells you.
-2. A file reads or writes the staff record when it imports the `staff` module (`import staff`, `from staff import`, `from scripts.production import staff`, `from scripts.production.staff import`), or names the record path `.local/state/staff/staff.json` or `staff.json` under the staff state folder, or runs `staff.py` as a command. Look at the tree with grep and make the rule match what you find; say in your summary which forms you found and which you count.
-3. Scan tracked files under scripts/, commands/ and docs/ that are code or commands (.py, .sh, .md commands). Skip test files and test support only if the doc's rule says so; otherwise count them. Keep the scan fast: one pass, no subprocess per file.
-4. The doc lists each accessor as a repo-relative path in backticks. The test reads every backticked path in the doc. It fails with one line per missing file, naming the file and the line that accesses the staff record. It also fails on a listed path that no longer exists.
-5. Until the doc lands, the test skips with the message `staff-accessors.md not in tree yet` — never passes silently. Remove this skip once the doc is merged (the unit director tells you).
-6. Prove the test with a temporary doc copy that misses one file: it must fail and name that file.
-Files: scripts/production/test_staff_accessors.py (new). Edit nothing else.
+**Goal:** a test fails when `docs/as-built/staff-accessors.md` misses a file that reads or writes the staff record, or lists a file that no longer exists (sdlc, 2026-11-04).
+
+**Spec:**
+1. A file reads or writes the staff record when it imports the `staff` module (`import staff`, `from staff import`, `from scripts.production import staff`, `from scripts.production.staff import`), names the record path (`.local/state/staff/staff.json`, or `staff.json` under the staff state folder), or runs `staff.py` as a command. Grep the tree and make the rule match what is there. The summary names each form found and each form counted.
+2. Scan tracked files under `scripts/`, `commands/` and `docs/` that are code or commands (`.py`, `.sh`, command `.md`). Follow the doc's own rule for test files ("Tests are left out"); the doc lists `*_test_support.py` files that name the record path, so match the doc. One pass, no subprocess per file.
+3. The doc lists each accessor as a repo-relative path in backticks. The test reads every backticked path in the doc. It fails with one line per missing file, naming the file and the line that accesses the record. It also fails on a listed path that no longer exists.
+4. A file the doc misses today is added to the doc in this phase, so the test passes at the checkpoint.
+5. Prove the test with a temporary doc copy that misses one file: it fails and names that file.
+
+**Files:**
+- `scripts/production/test_staff_accessors.py` — new.
+- `docs/as-built/staff-accessors.md` — rows for files it misses today.
+
+**Workers:** `1 writer` — one slot owns both files.
+
+**State:** none.
+
+**Acceptance gate:** the test passes on the tree; the doc copy that misses one file makes it fail and name that file; basedpyright 0/0 on the test file; the whole test runs in under one second.
 
 ### Phase 4u — The input gate accepts a bridge_status turn  · status: done
 
@@ -1712,7 +1658,7 @@ Files: scripts/herdr/herdr.py (`prompt_input_state` and a small helper beside it
 - `scripts/production/rename.py` — journal and recovery.
 - `scripts/production/test_rename.py` — the regression test.
 
-### Phase 4y — Rename edges after Step B  · status: todo
+### Phase 4y — Rename edges after Step B  · status: done
 
 **Depends on:** 4g Step B (rename_unit.py on the row, journal in unit_move.py).
 
@@ -1728,6 +1674,7 @@ Files: scripts/herdr/herdr.py (`prompt_input_state` and a small helper beside it
 5. Order (F020): set the displays before the folder and branch move (rule 2).
 6. Do not change `unit_move.observe()`; shutdown's fix3 owns it.
 7. Hana owner (sdlc merge gate on 63ba5e6a6, 2026-11-04): 4e removed `SHOWRUNNER_UNIT_ID`. `hana_shot.launch` sets `HANA_TEST_OWNER` from `--owner`, else from the caller's staff row: the caller's unit name (a worker's parent unit), found by `staff.runtime_id()` in the local staff record. No row or an unreadable record gives an empty owner. `hana_instances.is_test_hana` keeps `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` as agent markers. The tests change with it.
+8. Whole lib copy (sdlc, 2026-11-05): the isolated-copy test in `scripts/herdr/test_herdr.py` copies the whole `scripts/lib` folder (no `__pycache__`, no `test_*`), as shutdown's `unit_status_test_support.py` does. The fixed list of `lib/` files goes. A new import in a lib module then needs no test edit.
 
 The restart deadline (F007) moved to shutdown-unit Phase 4l.
 
@@ -1741,6 +1688,7 @@ The restart deadline (F007) moved to shutdown-unit Phase 4l.
 - `scripts/hana_shot/hana_shot.py`, `scripts/hana_shot/test_hana_shot.py` — owner from the staff row (item 7).
 - `scripts/hana_instances/test_hana_instances.py` — native agent markers (item 7).
 - `docs/as-built/hana-test-windows.md` — owner and marker text (item 7).
+- `scripts/herdr/test_herdr.py` — whole `scripts/lib` copy (item 8).
 
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: moved: shutdown-unit (sdlc, 2026-11-04)
 

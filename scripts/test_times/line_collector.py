@@ -25,6 +25,7 @@ ExecutedLine = tuple[str, int]
 LaunchKind = Literal["python", "leaf", "unverified"]
 SHARED_TEST = "__shared__"
 SHARED_THREAD = "__shared_thread__"
+POPEN_CLASS = subprocess.Popen
 POPEN_INIT = subprocess.Popen.__init__.__code__
 
 
@@ -147,7 +148,7 @@ def stack_popen() -> subprocess.Popen[bytes] | subprocess.Popen[str] | NoChildPr
     while frame is not None:
         if frame.f_code is POPEN_INIT:
             process = frame.f_locals.get("self")
-            if isinstance(process, subprocess.Popen):
+            if isinstance(process, POPEN_CLASS):
                 return process
         frame = frame.f_back
     return NoChildProcess()
@@ -223,7 +224,7 @@ def child_event(event: str, arguments: tuple[object, ...]) -> None:
                            "started": time.monotonic(), "owner": collector.launch_owner()}
     if event == "subprocess.Popen":
         process = stack_popen()
-        if isinstance(process, subprocess.Popen):
+        if isinstance(process, POPEN_CLASS):
             _popen_arguments.pending = PendingPopen(launch, process)
         return
     collector.record_launch(launch)
