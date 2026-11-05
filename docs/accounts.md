@@ -33,8 +33,9 @@ The board refreshes stored readings every ten seconds.
 The board and terminal table show upcoming moves under the table and before the problems.
 Both use the exact group text from `accounts.py next list`.
 An empty queue shows `Upcoming moves: none`.
-On the Mac, natedev supplies the list.
-If natedev is unavailable, one line reports the failure and the board still opens.
+On the Mac, the role-map reply supplies the list and saves it in the role-map cache.
+Stored and offline reads use the saved list without another SSH call.
+Without a saved list, the board shows `Upcoming moves: unavailable; natedev unreachable`.
 Run account operations in a terminal with `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py`.
 The terminal status table lists the numbered Claude and Codex accounts.
 The table includes accounts without a login.

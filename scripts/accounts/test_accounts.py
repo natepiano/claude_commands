@@ -3394,7 +3394,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                       patch.object(role_map, "ssh_role_map", side_effect=failure) as fetch):
                     code, output, error = self.run_cli("status", *flags)
                 self.assertEqual((code, error), (0, ""))
-                self.assertEqual(fetch.call_args_list, [call(("role-map-read",)), call(("next", "list"))])
+                fetch.assert_called_once_with(("role-map-read",))
                 lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
                 problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
                 self.assertEqual(len(problems), 1)
@@ -3409,13 +3409,13 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             "groups": {}, "workers": "codex1"}}))
         for flags in ((), ("--json",)):
             with (self.subTest(flags=flags), patch.object(role_map, "is_role_map_host", return_value=False),
-                  patch.object(role_map, "ssh_role_map", return_value="nothing set up\n") as fetch):
+                  patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored status reached ssh")) as fetch):
                 code, output, error = self.run_cli("status", "--stored", *flags)
             self.assertEqual((code, error), (0, ""))
             lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
             problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
             self.assertEqual(problems, [])
-            fetch.assert_called_once_with(("next", "list"))
+            fetch.assert_not_called()
 
     def test_piped_status_replays_held_warning_before_the_final_error(self) -> None:
         def failed_read(*_args: object, **_kwargs: object) -> accounts.StatusReading:
@@ -5115,14 +5115,14 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         expected = next_moves.list_next_moves()
         before = next_moves.next_moves_file().read_bytes()
         reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
-        with patch.object(accounts, "read_status", return_value=reading):
+        with patch.object(accounts, "_read_status", return_value=reading):
             code, output, error = self.run_cli()
         self.assertEqual((code, error), (0, ""))
         table, upcoming, problems = output.rstrip().split("\n\n", 2)
         self.assertTrue(table.startswith("| Folder"))
         self.assertEqual(upcoming + "\n\n" + problems,
                          "Upcoming moves:\n" + expected + "\n\nFixture problem.")
-        with patch.object(accounts, "read_status", return_value=reading):
+        with patch.object(accounts, "_read_status", return_value=reading):
             code, document, error = self.run_cli("status", "--stored", "--json")
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(json.loads(document)["upcoming_moves"], ["Upcoming moves:", *expected.splitlines()])
@@ -5130,37 +5130,33 @@ with path.with_name(path.name + ".lock").open("a") as lock:
 
     def test_board_shows_none_when_no_upcoming_moves_exist(self) -> None:
         reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
-        with patch.object(accounts, "read_status", return_value=reading):
+        with patch.object(accounts, "_read_status", return_value=reading):
             code, output, error = self.run_cli()
         self.assertEqual((code, error), (0, ""))
         self.assertTrue(output.endswith("\n\nUpcoming moves: none\n\nFixture problem.\n"))
-        with patch.object(accounts, "read_status", return_value=reading):
+        with patch.object(accounts, "_read_status", return_value=reading):
             code, document, error = self.run_cli("status", "--stored", "--json")
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(json.loads(document)["upcoming_moves"], ["Upcoming moves: none"])
         self.assertFalse(next_moves.next_moves_file().exists())
 
-    def test_board_reads_upcoming_moves_from_natedev_on_the_mac_without_failing_when_unreachable(self) -> None:
+    def test_board_uses_upcoming_moves_from_the_role_map_without_another_fetch(self) -> None:
         reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
-        for reply in ("showrunners 1: at 1% → claude3, else claude2\n", "nothing set up\n",
-                      OSError("fixture host unreachable")):
+        for lines in (("Upcoming moves:", "showrunners 1: at 1% → claude3, else claude2"),
+                      ("Upcoming moves: none",), ()):
             for arguments in ((), ("status", "--stored", "--json")):
-                with (self.subTest(reply=reply, arguments=arguments), patch.object(accounts, "read_status", return_value=reading),
+                with (self.subTest(lines=lines, arguments=arguments),
+                      patch.object(accounts, "_read_status", return_value=reading),
                       patch.object(role_map, "is_role_map_host", return_value=False),
-                      patch.object(role_map, "ssh_role_map", side_effect=[reply]) as fetch):
+                      patch.object(role_map, "read_role_map", return_value=role_map.RoleMap({}, "codex1", upcoming_moves=lines)),
+                      patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected second fetch")) as fetch):
                     code, output, error = self.run_cli(*arguments)
                 self.assertEqual((code, error), (0, ""))
-                fetch.assert_called_once_with(("next", "list"))
+                fetch.assert_not_called()
                 if arguments:
-                    output = "\n".join(cast(accounts.StatusDocument, json.loads(output))["upcoming_moves"]) + "\n"
-                else:
-                    self.assertTrue(output.endswith("\n\nFixture problem.\n"))
-                if isinstance(reply, OSError):
-                    self.assertIn("Upcoming moves: unavailable from natedev; next: remote list failed: fixture host unreachable", output)
-                elif reply == "nothing set up\n":
-                    self.assertIn("Upcoming moves: none", output)
-                else:
-                    self.assertIn("Upcoming moves:\n" + reply, output)
+                    output = "\n".join(cast(accounts.StatusDocument, json.loads(output))["upcoming_moves"])
+                expected = lines or ("Upcoming moves: unavailable; natedev unreachable",)
+                self.assertIn("\n".join(expected), output)
 
     def json_status_fixture(self) -> tuple[datetime, datetime]:
         self.login_directory("claude2", "main@example.invalid")
@@ -8147,7 +8143,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         ))
         self.assertCountEqual(reading.notes, expected)
         terminal = accounts.render_status_table(reading).splitlines()
-        self.assertCountEqual(terminal[terminal.index("") + 1:], expected)
+        self.assertCountEqual(terminal[terminal.index("") + 1:], [*reading.upcoming_moves, "", *expected])
         self.assertCountEqual(cast(list[str], json.loads(accounts.render_status_json(reading))["problems"]),
             [line.removeprefix("* ") for line in expected])
 
@@ -8276,7 +8272,8 @@ class StatusProblemCauseTests(unittest.TestCase):
             lines = list(reading.notes)
             observed.append(sorted(lines))
             self.assertCountEqual(lines, expected)
-            self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].splitlines(), expected)
+            self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].splitlines(),
+                                  [*reading.upcoming_moves, "", *expected])
             self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
         self.assertEqual(observed[0], observed[1])
 
@@ -8327,7 +8324,7 @@ class StatusProblemCauseTests(unittest.TestCase):
                         if outcome == agent_accounts.UsageReadOutcome.ERROR else
                         "the usage service did not accept this login; start a session on it to check it"))
                 terminal = accounts.render_status_table(reading).splitlines()
-                self.assertCountEqual(terminal[terminal.index("") + 1:], expected)
+                self.assertCountEqual(terminal[terminal.index("") + 1:], [*reading.upcoming_moves, "", *expected])
                 document = cast(dict[str, object], json.loads(accounts.render_status_json(reading)))
                 self.assertCountEqual(cast(list[str], document["problems"]),
                     [line.removeprefix("* ") for line in expected])
@@ -8417,7 +8414,8 @@ class StatusProblemCauseTests(unittest.TestCase):
                                      for line in lines))
                 expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
                             "claude2: test sign-in is stored; a test wrote ~/.claude2/.claude.json at 2026-10-29 01:14 UTC; delete ~/.claude2/.claude.json"]
-                self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+                self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(),
+                                      [*reading.upcoming_moves, "", *expected])
                 self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
 
     def test_startup_failure_stays_visible_when_another_home_reads_the_same_login(self) -> None:
@@ -8503,7 +8501,8 @@ class StatusProblemCauseTests(unittest.TestCase):
         self.assertFalse(any("account note" in line for line in lines))
         expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
                     "claude2: test sign-in is stored; a test wrote ~/.claude2/.claude.json at 2026-10-29 01:14 UTC; delete ~/.claude2/.claude.json"]
-        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(),
+                              [*reading.upcoming_moves, "", *expected])
         self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
 
     def test_codex_startup_cause_keeps_reading_and_setup_in_one_line(self) -> None:
@@ -8557,7 +8556,8 @@ class StatusProblemCauseTests(unittest.TestCase):
             "codex1: test sign-in is stored; a test wrote ~/.codex1/auth.json at 2026-10-29 01:15 UTC; delete ~/.codex1/auth.json",
             "codex1: login is stored in two homes; ~/.codex and ~/.codex1 store codex1's login; two homes on one login break token refresh; keep each login in one home",
         ]
-        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(),
+                              [*reading.upcoming_moves, "", *expected])
         self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
 
     def test_real_domains_keep_account_repairs_through_status(self) -> None:

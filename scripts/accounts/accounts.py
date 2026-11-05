@@ -4650,7 +4650,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     try:
         with (redirect_stderr(held), role_map.observe_map_reads(_observe_map_provenance),
               role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext()):
-            reading = _read_status(source, detail=detail, account_config=account_config)
+            reading = _with_upcoming_moves(_read_status(source, detail=detail, account_config=account_config))
     except BaseException:
         diagnostics.retain_raw(held.getvalue(), delivered=tty)
         if not isinstance(enclosing, StatusDiagnostics):
@@ -4676,19 +4676,27 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
-def _with_upcoming_moves(reading: StatusReading) -> StatusReading:
+def _upcoming_move_lines() -> tuple[str, ...]:
     try:
+        if not role_map.is_role_map_host():
+            return role_map.read_role_map().upcoming_moves or (
+                f"Upcoming moves: unavailable; {role_map.ROLE_MAP_HOST} unreachable",)
         upcoming = next_moves.list_next_moves()
-        lines = ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
+        return ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
+    except role_map.RoleMapUnavailable:
+        return (f"Upcoming moves: unavailable; {role_map.ROLE_MAP_HOST} unreachable",)
     except (next_moves.NextMoveError, ValueError) as error:
-        lines = (f"Upcoming moves: unavailable from {role_map.ROLE_MAP_HOST}; {str(error).splitlines()[0]}",)
-    return replace(reading, upcoming_moves=lines)
+        return (f"Upcoming moves: unavailable from {role_map.ROLE_MAP_HOST}; {str(error).splitlines()[0]}",)
+
+
+def _with_upcoming_moves(reading: StatusReading) -> StatusReading:
+    return replace(reading, upcoming_moves=_upcoming_move_lines())
 
 
 def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_USAGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
     """Show upcoming moves between the account table and its problems."""
     account_config = read_account_settings(account_config)
-    reading = _with_upcoming_moves(read_status(source=source, detail=detail, account_config=account_config))
+    reading = read_status(source=source, detail=detail, account_config=account_config)
     return render_status_table(reading, account_config=account_config)
 
 
@@ -5302,7 +5310,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
             if not role_map.is_role_map_host():
                 raise AccountsError(f"accounts: role map belongs on {role_map.ROLE_MAP_HOST}")
             if options.action == "role-map-read":
-                print(role_map.encode_role_map(read_role_map()))
+                print(role_map.encode_role_map(replace(read_role_map(), upcoming_moves=_upcoming_move_lines())))
             else:
                 write_role_map(role_map.decode_role_map_change(options.change))
             return 0
@@ -5372,7 +5380,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
             held = DiagnosticStream(sys.stderr)
             try:
                 with redirect_stderr(held):
-                    rendered = (render_status_json(_with_upcoming_moves(read_status(source=source, detail=options.detail, account_config=account_config)), account_config=account_config)
+                    rendered = (render_status_json(read_status(source=source, detail=options.detail, account_config=account_config), account_config=account_config)
                                 if options.as_json else status_report(source=source, detail=options.detail, account_config=account_config))
                 print(rendered)
             except BaseException as error:
