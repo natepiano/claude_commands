@@ -1710,7 +1710,7 @@ Importing `scripts/mac_test/offload.py` or `scripts/lint/sweep.py` loads no `bui
 
 **Ruled out:** splitting history by build feature or commit without a replay that shows fewer steps above their promise.
 
-### Phase 69 — A memory estimate reads its history file and its index rows once  · status: todo
+### Phase 69 — A memory estimate reads its history file and its index rows once  · status: done
 **Depends on:** Phase 68 (`ff1bee5bd`). Runs before Phase 19 (same file).
 
 **Approved:** showrunner 2026-11-05: next, done first. Phase 68 added 100 ms to the estimate median (0.436 s to 0.536 s); this phase pays it back. It also covers the Phase 60 item "a filtered test estimate reads the memory history file once".

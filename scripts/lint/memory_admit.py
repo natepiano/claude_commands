@@ -2026,30 +2026,40 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
                   fresh: bool = False,
                   shape: BuildShape | NoBuildShape = NO_BUILD_SHAPE,
                   first_peak_bytes: int) -> ExpectedPeak:
-    """Estimate a compile promise from HISTORY_DAYS of earlier peaks.
-
-    Full test requests with a package recover missing selection fields from
-    indexed arguments. Other requests keep the recorded scope rule.
-    The gate pools test widths. `test_threads` selects one width for reports.
-    """
+    """Read the history once and select a fresh or compile promise."""
     if step == "build":
         return build_expected_peak(repository, shape, host, now, root, first_peak_bytes)
     if isinstance(repository, UnknownRepository):
         return ExpectedPeak(first_peak_bytes, "fallback", 0)
     filters = filter_set(filters)
+    filtered = scope == "filtered" and bool(package)
+    steps = filtered_steps(step) if filtered else (step,)
+    history = read_estimate_history(root, host, steps, now)
     if fresh and step == "nextest" and package:
-        compile_peak = expected_peak(repository, step, host, now, root, test_threads,
-                                     scope=scope, filters=filters, package=package,
-                                     first_peak_bytes=first_peak_bytes)
-        return fresh_test_peak(repository, step, host, now, root, test_threads,
-                               scope, filters, package, compile_peak)
-    if scope == "filtered" and package:
-        return filtered_peak(repository, step, host, now, root, test_threads,
-                             filters, package)
+        fresh_peak = fresh_test_peak(repository, step, host, now, root, test_threads,
+                                     scope, filters, package, history)
+        if isinstance(fresh_peak, ExpectedPeak):
+            return fresh_peak
+    if filtered:
+        return filtered_history_peak(repository, step, host, now, root, test_threads,
+                                     filters, package, history)
+    return full_history_peak(repository, step, host, now, root, test_threads,
+                             scope, package, first_peak_bytes, history)
+
+
+def full_history_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
+                      root: Path, test_threads: int | None, scope: TestScope,
+                      package: str, first_peak_bytes: int, history: EstimateHistory) -> ExpectedPeak:
+    """Use repository peaks, indexed peaks, then pooled peaks for full runs.
+
+    Full test requests with a package recover missing selection fields from
+    indexed arguments. Other requests keep the recorded scope rule.
+    The gate pools test widths. `test_threads` selects one width for reports.
+    """
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     rows: list[dict[str, object]] = []
-    for item, evidence in compiling_history(root, host, step, now):
+    for item, evidence in compiling_history(history)[step]:
         if package and step in TEST_STEPS:
             selection = history_selection(item, evidence)
             if selection.package != package or selection.scope != scope:
@@ -2131,32 +2141,52 @@ def history_selection(item: Mapping[str, object], evidence: StepEvidence) -> His
                             "filtered" if scope == "filtered" else "full", filters)
 
 
-def compiling_history(root: Path, host: str, step: str,
-                      now: datetime, *, include_current_end: bool = False) -> list[tuple[dict[str, object], StepEvidence]]:
-    """Exclude only peaks whose known attempts compiled no crates."""
+@dataclass(frozen=True)
+class EstimateHistory:
+    root: Path
+    host: str
+    now: datetime
+    steps: tuple[str, ...]
+    include_current_end: bool
+    rows: Mapping[str, list[dict[str, object]]]
+
+
+def read_estimate_history(root: Path, host: str, steps: tuple[str, ...], now: datetime, *,
+                          include_current_end: bool = False) -> EstimateHistory:
+    """Decode the history once and group usable peaks in the completion window."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
-    evidence = index_step_evidence(file_marks.index_path_in(root), host, step,
-                                   datetime.min.replace(tzinfo=now.tzinfo), now)
-    peaks: list[tuple[dict[str, object], StepEvidence]] = []
+    rows: dict[str, list[dict[str, object]]] = {step: [] for step in steps}
     try:
         for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
-            if item.get("host") != host or item.get("step") != step:
-                continue
-            joined = evidence.get((str(item.get("call_id", "")), step),
-                                  NO_STEP_EVIDENCE)
-            if isinstance(joined.compilation, NoCratesCompiled):
+            step = item.get("step")
+            if item.get("host") != host or not isinstance(step, str) or step not in rows:
                 continue
             try:
                 ended_at = datetime.fromisoformat(str(item.get("ended_at", "")))
                 peak = item.get("anon_peak_bytes")
-                if (cutoff <= ended_at and (ended_at <= now if include_current_end else ended_at < now)
-                        and isinstance(peak, int)
+                in_window = cutoff <= ended_at and (ended_at <= now if include_current_end else ended_at < now)
+                if (in_window and isinstance(peak, int)
                         and not isinstance(peak, bool) and peak > 0):
-                    peaks.append((item, joined))
+                    rows[step].append(item)
             except (ValueError, TypeError):
                 continue
     except OSError:
         pass
+    return EstimateHistory(root, host, now, steps, include_current_end, rows)
+
+
+def compiling_history(history: EstimateHistory) -> dict[str, list[tuple[dict[str, object], StepEvidence]]]:
+    """Join the requested steps once and exclude only known zero-compile peaks."""
+    call_ids = tuple({call_id for step in history.steps for item in history.rows.get(step, [])
+                      if isinstance(call_id := item.get("call_id"), str) and call_id})
+    evidence = index_step_evidence(file_marks.index_path_in(history.root), history.host,
+                                   history.steps, call_ids, history.now)
+    peaks: dict[str, list[tuple[dict[str, object], StepEvidence]]] = {step: [] for step in history.steps}
+    for step in history.steps:
+        for item in history.rows.get(step, []):
+            joined = evidence.get((str(item.get("call_id", "")), step), NO_STEP_EVIDENCE)
+            if not isinstance(joined.compilation, NoCratesCompiled):
+                peaks[step].append((item, joined))
     return peaks
 
 
@@ -2192,7 +2222,7 @@ def history_matches_repository(row: Mapping[str, object], repository: Repository
 
 def build_peaks(repository: RepositoryIdentity, host: str, now: datetime, root: Path) -> list[BuildPeak]:
     """Keep compile peaks and resolve each shape from its recorded evidence."""
-    history = compiling_history(root, host, "build", now, include_current_end=True)
+    history = compiling_history(read_estimate_history(root, host, ("build",), now, include_current_end=True))["build"]
     shaped: dict[BuildShape, list[dict[str, object]]] = {}
     for item, evidence in history:
         shape = recorded_build_shape(item["shape"]) if "shape" in item else evidence.shape
@@ -2489,9 +2519,14 @@ def history_arguments(raw: object) -> list[str]:
     return []
 
 
-def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
-                  root: Path, width: int | None, filters: tuple[str, ...],
-                  package: str) -> ExpectedPeak:
+def filtered_steps(step: str) -> tuple[str, ...]:
+    """Read the requested step and the compile fallback steps without repeats."""
+    return tuple(dict.fromkeys((step, "check", "build")))
+
+
+def filtered_history_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
+                          root: Path, width: int | None, filters: tuple[str, ...],
+                          package: str, history: EstimateHistory) -> ExpectedPeak:
     """Use the larger exact-filter and package anonymous p90.
 
     Recorded selection fields take priority. The shared resolver reads indexed
@@ -2504,12 +2539,11 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
     exact: list[int] = []
     compile_peaks: list[int] = []
     compile_index: list[int] = []
-    histories = {name: compiling_history(root, host, name, now)
-                 for name in dict.fromkeys((step, "check", "build"))}
-    for sample_step, history in histories.items():
-        selected = repository_history([entry[0] for entry in history], repository)
+    histories = compiling_history(history)
+    for sample_step, samples in histories.items():
+        selected = repository_history([entry[0] for entry in samples], repository)
         selected_ids = {id(item) for item in selected}
-        for item, evidence in history:
+        for item, evidence in samples:
             if id(item) not in selected_ids:
                 continue
             peak = cast(int, item["anon_peak_bytes"])
@@ -2690,10 +2724,15 @@ def is_fresh_test(root: Path, host: str, worktree: str, package: str,
     return False
 
 
+@dataclass(frozen=True)
+class NoFreshHistory:
+    """No completed zero-compile measurement supplies a fresh promise."""
+
+
 def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
                     root: Path, width: int | None, scope: TestScope,
                     filters: tuple[str, ...], package: str,
-                    compile_peak: ExpectedPeak) -> ExpectedPeak:
+                    history: EstimateHistory) -> ExpectedPeak | NoFreshHistory:
     """Use only completed zero-compile measurements of this package and scope."""
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
@@ -2706,7 +2745,7 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
                 (host, step, cutoff, before, before),
             ).fetchall())
     except (OSError, sqlite3.Error):
-        return compile_peak
+        return NoFreshHistory()
     calls: dict[str, bool] = {}
     indexed: list[int] = []
     indexed_exact: list[int] = []
@@ -2725,27 +2764,18 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
                 indexed_exact.append(peak)
     measured: list[int] = []
     measured_exact: list[int] = []
-    try:
-        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
-            try:
-                call_id = item.get("call_id")
-                own = history_matches_repository(item, repository)
-                if (not own or item.get("host") != host or item.get("step") != step
-                        or not cutoff <= str(item.get("ended_at", "")) < before
-                        or not isinstance(call_id, str) or call_id not in calls
-                        or item.get("test_scope", scope) != scope
-                        or item.get("package", package) != package
-                        or (width is not None and item.get("test_threads") != width)):
-                    continue
-                peak = item.get("anon_peak_bytes")
-                if isinstance(peak, int) and peak > 0:
-                    measured.append(peak)
-                    if calls[call_id]:
-                        measured_exact.append(peak)
-            except (ValueError, TypeError, AttributeError):
-                continue
-    except OSError:
-        pass
+    for item in history.rows.get(step, []):
+        call_id = item.get("call_id")
+        if (not history_matches_repository(item, repository)
+                or not isinstance(call_id, str) or call_id not in calls
+                or item.get("test_scope", scope) != scope
+                or item.get("package", package) != package
+                or (width is not None and item.get("test_threads") != width)):
+            continue
+        peak = cast(int, item["anon_peak_bytes"])
+        measured.append(peak)
+        if calls[call_id]:
+            measured_exact.append(peak)
     for values, source in ((measured_exact, "measured"), (indexed_exact, "buildlog"),
                            (measured, "measured"), (indexed, "buildlog")):
         if values:
@@ -2754,7 +2784,7 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
                 peak = int(peak * ANON_SHARE)
             return ExpectedPeak(max(FILTERED_FLOOR, peak),
                                 cast(Literal["measured", "buildlog"], source), len(values))
-    return compile_peak
+    return NoFreshHistory()
 
 
 def process_start_time(pid: int) -> str | None:

@@ -2,7 +2,7 @@
 
 Shape and compile evidence remain independent. The join keeps test arguments
 for readers that must recover missing selection fields in anonymous peaks.
-Rows without valid arguments prove no shape.
+Only build rows supply a shape. Rows without valid arguments prove no shape.
 """
 
 from __future__ import annotations
@@ -131,23 +131,27 @@ def step_index(index_path: Path) -> Generator[tuple[sqlite3.Connection, set[str]
         yield connection, columns
 
 
-def index_step_evidence(index_path: Path, host: str, step: str,
-                        cutoff: datetime, before: datetime) -> dict[tuple[str, str], StepEvidence]:
-    """Read shape, compile evidence and test arguments for each call and step.
+def index_step_evidence(index_path: Path, host: str, steps: tuple[str, ...],
+                        call_ids: tuple[str, ...], before: datetime) -> dict[tuple[str, str], StepEvidence]:
+    """Read build shapes, compile evidence and test arguments for each call and step.
 
-    The caller filters peaks by repository and completion time.
+    The caller supplies call ids from peaks in its completion window.
+    Dated attempts at or after before do not change earlier evidence.
     Missing columns preserve the facts that the index can supply.
     This join does not parse test selections.
     """
     evidence: dict[tuple[str, str], StepEvidence] = {}
-    test_step = step in TEST_STEPS
+    if not steps or not call_ids:
+        return evidence
     try:
         with step_index(index_path) as (connection, columns):
             argv_column = "argv" if "argv" in columns else "NULL"
             count_column = "crates_compiled" if "crates_compiled" in columns else "NULL"
             rows = cast(list[tuple[object, ...]], connection.execute(
                 f"SELECT call_id, step, {argv_column}, started_at, {count_column} "
-                + "FROM steps WHERE host=? AND step=?", (host, step),
+                + "FROM steps WHERE call_id IN (SELECT value FROM json_each(?)) "
+                + "AND +host=? AND step IN (SELECT value FROM json_each(?))",
+                (json.dumps(call_ids), host, json.dumps(steps)),
             ).fetchall())
         for call_id, name, raw_argv, started_at, count in rows:
             if not isinstance(call_id, str) or not call_id or not isinstance(name, str):
@@ -155,7 +159,7 @@ def index_step_evidence(index_path: Path, host: str, step: str,
             dated = False
             try:
                 if isinstance(started_at, str):
-                    if not cutoff <= datetime.fromisoformat(started_at) < before:
+                    if datetime.fromisoformat(started_at) >= before:
                         continue
                     dated = True
             except (ValueError, TypeError):
@@ -177,9 +181,10 @@ def index_step_evidence(index_path: Path, host: str, step: str,
                             break
                     else:
                         decoded_arguments = cast(list[str], words)
-                        if test_step:
+                        if name in TEST_STEPS:
                             arguments = tuple(decoded_arguments)
-                        shape = build_shape(decoded_arguments)
+                        if name == "build":
+                            shape = build_shape(decoded_arguments)
             except (ValueError, TypeError):
                 pass
             previous = evidence.get((call_id, name))
