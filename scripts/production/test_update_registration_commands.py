@@ -41,7 +41,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(result.stderr, "agents_log: recording failed try later\n")
         self.assertIn("register: ok", result.stdout)
         self.assertEqual(len([call for call in self.notifier_calls()
-                              if call[:2] == ["new", "showrunner-example"]]), 1)
+                              if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"]]), 1)
 
     def test_copied_command_registers_and_records_showrunner_usage(self) -> None:
         result = self.run_copy(self.copied_command(), "register")

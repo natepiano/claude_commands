@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
-
 import io
 import sqlite3
 import sys
@@ -15,6 +13,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from ledger_test_support import ticket_owner_id
+
 import style_plan
 import style_proposals
 
@@ -22,7 +22,7 @@ import berth_board
 import rules
 import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 from scripts.production import staff
 
 
@@ -413,7 +413,7 @@ class StylePlanTests(StylePlanFixture):
         finding = ledger.hold(rule, self.sources[0], 1, "value", "rename", "old", "new", blob, "outside")
         ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+                             + f'unit: {unit_staff_id("names-unit")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
         self.proposals_field(folder)
         unit_change = self.unit_commit(self.sources[0], "pub fn value() { unit(); }\n")
         with mock.patch.object(style_proposals, "proposal_command") as start:

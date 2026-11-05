@@ -53,9 +53,7 @@ class MigrationDependencyTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        scratch = Path("/tmp/claude")
-        scratch.mkdir(parents=True, exist_ok=True)
-        folder = tempfile.TemporaryDirectory(prefix="migration-dependencies-", dir=scratch)
+        folder = tempfile.TemporaryDirectory(prefix="migration-dependencies-")
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
         self.codebase = self.root / "project"

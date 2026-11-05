@@ -719,6 +719,11 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
             # Read even when another reason keeps the folder, so errors are visible.
             state = record_object(Path(folder) / unit_runs.STATE_FILE)
             if not isinstance(state, MissingRecord):
+                if state.get(unit_runs.OWNER_FIELD):
+                    from scripts.production import staff
+                    owner = unit_runs.run_owner(state, staff.snapshot())
+                    if isinstance(owner, staff.StaffRow) and isinstance(owner.worktree, staff.PresentWorktree):
+                        state = {**state, "working_dir": str(owner.worktree.path)}
                 working = state.get("working_dir", "")
                 if not isinstance(working, str):
                     raise ValueError("run worktree unreadable")

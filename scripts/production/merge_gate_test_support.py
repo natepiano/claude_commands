@@ -274,7 +274,7 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        directory = tempfile.TemporaryDirectory(prefix="merge-gate-test-")
+        directory = tempfile.TemporaryDirectory(dir="/dev/shm", prefix="merge-gate-test-")
         cls.addClassCleanup(directory.cleanup)
         cls.fixture_root = Path(directory.name) / "case"
         cls.fixture_snapshot = Path(directory.name) / "snapshot"

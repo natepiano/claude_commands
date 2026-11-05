@@ -81,8 +81,7 @@ and say so in `<Report/>`.
 
 **Every todo phase states its dependencies** on the line after its heading:
 `**Depends on:** Phase 2, Phase 4` (the plan phases that must be done before it
-starts), or `**Depends on:** none`. Phase ids only. A `**Blocked by:**` gate
-stays its own line. `phase_table.py parallel` reads these lines; renumbering
+starts), or `**Depends on:** none`. Use phase ids only. `phase_table.py parallel` reads these lines; renumbering
 fixes them like any other reference.
 </PhaseNumbering>
 
@@ -190,19 +189,15 @@ not codebase searching.
 0. **Check for a `## Worktree Placement` section** (hand-written, or carried
    over from an older design doc).
    Optional — if absent, proceed normally and skip this item entirely. If
-   present, read its `**Base:**`, `**Gates:**`, `**Scope now:**`, and
+   present, read its `**Base:**`, `**Scope now:**`, and
    `**Scope deferred:**` fields, and let them shape the phase set:
 
    - **Phase the whole design, not just the unblocked part.** Deferred work still
      gets phases — it is real work with real content, and dropping it makes the
      plan look finished when it is not.
-   - **Order phases so every gated phase falls after the work it depends on**,
-     and carry the gate onto the phase itself: a phase blocked by `G2` opens with
-     `**Blocked by:** G2 — <the unblocking event>`. A worker reaching that
-     phase must be able to see it cannot start without reading the whole doc.
-   - **Do not mark a gated phase ready.** `/unit:direct` runs phases in order;
-     a gated phase is a deliberate stop, and the report at STEP 5 should say
-     which phase the plan runs to before it parks.
+   - Order phases after their dependencies.
+   - Record start-order waits as owed actions in the showrunner's notes.
+   - Use `cargo-berth sequence` for merge order.
    - **`**Scope now:**` sets the working repo** for the early phases. When the
      placement names a worktree, the Delegation Context's paths and `verify.sh`
      package names refer to *that* checkout, not the primary — getting this wrong

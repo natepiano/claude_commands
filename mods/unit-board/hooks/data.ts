@@ -81,6 +81,7 @@ export async function loadBoard(
   }
   watch({ kind: 'discovery', sources: response.watch, loadedAt });
   const boards: BoardData[] = [];
+  // The generator supplies staff-id paths from the staff record.
   for (const path of response.files) {
     ensureOpen();
     boards.push(JSON.parse(await calls.read(path)) as BoardData);
