@@ -155,8 +155,17 @@ Older Cargo metadata uses `target_directory` for both output roots.
 A step row's output roots use its command's Cargo inputs. The recorder omits them when `target_directory` differs from `target_dir`.
 Start-time capture applies config files, then `CARGO_BUILD_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`, then inline and file values from `--config`.
 It applies `CARGO_TARGET_DIR` next, then `--target-dir`.
-The sweep saves these mappings in `cargo-output-roots.json` beside its floor records.
-It keeps prior mappings for discovery and cold-rebuild attribution during the drain.
+The workspace budget sweep and each real floor pass save these mappings in `cargo-output-roots.json` beside the floor records.
+The floor reads output pairs from every recorded step kind on this host.
+It keeps each attempt's target and build directories together, keyed by `worktree`, or `cwd` when `worktree` is unknown.
+The floor uses recorded pairs first, then the saved output cache and its prior pairs.
+It keeps saved pairs when their checkout no longer exists.
+It runs no Cargo metadata command.
+An unavailable build index leaves only the saved cache as evidence.
+Unknown roots, relative roots, and steps with target folder overrides authorize no deletion.
+A discovered target with neither source has `NoRecordedEvidence` and stays protected until a new queue step builds it.
+The natedev low-space report lists protected folders by size so natedev can choose what to delete.
+The sweep keeps prior mappings for cold-rebuild attribution.
 No separate setup is required when the build drive is absent.
 
 The floor reads free space and computes the shortfall for each filesystem.
