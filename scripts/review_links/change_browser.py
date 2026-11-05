@@ -137,7 +137,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
         return f'''<section hidden data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <p class="kind">{html.escape(row.get(change_review.KIND) or 'Kind not recorded')}</p>
 <div class="id">{html.escape(change.key)}</div><h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2><pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
+<h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p></section>'''
     form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
         '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
@@ -148,7 +148,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
 <div class="id">{html.escape(change.key)} · {html.escape(row.get('Merged', ''))}</div>
 <h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
-<pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
+{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}</section>'''
 
 
