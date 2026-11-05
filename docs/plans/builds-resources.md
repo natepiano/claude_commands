@@ -563,8 +563,11 @@ A memory promise keeps only history rows from the same side of each listed build
 **Goal:** most admissions use measured anon peaks. The build-log peak times `ANON_SHARE` is a fallback that few admissions take.
 
 **Measured (code, at `a650d945`):**
-- `ANON_SHARE = 0.65` (`memory_admit.py` :70 at `e88fb841d`) scales a build-log `peak_mem_bytes` (page cache included) to process memory: in `expected_peak` (:1993; the tier at :2058–2059 and the 1–4 row tier at :2065–2066) when a repository has fewer than 5 measured anon peaks, and in `filtered_peak` (:2468; index tiers :2544–2550). `ExpectedPeak` (:587) names its source.
-- Phase 60 (`e88fb841d`) already puts package anonymous history before both indexed tiers in `filtered_peak` (:2506–2510), with legacy rows' package, scope and filters recovered from the indexed argv. Its test: `test_legacy_package_selection_recovers_anonymous_peaks_for_an_unseen_filter` (`test_memory_admit.py`). Rows recorded before 2026-10-29 15:05Z lack those fields; they leave the 14-day window about 2026-11-12, which also lowers the `ANON_SHARE` share.
+- `ANON_SHARE = 0.65` (`memory_admit.py` :74) scales a build-log `peak_mem_bytes` (page cache included) to process memory in three tiers. `ExpectedPeak` (:569) names its source.
+  1. `full_history_peak` (:2050), when a repository has fewer than 5 measured anon peaks: five or more indexed peaks (:2097) win; else measured anon peaks; else one to four indexed peaks (:2104).
+  2. `filtered_history_peak` (:2527): the indexed exact and package tiers (:2599) and the check/build compile index (:2603).
+  3. `fresh_test_peak` (:2732): indexed zero-compile peaks (:2784), exact and package, after the measured zero-compile peaks. With no row, it returns `NoFreshHistory` and the request takes the compile estimate.
+- Phase 60 (`e88fb841d`) already puts package anonymous history before both indexed tiers in `filtered_history_peak` (:2527), with legacy rows' package, scope and filters recovered from the indexed argv. Its test: `test_legacy_package_selection_recovers_anonymous_peaks_for_an_unseen_filter` (`test_memory_admit.py`). Rows recorded before 2026-10-29 15:05Z lack those fields; they leave the 14-day window about 2026-11-12, which also lowers the `ANON_SHARE` share.
 - Before Phase 20 Spec 0, no record keeps the source of an admitted step's estimate: reservations have no source field, and waiter rows (report Phase 3 adds `need_source`) are deleted at admission. From Spec 0's merge, each `admitted` event in `admission/queue_times.jsonl` records the need source, and Phase 20's one interval reader in `memory_admit.py` rebuilds each step from those events.
 
 **Spec:**
@@ -582,29 +585,31 @@ A memory promise keeps only history rows from the same side of each listed build
    Report missing shape evidence separately from ordinary fallback admissions.
    Keep `shape` and `cap` as distinct source rows. A chosen cap counts in neither fallback nor `ANON_SHARE` shares.
    Report source shares by step kind: full nextest, filtered nextest, clippy, check, build, doc and other.
+   Count the fresh tier (`fresh_test_peak`) in its own rows: measured, `buildlog`, and `NoFreshHistory` that took the compile estimate.
    Report the `ANON_SHARE` share and compare those estimates with measured anonymous peaks.
    Split recorded admissions by deployed estimator: before and after the Phase 60 merge, and before and after legacy rows leave the window (about 2026-11-12).
    Count recovered legacy rows apart from rows with recorded selection fields. The queue card already shows source and count (`queue_evidence.py` :108); test the totals, add no user control.
    Add a measurement test with two intervals, two sources and one logical step.
    The test counts two admissions and one memory wait. Include token return and incomplete evidence.
 2. **Stop rule.** If the `× ANON_SHARE` share is already small, the phase is only this measurement: the table goes in the as-built doc and no code changes. The showrunner sets "small" from the table.
-3. **Otherwise, widen anon matching where the table still shows `ANON_SHARE` tiers.** Filtered estimates already use package anonymous history first (Phase 60). Work only on the measured remaining gaps, for example a full estimate where five or more indexed peaks (:2058–2059) win over one to four anonymous peaks.
+3. **Otherwise, widen anon matching where the table still shows `ANON_SHARE` tiers.** Filtered estimates already use package anonymous history first (Phase 60). Work only on the measured remaining gaps, for example a full estimate where five or more indexed peaks (:2097) win over one to four anonymous peaks.
    Keep Phase 60's package selection and the max rule.
    Keep the scope and the compile split from Phase 11. Phase 68 removed Phase 18's history splits; add none back without a replay that shows fewer steps above their promise.
    Replay the source shares and estimate errors. Report steps above their promise.
    Keep modeled wait savings unavailable until queue calibration succeeds. Report observed waits separately.
 4. **Drop 0.65 once rare.** Remove the `ANON_SHARE` tiers only below the showrunner's bound.
    A step without anonymous history then uses the pooled tier, followed by fallback.
+   The fresh tier's indexed peaks (:2784) are `ANON_SHARE` tiers too. Without them, a fresh request with no measured zero-compile peak returns `NoFreshHistory` and takes the compile estimate. Keep the `FILTERED_FLOOR` on fresh measured peaks.
    Keep the tiers if replay shows more promises below half the measured peak.
    Stop only the producer. Keep old `buildlog` source values readable in the basis codec, wire codec, cards and `WaitOutput`.
    No unknown-source type exists yet: `NeedSource = str` (`memory_admit.py` :265), and `admission_client.py` :548 renders any unlisted source as "no history, so the fallback".
    This phase defines the boundary: a known source, or an unknown source that keeps its original wire text. Do not turn a future source into a fallback value.
    The protocol (`admission_protocol.py`), the client wait lines (`admission_client.py`), the service (`admission_service.py`) and the queue card (`queue_card.py`, `queue_evidence.py`) carry and render it.
-5. **Tests** in `scripts/lint/test_memory_admit.py`: repo + step anon rows win over the index tier when the exact filter has none; with no anon history the next tier applies; a `build` step keeps Phase 24's same-shape rule when the widened match has rows of another shape; fake both memory readings. In the client and protocol tests: an unknown source keeps its wire text through a reconnect, a refreshed estimate and a historical row, and never renders as the fallback. If Spec 4 removes the tier: an old waiter row with `need_source` `buildlog` still renders in the queue card (`scripts/build_queue/test_queue_evidence.py`) and in `admission_client.WaitOutput`.
+5. **Tests** in `scripts/lint/test_memory_admit.py`: repo + step anon rows win over the index tier when the exact filter has none; with no anon history the next tier applies; a `build` step keeps Phase 24's same-shape rule when the widened match has rows of another shape; fake both memory readings. A fresh request selects measured zero-compile peaks first; with only indexed zero-compile peaks, its source follows Spec 4 (`buildlog` kept, or `NoFreshHistory` and the compile estimate when the tier goes); the fresh floor stays. In the client and protocol tests: an unknown source keeps its wire text through a reconnect, a refreshed estimate and a historical row, and never renders as the fallback. If Spec 4 removes the tier: an old waiter row with `need_source` `buildlog` still renders in the queue card (`scripts/build_queue/test_queue_evidence.py`) and in `admission_client.WaitOutput`.
 6. **Docs.** `docs/as-built/build-memory-admission.md`: the tier share table; if changed, the `need` paragraph.
 
 **Constraints from prior phases:**
-- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :2106). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
+- Phase 11: `compiling_history(history: EstimateHistory)` (`memory_admit.py` :2178) keeps a peak with no index row and selects by completion time. A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
   Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
 - Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
   Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
@@ -621,8 +626,10 @@ A memory promise keeps only history rows from the same side of each listed build
   Preserve historical and future-source decoding. Test first, periodic and refreshed wait lines.
   Phase 20 supplies the lifecycle recording prerequisite. This phase still owns the source-share analysis.
   Coordinate admission files with queue-unit. Record `tested against <queue tip>` in the notice.
-- Phase 69: an estimate decodes the history file once and reads index rows only for the window's call ids.
-  An adopted tier change reuses that single decode and that bounded query. Add no second read.
+- Phase 69: `read_estimate_history` (:2154) decodes the history file once per estimate into `EstimateHistory`. `compiling_history(history)` joins it through `index_step_evidence`, which reads index rows only for the window's anonymous-history call ids.
+  The indexed fallback queries in `full_history_peak`, `filtered_history_peak` and `fresh_test_peak` are separate index reads by host, repository and step; that call-id bound does not apply to them.
+  `filtered_peak` no longer exists: `expected_peak` sends a filtered request with a package to `filtered_history_peak` (steps from `filtered_steps(step)`, :2522) and others to `full_history_peak`. Do not restore the wrapper.
+  An adopted tier change reuses the single decode and the bounded evidence query. Add no second history read or evidence join.
 
 
 **Files:**
@@ -652,6 +659,7 @@ A memory promise keeps only history rows from the same side of each listed build
   3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
   4. `test_frozen_pass_keeps_one_window_for_admission_view_explanation_and_wait_text` in `scripts/lint/test_memory_admit.py`.
   5. `test_recovery_release_keeps_required_endings_and_frozen_window` in `scripts/lint/test_memory_admit.py`.
+  6. The Phase 69 tests: the `assert_history_decoded_once` helper and its callers, `test_fresh_and_compile_estimates_share_the_precise_window_edge` and `test_shared_call_keeps_compile_results_and_nextest_selection_separate` in `scripts/lint/test_memory_admit.py`, and `test_evidence_query_uses_the_call_index_with_a_host_index_present` in `scripts/lint/test_build_shape.py`.
 - The tier share table is in the phase report and the checkpoint notice, with the stop decision.
 - If code changed: the memory admission tests pass; `basedpyright` over every changed module and its callers reports `0 errors, 0 warnings, 0 notes`; the merge gate is green; the before/after replay is in the notice. Post-merge check, 24 h after the merge reaches main: steps above their promise and wait minutes against the 24 h before.
 - Change-Review line: few admissions use the 0.65 fallback | on natedev while builds wait, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py 1` | the waiting rows name source `measured` and few name `buildlog`. If Spec 2 stops the phase: Change-Review: none — measurement only.
@@ -1711,49 +1719,23 @@ Importing `scripts/mac_test/offload.py` or `scripts/lint/sweep.py` loads no `bui
 **Ruled out:** splitting history by build feature or commit without a replay that shows fewer steps above their promise.
 
 ### Phase 69 — A memory estimate reads its history file and its index rows once  · status: done
-**Depends on:** Phase 68 (`ff1bee5bd`). Runs before Phase 19 (same file).
-
-**Approved:** showrunner 2026-11-05: next, done first. Phase 68 added 100 ms to the estimate median (0.436 s to 0.536 s); this phase pays it back. It also covers the Phase 60 item "a filtered test estimate reads the memory history file once".
-
-#### Work Order
-
-**Goal:** each `step_estimate` call decodes `admission/anon_peaks.jsonl` at most once and asks the index only for rows in its window. The estimates do not change.
-
-**Measured (Phase 68 simplify review, natedev, 2026-11-05):**
-- `filtered_peak` (`memory_admit.py` :2492) calls `compiling_history` for the step, `check` and `build`: three decodes of the 11 MB file (46,235 rows, about 0.18 s each) and three index queries.
-- A fresh nextest estimate (`expected_peak` :2040) runs the full compile estimate first, then `fresh_test_peak` (:2693) decodes the file again. The compile estimate is used only as a fallback.
-- `index_step_evidence` (`build_shape.py` :134) starts at `datetime.min`: it reads 95,985 host rows and returns 25,162 nextest rows, of which 5,805 are inside the 15-day window. Each returned row gets `json.loads` and `build_shape`.
-- Estimate median for the hana dev nextest request: 0.436 s before Phase 68, 0.536 s after (`phases/68/time_estimate.py`, `phases/68/timing_after.json`).
-
-**Spec:**
-1. Decode the history file once per estimate. Group the rows by step for the steps the estimate needs, and pass the grouped rows to `compiling_history`'s callers. Keep `anonymous_history_rows` as the one decoder.
-2. Let `index_step_evidence` take the steps it reads and run one query for all of them. Limit the query to the window's call ids (for example `call_id IN (SELECT value FROM json_each(?))` on the `steps_call` index). The call ids replace only the lower start bound (`datetime.min`).
-   Keep the `before` upper bound and the undated-attempt rule unchanged: a later retry must not change an earlier estimate.
-   Decide the test-step rule for each row: `build_shape.py` :143 now sets `test_step` once from the one requested step.
-3. In a fresh estimate, run `fresh_test_peak` first. Give it a named result for "no fresh history" and compute the compile estimate only for that result.
-4. Keep `expected_peak`'s and `filtered_peak`'s public signatures and every caller (`admission_client.py`, `width_trial.py`, `admission_service.py`).
-
-**Constraints from prior phases:**
-- Phase 68: estimates select history as `146a188e3` does; keep Phase 11's compile split, Phase 24's tiers and floor, Phase 39's `DevSizeHeadroom` and Phase 60's selection.
-- Phase 33: rows are decoded only through `store.whole_rows` (via `anonymous_history_rows`). Add no second decoder.
-- Keep one copy of each module in a process. At run time, import a `scripts/buildlog` module in the form its other importers use.
+#### As-built
+Each estimate decodes `admission/anon_peaks.jsonl` once and asks the index once, only for the window's call ids. The estimates are the same as before.
+- `read_estimate_history(root, host, steps, now, *, include_current_end=False) -> EstimateHistory` applies one parsed window to every tier: host, steps, `cutoff <= ended_at <= now` (`< now` unless `include_current_end`) and a positive int peak. `EstimateHistory` carries `root`, `host`, `now`, `steps`, `include_current_end` and `rows` by step.
+- `compiling_history(history)` takes only the history and joins its rows through `index_step_evidence`.
+- `expected_peak` reads once: a filtered request with a package reads `filtered_steps(step)` (`step`, `check`, `build` without repeats), others read `(step,)`. It tries `fresh_test_peak` (`ExpectedPeak | NoFreshHistory`), then `filtered_history_peak` or `full_history_peak`. No `filtered_peak` wrapper exists. `build_peaks` makes one read with `include_current_end=True`.
+- `index_step_evidence(index_path, host, steps: tuple[str, ...], call_ids: tuple[str, ...], before)` is one query over `json_each` call ids and steps with `+host=?`, so SQLite uses `steps_call`. It skips rows dated at or after `before`, keeps test arguments only for `TEST_STEPS`, and gives a `BuildShape` only to `build` rows (`NoBuildShape()` otherwise).
+- The hana dev nextest estimate median fell from 0.462 s to 0.276 s.
 
 **Files:**
 - `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py` — the single read and the bounded query.
-- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py` — tests.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py` — the decode-once helper `assert_history_decoded_once`, window-edge, query-plan and shared-call tests.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `memory_admit.py` and `build_shape.py`.
-- `test` owns the two test files.
+**Binds later work:** an estimate reuses the one `EstimateHistory` read and the one evidence join; add no second history read, evidence join or tier window. The indexed fallback queries in `full_history_peak`, `filtered_history_peak` and `fresh_test_peak` are separate index reads by host, repository and step. Only `build_peaks` reads `StepEvidence.shape`.
 
-**Acceptance gate:**
-- A test counts history decodes: a filtered estimate and a fresh estimate each decode the file once.
-- A test pins that the evidence query returns only call ids in the window.
-- A test with a `build` row and a nextest row that share a call id gives separate compile results and keeps the nextest arguments for `history_selection()`.
-- On `phases/18/replay_inputs`, every request in `phases/68/time_estimate.py` and the Phase 60 replay gives the same `ExpectedPeak` before and after.
-- The estimate median for the hana dev nextest request is at most 0.436 s; the notice gives before and after.
-- `test_memory_admit.py`, `test_build_shape.py`, `scripts/build_queue/test_admission_client.py`, `scripts/buildlog/test_width_trial.py` and `scripts/lint/test_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
-- Change-Review line: none — the same promises, computed faster.
+**Gotchas:** without `+host`, SQLite picks `steps_host_started` and reads every row for the host. `INDEXED BY steps_call` raises when the index lacks it (the frozen replay index does).
+
+**Ruled out:** a byte-offset start of the history read (the file is only close to append order); moving `program_peak_estimate` onto the shared read (it raises on an unreadable file); the fresh zero-compile rule inside the shared join (it changes fresh estimates).
 
 ### Phase 70 — Memory and sweep find the enclosing Cargo target with one function  · status: todo
 **Depends on:** report-unit Phase 25 (`9ae49ff1f`) on `origin/builds`. Start only when `git merge-base --is-ancestor 9ae49ff1f origin/builds` succeeds.
