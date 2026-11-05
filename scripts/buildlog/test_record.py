@@ -204,6 +204,45 @@ class RecordTests(unittest.TestCase):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
 
+    def test_reserved_test_phase_row_keeps_the_sampler_reservation_with_or_without_charge(self) -> None:
+        reservation = "sampled-reservation"
+        charge: recorder.TestPhaseChargeUse = {
+            "bytes": 8192, "selected_at": START, "reservation_id": reservation, "need": {},
+        }
+        history = self.root / "admission/anon_peaks.jsonl"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        for has_charge in (False, True):
+            with self.subTest(has_charge=has_charge):
+                _ = history.write_text(json.dumps({
+                    "reservation_id": reservation,
+                    "test_phase_charge_use": charge if has_charge else None,
+                }) + "\n")
+                result = self.record("test-phase-context", json.dumps({"reservation_id": reservation}), *NEXTEST)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                context = cast(Record, json.loads(result.stdout))
+                phase = self.base / f"reserved-phase-{has_charge}.json"
+                _ = phase.write_text(json.dumps({
+                    **context, "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+                }))
+                row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TEST_PHASE_FILE": str(phase)})
+                self.assertEqual(row["test_phase_charge"], charge if has_charge else None)
+                self.assertEqual(row["reservation_id"], reservation)
+
+    def test_test_phase_without_a_text_reservation_omits_the_sidecar_and_row_key(self) -> None:
+        contexts: tuple[Record, ...] = ({}, {"reservation_id": ""}, {"reservation_id": None}, {"reservation_id": 7})
+        for case, sampling_context in enumerate(contexts):
+            with self.subTest(sampling_context=sampling_context):
+                result = self.record("test-phase-context", json.dumps(sampling_context), *NEXTEST)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                context = cast(Record, json.loads(result.stdout))
+                phase = self.base / f"unreserved-phase-{case}.json"
+                _ = phase.write_text(json.dumps({
+                    **context, "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+                }))
+                row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TEST_PHASE_FILE": str(phase)})
+                self.assertNotIn("reservation_id", row)
+                self.assertNotIn("reservation_id", context)
+
     def test_step_records_resolved_target_and_build_directories(self) -> None:
         cargo = self.base / "tools" / "cargo"
         target, build = self.repo / "artifacts", self.base / "intermediates"

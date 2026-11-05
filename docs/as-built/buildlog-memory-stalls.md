@@ -54,6 +54,8 @@ The one admission sampler `buildlog_sample_anon` in `scripts/lint/invoke.sh` ope
 
 `record.py step` reads `BUILDLOG_TEST_PHASE_FILE` and validates the sidecar before it saves `PendingStep.test_phase`. An absent sidecar records null. An unreadable sidecar retains the sources and the pending record for a retry. The recorder writes one `pending record <path>` line to `errors.log`. The JSON row contains `test_phase_peak_bytes`, `test_phase_started_at`, and the selection fields from `TestPhaseContext`. The selection fields are `repo_identity`, `test_scope`, `package`, `filters`, `call_id`, and `test_threads`. The recorder and admission use `parse.test_threads` to read the width.
 
+The row keeps the sidecar's `reservation_id` when the sampler records one.
+
 `test_phase_charge` copies the charge that admission used for this reservation. The object contains `bytes`, `selected_at`, `reservation_id`, and `need`. The sampler saves the reservation identity before admission selects the charge. Admission release saves the evidence in `admission/anon_peaks.jsonl` before the recorder starts. The recorder finds that reservation's completed history row and copies `test_phase_charge_use` without a new estimate. Terminal and tee steps use the same path. A step without recorded charge evidence retains null. Admission publishes history only for a scoped step with a positive sampled peak; other steps record a null charge. The `steps.test_phase_charge_bytes` index column contains the charge bytes. Older rows and rows without a charge have SQL NULL. The other test-phase fields remain in the JSON rows.
 
 ### Old field names

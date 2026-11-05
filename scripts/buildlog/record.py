@@ -664,7 +664,7 @@ class ReservedTestPhaseRecord(TestPhaseRecord):
 
 
 @dataclass(frozen=True)
-class ChargedTestPhaseRecord(TestPhaseRecord):
+class ChargedTestPhaseRecord(ReservedTestPhaseRecord):
     charge: TestPhaseChargeUse
 
 
@@ -735,11 +735,11 @@ def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, obje
     if "NEXTEST_TEST_THREADS" in os.environ:
         width_argv = [*argv, "--test-threads", os.environ["NEXTEST_TEST_THREADS"]]
     context = _test_phase_context({**fields, "test_threads": parse.test_threads(width_argv)})
-    return {
-        **context,
-        "reservation_id": fields.get("reservation_id", ""),
-        "test_phase_charge": None,
-    }
+    result: dict[str, object] = {**context, "test_phase_charge": None}
+    reservation_id = fields.get("reservation_id")
+    if isinstance(reservation_id, str) and reservation_id:
+        result["reservation_id"] = reservation_id
+    return result
 
 
 def _test_phase_context(fields: Mapping[str, object]) -> TestPhaseContext:
@@ -807,6 +807,8 @@ def test_phase_fields(phase: TestPhaseRecord | NoTestPhaseRecord) -> dict[str, o
     }
     if isinstance(phase, TestPhaseRecord):
         fields.update({key: value for key, value in phase.context.items() if key != "repo_identity"})
+        if isinstance(phase, ReservedTestPhaseRecord):
+            fields["reservation_id"] = phase.reservation_id
         if isinstance(phase, ChargedTestPhaseRecord):
             fields["test_phase_charge"] = phase.charge
         if isinstance(phase.window, ObservedTestPhase):
@@ -936,7 +938,7 @@ def finish_pending_step(path: Path) -> PublishedStep:
         if isinstance(phase, ReservedTestPhaseRecord) and isinstance(phase.window, ObservedTestPhase):
             charge = completed_test_phase_charge(phase.reservation_id)
             if isinstance(charge, dict):
-                phase = ChargedTestPhaseRecord(phase.window, phase.context, charge)
+                phase = ChargedTestPhaseRecord(phase.window, phase.context, phase.reservation_id, charge)
         if isinstance(phase, UnreadableTestPhaseRecord):
             raise OSError(f"test-phase sidecar unreadable: {phase.reason}")
         pending = replace(pending, row={**pending.row, **test_phase_fields(phase)}, test_phase=phase)
@@ -1033,7 +1035,7 @@ def step(args: list[str]) -> None:
         if isinstance(phase, ReservedTestPhaseRecord) and isinstance(phase.window, ObservedTestPhase):
             charge = completed_test_phase_charge(phase.reservation_id)
             if isinstance(charge, dict):
-                phase = ChargedTestPhaseRecord(phase.window, phase.context, charge)
+                phase = ChargedTestPhaseRecord(phase.window, phase.context, phase.reservation_id, charge)
         record: dict[str, object] = {
             "kind": "step",
             "v": RECORD_VERSION,

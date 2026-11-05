@@ -260,6 +260,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
             "test_scope": "full", "package": "", "filters": [],
             "call_id": "phase-call", "test_threads": None, "test_phase_charge": PHASE_CHARGE,
             "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+            "reservation_id": "own-reservation",
         })
 
     def test_terminal_row_copies_its_completed_admission_charge(self) -> None:
@@ -379,7 +380,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
         fields = record.test_phase_context(json.dumps(context), NEXTEST)
         self.assertIsNone(fields["test_phase_charge"])
         self.assertEqual(fields["call_id"], "phase-call")
-        self.assertEqual(record.test_phase_context("{}", NEXTEST)["reservation_id"], "")
+        self.assertNotIn("reservation_id", record.test_phase_context("{}", NEXTEST))
 
     def test_only_matched_history_creates_a_charged_phase(self) -> None:
         publish = record.write_step_line
@@ -438,10 +439,65 @@ class StepOutputFolderTests(unittest.TestCase):
             '[package]\nname = "output-fixture"\nversion = "0.1.0"\nedition = "2024"\n')
         _ = (source / "lib.rs").write_text("pub fn fixture() {}\n")
         self.outside.mkdir()
+        # Phase 19 confirmed these answers with cargo metadata --format-version 1 --no-deps.
+        # Each row supplies that command's options, cwd, and CARGO_TARGET_DIR.
+        cases: list[tuple[list[str], Path, str | None, Path, Path]] = [
+            (["--config", 'build.target-dir="unused"', "--config",
+              'build.target-dir="' + str(self.workspace / "relative-output") + '"'],
+             self.workspace, None, self.workspace / "relative-output", self.workspace / "relative-output"),
+            (["--config", 'build.target-dir="' + str(self.temporary / "absolute-output") + '"'],
+             self.workspace, None, self.temporary / "absolute-output", self.temporary / "absolute-output"),
+            (['--config=build.target-dir="configured-output"'], self.workspace, None,
+             self.workspace / "configured-output", self.workspace / "configured-output"),
+            ([], self.workspace, "environment-output",
+             self.workspace / "environment-output", self.workspace / "environment-output"),
+            (["--config", 'build.target-dir="' + str(self.workspace / "configured-output") + '"'],
+             self.workspace, str(self.workspace / "environment-output"),
+             self.workspace / "environment-output", self.workspace / "environment-output"),
+            (["--manifest-path", "../workspace/member/Cargo.toml"], self.outside, None,
+             self.outside / "manifest-output", self.outside / "manifest-output"),
+            (["--config", 'build.build-dir="intermediate-output"'], self.workspace, None,
+             self.workspace / "target", self.workspace / "intermediate-output"),
+            (["--config", str(self.temporary / "settings/.cargo/config.toml")], self.workspace, None,
+             self.temporary / "settings/file-output", self.temporary / "settings/file-output"),
+            ([], self.workspace, "changed-output",
+             self.workspace / "changed-output", self.workspace / "changed-output"),
+            ([], self.workspace, None, self.workspace / "target", self.workspace / "target"),
+            (["--config", 'build.target-dir="' + str(self.workspace / "first-output") + '"'],
+             self.workspace, None, self.workspace / "first-output", self.workspace / "first-output"),
+        ]
+        table = self.temporary / "cargo-calls.json"
+        _ = table.write_text(json.dumps([
+            {"call": {"argv": ["metadata", "--format-version", "1", "--no-deps", *options],
+                      "cwd": str(cwd), "CARGO_TARGET_DIR": cargo_target},
+             "answer": {"workspace_root": str(self.workspace), "target_directory": str(target),
+                        "build_directory": str(build)}}
+            for options, cwd, cargo_target, target, build in cases
+        ]))
+        binaries = self.temporary / "bin"
+        binaries.mkdir()
+        cargo = binaries / "cargo"
+        _ = cargo.write_text("\n".join([
+            f"#!{sys.executable}",
+            "import json, os, sys",
+            f"with open({str(table)!r}) as source:",
+            "    cases = json.load(source)",
+            "call = {'argv': sys.argv[1:], 'cwd': os.getcwd(),",
+            "        'CARGO_TARGET_DIR': os.environ.get('CARGO_TARGET_DIR')}",
+            "for case in cases:",
+            "    if case['call'] == call:",
+            "        print(json.dumps(case['answer']))",
+            "        sys.exit(0)",
+            "print('Unexpected Cargo call: ' + json.dumps(call), file=sys.stderr)",
+            "sys.exit(1)",
+            "",
+        ]))
+        cargo.chmod(0o755)
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith(("CARGO_", "BUILDLOG_"))}
         environment.update({"CARGO_HOME": str(self.temporary / "cargo-home"),
-                            "BUILDLOG_DIR": str(self.log_root), "BUILDLOG_TARGET": "natedev"})
+                            "BUILDLOG_DIR": str(self.log_root), "BUILDLOG_TARGET": "natedev",
+                            "PATH": str(binaries) + os.pathsep + environment.get("PATH", "")})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
         _ = cast(object, self.enterContext(mock.patch.object(record, "output", return_value=None)))
         _ = cast(object, self.enterContext(mock.patch.object(treekey, "tree_key", return_value=None)))
