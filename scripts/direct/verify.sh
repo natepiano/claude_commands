@@ -427,6 +427,8 @@ run() {
 }
 
 run_step() {
+    # A reservation for this call must not cover the next step's local waits.
+    release_wait_claim
     local attempt status started ended step_log monitor=0
     local STEP_WRITES_TREE=0
     if step_writes_tree "$@"; then

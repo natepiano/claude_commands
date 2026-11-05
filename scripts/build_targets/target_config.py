@@ -42,10 +42,14 @@ Target = LocalTarget | SshTarget
 ConfigError = conf.Unusable
 
 
-def ssh_target_state_directory(target: str) -> Path:
-    """Return the state path without requiring target registration."""
+def require_target_name(target: str) -> None:
     if target in (".", "..") or Path(target).name != target:
         raise ConfigError(f"invalid target name: {target}")
+
+
+def ssh_target_state_directory(target: str) -> Path:
+    """Return the state path without requiring target registration."""
+    require_target_name(target)
     if target != "mac":
         return Path.home() / ".local/state/build-targets" / target
     configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
@@ -83,6 +87,15 @@ def read_targets(path: Path | None = None) -> tuple[Target, ...]:
             raise ConfigError(f"{key}: settings file does not exist: {settings}")
         targets.append(SshTarget(name, platform, settings))
     return tuple(targets)
+
+
+def configured_ssh_target(target: str) -> SshTarget:
+    """Resolve an SSH target before access to its coordination state."""
+    for configured in read_targets():
+        if configured.name == target and isinstance(configured, SshTarget):
+            require_target_name(target)
+            return configured
+    raise ConfigError(f"unknown SSH target: {target}")
 
 
 def aws_routing_enabled(settings: conf.ConfigRead) -> bool:

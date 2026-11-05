@@ -242,7 +242,8 @@ class MergeGateResourcesTests(GateSuitesFixture):
             if result.decision.state == "hold":
                 assert_busy()
                 waited.add("memory")
-                replies = self.admission.server.handle_request(wire.ReleaseRequest("release-busy", busy.reservation, 0))
+                with self.admission.loop_turn():
+                    replies = self.admission.server.handle_request(wire.ReleaseRequest("release-busy", busy.reservation, 0))
                 self.assertEqual(replies, [wire.Ok()])
 
         def free_slot(seconds: float) -> None:
