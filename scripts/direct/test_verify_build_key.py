@@ -13,6 +13,7 @@ import unittest
 from typing import cast, override
 
 from scripts.direct import verify_lint_scope_test_support as support
+from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -152,7 +153,7 @@ Path('admission.json').write_text(json.dumps({{'fresh': fresh,
             r'''CMD=test
 HOLD_WAIT_DIR="$PWD/tmp"
 tree_key() {
-  VERIFY_TEST_BUILD_INPUTS_FILE="$HOLD_WAIT_DIR/test-build-inputs" "$PY" "$TREE_WATCH_SCRIPT" --key --package sample "$VERIFY" "$HOME/.claude/scripts/lint/invoke.sh" "$LINT_CONFIG_FILE" -- test sample --filter native_rate <<< "$TEST_METADATA"
+  VERIFY_TEST_BUILD_INPUTS_FILE="$HOLD_WAIT_DIR/test-build-inputs" "$PY" "$TREE_WATCH_SCRIPT" --key "$@" --package sample "$VERIFY" "$HOME/.claude/scripts/lint/invoke.sh" "$LINT_CONFIG_FILE" -- test sample --filter native_rate <<< "$TEST_METADATA"
 }
 build_hold_wait_local() {
   printf "// edited during hold\n" >> src/lib.rs
@@ -162,7 +163,7 @@ build_hold_applies() { return 0; }
 build_hold_nothing_held() { test -f "$PWD/hold-released"; }
 step_state() { :; }
 ''',
-            hold_wrapper, key_setup,
+            shell_function(source, "set_verdict_keys"), hold_wrapper, key_setup,
             # Seed a finished build of A before the hold changes it to B.
             r'''printf "%s\n" "$BUILDLOG_TEST_BUILD_KEY" > old-build-key
 buildlog_begin cargo nextest run -E "package(sample) & test(native_rate)"
