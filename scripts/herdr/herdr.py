@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable, Generator, Iterable, Sequence, Set
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
 from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, cast, final, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -3277,7 +3277,15 @@ def conversation_note(observed: UnknownConversation) -> None:
     print(f"anomaly: {' '.join(observed.reason.splitlines())}; not blocking", file=sys.stderr)
 
 
-def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
+@dataclass(frozen=True)
+class CodexConversations:
+    """One pass shares these live Codex threads and incomplete process reads."""
+
+    live: Mapping[str, tuple[int, ...]]
+    unknown: tuple[str, ...]
+
+
+def codex_conversations() -> CodexConversations:
     from scripts.lib import unit_runs
 
     # A static import would close the cycle codex_mesh -> session_staff -> herdr -> codex_mesh.
@@ -3339,10 +3347,11 @@ def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
                 _ = live.setdefault(identity, ())
         except (OSError, ValueError) as error:
             unknown.append(f"{run.name} (Codex hosted threads unknown: {error})")
-    return live, unknown
+    return CodexConversations(live, tuple(unknown))
 
 
-def read_conversation(identity: str, kind: str = "") -> LiveConversation | StoppedConversation | UnknownConversation:
+def read_conversation(identity: str, kind: str = "", *,
+                      codex: CodexConversations | None = None) -> LiveConversation | StoppedConversation | UnknownConversation:
     """Read one current conversation across the native runtimes and hosted threads."""
     unknown: list[str] = []
     if kind != "codex":
@@ -3357,24 +3366,25 @@ def read_conversation(identity: str, kind: str = "") -> LiveConversation | Stopp
         except (HerdrFailure, OSError, ValueError) as error:
             unknown.append(f"{identity} (Claude session unknown: {error})")
     if kind != "claude":
-        live, incomplete = _codex_conversations()
-        if identity in live:
-            return LiveConversation("codex", live[identity])
-        unknown.extend(incomplete)
+        codex = codex_conversations() if codex is None else codex
+        if identity in codex.live:
+            return LiveConversation("codex", codex.live[identity])
+        unknown.extend(codex.unknown)
     if unknown:
         first = " ".join(unknown[0].splitlines())
         return UnknownConversation(f"{identity} is not proved live or stopped: {len(unknown)} processes unknown, first: {first}")
     return StoppedConversation()
 
 
-def running_codex_threads(*, thread_host: Callable[[list[str]], bool]) -> set[str]:
+def running_codex_threads(*, thread_host: Callable[[list[str]], bool],
+                          codex: CodexConversations | None = None) -> set[str]:
     """Read proved current threads, including app-server threads and excluding the shared daemon."""
     # Keep the keyword for external callers; host processes no longer exclude their threads.
     _ = thread_host
-    live, unknown = _codex_conversations()
-    for reason in dict.fromkeys(unknown):
+    codex = codex_conversations() if codex is None else codex
+    for reason in dict.fromkeys(codex.unknown):
         conversation_note(UnknownConversation(reason))
-    return set(live)
+    return set(codex.live)
 
 
 def process_environment(pid: int) -> dict[str, str]:

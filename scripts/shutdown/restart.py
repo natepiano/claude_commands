@@ -179,7 +179,8 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
 
 
 def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
-                 resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
+                 resolver: session_staff.RowResolver | None = None,
+                 codex: herdr.CodexConversations | None = None) -> list[staff.StaffRow]:
     """Read only the supplied rows and return their live local conversations."""
     import remote
 
@@ -190,7 +191,13 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
             machine, _folder = shutdown_record.row_folder(row, record, resolver=resolver)
             if machine != remote.local_machine():
                 continue
-            observed = herdr.read_conversation(str(row.current_session))
+            if codex is None:
+                observed = herdr.read_conversation(str(row.current_session), "claude")
+                if not isinstance(observed, herdr.LiveConversation):
+                    codex = herdr.codex_conversations()
+                    observed = herdr.read_conversation(str(row.current_session), codex=codex)
+            else:
+                observed = herdr.read_conversation(str(row.current_session), codex=codex)
             if isinstance(observed, herdr.LiveConversation):
                 selected.append(row)
             elif isinstance(observed, herdr.UnknownConversation):
@@ -210,13 +217,14 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     except (OSError, ValueError) as error:
         print(f"restart: Claude registry anomaly: {error}", file=sys.stderr)
         candidates = {}
-    for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon):
+    codex = herdr.codex_conversations()
+    for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
         _ = candidates.setdefault(identity, identity)
     owned = {row.current_session for row in record.rows}
     for identity in sorted(candidates.keys() - owned):
-        if isinstance(herdr.read_conversation(identity), herdr.LiveConversation):
+        if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
             print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
-    selected = live_members(record.rows, record, resolver=resolver)
+    selected = live_members(record.rows, record, resolver=resolver, codex=codex)
     if save_tabs:
         try:
             client.save_layout()

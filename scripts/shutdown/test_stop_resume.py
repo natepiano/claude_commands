@@ -406,7 +406,7 @@ class StopResumeTests(unittest.TestCase):
                                          Path(self.enterContext(tempfile.TemporaryDirectory()))))
         _ = self.enterContext(patch.object(sessions, "session_liveness", self.observe))
         _ = self.enterContext(patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness))
-        _ = self.enterContext(patch.object(herdr, "_codex_conversations", return_value=({}, [])))
+        _ = self.enterContext(patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="generation-1"))
         _ = self.enterContext(patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
             herdr.RolloutThread("019b3a40-4250-7000-8000-000000000102"), "generation-1", {})))
@@ -1164,7 +1164,7 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "pane_activity", side_effect=pane_activity),
               patch.object(self.client, "result", side_effect=self.client_result),
-              patch.object(herdr, "_codex_conversations", return_value=({identity: (123,)}, [])),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: (123,)}, ())),
               patch.object(herdr, "native_process", side_effect=native_process) as native):
             self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
@@ -1181,7 +1181,7 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))),
               patch.object(self.client, "result", side_effect=self.client_result),
-              patch.object(herdr, "_codex_conversations", return_value=({identity: (123,)}, []))):
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: (123,)}, ()))):
             self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
 
@@ -1195,7 +1195,7 @@ class StopResumeTests(unittest.TestCase):
         for observed in observations:
             with (self.subTest(observed=observed),
                   patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-                  patch.object(herdr, "_codex_conversations", return_value=observed)):
+                  patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(observed[0], tuple(observed[1])))):
                 result = stop_resume.stop("stable-row")
                 self.assertIsInstance(result, stop_resume.StopFailed if observed[1] else stop_resume.NotRunning)
                 self.kill.assert_not_called()

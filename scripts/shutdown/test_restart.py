@@ -25,10 +25,81 @@ from unit_staff_test_support import unit_host
 from scripts.production import fake_unit_host, session_staff, staff
 from scripts.accounts import accounts
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
+from scripts.lib import unit_runs
 from test_support import ShutdownTestCase, registry_confirmation
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 STOP_SESSION = stop_resume.stop
+
+
+class CodexSnapshotTests(ShutdownTestCase):
+    root: Path = Path()
+    proc: Path = Path()
+    rows: tuple[staff.StaffRow, ...] = ()
+    claude: set[str] = set()
+    codex: dict[int, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.proc = self.root / "proc"
+        self.proc.mkdir()
+        self.rows = tuple(
+            staff.StaffRow(staff.StaffId(f"row-{index}"), "agent", identity, staff.STAFF_ROOT,
+                current_session=staff.StaffId(identity), worktree=staff.PresentWorktree("natedev", self.root))
+            for index, identity in enumerate(("claude-a", "codex-a", "claude-b", "codex-b")))
+        self.claude = {"claude-a", "claude-b", "claude-orphan"}
+        self.codex = {998081: "codex-a", 998082: "codex-b", 998083: "codex-orphan"}
+        for pid in self.codex:
+            path = self.proc / str(pid)
+            path.mkdir()
+            _ = (path / "cmdline").write_bytes(b"codex\0")
+        _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
+        _ = self.enterContext(patch.object(herdr, "process_environment", return_value={}))
+        _ = self.enterContext(patch.object(herdr, "native_process", side_effect=self.native))
+        _ = self.enterContext(patch.object(unit_runs, "run_roots", return_value=()))
+        _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
+        records = registry_confirmation(frozenset(self.claude)).records
+        _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=records))
+
+    def native(self, pid: int, _kind: str) -> herdr.NativeAgentProcess:
+        return herdr.NativeAgentProcess(herdr.EnvironmentThread(self.codex[pid]), "1", {})
+
+    def liveness(self, identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+        return sessions.LiveSessionProcess(998080) if identity in self.claude else sessions.SessionNotLive()
+
+    def test_live_rows_scans_codex_once_for_members_and_unassigned_candidates(self) -> None:
+        with (patch.object(herdr, "_proc_root", return_value=self.proc) as scans,
+              patch.object(herdr.Herdr, "save_layout") as save,
+              redirect_stderr(io.StringIO()) as errors):
+            selected = restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents"), save_tabs=False)
+        self.assertEqual(selected, list(self.rows))
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "claude-orphan: restart anomaly: unassigned live session",
+            "codex-orphan: restart anomaly: unassigned live session"])
+        save.assert_not_called()
+        scans.assert_called_once()
+
+    def test_live_members_with_only_claude_rows_does_not_scan_codex(self) -> None:
+        rows = self.rows[::2]
+        with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
+            self.assertEqual(restart.live_members(rows, staff.StaffSnapshot(self.rows)), list(rows))
+        scans.assert_not_called()
+
+    def test_live_members_shares_one_scan_and_reads_fresh_evidence_each_pass(self) -> None:
+        with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
+            self.assertEqual(restart.live_members(iter(self.rows), staff.StaffSnapshot(self.rows)), list(self.rows))
+            scans.assert_called_once()
+            self.codex[998081] = "changed-thread"
+            self.assertEqual(restart.live_members(iter(self.rows), staff.StaffSnapshot(self.rows)), list(self.rows[::2]) + [self.rows[3]])
+            self.assertEqual(scans.call_count, 2)
+
+    def test_live_members_uses_a_supplied_snapshot_without_a_scan(self) -> None:
+        snapshot = herdr.CodexConversations({"codex-a": (998081,)}, ())
+        with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
+            self.assertEqual(restart.live_members(self.rows, staff.StaffSnapshot(self.rows), codex=snapshot), list(self.rows[:3]))
+        scans.assert_not_called()
 
 
 def checkout() -> inventory.GitCheckout:
@@ -233,7 +304,7 @@ class RestartTests(ShutdownTestCase):
             return_value=herdr.PreparedAgentEnvironment(self.root, {})))
         _ = self.enterContext(patch.object(herdr, "launch_prepared_agent", side_effect=self.launch))
         _ = self.enterContext(patch.object(herdr, "restore_server"))
-        _ = self.enterContext(patch.object(herdr, "_codex_conversations", return_value=({}, [])))
+        _ = self.enterContext(patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())))
         _ = self.enterContext(patch.object(herdr.Herdr, "save_layout"))
         _ = self.enterContext(patch.object(herdr.Herdr, "remember_row_tab"))
         _ = self.enterContext(patch.object(herdr.Herdr, "tab_sessions", return_value=[]))
@@ -370,7 +441,7 @@ class RestartTests(ShutdownTestCase):
         self.running.clear()
         row = self.rows[0]
         with (patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", row.current_session])),
-              patch.object(herdr, "_codex_conversations", return_value=({}, [])) as scan,
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())) as scan,
               patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                   "w1:p0", herdr.PromptSubmissionNotRequired())) as launch,
               redirect_stdout(io.StringIO()) as output):
@@ -385,15 +456,16 @@ class RestartTests(ShutdownTestCase):
             worktree=staff.PresentWorktree("mac", self.root))
         record = staff.StaffSnapshot((*self.rows, remote_row))
         resolver = session_staff.RowResolver(record)
+        snapshot = herdr.CodexConversations({}, ())
         with (patch.object(herdr, "read_conversation", side_effect=[
                   herdr.LiveConversation("claude", (123,)), herdr.StoppedConversation()]) as read,
               patch.object(sessions, "running_sessions") as registry,
               patch.object(herdr, "running_codex_threads") as codex,
               redirect_stderr(io.StringIO()) as errors):
-            selected = restart.live_members(iter((*self.rows[:2], remote_row)), record, resolver=resolver)
+            selected = restart.live_members(iter((*self.rows[:2], remote_row)), record, resolver=resolver, codex=snapshot)
         self.assertEqual(selected, [self.rows[0]])
         self.assertEqual(read.call_args_list, [
-            call(str(self.rows[0].current_session)), call(str(self.rows[1].current_session))])
+            call(str(self.rows[0].current_session), codex=snapshot), call(str(self.rows[1].current_session), codex=snapshot)])
         registry.assert_not_called()
         codex.assert_not_called()
         self.assertEqual(errors.getvalue(), "")
@@ -405,7 +477,8 @@ class RestartTests(ShutdownTestCase):
                       herdr.UnknownConversation("test-tab (conversation unknown)"), error,
                       herdr.LiveConversation("codex", (123,))]),
                   redirect_stderr(io.StringIO()) as errors):
-                self.assertEqual(restart.live_members(self.rows, staff.StaffSnapshot(self.rows)), [self.rows[2]])
+                self.assertEqual(restart.live_members(self.rows, staff.StaffSnapshot(self.rows),
+                    codex=herdr.CodexConversations({}, ())), [self.rows[2]])
             self.assertEqual(errors.getvalue().splitlines(), [
                 "anomaly: test-tab (conversation unknown); not blocking",
                 f"{self.rows[1].name}: restart anomaly: {error}"])
@@ -418,7 +491,7 @@ class RestartTests(ShutdownTestCase):
                                 (["codex", "app-server", "--listen", "ws://127.0.0.1:1234"], True)):
             with (self.subTest(arguments=arguments),
                   patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", row.current_session])),
-                  patch.object(herdr, "_codex_conversations", return_value=({str(row.current_session): (123,)} if live else {}, [])),
+                  patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({str(row.current_session): (123,)} if live else {}, ())),
                   patch.object(herdr, "launch_prepared_agent") as launch,
                   redirect_stdout(io.StringIO()) as output):
                 self.assertEqual(restart.live_rows(staff.StaffSnapshot((row,)), herdr.Herdr("agents")), [row] if live else [])
@@ -440,7 +513,9 @@ class RestartTests(ShutdownTestCase):
                     fake_unit_host.process(environment, 990100 + index, 1, [kind], {}, cwd=self.root)
 
                 def observe(identity: str, _kind: str = "", *,
-                            runtime: Literal["claude", "codex"] = kind) -> herdr.LiveConversation | herdr.StoppedConversation:
+                            runtime: Literal["claude", "codex"] = kind,
+                            codex: herdr.CodexConversations | None = None) -> herdr.LiveConversation | herdr.StoppedConversation:
+                    _ = codex
                     row = next(row for row in self.rows if row.current_session == identity)
                     return (herdr.LiveConversation(runtime, (990100 + self.rows.index(row),))
                             if identity in self.running else herdr.StoppedConversation())
@@ -864,13 +939,13 @@ class RestartTests(ShutdownTestCase):
                 records = [record for record in records if record["sessionId"] != self.rows[0].current_session]
                 orphan = next(record for record in records if record["sessionId"] == "orphan")
                 orphan.update(name="unassigned", cwd="/tmp/orphan")
-                def codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
+                def codex_conversations() -> herdr.CodexConversations:
                     identities: dict[str, tuple[int, ...]] = {"orphan": (456,), "codex-orphan": (789,)}
                     if self.rows[0].current_session in self.running:
                         identities[str(self.rows[0].current_session)] = (123,)
-                    return identities, []
+                    return herdr.CodexConversations(identities, ())
                 with (patch.object(sessions, "_readable_records", return_value=records),
-                      patch.object(herdr, "_codex_conversations", side_effect=codex_conversations),
+                      patch.object(herdr, "codex_conversations", side_effect=codex_conversations),
                       patch.object(herdr, "running_codex_threads",
                                    return_value={str(self.rows[0].current_session), "orphan", "codex-orphan"}) as codex,
                       redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):

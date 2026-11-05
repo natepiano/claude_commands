@@ -203,7 +203,7 @@ class PaneRestoreTests(unittest.TestCase):
                             "HERDR_PANE_RECORD_DIR": str(self.root / "herdr-panes")}),
                         mock.patch.object(sessions, "session_liveness", side_effect=session_liveness),
                         mock.patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness),
-                        mock.patch.object(herdr, "_codex_conversations", return_value=({}, [])),
+                        mock.patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
                         mock.patch.object(sessions, "running_sessions", list),
                         mock.patch.object(herdr, "open_tab", self.open_tab)):
             _ = cast(object, self.enterContext(patcher))
