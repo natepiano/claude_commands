@@ -87,3 +87,13 @@
   - Preserve same-shape build rules, compile selection, the single history decode and bounded evidence queries.
   - Preserve historical `buildlog` decoding and unknown source text through semantic source types.
   - Revealed by: Phase 19; the showrunner defined "small" as under 5% of estimates.
+
+- [ ] **Find what made the 11-05 12:00 Mac prelude compile run cold (162 s)**
+  - Target: Mac mirror and Mac floor records (`scripts/mac_test/`, `scripts/lint/sweep.py` Mac pass), read-only
+  - Why needed: a 162 s hana_rigging prelude compile run on the Mac at 2026-11-05 12:00:21 EST has no matched deletion or clone record (Phase 73 report)
+  - Completion condition: a report names the cause (Mac mirror change, Mac floor deletion or a new mirror path) with its record; a fix is proposed only if the cause repeats
+  - Revealed by: Phase 73 (builds showrunner 2026-11-05: next, bounded)
+
+## Dropped
+
+- **The floor pass keeps an existing hana `target/external-client`** — dropped by the builds showrunner 2026-11-05: the measured cause (fresh-clone CI points) is already gone, and 1 eviction in 3 days does not pay for 1.3 GB per checkout (Phase 73).

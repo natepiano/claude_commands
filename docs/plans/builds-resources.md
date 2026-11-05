@@ -1699,3 +1699,33 @@ One bad entry in a run marker folder keeps only its own session's runs; every ot
 - `session_staff.worker_run_index` lists the `active` folder as a run, and the shared roster lock creates `active/mesh_roster.json.lock`; models-rename-track owns that caller.
 
 **Ruled out:** a test that counts director reads (it needs a configured mock).
+
+### Phase 73 — Measure what drops the warm hana_rigging prelude build, and propose one fix  · status: done
+**Depends on:** none. Showrunner go 2026-11-05 (next item after Phase 72, from hana's fastest unit). Its report is in the run folder.
+
+#### Work Order
+
+**Goal:** count how often each cause drops the warm `target/external-client` build of the hana_rigging prelude compile test, and propose one fix at the cause.
+
+**Measured:**
+1. hana's fastest unit measured the prelude compile test: 108-162 s cold, 0.3-5.9 s warm.
+2. The cold cost comes from a lost `target/external-client`. Fresh clones start without it, and the disk-floor sweeper (`scripts/lint/sweep.py`) can delete it.
+3. A full gate in a new clone pays about 110 s on one test thread.
+
+**Spec:**
+1. Find the test and the code that sets `target/external-client` in the hana repository. Quote file:line for both. Give the folder's size in one warm checkout.
+2. For 2026-11-02 00:00 EST to the phase start, count each cause separately, per day: sweeper deletions of the folder (or of a target folder that held it), and fresh hana checkouts that ran the test without it. For each cold run found, give the test time and the cause before it. Name each source read and each source not found; write `not measured` with the reason, never an estimate.
+3. Propose one fix at the cause: the code that changes (file:line), the one rule it adds, the seconds saved per gate from the step 2 counts, and the disk cost. Name each config key it adds, renames or deletes; a renamed or deleted key needs the user's approval. Name one rejected fix with one clause why.
+4. Read live natedev state files read-only. Run a tool that can write state only on a copies.py copy. Change no repository file and no config.
+5. Send the proposal to builds before any build. Add no guard, refusal or check this Work Order does not ask for.
+
+**Files:**
+- `phases/73/prelude_cold_report.md` — in the unit run folder: the facts, the per-day cause table and the proposal.
+
+**Workers:** `1 writer`
+- `impl` reads the sources and writes the report.
+
+**Acceptance gate:**
+- The report quotes the test and the folder code with file:line and gives the folder size.
+- The report gives a per-day count for each cause, or `not measured` with the reason.
+- The proposal names the changed code, the seconds saved per gate, the disk cost and every config key it touches.
