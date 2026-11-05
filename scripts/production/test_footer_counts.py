@@ -71,13 +71,13 @@ def issue(folder: Path, name: str, status: str, tags: str, proposed_by: str, *fi
                                            encoding="utf-8")
 
 
-def production_doc(folder: Path, slug: str, proposals: Path, *units: str) -> Path:
+def production_doc(folder: Path, name: str, proposals: Path, *units: str) -> Path:
     """A production doc that names the shared proposals folder, with staff rows for its units."""
-    path = folder / f"{slug}-production.md"
-    _ = path.write_text(f"# {slug}\n\n- **Proposals:** {proposals}\n", encoding="utf-8")
-    _ = recorded_showrunner(slug, path)
+    path = folder / f"{name}-production.md"
+    _ = path.write_text(f"# {name}\n\n- **Proposals:** {proposals}\n", encoding="utf-8")
+    _ = recorded_showrunner(name, path)
     for unit in units:
-        _ = unit_membership(slug, unit)
+        _ = unit_membership(name, unit)
     return path
 
 
@@ -114,15 +114,15 @@ class FooterCountsTests(unittest.TestCase):
         # Each production below a root reports to that root.
         _ = self.enterContext(mock.patch.object(showrunner_tree, "edges", side_effect=self.parents))
 
-    def parents(self, slugs: set[str] | None = None, *,
+    def parents(self, names: set[str] | None = None, *,
                 record: staff.StaffSnapshot | None = None) -> dict[str, str]:
-        del slugs, record
+        del names, record
         return {child: parent for parent, children in self.below.items() for child in children}
 
-    def productions_below(self, slug: str, *,
+    def productions_below(self, name: str, *,
                           record: staff.StaffSnapshot | None = None) -> list[str]:
         del record
-        return self.below.get(slug, [])
+        return self.below.get(name, [])
 
     def doc(self, *fields: str) -> Path:
         path = self.root / "production.md"
@@ -163,10 +163,10 @@ class FooterCountsTests(unittest.TestCase):
         _ = record.write_text("---\nrecord_type: question\nstatus: open\n"
                               + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
                               + f"registration: {json.dumps(fields)}\n---\n# Choose the layout\n")
-        instance = self.root / "notifier/showrunner-example"
+        instance = self.root / f"notifier/showrunner-{owner.id}"
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {doc}\n")
+            f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(state), "USER_ZONE": "UTC"}):
             line, due, sources = counts_row.row(instance)
         self.assertEqual(line, "For you: 1 question")
@@ -218,7 +218,7 @@ class FooterCountsTests(unittest.TestCase):
         self.assertEqual(counts, before._replace(proposals=before.proposals + 1))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = next_item.main(["show", "--kind", "proposal", "--production", str(doc)])
+            code = next_item.main(["show", "--kind", "proposal", "--production", "production"])
         self.assertEqual(code, 0)
         self.assertEqual(out.getvalue(), f"proposal\nFaster tests\n{ledger}\n")
         row = footer_counts.counts_line(counts)

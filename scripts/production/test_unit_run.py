@@ -121,7 +121,7 @@ class UnitRunTests(unittest.TestCase):
         })
 
     def run_script(self, *arguments: str, unit: str = UNIT) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.production),
+        return subprocess.run([sys.executable, str(SCRIPT), "--production", "show",
                                unit, *arguments], env=self.environment, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 

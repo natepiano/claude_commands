@@ -34,7 +34,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         worktree = self.root / "project-alpha"
         owner = self.prepare_restored_worktree("alpha", worktree)
         request = add_unit.RequestedUnitLaunch(
-            production=read_production(self.doc), requested_name="alpha", unit="alpha-unit",
+            production=read_production(self.production_name), requested_name="alpha", unit="alpha-unit",
             branch="build-followups-alpha", worktree=worktree,
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
@@ -98,7 +98,7 @@ class AddUnitRerunTests(AddUnitTestCase):
               patch.object(unit_lookup, "labeled_session", return_value=marked) as lookup):
             found = add_unit.launched_unit(request)
         self.assertEqual(found, add_unit.LabeledSessionFound(marked))
-        lookup.assert_called_once_with(request.production.slug, request.unit)
+        lookup.assert_called_once_with(request.production.name, request.unit)
         self.assertTrue(pending.exists(), "read-only marked lookup removed the pending opening")
         self.assertEqual(pending.read_bytes(), before)
 
@@ -200,7 +200,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
-        unit = resume_unit.RetiredUnitRecovery(read_production(self.doc), "alpha-unit", self.root / "project-alpha",
+        unit = resume_unit.RetiredUnitRecovery(read_production(self.production_name), "alpha-unit", self.root / "project-alpha",
             "alpha-unit", unit_config.PlanFile(Path("docs/plans/given.md")), "62ccbd64-f22e-5647-b20e-7899aa39d766")
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         output = io.StringIO()

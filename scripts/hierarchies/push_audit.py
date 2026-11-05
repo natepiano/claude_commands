@@ -28,7 +28,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 
 from scripts.hierarchies import log_records
 from scripts.notify.pushover import MESSAGE_MAX
-from scripts.production import session_staff, showrunners, staff, unit_names
+from scripts.production import session_staff, staff, unit_names
 
 STATE_DIR = Path.home() / ".local/state/notify"
 SESSION_CONFIG = SCRIPTS.parent / "config/hierarchies/sessions.toml"
@@ -75,7 +75,7 @@ Sender = SessionSender | BareSender | SenderNotRecorded
 
 @dataclass(frozen=True)
 class ShowrunnerOwner:
-    slug: str
+    name: str
 
 
 @dataclass(frozen=True)
@@ -326,10 +326,9 @@ def read_owners(problems: list[log_records.SourceProblem]) -> ProductionOwnershi
         record = staff.snapshot()
         resolver = session_staff.RowResolver(record)
         for row in staff.active(record, "showrunner"):
-            timer = showrunners.timer_for(row, record)
-            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else row.name
-            exact_names[row.name].add(slug)
-            exact_names[slug].add(slug)
+
+            name = row.name
+            exact_names[row.name].add(row.name)
             for unit in staff.active(record, "unit"):
                 if unit.parent != staff.ReportsTo(row.id):
                     continue
@@ -338,13 +337,13 @@ def read_owners(problems: list[log_records.SourceProblem]) -> ProductionOwnershi
                     if isinstance(state, session_staff.LocationUnfilled):
                         problems.append(log_records.SourceProblem(unit.name, state.reason, log_records.SourceNotApplicable.ATTRIBUTION))
                     continue
-                exact_names[unit_names.unit_id(unit.name)].add(slug)
-                session_aliases[unit.name].add(slug)
+                exact_names[unit_names.unit_id(unit.name)].add(name)
+                session_aliases[unit.name].add(name)
     except (OSError, ValueError) as error:
         problems.append(log_records.SourceProblem("staff", str(error), log_records.SourceNotApplicable.ATTRIBUTION))
     return ProductionOwnership(
-        {name: ShowrunnerOwner(next(iter(slugs))) for name, slugs in exact_names.items() if len(slugs) == 1},
-        {name: ShowrunnerOwner(next(iter(slugs))) for name, slugs in session_aliases.items() if len(slugs) == 1})
+        {name: ShowrunnerOwner(next(iter(names))) for name, names in exact_names.items() if len(names) == 1},
+        {name: ShowrunnerOwner(next(iter(names))) for name, names in session_aliases.items() if len(names) == 1})
 
 
 def read_config(path: Path) -> log_records.JsonObject:
@@ -574,7 +573,7 @@ def sender_label(sender: Sender, sessions: TopLevelSessions) -> str:
 
 def owner_label(attribution: ShowrunnerAttribution, sessions: TopLevelSessions) -> str:
     if isinstance(attribution, ShowrunnerOwner):
-        return "showrunner / " + attribution.slug
+        return "showrunner / " + attribution.name
     if isinstance(attribution, MachineService):
         return "machine service / " + attribution.name
     if isinstance(attribution, SessionWithoutProduction):

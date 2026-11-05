@@ -90,22 +90,21 @@ class RegistrationTests(RegistrationFixture):
                                 doc=staff.LiveDoc("natedev", other / relative))
         return caller / relative, self.fixture_staff_id(), second.id
 
-    def test_ask_refuses_ambiguous_document_ownership_without_writing_a_question(self) -> None:
+    def test_ask_uses_the_staff_name_when_checkouts_share_a_document_path(self) -> None:
         document, first, second = self.ambiguous_question_document()
         asker_id = self.fixture_staff_id("alpha-unit")
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
-                  for path in self.state.rglob("*") if path.is_file()}
+        staff_file = self.state / "staff/staff.json"
+        before = staff_file.read_bytes()
         self.checkout = document.parents[2]
         self.doc = document
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
             result = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep this layout?",
                                       "--unit", str(asker_id))
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(str(first), result.stdout + result.stderr)
-        self.assertIn(str(second), result.stdout + result.stderr)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
-                          for path in self.state.rglob("*") if path.is_file()}, before)
-        self.assertEqual(list((self.root / "issues").iterdir()), [])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        question, = (self.root / "issues").glob("question-*.md")
+        self.assertIn(f"production_id: {first}", question.read_text().splitlines())
+        self.assertNotIn(f"production_id: {second}", question.read_text().splitlines())
+        self.assertEqual(staff_file.read_bytes(), before)
 
     def test_footer_sources_reports_ambiguous_document_ownership_without_a_traceback(self) -> None:
         import footer_counts

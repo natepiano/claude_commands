@@ -169,15 +169,15 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual([item.text for item in self.read_items(path)], ["Reminder"])
         records = [cast(dict[str, object], json.loads(line)) for line in answered_path.read_text().splitlines()]
         self.assertEqual(len(records), 1)
-        self.assertEqual((records[0]["slug"], records[0]["text"], records[0]["asked_by"]),
+        self.assertEqual((records[0]["name"], records[0]["text"], records[0]["asked_by"]),
                          ("example", "retry?", self.fixture_staff_id("alpha-unit")))
 
     def test_answered_record_expiry_and_legacy_asker_preserve_replay_rules(self) -> None:
         path = self.outstanding().with_suffix(".answered.jsonl")
         now = datetime.now(timezone.utc)
         records: list[dict[str, str]] = [
-            {"time": (now - timedelta(hours=49)).isoformat(), "slug": "example", "text": "expired?", "asked_by": self.fixture_staff_id("alpha-unit")},
-            {"time": (now - timedelta(hours=1)).isoformat(), "slug": "example", "text": "legacy?"},
+            {"time": (now - timedelta(hours=49)).isoformat(), "name": "example", "text": "expired?", "asked_by": self.fixture_staff_id("alpha-unit")},
+            {"time": (now - timedelta(hours=1)).isoformat(), "name": "example", "text": "legacy?"},
         ]
         _ = path.write_text("".join(json.dumps(item) + "\n" for item in records))
         before = path.read_bytes()
@@ -195,7 +195,7 @@ class RegistrationTests(RegistrationFixture):
     def test_answer_replay_prefers_exact_text_and_refuses_ambiguous_partial_matches(self) -> None:
         path = self.outstanding().with_suffix(".answered.jsonl")
         stamp = datetime.now(timezone.utc).isoformat()
-        records = [{"time": stamp, "slug": "example", "text": text, "asked_by": asker}
+        records = [{"time": stamp, "name": "example", "text": text, "asked_by": asker}
                    for text, asker in (("retry", self.fixture_staff_id("alpha-unit")),
                                        ("retry later", self.fixture_staff_id("showrunner")))]
         _ = path.write_text("".join(json.dumps(item) + "\n" for item in records))
@@ -212,7 +212,7 @@ class RegistrationTests(RegistrationFixture):
         stamp = datetime.now(timezone.utc).isoformat()
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry",
                                         "question": "Retry now?", "asked_by": self.fixture_staff_id("alpha-unit")})
-        _ = journal.write_text(json.dumps({"time": stamp, "slug": "example", "text": "retry",
+        _ = journal.write_text(json.dumps({"time": stamp, "name": "example", "text": "retry",
                                           "asked_by": self.fixture_staff_id("beta-unit")}) + "\n")
         opened = self.run_command("answer", "--item", "retry")
         self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
@@ -221,7 +221,7 @@ class RegistrationTests(RegistrationFixture):
 
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry later",
                                         "question": "Retry later?", "asked_by": self.fixture_staff_id("alpha-unit")})
-        records = [{"time": stamp, "slug": "example", "text": "retry", "asked_by": asker}
+        records = [{"time": stamp, "name": "example", "text": "retry", "asked_by": asker}
                    for asker in (self.fixture_staff_id("alpha-unit"), self.fixture_staff_id("beta-unit"))]
         _ = journal.write_text("".join(json.dumps(saved) + "\n" for saved in records))
         before = path.read_bytes(), journal.read_bytes()
@@ -230,7 +230,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn("2 open items match", ambiguous.stdout)
         self.assertEqual((path.read_bytes(), journal.read_bytes()), before)
 
-        _ = journal.write_text(json.dumps({"time": stamp, "slug": "example", "text": "retry yesterday",
+        _ = journal.write_text(json.dumps({"time": stamp, "name": "example", "text": "retry yesterday",
                                           "asked_by": self.fixture_staff_id("beta-unit")}) + "\n")
         partial = self.run_command("answer", "--item", "retry")
         self.assertEqual(partial.returncode, 0, partial.stdout + partial.stderr)
@@ -240,20 +240,20 @@ class RegistrationTests(RegistrationFixture):
     def test_missing_asker_context_preserves_the_callers_diagnostic_reason(self) -> None:
         opened = registration.OutstandingItem(since="2026-10-06T08:00", text="Reminder")
         saved = registration.AnsweredItem(time=datetime.now(timezone.utc).isoformat(),
-                                          slug="example", text="Reminder")
+                                          name="example", text="Reminder")
         open_asker = registration.question_asker(opened, registration.OpenItemWithoutAsker())
         saved_asker = registration.question_asker(saved,
                          registration.AskerNotRecorded("open item has no recorded asker"))
         with mock.patch.dict(os.environ, self.env):
-            production = read_production(self.doc)
+            production = read_production("example")
         self.assertEqual(registration.relay_line(production, "example", open_asker),
                          "relay: none; the item belongs to this production")
         self.assertEqual(registration.relay_line(production, "example", saved_asker),
                          "relay: none; open item has no recorded asker; the item belongs to this production")
 
     def test_answer_reaches_a_list_below_and_relays_through_its_showrunner_never_above(self) -> None:
-        for slug in ("top", "example", "kid"):
-            self.timer(slug)
+        for name in ("top", "example", "kid"):
+            self.timer(name)
         self.attach("example", "top")
         self.attach("kid", "example")
         self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today?", "question": "Merge today?",
@@ -265,12 +265,12 @@ class RegistrationTests(RegistrationFixture):
                          [f"relay: to the showrunner of kid, for kid-unit (staff {self.fixture_staff_id('kid-unit', 'kid')})",
                           "answer: ok — kid: merge today?"],
                          answered.stdout + answered.stderr)
-        self.assertEqual(json.loads(self.outstanding().with_name(f"{self.fixture_staff_id(slug='kid')}.json").read_text()), [])
+        self.assertEqual(json.loads(self.outstanding().with_name(f"{self.fixture_staff_id(name='kid')}.json").read_text()), [])
         self.assertEqual(self.run_command("answer", "--item", "ship it?").returncode, 2)
 
     def test_below_production_answer_uses_the_configured_role_name_on_first_send_and_replay(self) -> None:
-        for slug in ("example", "kid"):
-            self.timer(slug)
+        for name in ("example", "kid"):
+            self.timer(name)
         self.attach("kid", "example")
         self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "ship today?",
                                     "question": "Ship today?", "asked_by": "showrunner"})
@@ -286,12 +286,12 @@ class RegistrationTests(RegistrationFixture):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("relay: to the showrunner of kid, for coordinator", result.stdout)
         self.assertIn("already answered", repeated.stdout)
-        saved = cast(dict[str, object], json.loads(self.outstanding().with_name(f"{self.fixture_staff_id(slug='kid')}.answered.jsonl").read_text()))
+        saved = cast(dict[str, object], json.loads(self.outstanding().with_name(f"{self.fixture_staff_id(name='kid')}.answered.jsonl").read_text()))
         self.assertEqual(saved["asked_by"], self.fixture_staff_id("showrunner", "kid"))
 
     def test_below_production_answer_keeps_a_relay_when_names_cannot_be_read(self) -> None:
         with mock.patch.dict(os.environ, self.env):
-            production = read_production(self.doc)
+            production = read_production("example")
         with mock.patch.object(names, "runtime_names", return_value=names.UnreadableNames("names.toml", "unavailable")):
             line = registration.relay_line(production, "kid", registration.ShowrunnerAsker())
         self.assertEqual(line, "relay: to the showrunner of kid, for requesting role (display name unavailable)")

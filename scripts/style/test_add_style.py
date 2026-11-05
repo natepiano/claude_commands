@@ -27,7 +27,7 @@ from scripts.production.production_doc import production_field, read_production
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
 from scripts.production import change_review, staff
-from scripts.production.staff_test_support import fixture_showrunner_name, isolated_staff_file, recorded_showrunner
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
 SCRIPT = Path(add_style.__file__)
 STUB = '''import json
@@ -37,7 +37,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.environ["STYLE_TEST_CHECKOUT"])
-from scripts.production.staff_test_support import fixture_showrunner_name, recorded_showrunner, showrunner_relationship
+from scripts.production.production_doc import read_new_production, read_production
+from scripts.production.staff_test_support import recorded_showrunner, showrunner_relationship
 
 arguments = sys.argv[1:]
 name = Path(sys.argv[0]).name
@@ -47,7 +48,10 @@ state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
 if name == "style_sync.py":
     raise SystemExit(0)
 elif name == "launch.py":
-    doc = Path(arguments[arguments.index("--production") + 1])
+    production_name = arguments[arguments.index("--production") + 1]
+    production = (read_new_production(Path(arguments[arguments.index("--doc") + 1]), production_name)
+                  if "--doc" in arguments else read_production(production_name))
+    doc = production.doc
     if os.environ.get("TEST_BOOTSTRAP_AT_LAUNCH"):
         Path(os.environ["TEST_BOOTSTRAP_AT_LAUNCH"]).write_text(json.dumps({
             "production": doc.read_text(),
@@ -58,14 +62,14 @@ elif name == "launch.py":
         destinations.write(destination + "\\n")
     if os.environ.get("TEST_FAIL_LAUNCH") == "1":
         raise SystemExit(2)
-    slug = doc.name.removesuffix("-production.md")
+    name = production.name
+    owner = recorded_showrunner(name, doc)
     if os.environ.get("TEST_OPEN_SESSION_EXIT"):
-        (Path(os.environ["TEST_LIVE_SESSIONS"]) / slug).touch()
+        (Path(os.environ["TEST_LIVE_SESSIONS"]) / name).touch()
         raise SystemExit(int(os.environ["TEST_OPEN_SESSION_EXIT"]))
-    timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / ("showrunner-" + slug) / "conf"
+    timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / ("showrunner-" + name) / "conf"
     timer.parent.mkdir(parents=True, exist_ok=True)
-    timer.write_text("TARGET=session:stub\\nCHECK=zsh /x/production_check.sh " + shlex.quote(str(doc)) + "\\n")
-    recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
+    timer.write_text("TARGET=session:" + owner.id + "\\nCHECK=zsh /x/production_check.sh " + owner.id + "\\n")
 elif arguments[0] == "detach":
     (state / arguments[1] / "parent").unlink()
     showrunner_relationship(arguments[1])
@@ -172,23 +176,23 @@ class AddStyleTests(unittest.TestCase):
             ["git", "-C", str(self.repo), *arguments], check=True, text=True, capture_output=True,
         ).stdout.strip()
 
-    def parent_doc(self, slug: str, branch: str = "main", *, proposals: bool = True) -> Path:
-        path = self.root / f"{slug}-production.md"
+    def parent_doc(self, name: str, branch: str = "main", *, proposals: bool = True) -> Path:
+        path = self.root / f"{name}-production.md"
         fields = [
-            f"# Production — {slug}", "", "## Production Context", "",
+            f"# Production — {name}", "", "## Production Context", "",
             f"- **Repository:** `{self.repo}`",
             f"- **Merge branch:** `{branch}`",
             f"- **Showrunner checkout:** `{self.repo}`",
-            f"- **Log:** docs/{slug}-log.md",
+            f"- **Log:** docs/{name}-log.md",
             "- **Merge tests:** `sample`, `support` — packages tested on every merge",
         ]
         if proposals:
-            fields.append(f"- **Proposals:** `{self.root / (slug + '-issues')}`")
+            fields.append(f"- **Proposals:** `{self.root / (name + '-issues')}`")
         _ = path.write_text("\n".join([*fields, ""]))
-        timer = self.root / "notifier" / f"showrunner-{slug}" / "conf"
+        timer = self.root / "notifier" / f"showrunner-{name}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
-        _ = timer.write_text(f"TARGET=session:{slug}\nCHECK=zsh /x/production_check.sh {shlex.quote(str(path))}\n")
-        _ = recorded_showrunner(fixture_showrunner_name(slug, path), path)
+        _ = timer.write_text(f"TARGET=session:{name}\nCHECK=zsh /x/production_check.sh {shlex.quote(str(path))}\n")
+        _ = recorded_showrunner(name, path)
         return path
 
     def parent_document(self) -> Path:
@@ -201,7 +205,8 @@ class AddStyleTests(unittest.TestCase):
 
     def run_bootstrap(self, *arguments: str, parent: Path | None = None, success: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, "-c", BOOTSTRAP, str(SCRIPT), "--production", str(parent or self.parent),
+            [sys.executable, "-c", BOOTSTRAP, str(SCRIPT), "--production", next(row.name for row in staff.snapshot().find(kind="showrunner")
+                                  if isinstance(row.doc, staff.LiveDoc) and row.doc.path == (parent or self.parent)),
              "--model", "test-model", "--effort", "high", *arguments],
             env=self.env, cwd=self.repo, capture_output=True, text=True, check=False,
         )
@@ -215,7 +220,7 @@ class AddStyleTests(unittest.TestCase):
 
     def resume_call(self) -> ScriptCall:
         return {"command": "style_sync.py", "arguments": [
-            "resume", "--repo", str(self.checkout), "--slug", "sample-style",
+            "resume", "--repo", str(self.checkout), "--production", "sample-style",
             "--branch-point", "main", "--style-branch", "style/main",
         ]}
 
@@ -253,7 +258,7 @@ atomic_file.os.replace = interrupted_replace
         self.assertFalse(path.exists())
         finished = self.run_bootstrap()
         self.assertEqual(finished.returncode, 0, finished.stderr)
-        self.assertEqual(read_production(self.doc).merge_branch, "style/main")
+        self.assertEqual(read_production("sample-style").merge_branch, "style/main")
         self.assertEqual(len(list((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
         self.assertIn("## Phases", (self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md").read_text())
         self.assertEqual(sum(call["command"] == "launch.py" for call in self.calls()), 1)
@@ -382,13 +387,28 @@ atomic_file.os.replace = interrupted_replace
 
     def test_lookup_from_main_and_linked_worktree_finds_the_same_standing_production(self) -> None:
         _ = self.run_bootstrap()
+        previous = self.doc
+        self.doc = previous.with_name("tool-based-ui-production.md")
+        _ = previous.rename(self.doc)
+        owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.doc))
         main = add_style.standing_style_production(self.repo)
         linked = add_style.standing_style_production(self.checkout)
         self.assertEqual(main, linked)
         self.assertIsInstance(main, add_style.StandingStyleProduction)
         if isinstance(main, add_style.StandingStyleProduction):
-            self.assertEqual((main.repository, main.slug, main.checkout, main.doc, main.branch_point),
+            self.assertEqual((main.repository, main.name, main.checkout, main.doc, main.branch_point),
                              (self.repo, "sample-style", self.checkout, self.doc, "main"))
+
+    def test_check_uses_the_staff_name_and_keeps_document_paths(self) -> None:
+        _ = self.run_bootstrap()
+        owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
+        _ = staff.rename(owner.id, "hana")
+        output = self.run_bootstrap("--check").stdout
+        self.assertIn("find standing hana under parent", output)
+        self.assertIn(f"existing production doc {self.doc}", output)
+        self.assertIn("docs/sample-style-log.md", output)
+
 
     def test_lookup_without_a_production_leaves_directories_branches_and_excludes_unchanged(self) -> None:
         before = (sorted(self.root.iterdir()), self.git("branch", "--list"),
@@ -399,12 +419,13 @@ atomic_file.os.replace = interrupted_replace
                           (self.repo / ".git/info/exclude").read_bytes()), before)
 
     def test_bootstrap_creates_excluded_production_plans_and_pins_style_branch(self) -> None:
+        self.assertFalse(any(row.name == "sample-style" for row in staff.snapshot().find(kind="showrunner")))
         _ = self.run_bootstrap()
 
         self.assertEqual(self.git("rev-parse", "style/main"), self.initial_tip)
         self.assertIn(str(self.checkout), self.git("worktree", "list", "--porcelain"))
-        production = read_production(self.doc)
-        self.assertEqual((production.slug, production.merge_branch, production.checkout), ("sample-style", "style/main", self.checkout))
+        production = read_production("sample-style")
+        self.assertEqual((production.name, production.merge_branch, production.checkout), ("sample-style", "style/main", self.checkout))
         lines = self.doc.read_text().splitlines()
         for field, value in {
             "Kind": "style", "Repository": str(self.repo), "Branch point": "main",
@@ -416,7 +437,7 @@ atomic_file.os.replace = interrupted_replace
         for family in add_style.FAMILIES:
             plan = self.checkout / f"docs/style-production/units/sample-style-{family}-unit.md"
             text = plan.read_text()
-            self.assertIn(f"> **Production: sample-style** — unit `sample-style-{family}-unit`", text)
+            self.assertNotIn("**Production:", text)
             self.assertIn("> **Standing:** style_plan.py", text)
             self.assertNotIn("**Pilot scope:**", text)
             self.assertIn(f"global:rust/{family}.md", text)
@@ -437,8 +458,19 @@ atomic_file.os.replace = interrupted_replace
         self.assertEqual(self.parent_document(), self.parent)
         self.assertEqual(self.calls(), [{
             "command": "launch.py",
-            "arguments": ["--production", str(self.doc), "--model", "test-model", "--effort", "high"],
+            "arguments": ["--production", "sample-style", "--doc", str(self.doc),
+                          "--model", "test-model", "--effort", "high"],
         }, {"command": "showrunners.py", "arguments": ["attach", "sample-style", "parent"]}])
+
+    def test_launch_with_an_existing_staff_row_uses_its_doc_without_a_doc_argument(self) -> None:
+        _ = self.run_bootstrap()
+        (self.root / "notifier/showrunner-sample-style/conf").unlink()
+        _ = self.run_bootstrap()
+
+        launches = [call for call in self.calls() if call["command"] == "launch.py"]
+        self.assertEqual(launches[-1]["arguments"],
+                         ["--production", "sample-style", "--model", "test-model", "--effort", "high"])
+        self.assertEqual(read_production("sample-style").doc, self.doc)
 
     def test_standing_plans_do_not_become_local_rules_or_hide_real_rules(self) -> None:
         _ = self.run_bootstrap()
@@ -620,7 +652,8 @@ atomic_file.os.replace = interrupted_replace
         self.assertEqual((self.calls(), self.sync()), (calls, sync))
         timer = self.root / "notifier/showrunner-sample-style/conf"
         timer.parent.mkdir(parents=True)
-        _ = timer.write_text(f"TARGET=session:stub\nCHECK=zsh /x/production_check.sh {shlex.quote(str(self.doc))}\n")
+        owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
+        _ = timer.write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
 
         _ = self.run_bootstrap()
 
@@ -634,7 +667,7 @@ atomic_file.os.replace = interrupted_replace
         _ = self.run_bootstrap()
         plan = add_style.PLAN_DIRECTORY / "sample-style-names-unit.md"
         request = add_unit.RequestedUnitLaunch(
-            production=read_production(self.doc), requested_name="sample-style-names", unit="sample-style-names-unit",
+            production=read_production("sample-style"), requested_name="sample-style-names", unit="sample-style-names-unit",
             branch="sample-style-names", worktree=self.root / "sample-style-names",
             plan=add_unit.PlanGiven(plan), port=add_unit.OmittedCell(), session=add_unit.NewSession(), timeout=1.0,
         )

@@ -23,7 +23,8 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import fake_memory_readings
-from scripts.production import merge_gate
+from scripts.production import merge_gate, staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
@@ -338,7 +339,7 @@ class MergeGateFixture(unittest.TestCase):
         self.quiet_production = self.root / "quiet-production.md"
         home = self.root / "home"
         self.environment = {
-            **os.environ, "HOME": str(home), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -461,6 +462,8 @@ class MergeGateFixture(unittest.TestCase):
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"
         self.write(self.quiet_production, "# quiet\n")
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc("natedev", self.quiet_production))
         _ = self.git(self.root, "init", "--bare", str(self.origin))
         _ = self.git(self.root, "init", "-b", "main", str(self.checkout))
         _ = self.git(self.checkout, "config", "user.name", "Merge Gate Fixture")
@@ -531,7 +534,7 @@ class MergeGateFixture(unittest.TestCase):
              "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
              "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
-             *([] if callers_production or "--production" in extra else ["--production", str(self.quiet_production)]),
+             *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
              *extra]
         # The gate measures itself and descendants; cap assertions need their own gate process.
         if own_process or ignored_signals:
@@ -613,7 +616,7 @@ class MergeGateFixture(unittest.TestCase):
 
     def review_list(self) -> tuple[Path, Path]:
         """A change-review list holding C7, and the production doc that names it."""
-        review = self.root / "change-review.md"
+        review = Path(self.environment["HOME"]) / "rust/hanadocs/change-review/change-review - fixture-showrunner.md"
         self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                    + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
         doc = self.root / "production.md"

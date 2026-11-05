@@ -4,7 +4,6 @@
 
 > **As-built disposition: amend** — `docs/as-built/buildlog-memory-stalls.md` (report sections); `docs/as-built/build-followups.md` (rebuild bins and the clone-rebuild count)
 
-> **Production: builds** — unit `report-unit`; production doc `docs/plans/builds-production.md`
 ## Source
 
 2026-10-31 06:5x EDT (the showrunner, the user's request via sdlc)

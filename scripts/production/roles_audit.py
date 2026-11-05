@@ -28,7 +28,6 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import showrunners, staff, unit_lookup, unit_names
-from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from code_kind import is_test_code  # noqa: E402
@@ -126,7 +125,7 @@ class RetiredUse:
 
 @dataclass(frozen=True)
 class ProductionNames:
-    slug: str
+    name: str
     doc: str
     showrunner: str
     units: tuple[str, ...]
@@ -442,24 +441,22 @@ def measure_definitions(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) ->
     return tuple(result)
 
 
-def parse_production(slug: str, doc: Path, record: staff.StaffSnapshot) -> ProductionNames:
-    row = record.by_doc(remote.local_machine(), doc)
-    timer = showrunners.timer_for(row, record) if row is not None else showrunners.NoTimer("no staff row")
-    session = timer.target.removeprefix("session:") if isinstance(timer, showrunners.TimerRegistration) else slug
+def parse_production(production_name: str, doc: Path, record: staff.StaffSnapshot) -> ProductionNames:
+    row = showrunners.owner_for(production_name, record=record)
     units = tuple(unit_names.unit_id(row.name) for row in unit_lookup.doc_units(doc, record))
-    return ProductionNames(slug, str(doc), session, units)
+    return ProductionNames(row.name, str(doc), row.name, units)
 
 
 def measure_production_names(productions: tuple[ProductionNames, ...]) -> tuple[ProductionNameFinding, ...]:
     result: list[ProductionNameFinding] = []
     uses: dict[str, set[int]] = defaultdict(set)
     for index, production in enumerate(productions):
-        for name in {production.slug, production.showrunner, *production.units}:
+        for name in {production.name, production.showrunner, *production.units}:
             uses[name].add(index)
     for name, indices in sorted(uses.items()):
         if len(indices) > 1:
             owners = [productions[index] for index in sorted(indices)]
-            result.append(ProductionNameFinding("shared name", name, tuple(p.slug for p in owners),
+            result.append(ProductionNameFinding("shared name", name, tuple(p.name for p in owners),
                                                 tuple(p.doc for p in owners)))
     return tuple(result)
 
@@ -1053,9 +1050,9 @@ def baseline(root: Path, window: AuditWindow, *, tables: bool = False) -> str:
     unread_production_docs: list[UnreadSource] = []
     # This is the same timer/doc reader as `showrunners.py list`, without session/socket probes.
     record = staff.snapshot()
-    for slug, doc in sorted(showrunners.timer_docs().items()):
+    for production_name, doc in sorted(showrunners.timer_docs().items()):
         try:
-            productions.append(parse_production(slug, doc, record))
+            productions.append(parse_production(production_name, doc, record))
         except (OSError, UnicodeError, staff.StaffUnreadable) as error:
             unread_production_docs.append(UnreadSource(str(doc), str(error)))
             issues.append(f"{doc}: {error}")

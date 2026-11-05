@@ -35,7 +35,7 @@ from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import models_registry, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production import production_doc, session_staff, showrunners, staff, unit_config  # noqa: E402
+from scripts.production import session_staff, staff, unit_config  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 from scripts.usage import agents_log  # noqa: E402
 
@@ -5180,9 +5180,8 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
         parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
         if parent is None:
             return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
-        timer = showrunners.timer_for(parent, record)
-        slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name
-        return ProductionUnitIdentity(slug, row.name) if state.get(unit_runs.OWNER_FIELD) else ProductionUnitIdentity(production or slug, unit or row.name)
+        name = parent.name
+        return ProductionUnitIdentity(name, row.name) if state.get(unit_runs.OWNER_FIELD) else ProductionUnitIdentity(production or name, unit or row.name)
     except (OSError, ValueError) as error:
         return ProductionNotRecorded(str(error))
 
@@ -5259,21 +5258,6 @@ def _phase_repository(working_dir: str) -> RecordedPhaseMetadata | PhaseMetadata
     return PhaseMetadataNotRecorded("repository common directory is unavailable")
 
 
-def _phase_production_name(production: str, working_dir: str) -> RecordedPhaseMetadata | PhaseMetadataNotRecorded:
-    reference = production.strip("`")
-    if "/" not in reference and Path(reference).suffix.lower() != ".md":
-        return _recorded_phase_metadata(production, "phase plan header names no production")
-    document = Path(working_dir).expanduser() / Path(reference).expanduser()
-    try:
-        lines = document.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as error:
-        return PhaseMetadataNotRecorded(f"production document cannot be read: {error}")
-    name = production_doc.production_name(lines)
-    if isinstance(name, production_doc.ProductionNameNotRecorded):
-        return PhaseMetadataNotRecorded(name.reason)
-    return _recorded_phase_metadata(name.value, "production document heading names no production")
-
-
 def _phase_plan_names(state: Mapping[str, object]) -> tuple[
     RecordedPhaseMetadata | PhaseMetadataNotRecorded, RecordedPhaseMetadata | PhaseMetadataNotRecorded
 ]:
@@ -5293,8 +5277,6 @@ def _phase_source_identity(state: Mapping[str, object]) -> PhaseSourceIdentity:
             production = plan_production
         if isinstance(unit, PhaseMetadataNotRecorded):
             unit = plan_unit
-    if isinstance(production, RecordedPhaseMetadata):
-        production = _phase_production_name(production.value, _string(state.get("working_dir")))
     return PhaseSourceIdentity(production, unit, _phase_repository(_string(state.get("working_dir"))))
 
 
@@ -5623,9 +5605,8 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
         production = identity.removeprefix("showrunner:")
         records = {item["sessionId"]: item for item in sessions.live_sessions()}
         for row in staff.active(resolver.record, "showrunner"):
-            timer = showrunners.timer_for(row, resolver.record)
-            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else row.name
-            if slug == production and row.current_session in records:
+            name = row.name
+            if name == production and row.current_session in records:
                 return NamedSupplier("uds:" + records[row.current_session]["messagingSocketPath"])
         return NoNamedSupplier("showrunner has no current address")
     if identity.startswith(("uds:/", "codex:")):
@@ -6030,8 +6011,6 @@ def _read_waits(args: argparse.Namespace) -> None:
         for field in ("production", "repository"):
             if field in event:
                 metadata = _recorded_phase_metadata(event[field], f"phase has no {field}")
-                if field == "production" and isinstance(metadata, RecordedPhaseMetadata):
-                    metadata = _phase_production_name(metadata.value, _string(event.get("working_dir")))
                 phase[field] = _phase_metadata_fields(metadata)
         if own_missing:
             phase.update(reason="wait emission has a missing record", wait_missing_n=len(own_missing),

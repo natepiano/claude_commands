@@ -55,22 +55,22 @@ class TidyWrappedTests(unittest.TestCase):
         _ = path.write_text(content, encoding="utf-8")
         return path
 
-    def doc(self, slug: str, status: str) -> Path:
-        document = self.write(self.root / "docs" / f"{slug}-production.md", production(status))
-        _ = self.owner(slug)
+    def doc(self, production_name: str, status: str) -> Path:
+        document = self.write(self.root / "docs" / f"{production_name}-production.md", production(status))
+        _ = self.owner(production_name)
         return document
 
-    def owner(self, slug: str) -> staff.StaffRow:
-        document = self.root / "docs" / f"{slug}-production.md"
+    def owner(self, production_name: str) -> staff.StaffRow:
+        document = self.root / "docs" / f"{production_name}-production.md"
         rows = [row for row in staff.initial_snapshot().rows
                 if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path == document]
         if rows:
             return rows[0]
-        return fixture_member("showrunner", name=slug + "-owner", runtime_id=fixture_runtime_id("tidy:" + slug),
+        return fixture_member("showrunner", name=production_name, runtime_id=fixture_runtime_id("tidy:" + production_name),
                               doc=staff.WrappedDoc("natedev", document))
 
-    def state_files(self, slug: str) -> tuple[Path, ...]:
-        owner = self.owner(slug)
+    def state_files(self, production_name: str) -> tuple[Path, ...]:
+        owner = self.owner(production_name)
         return tuple(self.write(path, "[]\n") for path in (
             self.state / "footers-off" / owner.id, self.state / "review-paused" / f"{owner.id}.json",
             self.state / "outstanding" / f"{owner.id}.json",
@@ -187,8 +187,8 @@ class TidyWrappedTests(unittest.TestCase):
         import tidy_wrapped
         from update_registration import QuestionStaff
 
-        documents = [self.doc(slug, "wrapped") for slug in ("first", "second")]
-        paths = [path for slug in ("first", "second") for path in self.state_files(slug)]
+        documents = [self.doc(production_name, "wrapped") for production_name in ("first", "second")]
+        paths = [path for production_name in ("first", "second") for path in self.state_files(production_name)]
         environment = {**source_environment(self.root / "sources"),
                        "SHOWRUNNER_STATE_DIR": str(self.state), "NOTIFIER_STATE_DIR": str(self.notifier)}
         with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
@@ -287,7 +287,6 @@ class TidyWrappedTests(unittest.TestCase):
     def test_a_running_production_keeps_every_file(self) -> None:
         own = self.state_files("live")
         doc = self.doc("live", "running")
-        (self.root / "staff.json").unlink()
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 1)
         self.assertIn("kept: ", result.stderr)
@@ -307,29 +306,15 @@ class TidyWrappedTests(unittest.TestCase):
         own = self.state_files("done")
         doc = self.doc("done", "wrapped")
         owner = staff.rename(self.owner("done").id, "renamed-owner")
-        for name in (f"showrunner-{owner.id}", "showrunner-done"):
+        for name in (f"showrunner-{owner.id}",):
             with self.subTest(timer=name):
                 timer = self.notifier / name
                 timer.mkdir()
                 result = self.run_tidy(doc)
                 self.assertEqual(result.returncode, 1)
-                self.assertIn("done still has an update timer", result.stderr)
+                self.assertIn("renamed-owner still has an update timer", result.stderr)
                 self.assertTrue(all(path.exists() for path in own))
                 timer.rmdir()
-
-    def test_a_wrapped_production_checks_its_legacy_timer(self) -> None:
-        own = self.state_files("unrecorded")
-        doc = self.doc("unrecorded", "wrapped")
-        timer = self.notifier / "showrunner-unrecorded"
-        timer.mkdir()
-        refused = self.run_tidy(doc)
-        self.assertEqual(refused.returncode, 1)
-        self.assertIn("unrecorded still has an update timer", refused.stderr)
-        self.assertTrue(all(path.exists() for path in own))
-        timer.rmdir()
-        result = self.run_tidy(doc)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(any(path.exists() for path in own))
 
     def test_missing_or_unreadable_staff_keeps_every_file(self) -> None:
         own = self.state_files("done")
@@ -346,13 +331,12 @@ class TidyWrappedTests(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
                 self.assertTrue(all(path.exists() for path in own))
 
-    def test_a_slug_naming_a_shared_folder_deletes_nothing(self) -> None:
+    def test_a_production_name_naming_a_shared_folder_deletes_nothing(self) -> None:
         own = self.state_files("live")
         doc = self.doc("outstanding", "wrapped")
-        (self.root / "staff.json").unlink()
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("'outstanding' is not a production slug", result.stderr)
+        self.assertIn("'outstanding' is not a production name", result.stderr)
         self.assertTrue(all(path.exists() for path in own))
 
     def test_a_refused_doc_does_not_stop_the_next(self) -> None:

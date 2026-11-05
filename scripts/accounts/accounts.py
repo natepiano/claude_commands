@@ -2925,8 +2925,8 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     notices = (f"{group}: no live session moves",) if not ids else ()
     if group == "showrunners":
         notices += tuple(
-            f"{runner['slug']}: no session runs under the id its update timer names; "
-            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner['doc'])}"
+            f"{runner['name']}: no session runs under the id its update timer names; "
+            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner['name'])}"
             for runner in inventory.unregistered_showrunners(members, registrations=registrations))
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",

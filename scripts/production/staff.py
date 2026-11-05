@@ -1713,8 +1713,8 @@ def _parser() -> argparse.ArgumentParser:
     _ = rename_parser.add_argument("target")
     _ = rename_parser.add_argument("--name", required=True)
     move_parser = verbs.add_parser("move", help="move a unit and its live tab to another showrunner")
-    _ = move_parser.add_argument("target", help="<showrunner slug>/<unit>")
-    _ = move_parser.add_argument("destination", nargs="?", help="new showrunner slug")
+    _ = move_parser.add_argument("target", help="<showrunner production_name>/<unit>")
+    _ = move_parser.add_argument("destination", nargs="?", help="new showrunner production_name")
     _ = move_parser.add_argument("--parent", help=argparse.SUPPRESS)
     retire_parser = verbs.add_parser("retire", help=argparse.SUPPRESS)
     _ = retire_parser.add_argument("target")
@@ -1804,11 +1804,11 @@ def _main(arguments: _Arguments) -> int:
     if arguments.verb == "move":
         if arguments.destination is not None:
             if arguments.parent is not None:
-                raise StaffRefused("move takes a showrunner slug or --parent, not both")
+                raise StaffRefused("move takes a showrunner production_name or --parent, not both")
             move_command = cast(_MoveCommand, import_module("scripts.production.staff_move").cli_move)
             return move_command(arguments.target, arguments.destination, json_output=arguments.json)
         if arguments.parent is None:
-            raise StaffRefused("move needs <showrunner slug>/<unit> <new showrunner slug>")
+            raise StaffRefused("move needs <showrunner production_name>/<unit> <new showrunner production_name>")
     if arguments.verb == "show":
         if arguments.live:
             if not arguments.json or arguments.snapshot or arguments.kind or arguments.under:

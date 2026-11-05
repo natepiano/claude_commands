@@ -72,10 +72,6 @@ REFUSED = review.Failed(REWRITE, ["plain-words"], failures=(review.RuleFailure("
                         questions=("What does the fix change for the user?",))
 
 
-def same_slug(slug: str) -> str:
-    return slug
-
-
 def flags(argv: list[str]) -> dict[str, str]:
     """Each flag of a send.py call and its value; the --value pairs go under their own keys."""
     found: dict[str, str] = {}
@@ -134,12 +130,11 @@ class RcaTests(unittest.TestCase):
         # No test runs the real push review (claude -p).
         self.verdict, self.reviewed = None, []
         _ = self.enterContext(mock.patch.object(review, "review", side_effect=self.review))
-        _ = self.enterContext(mock.patch.object(showrunners, "canonical_slug", side_effect=same_slug))
         timers = self.root / "notifiers"
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", timers))
         document = self.root / "cargo-production.md"
         _ = document.write_text("# Cargo production\n")
-        owner = recorded_showrunner("cargo-owner", document)
+        owner = recorded_showrunner("cargo-liner", document)
         _ = fake_showrunner.write_timer(timers, "cargo-liner", owner.current_session, "UTC", document)
 
         def live_socket(target: str, *, deadline: float = math.inf) -> str | None:
@@ -323,13 +318,13 @@ subprocess.run([sys.executable, '-c',
         _ = rca.open_case(HANDLER._replace(production=""), OPENED)
         stopped_doc = self.root / "stopped-production.md"
         _ = stopped_doc.write_text("# Stopped production\n")
-        stopped = recorded_showrunner("stopped-owner", stopped_doc)
+        stopped = recorded_showrunner("stopped-production", stopped_doc)
         _ = fake_showrunner.write_timer(self.root / "notifiers", "stopped-production",
                                          stopped.current_session, "UTC", stopped_doc)
         _ = rca.open_case(HANDLER._replace(session="other", production="stopped-production"), OPENED)
         doc = self.root / "cargo-production.md"
         _ = doc.write_text("# Cargo production\n")
-        owner = recorded_showrunner("cargo-owner", doc)
+        owner = recorded_showrunner("cargo-liner", doc)
         member = fixture_member("unit", name="marked", parent=owner.id,
                                  worktree=staff.PresentWorktree("natedev", self.root / "marked"))
         self.live_session("marked", member.current_session)

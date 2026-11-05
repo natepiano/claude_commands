@@ -190,7 +190,7 @@ class RefusalWatchTests(unittest.TestCase):
             if identity is None or login is not None and identity.login != login:
                 continue
             production = (owner["production"] if owner["kind"] == "showrunner" else
-                          staff_sources.unit_parent(owner["host"]["unit"]).slug if owner["host"]["kind"] == "unit" else "")
+                          staff_sources.unit_parent(owner["host"]["unit"]).name if owner["host"]["kind"] == "unit" else "")
             doc = (owner["doc"] if owner["kind"] == "showrunner" else
                    staff_sources.unit_parent(owner["host"]["unit"]).doc if owner["host"]["kind"] == "unit" else "")
             result.append(inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],

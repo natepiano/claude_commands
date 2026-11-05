@@ -26,6 +26,7 @@ from scripts.shutdown import restart, stop_resume
 from scripts.shutdown.stop_results import ClaudeStartState
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.shutdown.inventory import PausedSeat
 import herdr
 import pane_record
@@ -396,8 +397,11 @@ class StopResumeTests(unittest.TestCase):
             "HOME": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
             "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
             "CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
         })))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="agents"))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
@@ -788,7 +792,6 @@ class StopResumeTests(unittest.TestCase):
                               + f"pathlib.Path({str(log)!r}).write_text(json.dumps(sys.argv[1:]))\n")
         _ = self.enterContext(patch.object(stall_watch, "STATE_DIR", state))
         _ = self.enterContext(patch.object(stall_watch, "SEND", sender))
-        _ = self.enterContext(patch.object(showrunners, "canonical_slug", return_value="production"))
         prompt = stall_watch.PromptWait(session_id="019b3a40-4250-7000-8000-000000000102", created=0,
             key="stall-watch:prompt:production:alpha", since=0, alerted=alerted, tool="permission", retiring=False, told=60)
         stall_watch.save_prompt(stall_watch.watched_staff_unit("production", "alpha", row).prompt_path, prompt)
@@ -1508,7 +1511,7 @@ class StopResumeTests(unittest.TestCase):
                     result = stop_resume.resume("alpha", why="maintenance")
                 self.assertIsInstance(result, stop_resume.ClaudeUp)
                 self.assertEqual(self.client.prompts, [])
-                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertEqual(len(errors.getvalue().splitlines()), 1, errors.getvalue())
                 self.assertIn("prompt identity anomaly:", errors.getvalue())
                 self.detach.assert_called()
 
@@ -1660,9 +1663,9 @@ class StopResumeTests(unittest.TestCase):
     def test_non_unit_early_exit_tells_only_the_requesting_showrunner(self) -> None:
         from scripts.production import showrunners
         import quota_alert
-        # The requester's registry is independent of the resumed session's mark.
-        with (patch.object(staff, "runtime_id", return_value="019b3a40-4250-7000-8000-000000000201"),
-              patch.object(showrunners, "production_of", return_value=self.root / "requester-production.md") as lookup,
+        requester = fixture_member("showrunner", name="requester",
+            runtime_id="019b3a40-4250-7000-8000-000000000201")
+        with (patch.object(staff, "runtime_id", return_value=requester.current_session),
               patch.object(stop_resume, "_detach", wraps=self.real_detach) as detach,
               patch.object(subprocess, "run"), patch.object(subprocess, "Popen"),
               patch.object(showrunners, "tell") as tell,
@@ -1677,7 +1680,6 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(invocation[0], "stay")
             self.assertIn("--requester", arguments)
             self.assertEqual(arguments[arguments.index("--requester") + 1], "requester")
-            lookup.assert_called_once_with("019b3a40-4250-7000-8000-000000000201")
             log = self.root / "stay.log"
             self.process.return_value = sessions.SessionNotLive()
             arguments[arguments.index("--log") + 1] = str(log)

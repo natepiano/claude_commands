@@ -35,7 +35,8 @@ import style_ledger
 import style_rules
 from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import recorded_showrunner
 from ledger_test_support import style_staff_fixture, style_unit_id
 from scripts.message import send_budget
 from scripts.direct import test_verify_lint_scope as verify_fixture
@@ -156,6 +157,9 @@ class StyleSyncTests(unittest.TestCase):
             "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
         })))
         _ = self.enterContext(style_staff_fixture(self.root, self.repo))
+        owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
+        assert isinstance(owner.doc, staff.LiveDoc)
+        _ = owner.doc.path.write_text("# Ticket owners\n")
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         sender = self.root / "send.py"
         _ = sender.write_text(
@@ -167,7 +171,7 @@ class StyleSyncTests(unittest.TestCase):
         _ = address.write_text("print('session:fake-style')\n")
         _ = self.enterContext(mock.patch.object(style_sync, "SEND", sender))
         _ = self.enterContext(mock.patch.object(style_sync, "SHOWRUNNERS", address))
-        _ = self.enterContext(mock.patch.object(showrunners, "production_of", return_value=None))
+        _ = self.enterContext(mock.patch.object(showrunners, "own_name", return_value=""))
         self.lint_temp = self.root / "tmp"
         self.lint_temp.mkdir()
         _ = self.enterContext(mock.patch.object(style_sync, "LINT_TEMP_PARENT", self.lint_temp))
@@ -178,8 +182,13 @@ class StyleSyncTests(unittest.TestCase):
                               capture_output=True, text=True, check=True).stdout.strip()
 
     def production(self, branch: str = "main") -> None:
+        _ = self.git("worktree", "add", "-q", "--detach", str(self.style))
         self.doc.parent.mkdir(parents=True)
-        _ = self.doc.write_text(f"# Style\n- **Branch point:** {branch}\n")
+        _ = self.doc.write_text(f"# Style\n- **Kind:** style\n- **Branch point:** {branch}\n")
+        owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
+        assert isinstance(owner.doc, staff.LiveDoc)
+        owner.doc.path.unlink()
+        _ = recorded_showrunner(owner.name, self.doc)
 
     def notice(self, repo: Path | None = None) -> tuple[int, str]:
         output = io.StringIO()
@@ -747,7 +756,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         observed = self.root / "fallback-checkout"
         with (mock.patch.object(style_sync, "gate_owner", self.resolve_owner),
               mock.patch.object(style_sync, "standing_style_production", return_value=NoStyleProduction(self.repo, "sample-style")),
-              mock.patch.object(showrunners, "own_slug", return_value=None),
+              mock.patch.object(showrunners, "own_name", return_value=""),
               mock.patch.object(copies, "fallback_owner", return_value="configured-style")):
             code, output = self.run_lint(f"pwd -P > {observed}\n")
         self.assertEqual(code, 0, output)
@@ -1082,7 +1091,7 @@ with Path('.claude-busy').open('r+') as lock:
     def send_handoff(self, checkpoint: str) -> tuple[int, str]:
         output = io.StringIO()
         with redirect_stdout(output):
-            code = style_sync.main(["send-handoff", "--repo", str(self.repo), "--slug", "sample-style",
+            code = style_sync.main(["send-handoff", "--repo", str(self.repo), "--production", "sample-style",
                                     "--checkpoint", checkpoint])
         return code, output.getvalue()
 
@@ -1099,7 +1108,7 @@ with Path('.claude-busy').open('r+') as lock:
     def resume_handoffs(self) -> tuple[int, str]:
         output = io.StringIO()
         with redirect_stdout(output):
-            code = style_sync.main(["resume", "--repo", str(self.repo), "--slug", "sample-style",
+            code = style_sync.main(["resume", "--repo", str(self.repo), "--production", "sample-style",
                                     "--branch-point", "main", "--style-branch", "style/main"])
         return code, output.getvalue()
 
@@ -1119,7 +1128,7 @@ with Path('.claude-busy').open('r+') as lock:
             self.assertTrue(options.get("capture_output"))
             return cast(object, mock.DEFAULT)
         with mock.patch("style_sync.subprocess.run", wraps=real_run, side_effect=observe_send), redirect_stdout(output):
-            code = style_sync.main(["resume", "--repo", str(self.repo), "--slug", "sample-style",
+            code = style_sync.main(["resume", "--repo", str(self.repo), "--production", "sample-style",
                                     "--branch-point", "main", "--style-branch", "style/main"])
         self.assertEqual(code, 0)
         rows = {row[0]: row for row in self.handoff_rows()}
@@ -1207,7 +1216,7 @@ with Path('.claude-busy').open('r+') as lock:
         checkpoint = self.handoff_checkpoint()
         output = io.StringIO()
         with redirect_stdout(output):
-            code = style_sync.main(["send-handoff", "--repo", str(self.repo), "--slug", "sample-style",
+            code = style_sync.main(["send-handoff", "--repo", str(self.repo), "--production", "sample-style",
                                     "--checkpoint", checkpoint])
         self.assertEqual(code, 0, output.getvalue())
         self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
@@ -1221,7 +1230,7 @@ with Path('.claude-busy').open('r+') as lock:
         _ = (self.root / "address.py").write_text("print('')\n")
         output = io.StringIO()
         with redirect_stdout(output):
-            code = style_sync.main(["send-handoff", "--repo", str(self.repo), "--slug", "sample-style",
+            code = style_sync.main(["send-handoff", "--repo", str(self.repo), "--production", "sample-style",
                                     "--checkpoint", checkpoint])
         self.assertEqual(code, 0)
         self.assertEqual(output.getvalue().strip(), f"root: merge {checkpoint[:7]} with --root-self")
@@ -1285,7 +1294,7 @@ with Path('.claude-busy').open('r+') as lock:
         checkpoint = self.handoff_checkpoint()
         with mock.patch.object(style_ledger.Ledger, "handoff_send", side_effect=RuntimeError("interruption")):
             with self.assertRaisesRegex(RuntimeError, "interruption"):
-                _ = style_sync.main(["send-handoff", "--repo", str(self.repo), "--slug", "sample-style",
+                _ = style_sync.main(["send-handoff", "--repo", str(self.repo), "--production", "sample-style",
                                      "--checkpoint", checkpoint])
         self.assertEqual(len(self.handoff_notices()), 1)
         self.assertEqual(self.handoff_rows()[0][1], "pending")

@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Make the `~/.claude` repo tests run in every gate, faster, and with less CPU. Phase 1 fixes the gate's test list. Phases 4-6 come from the measured inventory of full gate 3 (2026-10-30).
 
-> **Production: sdlc** — unit `devtools-unit`; production doc `docs/plans/sdlc-production.md`
 
 ## Source
 
@@ -908,6 +907,39 @@ Source: sdlc 2026-11-04 11:5x (save gate time). A unit gates a tree that already
 **Workers:** `1 writer` — `item34`.
 
 **Acceptance gate:** the merge_gate and `test_merge_checkpoint*` modules pass; basedpyright `0 errors, 0 warnings, 0 notes`. Branch `sdlc-devtools-passed` off origin/sdlc 5e8bc5a52.
+
+### Phase 7u — The production name is the showrunner's staff name  · status: todo
+
+**Source:** the user, through the sdlc showrunner, 2026-11-05 [fe103398]: "the name of the showrunner is the name of the productino wherever production is used we should just use the showrunner's name. the units alrady know what is there place int he staff so the prodution header line doesn't nee to exist nor does the name of the production doc because that also comes from the staff record."
+
+**Depends on:** Phase 3y. It lands as its own hash after 3t and 3y, in the clone branch `sdlc-devtools-prodname`.
+
+#### Work Order
+
+**Goal:** A production has one name: its showrunner's staff name. A unit finds its production from its staff row. No code reads a name from a doc file name or from a plan header.
+
+**Spec:**
+1. `row.name` of the showrunner row is the production name. Delete `showrunners.owner_slug`, `production_slug`, `canonical_slug`, `former_slugs`, `rename_history`, `MemberSources.canonical_slug`, the `Formerly` field reader, the legacy branch of `timer_name` and the doc-name branches of `owner_for` and `_source`.
+2. `production_doc.read_production(name, record=None)` takes a staff name and finds the doc in the row. Delete `production_name` and `ProductionName`, which read the doc's title line. A type field `slug` that holds a production name becomes `name`.
+3. Every `--production` option takes the staff name, with type `str`. A command that takes or prints a slug takes or prints the staff name. Doc file names do not change. A doc path comes only from `row.doc`.
+4. A unit is a production unit when its staff row has a showrunner parent. Delete each reader of the plan's `Production:` header line. `add_unit` writes no such line. `/unit:direct`, `docs/production_format.md` and `docs/direct_plan_format.md` say this.
+5. Remove the `Production:` header line from each plan in this repo. Every other repo gets one command through its showrunner. No commit goes into another showrunner's worktree.
+6. A one-off program, outside the repo, moves state keyed by an old name once at deploy: notifier and state folders, ledgers, stored records and change-review Production cells. Only `tool-based-ui` to `hana` and `performance` to `fps` differ. The program is deleted after it ran on natedev and the Mac. No old-name reader stays in the code.
+7. A plan's own slug, a model slug and other names that are not a production name stay.
+
+**Files:**
+- `scripts/`
+- `commands/`
+- `docs/`
+- `config/`
+
+**Workers:** `7 writers`: core, unit lifecycle, merge, registration and reports, other folders, style, docs. A seventh job writes the one-off program.
+
+**Acceptance gate:**
+1. `git grep -E 'owner_slug|production_slug|canonical_slug|former_slugs|rename_history'` finds nothing.
+2. No code outside tests reads `-production.md` for a name, or a `Production:` plan line.
+3. With a fixture whose doc is `tool-based-ui-production.md` and whose row name is `hana`, `merge_checkpoint.py`, `add_unit.py` and `update_registration.py` take `--production hana`, and their output and files say `hana`.
+4. Every suite of the changed folders passes on the clone, then the full merge gate passes. Source net negative.
 
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 

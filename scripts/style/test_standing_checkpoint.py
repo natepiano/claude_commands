@@ -96,7 +96,7 @@ class StandingCheckpointTests(unittest.TestCase):
         with (self.repo / ".git/info/exclude").open("a") as exclude:
             _ = exclude.write("/docs/product-production.md\n")
         self.write(parent, self.production("main", self.repo))
-        self.write(self.doc, self.production("style/main", self.style) + "\n- **Branch point:** main\n")
+        self.write(self.doc, self.production("style/main", self.style) + "\n- **Kind:** style\n- **Branch point:** main\n")
         _ = recorded_showrunner("sample", parent)
         owner = recorded_showrunner("sample-style", self.doc, parent="sample")
         _ = fixture_unit_location(owner, "names-unit", self.unit)
@@ -106,8 +106,8 @@ class StandingCheckpointTests(unittest.TestCase):
         self.template = self.style / "docs/style-production/units/names-unit.md"
         header = "\n".join([
             "# Standing names", "> **Standing:** style_plan.py",
-            "> **Production: sample-style** — unit names-unit", "", "## Delegation Context", "",
-            "Read the pinned names rule and judge every ticket file.", "", "## Phases", "",
+            "", "## Delegation Context", "Read the pinned names rule and judge every ticket file.",
+            "", "## Phases", "",
         ])
         self.write(self.plan, header)
         self.write(self.template, header + "Showrunner-only template line.\n")
@@ -205,7 +205,8 @@ class StandingCheckpointTests(unittest.TestCase):
         self.assertEqual(self.open_ticket()["checkpoint"], commit)
 
     def test_code_checkpoint_stages_only_status_code_paths_and_keeps_the_template_unchanged(self) -> None:
-        self.assertEqual(self.refill().returncode, 0)
+        result = self.refill()
+        self.assertEqual(result.returncode, 0, result.stderr)
         ticket = self.open_ticket()
         path = ticket["files"][0]
         source = self.unit / path
@@ -235,7 +236,8 @@ class StandingCheckpointTests(unittest.TestCase):
         self.assertEqual(self.template.read_bytes(), self.template_before)
 
     def close_without_code(self, verdict: str) -> None:
-        self.assertEqual(self.refill().returncode, 0)
+        result = self.refill()
+        self.assertEqual(result.returncode, 0, result.stderr)
         ticket = self.open_ticket()
         head = self.git(self.unit, "rev-parse", "HEAD")
         count = self.git(self.unit, "rev-list", "--count", "HEAD")
@@ -275,7 +277,8 @@ class StandingCheckpointTests(unittest.TestCase):
         self.close_without_code("held")
 
     def test_uncommitted_literal_change_fails_the_ticket_gate_at_its_unchanged_base(self) -> None:
-        self.assertEqual(self.refill().returncode, 0)
+        result = self.refill()
+        self.assertEqual(result.returncode, 0, result.stderr)
         ticket = self.open_ticket()
         self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), ticket["base"])
         path = self.unit / ticket["files"][0]

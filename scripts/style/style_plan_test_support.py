@@ -224,7 +224,7 @@ class StylePlanFixture(unittest.TestCase):
     def production(self, branch: str, checkout: Path, _parent: str) -> str:
         return "\n".join([
             "# Production", f"- **Merge branch:** {branch}", f"- **Showrunner checkout:** {checkout}",
-            "- **Log:** docs/log.md", "- **Branch point:** main", "",
+            "- **Log:** docs/log.md", "- **Branch point:** main", "- **Kind:** style", "",
         ])
 
     def unit_plan_config(self, worktree: Path, plan_name: str) -> None:
@@ -239,7 +239,7 @@ class StylePlanFixture(unittest.TestCase):
 
     def plan_header(self) -> str:
         return "\n".join([
-            "# Standing names", f"> **Production: sample-style** — unit `names-unit`; production doc `{self.doc}`",
+            "# Standing names",
             "> **Standing:** style_plan.py", "", "## Delegation Context", "",
             "- **Project:** sample", "- **Test:** verify.sh test <package>", "", "## Phases", "",
         ])

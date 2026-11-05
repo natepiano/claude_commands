@@ -145,7 +145,7 @@ class CiPointsTests(unittest.TestCase):
         self.stub_state.mkdir()
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        self.doc = self.root / "example-production.md"
+        self.doc = self.root / "tool-based-ui-production.md"
         self.log = self.checkout / "production.log"
         for name in ("review_regime.py", "gh", "claude",
                      "systemd-run", "ssh", "nix", "cargo-berth"):
@@ -179,6 +179,11 @@ class CiPointsTests(unittest.TestCase):
             _ = excluded.write("production.log\n")
         self.write(self.log, "# Production log — example\n\n### STATE\n")
         self.production_doc()
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+        from scripts.production import staff
+        self.env["STAFF_FILE"] = str(self.root / "staff.json")
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            _ = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
         _ = self.git("push", "-u", "origin", "production")
         self.ci_result(self.git("rev-parse", "HEAD"))
 
@@ -208,7 +213,7 @@ class CiPointsTests(unittest.TestCase):
         )))
 
     def run_ci(self, *args: str) -> subprocess.CompletedProcess[str]:
-        arguments = [*args, "--production", str(self.doc)]
+        arguments = [*args, "--production", "example"]
         return invoke_cli(ci_points, ci_points.main, arguments, self.env, self.checkout)
 
     def calls(self, name: str) -> list[list[str]]:
@@ -457,7 +462,7 @@ PY
         self.fixed_commit_validation(fix_commit=True)
         with merge_lock(self.checkout, "example"):
             process = subprocess.Popen(
-                [sys.executable, str(SCRIPT), "ci", "start", "--production", str(self.doc),
+                [sys.executable, str(SCRIPT), "ci", "start", "--production", "example",
                  "--state-dir", str(self.state)],
                 cwd=self.checkout, env=self.env, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True,
@@ -869,14 +874,14 @@ PY
         flag, value = collected.stdout.splitlines()[-1].split()
         self.assertEqual((flag, value), ("--ci-green", tip))
         promoted = subprocess.run([sys.executable, str(LIFECYCLE), "promote-main", "--production",
-                                   str(self.doc), flag, value, "--smoke-passed", tip],
+                                   "example", flag, value, "--smoke-passed", tip],
                                   cwd=self.checkout, env=self.env, capture_output=True,
                                   text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
         self.assertIn("ci: ok", promoted.stdout)
         _ = self.merge(2)
         held = subprocess.run([sys.executable, str(LIFECYCLE), "promote-main", "--production",
-                               str(self.doc), flag, value, "--smoke-passed", tip],
+                               "example", flag, value, "--smoke-passed", tip],
                               cwd=self.checkout, env=self.env, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(held.returncode, 2, held.stdout + held.stderr)
@@ -928,7 +933,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                     try:
                         processes.append(subprocess.Popen(
                             [sys.executable, "-c", program, str(write_ready), str(SCRIPT),
-                             "watch", "--production", str(self.doc), "--state-dir", str(self.state)],
+                             "watch", "--production", "example", "--state-dir", str(self.state)],
                             cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                         ))

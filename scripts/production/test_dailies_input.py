@@ -44,7 +44,7 @@ class RowDailiesTests(StaffTestCase):
                     "live-writer", unit.current_session, "", os.getpid()), HerdrPlace("writer", "w1:p1"),
                     identity=unit_lookup.LiveSession(unit.current_session))
                 with mock.patch.object(unit_lookup, "labeled_sessions", return_value={label: live}):
-                    units = dailies_input.report_units(fixture.doc, fixture.slug, staff.snapshot())
+                    units = dailies_input.report_units(fixture.doc, fixture.name, staff.snapshot())
                 self.assertEqual([(item.name, item.session) for item in units], [("writer-unit", "live-writer")])
                 self.assertEqual(self.staff_file.read_bytes(), before)
 
@@ -53,20 +53,20 @@ class RowDailiesTests(StaffTestCase):
         runs = unit_lookup.RunStates({str(fixture.worktree): unit_lookup.RunRecord(
             self.root / "finished-run.jsonl", UnitState.RUN_FINISHED)})
         with mock.patch.object(unit_lookup, "read_run_states", return_value=runs):
-            units = dailies_input.report_units(fixture.doc, fixture.slug, staff.snapshot())
+            units = dailies_input.report_units(fixture.doc, fixture.name, staff.snapshot())
         self.assertEqual([(unit.name, unit.run) for unit in units], [("member-unit", UnitState.RUN_FINISHED)])
 
 
 class DailiesInputTests(DailiesInputFixture):
     @override
-    def timer(self, slug: str) -> None:
-        super().timer(slug)
-        doc = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+    def timer(self, name: str) -> None:
+        super().timer(name)
+        doc = self.doc if name == "example" else self.root / f"{name}-production.md"
         if doc != self.doc:
             write_text_atomic(doc, self.doc.read_text())
-        row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
+        row = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == name)
         _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
-        conf = self.root / "notifier-state" / f"showrunner-{slug}" / "conf"
+        conf = self.root / "notifier-state" / f"showrunner-{row.id}" / "conf"
         write_text_atomic(conf, f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
 
     def test_fixed_judgment_id_survives_clear_and_unit_rename(self) -> None:
@@ -907,7 +907,7 @@ class DailiesInputTests(DailiesInputFixture):
     def test_user_run_restarts_notifier_once_and_logs_next_due(self) -> None:
         result = self.run_builder("--user-run")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.notifier_events(), [["restart", "showrunner-example"]])
+        self.assertEqual(self.notifier_events(), [["restart", f"showrunner-{self.production_id('example')}"]])
         self.assertEqual(self.report()["next_run"], "17:55")
         self.assertIn("next_due=", (self.checkout / "production.log").read_text(encoding="utf-8"))
 
@@ -946,7 +946,7 @@ class DailiesInputTests(DailiesInputFixture):
     def test_scheduled_run_reads_notifier_status_without_restart(self) -> None:
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.notifier_events(), [["status", "showrunner-example"]])
+        self.assertEqual(self.notifier_events(), [["status", f"showrunner-{self.production_id('example')}"]])
         self.assertEqual(self.report()["next_run"], "17:55")
 
     def test_each_completed_step_reports_once_before_input(self) -> None:
@@ -1064,7 +1064,7 @@ class DailiesInputTests(DailiesInputFixture):
                 self.assertLess(result.stdout.index("review watch: ok"), result.stdout.index("bevy upgrade: ok"))
                 self.assertLess(result.stdout.index("bevy upgrade: ok"), result.stdout.index("merge branch: ok"))
                 args = cast(list[str], json.loads((self.root / "bevy-events.json").read_text()))
-                self.assertEqual(args, ["--production", str(self.doc), "line", "--json"])
+                self.assertEqual(args, ["--production", "example", "line", "--json"])
 
     def test_bevy_upgrade_empty_output_adds_no_topic(self) -> None:
         result = self.run_builder()
@@ -1158,8 +1158,8 @@ class DailiesInputTests(DailiesInputFixture):
             ("record locked\nmore detail", "record locked"),
             (b"record locked\nmore detail", "record locked"),
         )
-        production = read_production(self.doc)
-        command = [sys.executable, self.env["DAILIES_BEVY_UPGRADE"], "--production", str(self.doc), "line", "--json"]
+        production = read_production("example")
+        command = [sys.executable, self.env["DAILIES_BEVY_UPGRADE"], "--production", "example", "line", "--json"]
         for stderr, reason in cases:
             with self.subTest(stderr=stderr), mock.patch.dict(os.environ, self.env), mock.patch(
                 "dailies_input.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 30, stderr=stderr),
@@ -1216,7 +1216,7 @@ class DailiesInputTests(DailiesInputFixture):
     def test_failed_restart_leaves_output_untouched(self) -> None:
         _ = self.notifier_failure.touch()
         _ = self.assert_refused_without_output("--user-run", mention="failed")
-        self.assertEqual(self.notifier_events(), [["restart", "showrunner-example"]])
+        self.assertEqual(self.notifier_events(), [["restart", f"showrunner-{self.production_id('example')}"]])
 
     def test_stale_eta_keeps_time_and_requests_once_for_phase(self) -> None:
         first = self.run_builder()
@@ -1514,7 +1514,7 @@ class DailiesInputTests(DailiesInputFixture):
             "DAILIES_RACE_WAITING": str(WAITING),
             "DAILIES_RACE_UNIT": BETA,
             "DAILIES_RACE_PHASE": beta_phase,
-            "DAILIES_RACE_PRODUCTION": str(self.doc),
+            "DAILIES_RACE_PRODUCTION": "example",
             "DAILIES_RACE_STATE": str(self.state),
         })
 
@@ -1636,7 +1636,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.judgment_file(alpha={"eta": {"percent": 60, "why": "the unit found another panel repair"}})
         accepted = self.run_builder("--user-run", "--render-state", str(render_state))
         self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
-        self.assertEqual(self.notifier_events(), [["restart", "showrunner-example"]])
+        self.assertEqual(self.notifier_events(), [["restart", f"showrunner-{self.production_id('example')}"]])
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["why"],
                          "the unit found another panel repair")
 

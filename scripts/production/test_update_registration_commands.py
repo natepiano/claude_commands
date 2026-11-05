@@ -33,7 +33,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
     runpy.run_path(script, run_name='__main__')
 """
         result = subprocess.run(
-            [sys.executable, "-c", harness, str(SCRIPT), "register", "--production", str(self.doc)],
+            [sys.executable, "-c", harness, str(SCRIPT), "register", "--production", "example"],
             cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
         )
 

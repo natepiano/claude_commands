@@ -183,7 +183,7 @@ Next skips a change without saving an answer.
 The page keeps the current row if the user selects Next or another tab during the save.
 
 The record's `Kind` column remains the only source for the kind.
-Set it with `change_review.py set-kind --production DOC --row C27 --kind 'See in action'`.
+Set it with `change_review.py set-kind --production <showrunner name> --row C27 --kind 'See in action'`.
 Use **See in action** for a change to something the user runs or sees.
 Use **Read only** for other changes.
 Both kinds appear.
@@ -229,7 +229,7 @@ An open question survives page loads and server restarts.
 A failed HTTP save keeps the row waiting with its typed question and answer form.
 A direct link shows the open question without verdict buttons.
 
-The showrunner answers with `scripts/review_links/change_page.py answer-question --production <doc> --list <list> --row C<n> --question <id> --text "<answer>"`.
+The showrunner answers with `scripts/review_links/change_page.py answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<answer>"`.
 The command refuses a row without an open question.
 The command refuses an old or unknown question ID.
 The same ID and answer text change nothing and exit 0 on a rerun.
@@ -258,13 +258,13 @@ Path fields, command fields, and non-ASCII tokens also receive 4xx.
 
 Older selected-row links still work with their existing plain HTML forms and 303 responses.
 Their `.review-link-changes.json` manifest keeps its immutable row allowlist.
-The selected-row publisher still accepts `--production DOC [--list LIST] C27`.
+The selected-row publisher still accepts `--production <showrunner name> [--list LIST] C27`.
 It requires a valid kind, description, and proof for each selected row.
 The normal command uses the all-list page instead.
 
 The server accepts writes only when its bound address equals the current `tailscale ip -4` address.
 A different bind or a failed address lookup refuses the write.
-The server resolves each row's Production slug across the root production's complete hierarchy.
+The server resolves each row's Production staff name across the root production's complete hierarchy.
 A child page can therefore answer sibling rows on the shared root list.
 An unknown production is refused before the verdict saves.
 
@@ -355,7 +355,7 @@ Recovery preserves attempts that a live request owns.
 Recovery scans each review list once and finds each record through `change_routing.delivery_path`.
 It ignores the `page` field in legacy records.
 The browser and recovery use `StaffRouting.owner_and_production` for the same owner and production document.
-The `Production:` line names that document in live and recovered messages.
+The `Production:` line names the showrunner in live and recovered messages.
 It never delivers a verdict without a saved verdict in the review list.
 Legacy failed records decode as nothing to deliver; they produce no send or page controls.
 A legacy failed validation keeps validation ownership without a message attempt.

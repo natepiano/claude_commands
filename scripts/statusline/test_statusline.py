@@ -582,9 +582,9 @@ class RoleTests(unittest.TestCase):
         unit = replace(UNIT, name="geometry-material", worktree=staff.PresentWorktree(machine, Path(folder)))
         other = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "showrunner", "other", staff.StaffRoot(), current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
         duplicate = replace(unit, id=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), parent=staff.ReportsTo(other.id))
-        source = showrunners.ShowrunnerSource(showrunners.Timer("different-slug", "session:runner-id", doc, "UTC"), "")
-        sources = {source.timer.slug: source}
-        instance = self.home / ".local/state/notifier/showrunner-different-slug"
+        source = showrunners.ShowrunnerSource(showrunners.Timer("different-name", "session:runner-id", doc, "UTC"), "")
+        sources = {source.timer.name: source}
+        instance = self.home / ".local/state/notifier/showrunner-different-name"
         instance.mkdir(parents=True)
         _ = doc.write_text("# Production\n")
         _ = (instance / "conf").write_text(
@@ -616,7 +616,7 @@ class RoleTests(unittest.TestCase):
                 path = self.write_staff(*rows)
                 # Exercise the schema emitted by staff's current writer.
                 _ = path.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
-                reader = session_labels.StaffLabels(staff.StaffSnapshot(rows), sources, {source.timer.slug: runner})
+                reader = session_labels.StaffLabels(staff.StaffSnapshot(rows), sources, {source.timer.name: runner})
                 resolved = reader.environment(environment, session_id)
                 row = reader.record.by_id(staff.StaffId(resolved.get("CLAUDE_CODE_SESSION_ID", "")))
                 self.assertEqual(row.id if row is not None else "", expected)

@@ -41,7 +41,7 @@ schedule runs: the builder touches no clock, the report names no next run,
 and step 2 below does nothing. Two steps do that:
 
 1. **Check every unit.** Save the status script's complete output before Gather:
-   `zsh ~/.claude/scripts/production/unit_status.sh <STATE_DIR>/unit_status <ZONE> --production PRODUCTION_DOC > <scratchpad>/unit_status.txt`.
+   `zsh ~/.claude/scripts/production/unit_status.sh <STATE_DIR>/unit_status <ZONE> --production <showrunner name> > <scratchpad>/unit_status.txt`.
    The input builder reads that file and prints `flags first:` for SESSION GONE,
    CLAUDE NOT RUNNING, FORM WAITING, a usage limit, and a DECISION. Put these
    first in the report.
@@ -81,7 +81,7 @@ Read the current state, not memory, and check what you state the way
    you and its footer. Supply the phase, started time, current update, and ETA
    numbers from the unit's plan and reports. Text after `❯` may be a prompt
    suggestion, not the user's draft:
-   `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <showrunner name> <unit> --ansi`
    shows a suggestion dimmed (`\e[2m`) on both hosts.
 4. **Merge branch.** The input builder reads the last merge and whether the
    branch is pushed. Supply anything held or testing in the judgment file.
@@ -122,7 +122,7 @@ carries the topic with that reason.
 
 ```sh
 python3 ~/.claude/scripts/production/dailies_input.py \
-  --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
+  --production <showrunner name> --status <scratchpad>/unit_status.txt \
   --judgment <STATE_DIR>/dailies_judgment.json --state-dir <STATE_DIR>/dailies_input_state \
   --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
   --render-state <STATE_DIR>/dailies_state.json [--user-run] [--expand <child|all>]
@@ -139,7 +139,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 - `--log` appends the `dailies ETAs:` line to `LOG`, so the next report can
   compare. Write no such line by hand.
 - Every builder run also saves
-  `~/.local/state/showrunner/<slug>/dailies_last.json`: this report's chart
+  `~/.local/state/showrunner/<staff id>/dailies_last.json`: this report's chart
   rows, its count of units and of units with a checkpoint not merged, and when
   it was written. The showrunner above yours draws your row from it. It prints
   `saved report: ok`; `saved report: unavailable` costs only that row, never
@@ -324,7 +324,7 @@ unless it names another plan's document. User, 2026-10-02.
   the build-holder files, the Mac block file, `OUTSTANDING` and whether any
   subject has `needed:`. A due item below this production also keeps it from
   saying `nothing needed`, and the two tree bullets (`reports to <root>`,
-  `<slug>: needs-user list unreadable`) appear there. No reply carries this
+  `<showrunner name>: needs-user list unreadable`) appear there. No reply carries this
   footer and no `Waiting on:` block follows it (user, 2026-10-18).
 
 ## Length

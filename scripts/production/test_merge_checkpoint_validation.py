@@ -108,7 +108,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn("a plain commit, not a merge: a merge may carry only `Change-Review: none` lines", result.process.stdout)
         self.assertIn(change_review.COVERS, result.process.stdout)
     def test_a_merge_adds_a_row_per_visible_change_to_the_named_list(self) -> None:
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         _ = review.write_text("## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                               + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n", encoding="utf-8")
         self.production_doc(change_review=review)
@@ -189,7 +189,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             with mock.patch("merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
                 return original_notify(checkout, branch, tip)
 
-        arguments = [str(SCRIPT), "--production", str(self.doc), "alpha-unit", "2", sha,
+        arguments = [str(SCRIPT), "--production", "example", "alpha-unit", "2", sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
                      "--review-trial", TRIAL, "--delivers", DELIVERS, "--parallel", PARALLEL]
         output = StringIO()

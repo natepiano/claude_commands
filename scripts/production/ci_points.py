@@ -155,7 +155,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     checkpoint = (f"{last_code.unit} phase {last_code.phase}" if isinstance(last_code, MergeEntry)
                   else "production wrap")
     state_dir.mkdir(parents=True, exist_ok=True)
-    with copies.standing(production.slug, production.checkout, tip) as checkout:
+    with copies.standing(production.name, production.checkout, tip) as checkout:
         source_url = required(git(checkout, "config", "--local", "--get", "remote.origin.url"), "ci start")
         settings = [(f"url.{push_origin}.pushInsteadOf", source_url)]
         for key in ("user.name", "user.email"):
@@ -170,7 +170,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
             configuration.extend((f"GIT_CONFIG_KEY_{index}={key}", f"GIT_CONFIG_VALUE_{index}={value}"))
         argv = ("env", *configuration, f"CARGO_TARGET_DIR={checkout / 'target'}", "bash", str(script.resolve()),
                 "--validate-only", "--fix-commit",
-                f"ci({production.slug}): validation fixes after {checkpoint}")
+                f"ci({production.name}): validation fixes after {checkpoint}")
         validation_log = state_dir.resolve() / "ci_validation.log"
         try:
             with validation_log.open("w", encoding="utf-8") as output:
@@ -190,7 +190,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         push = ("env", f"PUSH_TARGET_BRANCH={production.merge_branch}", f"CI_VALIDATED_BASE={tip}",
                 f"CANCEL_PRIOR={str(cancel_prior).lower()}", "bash",
                 str(script.resolve().with_name("push_direct.sh")))
-        with merge_lock(production.checkout, production.slug):
+        with merge_lock(production.checkout, production.name):
             _ = required(git(production.checkout, "fetch", "--no-tags", str(checkout), validated), "validation")
             if validated != tip:
                 current_branch = required(git(production.checkout, "branch", "--show-current"), "validation")
@@ -298,7 +298,7 @@ def main() -> int:
     collect_parser = ci_commands.add_parser("collect")
     watch_parser = commands.add_parser("watch")
     for subparser in (due_parser, start_parser, collect_parser, watch_parser):
-        _ = subparser.add_argument("--production", required=True, type=Path)
+        _ = subparser.add_argument("--production", required=True)
     for subparser in (due_parser, start_parser, collect_parser, watch_parser):
         _ = subparser.add_argument("--state-dir", required=True, type=Path)
     for subparser in (due_parser, start_parser, collect_parser):
@@ -307,7 +307,7 @@ def main() -> int:
     action = cast(str, args.action)
     step = action + (f" {cast(str, args.ci_action)}" if action == "ci" else "")
     try:
-        production = read_production(cast(Path, args.production))
+        production = read_production(cast(str, args.production))
         if action == "due":
             state = due(production, cast(Path, args.state_dir), cast(bool, args.no_ci))
             if isinstance(state, CiNotUsed):

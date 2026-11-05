@@ -152,7 +152,7 @@ def thread_usage(db: sqlite3.Connection, start: datetime, end: datetime) -> list
 
 @dataclass(frozen=True)
 class Showrunner:
-    slug: str
+    name: str
     # `uds:<socket>`, or empty while the showrunner is not running.
     address: str
     units: tuple[UnitWorktree, ...]
@@ -183,7 +183,7 @@ def registered_showrunners(*, resolver: session_staff.RowResolver | None = None)
         runners = unit_labels.registered_showrunners(diagnostics, membership=record, resolver=resolver)
         for warning in diagnostics.warnings:
             print(f"warning: {warning}", file=sys.stderr)
-        found = tuple(Showrunner(runner["slug"], f"uds:{runner['socket']}" if runner["socket"] else "",
+        found = tuple(Showrunner(runner["name"], f"uds:{runner['socket']}" if runner["socket"] else "",
                                 usage_report.document_units(Path(runner["doc"]), resolver=resolver))
                       for runner in runners)
         if problems:
@@ -374,7 +374,7 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
         elif runner is None:
             reason = f"no registered showrunner lists unit {usage.unit}"
         elif not runner.address:
-            reason = f"showrunner {runner.slug} is not running"
+            reason = f"showrunner {runner.name} is not running"
         else:
             reason = ""
         if printing:
@@ -386,7 +386,7 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
         else:
             sent = send(runner.address, text)
             if isinstance(sent, NotSent):
-                print(f"waste_watch: could not tell {runner.slug}: {sent.reason}; alert for the journal:\n{text}")
+                print(f"waste_watch: could not tell {runner.name}: {sent.reason}; alert for the journal:\n{text}")
                 continue
         alerts[usage.unit] = moment.isoformat()
         changed = True

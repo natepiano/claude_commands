@@ -206,7 +206,8 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 `~/.local/state/unit-workers/<production>/<unit>.json` (`UNIT_WORKERS_STATE`
 selects a private root). On first ledger binding, a production unit's run
 saves explicit production and unit fields in `progress_history_state.json`.
-Plan headers accept both Production forms and resolve former production names.
+The unit staff row selects its parent showrunner.
+The parent row's `name` and `doc.path` give the production name and document.
 Later reads use the saved identity, so moving a worktree does not change owners.
 `rename_unit.py` changes the unit row and repairs its session and display names.
 An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
@@ -331,7 +332,7 @@ Phase-bound `open` and `adopt` use the resolved design checkout when `--checkout
 
 Role IDs are `<design_id>/designer` and `<design_id>/reviewer`. Instance names are `<production>-<area>-astra-designer` / `-astra-reviewer`; an adopted role keeps its old mesh name.
 
-**Types.** Frozen dataclasses, tagged by `kind` at the JSON boundary (`../type_design.md`): `UnitHolder(production_slug, unit_name)` | `ShowrunnerHolder(production_slug)`; `DesignUnbound` | `DesignBoundToPhase(run_directory, phase, repository, output_paths)`; `PhaseBoundDesigner(binding_generation, launch_sandbox)` | `ReadOnlyReviewer` (`ThreadAccessPolicy`); `RoleNotOpened(claim)` | `RoleOpen(thread_id)` | `RolePausedForMove(thread_id)` | `RoleNeedsRecovery(thread_id, reason)` | `RoleEnded(thread_id)`; `DesignPlacement(design_id, host, generation)`; `RoleInstance`, `HeldDesign`, `PendingMessage`, `HolderReach(session_id)` | `HolderUnavailable(reason)`. Refusals raise `RoleRefused(ValueError)`.
+**Types.** Frozen dataclasses, tagged by `kind` at the JSON boundary (`../type_design.md`): `DesignUnbound` | `DesignBoundToPhase(run_directory, phase, repository, output_paths)`; `PhaseBoundDesigner(binding_generation, launch_sandbox)` | `ReadOnlyReviewer` (`ThreadAccessPolicy`); `RoleNotOpened(claim)` | `RoleOpen(thread_id)` | `RolePausedForMove(thread_id)` | `RoleNeedsRecovery(thread_id, reason)` | `RoleEnded(thread_id)`; `DesignPlacement(design_id, host, generation)`; `RoleInstance`, `HeldDesign`, `PendingMessage`, `HolderReach(session_id)` | `HolderUnavailable(reason)`. Refusals raise `RoleRefused(ValueError)`.
 
 **CLI** (exit 2 and one `roles:` stderr line on any refusal):
 

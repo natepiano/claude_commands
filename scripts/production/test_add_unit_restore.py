@@ -25,7 +25,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
     def test_a_name_ending_in_unit_launches_as_the_name_without_it(self) -> None:
         def request(name: str) -> tuple[str, str, Path, str]:
             launched = add_unit.launch_request(argparse.Namespace(
-                production=str(self.doc), name=name, plan="docs/plans/given.md", brief=None,
+                production=self.production_name, name=name, plan="docs/plans/given.md", brief=None,
                 standby=False, permanent=False, port=None, timeout=90.0, check=False,
                 resume=None, cwd=None, restart_note=None, session_name=None, host_session=None, probe=False,
             ))

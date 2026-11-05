@@ -194,7 +194,7 @@ def migrate(*, stop_after: int = 0) -> int:
                         raise staff.StaffRefused(f"{identity}: ownership evidence became unavailable")
                     timer = showrunners.timer_for(owner, current, sources=sources.productions.values())
                     if isinstance(timer, showrunners.Timer):
-                        conf = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{timer.slug}" / "conf"
+                        conf = showrunners.NOTIFIER_STATE_DIR / showrunners.timer_name(timer.name, record) / "conf"
                         content = conf.read_text()
                         old_prompt = root / reference / "prompt.txt"
                         new_prompt = root / identity / "prompt.txt"

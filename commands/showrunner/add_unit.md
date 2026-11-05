@@ -13,7 +13,7 @@ nightly review).
 Run:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_unit.py" --production <PRODUCTION_DOC> <arguments>
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_unit.py" --production <showrunner name> <arguments>
 ```
 
 Show the script's output. If it exits nonzero, show its message and stop.

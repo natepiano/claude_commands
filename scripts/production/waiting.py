@@ -148,7 +148,7 @@ def units_from_doc(production: Production) -> tuple[Unit, ...]:
     try:
         record = staff.snapshot()
         rows = unit_lookup.doc_units(production.doc, record)
-        marked = unit_lookup.labeled_sessions(production.slug, record=record)
+        marked = unit_lookup.labeled_sessions(production.name, record=record)
     except (OSError, staff.StaffRefused) as error:
         raise WaitingFailure("production", f"the unit sessions could not be looked up: {error}") from error
     resolver = session_staff.RowResolver(record)
@@ -272,7 +272,7 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     log = state_dir / f"scratch-test-{unit.name}-{stamp}.log"
     passed = False
     try:
-        with copies.standing(production.slug, production.checkout, unit.branch,
+        with copies.standing(production.name, production.checkout, unit.branch,
                              merge=production.merge_branch) as worktree:
             try:
                 with log.open("w", encoding="utf-8") as output:
@@ -544,7 +544,7 @@ def main() -> int:
     commands = parser.add_subparsers(dest="step", required=True)
     for name in ("scratch-test", "waits", "search", "agenda", "eta-request"):
         sub = commands.add_parser(name)
-        _ = sub.add_argument("--production", required=True, type=Path)
+        _ = sub.add_argument("--production", required=True)
         if name in ("scratch-test", "agenda", "eta-request"):
             _ = sub.add_argument("--state-dir", required=True, type=Path)
         if name == "scratch-test":
@@ -559,7 +559,7 @@ def main() -> int:
     args = parser.parse_args()
     step = cast(str, args.step)
     try:
-        production = read_production(cast(Path, args.production))
+        production = read_production(cast(str, args.production))
         if step == "scratch-test":
             scratch_test(production, cast(str, args.unit), cast(str, args.tests), cast(Path, args.state_dir))
         elif step == "waits":

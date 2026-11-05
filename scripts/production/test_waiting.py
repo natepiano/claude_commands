@@ -158,7 +158,7 @@ class WaitingTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
         self.host_pids = {}
         fake_unit_host.write(os.environ, [
-            labeled_host(unit, f"w{index}:p1", unit, slug="showrunner-example")
+            labeled_host(unit, f"w{index}:p1", unit, production_name="showrunner-example")
             for index, unit in enumerate((ALPHA, BETA), start=1)])
         for index, unit in enumerate((ALPHA, BETA), start=1):
             self.claude(unit, f"w{index}:p1")
@@ -264,7 +264,7 @@ class WaitingTests(unittest.TestCase):
 
         owner = showrunner_relationship("showrunner-example")
         _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.doc))
-        _ = write_timer(self.root / "notifier", "example", owner.id, "", self.doc)
+        _ = write_timer(self.root / "notifier", owner.name, owner.id, "", self.doc)
         for unit, folder, plan in ((ALPHA, self.alpha, "alpha"), (BETA, self.beta, "beta")):
             row = unit_membership("showrunner-example", unit)
             _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder), expected=row.worktree)
@@ -276,7 +276,7 @@ class WaitingTests(unittest.TestCase):
         self.claude(session, "w1:p1")
 
     def run_waiting(self, action: str, *args: str) -> subprocess.CompletedProcess[str]:
-        arguments = [action, *args, "--production", str(self.doc)]
+        arguments = [action, *args, "--production", "showrunner-example"]
         return invoke_cli(waiting, waiting.main, arguments, self.env, self.checkout, production_state=True)
 
 
@@ -308,7 +308,7 @@ class WaitingTests(unittest.TestCase):
     def test_named_unit_refuses_retired_row(self) -> None:
         _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
                                staff.RemovedWorktree(local_machine(), self.alpha), expected=unit_membership("showrunner-example", ALPHA).worktree)
-        production = production_doc.read_production(self.doc)
+        production = production_doc.read_production("showrunner-example")
         with self.assertRaisesRegex(waiting.WaitingFailure, f"unknown unit {ALPHA}"):
             _ = waiting.named_unit(production, ALPHA)
 
@@ -325,7 +325,7 @@ class WaitingTests(unittest.TestCase):
         return path
 
     def producer_launch_line(self, moment: datetime, *, session: str = ALPHA) -> str:
-        production = production_doc.read_production(self.doc)
+        production = production_doc.read_production("showrunner-example")
         producer_log = self.root / "launch-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         request = add_unit.UnitLaunch(
@@ -345,7 +345,7 @@ class WaitingTests(unittest.TestCase):
 
     def producer_merge_line(self, moment: datetime, unit_tip: str, merge_tip: str,
                             phase: str = "1") -> str:
-        production = production_doc.read_production(self.doc)
+        production = production_doc.read_production("showrunner-example")
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
@@ -362,7 +362,7 @@ class WaitingTests(unittest.TestCase):
         return f"- {moment:%H:%M %Z}: {produced}"
 
     def producer_state_block(self, moment: datetime, phases: dict[str, str]) -> str:
-        production = production_doc.read_production(self.doc)
+        production = production_doc.read_production("showrunner-example")
         judgments = tuple(update_registration.UnitJudgment(
                               unit_membership("showrunner-example", session).id, phase, "none")
                           for session, phase in phases.items())
@@ -668,7 +668,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
     def eta_request_process(self, phase: str) -> subprocess.Popen[str]:
         return subprocess.Popen(
             [sys.executable, str(SCRIPT), "eta-request", ALPHA, "--phase", phase,
-             "--production", str(self.doc), "--state-dir", str(self.state)],
+             "--production", "showrunner-example", "--state-dir", str(self.state)],
             cwd=self.checkout, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
@@ -720,7 +720,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                 process = subprocess.Popen(
                     [sys.executable, "-c", program, str(write_ready), str(SCRIPT),
                      "eta-request", ALPHA, "--phase", PHASE,
-                     "--production", str(self.doc), "--state-dir", str(self.state)],
+                     "--production", "showrunner-example", "--state-dir", str(self.state)],
                     cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
@@ -761,7 +761,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
         with mock.patch.dict(os.environ, self.env), \
              mock.patch.object(waiting, "datetime", clock), \
-             mock.patch.object(sys, "argv", [str(SCRIPT), "waits", "--production", str(self.doc)]), \
+             mock.patch.object(sys, "argv", [str(SCRIPT), "waits", "--production", "showrunner-example"]), \
              redirect_stdout(output):
             code = waiting.main()
         self.assertEqual(code, 0, output.getvalue())
@@ -961,7 +961,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
         output = io.StringIO()
         with mock.patch.object(waiting, "datetime", AgendaClock), redirect_stdout(output):
-            waiting.agenda(production_doc.read_production(self.doc), self.state)
+            waiting.agenda(production_doc.read_production("showrunner-example"), self.state)
         self.assertIn("agenda: ok — 0 new items", output.getvalue())
         self.assertFalse((self.state / "agenda_seen.json").exists())
 
@@ -992,7 +992,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         output = io.StringIO()
         clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
         with mock.patch.dict(os.environ, self.env), mock.patch.object(waiting, "datetime", clock), redirect_stdout(output):
-            waiting.waits(production_doc.read_production(self.doc))
+            waiting.waits(production_doc.read_production("showrunner-example"))
         found = re.search(r"open (\d+) minutes", output.getvalue())
         self.assertIsNotNone(found, output.getvalue())
         age = int(found.group(1)) if found else 0

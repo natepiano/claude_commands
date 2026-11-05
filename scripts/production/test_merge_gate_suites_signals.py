@@ -108,7 +108,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
                     [*self.gate_command(), "--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
                      "--unit", "fixture", "--phase", "repair",
-                     "--production", str(self.quiet_production), "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
+                     "--production", "quiet", "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
                     wait_until(lambda: (self.state / "module-held").exists() or process.poll() is not None,
@@ -147,7 +147,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
             [*self.gate_command(), "--repo", str(self.checkout), "--merge-branch", "integration",
              "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
              "--unit", "fixture", "--phase", "repair",
-             "--production", str(self.quiet_production)],
+             "--production", "quiet"],
             env=self.environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         hook_pid = 0
         try:

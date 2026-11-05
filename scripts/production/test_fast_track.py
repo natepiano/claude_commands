@@ -242,6 +242,8 @@ sys.exit(result.returncode)
 
 @final
 class FastTrackTests(MergeCheckpointFixture):
+    production_name: str = "example"
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.config: Path = Path()
@@ -338,7 +340,7 @@ class FastTrackTests(MergeCheckpointFixture):
             return invoke_cli(fast_track, lambda: fast_track.main(args), args, self.env, self.unit)
 
     def fast_track(self, *paths: str) -> subprocess.CompletedProcess[str]:
-        return self.command("--unit", "alpha-unit", "--production", str(self.doc),
+        return self.command("--unit", "alpha-unit", "--production", self.production_name,
                             "--why", "repair the sample", *(paths or ("scripts/sample/item.py",)))
 
     def change_module(self) -> None:
@@ -659,7 +661,7 @@ signal.pause()
         environment = {**self.env, "FAST_TRACK_PAUSE_COMMIT": str(ready),
                        "FAST_TRACK_COMMIT_RELEASE": str(release)}
         with subprocess.Popen([sys.executable, str(COMMAND), "--unit", "beta-unit",
-                               "--production", str(self.doc), "--why", "repair the sample",
+                               "--production", self.production_name, "--why", "repair the sample",
                                "scripts/sample/item.py"], cwd=self.unit, env=environment,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as beta:
             try:
@@ -762,6 +764,11 @@ signal.pause()
             _ = valid_doc.write_text(self.doc.read_text())
             self.doc.unlink()
             self.doc = valid_doc
+            self.production_name = "valid-production"
+            from scripts.production import staff
+            from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+            with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+                _ = fixture_member("showrunner", name=self.production_name, doc=staff.LiveDoc("natedev", valid_doc))
         else:
             _ = self.git("restore", "--staged", "--worktree", "scripts/sample/item.py", cwd=self.unit)
             self.write(self.unit, "local.txt", "unrelated local commit\n")

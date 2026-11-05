@@ -183,7 +183,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
               mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
-                production=str(self.doc), unit="alpha-unit", phase="2", hash=code,
+                production="example", unit="alpha-unit", phase="2", hash=code,
                 also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
                 cancel_prior=False, started=STARTED, regime="after", holds=0,
                 merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
@@ -207,7 +207,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
               mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
-                production=str(self.doc), unit="alpha-unit", phase="3", hash=code,
+                production="example", unit="alpha-unit", phase="3", hash=code,
                 also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
                 cancel_prior=False, started=STARTED, regime="after", holds=0,
                 merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),

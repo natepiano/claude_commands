@@ -360,7 +360,8 @@ with (patch.object(agent_accounts, 'command_json', return_value={
                   + "claim = usage_store.claim_read\n"
                   + f"usage_store.claim_read = lambda login, now: claim(login, datetime.fromisoformat({self.now.isoformat()!r}))\n"
                   + script)
-        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        result = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[2],
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rate_limit_holds_for_ten_minutes_even_when_the_caller_does_not_save(self) -> None:

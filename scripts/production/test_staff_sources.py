@@ -27,9 +27,9 @@ from scripts.production.session_staff import MemberSources
 
 class StaffSourcesTests(StaffTestCase):
     @override
-    def production(self, slug: str, *units: str, workspace: str = "", parent: str = "") -> Path:
-        doc = super().production(slug, *units, workspace=workspace)
-        owner = fixture_member("showrunner", name=workspace or slug)
+    def production(self, production_name: str, *units: str, workspace: str = "", parent: str = "") -> Path:
+        doc = super().production(production_name, *units, workspace=workspace)
+        owner = fixture_member("showrunner", name=workspace or production_name)
         _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         if parent:
             ancestor = fixture_member("showrunner", name=parent)
@@ -490,7 +490,7 @@ class StaffSourcesTests(StaffTestCase):
         with mock.patch.object(staff, "snapshot", side_effect=AssertionError("owner reread")):
             self.assertEqual(unit_lookup.session_showrunner(current.current_session, record=record, sources=sources),
                              session_staff.MemberFound(parent))
-            self.assertEqual(unit_lookup.unit_parent("models-unit", session_staff.LiveSession(current.current_session), record=record, sources=sources),
+            self.assertEqual(unit_lookup.unit_parent("models-unit", session_staff.LiveSession(current.current_session), record=record),
                              unit_lookup.UnitProduction("sdlc", str(doc)))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
@@ -546,10 +546,10 @@ class StaffSourcesTests(StaffTestCase):
             ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
         })
         record = staff.snapshot()
-        for slug in ("sdlc", "missing-source"):
-            with self.subTest(slug=slug):
-                self.assertEqual(staff_sources.member(staff_sources.UnitMember(slug, "models-unit"), record),
-                                 staff_sources.NoSuchMember(staff_sources.UnitMember(slug, "models-unit")))
+        for production_name in ("sdlc", "missing-source"):
+            with self.subTest(name=production_name):
+                self.assertEqual(staff_sources.member(staff_sources.UnitMember(production_name, "models-unit"), record),
+                                 staff_sources.NoSuchMember(staff_sources.UnitMember(production_name, "models-unit")))
         self.assertEqual(staff_sources.member(staff_sources.UnitMember("receiving", "models-unit"), record),
                          staff_sources.MemberFound(moved))
         self.assertEqual(staff_sources.unit_parent("models-unit", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721"),
@@ -569,7 +569,7 @@ class StaffSourcesTests(StaffTestCase):
         selector = staff_sources.UnitMember("sdlc", "models-unit")
         self.assertEqual(staff_sources.member(selector, staff.snapshot()), staff_sources.NoSuchMember(selector))
         self.assertEqual(staff_sources.unit_parent("models-unit", unit.id),
-                         staff_sources.UnitProduction("receiving", str(self.source_root / "receiving-production.md")))
+                         staff_sources.UnitProduction("control", str(self.source_root / "receiving-production.md")))
         self.assertEqual(staff.by_id(unit.id), moved)
 
 
@@ -617,7 +617,7 @@ class StaffSourcesTests(StaffTestCase):
             })
             before = len(self.ssh_commands())
             parent = staff_sources.unit_parent("models-unit", unit.id)
-            self.assertEqual(parent.slug, "receiving")
+            self.assertEqual(parent.name, "receiving")
             self.assertEqual(len(self.ssh_commands()) - before, 1)
 
 
@@ -633,8 +633,8 @@ class StaffSourcesTests(StaffTestCase):
         self.pane("w1:unit", session_id=unit.id, environment={
             "STAFF_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
         })
-        for slug, expected_parent, doc in (("sdlc", original, old_doc), ("receiving", destination, new_doc)):
-            with self.subTest(slug=slug):
+        for production_name, expected_parent, doc in (("sdlc", original, old_doc), ("control", destination, new_doc)):
+            with self.subTest(name=production_name):
                 _ = staff.move(unit.id, staff.ReportsTo(expected_parent.id))
                 record = staff.snapshot()
                 members = staff_sources.showrunner_members(record)
@@ -642,14 +642,14 @@ class StaffSourcesTests(StaffTestCase):
                         mock.patch.object(pane_record, "read_strict", wraps=pane_record.read_strict) as launches, \
                         mock.patch.object(showrunners, "read_sources", wraps=showrunners.read_sources) as productions:
                     parent = staff_sources.unit_parent("models-unit", unit.id)
-                self.assertEqual(parent, staff_sources.UnitProduction(slug, str(doc)))
-                self.assertEqual(members[parent.slug], expected_parent)
+                self.assertEqual(parent, staff_sources.UnitProduction(production_name, str(doc)))
+                self.assertEqual(members[parent.name], expected_parent)
                 recorded_unit = record.by_id(unit.id)
                 assert recorded_unit is not None
-                self.assertEqual(staff.ReportsTo(members[parent.slug].id), recorded_unit.parent)
+                self.assertEqual(staff.ReportsTo(members[parent.name].id), recorded_unit.parent)
                 self.assertEqual(snapshot.call_count, 1)
-                self.assertEqual(launches.call_count, 1)
-                self.assertEqual(productions.call_count, 1)
+                self.assertEqual(launches.call_count, 0)
+                self.assertEqual(productions.call_count, 0)
 
 
     def test_member_with_unresolved_or_wrong_kind_id_does_not_take_an_unrelated_name(self) -> None:

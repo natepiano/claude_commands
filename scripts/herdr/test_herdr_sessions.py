@@ -164,14 +164,16 @@ class HerdrSessionsTests(unittest.TestCase):
         _ = (self.records / f"{pid}.json").write_text(json.dumps(record))
 
     def register_showrunner(self, pid: int) -> None:
-        instance = self.state / "showrunner-production"
-        instance.mkdir()
         doc = self.root / "production.md"
         _ = doc.write_text("fake production")
         record = read_session(self.records / f"{pid}.json")
         assert not isinstance(record, UnreadableSessionRecord)
+        owner = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc("natedev", doc))
+        _ = self.enterContext(patch.object(showrunners, "_session_name", return_value=record["name"]))
+        instance = self.state / f"showrunner-{owner.id}"
+        instance.mkdir()
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{record['sessionId']}\nCHECK=/fake/production_check.sh {doc}\n")
+            f"TARGET=session:{owner.id}\nCHECK=/fake/production_check.sh {doc}\n")
 
     def call(self, *arguments: str) -> tuple[int, str, str]:
         stdout, stderr = io.StringIO(), io.StringIO()

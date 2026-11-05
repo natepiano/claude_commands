@@ -4160,10 +4160,6 @@ class HerdrTests(unittest.TestCase):
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex", "CODEX_THREAD_ID": codex.current_session})
         import unit_lookup as lookup
-        from scripts.production import session_staff
-
-        def current_slug(slug: str) -> str:
-            return slug
         live = lookup.LiveClaude("Unit", unit.id, "/fixture/socket", 12)
         with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
               patch.object(herdr.Herdr, "agents", return_value=[{
@@ -4171,7 +4167,6 @@ class HerdrTests(unittest.TestCase):
               }]),
               patch.object(lookup, "_claudes", return_value=(
                   {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
-              patch.object(session_staff, "lookup_slug", side_effect=current_slug),
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
             def read_callers() -> tuple[object, object, object]:

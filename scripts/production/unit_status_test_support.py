@@ -222,7 +222,7 @@ class UnitStatusFixture(unittest.TestCase):
             outputs: list[str] = []
             for pane_by_unit in panes:
                 hosted = [
-                    labeled_host(unit, f"w{index}:p1", unit, slug="example",
+                    labeled_host(unit, f"w{index}:p1", unit, production_name="example",
                                  screen=pane_by_unit.get(unit, "— holding: waiting on x\n"))
                     for index, unit in enumerate(units, start=1) if unit not in missing_units]
                 for unit in hosted:
@@ -235,7 +235,7 @@ class UnitStatusFixture(unittest.TestCase):
                     if unit.session in pids and not unit.pane.startswith("copy-"):
                         fake_unit_host.place_process(environment, pids[unit.session], unit.pane, exec_shell=True)
                 result = subprocess.run(
-                    [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", str(production_doc)],
+                    [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", "example"],
                     check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -210,7 +210,7 @@ class DailiesInputFixture(unittest.TestCase):
         self.origin = self.root / "origin.git"
         self.checkout = self.root / "merge"
         self.seed.copy_to(self.checkout, self.origin)
-        self.doc = self.root / "example-production.md"
+        self.doc = self.root / "report-notes.md"
         self.status = self.root / "status.txt"
         self.judgment = self.root / "judgment.json"
         self.state = self.root / "state"
@@ -370,7 +370,7 @@ class DailiesInputFixture(unittest.TestCase):
             ("--render-state", str(self.root / "render-state.json"))
             if include_render_state and "--render-state" not in extra else ()
         )
-        arguments = ["--production", str(self.doc),
+        arguments = ["--production", "example",
              "--status", str(self.status), "--judgment", str(self.judgment),
              "--state-dir", str(self.state), "--out", str(self.output),
              "--holders", str(self.holders), "--notifier", str(self.notifier),
@@ -476,13 +476,13 @@ class DailiesInputFixture(unittest.TestCase):
                 if events.exists() else [])
 
     def run_merge_watch(self) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", str(self.doc),
+        return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", "example",
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def run_eta_request(self, phase: str = "Phase 2 of 3: panel labels stay clear") -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(WAITING), "eta-request", ALPHA,
-                               "--phase", phase, "--production", str(self.doc),
+                               "--phase", phase, "--production", "example",
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
@@ -530,38 +530,37 @@ class DailiesInputFixture(unittest.TestCase):
         self.assertEqual([item for item in topics if item["title"] == "Bevy upgrade"], [
             {"title": "Bevy upgrade", "update": update, "eta": "no ETA stated yet", "needs_user": False}])
 
-    def timer(self, slug: str) -> None:
+    def timer(self, name: str) -> None:
         """A production with a complete update timer, so the tree counts it."""
-        instance = self.root / "notifier-state" / f"showrunner-{slug}"
-        instance.mkdir(parents=True, exist_ok=True)
-        document = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+        document = self.doc if name == "example" else self.root / f"{name}-production.md"
         if not document.exists():
-            _ = document.write_text(f"# Production — {slug}\n", encoding="utf-8")
-        row = recorded_showrunner(fixture_showrunner_name(slug, self.doc), document)
+            _ = document.write_text(f"# Production — {name}\n", encoding="utf-8")
+        row = recorded_showrunner(fixture_showrunner_name(name, self.doc), document)
+        instance = self.root / "notifier-state" / f"showrunner-{row.id}"
+        instance.mkdir(parents=True, exist_ok=True)
         _ = (instance / "conf").write_text(
             f"TARGET=session:{row.current_session}\nCHECK=zsh /x/production_check.sh {document}\n", encoding="utf-8")
         showrunner_launch(row, row.current_session, self.env)
 
     def attach(self, child: str, parent: str) -> None:
-        for slug in (child, parent):
-            if not (self.root / "notifier-state" / f"showrunner-{slug}").exists():
-                self.timer(slug)
+        for name in (child, parent):
+            self.timer(name)
         _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))
 
-    def saved_report(self, slug: str) -> Path:
-        return self.showrunner_state / self.production_id(slug) / "dailies_last.json"
+    def saved_report(self, name: str) -> Path:
+        return self.showrunner_state / self.production_id(name) / "dailies_last.json"
 
-    def write_saved_report(self, slug: str, **changed: object) -> None:
+    def write_saved_report(self, name: str, **changed: object) -> None:
         fields: dict[str, object] = {
             "written": "2026-10-06T16:50", "zone": "America/Los_Angeles", "interval": 15, "units": 3, "held": 1,
             "rows": [{"name": "fps", "started": "2026-10-06T15:10", "eta": "2026-10-06T19:20",
                       "earliest": "2026-10-06T19:20", "latest": "2026-10-06T19:20"}, {"name": "docs"}],
             **changed}
-        self.saved_report(slug).parent.mkdir(parents=True, exist_ok=True)
-        _ = self.saved_report(slug).write_text(json.dumps(fields), encoding="utf-8")
+        self.saved_report(name).parent.mkdir(parents=True, exist_ok=True)
+        _ = self.saved_report(name).write_text(json.dumps(fields), encoding="utf-8")
 
-    def write_open_for(self, slug: str, content: str) -> None:
-        path = self.showrunner_state / "outstanding" / f"{self.production_id(slug)}.json"
+    def write_open_for(self, name: str, content: str) -> None:
+        path = self.showrunner_state / "outstanding" / f"{self.production_id(name)}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(content, encoding="utf-8")
 
@@ -594,7 +593,7 @@ class DailiesInputFixture(unittest.TestCase):
         _ = self.doc.write_text(content.replace("## Production Context", "## Production Context\n\n- **Kind:** style"),
                                 encoding="utf-8")
 
-    def production_id(self, slug: str) -> staff.StaffId:
-        document = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+    def production_id(self, name: str) -> staff.StaffId:
+        document = self.doc if name == "example" else self.root / f"{name}-production.md"
         return next(row.id for row in staff.snapshot().find(kind="showrunner")
                     if isinstance(row.doc, staff.LiveDoc) and row.doc.path == document)

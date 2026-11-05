@@ -1545,11 +1545,10 @@ def staff_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
                 continue
             causes: list[str] = []
             try:
-                timer = showrunners.timer_for(parent, record)
+                _ = showrunners.timer_for(parent, record)
             except (OSError, ValueError) as error:
                 causes.append(str(error))
-                timer = showrunners.NoTimer(str(error))
-            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name
+            name = parent.name
             tree = resolver.unit_worktree(row)
             doc = resolver.production_doc(row)
             branch = resolver.unit_branch(row)
@@ -1578,7 +1577,7 @@ def staff_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
             if causes:
                 activity = UnitActivity.UNKNOWN
                 problems.append(log_records.SourceProblem(row.name, "; ".join(dict.fromkeys(causes)), event_source=log_records.SourceNotApplicable.STATE))
-            result.append(Unit(slug, row.name, repo, path, is_hana(path), "", parent.name, activity))
+            result.append(Unit(name, row.name, repo, path, is_hana(path), "", parent.name, activity))
     except (OSError, ValueError) as error:
         problems.append(log_records.SourceProblem("staff", str(error), event_source=log_records.SourceNotApplicable.STATE))
     return result
@@ -1672,7 +1671,7 @@ def read_tokens(path: Path, window: log_records.Window) -> list[WindowTokenUsage
 
 def hana_origin(origin: PhaseOrigin, prefixes: Sequence[str]) -> bool:
     """Use durable provenance before consulting a worktree that may be deleted."""
-    if isinstance(origin.production, RecordedOrigin) and origin.production.value in ("hana", "tool-based-ui"):
+    if isinstance(origin.production, RecordedOrigin) and origin.production.value == "hana":
         return True
     if isinstance(origin.repository, RecordedOrigin) and Path(origin.repository.value).expanduser().name in ("hana", "hana_catalyst"):
         return True
@@ -1802,9 +1801,9 @@ def read_waiting(
         folder = state / "showrunner/outstanding"
         paths = {path.stem: path for path in folder.glob("*.json")}
         questions: list[WaitingItem] = []
-        for slug in sorted(set(paths) | set(documents)):
-            reminder_path = paths.get(slug)
-            document = documents.get(slug)
+        for name in sorted(set(paths) | set(documents)):
+            reminder_path = paths.get(name)
+            document = documents.get(name)
             source = str(document if document is not None else reminder_path)
             outstanding = read_source(source, lambda: read_open_items(reminder_path, document=document, identities=identities),
                                       [], problems, event_source=log_records.SourceNotApplicable.STATE)

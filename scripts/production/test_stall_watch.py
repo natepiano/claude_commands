@@ -9,6 +9,7 @@ from contextlib import redirect_stderr
 import json
 import os
 import runpy
+import select
 import shutil
 import signal
 import socket
@@ -337,7 +338,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             self.assertEqual((watch.stretch_path, watch.prompt_path, watch.prompt_key), before)
 
     def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
-        """Give each showrunner an update timer, a production doc and staff rows for its units. The slug is its name."""
+        """Give each showrunner an update timer, a production doc and staff rows for its units. Use the staff name."""
         _ = self.config.write_text((f"""# range: 0..
 threshold_percent=1
 # range: 0..
@@ -389,16 +390,16 @@ always=natedev
         _ = (self.sessions / f"{pid}.json").write_text(json.dumps(record))
         return path
 
-    def production(self, slug: str, units: tuple[str, ...], *, target: str = "",
-                   doc: Path | None = None) -> None:
-        target = target or "session:" + showrunner_relationship(slug).id
-        directory = self.notifier / f"showrunner-{slug}"
+    def production(self, production_name: str, units: tuple[str, ...], *, doc: Path) -> None:
+        owner = showrunner_relationship(production_name)
+        owner = staff.set_doc(owner.id, staff.LiveDoc(local_machine(), doc))
+        directory = self.notifier / f"showrunner-{owner.id}"
         directory.mkdir(exist_ok=True)
         prompt = directory / "prompt"
         _ = prompt.write_text("Run `zsh ~/.claude/scripts/production/unit_status.sh /tmp/status "
                               + f"America/Los_Angeles {' '.join(units)} | cut -c1-400`.\n")
-        check = f"CHECK=zsh /scripts/production/production_check.sh {doc}\n" if doc is not None else ""
-        _ = (directory / "conf").write_text(f"TARGET={target}\nPROMPT_FILE={prompt}\n{check}")
+        check = f"CHECK=zsh /scripts/production/production_check.sh {owner.id}\n"
+        _ = (directory / "conf").write_text(f"TARGET=session:{owner.id}\nPROMPT_FILE={prompt}\n{check}")
 
     def unit(self, name: str) -> tuple[int, Path]:
         child = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -406,7 +407,7 @@ always=natedev
         pane_pid = 10_000 + len(self.panes)
         self.process_rows += [f"{pane_pid} 1 herdr pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
         pane_id = len(self.panes) + 1
-        self.panes[name] = {"pane": PANE, "id": pane_id, "pid": child.pid, "slug": "showrunner", "label": f"label-of-{name}"}
+        self.panes[name] = {"pane": PANE, "id": pane_id, "pid": child.pid, "name": "showrunner", "label": f"label-of-{name}"}
         socket_path = self.record_session(child.pid, unit_session(name), "different-remote-name")
         # The lookup reads the record itself: it needs the pane the session runs in, and a real socket.
         held = socket.socket(socket.AF_UNIX)
@@ -763,20 +764,20 @@ always=natedev
         import unit_lookup as lookup
         runners: list[showrunners.Showrunner] = []
         marked: dict[str, dict[str, lookup.LabeledSession]] = {}
-        for slug in ("first", "second"):
-            doc = self.root / f"{slug}-production.md"
-            _ = doc.write_text(f"# Production\n- **Production slug:** {slug}\n")
-            runners.append(showrunners.Showrunner(session=slug, socket="/fixture.sock",
-                            slug=slug, zone="UTC", doc=str(doc)))
-            marked[slug] = {}
+        for production_name in ("first", "second"):
+            doc = self.root / f"{production_name}-production.md"
+            _ = doc.write_text(f"# Production\n- **Production name:** {production_name}\n")
+            runners.append(showrunners.Showrunner(session=production_name, socket="/fixture.sock",
+                            name=production_name, zone="UTC", doc=str(doc)))
+            marked[production_name] = {}
             for name in ("alpha", "beta"):
-                row = unit_membership(slug, name)
-                marked[slug][name] = lookup.LabeledSession(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name),
+                row = unit_membership(production_name, name)
+                marked[production_name][name] = lookup.LabeledSession(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name),
                                                      identity=lookup.LiveSession(row.current_session))
 
-        def labeled_sessions(slug: str, *, record: staff.StaffSnapshot) -> dict[str, lookup.LabeledSession]:
+        def labeled_sessions(production_name: str, *, record: staff.StaffSnapshot) -> dict[str, lookup.LabeledSession]:
             del record
-            return marked[slug]
+            return marked[production_name]
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(stall_watch, "processes", return_value=[]),
               mock.patch.object(stall_watch, "STATE_DIR", self.state),
@@ -817,12 +818,11 @@ always=natedev
     def test_failed_production_discovery_still_alerts_the_healthy_production(self) -> None:
         self.assertEqual(self.tick(START).returncode, 0)
         self.configure({"aaa-stalled": [], "showrunner": ["unit-one"]})
-        self.production("aaa-stalled", (), target="session:stalled-id",
-                        doc=self.root / "aaa-stalled-production.md")
+        stalled = showrunner_relationship("aaa-stalled")
         original = showrunners.socket_for
 
         def lookup(target: str, *, deadline: float) -> str | None:
-            if target == "session:stalled-id":
+            if target == f"session:{stalled.current_session}":
                 raise TimeoutError("fixture lookup timed out; retained")
             return original(target, deadline=deadline)
 
@@ -2564,7 +2564,7 @@ always=natedev
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
 
-    def test_detached_processes_use_native_sessions_without_slug_resolution(self) -> None:
+    def test_detached_processes_use_native_sessions_without_production_name_resolution(self) -> None:
         import stall_watch
         from scripts.production import showrunners
 
@@ -2885,6 +2885,15 @@ always=natedev
             self.assertEqual(state.read_text(), "saved retire state\n")
             self.assertTrue(pid_file.exists(), "the relay must start its pipe-holding descendant")
             pid = int(pid_file.read_text())
+            try:
+                descriptor = os.pidfd_open(pid)
+            except ProcessLookupError:
+                pass
+            else:
+                try:
+                    _ = select.select([descriptor], [], [], max(0, deadline - time.monotonic()))
+                finally:
+                    os.close(descriptor)
             # A zombie is dead, awaiting the machine's init reaper, and cannot hold pipes.
             status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)

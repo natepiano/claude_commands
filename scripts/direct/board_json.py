@@ -372,14 +372,14 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
     try:
         record = staff.snapshot()
         members: dict[str, staff.StaffRow] = {}
-        by_slug: dict[str, showrunners.Showrunner] = {}
+        by_name: dict[str, showrunners.Showrunner] = {}
         for owner in staff.active(record, "showrunner"):
             timer = showrunners.timer_for(owner, record)
             if isinstance(timer, showrunners.NoTimer):
                 continue
-            members[timer.slug] = owner
-            by_slug[timer.slug] = showrunners.Showrunner(
-                slug=timer.slug, session=owner.name, socket="", doc=(str(owner.doc.path) if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""),
+            members[owner.name] = owner
+            by_name[owner.name] = showrunners.Showrunner(
+                name=owner.name, session=owner.name, socket="", doc=(str(owner.doc.path) if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""),
                 zone=timer.zone)
         if production:
             root = members.get(production)
@@ -390,19 +390,19 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
     except staff.StaffUnreadable as error:
         print(f"board_json: {error}", file=sys.stderr)
         return NoBoardSubtree()
-    slugs = {row.id: slug for slug, row in members.items()}
-    if root is None or root.id not in slugs:
+    names = {row.id: name for name, row in members.items()}
+    if root is None or root.id not in names:
         return NoBoardSubtree()
     boards: list[BoardProduction] = []
     level = [root]
     while level:
         for row in level:
-            slug = slugs.get(row.id, "")
-            if slug in by_slug:
-                boards.append(BoardProduction(row, by_slug[slug]))
+            name = names.get(row.id, "")
+            if name in by_name:
+                boards.append(BoardProduction(row, by_name[name]))
         level = sorted((child for row in level for child in staff.active(record, "showrunner")
-                        if child.parent == staff.ReportsTo(row.id) and child.id in slugs),
-                       key=lambda row: slugs.get(row.id, row.name))
+                        if child.parent == staff.ReportsTo(row.id) and child.id in names),
+                       key=lambda row: names.get(row.id, row.name))
     return BoardSubtree(record, tuple(boards))
 
 
@@ -415,7 +415,7 @@ def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
     owner = record.by_doc(remote.local_machine(), document)
     units: list[dict[str, object]] = []
     if owner is None:
-        print(f"board_json: {runner['slug']}: the production document is not recorded", file=sys.stderr)
+        print(f"board_json: {runner['name']}: the production document is not recorded", file=sys.stderr)
     for row in staff.active(record, "unit"):
         if owner is None or row.parent != staff.ReportsTo(owner.id):
             continue
@@ -440,7 +440,7 @@ def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
             plan = str(tree.path / config.plan.path) if isinstance(config.plan, unit_config.PlanFile) else "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
             units.append(unit(row.name, row.id, tree.path, plan, clock, sources, resolver=resolver))
     offset = datetime.fromtimestamp(clock.now, clock.zone).utcoffset()
-    return {"production": runner["slug"], "as_of": clock.time(clock.now), "zone": runner["zone"],
+    return {"production": runner["name"], "as_of": clock.time(clock.now), "zone": runner["zone"],
             "utc_offset_minutes": int(offset.total_seconds() / 60) if offset else 0,
             "units": units, "sources": existing_sources(sources)}
 
@@ -459,12 +459,12 @@ def write_board(path: Path, board: dict[str, object]) -> None:
 
 
 def migrate_cache(root: Path, record: staff.StaffSnapshot) -> int:
-    """Move exact timer slugs to staff ids. Retain files without a recorded owner."""
+    """Move exact timer names to staff ids. Retain files without a recorded owner."""
     owners: dict[str, staff.StaffId] = {}
     for row in record.find(kind="showrunner"):
         timer = showrunners.timer_for(row, record)
         if isinstance(timer, showrunners.TimerRegistration):
-            owners[timer.slug] = row.id
+            owners[row.name] = row.id
     ids = {row.id for row in record.find(kind="showrunner")}
     unknown: list[str] = []
     for source in sorted(root.glob("*.json")):

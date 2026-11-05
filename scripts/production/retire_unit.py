@@ -80,13 +80,13 @@ def failure(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
 
 
-def production_of(slug: str, *, record: staff.StaffSnapshot) -> Production:
-    found = staff_sources.member(staff_sources.ShowrunnerMember(slug), record)
+def production_of(production_name: str, *, record: staff.StaffSnapshot) -> Production:
+    found = staff_sources.member(staff_sources.ShowrunnerMember(production_name), record)
     if isinstance(found, staff_sources.NoSuchMember) or isinstance(found.row.doc, staff.DocUnfilled):
-        raise ValueError(f"{slug}: no showrunner staff document")
+        raise ValueError(f"{production_name}: no showrunner staff document")
     if found.row.doc.machine != local_machine():
-        raise ValueError(f"{slug}: run retire on {found.row.doc.machine}")
-    return read_production(found.row.doc.path)
+        raise ValueError(f"{production_name}: run retire on {found.row.doc.machine}")
+    return read_production(found.row.name, record=record)
 
 
 def _git(unit: Unit, *arguments: str, settings: conf.ConfigRead) -> subprocess.CompletedProcess[str]:
@@ -398,16 +398,16 @@ def _command_name(pid: int) -> str:
         return "?"
 
 
-def find_unit(slug: str, given: str, *,
+def find_unit(production_name: str, given: str, *,
               record: staff.StaffSnapshot | None = None,
               settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Unit:
     record = staff.snapshot() if record is None else record
-    production = production_of(slug, record=record)
+    production = production_of(production_name, record=record)
     member = record.by_id(staff.StaffId(given))
     if member is None or member.kind != "unit":
-        selected = staff_sources.member(staff_sources.UnitMember(production.slug, given), record)
+        selected = staff_sources.member(staff_sources.UnitMember(production.name, given), record)
         if isinstance(selected, staff_sources.NoSuchMember):
-            raise ValueError(f"{production.slug}/{given}: no matching staff member")
+            raise ValueError(f"{production.name}/{given}: no matching staff member")
         member = selected.row
     location = unit_lookup.local_worktree(staff_sources.MemberFound(member))
     branch = ""
@@ -453,7 +453,7 @@ def members(unit: Unit, record: staff.StaffSnapshot) -> list[staff.StaffRow]:
 
 
 def dry_run(unit: Unit, *, settings: conf.ConfigRead) -> int:
-    print(f"retire {unit.name} of {unit.production.slug}: dry run, nothing changes")
+    print(f"retire {unit.name} of {unit.production.name}: dry run, nothing changes")
     refused = refusals(unit, settings=settings)
     for reason in refused:
         print(f"refused: {reason}")
@@ -551,13 +551,13 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
 
 def _main(argv: list[str], *, settings: conf.ConfigRead) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("slug")
+    _ = parser.add_argument("production_name")
     _ = parser.add_argument("unit")
     _ = parser.add_argument("--dry-run", action="store_true")
     options = parser.parse_args(argv)
     try:
         record = staff.snapshot()
-        unit = find_unit(cast(str, options.slug), cast(str, options.unit), record=record, settings=settings)
+        unit = find_unit(cast(str, options.production_name), cast(str, options.unit), record=record, settings=settings)
         if cast(bool, options.dry_run):
             return dry_run(unit, settings=settings)
         return retire(unit, settings=settings, record=record)

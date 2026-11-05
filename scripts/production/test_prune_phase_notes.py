@@ -38,10 +38,10 @@ class PrunePhaseNotesTests(unittest.TestCase):
                     "HERDR_BIN": "/nonexistent/herdr"}
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
 
-    def production(self, slug: str) -> Path:
+    def production(self, name: str) -> Path:
         """A production with one live unit, alpha-unit, and its update timer."""
-        checkout = self.root / slug
-        alpha = self.root / f"{slug}-alpha"
+        checkout = self.root / name
+        alpha = self.root / f"{name}-alpha"
         alpha.mkdir(parents=True)
         _ = subprocess.run(["git", "-C", str(alpha), "init", "--quiet", "-b", "alpha"],
                            capture_output=True, check=True)
@@ -49,24 +49,24 @@ class PrunePhaseNotesTests(unittest.TestCase):
                             "-c", "user.email=fixture@example.invalid", "commit", "--quiet",
                             "--allow-empty", "-m", "fixture"], capture_output=True, check=True)
         write_text_atomic(alpha / ".unit.toml", 'plan = "docs/alpha.md"\nresponsibilities = []\n')
-        doc = checkout / f"docs/{slug}-production.md"
+        doc = checkout / f"docs/{name}-production.md"
         doc.parent.mkdir(parents=True)
         _ = doc.write_text("\n".join((
-            f"# Production — {slug}", "", "## Production Context", "",
+            f"# Production — {name}", "", "## Production Context", "",
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{checkout}`",
             "- **Log:** `production.log`", "",
         )), encoding="utf-8")
-        self.timer(slug, doc)
-        unit = unit_membership(slug, "alpha-unit")
+        self.timer(name, doc)
+        unit = unit_membership(name, "alpha-unit")
         _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha), expected=unit.worktree)
-        retired = unit_membership(slug, "beta-unit")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / f"{slug}-beta"),
+        retired = unit_membership(name, "beta-unit")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / f"{name}-beta"),
                                expected=retired.worktree)
         return doc
 
-    def timer(self, slug: str, doc: Path) -> None:
-        _ = recorded_showrunner(slug, doc)
-        instance = self.notifier / f"showrunner-{slug}"
+    def timer(self, name: str, doc: Path) -> None:
+        _ = recorded_showrunner(name, doc)
+        instance = self.notifier / f"showrunner-{name}"
         instance.mkdir()
         _ = (instance / "conf").write_text(
             f"TARGET=session:x\nCHECK=zsh /home/x/.claude/scripts/production/production_check.sh {doc}\n",

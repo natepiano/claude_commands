@@ -156,9 +156,9 @@ class UnitTransferFixture(StaffTestCase):
                    + shlex.join(["zsh", "/scripts/production_check.sh",
                                  str(self.giving / "docs/plans/demo-production.md")]) + "\n")
 
-    def production_doc(self, slug: str, checkout: Path) -> str:
-        return "\n".join(["# Production — " + slug, "", "## Production Context", "",
-                          f"- **Merge branch:** `{slug}`", f"- **Showrunner checkout:** `{checkout}`",
+    def production_doc(self, production_name: str, checkout: Path) -> str:
+        return "\n".join(["# Production — " + production_name, "", "## Production Context", "",
+                          f"- **Merge branch:** `{production_name}`", f"- **Showrunner checkout:** `{checkout}`",
                           "- **Log:** `production.log`", "", "## Production rules", "", "Rules.", ""])
 
     def write(self, path: Path, content: str) -> None:
@@ -175,8 +175,8 @@ class UnitTransferFixture(StaffTestCase):
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def transfer(self, verb: str, unit: str = "alpha-unit", to: Path | None = None) -> subprocess.CompletedProcess[str]:
-        arguments = [verb, "demo", unit, str(to or self.receiving / "docs/plans/other-production.md"),
+    def transfer(self, verb: str, unit: str = "alpha-unit", to: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = [verb, "demo", unit, to or "other",
                      "--scratch", str(self.root / "scratch")]
         return self.invoke(arguments)
 

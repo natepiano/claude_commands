@@ -55,12 +55,12 @@ class RowUnitReadingTests(unittest.TestCase):
         _ = self.enterContext(patch.object(remote, "local_machine", return_value="natedev"))
         _ = self.enterContext(patch.object(m, "running_phase_worktrees", return_value=set()))
 
-    def production(self, name: str, slug: str) -> tuple[staff.StaffRow, Path]:
-        doc = self.root / f"{slug}-production.md"
+    def production(self, name: str, document_name: str) -> tuple[staff.StaffRow, Path]:
+        doc = self.root / f"{document_name}-production.md"
         _ = doc.write_text("# Production\n\n- **Repository:** fixture\n")
         owner = recorded_showrunner(name, doc)
         _ = fake_showrunner.write_timer(Path(self.environment["NOTIFIER_STATE_DIR"]),
-                                         slug, owner.current_session, "UTC", doc)
+                                         owner.name, owner.current_session, "UTC", doc)
         return owner, doc
 
     def staff_units(self) -> tuple[list[m.Unit], list[log_records.SourceProblem]]:
@@ -74,7 +74,7 @@ class RowUnitReadingTests(unittest.TestCase):
         _ = recorded_unit("tools", "renderer", tree, doc)
         units, problems = self.staff_units()
         self.assertEqual([(unit.production, unit.name, unit.worktree) for unit in units],
-                         [("timer-alias", "renderer", str(tree))])
+                         [("tools", "renderer", str(tree))])
         self.assertEqual(problems, [])
 
     def test_wrapped_showrunner_children_are_excluded_from_current_units(self) -> None:
@@ -84,7 +84,7 @@ class RowUnitReadingTests(unittest.TestCase):
         _ = recorded_unit("wrapped-owner", "old-child", self.root / "old-child", wrapped_doc)
         _ = staff.set_doc(wrapped.id, staff.WrappedDoc("natedev", wrapped_doc))
         units, problems = self.staff_units()
-        self.assertEqual([(unit.production, unit.name) for unit in units], [("healthy-alias", "healthy")])
+        self.assertEqual([(unit.production, unit.name) for unit in units], [("healthy-owner", "healthy")])
         self.assertEqual(problems, [])
 
     def test_transferred_unit_uses_the_new_parent(self) -> None:
@@ -95,7 +95,7 @@ class RowUnitReadingTests(unittest.TestCase):
         _ = staff.move(unit.id, staff.ReportsTo(destination.id))
         units, problems = self.staff_units()
         self.assertEqual([(unit.production, unit.name, unit.worktree) for unit in units],
-                         [("new-alias", "renderer", str(tree))])
+                         [("new-owner", "renderer", str(tree))])
         self.assertEqual(problems, [])
 
     def test_unfilled_worktree_reports_the_unit_and_keeps_healthy_units(self) -> None:
@@ -147,7 +147,7 @@ class RowUnitReadingTests(unittest.TestCase):
         path = history / "retired.jsonl"
         _ = path.write_text(json.dumps({
             "event_type": "phase_started", "unit": {"state": "Recorded", "value": "renderer"},
-            "production": {"state": "Recorded", "value": "tool-based-ui"},
+            "production": {"state": "Recorded", "value": "hana"},
             "repository": {"state": "Recorded", "value": "claude"},
         }) + "\n")
         original = path.read_bytes()
@@ -2879,7 +2879,7 @@ class ComparisonTest(unittest.TestCase):
         projects = self.projects_from_history([{
             "event_type": "phase_started", "unit": {"state": "Recorded", "value": "retired-ui"},
             "main_agent": {"session_id": "retired-ui-director"},
-            "production": {"state": "Recorded", "value": "tool-based-ui"},
+            "production": {"state": "Recorded", "value": "hana"},
             "repository": {"state": "Recorded", "value": "claude"},
         }])
         part = self.part(self.before_window, 0)
@@ -2928,7 +2928,7 @@ class ComparisonTest(unittest.TestCase):
         recorded: log_records.JsonObject = {
             "event_type": "phase_started", "unit": {"state": "Recorded", "value": unit.name},
             "main_agent": {"session_id": unit.name},
-            "production": {"state": "Recorded", "value": "tool-based-ui"},
+            "production": {"state": "Recorded", "value": "hana"},
             "repository": {"state": "Recorded", "value": "claude"},
         }
         conflicting = {**recorded, "production": {"state": "Recorded", "value": "builds"},
@@ -3098,7 +3098,7 @@ class ComparisonTest(unittest.TestCase):
             {"event_type": "phase_started", "unit": {"state": "Recorded", "value": "retired-hana"},
              "main_agent": {"session_id": "retired-hana-director"},
              "repository": {"state": "Recorded", "value": "/retired/hana"},
-             "production": {"state": "Recorded", "value": "tool-based-ui"}},
+             "production": {"state": "Recorded", "value": "hana"}},
             {"event_type": "phase_started", "unit": "unknown-project",
              "repository": {"state": "NotRecorded", "reason": "worktree retired"},
              "production": {"state": "NotRecorded", "reason": "production not recorded"}},
@@ -3516,7 +3516,7 @@ class SourcesTest(unittest.TestCase):
                 + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
                 + f"registration: {json.dumps(fields)}\n---\n# Which?\n")
             answered = state / "showrunner/outstanding/hana.answered.jsonl"
-            _ = answered.write_text(json.dumps({"time": "2026-10-07T11:00:00-04:00", "slug": "hana",
+            _ = answered.write_text(json.dumps({"time": "2026-10-07T11:00:00-04:00", "name": "hana",
                                                 "text": "Answered recently", "asked_by": "fixture-unit"}) + "\n")
             answered_bytes = answered.read_bytes()
             found = m.read_issues(vault / "issues")

@@ -40,7 +40,7 @@ class ModuleRootTests(unittest.TestCase):
             environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
             with mock.patch.object(merge_gate, "LIVE_ROOTS", (str(live),)):
                 job = merge_gate.start_gate_job(
-                    "fixture", module, [sys.executable, str(merge_gate.RUNNER), str(root), module.name],
+                    "fixture", module, [sys.executable, str(merge_gate.module_runner(Path(__file__).resolve().parents[2])), str(root), module.name],
                     root, environment, job_root / "output.log")
             status = job.process.wait(timeout=30)
             result = merge_gate.finish_gate_job(job, status)
@@ -130,6 +130,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         super().setUp()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         _ = fixture_member("showrunner", name="unrelated")
+        _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc("natedev", self.quiet_production))
         environment = source_environment(self.root / "staff-sources")
         environment["NOTIFIER_STATE_DIR"] = self.environment["NOTIFIER_STATE_DIR"]
         self.environment.update(environment)
@@ -442,7 +443,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         # The row carries today in the user's zone, as the gate reads it; a run across midnight may take either day.
         with mock.patch.dict(os.environ, self.environment, clear=True):
             before = change_review.today()
-            result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+            result = self.run_gate("--production", "fixture-showrunner", checkpoint=checkpoint)
             days = {before.isoformat(), change_review.today().isoformat()}
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
@@ -465,7 +466,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         self.environment["USER_ZONE"] = "America/New_York"
         with mock.patch.object(change_review, "datetime", mock.Mock(wraps=datetime, now=now)):
-            result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+            result = self.run_gate("--production", "fixture-showrunner", checkpoint=checkpoint)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[0], "2026-11-03")
 
@@ -494,29 +495,19 @@ class MergeGateCheckpointTests(MergeGateFixture):
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away")
         result = self.run_gate(checkpoint=checkpoint, callers_production=True)
         self.assert_refused_before_gate(result)
-        self.assertIn("pass --production <doc>: the gate adds this merge's change-review rows to its list",
+        self.assertIn("pass --production <name>: the gate adds this merge's change-review rows to its list",
                       result.stderr)
 
     def test_a_production_without_a_list_still_merges_a_checkpoint_with_its_line(self) -> None:
         doc = self.root / "production.md"
         self.write(doc, "# p\n")
+        _ = self.review_producer(doc)
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
-        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        result = self.run_gate("--production", "fixture-showrunner", checkpoint=checkpoint)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Change review: the production doc has no Change review line; no rows written",
                       result.stdout)
 
-    def test_a_production_without_a_list_does_not_read_the_staff_record(self) -> None:
-        doc = self.root / "production.md"
-        self.write(doc, "# p\n")
-        _ = self.review_producer(doc)
-        Path(self.environment["STAFF_FILE"]).unlink()
-        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Run hana | The grid fades")
-        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"),
-                         self.git(self.origin, "rev-parse", "integration"))
 
     @gate_suites(*FIXTURE_FOLDERS)
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
@@ -605,7 +596,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                      "--previous-checkpoint", self.base, "--unit", "fixture-unit", "--phase", "phase-2",
                      "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
                      "--main-repo", str(self.main),
-                     "--ssh", str(self.bin / "ssh"), "--production", str(self.quiet_production)]
+                     "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
             merge_gate, "notify_style", side_effect=malformed_notification,
@@ -640,9 +631,10 @@ class MergeGateProducerTests(ProducerFixture):
     def test_record_changes_keeps_an_unknown_producer_empty_and_prints_one_named_note(self) -> None:
         merged = self.merge()
         commits = change_review.merge_commits(self.repo, merged)
+        record = staff.StaffSnapshot(tuple(row for row in staff.snapshot().rows if row.id != self.unit.id))
         output = io.StringIO()
         with (mock.patch.object(change_review, "drift", return_value=[]),
-              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), redirect_stdout(output)):
+              mock.patch.object(staff, "snapshot", return_value=record), redirect_stdout(output)):
             merge_gate.record_changes(self.repo, self.listing, self.doc,
                                       change_review.publication_changes(commits, self.doc), "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")

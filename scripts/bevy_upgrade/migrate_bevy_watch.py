@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shlex
 import sys
 from pathlib import Path
@@ -15,35 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lib.atomic_file import sync_folder, write_bytes_atomic, write_text_atomic
-from scripts.production import staff, store_owner
-from scripts.shutdown.remote import local_machine
+from scripts.production import staff, showrunners
 import upgrade_record
 import upgrade_schedule
 
 
-def _owner(document: Path) -> staff.StaffId:
-    # Read current ownership again for each file, including after a clear.
-    record = staff.snapshot()
-    try:
-        return store_owner.document_id(document, record=record)
-    except staff.StaffRefused:
-        pass
-    machine = local_machine()
-    matches: list[staff.StaffId] = []
-    for candidate in record.find(kind="showrunner"):
-        doc = candidate.doc
-        if isinstance(doc, staff.DocUnfilled) or doc.machine != machine:
-            continue
-        if doc.path.parent.resolve() != document.parent.resolve():
-            continue
-        former = [match.group(1) for line in doc.path.read_text(encoding="utf-8").splitlines()
-                  if line.startswith("- **Formerly:**") for match in re.finditer(r"`([^`]+)`", line)]
-        if any(doc.path.with_name(f"{name}-production.md").resolve() == document.resolve() for name in former):
-            matches.append(candidate.id)
-    if len(matches) != 1:
-        reason = "ambiguous former production document" if matches else "showrunner ownership evidence is unavailable"
-        raise staff.StaffRefused(f"{document}: {reason}")
-    return matches[0]
+def _owner(name: str) -> staff.StaffId:
+    return showrunners.owner_for(name).id
 
 
 def _record(source: Path) -> bool:
@@ -60,14 +37,14 @@ def _record(source: Path) -> bool:
     document = fields.get("production")
     if not isinstance(document, str):
         raise ValueError(f"{source}: production document evidence is unavailable")
-    identity = _owner(Path(document))
+    identity = _owner(document)
     if reference is not None and reference != identity:
         raise staff.StaffRefused(f"{source}: the recorded owner differs from the document owner")
     _ = fields.pop("slug", None)
     fields["staff_id"] = identity
     _ = upgrade_record.validate(fields)
     target = source.with_name(f"{identity}{suffix}")
-    if _owner(Path(document)) != identity:
+    if _owner(document) != identity:
         raise staff.StaffRefused(f"{source}: ownership evidence changed")
     if target != source and target.exists():
         existing = cast(object, json.loads(target.read_text(encoding="utf-8")))
@@ -90,7 +67,7 @@ def _job_owner(words: list[str], source: Path) -> staff.StaffId:
         return row.id
     if "--production" not in words:
         raise staff.StaffRefused(f"{source}: notifier production evidence is unavailable")
-    return _owner(Path(words[words.index("--production") + 1]))
+    return _owner(words[words.index("--production") + 1])
 
 
 def _merge_job(source: Path, target: Path, identity: staff.StaffId, updated: str) -> None:

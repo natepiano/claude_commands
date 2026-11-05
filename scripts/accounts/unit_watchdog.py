@@ -337,10 +337,10 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                     _ = retained.pop(claude.session_id, None)
                                     _write_state({**state, **retained})
                                 continue
-                        source = sources.get((runner["slug"], unit))
+                        source = sources.get((runner["name"], unit))
                         if source is None:
                             for key, outage in state.items():
-                                member = staff.snapshot().by_path(f"{runner['slug']}/{unit}")
+                                member = staff.snapshot().by_path(f"{runner['name']}/{unit}")
                                 if member is None or key != member.current_session:
                                     continue
                                 # A launch entry can disappear while a recovery job finishes. Keep its result for recovery bookkeeping.
@@ -362,7 +362,7 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                     _write_state({**state, **retained})
                             lines.append(f"watchdog: anomaly: {unit}: no pane launch entry")
                             if not dry_run:
-                                failure = _restart("", f"{runner['slug']}/{unit}", "")
+                                failure = _restart("", f"{runner['name']}/{unit}", "")
                                 if failure:
                                     lines.append(f"watchdog: {unit}: {failure}")
                             continue
@@ -419,11 +419,11 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                     except (OSError, ValueError, herdr.HerdrFailure) as error:
                         # Preserve incomplete observations, then continue with the next unit.
                         retained.update({key: value for key, value in state.items() if key not in retained})
-                        lines.append(f"watchdog: {runner['slug']}/{unit}: {error}")
+                        lines.append(f"watchdog: {runner['name']}/{unit}: {error}")
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 # Keep pending recovery evidence when discovery is incomplete.
                 retained.update({key: value for key, value in state.items() if key not in retained})
-                lines.append(f"watchdog: {runner['slug']}: {error}")
+                lines.append(f"watchdog: {runner['name']}: {error}")
         if not dry_run and retained != before:
             _write_state(retained)
     except (OSError, ValueError) as error:

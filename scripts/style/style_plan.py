@@ -361,7 +361,7 @@ def style_document(repo: Path) -> Path:
     standing = standing_style_production(repo)
     if isinstance(standing, StandingStyleProduction):
         return standing.doc
-    raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
+    raise style_ledger.LedgerError(f"no standing style production: {standing.name}")
 
 
 def busy_files(repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, board: berth_board.Board) -> BusyFiles:
@@ -2962,7 +2962,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             return WaitingForSync(0, f"touched set unknown: {error}")
         standing = standing_style_production(repo)
         if not isinstance(standing, StandingStyleProduction):
-            raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
+            raise style_ledger.LedgerError(f"no standing style production: {standing.name}")
         changes_on_main = main_changes(ledger, standing.branch_point, tip)
         if isinstance(changes_on_main, UnknownMainChanges):
             if isinstance(predecessor, WaitingCheckpoint):

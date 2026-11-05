@@ -98,13 +98,12 @@ class HostedUnit:
     label: str = ""
 
 
-def labeled(session: str, pane: str, unit: str, slug: str = "show", *,
+def labeled(session: str, pane: str, unit: str, production_name: str = "show", *,
             screen: str = "", agent_status: str = "idle", label: str = "", **environment: str) -> HostedUnit:
     """Publish a fixture member with its current native session identity."""
-    from scripts.production import showrunners
     from scripts.production.staff_test_support import unit_membership
 
-    row = unit_membership(showrunners.canonical_slug(slug), unit)
+    row = unit_membership(production_name, unit)
     return HostedUnit(session, pane, {"CODEX_THREAD_ID": row.current_session, **environment}, screen, agent_status, label)
 
 
@@ -254,12 +253,12 @@ class PaneShellFixture:
     """One session-qualified pane host for lifecycle operations."""
 
     def __init__(self, case: unittest.TestCase, worktree: Path, process_root: Path, *,
-                 live: bool, slug: str = "demo", unit: str = "alpha-unit",
+                 live: bool, production_name: str = "demo", unit: str = "alpha-unit",
                  env: dict[str, str] | None = None) -> None:
         import herdr
         import unit_lookup
         import unit_move
-        self.slug: str = slug
+        self.production_name: str = production_name
         self.unit: str = unit
         self.worktree: Path = worktree
         self.environment: dict[str, str] = {**(env or {}), **environment(process_root.parent)}
@@ -271,7 +270,7 @@ class PaneShellFixture:
         self.shell: int = 991001
         self.director: int = 4242
         from scripts.production import staff
-        owner = staff.by_path(f"{slug}/{unit.removesuffix('-unit')}")
+        owner = staff.by_path(f"{production_name}/{unit.removesuffix('-unit')}")
         assert owner is not None
         self.native_id: str = owner.current_session
         self.stop_calls: list[str] = []
@@ -326,12 +325,12 @@ class PaneShellFixture:
         self._found = unit_lookup.LabeledSession(self.unit, unit_lookup.ClaudeNotRunning(), self.place,
             identity=unit_lookup.LiveSession(self.native_id))
 
-    def labeled_session(self, slug: str, unit: str) -> unit_lookup.LabeledSession | None:
-        return self.found if (slug, unit) == (self.slug, self.unit) else None
+    def labeled_session(self, production_name: str, unit: str) -> unit_lookup.LabeledSession | None:
+        return self.found if (production_name, unit) == (self.production_name, self.unit) else None
 
-    def labeled_sessions(self, slug: str) -> dict[str, unit_lookup.LabeledSession]:
+    def labeled_sessions(self, production_name: str) -> dict[str, unit_lookup.LabeledSession]:
         found = self.found
-        return {self.unit: found} if slug == self.slug and found else {}
+        return {self.unit: found} if production_name == self.production_name and found else {}
 
     def inside_pids(self, worktree: Path) -> list[int]:
         root = str(worktree)
@@ -379,7 +378,7 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
             pane.stopped()
             stopped_event.set()
         elif arguments[0] == 'restart':
-            pane.slug, pane.unit, name = destination
+            pane.production_name, pane.unit, name = destination
             pane.place = herdr.HerdrPlace('restored', 'w2:p1')
             write(pane.environment, [HostedUnit(pane.place.session, pane.place.pane,
                   {"CLAUDE_CODE_SESSION_ID": pane.native_id})])

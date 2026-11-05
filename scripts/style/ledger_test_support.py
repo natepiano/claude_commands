@@ -65,7 +65,10 @@ def style_staff_fixture(root: Path, repo: Path) -> Generator[None]:
             staff.SeedMember(name, "unit", name, staff.NewSeedMember(), staff.SeedParent("owner"), style_unit_id(name))
             for name in STYLE_UNIT_NAMES
         ))
-        _ = staff.apply_seed(staff.SeedInput(tuple(members)))
+        record = staff.apply_seed(staff.SeedInput(tuple(members)))
+        for row in record.find(kind="unit", parent=owner.id):
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", root / ("unused-" + row.name)),
+                                  expected=row.worktree)
         document = repo / ".git/style-production.md"
         document.parent.mkdir(exist_ok=True)
         _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")

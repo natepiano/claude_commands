@@ -37,8 +37,8 @@ def run_gate(path: Path) -> int:
         record["proc_start"] = proc_start
         save_record(path, record)
     try:
-        with copies.standing(record["slug"], Path(record["checkout"]), record["tip"]) as clone:
-            production = Production(Path(record["production_doc"]), record["slug"], record["merge_branch"],
+        with copies.standing(record["name"], Path(record["checkout"]), record["tip"]) as clone:
+            production = Production(Path(record["production_doc"]), record["name"], record["merge_branch"],
                                     clone, Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
             os.environ["BUILDLOG_UNIT"] = record["unit"]
             detail = run_checkpoint_test_steps(

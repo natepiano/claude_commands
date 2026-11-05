@@ -34,7 +34,7 @@ from sessions import SessionRecord
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership
 from scripts.production.cli_fixture import invoke_cli
 from scripts.message import sessions as runtime_sessions
-from scripts.production import staff
+from scripts.production import staff, showrunners
 
 SCRIPT = Path(__file__).with_name("session_pane.py")
 
@@ -87,6 +87,7 @@ class SessionPaneTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.records = self.root / "sessions"
         self.records.mkdir()
         self.environment = {
@@ -133,7 +134,7 @@ class SessionPaneTests(unittest.TestCase):
         }
         _ = (self.root / "responses.json").write_text(json.dumps(responses))
         fake_unit_host.write(self.environment, [
-            labeled_host("native", "w1:p1", "herdr-unit", slug="show", screen="native screen\n"),
+            labeled_host("native", "w1:p1", "herdr-unit", production_name="show", screen="native screen\n"),
             fake_unit_host.HostedUnit("native", "w1:p2", {}, "native screen\n")])
         owner = unit_membership("show", "herdr-unit")
         fake_unit_host.process(self.environment, 998042, 991001, ["claude"], {

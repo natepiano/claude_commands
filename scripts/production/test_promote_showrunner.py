@@ -31,7 +31,7 @@ import unit_effort
 import unit_lookup
 import herdr
 import sessions
-from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_doc import Production, Refusal, read_new_production, read_production
 from scripts.accounts import accounts
 from scripts.herdr import herdr as trust_reader
 from scripts.whoami import account
@@ -124,18 +124,16 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
         })))
         _ = self.staff.production("parent")
-        _ = self.staff.production("child")
         parent = repo(self.root / "parent")
         self.parent_doc = parent / "parent-production.md"
         _ = self.parent_doc.write_text(doc_text(parent))
         _ = (parent / "log.md").write_text("log\n")
         commit_all(parent)
         self.worktree = repo(self.root / "demo")
-        self.child_doc = self.worktree / "child-production.md"
+        self.child_doc = self.worktree / "future-production.md"
         _ = self.child_doc.write_text(doc_text(self.worktree))
         commit_all(self.worktree)
         self.staff.register_production("parent", self.parent_doc)
-        self.staff.register_production("child", self.child_doc)
         parent_row = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", self.parent_doc))
         _ = fixture_member("unit", name="demo", parent=parent_row.id, runtime_id=SESSION,
                            worktree=staff.PresentWorktree("natedev", self.worktree))
@@ -190,7 +188,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", pane_result))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")))
         for module, name, stand_in in (
-                (showrunners, "production_of", self.production_of), (unit_lookup, "labeled_session", self.labeled_session),
+                (showrunners, "own_name", self.own_name), (unit_lookup, "labeled_session", self.labeled_session),
                 (herdr, "stop_session", self.stop_host), (promote_showrunner, "type_place", self.type_pane), (promote_showrunner, "_alive", self.is_alive),
                 (promote_showrunner, "POLL_S", 0), (add_showrunner, "checked", self.child_checked),
                 (add_showrunner, "main", self.start), (accounts, "role_account", self.role_account),
@@ -207,13 +205,13 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}))
         return accounts.NamedAccount("claude3", directory)
 
-    def production_of(self, _session: str) -> Path | None:
-        return self.parent_doc if self.runs_production else None
+    def own_name(self) -> str:
+        return "parent" if self.runs_production else ""
 
     def verdict(self, _capture: str) -> unit_effort.Ready | unit_effort.Skipped:
         return self.pane
 
-    def labeled_session(self, _slug: str, name: str) -> unit_lookup.LabeledSession | None:
+    def labeled_session(self, _production_name: str, name: str) -> unit_lookup.LabeledSession | None:
         return self.marked.get(name)
 
     def role_account(self, _role: str) -> accounts.ClaudeLaunchAccount:
@@ -243,7 +241,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def run_main(self, *extra: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = promote_showrunner.main(["demo", "--production", str(self.child_doc),
+            code = promote_showrunner.main(["demo", "--production", "child", "--doc", str(self.child_doc),
                                             "--model", "opus", "--effort", "high", *extra])
         return code, out.getvalue(), err.getvalue()
 
@@ -329,7 +327,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 _ = self.run_main()
         self.marked.clear()
-        pending = promote_showrunner.promotion_record(read_production(self.parent_doc), "demo-unit")
+        pending = promote_showrunner.promotion_record(read_production("parent"), "demo-unit")
         self.assertTrue(pending.exists())
         self.events.clear()
         code, out, err = self.run_main()
@@ -374,7 +372,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stopped before timer"):
                 _ = self.run_main()
         started.assert_called_once()
-        pending = promote_showrunner.promotion_record(read_production(self.parent_doc), "demo-unit")
+        pending = promote_showrunner.promotion_record(read_production("parent"), "demo-unit")
         self.assertTrue(pending.exists())
         place = herdr.HerdrPlace("agents", "w8:p1")
         with (mock.patch.object(showrunners, "current_name", return_value=""),
@@ -384,7 +382,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(herdr, "submitted_prompt", return_value=submitted),
               mock.patch.object(herdr.Herdr, "submit_opening_prompt") as prompt,
               mock.patch.object(add_showrunner, "showrunner_appeared", return_value=True) as appeared,
-              mock.patch.object(showrunners, "timer_slugs", return_value={"parent", "child"}),
+              mock.patch.object(showrunners, "timer_names", return_value={"parent", "child"}),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
               mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery(("sent child", "sent parent"))),
               mock.patch.object(add_showrunner, "main") as restart):
@@ -404,7 +402,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.marked.clear()
             return showrunners.main(["attach", "child", "parent"])
 
-        pending = promote_showrunner.promotion_record(read_production(self.parent_doc), "demo-unit")
+        pending = promote_showrunner.promotion_record(read_production("parent"), "demo-unit")
 
         def send_notices(texts: dict[str, str], key: str) -> showrunners.NoticeDelivery:
             self.assertTrue(pending.exists())
@@ -412,7 +410,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.assertEqual(key, "showrunner-tree:child")
             return showrunners.NoticeDelivery(("sent child", "sent parent"))
 
-        with (mock.patch.object(showrunners, "timer_slugs", return_value={"parent", "child"}),
+        with (mock.patch.object(showrunners, "timer_names", return_value={"parent", "child"}),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
             with (mock.patch.object(add_showrunner, "main", side_effect=start_and_attach),
                   mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("stopped before notices"))):
@@ -486,7 +484,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             with self.subTest(unit=unit):
                 err = io.StringIO()
                 with redirect_stdout(io.StringIO()), redirect_stderr(err):
-                    code = promote_showrunner.main([unit, "--production", str(self.child_doc),
+                    code = promote_showrunner.main([unit, "--production", "child", "--doc", str(self.child_doc),
                                                     "--model", "opus", "--effort", "high"])
                 self.assertEqual(code, 2)
                 self.assertIn(cause, err.getvalue())
@@ -742,12 +740,12 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("demo-unit is stopped and did not start as a showrunner.", out)
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py --production "
-                      + f"{self.parent_doc} demo --plan docs/demo.md --resume {SESSION} --cwd {self.worktree}", out)
+                      + f"parent demo --plan docs/demo.md --resume {SESSION} --cwd {self.worktree}", out)
 
     def child_with_open_tabs(self, panes: list[herdr.PaneIdentity]) -> Production:
         child_doc = self.worktree / "builds-production.md"
         _ = child_doc.write_text(doc_text(self.worktree))
-        child = read_production(child_doc)
+        child = read_new_production(child_doc, "child")
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {str(child.checkout): {"hasTrustDialogAccepted": True}}}))
         _ = self.enterContext(mock.patch.object(add_showrunner, "running", return_value=False))
@@ -761,16 +759,16 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
     def test_the_childs_check_lets_the_units_own_tab_carry_its_name(self) -> None:
         ending_place = herdr.HerdrPlace("agents", PANE)
-        child = self.child_with_open_tabs([pane_identity(ending_place.pane, "builds")])
+        child = self.child_with_open_tabs([pane_identity(ending_place.pane, "child")])
         ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(ending_place.pane),
                          config_dir=self.unit_account.dir)
 
     def test_the_childs_check_refuses_another_same_named_tab_beside_the_ending_unit(self) -> None:
         child = self.child_with_open_tabs([
-            pane_identity(PANE, "builds"),
-            pane_identity("w8:p2", "builds"),
+            pane_identity(PANE, "child"),
+            pane_identity("w8:p2", "child"),
         ])
-        with self.assertRaisesRegex(Refusal, "^a tab named builds is already open in herdr session agents$"):
+        with self.assertRaisesRegex(Refusal, "^a tab named child is already open in herdr session agents$"):
             ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(PANE),
                              config_dir=self.unit_account.dir)
 
@@ -784,7 +782,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                       + f"starting in {self.worktree}", self.events)
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {str(self.root.resolve()): {"hasTrustDialogAccepted": True}}}))
-        child = read_production(self.child_doc)
+        child = read_new_production(self.child_doc, "child")
         with (mock.patch.dict(os.environ, {"ADD_SHOWRUNNER_CLAUDE_JSON": str(config)}),
               mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
               mock.patch.object(add_showrunner, "herdr_tab_open", mock.Mock(return_value=False)),

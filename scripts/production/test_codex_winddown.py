@@ -54,7 +54,7 @@ class NoticeRetryTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(broadcast, "SEND", self.state / "fake-send.py"))
 
     def test_status_reports_partial_discovery_after_rendering_healthy_work(self) -> None:
-        runner = Showrunner(session="healthy", socket="/fixture.sock", slug="healthy", zone="UTC", doc="fixture.md")
+        runner = Showrunner(session="healthy", socket="/fixture.sock", name="healthy", zone="UTC", doc="fixture.md")
         partial = showrunners.ShowrunnerDiscovery([runner], (
             showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
         output = io.StringIO()
@@ -126,8 +126,8 @@ class NoticeRetryTests(unittest.TestCase):
             codex_winddown.announce_quiet(1)
             return {}
 
-        runner = Showrunner(session="runner", socket="/fixture", slug="show", zone="UTC", doc="doc.md")
-        with (mock.patch.object(showrunners, "named", return_value=runner),
+        runner = Showrunner(session="runner", socket="/fixture", name="show", zone="UTC", doc="doc.md")
+        with (mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([runner])),
               mock.patch.object(codex_winddown, "live_unit_names", return_value=["unit"]),
               mock.patch.object(codex_winddown, "current_counts", return_value=Counter[str]()),
               mock.patch.object(codex_winddown, "refresh", side_effect=refresh),
@@ -437,7 +437,7 @@ class CountTests(unittest.TestCase):
             tmux="",
             formerNames=[],
         )
-        runner = Showrunner(session="hana", socket="/tmp/newer.sock", slug="show", zone="UTC", doc="doc.md")
+        runner = Showrunner(session="hana", socket="/tmp/newer.sock", name="show", zone="UTC", doc="doc.md")
 
         with (
             mock.patch.object(codex_winddown, "STATE", state),
@@ -520,6 +520,7 @@ class CountTests(unittest.TestCase):
 class MessageTests(unittest.TestCase):
     root: Path = Path()
     environment: dict[str, str] = {}
+    timers: tuple[Path, Path] = (Path(), Path())
 
     @override
     def setUp(self) -> None:
@@ -537,8 +538,6 @@ class MessageTests(unittest.TestCase):
         other = self.root / "other-production.md"
         _ = other.write_text("# Other\n", encoding="utf-8")
         # A showrunner is recorded by its update timer; the one of `zz-gone` has no running session.
-        _ = fake_showrunner.write_timer(self.root / "notifier", "show", "b861068b-66ee-573d-b3be-ec6d4a321e71", "America/Los_Angeles", doc)
-        _ = fake_showrunner.write_timer(self.root / "notifier", "zz-gone", "id-gone", "America/Los_Angeles", other)
         socket_dir = Path(self.enterContext(short_socket_directory()))
         for name, pid in (("hana", os.getpid()), ("trunk", os.getppid())):
             listener = socket.socket(socket.AF_UNIX)
@@ -577,11 +576,15 @@ class MessageTests(unittest.TestCase):
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        self.timers = (
+            fake_showrunner.write_timer(self.root / "notifier", "show", "b861068b-66ee-573d-b3be-ec6d4a321e71", "America/Los_Angeles", doc),
+            fake_showrunner.write_timer(self.root / "notifier", "zz-gone", "id-gone", "America/Los_Angeles", other),
+        )
         runner = fixture_member("showrunner", name="show", runtime_id=fixture_runtime_id("showrunner::show"))
         _ = unit_membership("show", "trunk-unit")
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
         fake_unit_host.write({**os.environ, **self.environment}, [
-            labeled_host("trunk", "w1:p1", "trunk-unit", slug="show")])
+            labeled_host("trunk", "w1:p1", "trunk-unit", production_name="show")])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")
         self.set_processes()
 
@@ -625,7 +628,7 @@ class MessageTests(unittest.TestCase):
         ])
         # Only the showrunners' own update timers are left: every count is gone.
         self.assertEqual(sorted(path.name for path in (self.root / "notifier").iterdir()),
-                         ["showrunner-show", "showrunner-zz-gone"])
+                         sorted(path.name for path in self.timers))
         log = (self.root / "log").read_text(encoding="utf-8")
         self.assertIn("send --to session:b861068b-66ee-573d-b3be-ec6d4a321e71 --from natedev --here --text All clear, from the user", log)
         self.assertIn("Start using Codex again", log)

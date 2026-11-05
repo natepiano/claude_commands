@@ -2988,87 +2988,8 @@ with patch.object(fcntl, "flock", admission):
         phase, = cast(list[dict[str, object]], report["phases"])
         self.assertEqual(phase["plan_doc"], {"state": "NotRecorded", "reason": "phase has no plan document"})
 
-    def test_production_doc_paths_report_the_heading_name_instead_of_the_path(self) -> None:
-        name = "phase-production-doc-path"
-        session, worktree, plan = self.phase_source_fixture(name, production="tool-based-ui",
-                                                               unit="geometry-material-unit")
-        production_doc = worktree / "docs" / "hana" / "tool-based-ui-production.md"
-        production_doc.parent.mkdir(parents=True)
-        _ = production_doc.write_text("# Production — tool-based-ui\n", encoding="utf-8")
-        for index, reference in enumerate((str(production_doc.relative_to(worktree)), str(production_doc))):
-            with self.subTest(reference=reference):
-                _ = plan.write_text("# Geometry material\n",
-                                    encoding="utf-8")
-                _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
-                                     "--phase-title", "Production document", at=1010 + index)
-                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
-                phase = cast(list[dict[str, object]], report["phases"])[-1]
-                self.assertEqual(phase["production"], {"state": "Recorded", "value": "tool-based-ui"})
-                started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
-                self.assertEqual(started["production"], phase["production"])
-                self.assertEqual(started["unit"], {"state": "Recorded", "value": "geometry-material-unit"})
 
-    def test_stored_production_doc_paths_resolve_for_plain_and_tagged_metadata(self) -> None:
-        name = "phase-stored-production-doc-path"
-        session, worktree, plan = self.phase_source_fixture(name)
-        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
-                             "--phase-title", "Stored production document", at=1010)
-        production_doc = worktree / "docs" / "hana" / "production.md"
-        production_doc.parent.mkdir(parents=True)
-        events = self.read_events(name)
-        started = next(event for event in events if event["event_type"] == "phase_started")
-        history = self.history_dir / "runs" / f"{name}.jsonl"
-        # A stored document reference must not depend on a surviving plan header.
-        plan.unlink()
-        for reference in (str(production_doc.relative_to(worktree)), str(production_doc)):
-            for tagged in (False, True):
-                with self.subTest(reference=reference, tagged=tagged):
-                    started["production"] = {"state": "Recorded", "value": reference} if tagged else reference
-                    _ = history.write_text("\n".join(json.dumps(event) for event in events))
-                    _ = production_doc.write_text("# Production — tool-based-ui\n", encoding="utf-8")
-                    report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
-                    phase, = cast(list[dict[str, object]], report["phases"])
-                    self.assertEqual(phase["production"], {"state": "Recorded", "value": "tool-based-ui"})
-                    production_doc.unlink()
-                    report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
-                    phase, = cast(list[dict[str, object]], report["phases"])
-                    production = cast(dict[str, object], phase["production"])
-                    self.assertEqual(production["state"], "NotRecorded")
-                    self.assertIn("production document cannot be read:", str(production["reason"]))
-                    self.assertEqual(self.read_events(name), events)
 
-    def test_unreadable_or_unnamed_production_docs_report_missing_metadata_with_a_reason(self) -> None:
-        name = "phase-production-doc-unavailable"
-        session, worktree, plan = self.phase_source_fixture(name, recorded=False)
-        production_doc = worktree / "production.md"
-        _ = plan.write_text("# Geometry material\n",
-                            encoding="utf-8")
-        state_path = session / "progress_history_state.json"
-        state = cast(dict[str, object], json.loads(state_path.read_text()))
-        state.update(production=str(production_doc), unit="geometry-material-unit")
-        _ = state_path.write_text(json.dumps(state))
-        cases = (("missing", "production document cannot be read:"),
-                 ("invalid UTF-8", "production document cannot be read:"),
-                 ("no heading", "production doc lacks its name"),
-                 ("empty name", "production document heading names no production"))
-        for index, (state, reason) in enumerate(cases):
-            with self.subTest(state=state):
-                if state == "invalid UTF-8":
-                    _ = production_doc.write_bytes(b"\xff")
-                elif state == "no heading":
-                    _ = production_doc.write_text("# A document without a production heading\n", encoding="utf-8")
-                elif state == "empty name":
-                    _ = production_doc.write_text("# Production — \n", encoding="utf-8")
-                _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
-                                     "--phase-title", "Unavailable production document", at=1010 + index)
-                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
-                phase = cast(list[dict[str, object]], report["phases"])[-1]
-                production = cast(dict[str, object], phase["production"])
-                self.assertEqual(production["state"], "NotRecorded")
-                self.assertIn(reason, str(production["reason"]))
-                started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
-                self.assertEqual(started["production"], production)
-                self.assertEqual(started["unit"], {"state": "Recorded", "value": "geometry-material-unit"})
 
     def test_plain_production_names_do_not_require_a_production_doc(self) -> None:
         name = "phase-production-plain-name"
@@ -7050,7 +6971,7 @@ with patch.object(fcntl, "flock", admission):
         sessions_dir = self.root / "notifier-sessions"
         _ = fake_showrunner.write_timer(
             notifier_dir,
-            "example",
+            "Example",
             recorded_showrunner("Example", production_doc).current_session,
             "UTC",
             production_doc,
@@ -7130,7 +7051,7 @@ with patch.object(fcntl, "flock", admission):
         sessions_dir = self.root / "notifier-sessions"
         _ = fake_showrunner.write_timer(
             notifier_dir,
-            "example",
+            "Example",
             recorded_showrunner("Example", production_doc).current_session,
             "UTC",
             production_doc,

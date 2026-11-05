@@ -138,30 +138,31 @@ class ProposalsTableTests(StaffTestCase):
         _ = recorded_showrunner("demo", doc)
         with mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")}), \
                 mock.patch.object(proposals_table, "owners", return_value=frozenset({next(row.id for row in staff.snapshot().rows if row.name == "organon-unit")})):
-            self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines()[0], "unscored")
+            self.assertEqual(self.run_main(["--production", "demo", "--next"])[1].splitlines()[0], "unscored")
             _ = self.issue("now important", "date_created: 2026-10-05", *common, 'review_urgency: "user"')
             # The shown proposal stays until the user answers it.
-            self.assertEqual(self.run_main(["--next", "--production", str(doc)])[1].splitlines()[0], "unscored")
+            self.assertEqual(self.run_main(["--next", "--production", "demo"])[1].splitlines()[0], "unscored")
             (self.root / "issues/unscored.md").unlink()
-            self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines(),
+            self.assertEqual(self.run_main(["--production", "demo", "--next"])[1].splitlines(),
                              ["now important", str(self.root / "issues/now important.md")])
 
     def test_a_production_reads_its_own_folder_and_queue_and_with_below_each_lower_one_never_above(self) -> None:
         docs: dict[str, Path] = {}
-        for slug in ("top", "kid", "grand"):
-            _ = self.write(f"{slug}-backlog/ledger.md", f"- 2026-10-02 {slug} line — proposed\n")
-            docs[slug] = self.write(f"trunk/docs/plans/{slug}-production.md",
-                                    f"- **Proposals:** `{self.root / f'{slug}-issues'}`\n"
-                                    + f"- **Improvement queue:** {self.root / f'{slug}-backlog' / 'ledger.md'}\n")
-            _ = self.issue(f"{slug} idea", "date_created: 2026-10-01", "status: open", "tags: [issue, proposal]",
-                           f"proposed_by: {slug}", folder=f"{slug}-issues")
+        for name in ("top", "kid", "grand"):
+            _ = self.write(f"{name}-backlog/ledger.md", f"- 2026-10-02 {name} line — proposed\n")
+            docs[name] = self.write(f"trunk/docs/plans/{name}-production.md",
+                                    f"- **Proposals:** `{self.root / f'{name}-issues'}`\n"
+                                    + f"- **Improvement queue:** {self.root / f'{name}-backlog' / 'ledger.md'}\n")
+            _ = self.issue(f"{name} idea", "date_created: 2026-10-01", "status: open", "tags: [issue, proposal]",
+                           f"proposed_by: {name}", folder=f"{name}-issues")
         below = {"top": ["top", "kid", "grand"], "kid": ["kid", "grand"], "grand": ["grand"]}
 
-        def owner_docs(doc: Path) -> list[Path]:
-            return [docs[slug] for slug in below[doc.name.removesuffix("-production.md")]]
+        def owner_docs(doc: Path, *, record: staff.StaffSnapshot | None = None) -> list[Path]:
+            del record
+            return [docs[name] for name in below[doc.name.removesuffix("-production.md")]]
 
-        def waiting(slug: str, below: bool = False) -> list[str]:
-            return [entry.item.proposal for entry in proposals_table.waiting_entries(docs[slug], below)[0]]
+        def waiting(name: str, below: bool = False) -> list[str]:
+            return [entry.item.proposal for entry in proposals_table.waiting_entries(docs[name], below)[0]]
 
         with mock.patch.object(proposals_folder, "owner_docs", owner_docs):
             # Each showrunner reviews its own production; the ones below review theirs (user, 2026-10-27).
@@ -293,7 +294,7 @@ class ProposalsTableTests(StaffTestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_main_prints_the_three_sources_in_order(self) -> None:
-        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `issues`\n"
+        doc = self.write("trunk/docs/plans/report-settings.md", "# Production\n\n- **Proposals:** `issues`\n"
                          + f"- **Improvement queue:** {self.root / 'backlog' / 'ledger.md'}\n")
         _ = recorded_showrunner("footers", doc)
         production_membership("footers", "footer")
@@ -309,7 +310,7 @@ class ProposalsTableTests(StaffTestCase):
         with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "sessions",)), \
                 mock.patch.object(phase_table, "show_production", return_value=records), \
                 self.runs_of({plan: [Path("run-1.jsonl")]}):
-            code, out, err = self.run_main(["--production", str(doc)])
+            code, out, err = self.run_main(["--production", "footers"])
         self.assertEqual((code, err), (0, ""))
         self.assertEqual([line.split(" | ")[1] for line in out.splitlines()[2:]],
                          ["footer colours", "Codex dots", "Keep the old footer"])
@@ -317,16 +318,16 @@ class ProposalsTableTests(StaffTestCase):
                          [REVIEW_STATE, REVIEW_STATE, ADD_ON_STATE])
 
     def test_main_says_so_when_nothing_is_open(self) -> None:
-        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n")
+        doc = self.write("trunk/docs/plans/report-settings.md", "# Production\n")
         _ = recorded_showrunner("footers", doc)
         with mock.patch.object(phase_table, "show_production", return_value="{}"):
-            self.assertEqual(self.run_main(["--production", str(doc)]), (0, "no open proposals\n", ""))
+            self.assertEqual(self.run_main(["--production", "footers"]), (0, "no open proposals\n", ""))
 
     def test_main_refuses_a_session_that_runs_no_production(self) -> None:
         with mock.patch.object(showrunners, "production_of", return_value=None):
             code, out, err = self.run_main([])
         self.assertEqual((code, out), (1, ""))
-        self.assertIn("pass --production <doc>", err)
+        self.assertIn("pass --production <name>", err)
 
     def test_main_rejects_other_arguments(self) -> None:
         code, _, err = self.run_main(["--everything"])

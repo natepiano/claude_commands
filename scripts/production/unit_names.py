@@ -31,9 +31,9 @@ def stem(unit: str) -> str:
     return unit.removesuffix("-unit").replace("_", "-")
 
 
-def branch(slug: str, unit_stem: str) -> str:
-    """The slug names the branch, as it names the production; the merge branch may differ."""
-    return unit_stem if unit_stem.startswith(f"{slug}-") else f"{slug}-{unit_stem}"
+def branch(production_name: str, unit_stem: str) -> str:
+    """The production_name names the branch, as it names the production; the merge branch may differ."""
+    return unit_stem if unit_stem.startswith(f"{production_name}-") else f"{production_name}-{unit_stem}"
 
 
 def worktree(checkout: Path, unit_stem: str) -> Path:

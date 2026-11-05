@@ -24,10 +24,10 @@ from scripts.lib.test_names import NAMES_TOML
 from scripts.shutdown import remote
 
 
-def owned_units(doc: Path, *names: str, retired: tuple[str, ...] = ()) -> staff.StaffSnapshot:
+def owned_units(doc: Path, *names: str, retired: tuple[str, ...] = (), production_name: str = "alpha") -> staff.StaffSnapshot:
     """The showrunner row that owns `doc`, then its unit rows in row order."""
     machine = remote.local_machine()
-    owner = staff.StaffRow(staff.StaffId("s-owner"), "showrunner", "alpha", staff.StaffRoot(),
+    owner = staff.StaffRow(staff.StaffId("s-owner"), "showrunner", production_name, staff.StaffRoot(),
                            current_session=staff.StaffId("s-owner"), doc=staff.LiveDoc(machine, doc.resolve()))
     units = (staff.StaffRow(staff.StaffId(f"s-{name}"), "unit", name, staff.ReportsTo(owner.id), current_session=staff.StaffId(f"s-{name}"),
                             worktree=(staff.RemovedWorktree if name in retired else staff.PresentWorktree)(machine, Path("/fixture", name)))
@@ -532,7 +532,7 @@ class SourceCheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_check_root(root, {"scripts/error.py":
-                'raise ValueError(f"showrunner {runner.slug} is not running")\n'})
+                'raise ValueError(f"showrunner {runner.name} is not running")\n'})
             output = StringIO()
             with redirect_stdout(output):
                 status = audit.main(["check", "--root", str(root), "--prose"])
@@ -786,9 +786,7 @@ class SourceCheckTests(unittest.TestCase):
 class ProductionNameTests(unittest.TestCase):
     def test_reads_staff_units_and_finds_cross_role_collisions(self) -> None:
         doc = Path("/fixture/one.md")
-        timer = showrunners.Timer("one", "session:alpha", doc, "UTC")
-        with patch.object(showrunners, "timer_for", return_value=timer):
-            first = audit.parse_production("one", doc, owned_units(doc, "render", "old", retired=("old",)))
+        first = audit.parse_production("one", doc, owned_units(doc, "render", "old", retired=("old",), production_name="one"))
         second = audit.ProductionNames("two", "/fixture/two.md", "render-unit", ("tools-unit",))
         rows = audit.measure_production_names((first, second))
         self.assertEqual(first.units, ("render-unit", "old-unit"))
@@ -865,7 +863,7 @@ other_names = ["seat"]
             doc = root / "fixture-production.md"
             _ = doc.write_text("# Fixture\n", encoding="utf-8")
             at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-            with patch.object(showrunners, "timer_docs", return_value={"fixture": doc}), \
+            with patch.object(showrunners, "timer_docs", return_value={"alpha": doc}), \
                     patch.object(staff, "snapshot", return_value=owned_units(doc, "render")), \
                     patch.object(Path, "home", return_value=root), \
                     patch.dict("os.environ", {"USER_ZONE": "America/New_York"}):
@@ -902,7 +900,7 @@ other_names = []
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_text(text, encoding="utf-8")
-        _ = self.enterContext(patch.object(staff, "snapshot", return_value=owned_units(root / "fixture-production.md")))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=owned_units(root / "fixture-production.md", production_name="fixture")))
         return audit.AuditWindow(at, at + timedelta(days=1))
 
     def test_report_rejects_omitted_source_check_evidence(self) -> None:
@@ -938,6 +936,10 @@ other_names = []
             checked = audit.source_check(root)
             self.assertEqual([source.path for source in checked.unread_sources], ["scripts/bad.py"])
             with patch.object(Path, "home", return_value=root), \
+                    patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(tuple(
+                        staff.StaffRow(staff.StaffId(name), "showrunner", name, staff.StaffRoot(),
+                                       current_session=staff.StaffId(name))
+                        for name in ("unreadable", "missing")))), \
                     patch.object(showrunners, "timer_docs", return_value={"unreadable": unreadable_doc, "missing": missing_doc}):
                 result = audit.baseline(root, window)
             label_line = next(line for line in result.splitlines() if line.startswith("Fixed display labels:"))
@@ -1068,6 +1070,7 @@ other_names = []
             _ = (root / "scripts/bad.py").write_bytes(b"\xff")
             missing_doc = root / "missing-production.md"
             with patch.object(Path, "home", return_value=root), \
+                    patch.object(staff, "snapshot", return_value=owned_units(root / "fixture-production.md", production_name="missing")), \
                     patch.object(showrunners, "timer_docs", return_value={"missing": missing_doc}):
                 result = audit.baseline(root, window)
             for path in ("scripts/bad.py", str(missing_doc), str(root / ".local/state/message/log.jsonl")):

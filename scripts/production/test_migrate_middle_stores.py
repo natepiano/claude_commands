@@ -32,11 +32,11 @@ class MiddleStoreMigrationTests(unittest.TestCase):
         self.outstanding = Path(environment["SHOWRUNNER_STATE_DIR"]) / "outstanding"
         self.outstanding.mkdir(parents=True)
         document = self.root / "current-production.md"
-        _ = document.write_text("# Production\n\n## Production Context\n\n- **Formerly:** `alpha` `beta`\n")
+        _ = document.write_text("# Production\n\n## Production Context\n\n")
         owner = fixture_member("showrunner", name="current", doc=staff.LiveDoc("natedev", document))
-        timer = Path(environment["NOTIFIER_STATE_DIR"]) / "showrunner-current/conf"
+        timer = Path(environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{owner.id}/conf"
         timer.parent.mkdir(parents=True)
-        _ = timer.write_text(f"TARGET=session:{owner.current_session}\nCHECK=" +
+        _ = timer.write_text(f"TARGET=session:{owner.id}\nCHECK=" +
                          shlex.join(["production_check.sh", str(document)]) + "\n")
 
     @property
@@ -54,18 +54,17 @@ class MiddleStoreMigrationTests(unittest.TestCase):
             status = migrate_middle_stores.migrate("outstanding")
         return status, output.getvalue().splitlines()
 
-    def test_former_names_merge_history_by_instant_and_rerun_preserves_bytes(self) -> None:
+    def test_current_name_merges_history_by_instant_and_rerun_preserves_bytes(self) -> None:
         first = '{"time":"2026-10-27T08:00:00-04:00","text":"first"}\n'
         equal = '{"time":"2026-10-27T12:00:00Z","text":"equal"}\n'
         last = '{"time":"2026-10-27T09:00:00-04:00","text":"last"}\n'
-        target = self.write(f"{self.owner.id}.history.jsonl", first)
-        _ = self.write("alpha.history.jsonl", last)
-        _ = self.write("beta.history.jsonl", equal)
+        target = self.write(f"{self.owner.id}.history.jsonl", first + equal)
+        _ = self.write("current.history.jsonl", last)
         status, lines = self.migrate()
         self.assertEqual(status, 0, lines)
         self.assertEqual(target.read_text(), first + equal + last)
         self.assertEqual(sorted(path.name for path in self.outstanding.iterdir()), [target.name])
-        self.assertEqual(lines[-1], "moved 2; left in place 0; unavailable 0")
+        self.assertEqual(lines[-1], "moved 1; left in place 0; unavailable 0")
         before = (target.read_bytes(), target.stat().st_mtime_ns)
         self.assertEqual(self.migrate(), (0, ["moved 0; left in place 0; unavailable 0"]))
         self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), before)
@@ -80,10 +79,10 @@ class MiddleStoreMigrationTests(unittest.TestCase):
         self.assertEqual(self.migrate(), (status, lines))
 
     def test_unequal_json_remains_while_history_moves(self) -> None:
-        source = self.write("alpha.json", '{"old":true}\n')
+        source = self.write("current.json", '{"old":true}\n')
         target = self.write(f"{self.owner.id}.json", '{"new":true}\n')
         history = '{"time":"2026-10-27T12:00:00Z"}\n'
-        _ = self.write("alpha.history.jsonl", history)
+        _ = self.write("current.history.jsonl", history)
         status, lines = self.migrate()
         self.assertEqual(status, 0, lines)
         self.assertEqual(source.read_text(), '{"old":true}\n')
@@ -97,7 +96,7 @@ class MiddleStoreMigrationTests(unittest.TestCase):
         early = json.dumps({"time": "2026-10-27T12:00:00Z", "text": "early answer"}) + "\n"
         late = json.dumps({"time": "2026-10-27T13:00:00Z", "text": "late answer"}) + "\n"
         target = self.write(f"{self.owner.id}.answered.jsonl", late)
-        _ = self.write("alpha.answered.jsonl", early)
+        _ = self.write("current.answered.jsonl", early)
         status, lines = self.migrate()
         self.assertEqual(status, 0, lines)
         self.assertEqual(target.read_text(), early + late)
@@ -109,7 +108,7 @@ class MiddleStoreMigrationTests(unittest.TestCase):
         late = '{"time":"2026-10-27T13:00:00Z"}\n'
         undated = '{"text":"no time"}\n{"time":"bad"}\n{"time":"2026-10-27T12:30:00"}\n'
         target = self.write(f"{self.owner.id}.history.jsonl", middle)
-        _ = self.write("alpha.history.jsonl", late + early + undated)
+        _ = self.write("current.history.jsonl", late + early + undated)
         status, lines = self.migrate()
         self.assertEqual(status, 0, lines)
         self.assertEqual(target.read_text(), early + middle + late + undated)
@@ -117,7 +116,7 @@ class MiddleStoreMigrationTests(unittest.TestCase):
 
     def test_empty_source_lock_is_removed_without_replacing_destination(self) -> None:
         target = self.write(f"{self.owner.id}.lock", "retained lock content")
-        _ = self.write("alpha.lock", "")
+        _ = self.write("current.lock", "")
         status, lines = self.migrate()
         self.assertEqual(status, 0, lines)
         self.assertEqual({path.name: path.read_text() for path in self.outstanding.iterdir()},

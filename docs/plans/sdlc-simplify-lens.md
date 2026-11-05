@@ -1,6 +1,5 @@
 # sdlc simplify-lens plan
 
-> **Production:** sdlc (`docs/plans/sdlc-production.md`), unit phases-unit, worktree /home/natepiano/worktrees/claude-build-followups-sdlc-simplify, branch sdlc-simplify-lens (from origin/sdlc 6ed9311b3).
 
 ## Delegation Context
 

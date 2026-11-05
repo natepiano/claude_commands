@@ -223,7 +223,7 @@ class RosterTests(unittest.TestCase):
         }), encoding="utf-8")
 
     def _write_showrunner_timer(self) -> None:
-        instance = self.notifier / "showrunner-alpha"
+        instance = self.notifier / f"showrunner-{showrunner_relationship('alpha').id}"
         instance.mkdir()
         _ = (instance / "conf").write_text(
             "TARGET=session:acd50bad-5afa-5d3d-b155-3766b7d113e0\n"
@@ -664,10 +664,7 @@ class RosterTests(unittest.TestCase):
         owner = showrunner_relationship("alpha")
         owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.production_doc))
         showrunner_launch(owner, "acd50bad-5afa-5d3d-b155-3766b7d113e0", self.environment)
-        _ = (self.notifier / "showrunner-alpha").rename(self.notifier / "showrunner-builds")
-        _ = self.production_doc.write_text(
-            "## Production Context\n\n- **Formerly:** `alpha`\n\n" + self.production_doc.read_text(),
-        )
+        _ = staff.rename(owner.id, "builds")
         full = roster.unit_labels(self._entries().values())
         fast = roster.unit_labels_for(["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], self.environment)
         self.assertEqual(full["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("director", "builds", "unit-one"))
@@ -2678,7 +2675,7 @@ class UnitLabelsTests(unittest.TestCase):
         for record in records:
             _ = (registry / f"{record['pid']}.json").write_text(json.dumps(record))
         registered: list[showrunners.Showrunner] = [{
-            "session": "cargo-liner", "socket": f"/fixture/{unit.parent.id}.sock", "slug": "cargo-liner-style",
+            "session": "cargo-liner", "socket": f"/fixture/{unit.parent.id}.sock", "name": "cargo-liner-style",
             "zone": "America/New_York", "doc": str(doc),
         }]
         environment = {"HERDR_PROC": str(root / "proc"), "NOTIFIER_SESSIONS_DIR": str(root / "sessions")}

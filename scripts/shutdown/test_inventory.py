@@ -19,7 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production.staff_test_support import unit_membership, StaffTestCase, fixture_worker, fixture_runtime_id, fixture_session, fixture_roster
+from scripts.production.staff_test_support import unit_membership, recorded_showrunner, StaffTestCase, fixture_worker, fixture_runtime_id, fixture_session, fixture_roster
 from scripts.production import staff
 from scripts.usage import agents_log
 from test_support import ShutdownTestCase, linux_process_fixture
@@ -366,9 +366,10 @@ class InventoryTests(ShutdownTestCase):
                     self.assertNotIn("doc", session["host"])
 
     def test_listing_and_absent_target_check_share_timer_reads_without_resolving_sockets(self) -> None:
-        stale = self.notifier / "showrunner-stale"
-        stale.mkdir()
         stale_doc = self.root / "stale-production.md"
+        owner = recorded_showrunner("stale", stale_doc)
+        stale = self.notifier / f"showrunner-{owner.id}"
+        stale.mkdir()
         _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         _ = (stale / "conf").write_text(
             f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
@@ -386,7 +387,7 @@ class InventoryTests(ShutdownTestCase):
         unit = next(item for item in listed if item.session_id == UNIT_ID)
         self.assertEqual((unit.kind, unit.production, unit.doc),
             ("unit", "build-followups", director.doc))
-        self.assertEqual([(runner["slug"], runner["doc"]) for runner in missing], [("stale", str(stale_doc))])
+        self.assertEqual([(runner["name"], runner["doc"]) for runner in missing], [("stale", str(stale_doc))])
 
     def test_forty_session_listing_and_large_transcript_read_budget(self) -> None:
         for path in self.records.glob("*.json"):
@@ -1103,15 +1104,16 @@ elif "comm=" in joined:
         self.assertEqual(director["codex_servers"][0]["busy_workers"], ["busy-codex"])
 
     def test_a_showrunner_timer_naming_a_session_not_running_is_unregistered(self) -> None:
-        before = {runner["slug"] for runner in inventory.unregistered_showrunners()}
-        stale = self.notifier / "showrunner-stale"
-        stale.mkdir()
+        before = {runner["name"] for runner in inventory.unregistered_showrunners()}
         stale_doc = self.root / "stale-production.md"
+        owner = recorded_showrunner("stale", stale_doc)
+        stale = self.notifier / f"showrunner-{owner.id}"
+        stale.mkdir()
         _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         _ = (stale / "conf").write_text(
             f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
             encoding="utf-8")
-        self.assertEqual({runner["slug"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
+        self.assertEqual({runner["name"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
 
     def test_incomplete_showrunner_timer_leaves_session_top_level(self) -> None:
         invalid_showrunner = self.notifier / "showrunner-incomplete"

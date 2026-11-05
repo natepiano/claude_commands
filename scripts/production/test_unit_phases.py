@@ -148,9 +148,15 @@ class UnitPhasesTests(unittest.TestCase):
             "| gone | — | — |",
         ]))
 
+    def production_document(self, doc: Path) -> None:
+        _ = doc.write_text(doc.read_text() + f"\n- **Merge branch:** main\n"
+                           + f"- **Showrunner checkout:** {self.root}\n- **Log:** log.md\n")
+        _ = fixture_member("showrunner", name="show", doc=staff.LiveDoc("natedev", doc))
+
     def test_main_keeps_plan_history_functions_intact_while_it_reads_and_renders(self) -> None:
         doc = self.root / "production.md"
         _ = doc.write_text("# Production\n", encoding="utf-8")
+        self.production_document(doc)
         headers = plan_history.run_started_event
         paths = plan_history.resolve_plan_path
         scans = plan_history.plan_runs
@@ -175,7 +181,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(phase_table, "show_production", side_effect=records),
               patch.object(unit_phases, "table", side_effect=render),
               contextlib.redirect_stdout(output)):
-            self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
+            self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         self.assertEqual(calls, ["records", "table"])
         self.assertEqual(output.getvalue(), "phase table\n")
         self.assertIs(plan_history.run_started_event, headers)
@@ -185,19 +191,20 @@ class UnitPhasesTests(unittest.TestCase):
     def test_without_a_production_the_callers_timer_names_it(self) -> None:
         doc = self.root / "show-production.md"
         _ = doc.write_text("# Production\n", encoding="utf-8")
+        self.production_document(doc)
         out = io.StringIO()
         with (patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "caller"}),
-              patch.object(showrunners, "production_of", return_value=doc) as found,
+              patch.object(showrunners, "own_name", return_value="show") as found,
               patch.object(live_units, "units_of_doc", return_value=[unit("a-unit", live("a"))]),
               patch.object(phase_table, "show_production", return_value="{}"),
               contextlib.redirect_stdout(out)):
             self.assertEqual(unit_phases.main([]), 0)
-        found.assert_called_once_with("caller")
+        found.assert_called_once_with()
         self.assertIn("| a | — | — |", out.getvalue())
 
     def test_a_session_that_is_no_showrunner_is_told_to_name_the_production(self) -> None:
         err = io.StringIO()
-        with (patch.object(showrunners, "production_of", return_value=None),
+        with (patch.object(showrunners, "own_name", return_value=""),
               contextlib.redirect_stderr(err)):
             self.assertEqual(unit_phases.main([]), 1)
         self.assertIn("pass --production", err.getvalue())
@@ -205,9 +212,10 @@ class UnitPhasesTests(unittest.TestCase):
     def test_style_kind_routes_to_the_ticket_table(self) -> None:
         doc = self.root / "style-production.md"
         _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Showrunner checkout:** `{self.root}`\n")
+        self.production_document(doc)
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True,
                            timeout=10)
-        owner = fixture_member("showrunner", name="style", doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name="show", doc=staff.LiveDoc("natedev", doc))
         _ = fixture_member("unit", name="names", parent=owner.id,
                            worktree=staff.PresentWorktree("natedev", self.root))
         units = [unit("names-unit", live("names"))]
@@ -220,7 +228,7 @@ class UnitPhasesTests(unittest.TestCase):
                   self.root, self.root / "ledger.sqlite")) as locate,
               patch.object(unit_phases, "table") as phases,
               contextlib.redirect_stdout(output)):
-            self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
+            self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         tickets.assert_called_once_with(units, records, doc=doc, ledger_paths={"names-unit": self.root / "ledger.sqlite"})
         locate.assert_called_once_with(self.root)
         phases.assert_not_called()
@@ -231,12 +239,13 @@ class UnitPhasesTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 doc = self.root / "phase-production.md"
                 _ = doc.write_text("# Production\n" + kind, encoding="utf-8")
+                self.production_document(doc)
                 units = [unit("a-unit", live("a"))]
                 output = io.StringIO()
                 with (patch.object(live_units, "units_of_doc", return_value=units),
                       patch.object(phase_table, "show_production", return_value="{}"),
                       patch.object(style_units, "table") as tickets, contextlib.redirect_stdout(output)):
-                    self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
+                    self.assertEqual(unit_phases.main(["--production", "show"]), 0)
                 tickets.assert_not_called()
                 self.assertEqual(output.getvalue(), "| Unit | Phase | Task |\n| --- | --- | --- |\n| a | — | — |\n")
 
@@ -245,7 +254,8 @@ class UnitPhasesTests(unittest.TestCase):
         _ = self.enterContext(patch.dict(os.environ, {"STYLE_LEDGER_STATE_DIR": str(self.root / "state")}))  # pyright: ignore[reportAny]
         doc = self.root / "style-production.md"
         _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Showrunner checkout:** `{self.root}`\n")
-        owner = fixture_member("showrunner", name="style", doc=staff.LiveDoc("natedev", doc))
+        self.production_document(doc)
+        owner = fixture_member("showrunner", name="show", doc=staff.LiveDoc("natedev", doc))
         for name, folder in (("names", self.root), ("types", self.root / "gone")):
             _ = fixture_member("unit", name=name, parent=owner.id,
                                worktree=staff.PresentWorktree("natedev", folder))
@@ -273,7 +283,7 @@ class UnitPhasesTests(unittest.TestCase):
                   "names-unit": {"unavailable": "plan cannot be read"},
                   "types-unit": {"unavailable": "worktree cannot be read"}})),
               contextlib.redirect_stdout(output)):
-            self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
+            self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         self.assertIn("| names | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 | 0 | 1 |", output.getvalue())
         self.assertIn("| types | idle | idle | — | 0 | 0 | 0 |", output.getvalue())
 

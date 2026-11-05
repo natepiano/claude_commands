@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Print every proposal still open for the user as one Markdown table.
 
-Usage: proposals_table.py [--production <production doc>] [--next]
+Usage: proposals_table.py [--production <production name>] [--next]
 
 Without `--production`, the doc is the one held by the update timer of the calling session
 (`CLAUDE_CODE_SESSION_ID`). Three sources, in this order:
@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.production import showrunners, staff
 from scripts.production.production_doc import Refusal
+from change_review import production_doc
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress, staff_name
 from proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs
@@ -386,16 +387,16 @@ def next_proposal(doc: Path) -> str:
 def main(arguments: list[str]) -> int:
     one = "--next" in arguments
     match [argument for argument in arguments if argument != "--next"]:
-        case ["--production", doc_text]:
-            doc: Path | None = Path(doc_text)
+        case ["--production", name]:
+            doc: Path | None = production_doc(name)
         case []:
             doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
             if doc is None:
-                print("proposals_table: this session is no production's showrunner; pass --production <doc>",
+                print("proposals_table: this session is no production's showrunner; pass --production <name>",
                       file=sys.stderr)
                 return 1
         case _:
-            print("usage: proposals_table.py [--production <production doc>] [--next]", file=sys.stderr)
+            print("usage: proposals_table.py [--production <production name>] [--next]", file=sys.stderr)
             return 2
     if one:
         print(next_proposal(doc.expanduser().resolve()))

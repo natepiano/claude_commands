@@ -1610,7 +1610,7 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
 
 
 def nightly_owner(args: GateArguments) -> str:
-    from scripts.production import session_staff, showrunners, staff
+    from scripts.production import session_staff, showrunners, staff, unit_lookup
     from scripts.shutdown import remote
 
     try:
@@ -1626,7 +1626,7 @@ def nightly_owner(args: GateArguments) -> str:
         if len(matching) != 1:
             return copies.fallback_owner("nightly")
         doc = matching[0]
-    return showrunners.production_slug(str(doc))
+    return unit_lookup.doc_owner(doc, staff.snapshot()).name
 
 
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> None:
@@ -1693,7 +1693,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
-                            help="the production doc whose header names the list (default: the calling showrunner's)")
+                            help="the production staff name (default: the calling showrunner's)")
     _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=["scripts"])
     _ = parser.add_argument("--promote", action="store_true")
     _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")

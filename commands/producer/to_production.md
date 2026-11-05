@@ -108,7 +108,7 @@ production format, with status `planned`:
 - **Updates:** every 15 minutes (user, 2026-09-28).
 - **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
   named for the top-level showrunner that will run it (a child production uses
-  its root's list); `change_review.py showrunner --production <doc>` prints the
+  its root's list); `change_review.py showrunner --production <showrunner name>` prints the
   name once the showrunner runs.
 - **Close-out:** the source plans' production-level steps, meaning work that
   no one unit owns or that runs after the last merge. Examples: data or

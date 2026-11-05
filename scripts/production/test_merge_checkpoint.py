@@ -133,6 +133,13 @@ class ReviewNumbersTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_merge_uses_the_staff_name_with_a_different_document_name(self) -> None:
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            _ = staff.rename(showrunners.owner_for("example").id, "hana")
+        result = self.run_checkpoint(self.checkpoint(), "--production", "hana")
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "production", cwd=self.origin))
+
     def test_checkpoint_refuses_another_staff_parent_without_changes_on_retry(self) -> None:
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):

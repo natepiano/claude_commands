@@ -26,7 +26,7 @@ from uuid import NAMESPACE_URL, uuid5
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import pane_record
+from scripts.shutdown import pane_record, remote
 
 FIXTURE_GIT: str = shutil.which("git") or "git"
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -326,7 +326,8 @@ def recorded_showrunner(name: str, doc: Path, parent: str = "") -> staff.StaffRo
     """Record the document that identifies one private production owner."""
     rows = [row for row in staff.initial_snapshot().find(kind="showrunner") if row.name == name]
     row = rows[0] if rows and not parent else showrunner_relationship(name, parent)
-    return staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+    location = staff.LiveDoc(remote.local_machine(), doc)
+    return row if row.doc == location else staff.set_doc(row.id, location)
 
 
 def fixture_unit_location(owner: staff.StaffRow, unit: str, location: Path) -> staff.StaffRow:
@@ -380,12 +381,10 @@ def production_membership(showrunner: str, *units: str) -> None:
         _ = unit_membership(showrunner, unit)
 
 
-def fixture_showrunner_name(slug: str, doc: Path) -> str:
-    """Keep the real doc's workspace name; extra fixture productions use their slugs."""
-    from scripts.production import showrunners
-    from scripts.production.production_doc import read_production
-
-    return showrunners.herdr_space(slug, str(doc)) if slug == read_production(doc).slug else slug
+def fixture_showrunner_name(production_name: str, doc: Path) -> str:
+    """Return the supplied staff name without reading the document."""
+    del doc
+    return production_name
 
 
 def source_environment(source: Path) -> dict[str, str]:
@@ -522,7 +521,7 @@ class RowProductionFixture:
     worker: staff.StaffRow
     doc: Path
     worktree: Path
-    slug: str
+    name: str
 
 
 class StaffTestCase(unittest.TestCase):
@@ -650,40 +649,41 @@ class StaffTestCase(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
-    def production(self, slug: str, *units: str, workspace: str = "", parent: str = "") -> Path:
+    def production(self, production_name: str, *units: str, workspace: str = "", parent: str = "") -> Path:
         """Write real timer/doc sources; each listed unit has a staff row and a folder."""
-        doc = self.source_root / f"{slug}-production.md"
-        self.write_production_doc(doc, workspace=workspace or slug)
-        self.register_production(slug, doc, name=workspace or slug)
+        doc = self.source_root / f"{production_name}-production.md"
+        self.write_production_doc(doc, workspace=workspace or production_name)
+        self.register_production(production_name, doc, name=workspace or production_name)
         for unit in units:
             _ = self.worktree(unit)
-            owner = fixture_runtime_id("showrunner::" + (workspace or slug))
+            owner = fixture_runtime_id("showrunner::" + (workspace or production_name))
             from scripts.production import unit_names
 
             identity = fixture_runtime_id("unit:" + owner + ":" + unit_names.name(unit))
             # A test can make or rename the row first; keep that row.
             if staff.initial_snapshot().by_id(staff.StaffId(identity)) is None:
-                _ = unit_membership(workspace or slug, unit)
-            self.pane(f"fixture:{slug}/{unit}", session_id=identity,
+                _ = unit_membership(workspace or production_name, unit)
+            self.pane(f"fixture:{production_name}/{unit}", session_id=identity,
                       environment={"CLAUDE_CODE_SESSION_ID": identity},
                       written_at="2026-10-01T00:00:00+00:00")
         if parent:
-            parent_file = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / slug / "parent"
+            parent_file = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / production_name / "parent"
             parent_file.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(parent_file, parent + "\n")
         return doc
 
-    def register_production(self, slug: str, doc: Path, *, name: str = "") -> None:
+    def register_production(self, production_name: str, doc: Path, *, name: str = "") -> None:
         """Register an existing fixture document without making a second production."""
-        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
+        row = recorded_showrunner(name or production_name, doc)
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{row.id}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
-        identity = fixture_runtime_id("showrunner::" + (name or slug))
+        identity = row.id
         write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
 
-    def record_production(self, slug: str, doc: Path) -> staff.StaffRow:
+    def record_production(self, production_name: str, doc: Path) -> staff.StaffRow:
         """Register the timer and record its private owner document."""
-        row = recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
-        self.register_production(slug, doc, name=row.name)
+        row = recorded_showrunner(fixture_showrunner_name(production_name, doc), doc)
+        self.register_production(production_name, doc, name=row.name)
         return row
 
     def write_production_doc(self, doc: Path, *, workspace: str) -> None:
@@ -705,9 +705,9 @@ class StaffTestCase(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def fill_production(self, slug: str, *units: str) -> Path:
+    def fill_production(self, production_name: str, *units: str) -> Path:
         """Build a timer doc and real linked worktrees for the live fill."""
-        repository = self.source_root / "repositories" / slug
+        repository = self.source_root / "repositories" / production_name
         repository.mkdir(parents=True)
         _ = self.fixture_git(repository, "init", "-b", "main")
         _ = self.fixture_git(repository, "config", "user.email", "fixture@example.invalid")
@@ -718,13 +718,13 @@ class StaffTestCase(unittest.TestCase):
             folder.parent.mkdir(parents=True, exist_ok=True)
             _ = self.fixture_git(repository, "worktree", "add", "-b", unit, str(folder))
             write_text_atomic(folder / ".unit.toml", 'plan = "standby"\nresponsibilities = []\n')
-        doc = repository / "docs" / f"{slug}-production.md"
+        doc = repository / "docs" / f"{production_name}-production.md"
         doc.parent.mkdir()
-        self.write_production_doc(doc, workspace=slug)
-        self.register_production(slug, doc)
-        production_membership(slug, *units)
+        self.write_production_doc(doc, workspace=production_name)
+        self.register_production(production_name, doc)
+        production_membership(production_name, *units)
         for unit in units:
-            row = unit_membership(slug, unit)
+            row = unit_membership(production_name, unit)
             _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.source_root / "worktrees" / unit),
                                    expected=row.worktree)
         # Do not import the checkout's real showrunner registry into the fill.
@@ -735,8 +735,8 @@ class StaffTestCase(unittest.TestCase):
 
     def row_production(self) -> RowProductionFixture:
         """Create private git evidence and conflicting legacy metadata."""
-        slug = "timer-alias"
-        repository = self.source_root / "repositories" / slug
+        production_name = "timer-alias"
+        repository = self.source_root / "repositories" / production_name
         repository.mkdir(parents=True)
         _ = self.fixture_git(repository, "init", "-b", "merge-from-git")
         _ = self.fixture_git(repository, "config", "user.email", "fixture@example.invalid")
@@ -759,11 +759,11 @@ class StaffTestCase(unittest.TestCase):
         current = staff.native_id(fixture_runtime_id("row-worker-current"))
         fixture_session(current, CLAUDE_BACKEND)
         worker = staff.update_current_session(worker.current_session, current)
-        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.id}" / "conf"
         timer.parent.mkdir(parents=True)
         write_text_atomic(timer, f"TARGET=session:{runner.id}\n"
                           + f"CHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
-        return RowProductionFixture(runner, unit, worker, doc, folder, slug)
+        return RowProductionFixture(runner, unit, worker, doc, folder, runner.name)
 
     def separated_unit_folders(self) -> RowProductionFixture:
         """Give the production doc its checkout fields beside the unit's own folder."""
@@ -808,12 +808,12 @@ class StaffTestCase(unittest.TestCase):
         })
         return path
 
-    def worker_run(self, slug: str, unit: str, director: str) -> Path:
+    def worker_run(self, production_name: str, unit: str, director: str) -> Path:
         """A unit run with actual state, roster, server and director records."""
-        run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{slug}-{unit}"
+        run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
         self.write_json(run / "progress_history_state.json", {
-            "production": slug, "unit": unit,
+            "production": production_name, "unit": unit,
             "main_agent": {"family": "claude", "session_id": director},
         })
         write_text_atomic(run / "director", director + "\n")

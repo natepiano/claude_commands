@@ -152,7 +152,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertNotIn("<STATE_DIR>", prompt)
         self.assertEqual(prompt.count("--render-state"), 1)
         self.assertIn("America/Los_Angeles", prompt)
-        self.assertIn(f"--production {self.doc}", prompt)
+        self.assertIn("--production example", prompt)
         self.assertNotIn("first-showrunner", prompt)
 
 
@@ -421,7 +421,7 @@ class QuestionIdentityTests(RegistrationFixture):
         errors = io.StringIO()
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             identities = registration.QuestionStaff.read()
-            self.assertIn(child.name, identities.slugs("example", below=True))
+            self.assertIn(child.name, identities.names("example", below=True))
             self.assertNotIn(child.name, identities.documents())
             owner = identities.owner(self.doc)
             with redirect_stderr(errors):
@@ -643,8 +643,8 @@ class QuestionIdentityTests(RegistrationFixture):
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             identities = registration.QuestionStaff.read()
             self.assertNotIn("example", identities.sources.productions)
-            self.assertEqual(identities.documents()["example"], self.doc)
-            self.assertEqual(registration.outstanding_file("example", identities=identities),
+            self.assertEqual(identities.documents()["different-display-name"], self.doc)
+            self.assertEqual(registration.outstanding_file("different-display-name", identities=identities),
                              self.state / "showrunner/outstanding" / f"{owner.id}.json")
         listed = self.run_command("open")
         self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)

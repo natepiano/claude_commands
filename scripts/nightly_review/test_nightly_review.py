@@ -296,7 +296,7 @@ class TonightTests(NightlyReviewTests):
         lines, calls = self.tonight([None, UNIT], [done(), done()])
         self.assertEqual(lines, [f"{SESSION}: started", f"{SESSION}: tonight's review sent"])
         self.assertEqual(calls[0], [sys.executable, str(nightly_review.SCRIPTS / "production/add_unit.py"),
-                                    "--production", str(DOC), SESSION, "--permanent"])
+                                    "--production", "build-followups", SESSION, "--permanent"])
         self.assertEqual(calls[1][calls[1].index("--to") + 1], f"uds:{UNIT.socket}")
 
     def test_a_refused_start_names_add_units_reason_and_sends_nothing(self) -> None:
@@ -325,12 +325,12 @@ class NightlyProductionTests(NightlyReviewTests):
         parent = staff.snapshot().parent_of(unit)
         if parent is None:
             self.fail("the nightly fixture unit lost its parent")
-        _ = fake_showrunner.write_timer(Path(os.environ["NOTIFIER_STATE_DIR"]), name,
+        _ = fake_showrunner.write_timer(Path(os.environ["NOTIFIER_STATE_DIR"]), parent.name,
                                          parent.current_session, "UTC", path)
         return str(path)
 
     def runners(self, *docs: tuple[str, str]) -> list[showrunners.Showrunner]:
-        return [showrunners.Showrunner(session="", socket="", slug=slug, zone="", doc=doc) for slug, doc in docs]
+        return [showrunners.Showrunner(session="", socket="", name=name, zone="", doc=doc) for name, doc in docs]
 
     def test_configuration_responsibility_wins_over_the_permanent_plan(self) -> None:
         _ = self.doc("old-alias", "permanent")
@@ -338,10 +338,10 @@ class NightlyProductionTests(NightlyReviewTests):
         _ = (self.root / "old-alias-unit/.unit.toml").write_text('plan = "permanent"\nresponsibilities = []\n')
         _ = (self.root / "new-alias-unit/.unit.toml").write_text('plan = "standby"\nresponsibilities = ["nightly-review"]\n')
         self.assertEqual(nightly_review.nightly_production(),
-                         nightly_review.NightlyProduction(destination, "new-alias"))
+                         nightly_review.NightlyProduction(destination, "new-alias-owner"))
 
     def test_stopped_responsibility_holder_starts_its_own_name_and_configured_launch_mode(self) -> None:
-        document = Path(self.doc("review-alias", "standby"))
+        _ = self.doc("review-alias", "standby")
         member = next(row for row in staff.snapshot().find(kind="unit"))
         member = staff.rename(member.id, "auditor")
         live: sessions.SessionRecord = {
@@ -358,7 +358,7 @@ class NightlyProductionTests(NightlyReviewTests):
                     lines = nightly_review.tonight(NIGHT)
                 calls = [cast(list[str], call.args[0]) for call in run.call_args_list]
                 self.assertEqual(calls[0], [sys.executable, str(nightly_review.SCRIPTS / "production/add_unit.py"),
-                                           "--production", str(document), "auditor", *launch])
+                                           "--production", "review-alias-owner", "auditor", *launch])
                 self.assertEqual(len(calls), 2, calls)
                 self.assertEqual(calls[1][calls[1].index("--to") + 1], "uds:/private/auditor.sock")
                 self.assertIn("tonight's review sent", lines[-1])
@@ -440,14 +440,14 @@ class NightlyProductionTests(NightlyReviewTests):
         listed = self.runners(("one", self.doc("one", "standby")), ("two", self.doc("two", "permanent")))
         with mock.patch.object(showrunners, "registered_showrunners", return_value=listed):
             self.assertEqual(nightly_review.nightly_production(),
-                             nightly_review.NightlyProduction(self.root / "two.md", "two"))
+                             nightly_review.NightlyProduction(self.root / "two.md", "two-owner"))
 
     def test_no_permanent_row_and_two_permanent_rows_are_each_named(self) -> None:
         with mock.patch.object(showrunners, "registered_showrunners", return_value=self.runners(("one", self.doc("one", "standby")))):
             self.assertIn("no running production", cast(str, nightly_review.nightly_production()))
         twice = self.runners(("one", self.doc("one", "permanent")), ("two", self.doc("two", "permanent")))
         with mock.patch.object(showrunners, "registered_showrunners", return_value=twice):
-            self.assertEqual(nightly_review.nightly_production(), "2 productions hold nightly-review-unit: one, two")
+            self.assertEqual(nightly_review.nightly_production(), "2 productions hold nightly-review-unit: one-owner, two-owner")
 
 
 if __name__ == "__main__":

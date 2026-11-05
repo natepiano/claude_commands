@@ -1994,7 +1994,7 @@ class MeshCommandFixture(unittest.TestCase):
 
         place = unit_labels.ProductionPlace(unit_labels.ProductionWithoutRunningShowrunner("sdlc"),
                                             unit_labels.DirectsUnit("roles-unit"))
-        runner = {"session": "", "socket": "", "slug": "sdlc", "zone": "UTC",
+        runner = {"session": "", "socket": "", "name": "sdlc", "zone": "UTC",
                   "doc": str(self.session_dir / "production.md")}
         _ = self.patches.enter_context(isolated_staff_file(self.session_dir / "staff.json", {}))
         _ = self.patches.enter_context(patch.object(message_roster, "_registered_showrunners", return_value=[runner]))

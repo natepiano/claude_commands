@@ -46,7 +46,7 @@ def setUpModule() -> None:
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
     def assert_completed_handoff_preserves_published_tip(self, *, with_review: bool) -> None:
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         if with_review:
             self.production_doc(change_review=review)
         _ = self.child_production()
@@ -85,7 +85,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assert_completed_handoff_preserves_published_tip(with_review=True)
 
     def test_completed_handoff_repairs_missing_publication_records(self) -> None:
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         self.production_doc(change_review=review)
         _ = self.child_production()
         checkpoint = self.dated_checkpoint(
@@ -210,7 +210,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             _ = (self.state / "mac-rc").write_text("1\n")
         else:
             self.write(self.promote, "src/alpha.txt", "local edit\n")
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         self.production_doc(change_review=review)
         if handoff:
             _ = self.child_production()
@@ -635,7 +635,7 @@ with lock.open("a") as held:
         with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
               mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
-                production=str(self.doc), unit="alpha-unit", phase="2", hash=sha,
+                production="example", unit="alpha-unit", phase="2", hash=sha,
                 also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
                 cancel_prior=False, started=STARTED, regime="after", holds=0,
                 merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),

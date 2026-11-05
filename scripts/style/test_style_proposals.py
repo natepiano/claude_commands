@@ -799,9 +799,9 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(self.progress(issue), (["active"], proposal_issue.InProgress()))
 
     def test_an_approved_style_decision_leaves_the_footer_count(self) -> None:
-        # A doc named for the style production, so the decisions it files are its own.
-        doc = self.root / f"{style_proposals.style_slug(self.repo)}.md"
-        _ = doc.write_text(f"# Style\n\n- **Proposals:** {self.proposals}\n", encoding="utf-8")
+        # The staff row owns the document.
+        doc = self.repo / ".git/decision-review.md"
+        _ = doc.write_text(f"# Style\n- **Kind:** style\n- **Branch point:** main\n- **Proposals:** {self.proposals}\n", encoding="utf-8")
         owner = proposal_issue.staff_reference("sample-style", "showrunner")
         _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
         with self.ledger() as ledger:

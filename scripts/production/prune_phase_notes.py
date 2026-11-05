@@ -33,15 +33,15 @@ def prune_all() -> list[str]:
     for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
         if not instance.is_dir():
             continue
-        slug = instance.name.removeprefix("showrunner-")
+        name = instance.name.removeprefix("showrunner-")
         checked = showrunners.checked_doc(instance)
         if isinstance(checked, showrunners.NoCheckedDoc):
-            failures.append(f"{slug}: {checked.reason}")
+            failures.append(f"{name}: {checked.reason}")
             continue
         try:
             phase_table.prune(checked.path)
         except (Refusal, OSError, UnicodeError) as error:
-            failures.append(f"{slug}: {error}")
+            failures.append(f"{name}: {error}")
     return failures
 
 

@@ -113,7 +113,7 @@ class RunProcessTests(StaffTestCase):
         return ["sh", "-c", WATCHER, str(retire_unit.MESH.resolve()), "900", "51101", str(folder.resolve()),
                 "python3", "300"]
 
-    def no_units(self, _slug: str) -> dict[str, object]:
+    def no_units(self, _production_name: str) -> dict[str, object]:
         return {}
 
     def inside(self, worktree: Path) -> list[int]:

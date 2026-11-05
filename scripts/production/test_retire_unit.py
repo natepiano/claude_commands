@@ -288,9 +288,9 @@ class RetireUnitTests(unittest.TestCase):
         _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
         _ = fixture_member("worker", name="seat", parent=self.unit_staff_id, runtime_id=SEAT)
-        production = read_production(self.doc)
+        production = read_production("alpha")
 
-        def production_of(_slug: str, *, record: staff.StaffSnapshot) -> Production:
+        def production_of(_production_name: str, *, record: staff.StaffSnapshot) -> Production:
             del record
             return production
 
@@ -338,7 +338,7 @@ class RetireUnitTests(unittest.TestCase):
         self.marked = unit_lookup.LabeledSession(
             "alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
 
-        def labeled_session(_slug: str, _name: str) -> unit_lookup.LabeledSession | None:
+        def labeled_session(_production_name: str, _name: str) -> unit_lookup.LabeledSession | None:
             return self.marked
 
         self.config = self.root / "config"

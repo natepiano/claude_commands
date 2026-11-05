@@ -316,7 +316,7 @@ class AccountsTests(unittest.TestCase):
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
         _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=[
-            showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="America/Los_Angeles", doc=""),
+            showrunners.Showrunner(session="fixture", socket="", name="fixture", zone="America/Los_Angeles", doc=""),
         ]))
 
     def live_report(self, config_dir: Path) -> agent_accounts.Report:
@@ -1810,8 +1810,8 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude3", "other@example.invalid")
         sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
         inventory = import_module("inventory")
-        stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
-                                       doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
+        stale = [showrunners.Showrunner(session="", socket="", name=name, zone="America/New_York",
+                                       doc=f"/w/{name}-production.md") for name in ("first", "second")]
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
               patch.object(inventory, "unregistered_showrunners", return_value=stale),
               patch.object(accounts, "move_sessions") as moved):
@@ -1820,11 +1820,11 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         self.assertIn("showrunners: no live session moves", output)
         for runner in stale:
-            line = next(line for line in output.splitlines() if line.startswith(runner["slug"] + ":"))
+            line = next(line for line in output.splitlines() if line.startswith(runner["name"] + ":"))
             self.assertIn("no session runs under the id", line)
             self.assertIn("in any Claude session on", line)
             self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", line)
-            self.assertIn(f"--production {runner['doc']}", line)
+            self.assertIn(f"--production {runner['name']}", line)
         moved.assert_not_called()
 
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
@@ -1832,7 +1832,7 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude3", "other@example.invalid")
         sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
         inventory = import_module("inventory")
-        stale = showrunners.Showrunner(session="", socket="", slug="missing", zone="America/New_York",
+        stale = showrunners.Showrunner(session="", socket="", name="missing", zone="America/New_York",
                                        doc="/w/missing-production.md")
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
               patch.object(inventory, "unregistered_showrunners", return_value=[stale]),
@@ -1844,7 +1844,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("missing: no session runs under the id", output)
         self.assertIn("in any Claude session on", output)
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", output)
-        self.assertIn("--production /w/missing-production.md", output)
+        self.assertIn("--production missing", output)
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
         moved.assert_not_called()

@@ -6,13 +6,12 @@ from scripts.production.cli_fixture import process_boundary
 
 import json
 import shutil
-import subprocess
 import sys
 import unittest
 from pathlib import Path
 from typing import cast, final, override
 
-from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
+from scripts.production.staff_test_support import isolated_staff_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from merge_checkpoint import ChildHandoffEntry, CodeCheckpoint, MergeEntry, NoMerge, ShrinkCommit, merge_branch_history
@@ -20,8 +19,7 @@ from merge_checkpoint import ChildHandoffEntry, CodeCheckpoint, MergeEntry, NoMe
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, SCRIPT, STARTED, configure_test_environment
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -265,27 +263,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertLess(result.stdout.index("push: ok"), result.stdout.index("promote: ok"))
         self.assertEqual(len(self.events("send.py")), 1)
         self.assertNotIn("hand-off acknowledgment:", result.stdout)
-    def test_former_child_slug_resolves_to_the_canonical_doc_and_merge_subject(self) -> None:
-        doc = self.child_production()
-        owner = recorded_showrunner("example-style", doc, parent="example")
-        journal = Path(self.env["SHOWRUNNER_STATE_DIR"]) / "example-style/rename.json"
-        journal.parent.mkdir(parents=True)
-        _ = journal.write_text(json.dumps({"old": "old-style", "new": "example-style", "staff_id": owner.id}))
-        checkpoint = self.checkpoint()
-        result = subprocess.run([
-            sys.executable, str(SCRIPT), "--from-child", "old-style", "--checkpoint", checkpoint,
-            "--production", str(self.doc), "--started", STARTED,
-        ], cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.git("log", "-1", "--format=%s"),
-                         f"Merge example-style hand-off ({checkpoint[:7]}) into production")
-        entry = merge_branch_history(self.checkout, "production").last_merge()
-        self.assertIsInstance(entry, ChildHandoffEntry)
-        if not isinstance(entry, ChildHandoffEntry):
-            self.fail("canonical child's hand-off was not recorded")
-        self.assertEqual(entry.child, "example-style")
-        self.assertEqual(len(self.events("send.py")), 1)
-        self.assertNotIn("old-style", str(self.events("send.py")))
     def test_handoff_refuses_unit_only_hold_metadata(self) -> None:
         _ = self.child_production()
         before = self.git("rev-parse", "HEAD")

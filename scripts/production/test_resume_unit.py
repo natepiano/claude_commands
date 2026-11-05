@@ -150,13 +150,14 @@ class ResumeUnitTests(unittest.TestCase):
 
         self.calls = []
         self.launch_code = 0
-        production = read_production(self.doc)
+        _ = self.staff.record_production("alpha", self.doc)
+        production = read_production("alpha")
 
-        def production_of(_slug: str, *, record: staff.StaffSnapshot) -> Production:
+        def production_of(_production_name: str, *, record: staff.StaffSnapshot) -> Production:
             del record
             return production
 
-        def not_marked(_slug: str, _name: str) -> unit_lookup.LabeledSession | None:
+        def not_marked(_production_name: str, _name: str) -> unit_lookup.LabeledSession | None:
             # The real pane writer retains a fixed owner; the live process resumes
             # that owner's current conversation, which can differ after /clear.
             owner = staff.by_current_session(DIRECTOR)
@@ -211,7 +212,7 @@ class ResumeUnitTests(unittest.TestCase):
 
     def assert_resumed(self, code: int, output: str) -> None:
         self.assertEqual(code, 0, output)
-        self.assertEqual(self.calls[-1], ["add_unit.py", "--production", str(self.doc), "alpha", "--resume", DIRECTOR,
+        self.assertEqual(self.calls[-1], ["add_unit.py", "--production", "alpha", "alpha", "--resume", DIRECTOR,
                                           "--cwd", str(self.worktree), "--plan", "docs/plans/alpha.md"])
         self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
         self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "main"))
@@ -269,7 +270,7 @@ class ResumeUnitTests(unittest.TestCase):
         def launch(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
             if len(argv) > 1 and Path(argv[1]).name == "add_unit.py":
                 commands.append(argv)
-                production = read_production(Path(argv[argv.index("--production") + 1]))
+                production = read_production(argv[argv.index("--production") + 1])
                 row = add_unit.ensure_staff_unit(production, argv[4])
                 launched_ids.append(row.id)
                 retirement.marked = unit_lookup.LabeledSession("alpha-unit",
@@ -371,9 +372,8 @@ class ResumeUnitTests(unittest.TestCase):
             f"sys.path.insert(0, {str(CHECKOUT)!r})",
             "import add_unit", "from scripts.production.production_doc import read_production",
             "def launch(arguments):",
-            "    doc = arguments[arguments.index('--production') + 1]",
-            "    from pathlib import Path",
-            "    row = add_unit.ensure_staff_unit(read_production(Path(doc)), arguments[2])",
+            "    name = arguments[arguments.index('--production') + 1]",
+            "    row = add_unit.ensure_staff_unit(read_production(name), arguments[2])",
             "    import pane_record",
             f"    pane_record.write('agents', pane_record.launch('w1:p1', {DIRECTOR!r}, {str(self.worktree)!r}, {{}}, ['claude']))",
             "    print(row.id)", "    return 0",
@@ -452,7 +452,7 @@ class ResumeUnitTests(unittest.TestCase):
         code, output = self.resume()
 
         self.assertEqual(code, 0, output)
-        self.assertEqual(self.calls, [["add_unit.py", "--production", str(self.doc), "alpha",
+        self.assertEqual(self.calls, [["add_unit.py", "--production", "alpha", "alpha",
                                       "--resume", DIRECTOR, "--cwd", str(self.worktree), "--plan", plan]])
 
     def test_a_transcript_under_another_account_resumes(self) -> None:
@@ -534,10 +534,10 @@ class ResumeUnitTests(unittest.TestCase):
             pane_record.write("agents", launch)
         current_backend = unit_lookup.labeled_session
 
-        def observed_backend(slug: str, name: str) -> unit_lookup.LabeledSession | None:
+        def observed_backend(production_name: str, name: str) -> unit_lookup.LabeledSession | None:
             # Retained pane files are historical evidence. Only the fake launch
             # establishes a live backend for this test.
-            return current_backend(slug, name) if self.calls else None
+            return current_backend(production_name, name) if self.calls else None
 
         with mock.patch.object(unit_lookup, "labeled_session", side_effect=observed_backend):
             self.assert_resumed(*self.resume())

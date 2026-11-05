@@ -43,7 +43,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prepared = accounts.PreparedAccount({"ACCOUNT_TEST_VARIABLE": "selected", "CLAUDE_CODE_OAUTH_TOKEN": "remove-me"},
                                              frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}))
         with patch.dict(os.environ, self.env), patch.object(accounts, "prepared_account", return_value=prepared):
-            code = add_unit.main(["--production", str(self.doc), *flags])
+            code = add_unit.main(["--production", self.production_name, *flags])
         self.assertEqual(code, 0)
         self.assertEqual(self.pane_environment()["ACCOUNT_TEST_VARIABLE"], "selected")
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", self.pane_environment())
@@ -57,7 +57,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         errors = io.StringIO()
         with (patch.dict(os.environ, self.env), redirect_stderr(errors),
               patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("account logged out")) as prepared):
-            code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
+            code = add_unit.main(["--production", self.production_name, "alpha", "--plan", "docs/plans/given.md",
                                   "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--account", "claude3"])
         self.assertEqual(code, 2)
         self.assertIn("account logged out", errors.getvalue())
@@ -87,7 +87,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
             json.dumps({"type": "user", "message": {"model": "ignored"}}),
             json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}), "{partial"]))
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
-        self.assertIn("herdr session attach agents, workspace director, tab alpha", result.stdout)
+        self.assertIn("herdr session attach agents, workspace build-followups, tab alpha", result.stdout)
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
         self.assertEqual(self.agent_arguments()[:4], ["--model", "opus", "--effort", "high"])
         self.assertIn(["--session", "alpha", "server", "stop"], self.herdr_calls())
@@ -138,7 +138,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
             patch.object(add_unit, "ensure_worktree", side_effect=change_role_after_worktree),
         ):
             result = add_unit.main([
-                "--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
+                "--production", self.production_name, "alpha", "--plan", "docs/plans/given.md",
             ])
 
         self.assertEqual(result, 0)
@@ -253,7 +253,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
                                   "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         with (patch.dict(os.environ, self.env),
               patch.object(accounts, "prepared_account", wraps=accounts.prepared_account) as prepared):
-            code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
+            code = add_unit.main(["--production", self.production_name, "alpha", "--plan", "docs/plans/given.md",
                 "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior)])
         self.assertEqual(code, 0)
         prepared.assert_any_call("claude2", resume=True)
@@ -420,12 +420,13 @@ class AddUnitAccountsTests(AddUnitTestCase):
     def test_names_without_table_rows_keep_suffix_across_productions(self) -> None:
         sample_doc = self.doc.with_name("sample-production.md")
         _ = sample_doc.write_text(self.production_doc(), encoding="utf-8")
-        for document, names in ((self.doc, ("designers", "reviewers", "showrunners", "units")),
-                                (sample_doc, ("reports", "designers-helper"))):
+        _ = self.staff.record_production("sample", sample_doc)
+        for production_name, names in ((self.production_name, ("designers", "reviewers", "showrunners", "units")),
+                                       ("sample", ("reports", "designers-helper"))):
             for name in names:
-                with self.subTest(production=document.name, name=name):
+                with self.subTest(production=production_name, name=name):
                     request = add_unit.launch_request(argparse.Namespace(
-                        production=str(document), name=name, plan="docs/plans/given.md", brief=None,
+                        production=production_name, name=name, plan="docs/plans/given.md", brief=None,
                         standby=False, permanent=False, port=None, timeout=90.0, check=False,
                         resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
                         probe=False,

@@ -159,14 +159,14 @@ class SessionFile(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class ProductionSession:
-    slug: str
+    name: str
     doc: str
 
 
 @dataclass(frozen=True)
 class ShowrunnerRegistration:
     session_id: str
-    slug: str
+    name: str
     doc: str
 
 
@@ -368,7 +368,7 @@ def showrunner_registrations() -> ShowrunnerRegistrations:
             _ = doc.path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        found.append(ShowrunnerRegistration(target[8:], showrunners.production_slug(str(doc.path)), str(doc.path)))
+        found.append(ShowrunnerRegistration(target[8:], showrunners.owner_for(instance.name.removeprefix("showrunner-")).name, str(doc.path)))
     return ShowrunnerRegistrations(tuple(found))
 
 
@@ -387,7 +387,7 @@ def unregistered_showrunners(
     except OSError:
         return []
     live_ids = {entry.session_id for entry in entries}
-    return [showrunners.Showrunner(slug=timer.slug, doc=timer.doc, session="", socket="", zone="")
+    return [showrunners.Showrunner(name=timer.name, doc=timer.doc, session="", socket="", zone="")
             for timer in timers.entries if timer.session_id not in live_ids]
 
 
@@ -401,19 +401,19 @@ def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, Uni
         every = unit_lookup.every_labeled_session()
     except OSError:
         return {}
-    docs = {runner.slug: runner.doc for runner in runners}
+    docs = {runner.name: runner.doc for runner in runners}
     found: dict[str, UnitMarks] = {}
-    for slug, units in every.units.items():
-        if slug not in docs:
+    for name, units in every.units.items():
+        if name not in docs:
             continue
         for unit_id, labeled_session in units.items():
             claude = labeled_session.claude
             if not isinstance(claude, unit_lookup.LiveClaude):
                 continue
             found[claude.session_id] = UnitMarks(
-                production=slug,
+                production=name,
                 unit=unit_id,
-                doc=docs[slug],
+                doc=docs[name],
                 session_name=labeled_session.place.session,
                 session_host="herdr",
             )
@@ -909,13 +909,13 @@ def _listed_session(
     unit = units.get(session_id)
     if production is not None:
         kind: Literal["showrunner", "unit", "worker", "top-level"] = "showrunner"
-        slug, doc = production.slug, production.doc
+        name, doc = production.name, production.doc
     elif unit is not None:
         kind = "unit"
-        slug, doc = unit.production, unit.doc
+        name, doc = unit.production, unit.doc
     else:
         kind = "worker" if record.get("kind") == "bg" else "top-level"
-        slug, doc = "", ""
+        name, doc = "", ""
     return ListedSession(
         session_id=session_id,
         pid=pid,
@@ -924,7 +924,7 @@ def _listed_session(
         kind=kind,
         config_dir=attributed.config_dir,
         login=attributed.account.login,
-        production=slug,
+        production=name,
         doc=doc,
     )
 
@@ -934,7 +934,7 @@ def listing(login: str | None = None, *,
     """List membership without inspecting transcripts, worktrees or host resources."""
     home_state = account.home_account_state()
     timers = showrunner_registrations() if isinstance(registrations, str) else registrations
-    productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
+    productions = {timer.session_id: ProductionSession(timer.name, timer.doc) for timer in timers.entries}
     units = _unit_sessions(timers.entries)
     found: list[ListedSession] = []
     for record in sessions.live_sessions():
@@ -968,7 +968,7 @@ def inventory(
     home_state = account.home_account_state()
     records = [_session_file(record) for record in sessions.live_sessions()]
     timers = showrunner_registrations()
-    productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
+    productions = {timer.session_id: ProductionSession(timer.name, timer.doc) for timer in timers.entries}
     units = _unit_sessions(timers.entries)
     session_ids = {
         session_id

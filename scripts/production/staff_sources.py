@@ -42,17 +42,17 @@ import unit_lookup  # noqa: E402
 
 def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
     """Resolve pane identity or current production membership through the shared join."""
-    return _member_sources().member(selector, record)
+    return _MemberSources({}, ()).member(selector, record)
 
 
 def ensure_staff_showrunner(child: Production, caller: str = "", *, runtime_id: str = "") -> staff.StaffRow:
     record = staff.initial_snapshot()
     sources = _member_sources()
-    found = sources.member(ShowrunnerMember(child.slug), record)
+    found = sources.member(ShowrunnerMember(child.name), record)
     location = staff.LiveDoc(remote.local_machine(), child.doc.resolve())
     if isinstance(found, MemberFound):
         if runtime_id and found.row.current_session != staff.native_id(runtime_id):
-            raise staff.StaffRefused(f"{child.slug}: native session conflicts with retained staff identity")
+            raise staff.StaffRefused(f"{child.name}: native session conflicts with retained staff identity")
         if found.row.doc == location:
             return found.row
         return staff.ensure("showrunner", name=found.row.name, parent=found.row.parent, doc=location)
@@ -66,27 +66,27 @@ def ensure_staff_showrunner(child: Production, caller: str = "", *, runtime_id: 
             if existing is None and source is None:
                 raise staff.StaffRefused(f"{caller}: native showrunner identity is not proved by its timer")
             parent = MemberFound(staff.ensure(
-                "showrunner", name=existing.name if existing else showrunners.herdr_space(caller, str(parent_doc)),
+                "showrunner", name=existing.name if existing else caller,
                 parent=existing.parent if existing else staff.StaffRoot(), doc=parent_location,
                 runtime_id=existing.current_session if existing else source.timer.target.removeprefix("session:") if source else ""))
     if isinstance(parent, NoSuchMember):
         if caller:
-            raise staff.StaffRefused(f"{child.slug}: no staff parent or timer document for {caller}")
-        return staff.ensure("showrunner", name=showrunners.herdr_space(child.slug, str(child.doc)), doc=location, runtime_id=runtime_id)
+            raise staff.StaffRefused(f"{child.name}: no staff parent or timer document for {caller}")
+        return staff.ensure("showrunner", name=child.name, doc=location, runtime_id=runtime_id)
     # Admission records the live doc; attach_parent records the edge and its
     # routing notices together after the showrunner appears.
-    return staff.ensure("showrunner", name=showrunners.herdr_space(child.slug, str(child.doc)), doc=location, runtime_id=runtime_id)
+    return staff.ensure("showrunner", name=child.name, doc=location, runtime_id=runtime_id)
 
 
 def showrunner_members(record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
-    """Resolve local production slugs to rows with the same launch-first matching rule."""
+    """Resolve local production production_names to rows with the same launch-first matching rule."""
     return _member_sources(record=record).showrunner_members(record)
 
 
 def unit_parent(unit: str, session_id: str = "") -> UnitProduction:
     """Resolve the current staff edge through the stored member reference."""
     reference = session_staff.StoredReference(session_id) if session_id else session_staff.BY_NAME
-    return unit_lookup.unit_parent(unit, reference, record=staff.snapshot(), sources=_member_sources())
+    return unit_lookup.unit_parent(unit, reference, record=staff.snapshot())
 
 
 LiveRole = str
@@ -332,7 +332,7 @@ def live() -> dict[str, object]:
     """Read one owner snapshot and project identities without changing any source."""
     record = staff.snapshot()
     dependencies = staff.RecordInputs(set(record.inputs))
-    sources = _member_sources(dependencies=dependencies)
+    sources = _member_sources(dependencies=dependencies, record=record)
     scan = _WorkerSources(record, sources, dependencies=dependencies)
     observed = scan.collect()
     members: dict[staff.StaffId, dict[str, object]] = {}
@@ -420,16 +420,6 @@ def cli_live() -> int:
     return staff.cli_result(run)
 
 
-@dataclass(frozen=True)
-class FillDocument:
-    path: Path
-    text: str
-    source: str
-
-    @property
-    def slug(self) -> str:
-        return showrunners.production_slug(str(self.path))
-
 
 def source_allowed(path: Path) -> bool:
     """Scratch checkouts never provide production ownership evidence."""
@@ -447,7 +437,7 @@ class BoundMigrationSources(_MemberSources):
     @override
     def member(self, selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
         if isinstance(selector, UnitMember):
-            parent = self.member(ShowrunnerMember(selector.slug), record)
+            parent = self.member(ShowrunnerMember(selector.name), record)
             if isinstance(parent, NoSuchMember):
                 return NoSuchMember(selector)
             matches = [row for row in record.find(kind="unit", parent=parent.row.id)
@@ -457,7 +447,7 @@ class BoundMigrationSources(_MemberSources):
             return MemberFound(matches[0]) if matches else NoSuchMember(selector)
         if not isinstance(selector, ShowrunnerMember):
             return super().member(selector, record)
-        source = self.productions.get(selector.slug)
+        source = self.productions.get(selector.name)
         if source is None:
             return NoSuchMember(selector)
         matches = [row for row in record.find(kind="showrunner")
@@ -494,18 +484,18 @@ def migration_peer_identities(record: staff.StaffSnapshot) -> tuple[dict[staff.S
                 problems.append(f"{row.id} {row.name}: scratch production source refused: {location.path}")
                 continue
             try:
-                result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                _ = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                                          location.machine, "cat -- " + shlex.quote(str(location.path))],
                                         capture_output=True, text=True, check=True, timeout=20,
                                         stdin=subprocess.DEVNULL)
-                slug = FillDocument(location.path, result.stdout, f"{location.machine}:{location.path}").slug
+                production_name = row.name
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 problems.append(f"{row.id} {row.name}: stored peer document unavailable: {error}")
                 continue
             candidates = [entry for entry in peer.entries
                           if entry.machine == location.machine and entry.role == "showrunner"
                           and isinstance(entry.showrunner, roster.RunsProduction)
-                          and entry.showrunner.production == slug]
+                          and entry.showrunner.production == production_name]
         elif row.kind == "unit" and isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):
             location = row.worktree
             candidates = [entry for entry in peer.entries
@@ -576,15 +566,13 @@ def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tupl
             continue
         try:
             document = location.path.read_text(encoding="utf-8")
-            slug = FillDocument(location.path, document, str(location.path)).slug
+            production_name = row.name
             timer = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{row.id}"
-            if not timer.exists():
-                timer = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}"
             if timer.exists():
                 source = showrunners.read_bound_source(timer, location.path)
             else:
-                source = showrunners.ShowrunnerSource(showrunners.Timer(slug, "", location.path, ""), document)
-            productions[slug] = source
+                source = showrunners.ShowrunnerSource(showrunners.Timer(production_name, "", location.path, ""), document)
+            productions[production_name] = source
         except (OSError, ValueError) as error:
             problems.append(f"{row.id} {row.name}: {error}")
     return BoundMigrationSources(productions, tuple(permitted)), tuple(problems)

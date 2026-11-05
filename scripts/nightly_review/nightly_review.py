@@ -264,13 +264,13 @@ class NightlyUnitNotSelected:
 @dataclass(frozen=True)
 class NightlyProduction:
     doc: Path
-    slug: str
+    name: str
     selection: NightlyUnit | NightlyUnitNotSelected = field(default_factory=NightlyUnitNotSelected, compare=False)
 
 
 def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduction | str:
     """Find the active unit whose configuration assigns the nightly review."""
-    from scripts.production import session_staff, showrunners, staff
+    from scripts.production import session_staff, staff
 
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
@@ -279,7 +279,7 @@ def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduct
         unknown: list[str] = []
         for row in staff.active(record, "unit"):
             parent = record.parent_of(row)
-            if parent is not None and isinstance(parent.doc, staff.WrappedDoc):
+            if parent is None or parent.kind != "showrunner" or isinstance(parent.doc, staff.WrappedDoc):
                 continue
             try:
                 config = resolver.unit_config(row)
@@ -298,15 +298,7 @@ def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduct
                 print(f"nightly_review: {reason}", file=sys.stderr)
                 unknown.append(reason)
                 continue
-            try:
-                timer = showrunners.timer_for(parent, record) if parent is not None else showrunners.NoTimer("staff parent is missing")
-            except (OSError, ValueError) as error:
-                reason = f"{row.name}: {error}"
-                print(f"nightly_review: {reason}", file=sys.stderr)
-                unknown.append(reason)
-                continue
-            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name if parent is not None else row.name
-            found.append(NightlyProduction(doc.path, slug, NightlyUnit(row, config)))
+            found.append(NightlyProduction(doc.path, parent.name, NightlyUnit(row, config)))
     except ValueError as error:
         return f"nightly review membership is unavailable: {error}"
     if unknown:
@@ -314,7 +306,7 @@ def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduct
     if not found:
         return "no running production has a unit configuration that assigns nightly-review"
     if len(found) > 1:
-        return f"{len(found)} productions hold nightly-review-unit: " + ", ".join(item.slug for item in found)
+        return f"{len(found)} productions hold nightly-review-unit: " + ", ".join(item.name for item in found)
     return found[0]
 
 
@@ -345,7 +337,7 @@ def tonight(day: date) -> list[str]:
         return [f"skipped: {production}"]
     selection = production.selection
     if isinstance(selection, NightlyUnitNotSelected):
-        return [f"skipped: {production.slug}: the nightly unit is not selected"]
+        return [f"skipped: {production.name}: the nightly unit is not selected"]
     lines: list[str] = []
     try:
         claude = live_unit(production, resolver=resolver)
@@ -355,7 +347,7 @@ def tonight(day: date) -> list[str]:
                       ["--standby"] if isinstance(plan, unit_config.StandbyPlan) else
                       ["--plan", plan.path.as_posix()])
             started = subprocess.run([sys.executable, str(SCRIPTS / "production" / "add_unit.py"), "--production",
-                                      str(production.doc), selection.unit.name, *launch], capture_output=True, text=True, check=False)
+                                      production.name, selection.unit.name, *launch], capture_output=True, text=True, check=False)
             if started.returncode != 0:
                 return [f"{selection.unit.name}: not started: {failure_detail(started)}"]
             lines.append(f"{selection.unit.name}: started")

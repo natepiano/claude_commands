@@ -26,6 +26,7 @@ from scripts.whoami.note_file import note_name
 import inventory
 import sessions
 from scripts.production import showrunners
+from scripts.production.staff_test_support import recorded_showrunner
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
@@ -105,7 +106,7 @@ class AccountMoveTests(ShutdownTestCase):
             proc_start=item["proc_start"], name=item["name"], kind=item["kind"],
             config_dir=Path(item.get("config_dir", str(accounts.account_dir("claude1")))), login=report["login"],
             production=item["production"] if item["kind"] == "showrunner" else
-                staff_sources.unit_parent(item["host"]["unit"]).slug if item["host"]["kind"] == "unit" else "",
+                staff_sources.unit_parent(item["host"]["unit"]).name if item["host"]["kind"] == "unit" else "",
             doc=item["doc"] if item["kind"] == "showrunner" else
                 staff_sources.unit_parent(item["host"]["unit"]).doc if item["host"]["kind"] == "unit" else "")
             for item in report["sessions"]]
@@ -425,9 +426,10 @@ class AccountMoveTests(ShutdownTestCase):
 
 
     def test_preview_reports_absent_registration_target_from_one_timer_read_without_sockets(self) -> None:
-        runner = self.root / "notifier/showrunner-missing-runner"
-        runner.mkdir(parents=True)
         doc = self.root / "missing-production.md"
+        owner = recorded_showrunner("missing", doc)
+        runner = self.root / "notifier" / f"showrunner-{owner.id}"
+        runner.mkdir(parents=True)
         _ = doc.write_text("- **User zone:** America/New_York\n", encoding="utf-8")
         _ = (runner / "conf").write_text(
             f"TARGET=session:absent-session\nCHECK=zsh /opt/production_check.sh {doc}\n", encoding="utf-8")
@@ -442,7 +444,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertIn("missing: no session runs under the id its update timer names", output)
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", output)
         self.assertIn("in any Claude session on", output)
-        self.assertIn("--production " + str(doc), output)
+        self.assertIn("--production missing", output)
 
 
     def test_group_move_dry_run_prints_members_and_target_without_change(self) -> None:

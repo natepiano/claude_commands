@@ -15,7 +15,6 @@ import shlex
 import socket
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
@@ -68,6 +67,7 @@ class ShowrunnerFixture(StaffTestCase):
         self.send_script: Path = Path()
         self.sent: Path = Path()
         self.children: list[subprocess.Popen[bytes]] = []
+        self.session_labels: dict[str, list[str]] = {}
 
     @override
     def setUp(self) -> None:
@@ -118,19 +118,51 @@ raise SystemExit(1)
             child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.children.append(child)
             pid = child.pid
+        socket_name = session_id
+        try:
+            session_id = staff.native_id(session_id)
+        except staff.StaffRefused:
+            session_id = fixture_runtime_id(session_id)
         for unit in self.hosted_units:
             if name == unit.session or session_id == unit.marks.get("CODEX_THREAD_ID"):
                 fake_unit_host.place_process(self.environment(), pid, unit.pane)
-        _ = (self.sessions / f"{pid}.json").write_text(json.dumps({
-            "pid": pid, "name": name, "sessionId": session_id,
-            "messagingSocketPath": str(self.root / f"{session_id}.sock"),
-            "updatedAt": 1, "running": running,
-        }))
+        for index, runtime in enumerate(self.session_labels.get(session_id, [session_id])):
+            runtime_pid = pid
+            if index:
+                child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.children.append(child)
+                runtime_pid = child.pid
+            path = self.sessions / f"{runtime_pid}.json"
+            _ = path.write_text(json.dumps({
+                "pid": runtime_pid, "name": name, "sessionId": runtime,
+                "messagingSocketPath": str(self.root / f"{socket_name}.sock"),
+                "updatedAt": 1, "running": running,
+            }))
         return pid
 
     def instance(self, name: str, *, target: str = "session:live-id", zone: str = "America/Los_Angeles",
                  units: tuple[str, ...] = ("hook", "tool-based-ui-geometry-material"),
                  include_target: bool = True, include_prompt: bool = True, doc: Path | None = None) -> None:
+        if name.startswith("showrunner-") and doc is not None:
+            owner_name = name.removeprefix("showrunner-")
+            row = staff.initial_snapshot().by_id(staff.StaffId(owner_name))
+            row = row or next((row for row in staff.initial_snapshot().find(kind="showrunner") if row.name == owner_name), None)
+            if row is None:
+                row = fixture_member("showrunner", name=owner_name, doc=staff.LiveDoc("natedev", doc))
+            current = target.removeprefix("session:")
+            try:
+                current = staff.native_id(current)
+            except staff.StaffRefused:
+                current = fixture_runtime_id(current)
+            label = current
+            existing = staff.initial_snapshot().by_current_session(current)
+            if existing is not None and existing.id != row.id:
+                current = fixture_runtime_id(row.id + ":" + current)
+            self.session_labels.setdefault(label, []).append(current)
+            if row.current_session != current:
+                row = staff.update_current_session(row.current_session, staff.native_id(current))
+            name = f"showrunner-{row.id}"
+            target = f"session:{row.id}"
         directory = self.notifier / name
         directory.mkdir()
         prompt = directory / "prompt"
@@ -173,21 +205,17 @@ raise SystemExit(1)
         self.assertEqual(result.stdout, "")
         return result.stderr
 
-    def showrunner(self, slug: str, *, running: bool = True, previous: tuple[str, ...] = (), name: str = "") -> None:
-        """One production with an update timer, its showrunner named `name`, else its slug, when it runs."""
-        doc = self.root / f"{slug}-production.md"
-        row = fixture_member("showrunner", name=slug)
-        self.instance(f"showrunner-{slug}", target=f"session:{row.id}", doc=doc)
+    def showrunner(self, production_name: str, *, running: bool = True, name: str = "") -> None:
+        """One production with an update timer, its showrunner named `name`, else its production_name, when it runs."""
+        doc = self.root / f"{production_name}-production.md"
+        row = fixture_member("showrunner", name=production_name)
+        self.instance(f"showrunner-{production_name}", target=f"session:{row.id}", doc=doc)
         _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
-        for old in previous:
-            path = self.state / old / "rename.json"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _ = path.write_text(json.dumps({"old": old, "new": slug}))
         if running:
-            pid = self.record(name or slug, row.id)
+            pid = self.record(name or production_name, row.id)
             path = self.sessions / f"{pid}.json"
             value = cast(dict[str, object], json.loads(path.read_text()))
-            value["messagingSocketPath"] = str(self.root / f"{slug}-id.sock")
+            value["messagingSocketPath"] = str(self.root / f"{production_name}-id.sock")
             write_text_atomic(path, json.dumps(value) + "\n")
 
     def messages(self) -> list[tuple[str, str]]:
@@ -227,7 +255,7 @@ raise SystemExit(1)
 class RowTimerJoinTests(StaffTestCase):
     def register_timer(self, row: staff.StaffRow) -> Path:
         path = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{row.id}" / "conf"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, f"TARGET=session:{row.id}\n")
         return path
 
@@ -258,7 +286,7 @@ class RowTimerJoinTests(StaffTestCase):
         self.assertEqual(timer.target, f"session:{fixture.runner.id}")
         self.assertEqual(self.staff_file.read_bytes(), before)
 
-    def test_timer_keeps_the_production_label_after_an_owner_name_change(self) -> None:
+    def test_timer_uses_the_current_staff_name(self) -> None:
         fixture = self.row_production()
         _ = self.register_timer(fixture.runner)
         row = staff.rename(fixture.runner.id, "new-owner")
@@ -266,7 +294,7 @@ class RowTimerJoinTests(StaffTestCase):
         timer = showrunners.timer_for(row, staff.snapshot())
         self.assertIsInstance(timer, showrunners.TimerRegistration)
         assert isinstance(timer, showrunners.TimerRegistration)
-        self.assertEqual(timer.slug, "row")
+        self.assertEqual(timer.name, "new-owner")
         self.assertEqual(timer.target, f"session:{row.id}")
         self.assertEqual(self.staff_file.read_bytes(), before)
 
@@ -280,7 +308,7 @@ class RowTimerJoinTests(StaffTestCase):
                           + f"CHECK=zsh /tools/production_check.sh {row.id}\nZONE=UTC\n")
         return row, folder
 
-    def test_timer_keeps_the_production_label_and_supplied_staff(self) -> None:
+    def test_timer_uses_the_supplied_staff_name(self) -> None:
         row, folder = self.timer("hana")
         row = staff.rename(row.id, "hana-owner")
         record = staff.snapshot()
@@ -289,9 +317,9 @@ class RowTimerJoinTests(StaffTestCase):
             sources = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.RAISE, record=record)
             runners = showrunners.registered_showrunners(known_sessions={}, membership=record)
             members = staff_sources.showrunner_members(record)
-        self.assertEqual([source.timer.slug for source in sources], ["hana"])
-        self.assertEqual([runner["slug"] for runner in runners], ["hana"])
-        self.assertEqual(members, {"hana": row})
+        self.assertEqual([source.timer.name for source in sources], ["hana-owner"])
+        self.assertEqual([runner["name"] for runner in runners], ["hana-owner"])
+        self.assertEqual(members, {"hana-owner": row})
 
     def test_production_membership_does_not_require_a_matching_timer_target(self) -> None:
         row, folder = self.timer("member")
@@ -323,7 +351,7 @@ class RowTimerJoinTests(StaffTestCase):
         assert isinstance(timer, showrunners.TimerRegistration)
         self.assertEqual(timer.target, f"session:{row.id}")
         self.assertEqual(len(runners), 1)
-        self.assertEqual(runners[0]["slug"], row.name)
+        self.assertEqual(runners[0]["name"], row.name)
         self.assertEqual(runners[0]["doc"], "")
         self.assertEqual(runners.lookup_failures, ())
 
@@ -334,7 +362,7 @@ class RowTimerJoinTests(StaffTestCase):
             timer = showrunners.timer_for(row, staff.snapshot())
         self.assertIsInstance(timer, showrunners.TimerRegistration)
         assert isinstance(timer, showrunners.TimerRegistration)
-        self.assertEqual(timer.slug, row.name)
+        self.assertEqual(timer.name, row.name)
         self.assertEqual(showrunners.checked_doc(folder),
                          showrunners.CheckedDoc(self.root / "old-production.md"))
 
@@ -390,7 +418,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
             self.assertEqual(showrunners.registered_showrunners(self.notifier, deadline=began + 0.15), [])
         self.assertEqual(errors.getvalue().count("lookup timed out; retained"), 1)
         self.assertLess(monotonic() - began, 1.5)
-        self.assertTrue((self.notifier / "showrunner-builds" / "conf").exists())
+        self.assertTrue((self.notifier / f"showrunner-{showrunners.owner_for('builds').id}" / "conf").exists())
 
     def test_failed_lookup_keeps_healthy_rows_and_reserves_inspection_budget(self) -> None:
         self.instance("showrunner-a-stalled", target="session:stalled-id", doc=self.doc)
@@ -400,7 +428,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
             errors = io.StringIO()
 
             def lookup(target: str, *, deadline: float) -> str:
-                if target == "session:stalled-id":
+                if target == "session:" + fixture_runtime_id("stalled-id"):
                     clock[0] = deadline
                     raise failure("fixture lookup failed; retained")
                 self.assertGreater(deadline, clock[0])
@@ -412,12 +440,12 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
                   mock.patch.object(showrunners, "_session_name", return_value="healthy"),
                   redirect_stderr(errors)):
                 found = showrunners.registered_showrunners(self.notifier, deadline=210.0)
-                self.assertEqual([row["slug"] for row in found], ["b-healthy"])
+                self.assertEqual([row["name"] for row in found], ["b-healthy"])
                 self.assertEqual(found.exit_code, 1)
                 self.assertEqual(found.failures, (errors.getvalue().strip(),))
                 self.assertLess(clock[0], 210.0)
                 self.assertEqual(errors.getvalue().count("fixture lookup failed; retained"), 1)
-                self.assertTrue((self.notifier / "showrunner-a-stalled/conf").exists())
+                self.assertTrue((self.notifier / f"showrunner-{showrunners.owner_for('a-stalled').id}" / "conf").exists())
 
     def test_commands_finish_healthy_output_before_reporting_lookup_failure(self) -> None:
         self.showrunner("healthy")
@@ -425,7 +453,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         original = showrunners.socket_for
 
         def lookup(target: str) -> str | None:
-            if target == "session:stalled-id":
+            if target == "session:" + fixture_runtime_id("stalled-id"):
                 raise OSError("fixture registry unreadable")
             return original(target)
 
@@ -460,8 +488,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
     def test_named_lookup_keeps_unknown_liveness_distinct_from_absence(self) -> None:
         partial = showrunners.ShowrunnerDiscovery([], (
             showrunners.ShowrunnerLookupFailure("missing", "fixture registry unreadable"),))
-        with (mock.patch.object(showrunners, "canonical_slug", return_value="missing"),
-              mock.patch.object(showrunners, "registered_showrunners", return_value=partial)):
+        with mock.patch.object(showrunners, "registered_showrunners", return_value=partial):
             with self.assertRaisesRegex(OSError, "fixture registry unreadable"):
                 _ = showrunners.named("missing")
 
@@ -489,17 +516,17 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
               mock.patch.object(showrunners, "socket_for", side_effect=lookup),
               redirect_stderr(errors)):
             found = showrunners.registered_showrunners()
-            for slug in ("kid", "top"):
+            for production_name in ("kid", "top"):
                 with self.assertRaises(OSError) as caught:
-                    _ = showrunners.current_address(slug)
+                    _ = showrunners.current_address(production_name)
                 self.assertEqual(str(caught.exception),
-                                 "cannot tell whether session:kid-session is running: registry unreadable; " +
-                                 "cannot tell whether session:top-session is running: registry unreadable")
+                                 f"cannot tell whether session:{fixture_runtime_id('kid-session')} is running: registry unreadable; " +
+                                 f"cannot tell whether session:{fixture_runtime_id('top-session')} is running: registry unreadable")
                 self.assertNotIn("showrunners: skipping", str(caught.exception))
         self.assertEqual([failure.production for failure in found.lookup_failures], ["kid", "top"])
         self.assertEqual([failure.reason for failure in found.lookup_failures], [
-            "cannot tell whether session:kid-session is running: registry unreadable",
-            "cannot tell whether session:top-session is running: registry unreadable"])
+            f"cannot tell whether session:{fixture_runtime_id('kid-session')} is running: registry unreadable",
+            f"cannot tell whether session:{fixture_runtime_id('top-session')} is running: registry unreadable"])
         self.assertEqual(found.exit_code, 1)
         self.assertEqual(errors.getvalue().splitlines(), list(found.failures) * 3)
 
@@ -511,16 +538,16 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         listener.bind(str(socket_path))
         self.addCleanup(listener.close)
         record: SessionRecord = {
-            "pid": os.getpid(), "sessionId": "builds-id", "name": "builds", "updatedAt": 1,
+            "pid": os.getpid(), "sessionId": fixture_runtime_id("builds-id"), "name": "builds", "updatedAt": 1,
             "messagingSocketPath": str(socket_path), "tmux": "", "formerNames": [],
         }
         with mock.patch.object(showrunners, "socket_for", side_effect=AssertionError("no sessions subprocess")) as sockets, \
              mock.patch.object(showrunners, "_session_name", side_effect=AssertionError("no session reread")) as names:
-            found = showrunners.registered_showrunners(self.notifier, known_sessions={"builds-id": record})
+            found = showrunners.registered_showrunners(self.notifier, known_sessions={fixture_runtime_id("builds-id"): record})
             record["name"] = "renamed-builds"
-            renamed = showrunners.registered_showrunners(self.notifier, known_sessions={"builds-id": record})
+            renamed = showrunners.registered_showrunners(self.notifier, known_sessions={fixture_runtime_id("builds-id"): record})
             absent = showrunners.registered_showrunners(self.notifier, known_sessions={})
-        self.assertEqual([(runner["slug"], runner["session"], runner["socket"], runner["doc"]) for runner in found], [
+        self.assertEqual([(runner["name"], runner["session"], runner["socket"], runner["doc"]) for runner in found], [
             ("builds", "builds", str(socket_path), str(self.doc)),
             ("stopped", "", "", str(self.root / "stopped.md")),
         ])
@@ -532,7 +559,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
     def test_an_unreadable_timer_conf_refuses_registry_discovery_beside_a_good_timer(self) -> None:
         self.instance("showrunner-a-good", target="session:good-id", doc=self.doc)
         self.instance("showrunner-z-bad", target="session:bad-id", doc=self.root / "bad-production.md")
-        conf = self.notifier / "showrunner-z-bad" / "conf"
+        conf = self.notifier / f"showrunner-{showrunners.owner_for('z-bad').id}" / "conf"
         conf.unlink()
         conf.mkdir()
         with self.assertRaises(IsADirectoryError) as raised:
@@ -577,7 +604,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         current = staff.native_id(fixture_runtime_id("showrunner-after-clear"))
         _ = staff.update_current_session(row.current_session, current)
         _ = self.record("still-demo", current)
-        configuration = self.notifier / "showrunner-demo" / "conf"
+        configuration = self.notifier / f"showrunner-{row.id}" / "conf"
         before = configuration.read_bytes(), configuration.stat().st_mtime_ns
         self.assertEqual(self.successful("address", "demo"), f"uds:{self.root / (current + '.sock')}\n")
         self.assertEqual(self.successful("name", "demo"), "still-demo\n")
@@ -587,80 +614,27 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
     def test_a_stopped_timer_still_names_its_showrunner(self) -> None:
         # A production on demand keeps its timer stopped, and the timer is still the showrunner's record.
         self.instance("showrunner-show", doc=self.doc)
-        _ = (self.notifier / "showrunner-show" / "state").write_text(
+        _ = (self.notifier / f"showrunner-{showrunners.owner_for("show").id}" / "state").write_text(
             "ENABLED=0\nNEXT_DUE=0\nLAST_SENT=0\nLAST_RESTART=0\nLAST_TARGET=\n", encoding="utf-8")
         _ = self.record("on-demand", "live-id")
         self.assertEqual(self.successful("name", "show"), "on-demand\n")
         self.assertIn("show\ton-demand\t", self.successful("list"))
 
-    def test_former_slug_reaches_the_current_showrunner_by_name_and_address(self) -> None:
-        self.showrunner("new", previous=("old",), name="new-name")
-        address = f"uds:{self.root / 'new-id.sock'}"
-        self.assertEqual(self.successful("address", "old"), f"{address}\n")
-        self.assertEqual(self.successful("name", "old"), "new-name\n")
-        with (mock.patch.dict(os.environ, self.environment()),
-              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
-            self.assertEqual(showrunners.current_address("old"), address)
-            self.assertEqual(showrunners.current_name("old"), "new-name")
 
-    def test_named_accepts_a_live_session_name_and_a_former_production_slug(self) -> None:
-        self.showrunner("new", previous=("old",), name="new-name")
-        with (mock.patch.dict(os.environ, self.environment()),
-              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
-            self.assertEqual(showrunners.named("new-name")["slug"], "new")
-            self.assertEqual(showrunners.named("old")["slug"], "new")
 
-    def test_named_prefers_the_production_a_former_slug_resolves_to_over_a_session_of_that_name(self) -> None:
-        # The session-named runner sorts first, so a first-match lookup would return it.
-        self.instance("showrunner-a-other", target="session:a-other-id", doc=self.root / "a-other-production.md")
-        _ = self.record("old", "a-other-id")
-        self.showrunner("z-new", previous=("old",))
-        with (mock.patch.dict(os.environ, self.environment()),
-              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
-            self.assertEqual(showrunners.named("old")["slug"], "z-new")
 
-    def test_a_document_without_a_journal_claims_no_slug(self) -> None:
-        self.showrunner("new", running=False)
-        _ = (self.root / "new-production.md").write_text(
-            "# Production\n\n## Production Context\n\n- **Owner:** someone\n\n## Notes\n\n```\n- **Owner:** `old`\n```\n",
-            encoding="utf-8")
-        self.assertEqual(showrunners.canonical_slug("old"), "old")
 
-    def test_previous_can_name_two_previous_slugs_without_a_running_showrunner(self) -> None:
-        self.showrunner("new", running=False, previous=("old", "older"))
-        for slug in ("new", "old", "older"):
-            with self.subTest(slug=slug):
-                self.assertEqual(showrunners.canonical_slug(slug), "new")
-        self.assertEqual(showrunners.production_slug(str(self.root / "new-production.md")), "new")
 
-    def test_a_current_slug_takes_precedence_over_another_productions_former_slug(self) -> None:
-        # The former owner sorts first, so an alias match cannot win before all current slugs are checked.
-        self.showrunner("a-renamed", previous=("z-current",))
-        self.showrunner("z-current")
-        self.assertEqual(showrunners.canonical_slug("z-current"), "z-current")
-        self.assertEqual(self.successful("address", "z-current"), f"uds:{self.root / 'z-current-id.sock'}\n")
 
-    def test_an_unknown_slug_passes_through_but_showrunner_commands_refuse_it(self) -> None:
-        self.showrunner("new", running=False)
-        self.assertEqual(showrunners.canonical_slug("older"), "older")
-        for verb in ("name", "address"):
-            with self.subTest(verb=verb):
-                self.assertIn("the showrunner of older is not running", self.refused(verb, "older"))
-        for arguments in (("attach", "older", "new"), ("parent", "older")):
-            with self.subTest(arguments=arguments):
-                self.assertIn("older has no update timer", self.refused(*arguments))
 
     def test_name_and_address_refuse_a_showrunner_that_is_not_running_or_has_no_timer(self) -> None:
         self.instance("showrunner-show", doc=self.doc)
         for verb in ("name", "address"):
-            for slug in ("show", "absent"):
-                with self.subTest(verb=verb, slug=slug):
-                    result = self.cli(verb, slug)
+            for production_name in ("show", "absent"):
+                with self.subTest(verb=verb, name=production_name):
+                    result = self.cli(verb, production_name)
                     self.assertEqual((result.returncode, result.stdout), (1, ""))
-                    self.assertIn(f"the showrunner of {slug} is not running", result.stderr)
+                    self.assertIn(f"the showrunner of {production_name} is not running", result.stderr)
 
     def test_unreadable_session_records_are_an_error_not_a_stopped_showrunner(self) -> None:
         self.instance("showrunner-show", doc=self.doc)
@@ -671,7 +645,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         result = self.cli("list")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("not running", result.stdout)
-        self.assertIn("cannot tell whether session:live-id is running: sessions: one or more registry files",
+        self.assertIn(f"cannot tell whether session:{fixture_runtime_id('live-id')} is running: sessions: one or more registry files",
                       result.stderr)
 
     def test_the_zone_is_the_users_setting_whatever_the_doc_says(self) -> None:
@@ -688,8 +662,8 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         result = self.cli("list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(result.stdout.splitlines()), sorted(
-            f"{slug}\tdirector\t{LOS_ANGELES}\t{doc}"
-            for slug, doc in (("no-zone", no_zone), ("other-zone", other_zone), ("bad-zone", bad_zone))))
+            f"{production_name}\tdirector\t{LOS_ANGELES}\t{doc}"
+            for production_name, doc in (("no-zone", no_zone), ("other-zone", other_zone), ("bad-zone", bad_zone))))
         self.assertNotIn("skipping", result.stderr)
 
     def test_a_timer_that_is_not_a_complete_showrunners_is_left_out_with_the_reason(self) -> None:
@@ -706,9 +680,10 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [f"show\tdirector\t{LOS_ANGELES}\t{self.doc}"])
         self.assertIn("skipping showrunner-no-target", result.stderr)
-        self.assertIn("skipping showrunner-no-doc: CHECK is missing", result.stderr)
+        self.assertIn("skipping showrunner-no-doc:", result.stderr)
+        self.assertIn("no showrunner staff row", result.stderr)
         self.assertIn("skipping showrunner-lost-doc: production doc could not be read", result.stderr)
-        self.assertIn("skipping showrunner-unnamed: session unnamed-id has no live named process", result.stderr)
+        self.assertIn(f"skipping showrunner-unnamed: session {fixture_runtime_id('unnamed-id')} has no live named process", result.stderr)
 
     def test_the_name_comes_from_the_live_process_not_a_stale_record_of_the_same_session(self) -> None:
         self.instance("showrunner-show", doc=self.doc)
@@ -754,10 +729,10 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
                     _ = showrunners.load_settings_from(self.config)
 
     def test_delivery_result_tracks_failed_targets_and_preserves_output_lines(self) -> None:
-        def address(slug: str) -> str:
-            return "session:" + slug
+        def address(production_name: str) -> str:
+            return "session:" + production_name
 
-        with mock.patch.object(showrunners, "own_slug", return_value="self"), \
+        with mock.patch.object(showrunners, "own_name", return_value="self"), \
                 mock.patch.object(showrunners, "current_address", side_effect=address), \
                 mock.patch.object(showrunners, "send_to_address", wraps=showrunners.send_to_address) as sender, \
                 mock.patch.object(subprocess, "run", side_effect=[
@@ -782,18 +757,14 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertEqual(sent, [["--to", "session:unit-id", "--from", "transfer_unit", "--key", "transfer-key",
                                  "--text", "new production\nkeep running"]])
 
-
-class HerdrNameTests(unittest.TestCase):
-    def test_workspace_is_named_for_the_showrunner(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        named, unnamed = root / "prod-production.md", root / "other-production.md"
-        _ = named.write_text("# Prod\n\n- **Showrunner checkout:** `/repo`\n- **Showrunner session:** boss\n")
-        _ = unnamed.write_text("# Other\n")
-        with mock.patch.dict(os.environ, {"STAFF_FILE": str(root / "staff.json")}):
-            _ = fixture_member("showrunner", name="boss", doc=staff.LiveDoc("natedev", named))
-            self.assertEqual(showrunners.herdr_space("prod", str(named)), "boss")
-            self.assertEqual(showrunners.herdr_space("other", str(unnamed)), "other")
-            self.assertEqual(showrunners.herdr_space("gone", str(root / "gone-production.md")), "gone")
+    def test_commands_refuse_an_unknown_staff_name(self) -> None:
+        self.showrunner("new", running=False)
+        for verb in ("name", "address"):
+            with self.subTest(verb=verb):
+                self.assertIn("the showrunner of older is not running", self.refused(verb, "older"))
+        for arguments in (("attach", "older", "new"), ("parent", "older")):
+            with self.subTest(arguments=arguments):
+                self.assertIn("older has no update timer", self.refused(*arguments))
 
 if __name__ == "__main__":
     _ = unittest.main()

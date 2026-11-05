@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import change_review
 import scratch  # on the path once change_review has put scripts/lib there
-from scripts.production.showrunners import canonical_slug
+from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, Refusal, cell_value, production_field, read_production
 
 from scripts.direct import progress_history  # noqa: E402
@@ -235,17 +235,17 @@ def report(step: str, state: str, detail: str) -> None:
 
 
 @contextmanager
-def merge_lock(checkout: Path, slug: str) -> Generator[None]:
+def merge_lock(checkout: Path, name: str) -> Generator[None]:
     """Held for a whole merge gate. A unit rename takes it before it writes the merge branch, so
     neither lands a commit inside the other's run."""
     common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if common.returncode:
         raise OSError(f"{checkout}: no git directory for the merge lock: {common.stderr.strip()}")
-    with (Path(common.stdout.strip()) / f"showrunner-merge-{slug}.lock").open("a") as lock:
+    with (Path(common.stdout.strip()) / f"showrunner-merge-{name}.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(f"merge lock: waiting — a merge gate or a unit rename is writing {slug}'s merge branch", flush=True)
+            print(f"merge lock: waiting — a merge gate or a unit rename is writing {name}'s merge branch", flush=True)
             fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
@@ -362,10 +362,10 @@ def user_bump(args: argparse.Namespace) -> bool:
 
 def request_from(args: argparse.Namespace) -> MergeRequest:
     bump = user_bump(args)
-    production = read_production(Path(cast(str, args.production)))
+    record = staff.snapshot()
+    production = read_production(cast(str, args.production), record)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     name = cast(str, args.unit)
-    record = staff.snapshot()
     resolver = session_staff.RowResolver(record)
     rows = unit_lookup.doc_units(production.doc, record)
     selected = next((row for row in rows if row.name == unit_names.name(name)), None)
@@ -1075,7 +1075,7 @@ def send_queued_zone() -> None:
 
 def promotion_label(request: MergeRequest | ChildHandoffRequest) -> str:
     return (f"{request.unit.name} phase {request.phase}" if isinstance(request, MergeRequest)
-            else f"{request.child.slug} style hand-off")
+            else f"{request.child.name} style hand-off")
 
 
 def promote(request: MergeRequest | ChildHandoffRequest, tip: str, *, local_only: bool = False) -> None:
@@ -1296,7 +1296,7 @@ class BumpGateRecord(TypedDict):
     tip: str
     checkpoint: str
     production_doc: str
-    slug: str
+    name: str
     merge_branch: str
     checkout: str
     production_log: str
@@ -1368,12 +1368,12 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
                 continue
             for attempt in (1, 2):
                 try:
-                    unit_address, showrunner_address = bump_gate_addresses(current["slug"], current["unit"])
+                    unit_address, showrunner_address = bump_gate_addresses(current["name"], current["unit"])
                     address = unit_address if recipient == "unit" else showrunner_address
                     if not address:
-                        raise ValueError(f"no current {recipient} address for {current['slug']}/{current['unit']}")
+                        raise ValueError(f"no current {recipient} address for {current['name']}/{current['unit']}")
                     result = subprocess.run(
-                        [sys.executable, script, "--to", address, "--from", current["slug"], "--text", text],
+                        [sys.executable, script, "--to", address, "--from", current["name"], "--text", text],
                         capture_output=True, text=True, check=False,
                     )
                     if result.returncode:
@@ -1405,7 +1405,7 @@ def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, t
     log = path.with_name("bump-gate.log")
     record: BumpGateRecord = {
         "tip": tip, "checkpoint": request.commit,
-        "production_doc": str(request.production.doc), "slug": request.production.slug,
+        "production_doc": str(request.production.doc), "name": request.production.name,
         "merge_branch": request.production.merge_branch, "checkout": str(request.production.checkout),
         "production_log": str(request.production.log.relative_to(request.production.checkout)),
         "zone": str(request.production.zone), "unit": request.unit.name,
@@ -1469,7 +1469,7 @@ def deliver_gate_result(request: MergeRequest, merge_head: str, tip: str) -> Non
         send_result(path, record)
 
 
-def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
+def bump_gate_addresses(name: str, unit: str) -> tuple[str, str]:
     """Resolve recipients through the production's current unit and showrunner lookup."""
     from scripts.production import showrunners
     import unit_lookup
@@ -1477,13 +1477,13 @@ def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
     unit_address = ""
     showrunner_address = ""
     try:
-        found = unit_lookup.labeled_session(slug, unit)
+        found = unit_lookup.labeled_session(name, unit)
         if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
             unit_address = f"session:{found.claude.session_id}"
     except OSError as error:
         report("bump gate notice", "failed", str(error))
     try:
-        showrunner_address = showrunners.current_address(slug)
+        showrunner_address = showrunners.current_address(name)
     except (OSError, ValueError) as error:
         report("bump gate notice", "failed", str(error))
     return unit_address, showrunner_address
@@ -1562,7 +1562,7 @@ def run(request: MergeRequest) -> int:
                             tip = push_git(request.production, not already)
                         else:
                             tip = push_validate(request.production,
-                                                f"ci({request.production.slug}): format fixes after {request.unit.name} phase {request.phase}",
+                                                f"ci({request.production.name}): format fixes after {request.unit.name} phase {request.phase}",
                                                 not already, request.cancel_prior)
                         if request.bump:
                             start_gate(request, paths, merge_head, tip)
@@ -1636,42 +1636,38 @@ def child_runner(action: str, *arguments: str) -> str:
 
 
 def child_request(args: argparse.Namespace) -> ChildHandoffRequest:
-    production = read_production(Path(cast(str, args.production)))
-    slug = canonical_slug(cast(str, args.from_child))
+    production = read_production(cast(str, args.production))
+    name = owner_for(cast(str, args.from_child)).name
     try:
-        parent = child_runner("parent", slug)
+        parent = child_runner("parent", name)
     except Refusal as error:
-        raise Refusal(f"{slug} is not attached under {production.slug}") from error
+        raise Refusal(f"{name} is not attached under {production.name}") from error
     root_self = cast(bool, args.root_self)
     if root_self and parent:
-        raise Refusal(f"{slug} reports to {parent}; --root-self needs a root")
-    if not root_self and parent != production.slug:
-        raise Refusal(f"{slug} is not attached under {production.slug}")
-    doc = next((row.split("\t")[-1] for row in child_runner("list").splitlines()
-                if row.split("\t")[0] == slug), "")
-    if not doc:
-        raise Refusal(f"no production doc for child {slug}")
-    child = read_production(Path(doc).expanduser())
+        raise Refusal(f"{name} reports to {parent}; --root-self needs a root")
+    if not root_self and parent != production.name:
+        raise Refusal(f"{name} is not attached under {production.name}")
+    child = read_production(name)
     lines = child.doc.read_text().splitlines()
     if production_field(lines, "Kind") != "style":
-        raise Refusal(f"{slug} is not a style production")
+        raise Refusal(f"{name} is not a style production")
     branch_point = production_field(lines, "Branch point").removeprefix("refs/heads/")
     if branch_point != production.merge_branch.removeprefix("refs/heads/"):
-        raise Refusal(f"{slug} follows branch point {branch_point}, not {production.merge_branch}")
+        raise Refusal(f"{name} follows branch point {branch_point}, not {production.merge_branch}")
     checkout = production.checkout
     common = good(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"), "input")
     if common != good(git(child.checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"), "input"):
-        raise Refusal(f"{slug} is not in the parent's repository")
+        raise Refusal(f"{name} is not in the parent's repository")
     checkpoint = good(git(checkout, "rev-parse", "--verify", f"{cast(str, args.checkpoint)}^{{commit}}"), "ancestry")
     if git(child.checkout, "merge-base", "--is-ancestor", checkpoint, child.merge_branch).returncode:
-        raise Refusal(f"checkpoint {checkpoint[:7]} is not on {slug}'s merge branch {child.merge_branch}")
+        raise Refusal(f"checkpoint {checkpoint[:7]} is not on {name}'s merge branch {child.merge_branch}")
     history = merge_branch_history(checkout, production.merge_branch)
-    last = history.last_handoff_for_child(slug)
+    last = history.last_handoff_for_child(name)
     already = git(checkout, "merge-base", "--is-ancestor", checkpoint, production.merge_branch).returncode == 0
     if isinstance(last, ChildHandoffEntry) and not already:
         previous = good(git(checkout, "rev-parse", "--verify", last.merge_hash + "^2"), "ancestry")
         if git(checkout, "merge-base", "--is-ancestor", previous, checkpoint).returncode:
-            raise Refusal(f"checkpoint {checkpoint[:7]} does not descend from {slug}'s last merged hand-off {last.short}")
+            raise Refusal(f"checkpoint {checkpoint[:7]} does not descend from {name}'s last merged hand-off {last.short}")
     parent_lines = production.doc.read_text().splitlines()
     mode = production_doc.optional_field(parent_lines, "Push")
     raw = cell_value(mode.text) if isinstance(mode, production_doc.FieldPresent) else "validate_and_push"
@@ -1679,7 +1675,7 @@ def child_request(args: argparse.Namespace) -> ChildHandoffRequest:
         raise Refusal(f"unknown Push mode: {raw}")
     delivery: NotMerged | MergedNotPushed | MergedAndPushed = NotMerged()
     if already:
-        merge_head = handoff_merge_evidence(production, slug, checkpoint)
+        merge_head = handoff_merge_evidence(production, name, checkpoint)
         pushed = pushed_state(production, checkpoint)
         delivery = MergedAndPushed(merge_head) if isinstance(pushed, PushedTip) else MergedNotPushed(merge_head)
     promotion = production_doc.promotion_from_doc(parent_lines)
@@ -1729,12 +1725,12 @@ def record_handoff_merge(request: ChildHandoffRequest, merge_head: str) -> None:
 def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
     script = tool("send.py", Path(__file__).resolve().parents[1] / "message/send.py", "MERGE_CHECKPOINT_SEND")
     try:
-        address = child_runner("address", request.child.slug)
+        address = child_runner("address", request.child.name)
         if not address:
-            raise Refusal(f"no address for {request.child.slug}")
+            raise Refusal(f"no address for {request.child.name}")
         result = subprocess.run([
-            sys.executable, script, "--to", address, "--from", request.production.slug,
-            "--text", f"From the showrunner of {request.production.slug}: hand-off {request.checkpoint[:7]} merged as {merge_head[:7]}.",
+            sys.executable, script, "--to", address, "--from", request.production.name,
+            "--text", f"From the showrunner of {request.production.name}: hand-off {request.checkpoint[:7]} merged as {merge_head[:7]}.",
             "--timeout", "10",
         ], capture_output=True, text=True, check=False, timeout=15)
         if result.returncode:
@@ -1786,14 +1782,14 @@ def notify_published_style(production: Production, merge_head: str, tip: str) ->
 
 def record_handoff_publication(request: ChildHandoffRequest, merge_head: str, tip: str) -> None:
     record_pushed_merges(request.production, merge_head, request.checkpoint, tip,
-                         phase_id="", issue=f"{request.child.slug} hand-off")
+                         phase_id="", issue=f"{request.child.name} hand-off")
     record_publication_changes(request.production, change_review.merge_commits(request.production.checkout, merge_head),
                                merge_head, report_unchanged=False)
     notify_published_style(request.production, merge_head, tip)
 
 
 def record_handoff_completion(request: ChildHandoffRequest, merge_head: str, tip: str) -> None:
-    entry = f"{request.child.slug} style hand-off ({request.checkpoint}) merged as {merge_head}; pushed at {tip}"
+    entry = f"{request.child.name} style hand-off ({request.checkpoint}) merged as {merge_head}; pushed at {tip}"
     log = request.production.log
     if log.exists() and entry in log.read_text(encoding="utf-8"):
         return
@@ -1832,7 +1828,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     if isinstance(delivery, NotMerged):
         paths = merge_paths(checkout, branch, checkpoint)
         _ = good(git(checkout, "merge-tree", "--write-tree", branch, checkpoint), "conflicts")
-        subject = f"Merge {request.child.slug} hand-off ({checkpoint[:7]}) into {branch}"
+        subject = f"Merge {request.child.name} hand-off ({checkpoint[:7]}) into {branch}"
         pending_tests.parent.mkdir(parents=True, exist_ok=True)
         pending_tests.touch()
         _ = good(git(checkout, "merge", "--no-ff", "-m", subject, checkpoint), "merge")
@@ -1843,7 +1839,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
             paths = merge_paths(checkout, f"{merge_head}^1", checkpoint)
     if isinstance(delivery, NotMerged) or pending_tests.exists():
         try:
-            with child_handoff_wait(request.child.slug, checkpoint):
+            with child_handoff_wait(request.child.name, checkpoint):
                 _ = checkpoint_tests(request.production, paths, checkpoint, request.merge_tests,
                                      request.flakes, request.scratch, merge_head, request.flaky_tests)
         except (OSError, ValueError) as error:
@@ -1857,7 +1853,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
                 tip = push_git(request.production, isinstance(delivery, NotMerged))
             else:
                 tip = push_validate(request.production,
-                                    f"ci({request.production.slug}): format fixes after {request.child.slug} style hand-off",
+                                    f"ci({request.production.name}): format fixes after {request.child.name} style hand-off",
                                     isinstance(delivery, NotMerged))
             if isinstance(request.promotion, production_doc.NoPromotion):
                 promote(request, tip)
@@ -1911,7 +1907,7 @@ def main() -> int:
                     cast(str | None, args.excluded), cast(str | None, args.scratch))):
                 raise Refusal("--from-child is separate from unit checkpoint arguments")
             handoff = child_request(args)
-            with merge_lock(handoff.production.checkout, handoff.production.slug):
+            with merge_lock(handoff.production.checkout, handoff.production.name):
                 return run_handoff(handoff)
         except Stop as error:
             if error.state == "cancelled":
@@ -1929,7 +1925,7 @@ def main() -> int:
         parser.error("unit, phase and hash are required for a unit checkpoint")
     try:
         request = request_from(args)
-        with merge_lock(request.production.checkout, request.production.slug):
+        with merge_lock(request.production.checkout, request.production.name):
             return run(request)
     except staff.StaffUnreadable as error:
         report("change review", "failed", f"{error}: the staff record is read before the push")

@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — two checkpoints, build-report unit.** The showrunner, unit and issue skills file, approve, start and close proposals as hanadocs issues instead of rows in `proposals/index.md`.
 
-> **Production: build-followups** — unit `build-report`; production doc `docs/plans/build-followups-production.md`
 
 ## Decisions (mine, settled with the hanadocs dashboard unit 2026-10-15)
 

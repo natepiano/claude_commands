@@ -37,8 +37,8 @@ class AddUnitStaffRowTests(AddUnitTestCase):
     def test_same_showrunner_returns_the_existing_unit_without_writing(self) -> None:
         with (patch.dict(os.environ, self.env),
               isolated_staff_file(self.staff.staff_file, self.env)):
-            production = read_production(self.doc)
-            row = unit_membership("director", "alpha")
+            production = read_production(self.production_name)
+            row = unit_membership(self.production_name, "alpha")
             before = self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns
             with patch.object(staff, "ensure", wraps=staff.ensure) as ensure:
                 found = add_unit.ensure_staff_unit(production, "alpha-unit")
@@ -50,7 +50,7 @@ class AddUnitStaffRowTests(AddUnitTestCase):
     def test_missing_unit_is_added_under_the_requested_showrunner(self) -> None:
         with (patch.dict(os.environ, self.env),
               isolated_staff_file(self.staff.staff_file, self.env)):
-            production = read_production(self.doc)
+            production = read_production(self.production_name)
             _ = add_unit.ensure_staff_showrunner(production)
             before = staff.snapshot()
             worktree = self.root / "project-alpha"
@@ -58,7 +58,7 @@ class AddUnitStaffRowTests(AddUnitTestCase):
             row = add_unit.ensure_staff_unit(production, "alpha-unit",
                                              worktree=staff.PresentWorktree("natedev", worktree),
                                              runtime_id=fixture_runtime_id("new-alpha-unit-backend"))
-            parent = before.by_path("director")
+            parent = before.by_path(self.production_name)
             self.assertIsNotNone(parent)
             assert parent is not None
             self.assertEqual((row.kind, row.name, row.parent), ("unit", "alpha", staff.ReportsTo(parent.id)))

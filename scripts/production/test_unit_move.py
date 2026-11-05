@@ -484,12 +484,14 @@ class UnitFolderMoveTests(FolderRenameFixture):
     def test_unknown_folder_reader_never_proves_stopped_or_authorizes_a_signal(self) -> None:
         client = herdr.Herdr("agents")
         unknown = herdr.UnknownConversation("source (conversation unreadable)")
-        with (mock.patch.object(herdr, "read_conversation", return_value=unknown) as read,
+        codex = herdr.CodexConversations({}, ())
+        with (mock.patch.object(herdr, "codex_conversations", return_value=codex),
+              mock.patch.object(herdr, "read_conversation", return_value=unknown) as read,
               mock.patch.object(sessions, "running_sessions", return_value=[]),
               mock.patch.object(herdr, "running_codex_threads", return_value=set()),
               mock.patch.object(os, "kill") as killed, redirect_stderr(io.StringIO()) as output):
             self.assertEqual(restart.live_rows(staff.StaffSnapshot((self.owner,)), client), [])
-        read.assert_called_once_with(self.owner.current_session)
+        read.assert_called_once_with(self.owner.current_session, codex=codex)
         killed.assert_not_called()
         self.assertEqual(output.getvalue().splitlines(), [
             "anomaly: source (conversation unreadable); not blocking"])
@@ -955,7 +957,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
               mock.patch.object(staff, "row_operation", wraps=staff.row_operation) as row_lock,
               mock.patch.object(staff_move, "move_unit", side_effect=move_projection) as projection,
               redirect_stdout(io.StringIO())):
-            self.assertEqual(transfer_unit.apply("folder-production", "source-unit", production.doc), request)
+            self.assertEqual(transfer_unit.apply("folder-production", "source-unit", production.name), request)
         row_lock.assert_called_once_with(str(self.owner.id))
         projection.assert_called_once()
         self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, parent=staff.ReportsTo(parent.id)))

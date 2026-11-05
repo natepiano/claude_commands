@@ -22,7 +22,7 @@ import coverage_report
 import rules
 import style_ledger
 import style_rules
-from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, unit_membership
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner, unit_membership
 
 
 @dataclass(frozen=True)
@@ -97,6 +97,8 @@ class CoverageReportTests(unittest.TestCase):
         for source in self.sources:
             self.write(source, "pub fn value() -> u32 { 1 }\n")
         self.tip = self.commit("Create report workspace")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("showrunner", name="report")
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(
@@ -160,7 +162,7 @@ class CoverageReportTests(unittest.TestCase):
                                "value", "count", definition.blob, "40001").finding_id
 
     def staff_units(self, *units: str) -> None:
-        doc = self.root / "sample-style/docs/sample-style-production.md"
+        doc = self.repo / ".git/tool-based-ui-production.md"
         doc.parent.mkdir(parents=True, exist_ok=True)
         _ = doc.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))

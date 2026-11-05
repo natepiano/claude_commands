@@ -28,9 +28,9 @@ class UnitTransferTests(UnitTransferFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        for slug, checkout in (("demo", self.giving), ("other", self.receiving)):
-            owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
-            _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", checkout / f"docs/plans/{slug}-production.md"))
+        for production_name, checkout in (("demo", self.giving), ("other", self.receiving)):
+            owner = next(row for row in staff.find(kind="showrunner") if row.name == production_name)
+            _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", checkout / f"docs/plans/{production_name}-production.md"))
 
     def test_transfer_changes_only_parent_and_preserves_locations_and_config_bytes(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")

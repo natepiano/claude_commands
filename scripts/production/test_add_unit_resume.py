@@ -294,6 +294,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         before = self.repository_state()
         head = self.git("rev-parse", "HEAD")
@@ -318,6 +319,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior.mkdir()
         _ = self.git("branch", "build-followups-alpha")
         row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         before = self.repository_state()
 
@@ -399,7 +401,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)
         self.assertEqual(writes, 1)
-        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach agents, workspace director, tab alpha\n")
+        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach agents, workspace build-followups, tab alpha\n")
 
     def test_resume_from_a_brief_is_refused(self) -> None:
         result = self.cli("alpha", "--brief", "Do it.", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(self.root))
@@ -442,7 +444,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         standing = header + "> **Standing:** style_plan.py\n"
         _ = source.write_text(standing, encoding="utf-8")
         initial = self.repository_state()
-        refusal = f"plan {plan} is missing on build-followups or lacks the Production header"
+        refusal = f"plan {plan} is missing on build-followups"
 
         with self.subTest(plan="untracked but not excluded"):
             result = self.cli("alpha", "--plan", plan.as_posix(), "--check")
@@ -475,23 +477,6 @@ class AddUnitResumeTests(AddUnitTestCase):
         _ = source.write_text(standing + "\nShowrunner template changed\n", encoding="utf-8")
         _ = self.successful("alpha", "--plan", plan.as_posix())
         self.assertEqual(copied.read_text(encoding="utf-8"), progress)
-
-    def test_new_unit_as_built_plan_still_requires_a_production_header(self) -> None:
-        plan = "docs/as-built/alpha.md"
-        path = self.checkout / plan
-        path.parent.mkdir(parents=True)
-        _ = path.write_text("# Alpha as built\n", encoding="utf-8")
-        _ = self.git("add", plan)
-        _ = self.git("commit", "-m", "record completed plan")
-        before = self.repository_state()
-
-        result = self.cli("alpha", "--plan", plan, "--check")
-
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(result.stderr,
-                         f"add_unit: plan {plan} is missing on build-followups or lacks the Production header\n")
-        self.assertEqual(self.repository_state(), before)
-        self.assertEqual(self.herdr_calls(), [])
 
     def test_transcript_model_reads_newest_file_and_crosses_chunk_boundaries(self) -> None:
         root = Path(self.env["HOME"]) / ".claude/projects"
