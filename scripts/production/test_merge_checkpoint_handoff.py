@@ -10,7 +10,9 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
+
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from merge_checkpoint import ChildHandoffEntry, CodeCheckpoint, MergeEntry, NoMerge, ShrinkCommit, merge_branch_history
@@ -28,6 +30,13 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        staff_file = self.root / "staff.json"
+        _ = Path(self.env["STAFF_FILE"]).rename(staff_file)
+        _ = self.enterContext(isolated_staff_file(staff_file, self.env))
+
     # Keep the child CLI process boundary.
     @process_boundary
     def test_attached_child_handoff_merges_without_a_units_row_and_acknowledges_after_push(self) -> None:
@@ -258,12 +267,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertNotIn("hand-off acknowledgment:", result.stdout)
     def test_former_child_slug_resolves_to_the_canonical_doc_and_merge_subject(self) -> None:
         doc = self.child_production()
-        _ = doc.write_text(doc.read_text().replace(
-            "# Style production", "# Style production\n\n## Production Context\n- **Formerly:** `old-style`",
-        ))
-        timer = self.root / "notifier/showrunner-example-style/conf"
-        timer.parent.mkdir(parents=True)
-        _ = timer.write_text(f"TARGET=session:fake-child\nCHECK=zsh /unused/production_check.sh {doc}\n")
+        owner = recorded_showrunner("example-style", doc, parent="example")
+        journal = Path(self.env["SHOWRUNNER_STATE_DIR"]) / "example-style/rename.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "old-style", "new": "example-style", "staff_id": owner.id}))
         checkpoint = self.checkpoint()
         result = subprocess.run([
             sys.executable, str(SCRIPT), "--from-child", "old-style", "--checkpoint", checkpoint,

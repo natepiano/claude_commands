@@ -61,12 +61,6 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
   - Python is typed throughout, with no `Any` and no file-level type ignores.
   - User-facing times use `config/user_zone.conf` through `scripts/lib/user_zone.py`, with the applicable zone label and offset; `USER_ZONE` may pin tests. Transcript and buildlog stamps remain UTC.
 
-## Gates
-
-| Gate | Waiting | Waits on | Clears when |
-| --- | --- | --- | --- |
-| G1 | Phase 6's next re-rank | a week after Phase 10's failure texts landed | the clock: Thu 2026-10-22 15:07:01Z (11:07:01 AST) |
-
 ## Phases
 
 ### Phase 1 — One command shows how long an agent takes to get a framed shot, by hand vs `/hana_shot`, in every project · status: done

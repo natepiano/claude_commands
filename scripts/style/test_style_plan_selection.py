@@ -6,6 +6,7 @@ from ledger_test_support import ticket_owner_id
 
 import errno
 import io
+import re
 import sqlite3
 import subprocess
 import sys
@@ -27,7 +28,7 @@ import unit_files
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_unit_location, recorded_showrunner
 
-from style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 from unit_plans import AllCrates
 
 
@@ -95,7 +96,7 @@ class StylePlanTests(StylePlanFixture):
         self.commit_files({old: "pub struct Parent {\n    old: u32,\n}\n"})
         plan = self.modules_unit()
         issue, (finding,) = self.judged_findings(structure, ((old, 2, "old: u32,"),))
-        _ = issue.write_text(issue.read_text().replace("unit: names-unit", "unit: modules-unit"))
+        _ = issue.write_text(issue.read_text().replace(f"unit: {unit_staff_id('names-unit')}", f"unit: {unit_staff_id('modules-unit')}"))
         self.write_generated_body(issue)
         self.finish_judging()
         _ = self.git("mv", old, current)
@@ -120,7 +121,7 @@ class StylePlanTests(StylePlanFixture):
         first = self.select_for_family("modules", plan)
         self.assertEqual(first["kind"], "proposal")
         self.ledger().ticket_drop(first["id"])
-        _ = issue.write_text(issue.read_text().replace("plan: approved", "plan: ''"))
+        _ = issue.write_text(re.sub(r"unit: [^\n]*\n", "", issue.read_text()))
         ticket = self.select_for_family("modules", plan)
         self.assertEqual((ticket["kind"], ticket["files"]), ("structure", [self.sources[0]]))
         self.assertTrue(all(isinstance(finding.build_ticket, style_ledger.NoBuildTicket)

@@ -8,16 +8,6 @@ from scripts.production import staff, showrunners
 from scripts.lib import legacy_identity
 
 
-def showrunner_owner(record: staff.StaffSnapshot, slug: str, document: str) -> staff.StaffRow | None:
-    """A timer names a staff path or a unique showrunner short name, including nested owners."""
-    name = showrunners.space_from_text(slug, document)
-    row = record.by_path(name)
-    if row is not None and row.kind == "showrunner":
-        return row
-    owners = [owner for owner in record.find(kind="showrunner") if owner.name == name]
-    return owners[0] if len(owners) == 1 else None
-
-
 @dataclass(frozen=True)
 class StaffLabels:
     record: staff.StaffSnapshot
@@ -36,7 +26,7 @@ class StaffLabels:
         parents: dict[str, staff.StaffRow] = {}
         for row in record.find(kind="showrunner"):
             timer = showrunners.timer_for(row, record, sources=sources)
-            if isinstance(timer, showrunners.Timer):
+            if isinstance(timer, showrunners.TimerRegistration):
                 parents[timer.slug] = row
         return cls(record, productions, parents)
 
