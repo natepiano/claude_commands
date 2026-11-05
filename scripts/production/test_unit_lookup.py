@@ -8,7 +8,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -839,7 +841,7 @@ print(observed.row.id)
         self.assertEqual(self.run_script("list", "show").stdout.split("\t")[:4],
                          ["trunk", "herdr:writing:w1:p1", "writing", "live"])
 
-    def test_only_proved_ancestor_shells_leave_the_process_evidence(self) -> None:
+    def test_only_proved_ancestor_launchers_leave_the_process_evidence(self) -> None:
         row = unit_membership("show", "trunk")
         place = herdr.HerdrPlace("native", "w1:p1")
         running = [SessionRecord(pid=991099, name="director", sessionId=row.current_session,
@@ -848,7 +850,7 @@ print(observed.row.id)
             ("zsh", 991001, False, False),
             ("zsh", 991000, False, True),
             ("zsh", 991001, True, True),
-            ("python3", 991001, False, True),
+            ("python3", 991001, False, False),
         ):
             with self.subTest(command=command, parent=parent, unavailable=unavailable):
                 self.process(991001, 991000, [command], CODEX_THREAD_ID=row.current_session)
@@ -875,6 +877,93 @@ print(observed.row.id)
                 else:
                     self.assertEqual(grouped.faults, {})
                     self.assertIsInstance(grouped.units["show"]["trunk"].claude, LiveClaude)
+
+    def test_agent_children_share_identity_only_with_their_own_launchers(self) -> None:
+        self.enterContext(fake_unit_host.private_process_registry())
+        row = unit_membership("show", "trunk")
+        for agent in ("claude", "codex"):
+            with self.subTest(agent=agent):
+                self.hosts({"native": labeled("native", "w1:p1", "trunk"),
+                            "other": HostedUnit("native", "w2:p1", {})})
+                marks = {"CODEX_THREAD_ID" if agent == "codex" else "CLAUDE_CODE_SESSION_ID": row.current_session,
+                         "HERDR_SESSION": "native", "HERDR_PANE_ID": "w1:p1"}
+                self.process(991001, 991000, ["python3", "launcher.py"], **marks)
+                self.process(991098, 991001, ["node", "launcher.js"], **marks)
+                self.process(991099, 991098, [agent], **marks)
+                if agent == "claude":
+                    self.claude("director", "w1:p1", session_id=row.current_session, pid=991099)
+                    path = self.records / "director-1.json"
+                    record = cast(dict[str, object], json.loads(path.read_text()))
+                    record["procStart"] = "1"
+                    _ = path.write_text(json.dumps(record))
+                else:
+                    for path in self.records.iterdir():
+                        path.unlink()
+                errors = StringIO()
+                with redirect_stderr(errors):
+                    found = unit_lookup.every_labeled_session()
+                self.assertEqual(errors.getvalue(), "")
+                selected = found.status_units("show")[row.name]
+                self.assertEqual(selected.process, session_staff.ObservedProcess(991099, agent))
+                self.assertEqual(selected.identity, session_staff.LiveSession(row.current_session))
+                if agent == "claude":
+                    self.assertIsInstance(selected.claude, LiveClaude)
+                for pane in ("w1:p1", "w2:p1"):
+                    with self.subTest(pane=pane):
+                        self.process(991001, 991000, ["python3", "launcher.py"], **{**marks, "HERDR_PANE_ID": pane})
+                        self.process(991098, 991000 if pane == "w1:p1" else 991001, ["node", "launcher.js"], **marks)
+                        errors = StringIO()
+                        with redirect_stderr(errors):
+                            found = unit_lookup.every_labeled_session()
+                        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                        self.assertIn("multiple processes claim its runtime identity", errors.getvalue())
+                        self.assertIn("pid 991001 (python3)", errors.getvalue())
+                        self.assertIn(f"pid 991099 ({agent})", errors.getvalue())
+                        self.assertIsInstance(found.status_units("show")[row.name].claude, ClaudeUnknown)
+
+    def test_unavailable_agent_ancestry_does_not_hide_another_agents_launcher(self) -> None:
+        self.enterContext(fake_unit_host.private_process_registry())
+        healthy = unit_membership("show", "trunk")
+        broken = unit_membership("show", "other")
+        self.hosts({"healthy": labeled("native", "w1:p1", "trunk"),
+                    "broken": labeled("native", "w2:p1", "other")})
+        self.process(991020, 991003, ["codex"], CODEX_THREAD_ID=broken.current_session,
+                     HERDR_SESSION="native", HERDR_PANE_ID="w2:p1")
+        self.process(991099, 991001, ["claude"], CLAUDE_CODE_SESSION_ID=healthy.current_session,
+                     HERDR_SESSION="native", HERDR_PANE_ID="w1:p1")
+        self.claude("director", "w1:p1", session_id=healthy.current_session, pid=991099)
+        path = self.records / "director-1.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record["procStart"] = "1"
+        _ = path.write_text(json.dumps(record))
+        errors = StringIO()
+        with herdr.process_snapshot():
+            _ = herdr.herdr_processes()
+            (self.root / "proc/991020/stat").unlink()
+            with redirect_stderr(errors):
+                found = unit_lookup.every_labeled_session()
+        selected = found.status_units("show")[healthy.name]
+        self.assertIsInstance(selected.claude, LiveClaude)
+        self.assertEqual(selected.process, session_staff.ObservedProcess(991099, "claude"))
+        self.assertIsInstance(found.status_units("show")[broken.name].claude, ClaudeUnknown)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("other: multiple processes claim its runtime identity", errors.getvalue())
+        self.assertIn("pid 991003 (zsh)", errors.getvalue())
+        self.assertIn("pid 991020 (codex)", errors.getvalue())
+
+    def test_stopped_shell_does_not_read_the_darwin_process_snapshot(self) -> None:
+        from scripts.message import process_table
+
+        row = unit_membership("show", "trunk")
+        self.hosts({"stopped": labeled("native", "w1:p1", "trunk", CODEX_THREAD_ID="",
+                                      CLAUDE_CODE_SESSION_ID=row.current_session)})
+        with herdr.process_snapshot():
+            _ = herdr.herdr_processes()
+            with (mock.patch.dict(os.environ, {"HERDR_PLATFORM": "darwin"}),
+                  mock.patch.object(process_table, "snapshot", wraps=process_table.snapshot) as snapshot):
+                found = unit_lookup.every_labeled_session()
+        self.assertIsInstance(found.status_units("show")[row.name].claude, ClaudeNotRunning)
+        self.assertEqual(snapshot.call_count, 0)
 
     def test_live_claude_with_deleted_cwd_joins_its_marked_shell(self) -> None:
         self.herdr_session(name="writing")
