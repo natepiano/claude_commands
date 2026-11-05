@@ -15,11 +15,27 @@ The user said on 2026-11-03: "we need to be able to set a box up to run soup to 
 
 ## One-time user inputs
 
-These inputs are private files outside the repository, mode 0600. The user makes each one once.
+The user creates these private files outside the repository.
 
-1. `~/.config/aws-build/credentials`, profile `build-admin`. It exists.
-2. `~/.config/aws-build/notification-email`. It exists.
-3. `~/.config/aws-build/tailscale-oauth`: a Tailscale OAuth client with the scopes `auth_keys` (tag `tag:build-aws`) and `policy_file`. It is new. `up` refuses with one clear line when the file is missing.
+1. Run `deploy.py secrets` in a terminal to create `~/.config/aws-build/admin.gpg`, mode `0600`.
+2. Store the AWS administrator key and the Tailscale OAuth client in that encrypted file.
+3. Give the OAuth client three scopes: `auth_keys` for `tag:build-aws`, `devices:core` for `tag:build-aws` (`down` deletes the device), and `policy_file`.
+4. Keep `~/.config/aws-build/credentials` for the unattended `build-scaler` profile only.
+5. Keep the existing private Budget address file outside the repository.
+
+`secrets` imports an existing administrator profile and removes it after encryption succeeds.
+It also imports and removes the old `tailscale-oauth` file.
+The user can retain stored values with Enter and replace one value.
+The helper asks for one passphrase when a deployment first needs administrator credentials.
+It keeps decrypted values only in memory for that process.
+Symmetric AES256 encryption disables the GPG symmetric passphrase cache.
+`down --approve-destroy` uses the same terminal credential boundary.
+Without that flag, `down` prints a plan and changes nothing.
+Removal preserves the spend history and encrypted credentials.
+The OAuth client also needs device deletion access for `tag:build-aws`.
+
+`up` needs only this repository and the reviewed `/etc/nixos` checkout.
+The proof crate includes its own locked development shell and has no Rust dependencies.
 
 ## Stages of `up`
 
@@ -34,13 +50,20 @@ Each stage checks the live state first. It acts only when the state is not compl
 5. **Tailscale policy.** A tracked policy source holds the `tag:build-aws` rules: natedev's user and the Mac's user reach the box and enter `natepiano` through Tailscale SSH; the box starts no connection. `up` applies it through the Tailscale API when the live policy differs. It changes only rules for `tag:build-aws`, and it prints each change it makes (showrunner ruling, 2026-11-03).
 6. **Box join.** Wait for the instance in SSM. Ask the Tailscale API for a single-use, pre-approved, short-lived auth key for `tag:build-aws`. Send `tailscale up --ssh --advertise-tags=tag:build-aws` to the box through SSM with that key. No key is stored on the box, in git or in CloudFormation.
 7. **Box configuration.** From natedev, switch the box to the `aws-build` output of natedev's `/etc/nixos` main with `nixos-rebuild --target-host`. The nixos repository is private, so the box does not fetch it. The box configuration lives only in `/etc/nixos`. A change to it goes to natedev as a branch, and `up` only reads that repository (showrunner ruling, 2026-11-03).
-8. **Checks.** Confirm SSM, the `/home` mount on the expected data volume, the remote lifecycle service, and `rustc`, `cargo nextest` and `cargo mend` inside the configured shell.
+8. **Checks.** Confirm SSM, the `/home` mount on the expected data volume, the remote lifecycle service, and plain `rustc`, `cargo nextest` and `cargo mend` versions on both hosts.
 9. **Idle stop.** Confirm the box stops itself within `idle_stop_minutes` plus a margin, through EC2.
 10. **Activation.** Turn on routing to AWS from state outside the repository, then start `aws-target.service`. The registry rows land in the tracked config by a reviewed commit, with the user's approval of each value.
-11. **Routing proof.** Run one small test through the normal queue. Confirm `target=aws` in its record.
+11. **Routing proof.** Run the in-repository `scripts/aws_target/proof_crate` through the normal pinned queue. Confirm `target=aws` in its record.
 
 ## Phases
 
 1. **Stack lifecycle.** Stages 1 to 4, `down`, the `up` stage runner and its state record. Fixes: `REVIEW_IN_PROGRESS`, the preparation age, and one settings reader for `price`.
 2. **Box join and configuration.** Stages 5 to 8.
-3. **Activation and proof.** Stages 9 to 11. Then the user runs `down` and `up` once, to prove a rebuild from nothing.
+3. **Activation and proof.** Implementation complete; the user deployment proof remains. Stages 9 to 11. Then the user runs `down` and `up` once, to prove a rebuild from nothing.
+
+## Removal status
+
+`down` is implemented.
+It disables routing before removing the device, keys, compute, foundation, retained volume, and Budget.
+It removes setup state and preserves spend history.
+The user deployment proof remains.

@@ -158,7 +158,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 **Ruled out:** a plain launcher path for Claude workers; the roster adoption path (`adopted_to`, `handed_off`) and its tests.
 
-### Phase 3p — 3o follow-ups: live switch proofs, regression tests, test cut  · status: todo
+### Phase 3p — 3o follow-ups: live switch proofs, regression tests, test cut  · status: done
 
 **Owner:** models-unit. 3o routed these items here under the hard landing rule (repair round 11, 2026-11-04).
 
@@ -229,6 +229,51 @@ Milestone 2 (after devtools one-launch-path lands, and after Milestone 1 and any
 2. Affected suites green; source net negative.
 3. These assertions stay: the dry-run preview lines (`test_moves.py:678`); the `ResumePending` text (`test_moves.py:668`); the locked-worker regression (`test_moves.py:709`); the matched, absent and unknown delivery outcomes (`test_worker_fill.py`); the fresh and attach admission refusals (`test_implement_launcher_claude.py:62`); the live-roster check of the guarded runner.
 4. Pass the Delegation Context merge gate.
+
+### Phase 3q — 3p follow-ups: simplify cuts and the switch-state cleanup  · status: todo
+
+**Owner:** models-unit. 3p routed these items here under the hard landing rule (repair rounds 7-9, 2026-11-04).
+
+**Depends on:** 3p.
+
+#### Work Order
+
+**Goal:** Apply the 3p simplify review and the switch-state cleanup that 3p routed here.
+
+**Spec:**
+
+1. Apply each item in `docs/plans/models-rename-track-3q-items.md`. Each item names its change, files and reason.
+2. Settle each held-for-decision item under DecisionEconomy before dispatch. Send a design choice to sdlc.
+3. F006: remove the redundant switch-state write after publication and the `SwitchState` alternative of `dispatch` (see the F006 item).
+4. Make the phase source net negative: 3p added 265 more lines than it deleted.
+
+**Acceptance gate:**
+
+1. basedpyright zero errors and warnings on changed files and callers.
+2. Affected suites green; source net negative.
+3. No assertion of the 3p regression tests is weakened.
+4. Pass the Delegation Context merge gate.
+
+### Phase 3r — Live family-switch proofs through assign.sh  · status: todo
+
+**Owner:** models-unit. 3p Milestone 2 (Spec items 10-11) moved here so that 3p could land Milestone 1.
+
+**Depends on:** 3p, and the devtools one-launch-path change (assign.sh starts a Claude worker). sdlc tells models-unit when it lands.
+
+#### Work Order
+
+**Goal:** Prove a real worker family switch in both directions through assign.sh.
+
+**Spec:**
+
+1. Prove one real Codex-to-Claude switch through assign.sh, with the worker using the transcript extract (3o Acceptance gate 19).
+2. Prove the reverse direction and record both outcomes for sdlc (3o Acceptance gate 20).
+
+**Acceptance gate:**
+
+1. Both switches keep the worker's fixed staff id and open no second destination.
+2. Each destination reads the extract before its first assignment.
+3. Both outcomes go to sdlc with the evidence paths.
 
 ### Phase 5a — Bash reads the resolved model registry in one call  · status: todo
 

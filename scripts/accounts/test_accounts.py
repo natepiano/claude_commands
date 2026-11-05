@@ -27,7 +27,7 @@ import tempfile
 import time
 import unittest
 import urllib.request
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from collections.abc import Callable, Generator, Iterator
@@ -6332,26 +6332,15 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)),
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
-    def test_workers_swap_dry_run_names_target_and_preserves_roles_and_history(self) -> None:
-        _ = self.workers_fixture()
-        worker = self.workers_member()
-        before = self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()
-        with patch.object(stop_resume, "stop") as stop:
-            result, stdout, stderr = self.run_cli("swap", "workers", "codex1", "--dry-run")
-        self.assertEqual((result, stderr), (0, ""))
-        self.assertIn("codex1", stdout)
-        self.assertEqual(stdout, f"{worker.name} ({worker.id}): would stop; restart on codex1 stays pending\n")
-        self.assertEqual((self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()), before)
-        stop.assert_not_called()
-
-
-    def test_workers_swap_reports_each_failed_stop_and_keeps_new_role_for_pending_workers(self) -> None:
+    def test_workers_swap_selects_the_target_before_stops_and_keeps_pending_and_refused_workers(self) -> None:
         _, target = self.workers_fixture()
         failed = self.workers_member("project-review")
         pending = self.workers_member("project-test")
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
 
+        observed: list[Path] = []
         def stop(reference: str) -> stop_resume.StopFailed | stop_resume.Stopped:
+            observed.append(agent_accounts.workers_home())
             return (stop_resume.StopFailed(reference, "source process could not stop") if reference == failed.id
                     else stop_resume.Stopped(pending.current_session, 987654))
 
@@ -6362,6 +6351,8 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
         self.assertEqual({entry.args[0] for entry in stopped.call_args_list}, {failed.id, pending.id})
         self.assertEqual(stopped.call_count, 2)
+        self.assertEqual(observed, [target, target])
+        self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
         lines = output.splitlines()
         self.assertEqual(len(lines), 2)
         failed_line = next(line for line in lines if failed.id in line)
@@ -6372,135 +6363,88 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertIn("codex1", pending_line)
         self.assertNotIn("failed", pending_line)
 
-    def test_workers_swap_role_write_failure_exits_one_before_interrupting_workers(self) -> None:
-        _ = self.workers_fixture()
-        before = self.role_files()
-        with (patch.object(accounts, "_write_role", side_effect=accounts.AccountsError("role write refused")),
-              patch.object(stop_resume, "stop") as stop):
-            code, output, errors = self.run_cli("swap", "workers", "codex1")
-        self.assertEqual((code, output), (1, ""))
-        self.assertIn("role write refused", errors)
-        self.assertEqual(self.role_files(), before)
-        stop.assert_not_called()
+    def test_numbered_workers_targets_keep_the_selected_home_with_real_or_shared_entries(self) -> None:
+        for shared, target in ((False, "codex1"), (False, "codex2"), (True, "codex2")):
+            with self.subTest(shared=shared, target=target):
+                default, numbered = self.workers_fixture()
+                destination = numbered if target == "codex1" else default
+                if shared:
+                    _ = (default / "config.toml").write_text("own config")
+                    (default / "sessions").mkdir(exist_ok=True)
+                    for name in ("config.toml", "sessions"):
+                        _ = (self.home / ".codex1" / name).symlink_to(default / name)
+                initial = "codex2" if target == "codex1" else "codex1"
+                self.assertEqual(self.run_cli("set-role", "workers", initial), (0, "", ""))
+                report = cast(agent_accounts.Report, self.codex_reads.return_value)
+                report.email = "target@example.invalid" if target == "codex1" else "default@example.invalid"
+                report.source = agent_accounts.CodexHomeSource(destination)
+                worker = self.workers_member()
+                before = self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()
+                with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(worker.current_session, 987654)) as stop:
+                    code, stdout, stderr = self.run_cli("swap", "workers", target, *([] if shared else ["--dry-run"]))
+                self.assertEqual((code, stderr), (1 if shared else 0, ""))
+                if shared:
+                    self.assertIn("pending", stdout)
+                    stop.assert_called_once_with(worker.id)
+                else:
+                    self.assertIn(target, stdout)
+                    self.assertEqual(stdout, f"{worker.name} ({worker.id}): would stop; restart on {target} stays pending\n")
+                    self.assertEqual((self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()), before)
+                    stop.assert_not_called()
+                    self.assertEqual(self.run_cli("set-role", "workers", target), (0, "", ""))
+                self.assertEqual(agent_accounts.workers_home(), destination)
+                self.assertEqual(self.run_cli("role", "workers"), (0, target + "\n", ""))
+                self.assertEqual(accounts.role_account("workers").home, destination)
+                self.assertEqual(json.loads(accounts.accounts_config_file().read_text())["workers"], target)
 
-    def test_numbered_workers_target_selects_the_login_in_the_home_directory(self) -> None:
-        default, _ = self.workers_fixture()
-        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
-        report = cast(agent_accounts.Report, self.codex_reads.return_value)
-        report.email = "default@example.invalid"
-        report.source = agent_accounts.CodexHomeSource(default)
-        before = self.role_files()
-        worker = self.workers_member()
-        with patch.object(stop_resume, "stop") as stop:
-            code, stdout, stderr = self.run_cli("swap", "workers", "codex2", "--dry-run")
-        self.assertEqual((code, stderr), (0, ""))
-        self.assertEqual(stdout, f"{worker.name} ({worker.id}): would stop; restart on codex2 stays pending\n")
-        self.assertEqual(self.role_files(), before)
-        stop.assert_not_called()
-        self.assertEqual(self.run_cli("set-role", "workers", "codex2"), (0, "", ""))
-        self.assertEqual(agent_accounts.workers_home(), default)
-        self.assertEqual(self.run_cli("role", "workers"), (0, "codex2\n", ""))
-        self.assertEqual(accounts.role_account("workers").home, default)
-        self.assertEqual(json.loads(accounts.accounts_config_file().read_text())["workers"], "codex2")
-
-    def test_workers_swap_refuses_paid_credits_when_the_target_setting_is_off(self) -> None:
+    def test_workers_swap_checks_usage_and_credit_policy_before_changing_roles(self) -> None:
         _, target = self.workers_fixture()
-        note = Path(os.environ["AGENT_NOTES_DIR"]) / "codex1.md"
-        _ = note.write_text("---\nlogin: target@example.invalid\nuse_credits: off\n---\n")
-        report = cast(agent_accounts.Report, self.codex_reads.return_value)
-        report.quotas = [agent_accounts.Quota("Weekly", 100, datetime.now(timezone.utc) + timedelta(days=1))]
-        report.credit_balance = "6370"
-        before = self.role_files()
-        with patch.object(stop_resume, "stop") as stop:
-            code, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-        self.assertNotEqual(code, 0)
-        self.assertIn("is used up and set not to use credits; choose another account or wait for reset", stdout + stderr)
-        self.assertIn("codex1 (~/.codex1)", stdout + stderr)
-        self.assertEqual(self.role_files(), before)
-        self.assertEqual(target, self.home / ".codex1")
-        stop.assert_not_called()
-
-    def test_workers_swap_writes_role_before_stopping_fixed_workers(self) -> None:
-        _, target = self.workers_fixture()
-        worker = self.workers_member()
-        observed: list[Path] = []
-
-        def stop(reference: str) -> stop_resume.Stopped:
-            self.assertEqual(reference, worker.id)
-            observed.append(agent_accounts.workers_home())
-            return stop_resume.Stopped(worker.current_session, 987654)
-
-        with patch.object(stop_resume, "stop", side_effect=stop):
-            result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-        self.assertEqual((result, stderr), (1, ""))
-        self.assertEqual(observed, [target])
-        self.assertEqual(len(stdout.splitlines()), 1)
-        self.assertIn(worker.id, stdout)
-        self.assertIn("pending", stdout)
-        self.assertIn("codex1", stdout)
-        self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
-
-    def test_workers_swap_accepts_default_real_shared_entries(self) -> None:
-        default, _ = self.workers_fixture()
-        _ = (default / "config.toml").write_text("own config")
-        (default / "sessions").mkdir()
-        for name in ("config.toml", "sessions"):
-            _ = (self.home / ".codex1" / name).symlink_to(default / name)
-        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
-        report = cast(agent_accounts.Report, self.codex_reads.return_value)
-        report.email = "default@example.invalid"
-        report.source = agent_accounts.CodexHomeSource(default)
-        worker = self.workers_member()
-        with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(worker.current_session, 987654)) as stop:
-            result, output, stderr = self.run_cli("swap", "workers", "codex2")
-        self.assertEqual((result, stderr), (1, ""))
-        self.assertIn("pending", output)
-        stop.assert_called_once_with(worker.id)
-        self.assertEqual(self.run_cli("role", "workers"), (0, "codex2\n", ""))
-
-    def test_workers_swap_refuses_exhausted_usage(self) -> None:
-        _, target = self.workers_fixture()
-        before = self.role_files()
         now = datetime.now(timezone.utc)
-        for report in (
-            agent_accounts.Report("Codex", email="target@example.invalid", five_hour=agent_accounts.Quota("5-hour", 100, now + timedelta(hours=1)),
-                quotas=[agent_accounts.Quota("Weekly", 20, now + timedelta(days=1))], credit_balance="0"),
-        ):
-            with self.subTest(report=report), patch.object(stop_resume, "stop") as stop:
+        cases = (
+            ("role-write-refused", agent_accounts.Report("Codex", email="target@example.invalid")),
+            ("credits-disabled", agent_accounts.Report("Codex", email="target@example.invalid",
+                quotas=[agent_accounts.Quota("Weekly", 100, now + timedelta(days=1))], credit_balance="6370")),
+            ("exhausted", agent_accounts.Report("Codex", email="target@example.invalid",
+                five_hour=agent_accounts.Quota("5-hour", 100, now + timedelta(hours=1)),
+                quotas=[agent_accounts.Quota("Weekly", 20, now + timedelta(days=1))], credit_balance="0")),
+            ("credits", agent_accounts.Report("Codex", email="target@example.invalid",
+                five_hour=agent_accounts.Quota("5-hour", 100, now + timedelta(hours=1)), credit_balance="5")),
+            ("unknown", agent_accounts.Report("Codex", problem="read failed")),
+            ("stale", agent_accounts.Report("Codex", five_hour=agent_accounts.Quota("5-hour", 0, now - timedelta(seconds=1)),
+                quotas=[agent_accounts.Quota("Weekly", 0, now + timedelta(days=1))], credit_balance="0")),
+        )
+        for case, report in cases:
+            with self.subTest(case=case), patch.object(stop_resume, "stop") as stop:
+                note = Path(os.environ["AGENT_NOTES_DIR"]) / "codex1.md"
+                credits = "off" if case == "credits-disabled" else "on"
+                _ = note.write_text(f"---\nlogin: target@example.invalid\nuse_credits: {credits}\n---\n")
                 report.source = agent_accounts.CodexHomeSource(target)
                 self.codex_reads.return_value = report
-                result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-                self.assertNotEqual(result, 0)
-                self.assertIn("codex1", stdout + stderr)
-                self.assertIn("~/.codex1", stdout + stderr)
-                self.assertEqual(self.role_files(), before)
+                before = self.role_files()
+                with (patch.object(accounts, "_write_role", side_effect=accounts.AccountsError("role write refused"))
+                      if case == "role-write-refused" else nullcontext()):
+                    code, stdout, stderr = self.run_cli("swap", "workers", "codex1")
                 stop.assert_not_called()
-
-    def test_workers_swap_accepts_credits_when_a_window_is_used_up(self) -> None:
-        _ = self.workers_fixture()
-        report = cast(agent_accounts.Report, self.codex_reads.return_value)
-        report.five_hour = agent_accounts.Quota("5-hour", 100, datetime.now(timezone.utc) + timedelta(hours=1))
-        report.credit_balance = "5"
-        self.assertEqual(self.run_cli("swap", "workers", "codex1")[0], 0)
-
-    def test_workers_swap_reports_one_usage_anomaly_and_continues(self) -> None:
-        _, target = self.workers_fixture()
-        now = datetime.now(timezone.utc)
-        reports = (
-            agent_accounts.Report("Codex", problem="read failed"),
-            agent_accounts.Report("Codex", five_hour=agent_accounts.Quota("5-hour", 0, now - timedelta(seconds=1)),
-                quotas=[agent_accounts.Quota("Weekly", 0, now + timedelta(days=1))], credit_balance="0"),
-        )
-        for report in reports:
-            report.source = agent_accounts.CodexHomeSource(target)
-            self.codex_reads.return_value = report
-            with self.subTest(report=report):
-                result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-            self.assertEqual(result, 0)
-            self.assertEqual(len(stderr.splitlines()), 1)
-            self.assertIn("accounts: anomaly: codex1 (~/.codex1):", stderr)
-            self.assertEqual(stdout, "\n")
-            self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
+                if case == "role-write-refused":
+                    self.assertEqual((code, stdout), (1, ""))
+                    self.assertIn("role write refused", stderr)
+                    self.assertEqual(self.role_files(), before)
+                elif case in ("credits-disabled", "exhausted"):
+                    self.assertNotEqual(code, 0)
+                    self.assertIn("codex1", stdout + stderr)
+                    self.assertIn("~/.codex1", stdout + stderr)
+                    self.assertEqual(self.role_files(), before)
+                    if case == "credits-disabled":
+                        self.assertIn("is used up and set not to use credits; choose another account or wait for reset", stdout + stderr)
+                        self.assertIn("codex1 (~/.codex1)", stdout + stderr)
+                        self.assertEqual(target, self.home / ".codex1")
+                else:
+                    self.assertEqual(code, 0)
+                    self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
+                    if case in ("unknown", "stale"):
+                        self.assertEqual(len(stderr.splitlines()), 1)
+                        self.assertIn("accounts: anomaly: codex1 (~/.codex1):", stderr)
+                        self.assertEqual(stdout, "\n")
 
     def test_codex_log_directory_is_own_state(self) -> None:
         _, target = self.workers_fixture()

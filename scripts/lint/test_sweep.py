@@ -4,6 +4,7 @@ go with a build unit, which are orphans, and which stay."""
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import io
 import json
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
     from ..lib import scratch
     from ..message import process_table, sessions
     from ..notify import review
-    from ..notify.push_texts import RenderedPush, catalog, render, render_entry
+    from ..notify.push_texts import catalog, render, render_entry
     from ..notify.user_action import ActionRequired
 else:
     from scripts.copies import copies
@@ -62,7 +63,7 @@ else:
     import sessions
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
     import review
-    from push_texts import RenderedPush, catalog, render, render_entry
+    from push_texts import catalog, render, render_entry
     from user_action import ActionRequired
 
 GIB = 1 << 30
@@ -73,8 +74,6 @@ DEMO = "1111111111111111"
 TOOL = "2222222222222222"
 MY_TOOL = "3333333333333333"
 STALE = "4444444444444444"
-PAGE_PATHS = ["/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.",
-              "/tmp/claude-1000/scratch: frees 86.0 GiB."]
 
 
 def write(path: Path, size: int = SIZE) -> Path:
@@ -293,6 +292,42 @@ class LastUseTests(SweepCase):
         os.utime(fingerprint, (time.time(), compiled))
         _, owners = scanned(target)
         self.assertEqual(owners[str(fingerprint)].last_used, compiled)
+
+    def test_fingerprint_directory_mtime_keeps_both_ages_recent(self) -> None:
+        target = self.target()
+        fingerprint = target.tree / ".fingerprint" / f"app-{APP}"
+        modified = time.time() - DAY
+        os.utime(fingerprint, (time.time(), modified))
+        _, owners = scanned(target)
+        group = owners[str(fingerprint)]
+        self.assertEqual(group.last_used, modified)
+        self.assertEqual(group.compiled, modified)
+
+    def test_incremental_age_keeps_the_directory_mtime(self) -> None:
+        target = self.target()
+        incremental = target.tree / "incremental" / "app-session"
+        child = write(incremental / "output")
+        earlier = time.time() - 2 * DAY
+        os.utime(child, (earlier, earlier))
+        compiled = time.time() - DAY
+        os.utime(incremental, (compiled, compiled))
+        scan, owners = scanned(target)
+        self.assertIn(owners[str(incremental)], scan.groups)
+        self.assertEqual(owners[str(incremental)].last_used, compiled)
+
+    def test_grouping_and_walk_share_directory_observations(self) -> None:
+        target = self.target()
+        trees = sweep.build_trees(str(target.root))
+        listed: list[str] = []
+        scandir = os.scandir
+        def observe(path: str) -> object:
+            listed.append(path)
+            return scandir(path)
+        with mock.patch.object(os, "scandir", side_effect=observe):
+            scan = sweep.scan_roots(sweep.DiscoveredTargetRoots([str(target.root)], [str(target.root)]), trees)
+        fingerprint = str(target.tree / ".fingerprint" / f"app-{APP}")
+        self.assertEqual(listed.count(fingerprint), 1)
+        self.assertIn(str(target.app), {path for group in scan.groups for path in group.observed})
 
 
 class DepInfoTests(SweepCase):
@@ -1156,6 +1191,33 @@ class ReclamationTests(SweepCase):
 
 
 class FloorTests(SweepCase):
+    def test_output_owners_keep_mapping_order_and_exclude_neighbor_paths(self) -> None:
+        base = self.base()
+        outer = CargoOutputRoots(base / "outer", base / "artifacts", base / "build")
+        neighbor = CargoOutputRoots(base / "neighbor", base / "artifacts-old", base / "build-old")
+        inner = CargoOutputRoots(base / "inner", base / "build" / "nested", base / "build" / "nested")
+        index = sweep.CargoOutputIndex((outer, neighbor, inner))
+        self.assertEqual(index.mappings_for(inner.build_directory / "debug"), (outer, inner))
+        self.assertEqual(index.mappings_for(neighbor.target_directory / "release"), (neighbor,))
+        self.assertEqual(index.mappings_for(base / "unrelated"), ())
+
+    def test_linked_output_roots_follow_transitive_mappings_and_current_directories(self) -> None:
+        base = self.base()
+        roots = [base / name for name in ("target", "build", "shared", "other")]
+        for root in roots:
+            root.mkdir()
+        target, build, shared, other = roots
+        index = sweep.CargoOutputIndex((
+            CargoOutputRoots(base / "one", target, build),
+            CargoOutputRoots(base / "two", shared, other),
+            CargoOutputRoots(base / "bridge", build, shared),
+        ))
+        self.assertEqual(index.roots_for(str(target)), tuple(sorted(map(str, roots))))
+        shared.rmdir()
+        self.assertEqual(index.roots_for(str(other)), tuple(sorted(map(str, (target, build, other)))))
+        shared.mkdir()
+        self.assertEqual(index.roots_for(str(build)), tuple(sorted(map(str, roots))))
+
     def test_nested_workspace_members_share_one_metadata_read(self) -> None:
         base = self.base()
         workspace = base / "workspace"
@@ -1173,6 +1235,60 @@ class FloorTests(SweepCase):
         self.assertEqual(index.workspaces, (mapping,))
         self.assertEqual(index.unresolved, frozenset())
         self.assertEqual(index.history, ())
+
+    def test_known_workspace_refresh_overlaps_discovery_and_keeps_old_outputs(self) -> None:
+        base = self.base()
+        workspace = base / "workspace"
+        _ = write(workspace / "Cargo.toml", 0)
+        old = CargoOutputRoots(workspace, base / "old-target", base / "old-build")
+        current = CargoOutputRoots(workspace, base / "new-target", base / "new-build")
+        for root in (old.target_directory, old.build_directory, current.target_directory, current.build_directory):
+            root.mkdir()
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((old,)))
+        metadata_started = Event()
+        original = sweep.target_dirs
+
+        def discover(roots: Sequence[str], *, lint_settings: conf.ConfigRead,
+                     checkouts: list[str]) -> list[str]:
+            if not metadata_started.wait(5):
+                raise TimeoutError("Cargo metadata did not start during directory discovery")
+            return original(roots, lint_settings=lint_settings, checkouts=checkouts)
+
+        def read(checkout: Path) -> CargoOutputRoots:
+            self.assertEqual(checkout, workspace)
+            metadata_started.set()
+            return current
+
+        with (mock.patch.object(Path, "cwd", return_value=base),
+              mock.patch.object(sweep, "target_dirs", side_effect=discover),
+              mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read)):
+            roots, index = sweep.discover_cargo_outputs([str(base)], True, lint_settings=conf.read("lint"))
+        self.assertEqual(set(roots), {str(root) for mapping in (old, current)
+                                     for root in (mapping.target_directory, mapping.build_directory)})
+        self.assertEqual(index.workspaces, (current,))
+        self.assertEqual(index.history, (old,))
+
+    def test_discovered_parent_precedes_an_earlier_read_of_a_cached_child(self) -> None:
+        base = self.base()
+        workspace = base / "workspace"
+        child = workspace / "child"
+        for folder in (workspace, child):
+            _ = write(folder / "Cargo.toml", 0)
+        cached = CargoOutputRoots(child, base / "old-target", base / "old-build")
+        parent = CargoOutputRoots(workspace, base / "parent-target", base / "parent-build")
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((cached,)))
+        calls: list[Path] = []
+
+        def read(checkout: Path) -> CargoOutputRoots:
+            calls.append(checkout)
+            return parent if checkout == workspace else cached
+
+        with (mock.patch.object(Path, "cwd", return_value=base),
+              mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read)):
+            _, index = sweep.discover_cargo_outputs([str(base)], True, lint_settings=conf.read("lint"))
+        self.assertEqual(calls, [child, workspace])
+        self.assertIn(parent, index.workspaces)
+        self.assertEqual(index.unresolved, frozenset())
 
     def test_workspace_skip_cost_does_not_grow_with_the_number_of_roots(self) -> None:
         base = self.base()
@@ -1389,6 +1505,35 @@ class FloorTests(SweepCase):
         deleted = cast(dict[str, object], json.loads(sweep.target_deletes_path().read_text()))
         self.assertEqual(set(deleted), set(roots))
 
+    def test_paired_roots_without_fingerprints_keep_zero_time_units(self) -> None:
+        base = self.base()
+        mapping, own, copy = self.paired_output(base)
+        fingerprint = own.parent.parent / ".fingerprint" / f"app-{APP}"
+        shutil.rmtree(fingerprint)
+        os.utime(own, (0, 0))
+        second = write(copy.parent / "deps" / f"app-{APP}")
+        (copy.parent / ".fingerprint").mkdir()
+        for path in (second, copy, copy.with_suffix(".d")):
+            os.utime(path, (0, 0))
+        roots = [str(mapping.build_directory), str(mapping.target_directory)]
+        scan = sweep.scan_floor_roots(roots, {root: sweep.build_trees(root) for root in roots})
+        group, = scan.groups
+        self.assertTrue({str(own), str(second), str(copy)}.issubset(group.entries))
+        self.assertEqual((group.last_used, group.compiled), (0, 0))
+
+    def test_changed_fingerprint_keeps_its_target_after_an_older_target(self) -> None:
+        base = self.base()
+        now = time.time()
+        first, first_output = cargo_target(base, "first", APP, now - 6 * 3600)
+        second, second_output = cargo_target(base, "second", TOOL, now - 4 * 3600)
+        fingerprint = first / ".fingerprint" / f"first-{APP}"
+        os.utime(fingerprint, (now, now - 3600))
+        roots = [str(first.parent), str(second.parent)]
+        scan = sweep.scan_floor_roots(roots, {root: sweep.build_trees(root) for root in roots})
+        ordered = sorted(scan.groups, key=lambda group: sweep.unit_age(group, now))
+        self.assertEqual([str(second_output) in group.entries for group in ordered], [True, False])
+        self.assertIn(str(first_output), ordered[1].entries)
+
     def test_selected_unit_frees_both_devices_but_credits_only_the_shortfall_device(self) -> None:
         base = self.base()
         mapping, own, copy = self.paired_output(base)
@@ -1557,13 +1702,15 @@ class FloorTests(SweepCase):
         self.assertEqual([item.root_device for item in floors], [True, False])
 
     def test_missing_or_bad_floor_percent_refuses_once(self) -> None:
-        base = self.base()
         for value in ("", "bad", "-1", "101"):
             with self.subTest(value=value):
+                base = self.base()
                 _ = write_config_fixture(conf.path("lint"), f"sweep_free_floor_percent={value}\n")
                 errors = io.StringIO()
-                with redirect_stderr(errors):
+                with (redirect_stderr(errors),
+                      mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
                     self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB])[0], 2)
+                self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
                 self.assertIn("sweep_free_floor_percent", errors.getvalue())
 
@@ -1721,6 +1868,7 @@ class FloorTests(SweepCase):
 
     def test_failed_whole_payload_delete_keeps_markers_for_the_next_run(self) -> None:
         base = self.base()
+        send = self.enterContext(mock.patch.object(sweep, "send_floor_alert", return_value=True))
         root, payload = self.residue_target(base, "docs", time.time() - DAY)
         _ = (root / sweep.CACHE_TAG).write_text(sweep.CARGO_TAG_LINE + "\n")
         markers = [root / sweep.RUSTC_INFO, root / sweep.CACHE_TAG]
@@ -1733,6 +1881,7 @@ class FloorTests(SweepCase):
 
         with mock.patch.object(sweep, "remove_entry", side_effect=fail_payload):
             _ = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
         self.assertTrue(payload.exists())
         self.assertTrue(all(marker.exists() for marker in markers))
         self.assertIn(str(root), sweep.target_dirs([str(base)]))
@@ -2221,6 +2370,7 @@ class FloorTests(SweepCase):
         for caller in ("budget", "floor"):
             with self.subTest(caller=caller):
                 base = self.base()
+                send = self.enterContext(mock.patch.object(sweep, "send_floor_alert", return_value=True))
                 tree, output = cargo_target(base, "shared", APP, time.time() - DAY)
                 fingerprint = tree / ".fingerprint" / f"shared-{APP}" / "bin-shared.json"
                 clone = base / "copy" / "target"
@@ -2240,6 +2390,8 @@ class FloorTests(SweepCase):
                       mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
                       redirect_stderr(io.StringIO())):
                     status = self.take(base, tree.parent, caller)
+                if caller == "floor":
+                    self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
                 self.assertEqual(status, 1)
                 self.assertFalse(output.exists())
                 self.assertTrue(fingerprint.exists())
@@ -2385,7 +2537,7 @@ class FloorTests(SweepCase):
                     self.assertEqual(sweep.hold_floor(GIB, False, lock=str(base / "floor.lock")), 0)
                 self.assertTrue(output.exists(), "A busy configured standing target must survive")
                 self.assertEqual(self.trim_rows(), [])
-            with mock.patch.object(sweep, "free_bytes", side_effect=[0, 0, GIB]):
+            with self.free_space([0, GIB]):
                 self.assertEqual(sweep.hold_floor(GIB, False, lock=str(base / "floor.lock")), 0)
         self.assertFalse(output.exists(), "The default floor must reclaim an idle configured standing target")
         row, = self.trim_rows()
@@ -2395,6 +2547,7 @@ class FloorTests(SweepCase):
         for caller in ("budget", "floor"):
             with self.subTest(caller=caller):
                 base = self.base()
+                send = self.enterContext(mock.patch.object(sweep, "send_floor_alert", return_value=True))
                 now = time.time()
                 tree, refused = cargo_target(base, "shared", APP, now - 3 * DAY)
                 kept = unit(tree, "deps", "newer", DEMO, now - DAY)
@@ -2417,6 +2570,8 @@ class FloorTests(SweepCase):
                         status = sweep.sweep([str(tree.parent)], [str(tree)], total - 1, "test", False, recent_minutes=60)
                     else:
                         status, _ = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+                if caller == "floor":
+                    self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
                 self.assertEqual(status, 1)
                 self.assertTrue(refused.exists())
                 self.assertFalse(fingerprint.exists())
@@ -2663,7 +2818,7 @@ class FloorTests(SweepCase):
         self.assertFalse(output.exists())
         self.assertTrue((base / "outside-target").exists())
         send.assert_called_once()
-        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
 
     def test_floor_removes_old_hard_links_in_order_and_keeps_newer_output(self) -> None:
         base = self.base()
@@ -2854,6 +3009,47 @@ class FloorTests(SweepCase):
         self.assertEqual(len(self.trim_rows()), 1)
         self.assertFalse(sweep.sweep_removals_path().exists())
 
+    def test_dry_run_keeps_selection_when_cache_accounting_is_unavailable(self) -> None:
+        base = self.base()
+        _, first = cargo_target(base, "first", APP, time.time() - 2 * DAY)
+        _, second = cargo_target(base, "second", DEMO, time.time() - DAY)
+        free = [10 * GIB - 1, 10 * GIB - 1]
+        baseline = self.hold(base, 10 * GIB, free, dry_run=True)
+        with mock.patch.object(sweep, "directory_blocks", side_effect=OSError("fixture accounting unavailable")):
+            result = self.hold(base, 10 * GIB, free, dry_run=True)
+        self.assertEqual(result, baseline)
+        self.assertIn(f"from {first.parents[2]}", result[1])
+        self.assertNotIn(f"from {second.parents[2]}", result[1])
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+
+    def test_floor_grouping_resolves_each_target_once(self) -> None:
+        base = self.base()
+        for number in range(12):
+            _ = cargo_target(base, "repo", f"{number:016x}", time.time() - DAY)
+        index = sweep.CargoOutputIndex
+        roots_for = index.roots_for
+        scan_floor_roots = sweep.scan_floor_roots
+        target_last_use = sweep.target_last_use
+        grouping_queries: list[str] = []
+        observed_queries: list[list[str]] = []
+        def resolve(outputs: sweep.CargoOutputIndex, root: str) -> tuple[str, ...]:
+            grouping_queries.append(root)
+            return roots_for(outputs, root)
+        def scanned_roots(roots: list[str], trees: dict[str, list[str]], *,
+                          lint_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> sweep.Scan:
+            scan = scan_floor_roots(roots, trees, lint_settings=lint_settings)
+            grouping_queries.clear()
+            return scan
+        def last_use(root: str, groups: list[sweep.Group], discovered: Sequence[str] = ()) -> float:
+            observed_queries.append(list(grouping_queries))
+            return target_last_use(root, groups, discovered)
+        with (mock.patch.object(index, "roots_for", resolve),
+              mock.patch.object(sweep, "scan_floor_roots", side_effect=scanned_roots),
+              mock.patch.object(sweep, "target_last_use", side_effect=last_use)):
+            self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB - 1], dry_run=True)[0], 0)
+        self.assertEqual(observed_queries[0], [str(base / "repo" / "target")])
+
     def base(self) -> Path:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         config = base / "copies.conf"
@@ -2872,7 +3068,7 @@ class FloorTests(SweepCase):
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", return_value={}))
         _ = write_config_fixture(conf.path("lint"),
                                  f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n"
-                                 + f"sweep_floor_roots={base}\n")
+                                 + f"sweep_floor_roots={base}\n" + "sweep_phone_floor_gib=0\n")
         _ = self.enterContext(mock.patch.object(
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         _ = self.enterContext(mock.patch.object(
@@ -3117,7 +3313,7 @@ class FloorTests(SweepCase):
             self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
         self.assertFalse(output_file.exists())
         self.assertEqual(send.call_count, 1)
-        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
         message = cast(str, send.call_args.args[0])
         self.assertIn("No idle build cache is left to remove", message)
         self.assertIn("natedev still has only 9.0 GiB free. Builds need 10.0 GiB free", message)
@@ -3126,9 +3322,8 @@ class FloorTests(SweepCase):
         self.assertIn(f"- {busy_tree.parent} ({sweep.gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
                       + " no session found", message)
         self.assertIn(f"Not swept: CI's targets ({sweep.gib(ci_bytes)})", message)
-        self.assertIn("No session above could be told, so the user also gets a page with these paths.", message)
-        page = cast(RenderedPush, send.call_args.kwargs["phone"])
-        self.assertIn(f"{busy_tree.parent}: frees {sweep.gib(held_bytes)}. Process {os.getpid()} uses it now", page.values["paths"])
+        self.assertIn("The disk sweep sends alerts only to natedev.", message)
+        self.assertNotIn("phone", send.call_args.kwargs)
         self.assertNotIn("Could not remove", message)
         record = sweep.read_floor_record(sweep.floor_record_path())
         assert isinstance(record, sweep.FloorRecord)
@@ -3140,9 +3335,270 @@ class FloorTests(SweepCase):
         with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
             self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
         self.assertEqual(send.call_count, 1)
-        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
         self.assertIn("removed 0.0 GiB", cast(str, send.call_args.args[0]))
         self.assertIn("Not swept: CI's targets (0.0 GiB).", cast(str, send.call_args.args[0]))
+
+    def test_phone_floor_crossing_sends_once_until_free_space_rises(self) -> None:
+        base = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+            for free, expected in ((200, 0), (140, 1), (130, 1), (151, 1), (140, 2)):
+                self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB])[0], 0)
+                phone_calls = [call for call in send.call_args_list
+                               if cast(str, call.args[0]).startswith("Free disk space fell")]
+                self.assertEqual(len(phone_calls), expected)
+                for call in phone_calls:
+                    self.assertEqual(call.args[1], sweep.FloorAlertChannels.NATEDEV)
+                    self.assertNotIn("phone", call.kwargs)
+            saved = sweep.read_floor_record(sweep.floor_record_path())
+            assert isinstance(saved, sweep.FloorRecord)
+            self.assertIsInstance(saved.phone_crossing, sweep.UnderPhoneFloorPushed)
+
+    def test_phone_floor_crossing_retries_a_failed_delivery(self) -> None:
+        base = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True):
+            self.assertEqual(self.hold(base, 300 * GIB, [200 * GIB, 200 * GIB])[0], 0)
+        with mock.patch.object(sweep, "send_floor_alert", side_effect=[False, True]) as send:
+            self.assertEqual(self.hold(base, 300 * GIB, [140 * GIB, 140 * GIB])[0], 0)
+            saved = sweep.read_floor_record(sweep.floor_record_path())
+            assert isinstance(saved, sweep.FloorRecord)
+            self.assertIsInstance(saved.phone_crossing, sweep.UnderPhoneFloorPending)
+            self.assertEqual(self.hold(base, 300 * GIB, [130 * GIB, 130 * GIB])[0], 0)
+            self.assertEqual(send.call_count, 2)
+            self.assertTrue(all(call.args[1] is sweep.FloorAlertChannels.NATEDEV
+                                for call in send.call_args_list))
+
+    def test_failed_sweep_sends_only_a_natedev_alert(self) -> None:
+        base = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        _, output = cargo_target(base, "repo", APP, time.time() - DAY)
+        with (mock.patch.object(sweep, "remove", return_value=sweep.ConfirmedDeletion(0, 1)),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+            self.assertEqual(self.hold(base, 300 * GIB, [200 * GIB, 200 * GIB])[0], 1)
+            failure_calls = [call for call in send.call_args_list if "sweep failed" in cast(str, call.args[0])]
+            self.assertEqual(len(failure_calls), 1)
+            self.assertEqual(failure_calls[0].args[1], sweep.FloorAlertChannels.NATEDEV)
+            self.assertNotIn("phone", failure_calls[0].kwargs)
+        self.assertTrue(output.exists())
+
+    def test_late_completion_uses_current_space_for_one_crossing(self) -> None:
+        _ = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        with (mock.patch.object(sweep, "free_bytes", return_value=130 * GIB),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+            for older_reading in (140, 200, 130):
+                sweep.notify_floor_problem(sweep.FloorOutcome(0, 0, older_reading * GIB, older_reading * GIB, 0),
+                                           lint_settings=conf.read("lint"))
+        self.assertEqual(send.call_count, 1)
+        saved = sweep.read_floor_record(sweep.floor_record_path())
+        assert isinstance(saved, sweep.FloorRecord)
+        self.assertIsInstance(saved.phone_crossing, sweep.UnderPhoneFloorPushed)
+
+    def test_above_cleanup_floor_rearms_the_phone_crossing(self) -> None:
+        base = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+            for free in (140, 320, 140):
+                self.assertEqual(self.hold(base, 300 * GIB, [free * GIB])[0], 0)
+        phone_calls = [call for call in send.call_args_list
+                       if cast(str, call.args[0]).startswith("Free disk space fell")]
+        self.assertEqual(len(phone_calls), 2)
+
+    def test_contended_pass_keeps_crossing_and_failure_states(self) -> None:
+        base = self.base()
+        path = sweep.floor_record_path()
+        previous = sweep.FloorRecord(time.time(), 140 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(),
+                                     phone_crossing=sweep.UnderPhoneFloorPending(),
+                                     failure=sweep.FailurePending(sweep.FloorFailureEvent(1, "fixture failure")))
+        sweep.write_floor_record(path, previous)
+        with (path.with_suffix(".lock").open("a+") as lock,
+              mock.patch.object(sweep, "alert_floor_lock"),
+              mock.patch.object(sweep, "send_floor_alert") as send):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.hold(base, 300 * GIB, [140 * GIB])[0], 0)
+        send.assert_not_called()
+        self.assertEqual(sweep.read_floor_record(path), previous)
+
+    def test_lock_alert_error_keeps_the_contended_pass_skipped(self) -> None:
+        base = self.base()
+        path = sweep.floor_record_path()
+        previous = sweep.FloorRecord(time.time(), 140 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(),
+                                     phone_crossing=sweep.UnderPhoneFloorPending(),
+                                     failure=sweep.FailurePending(sweep.FloorFailureEvent(1, "fixture failure")))
+        sweep.write_floor_record(path, previous)
+        error_output = io.StringIO()
+        with (path.with_suffix(".lock").open("a+") as lock,
+              mock.patch.object(sweep, "alert_floor_lock", side_effect=OSError("fixture lock alert failed")),
+              mock.patch.object(sweep, "send_floor_alert") as send,
+              redirect_stderr(error_output)):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.hold(base, 300 * GIB, [140 * GIB])[0], 0)
+        send.assert_not_called()
+        self.assertEqual(sweep.read_floor_record(path), previous)
+        self.assertIn("fixture lock alert failed", error_output.getvalue())
+
+    def test_failure_before_scan_reaches_the_finalizer(self) -> None:
+        base = self.base()
+        with (mock.patch.object(sweep, "recover_pending_trims", side_effect=OSError("fixture recovery failed")),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send,
+              redirect_stderr(io.StringIO())):
+            self.assertEqual(self.hold(base, 300 * GIB, [200 * GIB])[0], 1)
+        self.assertIn("fixture recovery failed", cast(str, send.call_args.args[0]))
+        saved = sweep.read_floor_record(sweep.floor_record_path())
+        assert isinstance(saved, sweep.FloorRecord)
+        self.assertIsInstance(saved.failure, sweep.FailureReported)
+
+    def test_notification_finishes_before_the_acquired_floor_lock_closes(self) -> None:
+        base = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        def deliver(*args: object, **values: object) -> bool:
+            if str(args[0]).startswith("Free disk space fell"):
+                self.assertNotIn("phone", values)
+                held = sweep.try_lock(str(sweep.floor_record_path().with_suffix(".lock")))
+                if held is not None:
+                    os.close(held)
+                self.assertIsNone(held)
+            return True
+        with mock.patch.object(sweep, "send_floor_alert", side_effect=deliver):
+            self.assertEqual(self.hold(base, 300 * GIB, [140 * GIB])[0], 0)
+        guard = sweep.try_lock(str(sweep.floor_record_path().with_suffix(".lock")))
+        self.assertIsNotNone(guard)
+        if guard is not None:
+            os.close(guard)
+
+    def test_nonroot_failure_does_not_change_the_root_crossing(self) -> None:
+        base = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        root_path = sweep.floor_record_path()
+        root = sweep.FloorRecord(time.time(), 200 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())
+        sweep.write_floor_record(root_path, root)
+        token = sweep.FLOOR_FILESYSTEM.set(sweep.FilesystemFloor(2, str(base), 300 * GIB, (), False))
+        try:
+            with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+                sweep.notify_floor_problem(sweep.FloorOutcome(1, 0, 100 * GIB, 100 * GIB, 0),
+                                           lint_settings=conf.read("lint"))
+            self.assertEqual(send.call_count, 1)
+            other = sweep.read_floor_record(sweep.floor_record_path())
+            assert isinstance(other, sweep.FloorRecord)
+            self.assertIsInstance(other.phone_crossing, sweep.AbovePhoneFloor)
+            with mock.patch.object(sweep, "send_floor_alert") as recovered_send:
+                sweep.notify_floor_problem(sweep.FloorOutcome(0, 0, 100 * GIB, 100 * GIB, 0),
+                                           lint_settings=conf.read("lint"))
+            recovered_send.assert_not_called()
+            recovered = sweep.read_floor_record(sweep.floor_record_path())
+            assert isinstance(recovered, sweep.FloorRecord)
+            self.assertIsInstance(recovered.failure, sweep.NoFailure)
+        finally:
+            sweep.FLOOR_FILESYSTEM.reset(token)
+        self.assertEqual(sweep.read_floor_record(root_path), root)
+
+    def test_full_record_storage_still_delivers_the_crossing(self) -> None:
+        _ = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        with (mock.patch.object(sweep, "free_bytes", return_value=140 * GIB),
+              mock.patch.object(sweep, "write_floor_record", side_effect=OSError(errno.ENOSPC, "fixture full")),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send,
+              redirect_stderr(io.StringIO())):
+            sweep.notify_floor_problem(sweep.FloorOutcome(0, 0, 140 * GIB, 140 * GIB, 0),
+                                       lint_settings=conf.read("lint"))
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
+        self.assertNotIn("phone", send.call_args.kwargs)
+        self.assertIn("Free disk space fell", cast(str, send.call_args.args[0]))
+
+    def test_unavailable_record_allows_one_unsaved_delivery(self) -> None:
+        _ = self.base()
+        with (mock.patch.object(sweep, "locked_floor_record", side_effect=OSError(errno.ENOSPC, "fixture full")),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send,
+              redirect_stderr(io.StringIO())):
+            sweep.notify_floor_problem(sweep.FloorOutcome(1, 0, 200 * GIB, 200 * GIB, 0),
+                                       lint_settings=conf.read("lint"), scope=sweep.FloorFailureScope.DISCOVERY)
+        self.assertEqual(send.call_count, 1)
+
+    def test_failure_episode_needs_recovery_before_another_natedev_alert(self) -> None:
+        _ = self.base()
+        with (mock.patch.object(sweep, "free_bytes", return_value=200 * GIB),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+            for outcome in (sweep.FloorOutcome(1, 0, 0, 0, 0), sweep.FloorOutcome(1, 0, 0, 0, 0),
+                            sweep.FloorOutcome(0, 0, 0, 0, 0, sweep.SkippedFloorAssessment()),
+                            sweep.FloorOutcome(1, 0, 0, 0, 0), sweep.FloorOutcome(0, 0, 0, 0, 0),
+                            sweep.FloorOutcome(1, 0, 0, 0, 0)):
+                sweep.notify_floor_problem(outcome, lint_settings=conf.read("lint"))
+        self.assertEqual(send.call_count, 2)
+
+    def test_successful_assessment_clears_an_undelivered_failure_without_a_push(self) -> None:
+        _ = self.base()
+        with (mock.patch.object(sweep, "free_bytes", return_value=320 * GIB),
+              mock.patch.object(sweep, "send_floor_alert", side_effect=[False, True]) as send):
+            sweep.notify_floor_problem(sweep.FloorOutcome(1, 0, 0, 0, 0), lint_settings=conf.read("lint"),
+                                       detail="private failure detail")
+            pending = sweep.read_floor_record(sweep.floor_record_path())
+            assert isinstance(pending, sweep.FloorRecord)
+            self.assertIsInstance(pending.failure, sweep.FailurePending)
+            assert isinstance(pending.failure, sweep.FailurePending)
+            self.assertEqual(pending.failure.event.detail, "private failure detail")
+            sweep.notify_floor_problem(sweep.FloorOutcome(0, 0, 0, 0, 0), lint_settings=conf.read("lint"))
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
+        self.assertNotIn("phone", send.call_args.kwargs)
+        saved = sweep.read_floor_record(sweep.floor_record_path())
+        assert isinstance(saved, sweep.FloorRecord)
+        self.assertIsInstance(saved.failure, sweep.NoFailure)
+
+    def test_failed_natedev_failure_delivery_retries_until_reported(self) -> None:
+        _ = self.base()
+        with (mock.patch.object(sweep, "free_bytes", return_value=200 * GIB),
+              mock.patch.object(sweep, "send_floor_alert", side_effect=[False, True]) as send):
+            sweep.notify_floor_problem(sweep.FloorOutcome(1, 0, 200 * GIB, 200 * GIB, 0),
+                                       lint_settings=conf.read("lint"), detail="private exception detail")
+            pending = sweep.read_floor_record(sweep.floor_record_path())
+            assert isinstance(pending, sweep.FloorRecord)
+            self.assertIsInstance(pending.failure, sweep.FailurePending)
+            sweep.notify_floor_problem(sweep.FloorOutcome(1, 0, 200 * GIB, 200 * GIB, 0),
+                                       lint_settings=conf.read("lint"), detail="later failure detail")
+        self.assertEqual(send.call_count, 2)
+        for call in send.call_args_list:
+            self.assertEqual(call.args[1], sweep.FloorAlertChannels.NATEDEV)
+            self.assertNotIn("phone", call.kwargs)
+            self.assertIn("private exception detail", cast(str, call.args[0]))
+            self.assertNotIn("later failure detail", cast(str, call.args[0]))
+        reported = sweep.read_floor_record(sweep.floor_record_path())
+        assert isinstance(reported, sweep.FloorRecord)
+        self.assertIsInstance(reported.failure, sweep.FailureReported)
+
+    def test_low_disk_failure_sends_one_natedev_message_for_the_episode(self) -> None:
+        _ = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        with (mock.patch.object(sweep, "free_bytes", return_value=140 * GIB),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+            for status in (1, 1):
+                sweep.notify_floor_problem(sweep.FloorOutcome(status, 0, 140 * GIB, 140 * GIB, 0),
+                                           lint_settings=conf.read("lint"), detail="private exception detail")
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
+        self.assertNotIn("phone", send.call_args.kwargs)
+        self.assertIn("private exception detail", cast(str, send.call_args.args[0]))
+
+    def test_unreadable_free_space_does_not_stop_later_filesystems(self) -> None:
+        base = self.base()
+        first = sweep.FilesystemFloor(1, str(base / "bad"), 100, (), True)
+        second = sweep.FilesystemFloor(2, str(base / "good"), 100, (), False)
+        measured: list[str] = []
+        def available(path: str) -> int:
+            measured.append(path)
+            if path == first.probe_path:
+                raise OSError("fixture free-space read failed")
+            return 200
+        with (mock.patch.object(sweep, "discover_cargo_outputs", return_value=([], sweep.CargoOutputIndex())),
+              mock.patch.object(sweep, "filesystem_floors", return_value=[first, second]),
+              mock.patch.object(sweep, "free_bytes", side_effect=available),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send,
+              redirect_stderr(io.StringIO())):
+            self.assertEqual(sweep.hold_floor(100, False), 1)
+        self.assertIn(second.probe_path, measured)
+        self.assertEqual(send.call_count, 1)
 
     def test_under_floor_with_removable_units_left_sends_no_push(self) -> None:
         base = self.base()
@@ -3159,7 +3615,7 @@ class FloorTests(SweepCase):
         with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
             self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
         self.assertEqual(send.call_count, 1)
-        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
 
     def test_recent_push_holds_next_push_for_its_own_hour(self) -> None:
         base = self.base()
@@ -3174,7 +3630,7 @@ class FloorTests(SweepCase):
         with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
             self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
         self.assertEqual(send.call_count, 1)
-        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
 
     def test_failed_push_does_not_start_its_hour(self) -> None:
         base = self.base()
@@ -3232,9 +3688,9 @@ class FloorTests(SweepCase):
         self.assertIsInstance(record, sweep.FloorRecord)
         assert isinstance(record, sweep.FloorRecord)
         self.assertEqual(record.build_cache_bytes, before)
-        self.assertEqual(send.call_count, 1)
-        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
-        message = cast(str, send.call_args.args[0])
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
+        message = cast(str, send.call_args_list[0].args[0])
         self.assertIn("Not swept: CI's targets (0.0 GiB).\nCould not remove 1 path this sweep; the next sweep tries again.", message)
 
     def test_both_sends_failing_retry_and_one_delivery_stamps_hour(self) -> None:
@@ -3287,12 +3743,12 @@ raise SystemExit(int(os.environ[variable]))
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "1", "SWEEP_USER_EXIT": "0"}),
               redirect_stdout(output), redirect_stderr(errors)):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
+                                                   phone=render("nixos.disk_low", free="9", shortfall="1")))
         self.assertEqual(run.call_count, 2)
         commands = [cast(list[str], call.args[0]) for call in run.call_args_list]
         self.assertEqual([command[command.index("--to") + 1] for command in commands], ["natedev", "user"])
-        self.assertEqual(commands[1][commands[1].index("--text-id") + 1], "sweep.disk_floor")
-        self.assertIn("shortfall=1.0 GiB", commands[1])
+        self.assertEqual(commands[1][commands[1].index("--text-id") + 1], "nixos.disk_low")
+        self.assertIn("shortfall=1", commands[1])
         self.assertEqual(run.call_args_list[0].kwargs["input"], "disk notice")
         self.assertIsNone(cast(object, run.call_args_list[1].kwargs["input"]))
         self.assertIn("message alert queued", output.getvalue())
@@ -3301,13 +3757,13 @@ raise SystemExit(int(os.environ[variable]))
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "0", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
-            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
+            self.assertFalse(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
+                                                   phone=render("nixos.disk_low", free="9", shortfall="1")))
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "3", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             self.assertFalse(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
+                                                   phone=render("nixos.disk_low", free="9", shortfall="1")))
 
     def test_phone_alert_wait_covers_configured_review_while_session_wait_stays_short(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "notify.conf"
@@ -3316,7 +3772,7 @@ raise SystemExit(int(os.environ[variable]))
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
               redirect_stdout(io.StringIO())):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
+                                                   phone=render("nixos.disk_low", free="9", shortfall="1")))
         self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [170, 345])
         self.assertEqual(run.call_count, 2)
 
@@ -3327,41 +3783,31 @@ raise SystemExit(int(os.environ[variable]))
         with (mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
               redirect_stdout(io.StringIO())):
             self.assertTrue(sweep.send_floor_alert(text, sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
+                                                   phone=render("nixos.disk_low", free="9", shortfall="1")))
         self.assertEqual(run.call_args_list[0].kwargs["input"], text)
         command = cast(list[str], run.call_args_list[1].args[0])
-        self.assertEqual(command[command.index("--text-id") + 1], "sweep.disk_floor")
-        self.assertIn("shortfall=1.0 GiB", command)
-        self.assertIn("floor=10.0 GiB", command)
+        self.assertEqual(command[command.index("--text-id") + 1], "nixos.disk_low")
+        self.assertIn("shortfall=1", command)
+        self.assertIn("free=9", command)
         self.assertNotIn("measurement unavailable", " ".join(command))
 
-    def test_typical_disk_cleanup_example_uses_the_live_build_floor(self) -> None:
-        entry = next(entry for entry in catalog() if entry.id == "sweep.disk_floor")
-        typical = next(example for example in entry.examples if example.name == "typical")
-        push = render_entry(entry, typical.values)
-        actual = sweep.disk_floor_push(2 * GIB, 290 * GIB, 300 * GIB, PAGE_PATHS)
-        self.assertEqual(push, actual)
-        self.assertEqual(typical.values, {"shortfall": "10.0 GiB", "free": "290.0 GiB",
-                                        "floor": "300.0 GiB", "removed": "2.0 GiB", "paths": "\n\n".join(PAGE_PATHS)})
-
-    def test_disk_page_never_asks_the_user_to_free_space_by_hand(self) -> None:
-        entry = next(entry for entry in catalog() if entry.id == "sweep.disk_floor")
-        for example in entry.examples:
-            with self.subTest(example=example.name):
-                push = render_entry(entry, example.values)
-                assert isinstance(push.action, ActionRequired)
-                self.assertIn("Claude session named natedev", push.action.text)
-                for words in ("terminal", "delete", "personal files", "free more space"):
-                    self.assertNotIn(words, push.message)
-
-    def test_disk_page_names_as_many_exact_paths_as_fit_one_push(self) -> None:
-        long_paths = [f"/tmp/claude-1000/{'x' * 60}/{index}: frees 1.0 GiB." for index in range(6)]
-        push = sweep.disk_floor_push(0, 0, 300 * GIB, long_paths)
-        listed = push.values["paths"].split("\n\n")
-        self.assertLess(len(push.message), conf.read("lint").whole("sweep_push_text_limit"))
-        self.assertTrue(listed)
-        self.assertEqual(listed, long_paths[:len(listed)])
-        self.assertEqual(sweep.disk_floor_push(0, 0, 300 * GIB, []).values["paths"], sweep.NO_PAGE_PATHS)
+    def test_low_space_alert_stays_in_natedev_after_the_phone_review_fails(self) -> None:
+        base = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
+        folder = sweep.OutsideCacheDirectory(str(base / "measured"), 26 * GIB, 0, sweep.NoLargestGrowingChild())
+        measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [folder], 0)
+        with (mock.patch.object(sweep, "free_bytes", return_value=140 * GIB),
+              mock.patch.object(sweep, "read_disk_measurement", return_value=measurement),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+            sweep.notify_floor_problem(sweep.FloorOutcome(0, 0, 140 * GIB, 140 * GIB, 0),
+                                       lint_settings=conf.read("lint"))
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
+        self.assertNotIn("phone", send.call_args.kwargs)
+        message = cast(str, send.call_args.args[0])
+        self.assertIn("140.0 GiB", message)
+        self.assertIn("150.0 GiB", message)
+        self.assertIn(f"{folder.path}: holds 26.0 GiB.", message)
 
     def test_page_lists_busy_targets_then_the_deepest_measured_folders_by_size(self) -> None:
         def folder(path: str, size: int) -> sweep.OutsideCacheDirectory:
@@ -3374,7 +3820,7 @@ raise SystemExit(int(os.environ[variable]))
         self.assertEqual(sweep.page_paths(holders, measurement), [
             "/home/n/rust/a/target: frees 26.0 GiB. Process 41 uses it now and can fail.",
             "/tmp/b/target: frees 3.0 GiB. A build uses it now and can fail.",
-            "/tmp/claude-1000/scratch: frees 86.0 GiB.", "/home/n/.cache/uv: frees 12.0 GiB."])
+            "/tmp/claude-1000/scratch: holds 86.0 GiB.", "/home/n/.cache/uv: holds 12.0 GiB."])
 
     def test_nixos_disk_action_states_the_space_needed_to_restore_the_build_floor(self) -> None:
         for free in (149, 0, 290):
@@ -3406,8 +3852,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         errors = io.StringIO()
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
               redirect_stdout(io.StringIO()), redirect_stderr(errors)):
-            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
+            self.assertFalse(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
+                                                   phone=render("nixos.disk_low", free="9", shortfall="1")))
         self.assertIn("phone alert failed (3): stdout: FAILED: Pushover keys are missing", errors.getvalue())
 
     def test_natedev_only_channel_never_calls_phone(self) -> None:
@@ -3646,6 +4092,21 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertEqual(sweep.floor_bytes(values, "mac"), (None, "sweep_free_floor_gib.mac"))
         self.assertEqual(sweep.floor_bytes({}, "natedev"), (None, None))
 
+    def test_unreadable_parent_preserves_discovery_of_the_git_style_cache(self) -> None:
+        base = self.base()
+        target = base / ".git" / scratch.STYLE_TARGET_NAME
+        _ = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
+        _ = (target / sweep.RUSTC_INFO).write_text("{}")
+        scan = os.scandir
+
+        def deny_parent(path: str) -> object:
+            if path == str(base):
+                raise PermissionError("the parent cannot be listed")
+            return scan(path)
+
+        with mock.patch.object(os, "scandir", side_effect=deny_parent):
+            self.assertEqual(sweep.target_dirs([str(base)]), [str(target)])
+
     def test_finds_cargo_targets_and_nothing_inside_them(self) -> None:
         base = self.base()
         _ = cargo_target(base, "repo", APP, time.time())
@@ -3654,6 +4115,20 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         _ = write(base / "uv" / scratch.CACHE_TAG)
         self.assertEqual(sweep.target_dirs([str(base)]),
                          [str(base / "repo" / "target"), str(base / "repo" / "target" / "nested" / "target")])
+
+    def test_discovery_branches_preserve_depth_and_reset_only_at_targets(self) -> None:
+        base = self.base()
+        _ = write_config_fixture(conf.path("lint"), "sweep_floor_search_depth=1\n")
+        _ = write(base / "Cargo.toml", 0)
+        _ = write(base / "left" / "too-deep" / sweep.RUSTC_INFO, 0)
+        target = base / "right"
+        _ = write(target / sweep.RUSTC_INFO, 0)
+        _ = write(target / "nested" / sweep.RUSTC_INFO, 0)
+        _ = write(target / "debug" / ".fingerprint" / "Cargo.toml", 0)
+        checkouts: list[str] = []
+        self.assertEqual(sweep.target_dirs([str(base)], checkouts=checkouts),
+                         [str(target), str(target / "nested")])
+        self.assertEqual(checkouts, [str(base)])
 
     def test_cache_trace_targets_are_scratch_floor_targets_and_sccache_is_not_a_target(self) -> None:
         home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -3692,12 +4167,11 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
                     self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
                     self.assertNotIn("phone", send.call_args.kwargs)
                     self.assertIn("; session hana-unit was told", message)
-                    self.assertIn("The user gets no page while a session can end a use.", message)
+                    self.assertIn("The disk sweep sends alerts only to natedev.", message)
                 else:
-                    self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+                    self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
                     self.assertIn("; the message to session hana-unit failed", message)
-                    page = cast(RenderedPush, send.call_args.kwargs["phone"])
-                    self.assertIn(f"{busy_tree.parent}: ", page.values["paths"])
+                    self.assertNotIn("phone", send.call_args.kwargs)
                 record = sweep.read_floor_record(sweep.floor_record_path())
                 assert isinstance(record, sweep.FloorRecord)
                 self.assertIsInstance(record.push_history, sweep.DeliveredAlert)
@@ -3963,7 +4437,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
 
         def measure() -> int:
             _ = write_config_fixture(conf.path("lint"),
-                                     f"sweep_floor_roots={base}\n")
+                                     f"sweep_floor_roots={base}\n" + "sweep_phone_floor_gib=0\n")
             with self.free_space([2 * GIB, 302 * GIB], scanned=302 * GIB):
                 return sweep.hold_floor(300 * GIB, False)
 
@@ -4025,6 +4499,92 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         with mock.patch.object(sweep, "lock_holder", return_value=None), mock.patch.object(
                 sweep, "send_floor_alert") as send:
             self.assertEqual(self.hold(base, 300 * GIB, [2 * GIB])[0], 0)
+            send.assert_not_called()
+
+    def test_unreadable_hold_keeps_its_first_observation_until_the_configured_delay(self) -> None:
+        base = self.base()
+        path = self.locked_floor(base, 100, command=("python3", "other_tool.py"))
+        _ = path.write_text("broken")
+        with mock.patch.object(time, "time") as clock, mock.patch.object(
+                sweep, "send_floor_alert", return_value=True) as send:
+            for now in (1000, 1200, 1419):
+                clock.return_value = now
+                sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+                saved = sweep.read_floor_record(sweep.floor_record_path())
+                assert isinstance(saved, sweep.FloorRecord)
+                self.assertEqual(saved.lock_alert, sweep.ObservedUnreadableFloorHold(321, 1000))
+                send.assert_not_called()
+            clock.return_value = 1420
+            sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            send.assert_called_once()
+            message = cast(str, send.call_args.args[0])
+            self.assertIn("321 (python3 other_tool.py)", message)
+
+    def test_unreadable_hold_resets_its_clock_for_a_new_pid(self) -> None:
+        base = self.base()
+        path = self.locked_floor(base, 100, command=("python3", "other_tool.py"))
+        _ = path.write_text("broken")
+        with mock.patch.object(time, "time") as clock, mock.patch.object(
+                sweep, "send_floor_alert", return_value=True) as send:
+            clock.return_value = 1000
+            sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            clock.return_value = 1420
+            with mock.patch.object(sweep, "lock_holder", return_value=654):
+                sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+                saved = sweep.read_floor_record(sweep.floor_record_path())
+                assert isinstance(saved, sweep.FloorRecord)
+                self.assertEqual(saved.lock_alert, sweep.ObservedUnreadableFloorHold(654, 1420))
+                send.assert_not_called()
+                clock.return_value = 1840
+                sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            send.assert_called_once()
+            self.assertIn("654 (command is unreadable)", cast(str, send.call_args.args[0]))
+
+    def test_unreadable_hold_resets_its_clock_when_the_lock_is_free(self) -> None:
+        base = self.base()
+        path = self.locked_floor(base, 100, command=("python3", "other_tool.py"))
+        _ = path.write_text("broken")
+        with mock.patch.object(time, "time") as clock, mock.patch.object(
+                sweep, "send_floor_alert", return_value=True) as send:
+            clock.return_value = 1000
+            sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            with mock.patch.object(sweep, "lock_holder", return_value=None):
+                sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            clock.return_value = 1420
+            sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            send.assert_not_called()
+            saved = sweep.read_floor_record(sweep.floor_record_path())
+            assert isinstance(saved, sweep.FloorRecord)
+            self.assertEqual(saved.lock_alert, sweep.ObservedUnreadableFloorHold(321, 1420))
+
+    def test_unreadable_hold_retries_a_failed_delivery(self) -> None:
+        base = self.base()
+        path = self.locked_floor(base, 100, command=("python3", "other_tool.py"))
+        _ = path.write_text("broken")
+        with mock.patch.object(time, "time") as clock, mock.patch.object(
+                sweep, "send_floor_alert", side_effect=[False, True]) as send:
+            clock.return_value = 1000
+            sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            clock.return_value = 1420
+            sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            saved = sweep.read_floor_record(sweep.floor_record_path())
+            assert isinstance(saved, sweep.FloorRecord)
+            self.assertEqual(saved.lock_alert, sweep.ObservedUnreadableFloorHold(321, 1000))
+            clock.return_value = 1421
+            sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
+            self.assertEqual(send.call_count, 2)
+
+    def test_live_sweep_with_unreadable_identity_sends_no_alert(self) -> None:
+        base = self.base()
+        path = self.locked_floor(base, 100)
+        _ = path.write_text("broken")
+        with mock.patch.object(time, "time") as clock, mock.patch.object(
+                sweep, "send_floor_alert", return_value=True) as send:
+            for now in (1000, 1420, 1900):
+                clock.return_value = now
+                sweep.alert_floor_lock(str(path), GIB, 300 * GIB)
             send.assert_not_called()
 
     def test_lock_contention_above_the_floor_and_dry_runs_send_no_lock_alert(self) -> None:
@@ -4280,6 +4840,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
 
     def test_failed_group_has_no_floor_line_when_another_target_succeeds(self) -> None:
         base = self.base()
+        send = self.enterContext(mock.patch.object(sweep, "send_floor_alert", return_value=True))
         now = time.time()
         failed_tree, failed_output = cargo_target(base, "failed", APP, now - 2 * DAY)
         _, successful_output = cargo_target(base, "successful", DEMO, now - DAY)
@@ -4302,6 +4863,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         with mock.patch.object(os, "rmdir", side_effect=fail_one_group), redirect_stderr(errors):
             status, output = self.hold(base, 10 * GIB, [10 * GIB - shortfall, 10 * GIB])
 
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
         self.assertEqual(status, 1)
         self.assertIn("could not remove", errors.getvalue())
         self.assertTrue(failed_output.exists() or (failed_tree / ".fingerprint" / f"failed-{APP}").exists())

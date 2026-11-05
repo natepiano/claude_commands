@@ -152,6 +152,7 @@ def start(handoff):
     return identity
 def dispatch(published):
     assert staff.by_id(row.id) == published.row
+    return admission.SwitchState.ASSIGNMENT_ACCEPTED
 with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.current_session, 987654)):
     admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: None)
 '''

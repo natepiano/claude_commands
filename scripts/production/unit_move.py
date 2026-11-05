@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from enum import Enum
@@ -537,17 +537,16 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             _ = locks.enter_context(staff.row_operation(str(member.id)))
         # The delayed import avoids the restart module's dependency on unit_move.
         restart = import_module("scripts.shutdown.restart")
-        live_rows = cast(Callable[[staff.StaffSnapshot, herdr.Herdr], list[staff.StaffRow]], restart.live_rows)
+        live_members = cast(Callable[[Iterable[staff.StaffRow], staff.StaffSnapshot], list[staff.StaffRow]], restart.live_members)
         stop_row = cast(Callable[[staff.StaffRow, herdr.Herdr], bool], restart.stop_row)
         start_row = cast(Callable[[staff.StaffRow, staff.StaffSnapshot, herdr.Herdr], str], restart.start_row)
         client = herdr.Herdr(herdr.shared_session())
-        selected = {member.id for member in members}
         observed_live = set[staff.StaffId]()
 
         def observe() -> set[staff.StaffId]:
             nonlocal observed_live
             _check_move_deadline()
-            found = {member.id for member in live_rows(record, client) if member.id in selected}
+            found = {member.id for member in live_members(members, record)}
             _check_move_deadline()
             observed_live = found
             return found
