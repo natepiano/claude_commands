@@ -152,6 +152,9 @@ A missing or invalid live percent stops the floor pass with one line.
 
 `cargo_output.py` reads `workspace_root`, `target_directory`, and `build_directory` from Cargo metadata.
 Older Cargo metadata uses `target_directory` for both output roots.
+A step row's output roots use its command's Cargo inputs. The recorder omits them when `target_directory` differs from `target_dir`.
+Start-time capture applies config files, then `CARGO_BUILD_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`, then inline and file values from `--config`.
+It applies `CARGO_TARGET_DIR` next, then `--target-dir`.
 The sweep saves these mappings in `cargo-output-roots.json` beside its floor records.
 It keeps prior mappings for discovery and cold-rebuild attribution during the drain.
 No separate setup is required when the build drive is absent.

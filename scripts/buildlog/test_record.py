@@ -211,18 +211,15 @@ class RecordTests(unittest.TestCase):
                               "build_directory": str(build)})
         _ = cargo.write_text("#!/bin/sh\nif [ \"$1\" = metadata ]; then\n  printf '%s\\n' '" + payload + "'\nelse\n  exit 99\nfi\n")
         cargo.chmod(0o755)
-        captured = str(self.repo / "captured-output")
-        row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TARGET_FOLDER": captured})
-        self.assertEqual(row["target_directory"], str(target))
+        row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TARGET_FOLDER": str(target)})
+        self.assertTrue(row["target_dir"] == row["target_directory"] == str(target))
         self.assertEqual(row["build_directory"], str(build))
-        self.assertIn("target_dir", row)
-        self.assertEqual(row["target_dir"], captured)
         _ = index.update()
         with closing(index.read_only()) as connection:
             indexed = connection.execute(
                 "SELECT target_folder, build_history_group, target_directory, build_directory FROM steps"
             ).fetchall()
-        self.assertEqual(indexed, [(captured, "folder:" + captured, str(target), str(build))])
+        self.assertEqual(indexed, [(str(target), "folder:" + str(target), str(target), str(build))])
 
     def test_floor_scan_records_filesystem_identity_without_changing_old_rows(self) -> None:
         recorder.floor_scan(1, 2, [], START, filesystem="8-1:/outputs")
@@ -416,6 +413,25 @@ class RecordTests(unittest.TestCase):
         _ = (config / "config.toml").write_text('[build\n')
         _ = self.assert_folder_record(NEXTEST, "unresolved")
         self.assertIn("target folder:", (self.root / "errors.log").read_text())
+
+    def test_invalid_cli_config_records_unresolved_and_an_error(self) -> None:
+        _ = (self.repo / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
+        malformed = self.base / "malformed.toml"
+        _ = malformed.write_text('[build\n')
+        unreadable = self.base / "config-directory"
+        unreadable.mkdir()
+        for setting in ('build.target-dir="broken', str(malformed), str(unreadable), str(self.base / "missing.toml")):
+            with self.subTest(setting=setting):
+                self.assertEqual(self.resolved_folder(["cargo", "check", "--config", setting]), "unresolved")
+                self.assertIn("target folder:", (self.root / "errors.log").read_text())
+
+    def test_target_environment_overrides_cli_config_in_capture(self) -> None:
+        argv = ["cargo", "check", "--config", 'build.target-dir="configured-output"']
+        for variable, expected in (("CARGO_TARGET_DIR", "environment-output"),
+                                   ("CARGO_BUILD_TARGET_DIR", "configured-output")):
+            with self.subTest(variable=variable):
+                self.assertEqual(self.resolved_folder(argv, extra={variable: "environment-output"}),
+                                 str(self.repo / expected))
 
     def test_captured_folder_survives_config_change_and_pending_retry(self) -> None:
         config = self.repo / ".cargo"

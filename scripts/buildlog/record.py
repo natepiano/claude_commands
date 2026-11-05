@@ -89,9 +89,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
 if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 else:
-    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 if TYPE_CHECKING:
     from ..aws_target.config import MeasurementUnavailable
 
@@ -1019,7 +1019,14 @@ def step(args: list[str]) -> None:
                 store.note_error(f"parse {name} {held}")
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
-        output_roots = read_cargo_output_roots(Path(directory)) if name != "sweep" else CargoOutputUnavailable("sweep step")
+        output_roots = step_context.step_output_roots(argv, cwd) if name != "sweep" else CargoOutputUnavailable("sweep step")
+        target_folder = step_context.captured_target_folder(os.environ.get("BUILDLOG_TARGET_FOLDER", ""))
+        if (isinstance(output_roots, CargoOutputRoots)
+                and isinstance(target_folder, step_context.CargoTargetFolder)
+                and output_roots.target_directory != target_folder.path):
+            store.note_error(f"step output folders: target_directory {output_roots.target_directory} "
+                             + f"differs from target_dir {target_folder.path}")
+            output_roots = CargoOutputUnavailable("step target folder mismatch")
         memory = peak_and_stall(peak)
         step_slice = "none" if not peak else "builds" if Path(peak).is_file() else "fallback"
         phase = read_test_phase(phase_file)
@@ -1042,8 +1049,7 @@ def step(args: list[str]) -> None:
             "step": name,
             "argv": argv,
             "cwd": cwd,
-            "target_dir": step_context.target_folder_text(
-                step_context.captured_target_folder(os.environ.get("BUILDLOG_TARGET_FOLDER", ""))),
+            "target_dir": step_context.target_folder_text(target_folder),
             **({"target_directory": str(output_roots.target_directory),
                 "build_directory": str(output_roots.build_directory)}
                if isinstance(output_roots, CargoOutputRoots) else {}),

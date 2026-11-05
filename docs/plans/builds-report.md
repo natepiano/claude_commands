@@ -369,3 +369,38 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 **Files:** `scripts/buildlog/record.py`, `index.py`, `test_step_row.py`, `test_index.py`, `scripts/lib/test_phase.py`, `scripts/lint/memory_admit.py`, `test_memory_admit.py`, `docs/as-built/buildlog-memory-stalls.md`.
 
 **Ruled out:** reading the charge from the grant's sampling context (the charge is chosen later); a history offset in the sidecar (a search with no match costs about 1 ms).
+
+### Phase 19 — Each step row names the output folders its own command built  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A step row's `target_directory` and `build_directory` are the folders the step's own command used, or absent when the recorder cannot prove them.
+
+**Spec:**
+Routed from resources' Phase 62 review, through the builds showrunner (2026-11-04). It fixes wrong results.
+
+Fault: `record.step()` (`scripts/buildlog/record.py:1022`) calls `read_cargo_output_roots(Path(directory))`. That runs `cargo metadata` in the step's folder with the writer's environment. It does not apply the step command's `--target-dir`, `--config` values or `env` wrapper assignments. So a step that built `/x/t` can record `target_directory` `/checkout/target`. The step's `target_dir` field is already right: `step_context.resolve_target_folder` applies all of these at step start (Phase 11). resources' disk floor now reads a pair that differs from `target_dir` as no evidence, so nothing is deleted meanwhile.
+
+1. Read the pair with the step command's own Cargo inputs: its working folder and environment after its `env` wrapper (`parse.command_context(argv, cwd, environ)`), its `--manifest-path`, and its `--config` values. Pass `--target-dir <p>` as `--config build.target-dir="<absolute p>"`, because `cargo metadata` has no `--target-dir`. `scripts/lib/cargo_output.read_cargo_output_roots` may take these inputs as an optional keyword; its other callers (`tree_watch.py`, `linux_runner.py`, `memory.py`, `sample.py`, `folder_audit.py`, `sweep.py`) must not change.
+2. When `target_dir` is an absolute folder and the read `target_directory` differs from it, write no pair and one `errors.log` line. When `target_dir` is `unresolved` or `none`, keep today's rule: the pair is written only from a successful read.
+3. Rows already in the log stay as they are. Do not rewrite or reindex old rows.
+
+Acceptance: real-path tests in `test_step_row.py` with a real `cargo metadata` call (one small workspace fixture), one per input: `--target-dir` relative and absolute, `--config build.target-dir`, `env CARGO_TARGET_DIR=… cargo …`, `--manifest-path` from another folder, a `build.build-dir` setting, and a forced mismatch (no pair, one error line). Each pair equals the step's `target_dir`. CPU per `record.py` terminal and tee call stays within 10 % of the Phase 18 values (118.5 ms and 112.1 ms; `SD/phases/18/cpu_driver.py`).
+
+**Files:**
+- `scripts/buildlog/record.py` — the call at line 1022 and the mismatch rule.
+- `scripts/lib/cargo_output.py` — an optional keyword for the step's Cargo inputs, only if step 1 needs it.
+- `scripts/buildlog/test_step_row.py` — the acceptance tests.
+- `docs/as-built/build-targets.md` — one line near line 153: a step row's pair comes from the step command's own Cargo inputs.
+
+**Workers:** 1 writer (rowcpu): the change and its tests are one small file set.
+
+**State:** step rows in the build log (new rows only).
+
+### Phase 20 — memory.py reads recorded output folders through one reader  · status: todo
+**Depends on:** resources' Phase 62 lands on builds (it adds `build_shape.recorded_output_roots`).
+
+Routed from resources' Phase 62 review (F021), through the builds showrunner (2026-11-04). `scripts/buildlog/memory.py` `build_output_roots` (line 87) reads the steps output pairs with its own SQL. Make it read them through `build_shape.recorded_output_roots`, so one reader remains. Write the Work Order when Phase 62 lands and the function's signature is known.
+
+**Workers:** 1 writer (rowcpu).

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from functools import cached_property
 import io
 import json
 import os
@@ -12,7 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import record
@@ -38,11 +39,35 @@ PHASE_GRANT = json.dumps({
 
 if TYPE_CHECKING:
     from ..lib.cargo_output import CargoOutputRoots
+    from ..lib.cargo_output_test_support import fake_cargo_output_roots
 else:
     from scripts.lib.cargo_output import CargoOutputRoots
+    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 
 class RecorderCompatibilityTests(unittest.TestCase):
+    def test_output_fixture_accepts_command_inputs_during_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary).resolve()
+            target = checkout / "selected-output"
+            build = checkout / "intermediate-output"
+            roots = CargoOutputRoots(checkout, target, build)
+            environment = {"BUILDLOG_DIR": str(checkout / "rows"), "BUILDLOG_TARGET_FOLDER": str(target)}
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(record, "output", return_value=None),
+                mock.patch.object(treekey, "tree_key", return_value=None),
+                fake_cargo_output_roots(roots),
+                contextlib.chdir(checkout),
+            ):
+                record.step(["0", str(int(START)), str(int(START) + 2), "1", "", "",
+                             "cargo", "check", "--target-dir", str(target)])
+                rows = [cast(dict[str, object], json.loads(line))
+                        for path in store.root().glob("*/*.jsonl") for line in path.read_text().splitlines()]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual((rows[0]["target_dir"], rows[0]["target_directory"], rows[0]["build_directory"]),
+                                 (str(target), str(target), str(build)))
+
     def test_scp_remote_identity_does_not_load_url_parsing(self) -> None:
         source = (
             "import sys; sys.path.insert(0, sys.argv[1]); import record; "
@@ -188,7 +213,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
                 mock.patch.object(store, "host_name", return_value="fixture"),
                 mock.patch.object(subprocess, "run", side_effect=command),
                 mock.patch.object(record, "new_id", return_value="fixture-id"),
-                mock.patch.object(record, "read_cargo_output_roots", return_value=CargoOutputRoots(
+                mock.patch("scripts.lib.cargo_output.read_cargo_output_roots", return_value=CargoOutputRoots(
                     Path("/fixture/project"), Path("/fixture/target"), Path("/fixture/build"))),
                 mock.patch.object(treekey, "tree_key", return_value="tree"),
             ):
@@ -385,6 +410,151 @@ class RecorderCompatibilityTests(unittest.TestCase):
         ):
             step_context.step_context(NEXTEST, "")
         self.assertEqual(output.getvalue(), "tree\n/fixture/target\n")
+
+
+class StepOutputFolderTests(unittest.TestCase):
+    @cached_property
+    def temporary(self) -> Path:
+        return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+
+    @property
+    def workspace(self) -> Path:
+        return self.temporary / "workspace"
+
+    @property
+    def outside(self) -> Path:
+        return self.temporary / "outside"
+
+    @property
+    def log_root(self) -> Path:
+        return self.temporary / "rows"
+
+    @override
+    def setUp(self) -> None:
+        source = self.workspace / "member/src"
+        source.mkdir(parents=True)
+        _ = (self.workspace / "Cargo.toml").write_text('[workspace]\nmembers = ["member"]\nresolver = "2"\n')
+        _ = (source.parent / "Cargo.toml").write_text(
+            '[package]\nname = "output-fixture"\nversion = "0.1.0"\nedition = "2024"\n')
+        _ = (source / "lib.rs").write_text("pub fn fixture() {}\n")
+        self.outside.mkdir()
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(("CARGO_", "BUILDLOG_"))}
+        environment.update({"CARGO_HOME": str(self.temporary / "cargo-home"),
+                            "BUILDLOG_DIR": str(self.log_root), "BUILDLOG_TARGET": "natedev"})
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        _ = cast(object, self.enterContext(mock.patch.object(record, "output", return_value=None)))
+        _ = cast(object, self.enterContext(mock.patch.object(treekey, "tree_key", return_value=None)))
+
+    def write_step(self, argv: list[str], target: Path, *, cwd: Path) -> dict[str, object]:
+        captured = step_context.target_folder_text(step_context.resolve_target_folder(argv, str(cwd), os.environ))
+        self.assertEqual(captured, str(target))
+        os.environ["BUILDLOG_TARGET_FOLDER"] = captured
+        return self.publish_step(argv, cwd=cwd)
+
+    def publish_step(self, argv: list[str], *, cwd: Path) -> dict[str, object]:
+        with contextlib.chdir(cwd):
+            record.step(["0", str(int(START)), str(int(START) + 2), "1", "", "", *argv])
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in self.log_root.glob("*/*.jsonl") for line in path.read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def assert_output_pair(self, row: dict[str, object], target: Path, build: Path) -> None:
+        self.assertEqual(row["target_dir"], str(target))
+        self.assertEqual(row["target_directory"], row["target_dir"])
+        self.assertEqual(row["build_directory"], str(build))
+        self.assertFalse((self.log_root / store.ERRORS_NAME).exists())
+
+    def test_relative_target_argument_overrides_config(self) -> None:
+        target = self.workspace / "relative-output"
+        row = self.write_step(["cargo", "check", "--config", 'build.target-dir="unused"',
+                               "--target-dir", "relative-output"], target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_absolute_target_argument_selects_output(self) -> None:
+        target = self.temporary / "absolute-output"
+        row = self.write_step(["cargo", "check", "--target-dir=" + str(target)],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_inline_config_selects_target_output(self) -> None:
+        config = self.workspace / ".cargo/config.toml"
+        config.parent.mkdir()
+        _ = config.write_text('[build]\ntarget-dir = "file-output"\n')
+        target = self.workspace / "configured-output"
+        row = self.write_step(["cargo", "check", "--config=build.target-dir=\"configured-output\""],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_env_assignment_selects_target_output(self) -> None:
+        target = self.workspace / "environment-output"
+        row = self.write_step(["env", "CARGO_TARGET_DIR=environment-output", "cargo", "check"],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_target_environment_overrides_cli_config_for_output_pair(self) -> None:
+        target = self.workspace / "environment-output"
+        configured = self.workspace / "configured-output"
+        row = self.write_step(["env", "CARGO_TARGET_DIR=" + str(target), "cargo", "check",
+                               "--config", 'build.target-dir="' + str(configured) + '"'],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_manifest_argument_selects_workspace_outside_working_folder(self) -> None:
+        config = self.outside / ".cargo/config.toml"
+        config.parent.mkdir()
+        _ = config.write_text('[build]\ntarget-dir = "manifest-output"\n')
+        target = self.outside / "manifest-output"
+        row = self.write_step(["cargo", "check", "--manifest-path", "../workspace/member/Cargo.toml"],
+                              target, cwd=self.outside)
+        self.assert_output_pair(row, target, target)
+
+    def test_build_directory_config_preserves_separate_intermediate_output(self) -> None:
+        target = self.workspace / "target"
+        build = self.workspace / "intermediate-output"
+        row = self.write_step(["cargo", "check", "--config", 'build.build-dir="intermediate-output"'],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, build)
+
+    def test_config_file_resolves_paths_from_its_parent_folder(self) -> None:
+        config = self.temporary / "settings" / ".cargo/config.toml"
+        config.parent.mkdir(parents=True)
+        _ = config.write_text('[build]\ntarget-dir = "file-output"\n')
+        target = self.temporary / "settings/file-output"
+        row = self.write_step(["cargo", "check", "--config", str(config)], target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_env_chdir_resolves_relative_target_from_effective_working_folder(self) -> None:
+        target = self.workspace / "changed-output"
+        row = self.write_step(["env", "-C", "../workspace", "CARGO_TARGET_DIR=changed-output", "cargo", "check"],
+                              target, cwd=self.outside)
+        self.assert_output_pair(row, target, target)
+
+    def test_mismatched_output_pair_is_omitted_with_one_diagnostic(self) -> None:
+        target = self.workspace / "captured-output"
+        os.environ["BUILDLOG_TARGET_FOLDER"] = str(target)
+        row = self.publish_step(["cargo", "check"], cwd=self.workspace)
+        self.assertEqual(row["target_dir"], str(target))
+        self.assertNotIn("target_directory", row)
+        self.assertNotIn("build_directory", row)
+        errors = (self.log_root / store.ERRORS_NAME).read_text()
+        self.assertEqual(sum("step output folders:" in line for line in errors.splitlines()), 1)
+        self.assertIn(str(self.workspace / "target"), errors)
+        self.assertIn(str(target), errors)
+
+    def test_unresolved_target_keeps_successful_output_pair(self) -> None:
+        row = self.publish_step(["cargo", "check"], cwd=self.workspace)
+        self.assertEqual(row["target_dir"], "unresolved")
+        self.assertEqual(row["target_directory"], str(self.workspace / "target"))
+        self.assertEqual(row["build_directory"], str(self.workspace / "target"))
+        self.assertFalse((self.log_root / store.ERRORS_NAME).exists())
+
+    def test_first_target_argument_selects_start_and_end_output(self) -> None:
+        target = self.workspace / "first-output"
+        row = self.write_step(["cargo", "check", "--target-dir=first-output", "--target-dir=last-output"],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
 
 
 TERMINAL_BASELINE: dict[str, object] = {'kind': 'step',
