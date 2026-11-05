@@ -3909,12 +3909,16 @@ class HerdrTests(unittest.TestCase):
         reply = subprocess.CompletedProcess(["fixture"], 0, '{"result":{"agents":[]}}', "")
         with (patch.object(time, "monotonic", return_value=100.0),
               patch.object(herdr, "run_program", return_value=reply) as program):
-            for deadline, expected in ((100.25, 0.25), (99.0, 0.0), (200.0, 10.0)):
+            for deadline, expected in ((100.25, 0.25), (200.0, 10.0)):
                 with self.subTest(deadline=deadline):
                     _ = self.herdr.read("pane-1", 40, joined=True, ansi=False, deadline=deadline)
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
                     self.assertEqual(self.herdr.agents(deadline=deadline), [])
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
+            program.reset_mock()
+            with self.assertRaisesRegex(herdr.HerdrFailure, "deadline passed"):
+                _ = self.herdr.read("pane-1", 40, joined=True, ansi=False, deadline=99.0)
+            program.assert_not_called()
             _ = self.herdr.read("pane-1", 40, joined=False, ansi=False)
             self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
             self.assertEqual(self.herdr.agents(), [])
