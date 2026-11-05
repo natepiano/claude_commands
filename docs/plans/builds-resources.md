@@ -245,11 +245,9 @@ Own what a build may use and when it starts: memory admission and the memory que
    Fake both memory readings. Never change real coordination state in a test.
 
 **Constraints from prior phases:**
-- Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
-  Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
-  `NoQueuedHead` means no eligible head. A first mark uses the active window from the same pass.
-  Keep an explicit inactive window for an old head without priority. Do not derive a deadline from the current time.
-  Use `head_policy` for the deployed policy. Add no separate window rule in a reader.
+- builds-queue Phase 10z replaced the Phase 20 active and inactive windows. One pass (`memory_admit.admission_walk`) uses the captured room.
+  It protects room for the head, lets a `ContinuationSlot` reuse its run's slot, and lets an oversized head start alone.
+  Displays, the client and the wait text use that pass's frozen result. Add no separate admission rule in a reader.
 - Phase 20: `PendingLeft` saves durable cancellation facts. Restart publishes one cancellation with its original time.
   Keep the one lifecycle outbox and the saved finalization intent. Add no second lifecycle writer.
 - Phase 20: an old `NoWaiter` place identity is migration input, not proof that a step ended.
@@ -282,11 +280,13 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Acceptance gate:**
 - Preserve these existing tests unchanged:
-  1. `test_first_priority_mark_agrees_in_the_card_overview_and_shell` in `scripts/build_queue/test_queue_view.py`.
-  2. `test_token_wait_preserves_backfill_and_strict_windows_until_its_next_admission` in `scripts/build_queue/test_admission_service.py`.
+  1. `test_live_priority_marks_and_cards_use_the_snapshot_without_bump_history` in `scripts/build_queue/test_queue_view.py`.
+  2. `test_token_wait_keeps_place_one_and_head_status_moves_to_the_eligible_row` in `scripts/build_queue/test_queue_view.py`.
   3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
-  4. `test_frozen_pass_keeps_one_window_for_admission_view_explanation_and_wait_text` in `scripts/lint/test_memory_admit.py`.
-  5. `test_recovery_release_keeps_required_endings_and_frozen_window` in `scripts/lint/test_memory_admit.py`.
+  4. `test_each_pass_matches_the_shared_rule_and_view_uses_its_frozen_limits` in `scripts/build_queue/test_admission_service.py`.
+  5. `test_view_release_and_admit_pass_capture_the_same_continuation_slot` in `scripts/build_queue/test_admission_service.py`.
+  6. `test_a_younger_run_cannot_take_the_room_protected_for_the_head` in `scripts/build_queue/test_admission_service.py`.
+  7. `test_an_oversized_head_starts_alone_but_unreadable_host_or_pressure_holds_it` in `scripts/build_queue/test_admission_service.py`.
 - Preserve `test_restart_retries_an_interrupted_cancellation_with_its_original_time` unchanged in `scripts/build_queue/test_admission_service.py`.
 - Preserve `test_imported_and_restored_places_record_one_owner_exit_after_restarts` unchanged in the same module.
 - Preserve `test_full_queue_holds_gate_until_the_running_charge_is_released` and `test_admission_error_refuses_before_any_module_starts` unchanged.
@@ -1661,48 +1661,23 @@ One function finds the Cargo target folder that holds a path, and both parent wa
 **Ruled out:** moving the memory cache-tag and symlink tests to `test_sweep.py` (they pin memory's classification).
 
 ### Phase 71 — The phone low-disk push carries only the free space, the alert line and one folder  · status: done
-**Depends on:** none. Phase 63 built the push. Phase 70's held hash carries it; this phase lands before the user reviews the text.
-
-**Approved:** builds showrunner 2026-11-05 09:20 EST, relaying the user: "the body will be too long."
-
-#### Work Order
-
-**Goal:** the `sweep.disk_floor` phone push is short. The natedev session message carries the full folder list.
-
-**Measured:**
-1. The push body has the free space, the alert line, the cleanup result, up to `sweep_page_paths` (4) folder lines with effects, a recommendation, a closing line and a safety line. `fit_disk_floor_push` trims folders until the text is under `sweep_push_text_limit` (500).
-2. The natedev session message on a crossing has the alert line, `page_paths(measurement)` and `protected_folder_lines`. It has no choices, effects or recommendation.
-3. `page_paths` has one caller (`sweep.py:3816`) and one test (`test_sweep.py:4629`).
-
-**Spec:**
-1. The push keeps its title and its action line, unchanged.
-2. The push body template is `natedev has {free} free, below the {floor} alert line, so builds can fail. {recommendation}`. The `{cleanup}` and `{choices}` fields and the closing safety sentence leave the push.
-3. `{recommendation}` names one folder with its size and says what deleting it does. Start from these sentences; the writer may change their words until `review.py texts` passes, with no new fact added:
-   - available, trash: `Delete <folder> (recommended): this frees <size>, which covers the <shortfall> shortfall.`
-   - available, protected, scratch or other: `Review <folder> first (recommended): deleting it frees <size>, which covers the <shortfall> shortfall.`
-   - insufficient: `The largest folder is <folder> at <size>. Deleting it frees only part of the <shortfall> shortfall; the natedev session lists every folder.`
-   - unavailable: `Folder sizes are unknown. Measure (recommended): natedev lists folder sizes, then you choose. Delete nothing: free space stays low.` The action line names both choices, so the body says what each does.
-4. On a crossing, the natedev session message has, in order: the alert line, the cleanup line, each folder line with its effect, the folder fact, the closing line (`Delete nothing: builds can fail when the disk is full.`), and `natedev checks your choice before it deletes anything.` These lines replace `page_paths` and `protected_folder_lines` in that message. The unavailable state keeps its measure-first lines.
-5. One function writes the folder fact: the folder, its size and the shortfall, or `Folder sizes are unknown.` The push adds its choice words to it; the session message uses it with its own lines. `folder_choices` runs once per crossing, both channels use its result, and the session message lists every measured folder (review F001-F003, 2026-11-05).
-6. `fit_disk_floor_push` renders the push. When the text is at or over the limit, it renders the unavailable form. When that is also over the limit, it sends no push. The folder-trim loop goes.
-7. Delete `page_paths` and its test. `protected_folder_lines` keeps its other caller (the out-of-reach report). `sweep_page_paths` loses its last reader: delete it from `config/lint.conf` and `config/README.md`.
-8. Update the four catalog examples (available, unavailable, insufficient, protected) to the new fields.
-9. Add no guard, refusal or check this Work Order does not ask for.
-
-**Constraints from prior phases:**
-- Phase 63: the phone stays off until the user approves the text (`disk_floor_channels`). Only the user records that approval.
-- The session message still goes through `fit_alert_text`, so folder labels shorten with its path widths.
+#### As-built
+The `sweep.disk_floor` push body is `natedev has {free} free, below the {floor} alert line, so builds can fail. {recommendation}`. Its title and action lines did not change. The natedev session message carries the cleanup line, every measured folder and the choices. The phone stays off until the user approves the text (Phase 63).
+- `sweep.folder_recommendation(choices: FolderChoices, shortfall: int) -> str` writes the one folder fact both channels use. Trash: `Delete <folder> (recommended): this frees <size>, which covers the <shortfall> shortfall.` Protected, scratch or other: `Review <folder> first (recommended): deleting it frees …`. Insufficient: `The largest folder is <folder> at <size>. Deleting it frees only part of the <shortfall> shortfall.` Unavailable: `Folder sizes are unknown.`
+- `sweep.disk_floor_push(free: int, floor: int, choices: FolderChoices) -> RenderedPush` adds the push-only words: the measure and delete-nothing choices for the unavailable state, and `; the natedev session lists every folder.` for the insufficient state. The unavailable action is `In the natedev Claude session, reply measure or delete nothing.`
+- `sweep.fit_disk_floor_push(free, floor, choices, *, lint_settings) -> RenderedPush | NoPhoneAlert` renders the measured choices, then the unavailable form, and returns `NO_PHONE_ALERT` with a stderr line when both reach `sweep_push_text_limit`.
+- `sweep.folder_choice_lines(choices, shortfall, *, path_limit) -> list[str]` writes the session lines: one line per folder with its size and effect, the folder fact, `Delete nothing: builds can fail when the disk is full.` and `natedev checks your choice before it deletes anything.` The unavailable state has the fact, `Measure first (recommended): …` and `Delete nothing: the disk stays low and builds can fail.` `notify_floor_problem` computes the shortfall once and runs `folder_choices` once per crossing for both channels.
+- `folder_choices` returns every measured choice; the `sweep_page_paths` cut is gone. The measured list comes from the folder audit rows at depth 1-2 of at least `MIN_OUTSIDE_DIRECTORY_BYTES`.
+- `page_paths` and `classified_folder_choices` are deleted. The out-of-reach floor sends no phone page; holder sessions and natedev get their messages.
+- Catalog examples (longest message 285 characters): available 248, unavailable 283, insufficient 285, protected 253. Purpose: `A low-disk alert recommends one folder for natedev review.`
 
 **Files:**
-- `scripts/lint/sweep.py` — the recommendation sentence, the session message lines, `fit_disk_floor_push`, `page_paths` removed.
-- `scripts/notify/push_catalog.py` — the `sweep.disk_floor` template and its four examples.
-- `scripts/lint/test_sweep.py` — the push text, the session message, the fit fallback and the removed `page_paths` test.
+- `scripts/lint/sweep.py` — the folder fact, the push and session renderers, the fit fallback.
+- `scripts/notify/push_catalog.py` — the `sweep.disk_floor` template, its four examples and purpose.
+- `scripts/lint/test_sweep.py` — exact session lines, every folder listed, the action lines, the protected session label and `test_disk_floor_push_fit_falls_back_at_each_limit`.
 - `config/lint.conf`, `config/README.md` — `sweep_page_paths` removed.
-- `docs/as-built/build-memory-admission.md` — the out-of-reach paragraph no longer names `page_paths` or a phone page.
+- `docs/as-built/build-memory-admission.md` — the out-of-reach paragraph.
 
-**Workers:** `1 writer + 1 tester`
+**Gotchas:** `test_push_texts.test_every_catalog_example_has_current_approval` stays red until the user approves `sweep.disk_floor`; only the user records that approval.
 
-**Acceptance gate:**
-- `test_sweep.py` and `scripts/notify/test_push_texts.py` pass, except the one known red: the missing `sweep.disk_floor` approval.
-- `review.py texts --id sweep.disk_floor` (without `--approve`) reports each example. The report to builds gives the title, the action, the body and the longest example's character count.
-- Basedpyright reports `0 errors, 0 warnings, 0 notes` over the three files.
+**Ruled out:** shortening the push folder label before the unavailable fallback (Spec 6 sets the fallback; a label over about 220 characters is rare).

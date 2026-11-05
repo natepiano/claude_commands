@@ -14,13 +14,14 @@
   - Completion condition: on or after 2026-12-05 the reader and the file are deleted, `sweep.py rebuilds` reads only the journal and the build-log rows, and `test_sweep.py` passes.
   - Revealed by: Phase 25 review (Phase 4 Spec 6; builds showrunner 2026-10-30: next, dated on or after 2026-12-05)
 
-- [ ] **Measure EASY backfill against the deployed Rule A queue policy**
-  - Start after both Phase 39 checkpoints reach main and seven days exist within one unchanged policy and configuration span. Calibrate the deployed model first. Stop comparison if calibration fails.
-  - Bound the cohort at changes to queue priority, head policy, estimation, running charge, budget, or headroom settings.
-  - Compare EASY with the deployed ordered walk, including Rule A and recovery spacing.
-  - Use the shipped `head_policy` for the deployed baseline. Add any alternate analysis rule explicitly; Phase 20 provides no alternate rule argument.
+- [ ] **Measure EASY backfill against the deployed captured-room rule**
+  - Start after deployment of the current rule and seven days within one unchanged policy and configuration span.
+  - Calibrate the deployed model first. Stop comparison if calibration fails.
+  - Bound the cohort at changes to priority, head policy, estimation, memory charges, slots, spacing, safety settings or headroom.
+  - Use the shipped `head_policy` and `admission_walk` for the baseline.
+  - Include head protection, continuation slots, the starts-alone exception and start spacing.
   - Report additional wait savings and head delay.
-  - Revealed by: Phase 30; baseline corrected after Phase 31's Work Order and Phase 39.
+  - Revealed by: Phase 30; baseline corrected against the current admission rule.
 
 - [ ] **Make the build_targets.py call from verify.sh cheap: it costs 199 ms of CPU on every step**
   - Why needed: verify measured `build_targets.py` at 199 ms of CPU each time `verify.sh` starts it, on every step; it is the most costly helper.
@@ -51,11 +52,14 @@
   - Completion condition: Ctrl-C ends with one line and exit 130; a plan run prints a short summary (counts and bytes per group) and the path of the full plan file; a test pins both
   - Revealed by: builds C617 (builds showrunner 2026-10-30: next)
 
-- [ ] **The user's typed queue bump works from any pane**
-  - Target: `mods/unit-board/hooks/register.tsx`, `mods/unit-board/tests/queue.test.ts`, the shared queue-priority writer and its tests, and `commands/build/queue.md`.
-  - Completion condition: typed `/build:queue bump <unit>` from any pane sets or replaces persistent priority through the existing writer, without a session-role check on the plugin route; tests cover a non-showrunner pane and replacement, while direct priority commands retain their existing caller checks.
-  - Revealed by: Phase 26; approved by builds in `S/next_items_pending.md`.
-
+- [ ] **The user's typed queue bump accepts a unit name**
+  - Target: `scripts/build_queue/build_queue.py`, its selector and tests, `mods/unit-board/tests/queue.test.ts`, and `commands/build/queue.md`.
+  - Completion condition: `/build:queue bump <unit>` selects that unit's waiting step and sets or replaces priority through the existing writer.
+  - Test a unit name that differs from every session label and folder name.
+  - Preserve position, session and folder selectors.
+  - Preserve access from any pane and the current direct-command behavior.
+  - Test unit selection from a non-showrunner pane and replacement of existing priority.
+  - Revealed by: Phase 26; narrowed after the existing pane route and writer tests satisfied the access requirement.
 
 - [ ] **Mac claims and releases read session ownership without importing the build queue**
   - Target: `scripts/build_hold/build_hold.py`, a new `scripts/build_hold/session_owner.py`, `scripts/mac_test/mac_test.py` (:31), and their tests.
@@ -74,7 +78,12 @@
   - Revealed by: Phase 70 simplify review F008 (builds showrunner 2026-11-05: next; run after the held 63-64 hash lands, so `sweep.py` changes in one place at a time)
 
 - [ ] **Measure the ANON_SHARE estimate share again after the legacy rows expire** (on or after 2026-11-12)
-  - Target: rerun the Phase 19 source measurement (`count_queue_sources` over 7 days of `admission/queue_times.jsonl`, and the `expected_peak` replay) on a copy of the natedev state; update `#### Phase 19 source shares` in `docs/as-built/build-memory-admission.md`.
-  - Why needed: Phase 19 stopped at Spec 2 because `ANON_SHARE` estimates were below the 5% bar. No recorded admission used `ANON_SHARE`; 10/4,267 replayed estimates used it (0.23%, excluding caps). Recorded admissions covered only 16.30 hours. The recovered legacy test rows were still inside the window.
-  - Completion condition: the table shows the share by step kind after the legacy rows leave the window. If the share is above 5% of estimates, Phase 19 Specs 3-4 (remove or narrow the `ANON_SHARE` tiers, with the unknown-source boundary) come back as a phase.
-  - Revealed by: Phase 19 Spec 2 (builds showrunner 2026-11-05: stop at Spec 2; "small" means under 5% of estimates)
+  - Target: repeat the Phase 19 lifecycle measurement and `expected_peak` replay on a copy of natedev state.
+  - Update `#### Phase 19 source shares` in `docs/as-built/build-memory-admission.md`.
+  - Report retained coverage and shares by step kind. Keep recorded admissions separate from reconstructed estimates.
+  - Phase 19 measured 10/4,267 reconstructed estimates using `ANON_SHARE`, excluding caps. Recorded admissions covered only 16.30 hours.
+  - If the reconstructed share excluding caps reaches 5%, create a self-contained Work Order for the measured remaining matching gaps.
+  - Require replay evidence before narrowing or removing indexed tiers.
+  - Preserve same-shape build rules, compile selection, the single history decode and bounded evidence queries.
+  - Preserve historical `buildlog` decoding and unknown source text through semantic source types.
+  - Revealed by: Phase 19; the showrunner defined "small" as under 5% of estimates.
