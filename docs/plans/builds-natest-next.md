@@ -22,6 +22,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 
 ## Items to consider
 
+- [ ] **One path to `send.py`.** `scripts/notify/push_texts.py` and `scripts/agents/codex_mesh.py` each define their own `SEND_SCRIPT` and build their own send command, so the Phase 21 guard at `session_send` does not cover them. Route both through `session_send`. Found at Phase 21 start, 2026-11-05. The showrunner approved it; send it after Phase 21 lands, with the owner of each file, and the showrunner routes it. codex_mesh retires, so check whether its sender still runs first.
 - [ ] **Select the next speed target after Phase 24.**
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
