@@ -187,6 +187,9 @@ class StaffRouting:
     def _staff_owner(self, row: dict[str, str], review_list: Path) -> ChangeOwner:
         list_owner = self.list_owner(review_list)
         identity = row.get(PRODUCER, "").strip()
+        recorded_owner = row.get("Production", "").strip()
+        if not identity and not row.get("Verdict") and self.record.by_id(staff.StaffId(recorded_owner)) is not None:
+            identity = recorded_owner
         if not identity:
             runner = self.runners_by_name.get(list_owner)
             if runner is not None and runner.kind == "showrunner":

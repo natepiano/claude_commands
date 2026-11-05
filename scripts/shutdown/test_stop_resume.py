@@ -106,8 +106,7 @@ class StopResumeTests(unittest.TestCase):
     def test_batch_without_a_tab_reaches_the_shared_restore(self) -> None:
         up = stop_resume.ClaudeUp("saved", "new-pane", "claude4")
         with (patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("saved")),
-              patch.object(stop_resume, "resume", return_value=up) as resumed,
-              patch.object(stop_resume, "_running_on_account", return_value=up)):
+              patch.object(stop_resume, "resume", return_value=up) as resumed):
             results = stop_resume.move_sessions(["saved"], "claude4", why="limit")
         self.assertEqual(results, [up])
         resumed.assert_called_once_with("saved", why="limit", to="claude4")
@@ -681,6 +680,9 @@ class StopResumeTests(unittest.TestCase):
 
     def prompt_retirement_fixture(self, *, alerted: bool) -> Path:
         """Publish cancellation requests for the watcher with an isolated send.py recorder."""
+        from scripts.production.staff_test_support import unit_membership
+
+        _ = unit_membership("production", "alpha")
         self.entry["environment"].update({"SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "alpha"})
         pane_record.write("agents", self.entry)
         state = self.root / "stall-watch"
@@ -1269,9 +1271,10 @@ class StopResumeTests(unittest.TestCase):
         self.start.assert_not_called()
 
     def test_self_move_hands_off_the_whole_batch_without_signalling(self) -> None:
-        from scripts.production.staff_test_support import isolated_staff_file
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("agent", name="alpha", runtime_id=self.entry["session_id"])
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.add_beta()
@@ -1294,6 +1297,22 @@ class StopResumeTests(unittest.TestCase):
                 self.assertIn("batch", argv)
                 self.assertEqual(argv[argv.index("--target") + 1], "claude4")
                 self.assertEqual(argv[-2:], ["beta", "alpha"])
+        self.kill.assert_not_called()
+        self.start.assert_not_called()
+
+    def test_self_move_uses_the_current_session_of_a_saved_staff_reference(self) -> None:
+        current = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "alpha", staff.StaffRoot(),
+                             current_session=staff.StaffId(current))
+        saved = self.entry.copy()
+        saved["session_id"] = row.id
+        pane_record.save("agents", {saved["pane_id"]: saved})
+        self.client.rows[0]["agent_session"] = None
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": current}),
+              patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,)))):
+            result = stop_resume.move_sessions(["alpha"], "claude4", why="limit")
+        self.assertEqual(result, [stop_resume.MoveHandedOff(current)])
+        self.detach.assert_called_once()
         self.kill.assert_not_called()
         self.start.assert_not_called()
 
@@ -1705,24 +1724,6 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(results, [stop_resume.StopFailed("stop-error", "cannot signal"),
             stop_resume.ResumePending("resume-error", "claude4", "cannot run"),
             stop_resume.ResumePending("gone-tab", "claude4", "session has no tab after stop"), stop_resume.ClaudeUp("good", "own-pane", "claude4")])
-
-    def test_move_confirms_each_member_runs_on_the_target_after_resume(self) -> None:
-        identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId(identity), "unit", "alpha", staff.STAFF_ROOT,
-                             current_session=staff.StaffId(identity))
-        line = ("alpha: not running on claude4 after the move; resume it with: "
-                + f"accounts.py move {identity} claude4")
-        for live in (sessions.SessionNotLive(), sessions.LiveSessionProcess(123)):
-            with (self.subTest(live=live),
-                  patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-                  patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped(identity, 123)),
-                  patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp(identity, "w1:p2", "claude4")),
-                  redirect_stderr(io.StringIO()) as output):
-                self.live.return_value = live
-                results = stop_resume.move_sessions([identity], "claude4", why="limit")
-            self.assertEqual(output.getvalue(), line + "\n")
-            self.assertEqual(results, [stop_resume.ResumePending(identity, "claude4", line)])
-
 
     def test_cli_prints_one_line_and_uses_the_result_exit_status(self) -> None:
         for arguments, expected in ((["stop", "alpha"], 0), (["resume", "alpha", "--why", "maintenance"], 0),

@@ -33,7 +33,7 @@ import herdr
 from scripts.lib import operation_deadline
 from scripts.message import session_send
 import pane_record
-from scripts.shutdown.launch_names import LaunchNames
+from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
 import pane_launch
 from scripts.lib.resume_message import (
@@ -65,24 +65,30 @@ START_SECONDS = 20.0
 STAY_SECONDS = 10.0
 
 
-def _tab_of(session: str) -> herdr.TabSession | SessionNotFound:
+_UNREAD_NAMES = LaunchNamesNotRead()
+
+
+def _tab_of(session: str, *, names: LaunchNames | LaunchNamesNotRead = _UNREAD_NAMES) -> herdr.TabSession | SessionNotFound:
     """Find an existing pane, retaining its saved conversation when herdr's id is stale."""
     client = herdr.Herdr(herdr.shared_session())
     entries = pane_record.read(client.session)
+    membership = (LaunchNames.read() if isinstance(names, LaunchNamesNotRead) else names).tab_record
     tabs: list[herdr.TabSession] = []
     for pane in client.panes():
         identity = pane["session_id"]
         entry = entries.get(pane["pane_id"])
+        owner = membership.by_member_reference(entry["session_id"]) if entry is not None else None
+        saved_identity = owner.current_session if owner is not None else entry["session_id"] if entry is not None else ""
         label = pane.get("label") or ""
-        if entry is not None and entry["session_id"] != identity and (
-                session == entry["session_id"] or session == label):
+        if entry is not None and saved_identity != identity and (
+                session in (entry["session_id"], saved_identity) or session == label):
             if identity:
                 live = herdr.read_conversation(identity)
                 if isinstance(live, herdr.UnknownConversation):
                     herdr.conversation_note(live)
                 if isinstance(live, herdr.LiveConversation):
                     continue  # A saved entry cannot displace another running conversation.
-            identity = entry["session_id"]
+            identity = saved_identity
         tabs.append(herdr.TabSession(pane["pane_id"], label, pane["workspace_id"], identity))
     matches = [tab for tab in tabs if tab.session_id == session] or [tab for tab in tabs if tab.label == session]
     if len(matches) > 1:
@@ -428,7 +434,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
     original: pane_launch.LaunchPublication | None = None
     attempt_pane = ""
     try:
-        tab = _tab_of(session)
+        tab = _tab_of(session, names=names)
         client = herdr.Herdr(herdr.shared_session())
         row = names.tab_record.by_current_session(identity)
         if isinstance(tab, SessionNotFound):
@@ -749,19 +755,6 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                         outcomes.append(ResumePending(identity, target, resumed.reason))
                 except Exception as error:
                     outcomes.append(ResumePending(identity, target, str(error)))
-            record = staff.initial_snapshot()
-            for index, (session, outcome) in enumerate(zip(selected, outcomes)):
-                identity = outcome.name if isinstance(outcome, SessionNotFound) else outcome.session_id
-                running = _running_on_account(identity, "")
-                if isinstance(running, ClaudeUp) and running.account == target:
-                    continue
-                member = record.by_member_reference(identity)
-                name = member.name if member is not None else session
-                line = (f"{name}: not running on {target} after the move; resume it with: "
-                        + f"accounts.py move {identity} {target}")
-                print(line, file=sys.stderr)
-                if isinstance(outcome, ClaudeUp):
-                    outcomes[index] = ResumePending(identity, target, line)
             return outcomes
 
 

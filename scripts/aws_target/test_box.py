@@ -1,6 +1,7 @@
 """Exercise box deployment with local executable fakes and an in-memory tailnet."""
 from __future__ import annotations
 
+from base64 import b64encode
 from contextlib import redirect_stdout
 from email.message import Message
 from io import BytesIO, StringIO
@@ -85,7 +86,8 @@ elif name == 'bash':
         with log.open('a') as handle: handle.write(json.dumps({'kind': 'step', 'id': 'proof-step', 'target': 'aws', 'host': 'aws-build', 'package': 'aws-routing-proof', 'status': 0, 'pinned': True}) + '\n')
 elif name == 'tailscale':
     output({'Self': {'HostName': 'natedev', 'DNSName': 'natedev.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.1']},
-            'Peer': {'mac': {'HostName': "Nate's MacBook Pro 2023", 'DNSName': 'nates-macbook-pro-2023.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.2']}}})
+            'Peer': {'mac': {'HostName': "Nate's MacBook Pro 2023", 'DNSName': 'nates-macbook-pro-2023.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.2']},
+                     'box': {'ID': 'node-box', 'TailscaleIPs': ['100.64.0.3'], 'sshHostKeys': s.get('host_keys', [])}}})
 elif name == 'git':
     if 'branch' in args: print('main')
     elif s.get('dirty'): print(' M hosts/aws-build.nix')
@@ -97,6 +99,8 @@ elif name == 'nix':
         s['copies'] = s.get('copies', 0) + 1; save()
     else: raise AssertionError(args)
 elif name == 'ssh':
+    if 'ssh_stderr' in s:
+        print(s['ssh_stderr'], file=sys.stderr); sys.exit(255)
     command = args[-1]
     if 'aws-build-setup-stop --on-active' in command:
         s['hold'] = True; s['active'] = False; save()
@@ -243,10 +247,14 @@ class BoxTests(unittest.TestCase):
             _ = path.write_text(f'#!{sys.executable}\n' + FAKE)
             path.chmod(0o700)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root),
+                                      'HOME': str(self.root / 'home'),
                                       'BUILDLOG_DIR': str(self.root / 'buildlog'), 'PATH': str(bin_path) + os.pathsep + os.environ['PATH']})))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.directory)))
         _ = cast(object, self.enterContext(mock.patch('target_config.ssh_target_state_directory', return_value=self.directory)))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),))))
+        registry = self.root / 'home/.claude/config/build_targets.conf'
+        registry.parent.mkdir(parents=True)
+        _ = registry.write_text('targets=aws\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=' + str(self.settings) + '\n')
         _ = cast(object, self.enterContext(mock.patch.object(mac_test, 'live_claims', return_value=())))
         self.save({'self_stop': True, 'stop_after': 2, 'online': True, 'joined': False, 'active': True, 'system': '/nix/store/old',
                    'desired': SYSTEM})
@@ -394,6 +402,46 @@ class BoxTests(unittest.TestCase):
         before = len(self.tailnet.requests)
         self.subject.join()
         self.assertEqual(len(self.tailnet.requests), before)
+
+    def test_join_replaces_host_and_address_keys_and_preserves_other_hosts(self) -> None:
+        keys = ['ssh-ed25519 ' + b64encode(b'\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20' + bytes([value]) * 32).decode()
+                for value in (1, 2)]
+        known_hosts = self.root / 'home/.ssh/known_hosts'
+        known_hosts.parent.mkdir(parents=True)
+        unrelated = 'other-host ' + keys[0] + '\n'
+        _ = known_hosts.write_text('aws-build ' + keys[0] + '\n100.64.0.3 ' + keys[0] + '\n' + unrelated)
+        self.change(host_keys=keys)
+        self.subject.join()
+        self.assertEqual(known_hosts.read_text(), unrelated + ''.join('aws-build,100.64.0.3 ' + key + '\n' for key in keys))
+        self.assertEqual(box.json_record((self.directory / 'deployment.json').read_text())['tailscale_node_id'], 'node-box')
+
+    def test_join_creates_private_host_key_paths(self) -> None:
+        self.change(joined=True, host_keys=['ssh-ed25519 fixture-public-key'])
+        self.assertTrue(self.subject.join_present())
+        known_hosts = self.root / 'home/.ssh/known_hosts'
+        self.assertEqual(known_hosts.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(known_hosts.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(known_hosts.read_text(), 'aws-build,100.64.0.3 ssh-ed25519 fixture-public-key\n')
+
+    def test_join_without_host_keys_writes_nothing(self) -> None:
+        self.change(joined=True)
+        self.assertTrue(self.subject.join_present())
+        known_hosts = self.root / 'home/.ssh/known_hosts'
+        self.assertFalse(known_hosts.parent.exists())
+        known_hosts.parent.mkdir(parents=True)
+        _ = known_hosts.write_text('unrelated entry\n')
+        self.assertTrue(self.subject.join_present())
+        self.assertEqual(known_hosts.read_text(), 'unrelated entry\n')
+
+    def test_box_command_refusal_reports_the_last_stderr_line(self) -> None:
+        for stderr, detail in (('earlier error\n  Host key verification failed. \n\n', ': Host key verification failed.'),
+                               (' earlier \n\tlast  ' + 'x' * 400 + '\n', ': ' + ('last ' + 'x' * 400)[:300]),
+                               ('\n  \n', '')):
+            with self.subTest(stderr=stderr):
+                self.change(joined=True, ssh_stderr=stderr)
+                with self.assertRaises(box.BoxRefused) as failure:
+                    _ = self.subject.configuration_present()
+                self.assertEqual(str(failure.exception), 'ssh failed during box setup (exit 255)' + detail)
 
     def test_stopped_join_proof_cannot_replace_a_missing_saved_node_identity(self) -> None:
         self.change(joined=True, ec2='stopped')

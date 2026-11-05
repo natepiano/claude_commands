@@ -395,7 +395,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
         prompt.assert_not_called()
         self.assertIn("sent child", out)
         self.assertIn("sent parent", out)
-        self.assertEqual((self.root / "showrunner-state" / staff.native_id(SESSION) / "parent").read_text(), "parent\n")
+        self.assertEqual(showrunner_tree.parent_of("child"), "parent")
+        self.assertFalse((self.root / "showrunner-state" / staff.native_id(SESSION) / "parent").exists())
         self.assertFalse(pending.exists())
 
     def test_saved_parent_after_interrupted_attach_still_sends_routing_notices(self) -> None:
@@ -417,7 +418,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
                   mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("stopped before notices"))):
                 with self.assertRaisesRegex(RuntimeError, "stopped before notices"):
                     _ = self.run_main()
-            self.assertEqual((self.root / "showrunner-state" / staff.native_id(SESSION) / "parent").read_text(), "parent\n")
+            self.assertEqual(showrunner_tree.parent_of("child"), "parent")
+            self.assertFalse((self.root / "showrunner-state" / staff.native_id(SESSION) / "parent").exists())
             self.assertTrue(pending.exists())
             with (mock.patch.object(showrunners, "current_name", return_value="child"),
                   mock.patch.object(showrunners, "tell_others", side_effect=send_notices) as notices,
