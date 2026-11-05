@@ -28,14 +28,14 @@ def unit_references(path: Path, owner: staff.StaffId, record: staff.StaffSnapsho
         if row is None:
             parent = record.by_id(owner)
             if parent is None:
-                raise staff.StaffRefused(f"{path}: production ownership evidence is unavailable")
+                raise staff.StaffRefused(f"{reference}: no production staff row")
             found = session_staff.unit_match(session_staff.UnitMember("", reference), record,
                                              parent=session_staff.RequiredParent(parent))
             if isinstance(found, session_staff.NoSuchMember):
-                raise staff.StaffRefused(f"{path}: unit {reference}: ownership evidence is unavailable")
+                raise staff.StaffRefused(f"{reference}: no unit staff row")
             row = found.row
         if row.kind != "unit" or row.parent != staff.ReportsTo(owner):
-            raise staff.StaffRefused(f"{path}: {reference}: expected a unit in this production")
+            raise staff.StaffRefused(f"{reference}: expected a unit in this production")
         return row.id
 
     content = path.read_text()
@@ -46,7 +46,13 @@ def unit_references(path: Path, owner: staff.StaffId, record: staff.StaffSnapsho
             reference, separator, tail = line.partition(delimiter)
             if not separator:
                 raise ValueError(f"{path}: expected a structured unit record")
-            lines.append(f"{identity(reference)}{separator}{tail}")
+            try:
+                fixed = identity(reference)
+            except staff.StaffRefused as error:
+                print(f"anomaly: {error}")
+                lines.append(line)
+                continue
+            lines.append(f"{fixed}{separator}{tail}")
         updated = "".join(lines)
     else:
         value = cast(object, json.loads(content))
@@ -59,29 +65,49 @@ def unit_references(path: Path, owner: staff.StaffId, record: staff.StaffSnapsho
             if not isinstance(units, list):
                 raise ValueError(f"{path}: expected units list")
             seen: set[staff.StaffId] = set()
+            retained: list[object] = []
             for entry in cast(list[object], units):
                 if not isinstance(entry, dict):
                     raise ValueError(f"{path}: expected a unit object")
                 unit = cast(dict[str, object], entry)
                 reference = unit.get("unit")
-                if not reference:
+                if not reference and path.name == "showrunner_state.json":
+                    retained.append(unit)
                     continue
                 if not isinstance(reference, str):
                     raise ValueError(f"{path}: expected unit text")
-                fixed = identity(reference)
+                try:
+                    fixed = identity(reference)
+                except staff.StaffRefused as error:
+                    print(f"anomaly: {error}")
+                    if path.name == "showrunner_state.json":
+                        retained.append(unit)
+                    else:
+                        changed = True
+                    continue
                 if fixed in seen:
-                    raise staff.StaffRefused(f"{path}: duplicate unit {fixed}")
+                    print(f"anomaly: {path}: duplicate unit {fixed}")
+                    if path.name == "dailies_judgment.json":
+                        changed = True
+                        continue
                 seen.add(fixed)
+                retained.append(unit)
                 if reference != fixed:
                     unit["unit"] = fixed
                     changed = True
+            fields["units"] = retained
         else:
             converted: dict[str, object] = {}
             for key, item in fields.items():
                 reference, separator, tail = key.partition("|") if path.name == "eta_seen.json" else (key, "", "")
-                fixed = f"{identity(reference)}{separator}{tail}"
-                if fixed in converted and converted[fixed] != item:
-                    raise staff.StaffRefused(f"{path}: unequal unit state for {fixed}")
+                try:
+                    fixed = f"{identity(reference)}{separator}{tail}"
+                except staff.StaffRefused as error:
+                    print(f"anomaly: {error}")
+                    fixed = key
+                if fixed in converted or (fixed != key and fixed in fields):
+                    print(f"anomaly: {path}: duplicate unit state for {fixed}; kept {key}")
+                    fixed = key
                 converted[fixed] = item
                 changed = changed or fixed != key
             fields = converted
@@ -93,7 +119,8 @@ def unit_references(path: Path, owner: staff.StaffId, record: staff.StaffSnapsho
 def migrate(*, stop_after: int = 0) -> int:
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     completed = 0
-    missing: list[str] = []
+    left = 0
+    unavailable = 0
     with staff.operation():
         record = staff.snapshot()
         sources = session_staff.member_sources()
@@ -101,13 +128,29 @@ def migrate(*, stop_after: int = 0) -> int:
         reports = sorted((root / "reports").glob("*.json"))
         for source_root in [*folders, *reports]:
             reference = source_root.stem if source_root.is_file() else source_root.name
+            if source_root.is_symlink():
+                print(f"anomaly: {source_root}: symbolic link needs ownership review")
+                left += 1
+                continue
             try:
-                if source_root.is_symlink():
-                    raise staff.StaffRefused(f"{source_root}: symbolic link needs ownership review")
                 identity = showrunner_id(reference, record=record, sources=sources)
-                destination = root / "reports" / f"{identity}.json" if source_root.is_file() else root / identity
+            except staff.StaffRefused:
+                print(f"anomaly: {source_root}: no showrunner staff row; left in place")
+                left += 1
+                continue
+            except staff.StaffUnreadable as error:
+                print(f"anomaly: {source_root}: {error}")
+                left += 1
+                continue
+            destination = root / "reports" / f"{identity}.json" if source_root.is_file() else root / identity
+            try:
                 files = [source_root] if source_root.is_file() else sorted(source_root.rglob("*"))
-                for source in files:
+            except OSError as error:
+                print(f"anomaly: {source_root}: {error}")
+                unavailable += 1
+                continue
+            for source in files:
+                try:
                     if source.is_symlink():
                         raise staff.StaffRefused(f"{source}: symbolic link needs ownership review")
                     if not source.is_file():
@@ -134,8 +177,17 @@ def migrate(*, stop_after: int = 0) -> int:
                     completed += 1
                     print(f"moved {source} to {target}")
                     if stop_after and completed >= stop_after:
+                        print(f"moved {completed}; left in place {left}; unavailable {unavailable}")
                         return 75
-                if source_root.is_dir():
+                except OSError as error:
+                    print(f"anomaly: {source}: {error}")
+                    unavailable += 1
+                except (ValueError, staff.StaffRefused, staff.StaffUnreadable) as error:
+                    print(f"anomaly: {source}: {error}")
+                    left += 1
+            if source_root.is_dir():
+                conf = source_root
+                try:
                     current = staff.snapshot()
                     owner = current.by_id(identity)
                     if owner is None:
@@ -149,18 +201,25 @@ def migrate(*, stop_after: int = 0) -> int:
                         updated = content.replace(f"PROMPT_FILE={old_prompt}\n", f"PROMPT_FILE={new_prompt}\n")
                         if updated != content:
                             write_text_atomic(conf, updated)
-                if source_root.is_dir() and source_root != destination:
+                except OSError as error:
+                    print(f"anomaly: {conf}: {error}")
+                    unavailable += 1
+                except (ValueError, staff.StaffRefused, staff.StaffUnreadable) as error:
+                    print(f"anomaly: {conf}: {error}")
+                    left += 1
+            if source_root.is_dir() and source_root != destination:
+                try:
                     for folder in sorted(source_root.rglob("*"), reverse=True):
-                        if folder.is_dir():
+                        if folder.is_dir() and not folder.is_symlink() and not any(folder.iterdir()):
                             folder.rmdir()
-                    source_root.rmdir()
-                    sync_folder(root)
-            except (OSError, ValueError, staff.StaffRefused, staff.StaffUnreadable) as error:
-                missing.append(str(error))
-    for problem in missing:
-        print(f"unavailable: {problem}", file=sys.stderr)
-    print(f"moved {completed}; unavailable {len(missing)}")
-    return 1 if missing else 0
+                    if not any(source_root.iterdir()):
+                        source_root.rmdir()
+                        sync_folder(root)
+                except OSError as error:
+                    print(f"anomaly: {source_root}: {error}")
+                    unavailable += 1
+    print(f"moved {completed}; left in place {left}; unavailable {unavailable}")
+    return 1 if unavailable else 0
 
 
 def main() -> int:

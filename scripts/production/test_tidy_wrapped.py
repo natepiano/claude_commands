@@ -103,7 +103,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertFalse(any(path.exists() for path in sources))
         self.assertEqual(len(staff.snapshot().rows), 1)
 
-    def test_outstanding_migration_refuses_unknown_owners_and_unequal_destinations(self) -> None:
+    def test_outstanding_migration_leaves_unknown_owners_and_unequal_destinations(self) -> None:
         from scripts.production import migrate_middle_stores
 
         owner = fixture_member("showrunner", name="legacy-owner")
@@ -113,7 +113,7 @@ class TidyWrappedTests(unittest.TestCase):
         paths = (source, target, unknown, self.root / "staff.json")
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
-            self.assertEqual(migrate_middle_stores.migrate("outstanding"), 1)
+            self.assertEqual(migrate_middle_stores.migrate("outstanding"), 0)
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
 
@@ -351,7 +351,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertFalse((self.state / "legacy-state").exists())
         self.assertEqual(len(staff.snapshot().rows), 1)
 
-    def test_state_migration_refuses_unknown_owner_and_unequal_destination(self) -> None:
+    def test_state_migration_leaves_unknown_owner_and_unequal_destination(self) -> None:
         from scripts.production import migrate_showrunner_state
 
         owner = fixture_member("showrunner", name="legacy-state")
@@ -361,7 +361,7 @@ class TidyWrappedTests(unittest.TestCase):
         paths = (source, target, unknown, self.root / "staff.json")
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
-            self.assertEqual(migrate_showrunner_state.migrate(), 1)
+            self.assertEqual(migrate_showrunner_state.migrate(), 0)
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
 if __name__ == "__main__":
