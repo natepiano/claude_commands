@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from scripts.production import staff
 from scripts.production.staff_test_support import transcript_fixture, switch_backend_stub, isolated_staff_file
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
 import contextlib
+from pathlib import Path
 from scripts.direct import implement_launcher_test_support as support
 from scripts.direct.implement_launcher_test_support import STUB_MESH as STUB_MESH
 from typing import cast
@@ -25,6 +26,18 @@ from scripts.direct.wait_for_test_state import wait_for_pid
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    def test_implementation_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
+        session = self.start_phase("registry-snapshot")
+        environment = self.mesh_environment()
+        probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
+        result = subprocess.run(
+            ["bash", str(self.implement_script), str(session), str(self.working_dir), str(self.prompt_file),
+             "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
+            env=probe.environment(environment), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(probe.reads()), 1, probe.reads())
+        self.assertEqual(self.recorded_worker(session).name, "project-impl")
+
     def test_named_claude_slot_uses_codex_start_after_family_selection(self) -> None:
         run = self.start_phase("switch-named-slot")
         _ = self.claude_worker(run)

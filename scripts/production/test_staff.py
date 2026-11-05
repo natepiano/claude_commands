@@ -69,6 +69,13 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_agent_environment_removes_launch_and_editor_configuration(self) -> None:
+        environment = {"MODELS_LAUNCH_CONFIGURATION": "launch-generation",
+                       "MODELS_REGISTRY_EDIT_BASE": "editor-generation", "KEEP": "agent-value"}
+        self.assertEqual(staff.child_environment(environment), {"KEEP": "agent-value"})
+        self.assertEqual(environment["MODELS_LAUNCH_CONFIGURATION"], "launch-generation")
+        self.assertEqual(environment["MODELS_REGISTRY_EDIT_BASE"], "editor-generation")
+
     def test_worker_rename_cli_keeps_identity_for_each_backend_and_holder(self) -> None:
         from scripts.production.cli_fixture import invoke_cli
         from scripts.production.rename_test_support import RenameDisplays

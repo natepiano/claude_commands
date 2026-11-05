@@ -22,9 +22,9 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import SignalPidGuard, install_signal_pid_guard
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
-from scripts.lib import names
+from scripts.lib import models_registry, names
 from scripts.lib.test_names import fixture_names
 
 from scripts.whoami.note_file import note_name
@@ -451,8 +451,8 @@ class FixtureModelDefaults:
     resolver. No second registry parser or model-selection rule lives here.
     """
 
-    def __init__(self, resolve: Callable[[argparse.Namespace], tuple[str, str]]) -> None:
-        self.resolve: Callable[[argparse.Namespace], tuple[str, str]] = resolve
+    def __init__(self, resolve: Callable[[argparse.Namespace, models_registry.LaunchModelConfiguration], tuple[str, str]]) -> None:
+        self.resolve: Callable[[argparse.Namespace, models_registry.LaunchModelConfiguration], tuple[str, str]] = resolve
         self.environment: dict[str, str] = self.resolver_environment()
         self.files: dict[Path, tuple[int, bytes]] = {
             Path(os.environ[key]): (Path(os.environ[key]).stat().st_mtime_ns, Path(os.environ[key]).read_bytes())
@@ -474,12 +474,12 @@ class FixtureModelDefaults:
         return all(path.is_file() and (path.stat().st_mtime_ns, path.read_bytes()) == value
                    for path, value in self.files.items())
 
-    def __call__(self, args: argparse.Namespace) -> tuple[str, str]:
+    def __call__(self, args: argparse.Namespace, configuration: models_registry.LaunchModelConfiguration) -> tuple[str, str]:
         if getattr(args, "model", "") not in ("", "gpt-test") or not self.unchanged():
-            return self.resolve(args)
+            return self.resolve(args, configuration)
         key = tuple(str(getattr(args, name, "")) for name in ("role", "task", "model", "effort"))
         if key not in self.defaults:
-            value = self.resolve(args)
+            value = self.resolve(args, configuration)
             if self.unchanged():
                 self.defaults[key] = value
             return value
@@ -589,11 +589,15 @@ def setUpModule() -> None:
         "MODELS_CONFIG_FILE": str(Path(home.name) / "models.conf"),
         "CODEX_CATALOG_SYNC_STATE_FILE": str(Path(home.name) / "catalog-sync"),
         "CODEX_CONFIG_FILE": str(Path(home.name) / "codex.toml"),
+        "CODEX_MODELS_CACHE_FILE": str(Path(home.name) / "models_cache.json"),
         "CODEX_PACER_TIER_FILE": str(Path(home.name) / "pacer-tier"),
     }
     for path in tier_files.values():
         _ = Path(path).write_text("", encoding="utf-8")
     _ = write_registry(Path(tier_files["MODELS_CONFIG_FILE"]))
+    for path in tier_files.values():
+        os.utime(path, (1, 1))
+    os.utime(tier_files["CODEX_CATALOG_SYNC_STATE_FILE"], (2, 2))
     for key, value in tier_files.items():
         unittest.addModuleCleanup(set_environment(key, value))
     # The complete shared fixture costs seconds to validate in Bash. Reuse
@@ -602,8 +606,8 @@ def setUpModule() -> None:
     baseline = FixtureModelDefaults(codex_mesh._turn_model_effort)  # pyright: ignore[reportPrivateUsage]
 
     @functools.wraps(codex_mesh._turn_model_effort)  # pyright: ignore[reportPrivateUsage]
-    def baseline_defaults(args: argparse.Namespace) -> tuple[str, str]:
-        return baseline(args)
+    def baseline_defaults(args: argparse.Namespace, configuration: models_registry.LaunchModelConfiguration) -> tuple[str, str]:
+        return baseline(args, configuration)
 
     defaults = patch.object(codex_mesh, "_turn_model_effort", baseline_defaults)
     _ = defaults.start()
@@ -917,26 +921,28 @@ class FixtureModelDefaultsTests(unittest.TestCase):
             with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}):
                 resolve = MagicMock(return_value=("gpt-test", "high"))
                 defaults = FixtureModelDefaults(resolve)
+                configuration = models_registry.launch_configuration({})
                 args = argparse.Namespace(role="impl", task="", model="gpt-test", effort="high")
-                self.assertEqual(defaults(args), ("gpt-test", "high"))
-                self.assertEqual(defaults(args), ("gpt-test", "high"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
                 self.assertEqual(resolve.call_count, 1)
                 _ = write_registry(registry, {"direct.codex": {"impl": "gpt-test:max"}}, update=True)
                 resolve.return_value = ("gpt-test", "max")
-                self.assertEqual(defaults(args), ("gpt-test", "max"))
-                self.assertEqual(defaults(args), ("gpt-test", "max"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "max"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "max"))
                 self.assertEqual(resolve.call_count, 3, "changed registries must resolve on every turn")
 
     def test_custom_registry_and_subprocess_faults_bypass_baseline_reuse(self) -> None:
         resolve = MagicMock(return_value=("gpt-test", "high"))
         defaults = FixtureModelDefaults(resolve)
+        configuration = models_registry.launch_configuration({})
         args = argparse.Namespace(role="review", task="", model="gpt-test", effort="high")
-        self.assertEqual(defaults(args), ("gpt-test", "high"))
+        self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
         with patch.dict(os.environ, {"MODELS_CONFIG_FILE": "/tmp/custom-mesh-registry"}):
-            self.assertEqual(defaults(args), ("gpt-test", "high"))
-            self.assertEqual(defaults(args), ("gpt-test", "high"))
+            self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+            self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
         with patch.object(subprocess, "run"):
-            self.assertEqual(defaults(args), ("gpt-test", "high"))
+            self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
         self.assertEqual(resolve.call_count, 4)
 
 
@@ -2065,7 +2071,8 @@ class StaffAdmissionTests(MeshCommandFixture):
             return stop_resume.Stopped(old.current_session, 987654)
 
         with patch.object(stop_resume, "stop", side_effect=stop):
-            result = codex_mesh.open_unit_worker(str(self.session_dir), old.name, "impl")
+            result = codex_mesh.open_unit_worker(str(self.session_dir), old.name, "impl",
+                configuration=models_registry.launch_configuration(os.environ))
         current = staff.by_id(old.id)
         assert current is not None
         self.assertEqual((current.id, current.name, current.parent), (old.id, old.name, old.parent))
@@ -2365,7 +2372,8 @@ class StaffAdmissionTests(MeshCommandFixture):
             return respond(request)
 
         self.server.respond = check
-        _ = codex_mesh.open_unit_worker(str(self.session_dir), "test", "test")
+        _ = codex_mesh.open_unit_worker(str(self.session_dir), "test", "test",
+            configuration=models_registry.launch_configuration(os.environ))
         self.assertEqual(observed, [])
         published = staff.by_id(staff.StaffId(THREAD_ID))
         assert published is not None
@@ -5303,7 +5311,10 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         registry_file = self.session_dir / "models.conf"
         config_file = self.session_dir / "codex.toml"
         _ = write_registry(registry_file, registry)
+        os.utime(registry_file, (1, 1))
         _ = config_file.write_text(config, encoding="utf-8")
+        os.utime(config_file, (1, 1))
+        os.utime(os.environ["CODEX_CATALOG_SYNC_STATE_FILE"], (2, 2))
         return {"MODELS_CONFIG_FILE": str(registry_file), "CODEX_CONFIG_FILE": str(config_file),
                 "CODEX_PACER_TIER_FILE": str(self.session_dir / "pacer-tier")}
 
@@ -5313,7 +5324,11 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 function, row = task.split(".")
                 environment = self.tier_environment(
                     {"delegate.options": {"codex_service_tier": "flex"},
+                     f"{function}.codex": {row: "gpt-test:high"},
+                     "direct.codex": {"review": "gpt-test:high"},
+                     "codex.agents": {"gpt-next": "low"},
                      f"{function}.options": {f"codex_service_tier.{row}": "fast"}})
+                probe = RegistryReadProbe(self.session_dir, Path(environment["MODELS_CONFIG_FILE"]))
                 self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
                 self.server.requests.clear()
                 read = codex_mesh.Client.next_frame
@@ -5331,10 +5346,14 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                                 message="Run finished: fixture build passed", message_file="")), 0)
                         _ = write_registry(Path(environment["MODELS_CONFIG_FILE"]),
                             {"delegate.options": {"codex_service_tier": "flex"},
+                             f"{function}.codex": {row: "gpt-next:low"},
+                             "direct.codex": {"review": "gpt-next:low"},
+                             "codex.agents": {"gpt-next": "low"},
                              f"{function}.options": {f"codex_service_tier.{row}": "default"}})
                     return frame
 
-                with patch.dict(os.environ, environment), patch.object(codex_mesh.Client, "next_frame", wake):
+                with probe.active({**os.environ, **environment}), \
+                        patch.object(codex_mesh.Client, "next_frame", wake):
                     if follow:
                         code, _output, errors = self.run_mesh(
                             self.follow_cli("--task", task, "--service-tier", "fast"))
@@ -5349,6 +5368,9 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 self.assertEqual((code, errors), (0, ""))
                 params = [_as_test_dict(start["params"]) for start in self.methods("turn/start")]
                 self.assertEqual([item.get("serviceTier") for item in params], ["fast", "default"])
+                self.assertEqual([(item.get("model"), item.get("effort")) for item in params],
+                                 [("gpt-test", "high"), ("gpt-next", "low")])
+                self.assertEqual(probe.total(), 2, probe.reads())
                 self.assertEqual(self.turn_inputs[-1], "Run finished: fixture build passed")
                 self.assertEqual(self.worker_record().get("task"), task)
 
@@ -6527,10 +6549,41 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(self.methods("thread/compact/start"), [])
         self.assertEqual(self.methods("turn/interrupt"), [])
 
+    def start_with_a_registry_edit_after_the_first_submission(self) -> tuple[int, str]:
+        environment = self.tier_environment({"direct.codex": {"impl": "gpt-first:high"},
+            "codex.agents": {"gpt-first": "high", "gpt-next": "low"},
+            "direct.options": {"codex_service_tier": "fast"}})
+        probe = RegistryReadProbe(self.session_dir, Path(environment["MODELS_CONFIG_FILE"]))
+        original = self.server.respond
+        changed = False
+
+        @bounded_fixture
+        def edit_after_submission(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal changed
+            if request.get("method") == "turn/start" and not changed:
+                changed = True
+                _ = write_registry(Path(environment["MODELS_CONFIG_FILE"]), {
+                    "direct.codex": {"impl": "gpt-next:low"}, "codex.agents": {"gpt-next": "low"},
+                    "direct.options": {"codex_service_tier": "flex"}})
+            return original(request)
+
+        self.server.respond = edit_after_submission
+        with probe.active({**os.environ, **environment}):
+            code, _output, errors = self.run_mesh([
+                "start", "--name", "worker", "--role", "impl", "--task", "direct.impl",
+                "--prompt-file", str(self.session_dir / "prompt.txt"),
+                "--summary-file", str(self.session_dir / "summary.txt"),
+                "--log-file", str(self.session_dir / "worker.log"), "--timeout", "5"])
+        params = [_as_test_dict(item["params"]) for item in self.methods("turn/start")]
+        self.assertEqual([(item.get("model"), item.get("effort"), item.get("serviceTier")) for item in params],
+                         [("gpt-first", "high", "fast"), ("gpt-next", "low", "flex")])
+        self.assertEqual(probe.total(), 2, probe.reads())
+        return code, errors
+
     def test_context_overflow_starts_one_continue_turn_and_posts_once(self) -> None:
         self.outcomes = ["overflow", "completed"]
 
-        code, errors = self.run_start()
+        code, errors = self.start_with_a_registry_edit_after_the_first_submission()
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(
@@ -9185,7 +9238,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_capacity_resumes_its_thread_without_repeating_the_prompt(self) -> None:
         self.outcomes = ["capacity", "completed"]
-        code, errors = self.run_start()
+        code, errors = self.start_with_a_registry_edit_after_the_first_submission()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(len(self.methods("thread/start")), 1)
         starts = self.methods("turn/start")
@@ -16803,6 +16856,14 @@ class WorkersHomeTests(unittest.TestCase):
         with patch.dict(os.environ, caller), patch.object(subprocess, "Popen", return_value=process) as launch, patch.object(codex_mesh, "_free_port", return_value=4001), patch.object(codex_mesh, "WebSocket"), patch.object(codex_mesh, "_start_watcher"):
             _ = codex_mesh._start_server(str(self.session_dir), agent_accounts.workers_home())  # pyright: ignore[reportPrivateUsage]
         return cast(dict[str, str], launch.call_args.kwargs["env"])
+
+    def test_app_server_environment_excludes_the_launch_and_editor_configuration(self) -> None:
+        environment = self.started_environment({"MODELS_LAUNCH_CONFIGURATION": "launch-generation",
+            "MODELS_REGISTRY_EDIT_BASE": "editor-generation", "KEEP": "server-value"})
+        self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", environment)
+        self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", environment)
+        self.assertEqual(environment["KEEP"], "server-value")
+        self.assertEqual(environment["CODEX_HOME"], str(self.home / ".codex1"))
 
     def test_a_run_folders_server_names_its_run_whatever_the_caller_carries(self) -> None:
         # implement.sh's claim step can start the server before the launcher exports the run.

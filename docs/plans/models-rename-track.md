@@ -219,32 +219,34 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - A sixth staff refusal for an unknown dispatch state: the staff spec allows five; the anomaly line continues the operation.
 - Changing six other units' test files to remove `membership` from `UnitWorkerLedger.locked()`.
 
-### Phase 3s — A moved session resumes only its own workers, through assign.sh  · status: todo
+### Phase 3s — A moved session resumes only its own workers  · status: todo
 
 **Owner:** models-unit (sdlc, 2026-11-05: "You own it; one worker beside 5a after the 3q hash"). shutdown-unit agrees the `stop_resume.py` and `inventory.py` edits (2026-11-05).
 
-**Depends on:** 3q, and shutdown-unit's F007 (`stop(session, *, deadline=math.inf)` in `stop_resume.py`) on sdlc: merge sdlc after F007 lands, before dispatch. The `assign.sh --to` resume line needs devtools' one-launch path on sdlc; if it is not there at dispatch, the worker writes the list fix first and the command last, after the devtools merge.
+**Depends on:** 3q, and shutdown-unit's F007 (`stop(session, *, deadline=math.inf)` in `stop_resume.py`) on sdlc: merge sdlc after F007 lands, before dispatch.
+
+**Scope (sdlc, 2026-11-05):** devtools-unit 3t deletes the Codex branches of `implement.sh` and `review.sh` and switches every caller to `assign.sh`, `resume_message.resume_worker_command` included. 3s keeps only the worker list. If 3s lands first, it keeps the old resume command.
 
 #### Work Order
 
-**Goal:** A session move tells the moved session to resume only its own workers, and every resume command it prints starts the worker through `assign.sh`.
+**Goal:** A session move tells the moved session to resume only its own workers, with one result for each worker.
 
 **Spec:**
 
 1. Cause (cargo-liner showrunner, 2026-11-05 01:0x move to claude4): the move told the showrunner to resume 24 Codex workers of four units, not its own. One line carried a direct `implement.sh` resume command. `stop_resume.py:496` builds the list from `codex_seats([Path(run) for run in unit_runs.held(identity)])`. `unit_runs.held` finds each run's owner through staff (`unit_runs.director`, `unit_runs.py:132`), so the move takes every worker of every run the session directs. `inventory.codex_seats` (`inventory.py:843`) adds every roster entry of those runs and does not check each worker's `parent`.
 2. The move lists the moved row's staff children only: the worker rows whose `parent` is the moved row (`docs/plans/staff-lifecycle.md` section 2, item 6). Each child gives one entry, keyed by its fixed staff id, also when several runs name it.
 3. Each child gets one named result:
-   1. Resumable: its turn was live, and its last assignment is complete. Print the assign.sh command.
+   1. Resumable: its turn was live. Print its resume command from `resume_message.resume_worker_command`, unchanged.
    2. Idle: its turn was not live. Keep the "idle: nothing to run now" line.
    3. Unavailable: its roster entry, its run or its last assignment cannot be read. Print the child and the reason on one `anomaly:` line. Never call it idle.
-4. `resume_message.resume_worker_command` prints `bash ~/.claude/scripts/direct/assign.sh --role <role> --to <worker> --phase <phase> --session-dir <run> --prompt <resume prompt> --cwd <cwd>`. A writable role adds `--paths <list file>`; a review keeps its `--lens`. Take role, phase and lens from the worker's last assignment. Take the authorized paths from the newest `<run>/phases/<phase>/dispatch_<n>_paths.json` record for that worker (written by `assign.py`), and write them to a list file in the run. No resume line names `implement.sh` or `review.sh`. The fallback sentence in `resume_message` (no seats) names assign.sh too.
-5. Delete the code this makes dead (the `director`-file worker path in the move; `_resume_task`'s saved-launcher parsing when nothing else reads it). Keep `unit_runs.held` for its other caller (`unit_lookup.py:279`).
+4. Do not edit the resume command: `resume_worker_command`, `_resume_task` and the fallback sentence belong to devtools-unit 3t.
+5. Delete the code this makes dead in the move's worker path. Keep `unit_runs.held` for its other caller (`unit_lookup.py:279`).
 6. Unexpected cases print one `anomaly:` line and continue (staff spec section 4).
 
 **Files:**
 - `scripts/shutdown/stop_resume.py` — the workers line of the move (shutdown-unit's file, agreed).
 - `scripts/shutdown/inventory.py` — `codex_seats` takes the staff children when it must (shutdown-unit's file, agreed; `_session_details` is messaging-unit's fenced code: do not edit it).
-- `scripts/lib/resume_message.py` — the assign.sh command.
+- `scripts/lib/resume_message.py` — the per-worker result lines only; not `resume_worker_command` or `_resume_task`.
 - `scripts/shutdown/test_stop_resume.py`, `scripts/shutdown/test_inventory.py`, `scripts/lib/test_relaunch.py`, `scripts/notify/test_auto_silence.py` — regressions and callers.
 
 **Workers:** `1 writer` — `impl` writes the source and its regression tests.
@@ -252,12 +254,12 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 **Constraints from prior phases:**
 
 1. 3q: `stop_resume.release_source` and `ReleaseSource` stay as 3q left them; F007's `stop` deadline merges beside them.
-2. One way to start a worker: `assign.sh` (user, 2026-11-04).
+2. devtools-unit 3t owns the resume command's switch to `assign.sh`.
 
 **Acceptance gate:**
 
 1. A test moves a showrunner row that owns a unit's run in staff and has one worker child of its own, with a mixed-owner roster: the message lists only its own worker.
-2. A test reads every resume line for a live-turn worker of each family (Codex and Claude): each one starts with `bash` and names `assign.sh --to <worker>`; none names `implement.sh` or `review.sh`. The test passes each generated command through `assign.py`'s argument and authorized-paths checks, for a writable role and for a review with a lens.
+2. A test covers a live-turn worker of each family (Codex and Claude): each gets one resumable entry with its resume command.
 3. Tests cover a child with no roster entry (one `anomaly:` line, not idle) and a child that two runs name (one entry).
 4. `test_stop_resume.py`, `test_inventory.py`, `test_relaunch.py`, `test_auto_silence.py` pass; basedpyright 0/0 on changed files and every caller module.
 5. Source lines net negative.
@@ -309,7 +311,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 3. Item 7: `test_worker_admission.py`, `test_worker_fill.py`, `test_codex_mesh.py`, `test_agent_bg.py` and every other `admit` caller suite pass; basedpyright 0/0 on changed files and caller modules. `test_default_switch_request_reuses_the_published_destination_after_fresh_admission` and `test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch` stay.
 4. Both outcomes go to sdlc with the evidence paths.
 
-### Phase 5a — Bash reads the resolved model registry in one call  · status: todo
+### Phase 5a — Bash reads the resolved model registry in one call  · status: done
 
 **Owner:** models-unit (user via natedev and sdlc, 2026-11-03: "going forward herdr should not own changes to /default_models - it should be owned by the models unit under sdlc"). models-unit owns `commands/default_models.md`, `scripts/agents/default_models.sh`, `models_config.sh`, `sync_codex_catalog.sh`, `scripts/lib/models_registry.py` and `config/models.conf`.
 
@@ -359,6 +361,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - `scripts/direct/assign.py`
 - `scripts/direct/workers.py`
 - `scripts/production/unit_effort.py`
+- `scripts/direct/progress_history.py` — its configuration digest reads the launch configuration, not the file
 - `commands/default_models.md`
 - `config/models.conf`
 - `scripts/lib/test_models_registry.py`
@@ -417,3 +420,33 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 12. Pass basedpyright with zero errors and warnings on changed Python files and caller modules.
 13. Pass the Delegation Context merge gate.
 14. Give herdr-unit the checkpoint hash for routed findings F002, F003, F004, F006, and F008.
+
+### Phase 5b — 5a follow-ups: tests that fail without the simplify repairs  · status: todo
+
+**Owner:** models-unit. 5a routed findings F005, F007 and F009 here at repair round 8 under the hard landing (2026-11-05). The 5a repairs landed; only the tests that fail without them are missing.
+
+**Depends on:** 5a.
+
+#### Work Order
+
+**Goal:** Each 5a simplify repair has a test that fails when the repair is reverted.
+
+**Spec:**
+
+1. F005: A test proves that worker reuse in `codex_mesh.py` reads the registry zero times when the launch already holds a configuration.
+2. F007: The registry-read count test drives the editor path in `default_models.sh` with `MODELS_REGISTRY_EDIT_BASE` set, not `--check`. It proves the catalog sync gate does not run inside an edit.
+3. F009: A test proves that `sync_codex_catalog.sh` parses the registry only after it holds the publication lock.
+4. Revert each repair in a scratch copy and record that its test fails. Restore the repair.
+
+**Files:**
+- `scripts/agents/test_codex_mesh.py`
+- `scripts/agents/test_models_config.sh`
+- `scripts/agents/test_sync_codex_catalog.sh`
+
+**Workers:** `1 tester`
+
+**Acceptance gate:**
+
+1. Each new test passes on the 5a tree and fails with its repair reverted. The summary quotes each failing assertion.
+2. Pass the three affected suites.
+3. Pass the Delegation Context merge gate.

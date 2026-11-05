@@ -7,6 +7,9 @@ source "$SCRIPT_DIR/../lib/test_models_registry.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agents-config.XXXXXX")"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
+export HOME="$TEST_DIR/home"
+mkdir -p "$HOME"
+
 MODELS_CONFIG_FILE="$TEST_DIR/models.conf"
 MODELS_CONFIG_PUBLISH=0
 CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
@@ -122,17 +125,11 @@ assert_registry_matches() {
 test_resolve_reads_registry_once() (
     MODELS_CONFIG_FILE="$TEST_DIR/read-once.conf"
     write_fixture "$TEST_DIR/base.conf"
-    # A file counts reads in command substitutions as well as this shell.
-    registry_reader="$(declare -f models_registry_text)"
-    eval "${registry_reader/models_registry_text /test_original_registry_text }"
-    models_registry_text() {
-        printf 'read\n' >> "$TEST_DIR/registry-reads"
-        test_original_registry_text "$@"
-    }
+    registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
     for task in alpha.work alpha.claude_task; do
-        : > "$TEST_DIR/registry-reads"
+        : > "$TEST_REGISTRY_READS"
         agents_resolve "$task" || fail "read-count task did not resolve: $task"
-        read_count="$(wc -l < "$TEST_DIR/registry-reads")"
+        read_count="$(wc -l < "$TEST_REGISTRY_READS")"
         [[ "$read_count" -eq 1 ]] \
             || fail "$task read the registry $read_count times; expected one read per resolve"
         if [[ "$task" == alpha.work ]]; then
@@ -179,6 +176,49 @@ test_changed_registry_file_refreshes_readers() (
     [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == high ]] \
         || fail "switching back to the first registry kept the second file's values"
     echo "models_config file refresh tests passed"
+)
+
+test_spaced_keys_and_shell_quoting() (
+    MODELS_CONFIG_FILE="$TEST_DIR/spaced registry.conf"
+    write_test_registry "$MODELS_CONFIG_FILE" assignments/direct=codex
+    sed 's/^direct=codex$/  direct = codex   # chosen family/' "$MODELS_CONFIG_FILE" > "$TEST_DIR/spaced.conf"
+    mv "$TEST_DIR/spaced.conf" "$MODELS_CONFIG_FILE"
+    cat >> "$MODELS_CONFIG_FILE" <<'EOF'
+
+[empty]
+[quoted]
+key = a 'quoted' $(exit 9) value # keep the source comment
+EOF
+    agents_resolve direct.impl
+    [[ "$AGENT_FAMILY:$AGENT_MODEL:$AGENT_EFFORT" == codex:gpt-test:high ]] \
+        || fail "spaced keys changed the resolved assignment"
+    _models_config_has_section empty || fail "the parser discarded an empty section"
+    [[ "$(_models_registry_get quoted key)" == "a 'quoted' \$(exit 9) value" ]] \
+        || fail "the shell changed a quoted registry value"
+)
+
+test_editor_uses_matching_text_and_values_after_a_concurrent_edit() (
+    MODELS_CONFIG_FILE="$TEST_DIR/editor-base.conf"
+    write_fixture "$TEST_DIR/base.conf"
+    cp "$MODELS_CONFIG_FILE" "$TEST_DIR/editor-before.conf"
+    sed 's/^work=gpt-test:high$/work=gpt-test:medium/' "$MODELS_CONFIG_FILE" > "$TEST_DIR/editor-peer.conf"
+    registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
+    parser="$(declare -f _models_registry_parse)"
+    eval "${parser/_models_registry_parse /test_original_registry_parse }"
+    _models_registry_parse() {
+        test_original_registry_parse "$@"
+        cp "$TEST_DIR/editor-peer.conf" "$MODELS_CONFIG_FILE"
+    }
+    validate_editor_base() {
+        models_registry_text > "$TEST_DIR/editor-source.conf"
+        cmp "$TEST_DIR/editor-before.conf" "$TEST_DIR/editor-source.conf" \
+            || fail "editor source text changed after the read"
+        [[ "$(_models_registry_get alpha.codex work)" == gpt-test:high ]] \
+            || fail "editor validation read another generation"
+    }
+    models_registry_edit validate_editor_base
+    [[ "$(wc -l < "$TEST_REGISTRY_READS")" -eq 1 ]] || fail "editor read more than one base"
+    cmp "$TEST_DIR/editor-peer.conf" "$MODELS_CONFIG_FILE" || fail "editor replaced the concurrent edit"
 )
 
 test_model_families() (
@@ -951,5 +991,7 @@ agents_resolve production.director
 test_registry_edit_refreshes_readers
 test_changed_registry_file_refreshes_readers
 test_resolve_reads_registry_once
+test_spaced_keys_and_shell_quoting
+test_editor_uses_matching_text_and_values_after_a_concurrent_edit
 
 echo "models_config tests passed"

@@ -111,7 +111,7 @@ class UnitStatusFixture(unittest.TestCase):
         (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
-        for name in ("agent_scope.py", "legacy_identity.py", "script_envelope.py", "atomic_file.py", "conf.py", "git_exclude.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py"):
+        for name in ("agent_scope.py", "legacy_identity.py", "script_envelope.py", "atomic_file.py", "conf.py", "git_exclude.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py", "models_registry.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, root / "scripts/lib" / name)
         for name in ("active", "sessions"):
             (root / name).mkdir()

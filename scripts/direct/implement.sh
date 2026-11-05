@@ -100,6 +100,7 @@ source "${SCRIPT_DIR}/../lib/conf.sh"
 COMPACT_ABOVE_TOKENS="$(conf_value direct UNIT_COMPACT_ABOVE_TOKENS)"
 
 source "${SCRIPT_DIR}/../agents/models_config.sh"
+models_launch_configuration || exit 1
 if ! agents_resolve "${TASK}"; then
   exit 1
 fi

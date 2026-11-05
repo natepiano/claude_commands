@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 from scripts.agents import worker_lifecycle
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import models_registry
 
 ROSTER = "mesh_roster.json"
 STATE = "progress_history_state.json"
@@ -538,7 +539,8 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
             if new_name in ledger.workers or new_name in roster:
                 raise WorkerUnavailable(f"{new_name}: worker name already exists")
             name = new_name
-        record = codex_mesh.open_unit_worker(str(run), name, role,
+        configuration = models_registry.launch_configuration(os.environ)
+        record = codex_mesh.open_unit_worker(str(run), name, role, configuration=configuration,
             model=model or (carried.model if carried is not None else ""),
             effort=effort or (carried.effort if carried is not None else ""))
         if carried is not None:

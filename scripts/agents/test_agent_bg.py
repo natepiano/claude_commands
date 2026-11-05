@@ -13,6 +13,8 @@ import signal
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib import models_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
@@ -26,6 +28,7 @@ sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 log = Path(os.environ["FIXTURE_BACKEND_LOG"])
 with log.open("a") as output:
     output.write(json.dumps({"arguments": sys.argv[1:], "STAFF_ID": os.environ.get("STAFF_ID", ""),
+        "operation_environment": {key: os.environ[key] for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE") if key in os.environ},
         "row_locks": [key for key in os.environ if key.startswith("STAFF_ROW_FD_")],
         "lock_fds": [str(path.resolve()) for path in (Path("/proc/self/fd").glob("*") if sys.platform == "linux" else ())
                      if "/rows/" in str(path.resolve()) and str(path.resolve()).endswith(".lock")]}) + "\\n")
@@ -119,6 +122,8 @@ class NativeClaudeWorkerTests(StaffTestCase):
         record: dict[str, object] = {"pid": os.getpid(), "procStart": sessions.process_start(os.getpid()),
                   "sessionId": identity, "name": "fresh-impl", "entrypoint": "cli",
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
+        models = write_registry(self.root / "models.conf")
+        self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
             "CONF_DIR": str(CHECKOUT / "config"),
             "CLAUDE_BIN": str(backend), "AGENT_BG_ROLE": "impl", "AGENT_BG_DETACH": "1", "AGENT_BG_SEND_SCRIPT": str(sender),
@@ -277,12 +282,19 @@ if sys.argv[1:2] == ["coordinate-claude"]:
         return sessions.RegistryRead((), ()) if read_count <= 2 else read_registry()
     sessions.read_registry = delayed_registry
 ''')
-        result = self.launch(PYTHONPATH=os.pathsep.join((str(fake_modules), str(CHECKOUT))),
-                             FIXTURE_REGISTRY_READS=str(reads), CLAUDE_CODE_CHILD_SESSION="1")
+        environment = models_registry.launch_configuration(os.environ).environment(
+            models_registry.edit_base(os.environ).environment(self.fixture.environment))
+        result = self.launch(**{**environment, "PYTHONPATH": os.pathsep.join((str(fake_modules), str(CHECKOUT))),
+                               "FIXTURE_REGISTRY_READS": str(reads), "CLAUDE_CODE_CHILD_SESSION": "1"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         arguments = cast(list[str], self.backend_calls()[0]["arguments"])
         settings = cast(dict[str, object], json.loads(arguments[arguments.index("--settings") + 1]))
         self.assertNotIn("CLAUDE_CODE_CHILD_SESSION", cast(dict[str, str], settings["env"]))
+        for surface, environment in (("process", self.backend_calls()[0]["operation_environment"]),
+                                     ("settings", settings["env"])):
+            with self.subTest(surface=surface):
+                self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", cast(dict[str, str], environment))
+                self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", cast(dict[str, str], environment))
         self.assertEqual(reads.read_text().splitlines(), ["empty", "empty", "ready"])
         row = staff.by_id(staff.StaffId(self.fixture.identity))
         assert row is not None

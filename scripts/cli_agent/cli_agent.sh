@@ -51,6 +51,7 @@ cli_agent_run() {
         codex)
             workers_home="$(agents_workers_home)" || return 1
             read -r -a agent_args <<< "$(agents_codex_args)"
+            models_agent_environment
             if [[ -z "$invocation" ]]; then
                 exec env "CODEX_HOME=$workers_home" codex "${agent_args[@]}"
             fi
@@ -60,6 +61,7 @@ cli_agent_run() {
             source "$CLI_AGENT_DIR/../agents/claude_account.sh"
             claude_launch_environment workers || return 1
             read -r -a agent_args <<< "$(agents_claude_args)"
+            models_agent_environment
             if [[ -z "$invocation" ]]; then
                 exec "$CLI_AGENT_DIR/../lib/py" "$CLI_AGENT_DIR/../lib/nix_env.py" exec "$(command -v claude)" "${agent_args[@]}"
             fi

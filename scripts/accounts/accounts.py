@@ -39,7 +39,7 @@ sys.path.insert(0, str(SCRIPTS / "whoami"))
 
 from scripts.whoami import account  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
-from scripts.lib import atomic_file, conf, unit_runs  # noqa: E402
+from scripts.lib import atomic_file, conf, unit_runs, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
@@ -1512,7 +1512,7 @@ def _exec_codex_account(label: str, arguments: list[str], *, account_config: con
     environment["CODEX_HOME"] = str(target.home)
     try:
         program = resolve_program("codex", environment=environment)
-        os.execvpe(program, [program, *arguments], environment)
+        os.execvpe(program, [program, *arguments], models_registry.agent_environment(environment))
     except OSError as error:
         raise AccountsError(f"accounts: could not start codex: {error}") from error
 
@@ -1627,9 +1627,9 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
         program = resolve_program("claude", environment=environment)
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
-                                      "run", "--", program, *arguments], environment)
+                                      "run", "--", program, *arguments], models_registry.agent_environment(environment))
         else:
-            os.execvpe(program, [program, *arguments], environment)
+            os.execvpe(program, [program, *arguments], models_registry.agent_environment(environment))
     except OSError as error:
         raise AccountsError(f"accounts: could not start claude: {error}") from error
 

@@ -38,7 +38,7 @@ from scripts.agents import worker_lifecycle
 from scripts.lib.agent_scope import agent_scope_prefix
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
-from scripts.lib import build_folders, nix_env, process_group, unit_runs
+from scripts.lib import build_folders, nix_env, process_group, unit_runs, models_registry
 from scripts.lib.unit_runs import SERVER_FILE as SERVER_FILE
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import staff, worker_admission, session_staff
@@ -3040,7 +3040,7 @@ def _start_server(
                     stdout=subprocess.DEVNULL,
                     stderr=log_handle,
                     start_new_session=True,
-                    env=environment,
+                    env=staff.child_environment(environment),
                 )
         except OSError as error:
             if not isinstance(dev_shell, WorktreeDevShell):
@@ -6001,7 +6001,16 @@ def _start_workers_turn(
         raise
 
 
-def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
+def _registry_shell(name: str, script: str, *arguments: str,
+                    configuration: models_registry.LaunchModelConfiguration, timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", 'source "$1"; models_launch_configuration || exit 2; ' + script,
+         name, str(Path(__file__).with_name("models_config.sh")), *arguments],
+        capture_output=True, text=True, timeout=timeout, env=configuration.environment(os.environ))
+
+
+def _turn_service_tier(client: Client, args: argparse.Namespace,
+                       configuration: models_registry.LaunchModelConfiguration) -> str:
     """Resolve the current task's tier once for each turn, without a server cache."""
     session_dir = _as_str(_attr(args, "session_dir")) or client.session_dir
     name = _as_str(_attr(args, "to")) or _as_str(_attr(args, "name")) or client.name
@@ -6009,11 +6018,8 @@ def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
     try:
         record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)) if session_dir else {}
         task = _as_str(record.get("task"))
-        resolved = subprocess.run(
-            ["bash", "-c", 'MODELS_CONFIG_TIER_ONLY=1; source "$1"; agents_turn_service_tier "$2"',
-             "codex-mesh-tier", str(Path(__file__).with_name("models_config.sh")), task or "delegate"],
-            capture_output=True, text=True, timeout=5,
-        )
+        resolved = _registry_shell("codex-mesh-tier", 'agents_turn_service_tier "$2"', task or "delegate",
+                                   configuration=configuration, timeout=5)
         if resolved.returncode:
             raise ValueError(resolved.stderr.strip() or "agent tier resolver failed")
         if resolved.stderr.strip():
@@ -6030,7 +6036,8 @@ def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
         return "default"
 
 
-def _turn_model_effort(args: argparse.Namespace) -> tuple[str, str]:
+def _turn_model_effort(args: argparse.Namespace,
+                       configuration: models_registry.LaunchModelConfiguration) -> tuple[str, str]:
     """Select explicit dispatch settings or the current role default at send time."""
     role = _roster_role(_attr(args, "role"))
     # Freestanding resident threads may omit assignment metadata. Their task
@@ -6039,8 +6046,7 @@ def _turn_model_effort(args: argparse.Namespace) -> tuple[str, str]:
         _as_str(_attr(args, "task")) or "direct.impl")
     model = _as_str(_attr(args, "model"))
     effort = _as_str(_attr(args, "effort"))
-    resolved = subprocess.run([
-        "bash", "-c", '''source "$1"; AGENTS_CALLER_FAMILY=codex agents_resolve "$2" || exit 2
+    resolved = _registry_shell("mesh-turn", '''AGENTS_CALLER_FAMILY=codex agents_resolve "$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
  pair="${3:-$AGENT_MODEL}"
  [[ "$pair" == *:* ]] || pair="$pair:${4:-$AGENT_EFFORT}"
@@ -6048,8 +6054,7 @@ if [[ -n "$3" || -n "$4" ]]; then
  _agents_validate_pair "$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
 printf '%s\\n' "$AGENT_MODEL" "$AGENT_EFFORT"
-''', "mesh-turn", str(Path(__file__).with_name("models_config.sh")), task, model, effort,
-    ], capture_output=True, text=True, timeout=30)
+''', task, model, effort, configuration=configuration, timeout=30)
     if resolved.returncode:
         raise SystemExit(resolved.stderr.strip() or "cannot resolve turn model and effort")
     fields = resolved.stdout.splitlines()
@@ -6098,9 +6103,12 @@ def _start_turn(
         READ_ONLY_SANDBOX if _attr(args, "read_only") is True else worker_sandbox)
     # Resolve at every submission, including continuations and capacity retries.
     # Roster/identity values are display history, never input to this choice.
-    model, effort = _turn_model_effort(args)
+    fresh = isinstance(_attr(args, "launch_configuration"), models_registry.FreshLaunchConfiguration)
+    configuration = models_registry.launch_configuration({} if fresh else os.environ)
+    args.launch_configuration = models_registry.FreshLaunchConfiguration()
+    model, effort = _turn_model_effort(args, configuration)
     params["model"], params["effort"] = model, effort
-    service_tier = _turn_service_tier(client, args)
+    service_tier = _turn_service_tier(client, args, configuration)
     params["serviceTier"] = service_tier
     client.turn_submitted_at = time.time()
     request = _as_str(_attr(args, "switch_request"))
@@ -6791,26 +6799,26 @@ class UnrecordedWorkerThread:
 
 
 def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
-                     effort: str = "") -> dict[str, object]:
+                     effort: str = "", configuration: models_registry.LaunchModelConfiguration) -> dict[str, object]:
     """Open an idle thread; assignment starts its first turn later through follow."""
     try:
         admitted = worker_admission.admit(name, Path(session_dir), role=role)
     except ValueError as error:
         raise unit_workers.WorkerUnavailable(str(error)) from error
     with worker_admission.worker_operation(admitted):
-        return _open_admitted_worker(session_dir, role, admitted, model=model, effort=effort)
+        return _open_admitted_worker(session_dir, role, admitted, model=model, effort=effort, configuration=configuration)
 
 
 def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllowed, *,
-                          model: str, effort: str) -> dict[str, object]:
+                          model: str, effort: str,
+                          configuration: models_registry.LaunchModelConfiguration) -> dict[str, object]:
     name = admitted.name
     with worker_lifecycle.membership_operation(session_dir):
         with contextlib.ExitStack() as lifecycle:
             _ = lifecycle.enter_context(worker_lifecycle.lock_worker(session_dir, name))
-            command = ['bash', '-c',
-                       'source "$1"; agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"', 'workers',
-                       str(Path(__file__).with_name("models_config.sh")), role]
-            resolved = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+            resolved = _registry_shell("workers",
+                'agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"',
+                role, configuration=configuration, timeout=30)
             fields = resolved.stdout.strip().split()
             if resolved.returncode or len(fields) != 4:
                 raise unit_workers.WorkerUnavailable(resolved.stderr.strip() or "cannot resolve worker model")

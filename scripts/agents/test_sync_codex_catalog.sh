@@ -10,6 +10,9 @@ TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sync-codex-catalog.XXXXXX")"
 # it writable again to clear the tree.
 trap 'chmod -R u+rwx "$TEST_DIR" 2>/dev/null; rm -rf "$TEST_DIR"' EXIT
 
+export HOME="$TEST_DIR/home"
+mkdir -p "$HOME"
+
 AGENTS="$TEST_DIR/models.conf"
 export MODELS_CONFIG_PUBLISH=0
 CODEX_CONFIG="$TEST_DIR/config.toml"
@@ -86,6 +89,13 @@ test_model_families() (
         claude.families/opus=opus \
         claude.families/sonnet=sonnet \
         claude.families/haiku=haiku
+    "$SCRIPT_DIR/../lib/py" - "$AGENTS" <<'PYTHON'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+path.write_text(re.sub(r"^(direct|gpt-[^=\n]*)=", r"\1 = ", path.read_text(), flags=re.MULTILINE))
+PYTHON
     printf '%s\n' 'model = "gpt-9-sol"' > "$CODEX_CONFIG"
     cat > "$MODELS_CACHE" <<'EOF'
 {"models":[

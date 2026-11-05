@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if __name__ == "__main__":
     # Lazy runtime readers share these exact row and exception classes in the CLI.
     sys.modules["scripts.production.staff"] = sys.modules[__name__]
+from scripts.lib.models_registry import agent_environment
 from scripts.lib import atomic_file, conf  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
@@ -601,8 +602,8 @@ def is_owner() -> bool:
 
 
 def child_environment(environment: Mapping[str, str]) -> dict[str, str]:
-    """Remove row lock proofs and retired staff hints from child environments."""
-    return {key: value for key, value in environment.items()
+    """Remove row lock proofs, staff hints, and operation state from agent environments."""
+    return {key: value for key, value in agent_environment(environment).items()
             if not key.startswith("STAFF_ROW_FD_") and key != "STAFF_ID"}
 
 

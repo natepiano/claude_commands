@@ -643,6 +643,7 @@ fi
 
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/../agents/models_config.sh"
+models_launch_configuration || exit 1
 if [[ "${TASK}" == direct.simplify && "$(_agents_live_family direct simplify)" != claude ]]; then
   review_error "direct.simplify requires a Claude assignment"
   write_review_status error

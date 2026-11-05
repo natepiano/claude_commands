@@ -13,6 +13,7 @@ from scripts.direct import assign
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, LauncherScript, read_object
 from scripts.lint import style_review
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 
 def setUpModule() -> None:
@@ -21,6 +22,38 @@ def setUpModule() -> None:
 
 @final
 class AssignLauncherTests(AssignLauncherFixture):
+    def test_assignment_shares_one_generation_through_allocation_and_refreshes_the_next_launch(self) -> None:
+        probe = RegistryReadProbe(self.session_dir.parent, self.registry)
+        _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-kept-sol:high"},
+                                           "codex.agents": {"gpt-kept-sol": "high", "gpt-other-sol": "high,max"},
+                                           "direct.options": {"codex_service_tier": "fast"}})
+        original = self.server.respond
+        edited = False
+
+        @self.hang_guard.callback
+        def change_after_creation(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal edited
+            if request.get("method") == "thread/start" and not edited:
+                edited = True
+                _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-other-sol:max"},
+                                                   "codex.agents": {"gpt-other-sol": "high,max"},
+                                                   "direct.options": {"codex_service_tier": "flex"}})
+            return original(request)
+
+        self.server.respond = change_after_creation
+        with patch.dict(os.environ, probe.environment(os.environ)):
+            for expected in (("gpt-kept-sol", "high", "fast"), ("gpt-other-sol", "max", "flex")):
+                with self.subTest(expected=expected):
+                    probe.clear()
+                    self.server.requests.clear()
+                    _ = self.successful(execution=LauncherScript(ASSIGN))
+                    turns = self.methods("turn/start")
+                    self.assertEqual(len(turns), 1)
+                    params = cast(dict[str, object], turns[0]["params"])
+                    self.assertEqual((params.get("model"), params.get("effort"), params.get("serviceTier")), expected)
+                    self.assertEqual(len(probe.reads()), 1, probe.reads())
+        self.assertTrue(edited)
+
     def test_dispatch_has_a_durable_worker_row_before_submitting_work(self) -> None:
         from scripts.production import staff
         _ = self.successful()

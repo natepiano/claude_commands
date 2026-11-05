@@ -193,16 +193,17 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
 
 
 def resolve_model(args: Arguments, role: str, env: dict[str, str]) -> tuple[str, str, str, str]:
-    result = call(["bash", "-c", '''source "$1"; agents_resolve "direct.$2" || exit 2
+    result = call(["bash", "-c", '''source "$1"; models_launch_configuration || exit 2; agents_resolve "direct.$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
  pair="${3:-$AGENT_MODEL}"
  [[ "$pair" == *:* ]] || pair="$pair:${4:-$AGENT_EFFORT}"
  [[ -z "$4" ]] || pair="${pair%%:*}:$4"
  _agents_validate_pair "direct.$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
-printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"
+printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}" "$MODELS_LAUNCH_CONFIGURATION"
 ''', "assign", str(SCRIPTS / "../agents/models_config.sh"), role, args.model, args.effort], env, capture=True)
-    family, model, effort, tier = result.stdout.strip().splitlines()[-4:]
+    family, model, effort, tier, configuration = result.stdout.strip().splitlines()[-5:]
+    env["MODELS_LAUNCH_CONFIGURATION"] = configuration
     if family != "codex":
         print("assign.sh: persistent unit workers require a Codex assignment", file=sys.stderr)
         raise SystemExit(3)

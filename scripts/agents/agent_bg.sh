@@ -145,6 +145,8 @@ else
   claude_launch_environment || exit 1
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/models_config.sh"
+
 # The daemon can retain an earlier worktree environment.
 # Pass the current worker values through its session settings.
 WORKER_ENV_NAMES=(UNIT_RUN_DIR UNIT_TEAM_ROLE MODELS_CONFIG_FILE)
@@ -155,7 +157,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[2])
+sys.path.insert(0, str(Path(sys.argv[2]).parents[1]))
 import nix_env
+from scripts.lib.models_registry import agent_environment
 
 loaded = nix_env.ensure(Path(sys.argv[1]))
 if isinstance(loaded, nix_env.Refused):
@@ -168,6 +172,7 @@ env.update({name: "" for name in os.environ if name not in loaded.env})
 env.update({name: os.environ.get(name, "") for name in sys.argv[3:]})
 env.update({name: os.environ[name] for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_REMOTE_MEMORY_DIR") if name in os.environ})
 env.pop("CLAUDE_CODE_CHILD_SESSION", None)
+env = agent_environment(env)
 print(json.dumps({"sandbox": {"enabled": False}, "env": env}))
 PY
 )" || exit 1
@@ -183,6 +188,7 @@ if [[ -n "${EFFORT}" ]]; then
 fi
 
 banner="$(close_switch_fds
+          models_agent_environment
           cd "${WORKING_DIR}" \
             && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u MODELS_CONFIG_FILE \
                    -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS -u CLAUDE_CODE_CHILD_SESSION \

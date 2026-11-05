@@ -136,7 +136,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_names
-from scripts.lib import conf
+from scripts.lib import conf, models_registry
 from scripts.notify import decision_priority
 from scripts.message import send_budget
 from scripts.message.send_result import (
@@ -2024,7 +2024,7 @@ def relay(message: Message, timeout: float) -> Result:
             return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
     command = [sys.executable, "-c", RELAY_EXEC, str(STATE / "relay_senders"), message.sender, *command]
-    code, out, err = run(command, relay_prompt(message), timeout, env, Path.home())
+    code, out, err = run(command, relay_prompt(message), timeout, models_registry.agent_environment(env), Path.home())
     raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
     raw.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(raw, out + err)
