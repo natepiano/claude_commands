@@ -213,7 +213,9 @@ The build queue reads process memory every ten seconds while open.
   Each role has a separate row with its own counts.
   The first row shows all account values.
   Later rows show only the role and its counts.
-  The view sums the available entries in `role_counts_by_machine` without changing their separate JSON representation.
+  Python combines available machine counts once in `role_counts`, in role order.
+  The view reads these counts directly; `role_counts_by_machine` keeps the separate machine records.
+  A role with no reported members has zero counts; `spare` has no count.
   A totals row sums the known activity counts.
   Codex shell counts remain unknown; they do not become zero.
   The access mark uses `read_ok`: success for a recent usable reading, and error otherwise.
@@ -308,7 +310,7 @@ The accounts view uses `accounts.py status --json --stored` to read saved usage 
 It watches usage, group selection, worker selection, role-map cache, peer-count cache, and reported session inputs.
 When the generator reports session inputs, each open-pane tick refreshes local liveness counts.
 The stored read uses an existing peer-count cache without waiting for its refresh.
-The separate machine counts let the view sum available observations without hiding a missing peer.
+Python combines available observations in `role_counts`; the separate machine records and problem lines identify a missing peer.
 Aligned headers and complete facts keep the same contract readable in wide and narrow panes.
 
 

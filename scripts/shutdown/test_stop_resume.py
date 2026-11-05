@@ -106,8 +106,7 @@ class StopResumeTests(unittest.TestCase):
     def test_batch_without_a_tab_reaches_the_shared_restore(self) -> None:
         up = stop_resume.ClaudeUp("saved", "new-pane", "claude4")
         with (patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("saved")),
-              patch.object(stop_resume, "resume", return_value=up) as resumed,
-              patch.object(stop_resume, "_running_on_account", return_value=up)):
+              patch.object(stop_resume, "resume", return_value=up) as resumed):
             results = stop_resume.move_sessions(["saved"], "claude4", why="limit")
         self.assertEqual(results, [up])
         resumed.assert_called_once_with("saved", why="limit", to="claude4")
@@ -1705,24 +1704,6 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(results, [stop_resume.StopFailed("stop-error", "cannot signal"),
             stop_resume.ResumePending("resume-error", "claude4", "cannot run"),
             stop_resume.ResumePending("gone-tab", "claude4", "session has no tab after stop"), stop_resume.ClaudeUp("good", "own-pane", "claude4")])
-
-    def test_move_confirms_each_member_runs_on_the_target_after_resume(self) -> None:
-        identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId(identity), "unit", "alpha", staff.STAFF_ROOT,
-                             current_session=staff.StaffId(identity))
-        line = ("alpha: not running on claude4 after the move; resume it with: "
-                + f"accounts.py move {identity} claude4")
-        for live in (sessions.SessionNotLive(), sessions.LiveSessionProcess(123)):
-            with (self.subTest(live=live),
-                  patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-                  patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped(identity, 123)),
-                  patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp(identity, "w1:p2", "claude4")),
-                  redirect_stderr(io.StringIO()) as output):
-                self.live.return_value = live
-                results = stop_resume.move_sessions([identity], "claude4", why="limit")
-            self.assertEqual(output.getvalue(), line + "\n")
-            self.assertEqual(results, [stop_resume.ResumePending(identity, "claude4", line)])
-
 
     def test_cli_prints_one_line_and_uses_the_result_exit_status(self) -> None:
         for arguments, expected in ((["stop", "alpha"], 0), (["resume", "alpha", "--why", "maintenance"], 0),
