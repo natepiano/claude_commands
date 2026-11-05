@@ -677,7 +677,7 @@ One idle episode sends one showrunner message and at most one phone push. A chan
 
 A good vault sync closes the question that its outage filed, through the public `withdraw` command. This replaces the earlier rule that natedev clears the question by hand.
 - `question_text(since: float) -> str` in `vault_pull.py` is the one source of the short line: `Hanadocs vault sync stopped, <opened iso>`. The cause is only in `--question`, because a cause can change inside one outage and `withdraw` needs the exact text.
-- `ask_question(reason, choices, since)` files that text. `withdraw_question(since) -> bool` runs `update_registration.py withdraw --production <PRODUCTION> --item <text>` through `run(..., COMMAND_TIMEOUT_S)`.
+- `registration(command: str, *args: str) -> bool` runs `update_registration.py <command> --production <PRODUCTION> <args>` through `run(..., COMMAND_TIMEOUT_S)`. `ask_question(reason, choices, since)` files the text through it, and `withdraw_question(since) -> bool` runs `withdraw --item <text>` through it.
 - In `_vault_locked`, a `Pulled` or `Current` outcome writes `VaultState(LastGoodPull(now), NoOutage())` first. It then withdraws once when the earlier outage is an `OpenOutage` with `asked=True`.
 - A failed or timed-out withdraw still exits 0 and keeps `NoOutage`. The sync line ends `; the question was not withdrawn`, and nothing retries.
 - A `DeferredSync` keeps the outage and withdraws nothing. An outage with `asked=False` withdraws nothing. `VaultState` and `vault_pull.json` keep their form.

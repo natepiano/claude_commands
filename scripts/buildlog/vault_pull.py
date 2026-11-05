@@ -365,23 +365,25 @@ def question_text(since: float) -> str:
     return f"Hanadocs vault sync stopped, {opened.isoformat()}"
 
 
+def registration(command: str, *args: str) -> bool:
+    result = run([
+        "python3", str(REGISTRATION), command, "--production", str(PRODUCTION), *args,
+    ], COMMAND_TIMEOUT_S)
+    return result is not None and result.returncode == 0
+
+
 def ask_question(reason: str, choices: str, since: float) -> bool:
     opened = datetime.fromtimestamp(since, UTC)
-    result = run([
-        "python3", str(REGISTRATION), "ask", "--production", str(PRODUCTION),
+    return registration(
+        "ask",
         "--text", question_text(since),
         "--question", reason + " " + choices, "--urgency", "soon",
         "--due", (opened + timedelta(days=1)).date().isoformat(),
-    ], COMMAND_TIMEOUT_S)
-    return result is not None and result.returncode == 0
+    )
 
 
 def withdraw_question(since: float) -> bool:
-    result = run([
-        "python3", str(REGISTRATION), "withdraw", "--production", str(PRODUCTION),
-        "--item", question_text(since),
-    ], COMMAND_TIMEOUT_S)
-    return result is not None and result.returncode == 0
+    return registration("withdraw", "--item", question_text(since))
 
 
 def vault() -> int:
@@ -407,9 +409,8 @@ def _vault_locked() -> int:
         if isinstance(outcome, (Pulled, Current)):
             write_state(VaultState(LastGoodPull(now), NoOutage()))
             description = f"buildlog vault: synced {outcome.commits} incoming commits" if isinstance(outcome, Pulled) else "buildlog vault: current"
-            if isinstance(state.outage, OpenOutage) and state.outage.asked:
-                if not withdraw_question(state.outage.since):
-                    description += "; the question was not withdrawn"
+            if isinstance(state.outage, OpenOutage) and state.outage.asked and not withdraw_question(state.outage.since):
+                description += "; the question was not withdrawn"
             print(description)
             return 0
         cause, reason, choices = stop_details(outcome)
