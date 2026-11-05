@@ -69,13 +69,18 @@ from typing import TextIO, cast
 
 class WaitingChild(unittest.TestCase):
     child: subprocess.Popen[str]
+    report_coverage = True
 
     @classmethod
     def start_child(cls) -> None:
+        environment = dict(os.environ)
+        if not cls.report_coverage:
+            environment.pop("NATEST_COVERAGE_TEST", None)
         cls.child = subprocess.Popen(
             [sys.executable, "-c", "from product import right; "
              "import sys; print('ready', flush=True); sys.stdin.read(); right()"],
-            cwd=Path(__file__).parent, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            cwd=Path(__file__).parent, env=environment,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -83,6 +88,71 @@ class WaitingChild(unittest.TestCase):
             cls.child.kill()
         cls.child.communicate(timeout=10)
 '''
+
+THREAD_PRELUDE = '''\
+import threading
+
+def require_event(event: threading.Event) -> None:
+    if not event.wait(timeout=10):
+        raise AssertionError("The worker did not reach the boundary")
+
+def join_thread(worker: threading.Thread) -> None:
+    worker.join(timeout=10)
+    if worker.is_alive():
+        raise AssertionError("The worker did not stop")
+'''
+
+WAITING_THREAD = THREAD_PRELUDE + '''\
+class WaitingThread(unittest.TestCase):
+    ready = threading.Event()
+    release = threading.Event()
+    values: list[str] = []
+    worker: threading.Thread
+
+    @classmethod
+    def work(cls) -> None:
+        cls.ready.set()
+        require_event(cls.release)
+        cls.values.append(right())
+
+    @classmethod
+    def start_thread(cls) -> None:
+        cls.worker = threading.Thread(target=cls.work)
+        cls.worker.start()
+        require_event(cls.ready)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.release.set()
+        join_thread(cls.worker)
+'''
+
+FAILED_EXEC_CHILD = '''\
+import os
+from pathlib import Path
+from product import left, right
+
+print(left(), flush=True)
+missing = str(Path(__file__).with_name("missing-program"))
+try:
+    os.execv(missing, [missing])
+except FileNotFoundError:
+    print(right(), flush=True)
+'''
+
+
+def child_script_sources(name: str, child_source: str, parent_body: str) -> dict[str, str]:
+    """Build a child script and its measured parent module."""
+    parent_source = PRELUDE + f'''
+def run_child() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(Path(__file__).with_name({name + ".py"!r}))],
+        cwd=Path(__file__).parent, capture_output=True, text=True, check=True)
+''' + parent_body
+    return {
+        f"scripts/fixture/{name}.py": child_source,
+        f"scripts/fixture/test_{name}.py": parent_source,
+    }
 
 
 class CoverageOverlapTests(unittest.TestCase):
@@ -93,10 +163,13 @@ class CoverageOverlapTests(unittest.TestCase):
             folder.mkdir(parents=True)
             tooling = root / "scripts" / "test_times"
             (tooling / "coverage_child").mkdir(parents=True)
+            library = root / "scripts" / "lib"
+            library.mkdir()
             for source, destination in (
                 (TOOL, tooling / TOOL.name),
                 (TOOL.with_name("line_collector.py"), tooling / "line_collector.py"),
                 (CHILD_STARTUP / "sitecustomize.py", tooling / "coverage_child" / "sitecustomize.py"),
+                (TOOL.parents[1] / "lib" / "code_kind.py", library / "code_kind.py"),
             ):
                 _ = shutil.copy2(source, destination)
             sources = {
@@ -356,6 +429,195 @@ class Completed(unittest.TestCase):
                 self.assertEqual(row["line_count"], 1)
                 self.assertFalse(row["candidate"])
 
+    def test_setup_python_without_report_marks_only_live_tests_unknown(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_setup_missing.py": PRELUDE + WAITING_CHILD + '''
+class SetupMissing(WaitingChild):
+    report_coverage = False
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.start_child()
+        if cast(TextIO, cls.child.stdout).readline().strip() != "ready":
+            raise AssertionError("The shared child did not start")
+
+    def test_a_live(self) -> None:
+        self.assertEqual(left(), "left")
+
+    def test_b_finish(self) -> None:
+        self.child.communicate(input="finish", timeout=10)
+        self.assertEqual(self.child.returncode, 0)
+        self.assertEqual(right(), "right")
+
+    def test_c_after(self) -> None:
+        self.assertEqual((left(), right()), ("left", "right"))
+'''})
+        for method in ("test_a_live", "test_b_finish"):
+            with self.subTest(method=method):
+                row = fixture.row(method)
+                self.assertEqual(row["status"], "pass")
+                self.assertEqual(row["child"], "unknown: shared child")
+                self.assertFalse(row["candidate"])
+        after = fixture.row("test_c_after")
+        self.assertEqual(after["child"], "none")
+        self.assertEqual(after["line_count"], 2)
+        self.assertFalse(after["candidate"])
+
+    def test_owned_child_exit_between_tests_keeps_the_next_test_known(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_between.py": PRELUDE + WAITING_CHILD + '''
+class AOwner(WaitingChild):
+    def test_a_start(self) -> None:
+        type(self).start_child()
+        self.assertEqual(cast(TextIO, self.child.stdout).readline().strip(), "ready")
+        self.assertEqual(left(), "left")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            cls.child.communicate(input="finish", timeout=10)
+            if cls.child.returncode != 0:
+                raise AssertionError("The child failed between tests")
+        finally:
+            super().tearDownClass()
+
+class BAfter(unittest.TestCase):
+    def test_b_after(self) -> None:
+        self.assertEqual((left(), right()), ("left", "right"))
+'''})
+        owner = fixture.row("test_a_start")
+        after = fixture.row("test_b_after")
+        self.assertEqual(owner["child"], "unknown: child outlived its test")
+        self.assertFalse(owner["candidate"])
+        self.assertEqual(after["child"], "none")
+        self.assertEqual(after["line_count"], 2)
+        self.assertFalse(after["candidate"])
+
+    def test_thread_from_an_earlier_test_cannot_give_lines_to_a_later_test(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_thread_owner.py": PRELUDE + WAITING_THREAD + '''
+class ThreadOwner(WaitingThread):
+    def test_a_start(self) -> None:
+        type(self).start_thread()
+        self.assertEqual(left(), "left")
+
+    def test_b_shared(self) -> None:
+        self.assertEqual(left(), "left")
+        self.release.set()
+        join_thread(self.worker)
+        self.assertEqual(self.values, ["right"])
+
+    def test_c_after(self) -> None:
+        self.assertEqual(right(), "right")
+'''})
+        owner = fixture.row("test_a_start")
+        shared = fixture.row("test_b_shared")
+        after = fixture.row("test_c_after")
+        self.assertEqual(owner["child"], "unknown: thread outlived its test")
+        self.assertEqual(shared["child"], "unknown: shared thread")
+        self.assertEqual((owner["line_count"], shared["line_count"], after["line_count"]), (1, 1, 1))
+        for row in (owner, shared, after):
+            self.assertFalse(row["candidate"])
+        self.assertEqual(after["child"], "none")
+
+    def test_shared_thread_is_seen_after_the_runner_runs_the_same_line(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_thread_line.py": PRELUDE + WAITING_THREAD + '''
+class SameLine(WaitingThread):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.start_thread()
+
+    def test_a_same_line(self) -> None:
+        self.assertEqual(right(), "right")
+        self.release.set()
+        join_thread(self.worker)
+        self.assertEqual(self.values, ["right"])
+
+    def test_b_after(self) -> None:
+        self.assertEqual(left(), "left")
+'''})
+        shared = fixture.row("test_a_same_line")
+        self.assertEqual(shared["child"], "unknown: shared thread")
+        self.assertEqual(shared["line_count"], 1)
+        self.assertFalse(shared["candidate"])
+        self.assertEqual(fixture.row("test_b_after")["child"], "none")
+
+    def test_child_launched_by_a_setup_thread_has_no_test_owner(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_thread_child.py": PRELUDE + THREAD_PRELUDE + '''
+class ThreadChild(unittest.TestCase):
+    start = threading.Event()
+    running = threading.Event()
+    finish = threading.Event()
+    values: list[str] = []
+    worker: threading.Thread
+
+    @classmethod
+    def work(cls) -> None:
+        require_event(cls.start)
+        with subprocess.Popen(
+                [sys.executable, "-c", "from product import right; "
+                 "import sys; print('ready', flush=True); sys.stdin.read(); print(right())"],
+                cwd=Path(__file__).parent, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, text=True) as child:
+            if child.stdout is None or child.stdout.readline().strip() != "ready":
+                raise AssertionError("The worker child did not start")
+            cls.running.set()
+            require_event(cls.finish)
+            output = child.communicate(input="finish", timeout=10)[0]
+            if child.returncode != 0:
+                raise AssertionError("The worker child failed")
+            cls.values.append(output.strip())
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.worker = threading.Thread(target=cls.work)
+        cls.worker.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.start.set()
+        cls.finish.set()
+        join_thread(cls.worker)
+
+    def test_a_thread_child(self) -> None:
+        self.start.set()
+        require_event(self.running)
+        self.assertEqual(left(), "left")
+        self.finish.set()
+        join_thread(self.worker)
+        self.assertEqual(self.values, ["right"])
+
+    def test_b_parent(self) -> None:
+        self.assertEqual(right(), "right")
+'''})
+        shared = fixture.row("test_a_thread_child")
+        parent = fixture.row("test_b_parent")
+        self.assertEqual(shared["child"], "unknown: shared thread")
+        self.assertEqual(shared["line_count"], 1)
+        self.assertFalse(shared["candidate"])
+        self.assertEqual(parent["child"], "none")
+        self.assertEqual(parent["line_count"], 1)
+        self.assertFalse(parent["candidate"])
+
+    @unittest.skipUnless(hasattr(os, "posix_spawn"), "The fixture needs os.posix_spawn")
+    def test_launch_without_popen_or_report_stays_unknown_for_later_tests(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_spawn.py": PRELUDE + '''
+class Spawn(unittest.TestCase):
+    def test_a_spawn(self) -> None:
+        child = os.posix_spawn(sys.executable, [sys.executable, "-I", "-c", "pass"], dict(os.environ))
+        self.assertEqual(os.waitpid(child, 0), (child, 0))
+        self.assertEqual(left(), "left")
+
+    def test_b_later(self) -> None:
+        self.assertEqual(right(), "right")
+'''})
+        first = fixture.row("test_a_spawn")
+        self.assertIn("1 python children, 0 reported", first["child"])
+        self.assertIn("child outlived its test", first["child"])
+        self.assertEqual(fixture.row("test_b_later")["child"], "unknown: child outlived its test")
+        for method in ("test_a_spawn", "test_b_later"):
+            row = fixture.row(method)
+            self.assertEqual(row["status"], "pass")
+            self.assertEqual(row["line_count"], 1)
+            self.assertFalse(row["candidate"])
+
     def test_python_child_without_report_cannot_cover_another_test(self) -> None:
         fixture = self.run_fixture({"scripts/fixture/test_missing.py": PRELUDE + '''
 class Missing(unittest.TestCase):
@@ -381,6 +643,9 @@ class FailedLaunch(unittest.TestCase):
     def test_a_failed_launch(self) -> None:
         with self.assertRaises(FileNotFoundError):
             subprocess.Popen([str(Path(__file__).with_name("missing-program"))])
+        with self.assertRaises(FileNotFoundError):
+            subprocess.Popen([str(Path(__file__).with_name("missing-program"))],
+                             cwd=Path(__file__).parent)
         self.assertEqual(left(), "left")
 
     def test_b_next(self) -> None:
@@ -395,8 +660,7 @@ class FailedLaunch(unittest.TestCase):
                 self.assertFalse(row["candidate"])
 
     def test_python_child_catching_failed_launch_still_reports_lines(self) -> None:
-        fixture = self.run_fixture({
-            "scripts/fixture/child_launch.py": '''
+        fixture = self.run_fixture(child_script_sources("child_launch", '''
 from pathlib import Path
 import subprocess
 from product import right
@@ -405,19 +669,15 @@ try:
     subprocess.Popen([str(Path(__file__).with_name("missing-program"))])
 except FileNotFoundError:
     print(right())
-''',
-            "scripts/fixture/test_failed_child_launch.py": PRELUDE + '''
+''', '''
 class FailedChildLaunch(unittest.TestCase):
     def test_a_child(self) -> None:
-        child = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("child_launch.py"))],
-            capture_output=True, text=True, check=True)
+        child = run_child()
         self.assertEqual(child.stdout.strip(), "right")
 
     def test_b_parent(self) -> None:
         self.assertEqual(right(), "right")
-''',
-        })
+'''))
         child = fixture.row("test_a_child")
         parent = fixture.row("test_b_parent")
         self.assertEqual(child["status"], "pass")
@@ -425,6 +685,187 @@ class FailedChildLaunch(unittest.TestCase):
         self.assertFalse(child["candidate"])
         self.assertTrue(parent["candidate"])
         self.assertEqual(parent["covered_by"], [child["id"]])
+
+    def test_caught_failed_exec_keeps_the_runner_collecting(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_failed_exec.py": PRELUDE + '''
+class FailedExec(unittest.TestCase):
+    def test_a_failed_exec(self) -> None:
+        missing = str(Path(__file__).with_name("missing-program"))
+        with self.assertRaises(FileNotFoundError):
+            os.execv(missing, [missing])
+        self.assertEqual((left(), right()), ("left", "right"))
+
+    def test_b_after(self) -> None:
+        self.assertEqual(right(), "right")
+'''})
+        failed = fixture.row("test_a_failed_exec")
+        after = fixture.row("test_b_after")
+        self.assertEqual(failed["status"], "pass")
+        self.assertEqual(failed["child"], "none")
+        self.assertEqual(failed["line_count"], 2)
+        self.assertFalse(failed["candidate"])
+        self.assertEqual(after["status"], "pass")
+        self.assertEqual(after["child"], "none")
+        self.assertTrue(after["candidate"])
+        self.assertEqual(after["covered_by"], [failed["id"]])
+
+    def test_failed_exec_child_final_report_keeps_lines_after_the_snapshot(self) -> None:
+        fixture = self.run_fixture(child_script_sources("failed_exec_child", FAILED_EXEC_CHILD, '''
+class FailedExecChild(unittest.TestCase):
+    def test_a_child(self) -> None:
+        child = run_child()
+        self.assertEqual(child.stdout.splitlines(), ["left", "right"])
+
+    def test_b_parent(self) -> None:
+        self.assertEqual((left(), right()), ("left", "right"))
+'''))
+        child = fixture.row("test_a_child")
+        parent = fixture.row("test_b_parent")
+        self.assertEqual(child["status"], "pass")
+        self.assertEqual(child["child"], "none")
+        self.assertFalse(child["candidate"])
+        self.assertEqual(parent["line_count"], 2)
+        self.assertTrue(parent["candidate"])
+        self.assertEqual(parent["covered_by"], [child["id"]])
+
+    def test_snapshot_without_a_final_report_cannot_cover_another_test(self) -> None:
+        fixture = self.run_fixture(child_script_sources("snapshot_child", FAILED_EXEC_CHILD + "os._exit(0)\n", '''
+class SnapshotChild(unittest.TestCase):
+    def test_a_child(self) -> None:
+        child = run_child()
+        self.assertEqual(child.stdout.splitlines(), ["left", "right"])
+
+    def test_b_parent(self) -> None:
+        self.assertEqual(left(), "left")
+'''))
+        child = fixture.row("test_a_child")
+        parent = fixture.row("test_b_parent")
+        self.assertEqual(child["status"], "pass")
+        self.assertEqual(child["child"], "unknown: 1 python children, 0 reported")
+        self.assertFalse(child["candidate"])
+        self.assertEqual(parent["child"], "none")
+        self.assertFalse(parent["candidate"])
+
+    def test_successful_exec_keeps_lines_from_both_collector_instances(self) -> None:
+        fixture = self.run_fixture(child_script_sources("transition_child", '''
+import os
+import sys
+from product import left
+
+print(left(), flush=True)
+os.execv(sys.executable, [sys.executable, "-c", "from product import right; print(right())"])
+''', '''
+class TransitionChild(unittest.TestCase):
+    def test_a_child(self) -> None:
+        child = run_child()
+        self.assertEqual(child.stdout.splitlines(), ["left", "right"])
+
+    def test_b_parent(self) -> None:
+        self.assertEqual((left(), right()), ("left", "right"))
+'''))
+        child = fixture.row("test_a_child")
+        parent = fixture.row("test_b_parent")
+        self.assertEqual(child["child"], "none")
+        self.assertFalse(child["candidate"])
+        self.assertTrue(parent["candidate"])
+        self.assertEqual(parent["covered_by"], [child["id"]])
+
+    @unittest.skipUnless(hasattr(os, "fork"), "The fixture needs os.fork")
+    def test_python_exec_from_a_worker_fork_keeps_shared_ownership(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_worker_exec.py": PRELUDE + THREAD_PRELUDE + '''
+class WorkerExec(unittest.TestCase):
+    release = threading.Event()
+    statuses: list[int] = []
+    worker: threading.Thread
+
+    @classmethod
+    def work(cls) -> None:
+        require_event(cls.release)
+        child = os.fork()
+        if child == 0:
+            os.chdir(Path(__file__).parent)
+            os.execv(sys.executable, [sys.executable, "-c", "from product import right; right()"])
+            os._exit(1)
+        cls.statuses.append(os.waitpid(child, 0)[1])
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.worker = threading.Thread(target=cls.work)
+        cls.worker.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.release.set()
+        join_thread(cls.worker)
+
+    def test_a_worker_exec(self) -> None:
+        self.assertEqual(left(), "left")
+        self.release.set()
+        join_thread(self.worker)
+        self.assertEqual(self.statuses, [0])
+
+    def test_b_parent(self) -> None:
+        self.assertEqual((left(), right()), ("left", "right"))
+'''})
+        shared = fixture.row("test_a_worker_exec")
+        parent = fixture.row("test_b_parent")
+        self.assertEqual(shared["status"], "pass")
+        self.assertIn("shared thread", shared["child"])
+        self.assertEqual(shared["line_count"], 1)
+        self.assertFalse(shared["candidate"])
+        self.assertEqual(parent["child"], "none")
+        self.assertFalse(parent["candidate"])
+
+    def test_consecutive_failed_execs_leave_no_launch_or_cause(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_repeated_exec.py": PRELUDE + '''
+class RepeatedExec(unittest.TestCase):
+    def test_a_failures(self) -> None:
+        missing = str(Path(__file__).with_name("missing-program"))
+        with self.assertRaises(FileNotFoundError):
+            os.execv(missing, [missing])
+        with self.assertRaises(FileNotFoundError):
+            os.execv(missing, [missing])
+        self.assertEqual((left(), right()), ("left", "right"))
+
+    def test_b_after(self) -> None:
+        self.assertEqual(right(), "right")
+'''})
+        failed = fixture.row("test_a_failures")
+        after = fixture.row("test_b_after")
+        self.assertEqual(failed["status"], "pass")
+        self.assertEqual(failed["child"], "none")
+        self.assertEqual(failed["line_count"], 2)
+        self.assertFalse(failed["candidate"])
+        self.assertEqual(after["child"], "none")
+        self.assertTrue(after["candidate"])
+        self.assertEqual(after["covered_by"], [failed["id"]])
+
+    def test_runner_failed_exec_writes_no_child_report_or_cause(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_runner_report.py": PRELUDE + '''
+class RunnerReport(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        subprocess.run(["sh", "-c", "true"], check=True)
+
+    def test_a_failed_exec(self) -> None:
+        directory = Path(os.environ["NATEST_COVERAGE_DIR"])
+        before = sorted(directory.glob("*.json"))
+        missing = str(Path(__file__).with_name("missing-program"))
+        with self.assertRaises(FileNotFoundError):
+            os.execv(missing, [missing])
+        self.assertEqual(left(), "left")
+        self.assertEqual(sorted(directory.glob("*.json")), before)
+
+    def test_b_after(self) -> None:
+        self.assertEqual(right(), "right")
+'''})
+        for method in ("test_a_failed_exec", "test_b_after"):
+            with self.subTest(method=method):
+                row = fixture.row(method)
+                self.assertEqual(row["status"], "pass")
+                self.assertEqual(row["child"], "none")
+                self.assertEqual(row["line_count"], 1)
+                self.assertFalse(row["candidate"])
 
     def test_stopped_collector_does_not_change_launch_environment(self) -> None:
         fixture = self.run_fixture({"scripts/fixture/test_stopped.py": PRELUDE + '''

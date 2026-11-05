@@ -145,7 +145,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         parent = fixture_member("showrunner", name="other")
         child = fixture_member("showrunner", name="kid", parent=parent.id,
                              doc=staff.LiveDoc("natedev", self.doc("kid")))
-        path = self.root / "showrunner/kid/parent"
+        path = self.root / "showrunner" / child.id / "parent"
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, "top\n")
         before = self.staff.staff_file.read_bytes(), path.read_bytes()
@@ -169,7 +169,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         with patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted):
             with self.assertRaisesRegex(NativeCallbackInterrupted, "stopped after saving launch"):
                 _ = self.run_command("kid")
-        receipt = completion_receipt.read_launch_receipt(self.root / "showrunner/kid/add_showrunner.json", staff.initial_snapshot())
+        receipt = completion_receipt.read_launch_receipt(self.root / "showrunner/cfc4564d-fed3-5803-9a4c-e3119733bb53/add_showrunner.json", staff.initial_snapshot())
         assert isinstance(receipt, completion_receipt.UnpublishedReceipt)
         identity = add_showrunner.ShowrunnerLaunch.from_receipt(receipt.fields)
         self.assertEqual(receipt.identity, identity.session_id)
@@ -202,7 +202,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         assert child is not None
         self.assertEqual((child.id, child.current_session), (returned_native, returned_native))
         recovered_receipt = completion_receipt.read_launch_receipt(
-            self.root / "showrunner/kid/add_showrunner.json", staff.snapshot())
+            self.root / "showrunner" / child.id / "add_showrunner.json", staff.snapshot())
         assert isinstance(recovered_receipt, completion_receipt.OwnedReceipt)
         self.assertEqual(recovered_receipt.fields["session_id"], returned_native)
 
@@ -270,7 +270,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         with patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted):
             with self.assertRaisesRegex(NativeCallbackInterrupted, "interrupted after native observation"):
                 _ = self.run_command("kid")
-        receipt_path = self.root / "showrunner/kid/add_showrunner.json"
+        receipt_path = self.root / "showrunner/cfc4564d-fed3-5803-9a4c-e3119733bb53/add_showrunner.json"
         receipt = completion_receipt.read_launch_receipt(receipt_path, staff.initial_snapshot())
         if after_publication:
             self.assertIsInstance(receipt, completion_receipt.OwnedReceipt)

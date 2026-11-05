@@ -13,7 +13,7 @@ import herdr  # noqa: E402
 from herdr import AgentBlocked, Herdr  # noqa: E402
 from herdr import HerdrFailure as HerdrFailure  # noqa: E402
 from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from unit_lookup import LiveClaude, Place, marked_unit, sessions_dir  # noqa: E402
+from unit_lookup import LiveSession, LiveClaude, Place, labeled_session, sessions_dir  # noqa: E402
 from scripts.lib.script_envelope import script_prompt  # noqa: E402
 
 USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <slug> <unit>|session <id>> "
@@ -108,11 +108,11 @@ def main(arguments: list[str]) -> int:
               or verb == "where" and rest):
             raise ValueError(USAGE)
         if kind == "unit":
-            unit = marked_unit(slug, name)
+            unit = labeled_session(slug, name)
             if unit is None:
                 raise NoSuchTarget(target)
             place = unit.place
-            session_id = unit.claude.session_id if isinstance(unit.claude, LiveClaude) else unit.staff_id
+            session_id = unit.claude.session_id if isinstance(unit.claude, LiveClaude) else unit.identity.id if isinstance(unit.identity, LiveSession) else ""
         else:
             place = session_place(name)
             session_id = name

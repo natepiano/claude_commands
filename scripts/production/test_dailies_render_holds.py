@@ -378,7 +378,7 @@ class DailiesHoldTests(unittest.TestCase):
     def test_stale_unit_marker_after_last_release_is_refused(self) -> None:
         self.assert_refused(self.report(True), "build_hold", "holder")
 
-    def test_active_holder_without_marked_unit_is_refused(self) -> None:
+    def test_active_holder_without_labeled_session_is_refused(self) -> None:
         _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
         self.assert_refused(self.report(False), "build_hold", "unit")
 

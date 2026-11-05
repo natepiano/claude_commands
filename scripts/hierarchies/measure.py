@@ -1797,7 +1797,8 @@ def read_waiting(
 
     def read_questions() -> list[WaitingItem]:
         identities = QuestionStaff.read()
-        documents = identities.documents()
+        documents: dict[str, Path] = {identities.owner(document).id: document
+                                      for document in identities.documents().values()}
         folder = state / "showrunner/outstanding"
         paths = {path.stem: path for path in folder.glob("*.json")}
         questions: list[WaitingItem] = []

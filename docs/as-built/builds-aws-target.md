@@ -127,6 +127,8 @@ An interruption marker reports the instance generation.
 
 ### Box setup stages
 
+Device names in `config/aws-build-tailscale.json` must equal a machine name (first label of `DNSName` in `tailscale status`); `up` checks this first.
+
 1. `tailscale-policy` reads `config/aws-build-tailscale.json` and the live policy.
    It resolves the natedev and Mac addresses from local Tailscale status.
    It changes only `tag:build-aws` owners and destination rules.
