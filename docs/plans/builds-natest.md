@@ -593,29 +593,17 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 23 — `test_show.py` passes in a checkout with no origin  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/test_times/test_show.py` reads nothing from the real checkout's remote, and passes in a clone with an origin and in a clone with no origin.
-
-**Spec:** The builds showrunner asked for this on 2026-11-05 (reported by devtools-unit through sdlc). In a clone with no origin, `test_show.py` has 10 failures.
-
-1. Cause: `test_show.py:48` sets `TOOL_IDENTITY = record.recorded_repository_key(["git"], <real checkout root>)` at import. `setUp` (about line 112) sets the fixture repository's origin to that value, and `test_top_keeps_the_module_view_from_the_claude_working_directory` (about line 297) records steps under it. `show.py` `main()` (about line 438) picks the module view when the identity of `--repo` equals the identity of `show.TOOL_REPOSITORY`, the real checkout. With no origin, the real key is `git-root:<real root>`, and the fixture repository cannot match it.
-2. Fix: in `setUp`, patch `show.TOOL_REPOSITORY` to the fixture repository `self.repo` with `mock.patch.object`. Remove `TOOL_IDENTITY` and the `remote set-url` call. The fixture repository keeps the origin that `initialize_repository` gives it. Where a test needs the tool identity, use `record.recorded_repository_key(["git"], str(self.repo))`, computed once in `setUp`.
-3. Change no production file. Keep every test and assertion.
+- `test_show.py` read the real checkout's origin at import (`TOOL_IDENTITY`), so a clone with no origin gave 10 failures: `show.py` `main()` picks the module view when `--repo` has the identity of `show.TOOL_REPOSITORY`.
+- `setUp` patches `show.TOOL_REPOSITORY` to the fixture repository `self.repo`, and computes `self.tool_identity` from it. `TOOL_IDENTITY` and the `remote set-url` call are gone. No production file changed; every test and assertion stays.
+- 24 tests green in a checkout with an origin and in a `copies.py` clone with its origin removed.
 
 **Files:**
 - `scripts/test_times/test_show.py` — the fixture tool repository
 
-**Workers:** 1 writer (one test file; there is nothing to split)
-- `impl` — `test_show.py`
-
-**Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `/tmp/claude`.
-- Phase 22 later changes `show.py` `main()` to call `repository_key(directory)` from a light module. The patch target stays `show.TOOL_REPOSITORY`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/test_times -p 'test_show.py'` green in a `copies.py` clone with an origin, and in a clone with its origin removed (`git remote remove origin`)
-- `basedpyright scripts/test_times/test_show.py` prints `0 errors, 0 warnings, 0 notes`
+**Binds later work:**
+- A test reads no identity from the real checkout. Patch `show.TOOL_REPOSITORY` to a fixture repository.
 
 ### Phase 24 — `test_verify_ssh_targets_routing.py` runs in half its time  · status: todo
 **Depends on:** none
