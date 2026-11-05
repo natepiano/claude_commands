@@ -749,19 +749,6 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                         outcomes.append(ResumePending(identity, target, resumed.reason))
                 except Exception as error:
                     outcomes.append(ResumePending(identity, target, str(error)))
-            record = staff.initial_snapshot()
-            for index, (session, outcome) in enumerate(zip(selected, outcomes)):
-                identity = outcome.name if isinstance(outcome, SessionNotFound) else outcome.session_id
-                running = _running_on_account(identity, "")
-                if isinstance(running, ClaudeUp) and running.account == target:
-                    continue
-                member = record.by_member_reference(identity)
-                name = member.name if member is not None else session
-                line = (f"{name}: not running on {target} after the move; resume it with: "
-                        + f"accounts.py move {identity} {target}")
-                print(line, file=sys.stderr)
-                if isinstance(outcome, ClaudeUp):
-                    outcomes[index] = ResumePending(identity, target, line)
             return outcomes
 
 
