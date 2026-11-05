@@ -5288,6 +5288,45 @@ class RowTabTests(StaffTestCase):
         self.assertEqual(self.client.commands, [])
         self.assertEqual(self.staff_file.read_bytes(), before)
 
+    def test_moved_unit_takes_its_alphabetical_place_with_a_saved_tab_order(self) -> None:
+        parent = self.rows["parent"]
+        alpha = fixture_member("unit", name="alpha", parent=parent.id)
+        zulu = fixture_member("unit", name="zulu", parent=parent.id)
+        other = fixture_member("worker", name="another-tab", parent=parent.id)
+        initial = [dict(self.client.tabs[0])]
+        for index, member in enumerate((parent, alpha, zulu, other), 1):
+            initial.append({"pane_id": f"destination-p{index}", "tab_id": f"destination-t{index}",
+                "workspace_id": "w2", "label": member.name, "session_id": member.current_session,
+                "terminal_id": f"destination-terminal-{index}"})
+        for saved_order in (False, True):
+            with self.subTest(saved_order=saved_order):
+                self.client.tabs = [dict(pane) for pane in initial]
+                self.client.focused_pane = "p0"
+                saved = herdr.SavedLayout(at=time.time(), workspaces=[])
+                if saved_order:
+                    saved["workspaces"] = [
+                        herdr.SavedSpace(name="old-production", seen=time.time(), tabs=[
+                            herdr.SavedName(name=self.rows["unit"].id, seen=time.time())]),
+                        herdr.SavedSpace(name=parent.name, seen=time.time(), tabs=[
+                            herdr.SavedName(name=member.id, seen=time.time())
+                            for member in (parent, alpha, zulu, other)])]
+                path = herdr.layout_path("fixture")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text(json.dumps(saved))
+
+                self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
+
+                expected = [parent, alpha, self.rows["unit"], zulu, other]
+                self.assertEqual([tab["label"] for tab in self.client.listed("tab", "--workspace", "w2")],
+                                 [member.name for member in expected])
+                destination = next(space for space in herdr.saved_layout("fixture")["workspaces"]
+                                   if space["name"] == parent.name)
+                if saved_order:
+                    self.assertEqual([tab["name"] for tab in destination["tabs"]],
+                                     [member.id for member in expected]
+                                     + [self.rows[key].id for key in ("split", "stopped", "worker")])
+                self.assert_complete_rerun()
+
     def test_record_layout_binds_the_native_row_instead_of_a_stale_mark(self) -> None:
         self.client.tabs = self.client.tabs[:1]
         self.client.tabs[0]["mark"] = self.rows["stopped"].current_session
