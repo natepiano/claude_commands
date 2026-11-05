@@ -316,53 +316,29 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Result:** `coverage_overlap.py` on `test_fast_track.py`: 25 of 55 tests known, 9 candidates, 191 s with the collector on (189 s module time). The 30 unknown tests name their cause (a git wrapper script on the test PATH, or Python children with no set). Thread attribution, setup-child liveness and a failed exec moved to Phase 15; Phase 13 waits for it.
 
-#### Work Order
+#### As-built
 
-**Goal:** `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file> [<file> ...]` lists each test whose lines other tests in the same run also run, as removal candidates, in a few seconds over the module's own run time.
-
-**Spec:**
-
-1. Collector: standard library only. Use Python 3.13 `sys.monitoring` `LINE` events under its own tool id. Run the named modules through `unittest` in one process, and record one set of `(path, line)` for each test id. Call `sys.monitoring.restart_events()` between tests, so a line that one test ran counts again for the next one. Record only lines of repository files under `scripts/` that are not test modules or `*_test_support.py` files.
-2. Child coverage (showrunner ruling 2026-11-04: standard library, not coverage.py, which the Nix Python does not have). The folder `scripts/test_times/coverage_child/` holds only `sitecustomize.py`. During a test, the collector puts that folder first on `PYTHONPATH` and sets `NATEST_COVERAGE_TEST` (the active test id) and `NATEST_COVERAGE_DIR` (a temporary output folder).
-   - In a child Python, `sitecustomize.py` does nothing when `NATEST_COVERAGE_TEST` is not set, so normal runs pay no cost.
-   - When it is set, the child collects `LINE` events with the same path filter and writes its line set at exit to `<dir>/<test id>.<pid>.json`.
-   - In both cases it then loads the next `sitecustomize` on `sys.path`. The Nix Python reads `NIX_PYTHONPATH` in its own `sitecustomize.py`, and a child must keep that behavior.
-   - The collector joins each child's set to its test's set. Each process records each child it starts (audit hook) and writes the list with its set. Each child also writes its exit time.
-   - A child launch is verified in two cases. (a) Its program is Python, or a `#!` script whose interpreter is Python; this child must write a set (a Python under `-I`, `-S` or `-E` writes none, so the count rule below makes its test unknown). (b) Its program is a binary (not a `#!` script) whose name is in `COVERAGE_LEAF_PROGRAMS` in `config/test_times.conf` (default `git`); its Python descendants write sets through the inherited variables. Every other launch is unverified: a shell, `env`, or a non-Python `#!` script. A launch that fails to start is no launch.
-   - A test is `child: unknown`, with the cause, when one of these occurs: a verified Python child wrote no set (an `env=` without the variables, a child killed before exit); it made an unverified launch; it forked with no exec; or a child of an earlier test was still alive when it started.
-   - A child that exits after its test stops makes that test unknown (cause `child outlived its test`), and also each later test that started before the child exit. A Python child that starts outside a test (`setUpClass`, module setup) makes unknown each test that starts before its exit (cause `shared child`). A child from setup that exited before a test started has no effect on that test: no test owns setup lines. A leaf or unverified launch from setup has no exit time; it has no effect (risk: a background process from setup that serves later tests).
-   - Lines of the runner classes (`module_run.py` and the collector) are not counted.
-   - An unknown test is never a candidate, and its lines do not cover another test.
-3. Candidates: a test is a candidate when a kept test, or the union of kept tests, runs every line it runs. Decide the tests slowest first. After each candidate, take it out of the kept set and check again, so two tests that cover each other cannot both be candidates.
-4. Output: one JSON file (`COVERAGE_OUT=<path>`) with the tree sha, the interpreter, and for each test: id, status, seconds, line count, `child`, and for a candidate the covering test ids. Also print a table: candidate, covering tests, seconds. Use `terminal_cells.py` for alignment.
-5. The list is candidates only. Two tests can run the same lines and check different results. Before a removal, a worker compares the assertions and names the covering test that checks the same result. Speed is never measured with the collector on.
-6. Add one line to the Speed method step 3, under "Remove trivial tests": run `coverage_overlap.py` on the module, and treat each confirmed candidate as a trivial test.
+- `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file> [<file> ...]` runs the modules through `unittest` with `sys.monitoring` `LINE` events under its own tool id, one `(path, line)` set for each test. `COVERAGE_OUT=<path>` writes the JSON (tree sha, interpreter, and for each test: id, status, seconds, line count, `child`, covering ids). The table prints through `terminal_cells.print_table` and `seconds`.
+- Candidates are decided slowest first against the kept set; two tests that cover each other give one candidate. Unknown tests are never candidates and cover nothing.
+- `line_collector.py` holds the `LINE` collector, the path filter and the launch record (audit hook), used by the parent and by each child. `start_child()` owns the child setup. `ActiveTest.finish_processes()` drops a `Popen` with no pid, records exited and pending launches, and releases the `Popen` objects; `stop_test` and `write_child_report` both call it. A thread-local argument identity skips the duplicate `posix_spawn` event.
+- `coverage_child/sitecustomize.py` loads `line_collector.start_child()` when `NATEST_COVERAGE_TEST` is set, then always loads the next `sitecustomize` (the Nix `NIX_PYTHONPATH` one).
+- The child rule is a count: `unknown: <n> python children, <m> reported` when a Python child wrote no set (this covers `-I`, `-S`, `-E`), `unknown: unverified launch <program>` for a shell, `env` or a non-Python `#!` script. `COVERAGE_LEAF_PROGRAMS` (`git`) launches are verified. A launch that fails to start is no launch.
+- The path filter drops test code (`scripts.lib.code_kind.is_test_code`), the runner classes (the files of `CoverageResult.__mro__`) and the collector.
+- `module_run.timed_outcomes(result)` is the one outcome rule for `test_times` and the collector. `print_table` and `seconds` moved from `show.py` to `scripts/lib/terminal_cells.py`.
+- On `test_fast_track.py`: 25 of 55 known, 9 candidates, 191 s with the collector on (189 s module time). 28 of the unknown tests cite `unverified launch git`: the module puts a non-Python `#!` git wrapper on PATH.
 
 **Files:**
-- `scripts/test_times/coverage_overlap.py` — new collector and report
-- `scripts/test_times/test_coverage_overlap.py` — new tests, with small fixture modules written in a temporary folder
-- `scripts/test_times/coverage_child/sitecustomize.py` — new child collector (the folder holds only this file)
-- `scripts/test_times/line_collector.py` — new: the `LINE` collector, its path filter and the child launch record, used by the parent and by each child (one place)
-- `config/test_times.conf` — read only here: Phase 14 adds `COVERAGE_LEAF_PROGRAMS` (one phase owns each file)
-- `scripts/test_times/module_run.py` — one outcome function that `test_times` and the collector share
-- `scripts/test_times/show.py`, `scripts/lib/terminal_cells.py` — `print_table` and `seconds` move to `terminal_cells.py`, so the report and `show.py` share them
-- `docs/plans/builds-natest.md` — the Speed method line (director)
+- `scripts/test_times/coverage_overlap.py`, `line_collector.py`, `coverage_child/sitecustomize.py` — the tool
+- `scripts/test_times/module_run.py`, `show.py`, `scripts/lib/terminal_cells.py` — the shared outcome rule and table
+- `scripts/test_times/test_coverage_overlap.py` — 22 tests, 4 s
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `coverage_overlap.py`, `coverage_child/sitecustomize.py`, `line_collector.py`, `module_run.py`, `show.py`, `terminal_cells.py`
-- `test` — `test_coverage_overlap.py`, from the Spec: a repeat test is a candidate; a test with one line of its own is not; two tests that cover each other give one candidate; a Python child's lines join its test's set; a child under `-I` makes the test `child: unknown`, and it covers nothing; a failed launch keeps the tests known and collecting; a shell child (`sh -c 'python3 -I …'`) makes the test unknown; a git child keeps the test known; a child that outlives its test makes that test and each overlapped later test unknown; a Python child from `setUpClass` that is still alive at a test's start makes that test unknown; a git child or a Python child from `setUpClass` that exited before the first test keeps the tests known; a child still sees `NIX_PYTHONPATH` entries on `sys.path`; with no `NATEST_COVERAGE_TEST`, the child writes nothing; lines in test files are not counted
+**Gotchas:**
+- A commit during a simplify review changes git status, and the review fails. Commit nothing while a reviewer runs.
+- Each review round found new attribution edges. Thread attribution, setup-child liveness and a failed exec moved to Phase 15 at repair round 3 (hard landing, after an Astra review).
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 1: `module_run.py` and its `TimedRunner` give each test's id and time; reuse its runner and output form, do not copy it.
-- Invariants: standard library only; typed; tunables in `config/test_times.conf`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/test_times -p 'test_coverage_overlap.py'` green
-- the tool runs on `scripts/production/test_fast_track.py` and prints its table; the run takes less than twice the module's own `module_run.py` time
-- on `test_fast_track.py`, the report names how many tests are known; a test still `child: unknown` is named with its cause
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- coverage.py: the Nix Python does not have it (showrunner ruling 2026-11-04).
+- Parsing `-I`/`-S`/`-E` flags: the count rule covers them with no parser.
 
 ### Phase 13 — The slowest modules lose the tests that only repeat other tests  · status: todo
 **Depends on:** Phase 12, Phase 7, Phase 14, Phase 15
@@ -373,7 +349,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Spec:**
 
-1. At dispatch, the director takes the 10 modules from `test_times top` (the Phase 14 ranking) and splits them between writers by folder.
+1. At dispatch, the director takes the 10 modules from `test_times top` (the Phase 14 ranking) and splits them between writers by folder. First drop each floored module in `builds-natest-next.md` whose gate median is not 20% above its floor (Standing work item 3). When fewer than 10 modules qualify, take fewer.
 2. For each module, run `coverage_overlap.py`. For each candidate, compare its assertions with the covering tests. Remove it only when a covering test checks the same result; otherwise keep it and give the reason in the summary.
 3. Measure the gain with same-load pairs (Speed method step 5).
 4. Report each removed test, its covering test, and the time saved; and each kept candidate with its reason.
@@ -425,6 +401,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
    - A launch whose `Popen` constructor raised after a fork is no launch. Phase 12 drops only a `Popen` with no pid; record constructor success explicitly, never from an exit code. Test a missing program with `cwd` set.
 2. Threads: a thread alive at a test's start that runs a measured line during the test makes the test unknown (cause `shared thread`). A thread that a test starts and that is alive at its stop makes the test unknown (cause `thread outlived its test`).
    - `line()` returns `DISABLE`, so a second thread on the same line gives no event. Keep LINE events on while thread attribution is needed. Exclude the runner thread. Compare thread objects, not reusable idents. Reject a shared thread's line before it goes into the set. Test a line that the runner runs before a shared thread runs it.
+   - A child launched from a thread other than the runner thread belongs to no test. Each test that runs while that child is alive is unknown (cause `shared thread`). The audit hook reads the launching thread. Test a setup thread that starts a Python child during a later test.
 3. Exec: separate the set write from the collector stop. A later snapshot replaces an earlier one only for the same collector instance and test. A successful exec keeps the pre-exec set as its own report. Mark a snapshot apart from a completed report. Keep the fork-exec test; add a failed exec and a case with no final report.
 
 **Files:**
@@ -443,4 +420,47 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/test_times -p 'test_coverage_overlap.py'` green
 - on `test_fast_track.py`, the known count is not lower than after Phase 12, or each newly unknown test names a cause from this Spec
+- on `test_fast_track.py`, the collector run takes less than two times the `module_run.py` run at the same load (LINE events stay on, so measure it again)
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 16 — `/test_times top` ranks the slow tests of the calling session's repository  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** In a hana session, `/test_times top` with no arguments ranks hana's slowest nextest tests. In a ~/.claude session it shows today's module view.
+
+**Spec:** The user approved this on 2026-11-04 through the builds showrunner. First consumer: hana's fastest unit (tool-based-ui production), Phase 5c.
+
+The recording exists: `buildlog/parse.test_results` keeps each nextest test that failed, was retried, took over `SLOW_TEST_S` (1.0 s) or was reported SLOW. `buildlog/index.py` puts these rows in the `tests` table, with `step_id`, `host`, `binary`, `test`, `status`, `duration_s`. On 2026-11-04 the index held 1.29 M hana rows from natedev and 294 k Mac rows. Each `steps` row has `repo_identity` (the origin URL key, from `record.recorded_repository_key`).
+
+1. Scope: `show.py top` with no `--repo` finds the repository of the working directory. It uses `buildlog.record.recorded_repository_key` (no copy). When the identity is the ~/.claude repository, `top` shows today's gate module view. Otherwise `top` ranks the nextest tests of steps with that `repo_identity`, on the current host, within `TOP_MAX_AGE_DAYS`.
+2. Rank: one row per `binary` and `test`: the median `duration_s` of its passed runs, the count of runs kept, the count of failed and timed-out runs, and the last run time. Sort by median, descending. A test with only failed runs ranks after the others by its last time. The heading names the repository, the host and the threshold.
+3. Mac rows: a Mac nextest step records `repo_identity` `unknown` (its mirror has no origin). The index gives a Mac step the `repo_identity` of the natedev call it served: `steps.call_id` joins `calls.id`, and `calls` gives `repo_path`; take the identity from the natedev step or `ssh_attempts` row of the same call. Do this at index time, once per row, not in `show.py`.
+4. Speed: `top` for hana answers in under 0.5 s on a warm index. Today a join over `tests` and `steps` takes 1.6 s. Add the column or index the query needs in `index.py`. Measure before and after. Importing `record` adds about 20 ms to `show.py`; when it adds more, report it, so a light module can hold the key function.
+5. Config: `config/test_times.conf` gets `NEXTEST_SLOW_TEST_S=1.0` (the recording threshold) with a basis line. `parse.py` reads it at use, in place of its constant. A new key needs no go; a changed or deleted key goes to the showrunner for the user.
+6. Cost: measure the time that `test_results` and the `tests` insert add to one hana nextest step (a log of about 2,000 tests). Write it in the As-built.
+7. Docs: `commands/test_times.md` says what `top` shows in each kind of repository.
+
+**Files:**
+- `scripts/test_times/show.py`, `scripts/test_times/test_show.py` — the scope and the ranking
+- `scripts/buildlog/index.py`, `scripts/buildlog/test_index.py` — the Mac identity and the query index
+- `config/test_times.conf` — `NEXTEST_SLOW_TEST_S`
+- `scripts/buildlog/parse.py` — the threshold read (report-unit's file; see the showrunner answer)
+- `commands/test_times.md` — the doc line
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `show.py`, `index.py`, `parse.py`, `config/test_times.conf`, `commands/test_times.md`
+- `test` — `test_show.py`, `test_index.py`, from the Spec: a fixture index with steps of two repositories ranks only the calling repository; a ~/.claude working directory keeps the module view; a Mac step whose call came from a hana natedev call ranks under hana; a test with only failed runs ranks last
+
+**State:** `steps.repo_identity` for Mac rows changes from `unknown` to the served call's identity. The `tests` table gains what the query needs. A schema change makes a new index file (Phase 10), so the first command after the merge rebuilds the index.
+
+**Constraints from prior phases:**
+- Phase 10: each schema keeps its own index file.
+- Phase 14: `top` ranks gate modules by the median of valid runs; `TOP_RUNS`, `TOP_CHECKOUT` and `TOP_MAX_AGE_DAYS` are in `config/test_times.conf`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/test_times -p 'test_show.py'` green
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` green
+- in a hana worktree, `python3 ~/.claude/scripts/test_times/show.py top` lists hana nextest tests, in under 0.5 s warm
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
