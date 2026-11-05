@@ -376,6 +376,23 @@ class MeshRunsTests(unittest.TestCase):
         self.assertNotIn("port", record)
         self.assertIn("next message", output.getvalue())
 
+    def test_run_uses_the_start_folder_instead_of_the_staff_worktree(self) -> None:
+        start_folder = self.root / "repair-checkout"
+        start_folder.mkdir()
+        result_file = self.root / "command-folder.txt"
+        command = [sys.executable, "-c",
+                   "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(str(Path.cwd()))",
+                   str(result_file)]
+        with contextlib.chdir(start_folder):
+            supervisor, output = self.start(command)
+        self.assertIn("started detached", output)
+        records = list((self.session / codex_mesh.DETACHED_RUNS_DIR).glob("*.json"))
+        self.assertEqual(len(records), 1)
+        with contextlib.chdir(cast(str, supervisor.call_args.kwargs["cwd"])):
+            record = self.supervise(records[0])
+        self.assertEqual(record.get("exit_code"), 0)
+        self.assertEqual(result_file.read_text(), str(start_folder))
+
     def test_start_refuses_at_the_live_run_limit_without_a_record_or_supervisor(self) -> None:
         paths = self.seat_runs(3)
         before = {path: path.read_bytes() for path in paths}
