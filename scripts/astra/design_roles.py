@@ -17,7 +17,7 @@ import shlex
 import socket
 import subprocess
 import sys
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
@@ -76,6 +76,7 @@ class AstraCensusProjection(Protocol):
     def hold(self, role: Literal['designer', 'reviewer'], staff_id: str, *,
              design_id: str, role_id: str) -> object: ...
     def release(self, staff_id: str) -> None: ...
+    def live_roles(self) -> Sequence[Mapping[str, object]]: ...
 
 
 def _mesh_transport() -> MeshLifecycleTransport:
@@ -626,11 +627,10 @@ def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effo
     name = admitted.name
     if name != _instance(design, role).name:
         raise RoleRefused("staff admission names another worker")
-    policy = access_policy(design, role)
-    result = subprocess.run([sys.executable, str(ROOT / 'scripts/agents/codex_mesh.py'), 'prime',
-                             '--session-dir', str(mesh), '--name', name,
-                             '--instructions-file', str(prompt), '--model', model, '--effort', effort,
-                             '--sandbox', 'read-only' if isinstance(policy, ReadOnlyReviewer) else policy.launch_sandbox,
+    result = subprocess.run(['bash', str(ROOT / 'scripts/direct/assign.sh'),
+                             '--role', 'implement' if role == 'designer' else 'review', '--operation', 'prime',
+                             '--session-dir', str(mesh), '--new-worker', name, '--cwd', design.repository,
+                             '--prompt', str(prompt), '--model', model, '--effort', effort,
                              '--held-design', design.placement.design_id, '--held-role', role],
                             capture_output=True, text=True, check=False)
     if result.returncode:
@@ -643,11 +643,13 @@ def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effo
 def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path, model: str, effort: str) -> None:
     """Submit one turn outside store locks and save its reply at the header's path."""
     mesh = mesh_directory(design.placement.design_id)
-    result = subprocess.run([sys.executable, str(ROOT / 'scripts/agents/codex_mesh.py'), 'follow',
+    result = subprocess.run(['bash', str(ROOT / 'scripts/direct/assign.sh'),
+                             '--role', 'implement' if role == 'designer' else 'review', '--operation', 'follow',
                              '--session-dir', str(mesh), '--to', _instance(design, role).name,
-                             '--role', 'impl' if role == 'designer' else 'review', '--message-file', str(prompt),
-                             '--summary-file', str(reply), '--log-file', str(reply.with_suffix('.log')),
-                             '--model', model, '--effort', effort, '--cwd', design.repository], check=False)
+                             '--cwd', design.repository, '--prompt', str(prompt),
+                             '--summary', str(reply), '--log', str(reply.with_suffix('.log')),
+                             '--model', model, '--effort', effort,
+                             '--held-design', design.placement.design_id, '--held-role', role], check=False)
     if result.returncode:
         raise RoleRefused('RoleNeedsRecovery: held turn did not complete; pending input is retained')
 
@@ -890,7 +892,10 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
                             or pending.get('target', _design_fields(design)) != _design_fields(design)):
                 raise RoleRefused('another lifecycle transition is incomplete')
             context = mesh_directory(design_id) / 'design_context.json'
-            if not pending and context.exists() and _read(context) == _mesh_context_fields(design):
+            identities = {role['staff_id'] for role in _census_projection().live_roles()}
+            if (not pending and context.exists() and _read(context) == _mesh_context_fields(design)
+                    and all(isinstance(role.lifecycle, (RoleNotOpened, RoleEnded))
+                            or role.lifecycle.staff_id in identities for role in design.roles)):
                 return design
         else:
             if design.placement.generation != expected_generation:
@@ -1045,11 +1050,7 @@ def render_roles(report: dict[str, object]) -> str:
         thread = ' | staff ' + _text(lifecycle, 'staff_id') if lifecycle.get('staff_id') else ''
         lines.append(f"{entry['instance_id']} | {entry['role']} | {_text(lifecycle, 'kind')} | "
                      + f"{thread} | {entry['document']}")
-    if not lines:
-        lines.append('no held roles')
-    for problem in cast(list[dict[str, str]], report['problems']):
-        lines.append(f"problem: {problem['path']}: {problem['reason']}")
-    return '\n'.join(lines)
+    return '\n'.join(lines) if lines else 'no held roles'
 
 
 def _resolved_binding(binding: Binding, repository: str) -> Binding:
@@ -1062,14 +1063,10 @@ def _has_live_roles(fields: dict[str, object]) -> bool:
     roles = fields.get('roles')
     if not isinstance(roles, list):
         return False
-    for value in cast(list[object], roles):
-        if not isinstance(value, dict):
-            continue
-        lifecycle = cast(dict[str, object], value).get('lifecycle')
-        if isinstance(lifecycle, dict) and cast(dict[str, object], lifecycle).get('kind') in (
-                'RoleOpen', 'RolePausedForMove', 'RoleNeedsRecovery'):
-            return True
-    return False
+    return any(isinstance(value, dict)
+               and isinstance(lifecycle := cast(dict[str, object], value).get('lifecycle'), dict)
+               and cast(dict[str, object], lifecycle).get('kind') in ('RoleOpen', 'RolePausedForMove', 'RoleNeedsRecovery')
+               for value in cast(list[object], roles))
 
 
 @dataclass
@@ -1135,7 +1132,7 @@ def unbind_run(run_directory: str) -> None:
         directory = cast(dict[str, object], binding).get('run_directory')
         return isinstance(directory, str) and Path(directory) == Path(run_directory)
 
-    for design in _read_designs(relevant):
+    for design in _read_designs(relevant, refuse_matching_damage=True):
         if isinstance(design.binding, DesignBoundToPhase) and Path(design.binding.run_directory) == Path(run_directory):
             _ = rebind(design.placement.design_id, expected_generation=design.placement.generation,
                        reason='run ended after reservation release', binding=DesignUnbound())
@@ -1342,6 +1339,8 @@ def main(argv: list[str]) -> int:
             print(json.dumps(_authority_local(argument('operation'), _object(cast(object, json.load(sys.stdin))))))
         else:
             report = list_roles()
+            for problem in cast(list[dict[str, str]], report['problems']) if not args.get('json') else ():
+                print(f"problem: {problem['path']}: {problem['reason']}", file=sys.stderr)
             print(json.dumps(report) if args.get('json') else render_roles(report))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, configparser.Error) as error:
         damaged = (error.__cause__ if isinstance(error, worker_lifecycle.WorkerStateUnreadable)

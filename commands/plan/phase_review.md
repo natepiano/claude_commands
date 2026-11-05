@@ -84,9 +84,8 @@ recovery condition, diagnostic, or externally observable lifecycle, record:
    node-runtime repository, or none. Then its owner — an existing remaining Work
    Order for an in-repository destination, or `${NEXT_ITEMS_PATH}` for one this
    plan cannot implement. Name the acceptance test for every in-repository
-   destination. A destination is never dropped for being blocked by a gate or
-   living in another repository; that is what makes it a next item rather than a
-   phase.
+   destination. Keep a destination when it waits on code or belongs to another repository.
+   Record it as a next item.
 6. When no external surface is appropriate, `implementation-only because
    <reason>` instead of silently omitting it.
 

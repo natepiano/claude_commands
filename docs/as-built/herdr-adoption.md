@@ -252,7 +252,6 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
     scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions \
     scripts.shutdown.test_restart scripts.shutdown.test_account_move \
-    scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle \
     scripts.production.test_add_unit scripts.production.test_add_unit_accounts \
     scripts.production.test_add_unit_resume scripts.production.test_add_unit_restore \
     scripts.production.test_add_showrunner \

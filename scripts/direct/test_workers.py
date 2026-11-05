@@ -921,6 +921,18 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
 
+    def test_explicit_working_directory_reaches_a_new_worker(self) -> None:
+        self.configure_new_worker()
+        directory = self.session_dir.parent / "explicit-directory"
+        directory.mkdir()
+        result = self.worker_cli(
+            "resolve", "--session-dir", str(self.session_dir), "--role", "impl",
+            "--owner-pid", str(os.getpid()), "--working-dir", str(directory))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        starts = self.methods("thread/start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(cast(dict[str, object], starts[0]["params"])["cwd"], str(directory))
+
     def test_the_unit_ledger_retains_backend_access_model_and_a_caused_open_event(self) -> None:
         self.open_worker()
         name = self.resolve(self.session_dir)

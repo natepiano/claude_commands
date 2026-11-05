@@ -44,14 +44,12 @@ completes.
    without `--to`. Later phases normally run:
 
    ```sh
-   implement.sh --to "<full impl worker name>" --phase "<phase id>" \
-     "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${PHASE_DIR}/implementation_prompt.md" impl \
-     "<responsibility>" impl "<activity>" 0 impl
-   implement.sh --to "<full test worker name>" --phase "<phase id>" \
-     "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${PHASE_DIR}/test_prompt.md" test \
-     "<responsibility>" test "<activity>" 0 test
+   bash ~/.claude/scripts/direct/assign.sh --role implement --to "<full impl worker name>" \
+     --phase "<phase id>" --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" \
+     --prompt "${PHASE_DIR}/implementation_prompt.md" --paths "${PHASE_DIR}/implementation_paths.txt" &
+   bash ~/.claude/scripts/direct/assign.sh --role test --to "<full test worker name>" \
+     --phase "<phase id>" --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" \
+     --prompt "${PHASE_DIR}/test_prompt.md" --paths "${PHASE_DIR}/test_paths.txt" &
    ```
 
    Every launch, a slot's first included, carries `--phase "<phase id>"`: the
@@ -59,9 +57,7 @@ completes.
    and log to `${PHASE_DIR}`, so a phase running beside another never reads
    that one's files.
 
-   A worker assigned another role swaps both role words and nothing else — the
-   open `test` worker continuing as a writer is
-   `implement.sh --to "<full test worker name>" --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" "${PHASE_DIR}/test_prompt.md" impl "<responsibility>" impl "<activity>" 0 test`.
+   Change `--role` to assign another role to the same worker.
    Responsibility follows <ProgressContract/>. **Both workers carry a pass
    kind**, so a team phase records two passes and stops being attributed to one
    agent. The kind is the work the worker was assigned and nothing more — it names,

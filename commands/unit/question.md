@@ -18,10 +18,10 @@ those to the showrunner as before.
 
 ## Steps
 
-1. **The production.** Read the `> **Production:**` line of your plan header:
-   it names the production doc. Your unit name is your staff row name
-   (for example `alpha-unit`). No production line
-   means no production: end the turn on `— decision:` as `/unit:direct` says.
+1. **The production.** Read your staff row and its parent showrunner row.
+   The parent row gives the production name and its `doc.path`.
+   Your staff row gives your unit name.
+   Without a parent showrunner, end the turn on `— decision:` as `/unit:direct` says.
 2. **The question in full.** Write it so that it stands alone when the user
    reads it days later, with nothing else in front of them:
    - what is asked, and where (the unit, the phase, the file or the screen);

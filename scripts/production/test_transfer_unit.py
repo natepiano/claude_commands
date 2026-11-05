@@ -8,6 +8,7 @@ from typing import override
 from unittest import mock
 
 from scripts.production import staff, staff_move, unit_config
+import stall_watch
 from scripts.production.staff_test_support import unit_membership
 from scripts.production.transfer_unit_test_support import UnitTransferFixture
 
@@ -54,6 +55,21 @@ class UnitTransferTests(UnitTransferFixture):
         self.assert_ok(self.transfer("apply"))
         self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(receiving.id)))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_transfer_preserves_staff_keyed_stall_files(self) -> None:
+        row = unit_membership("demo", "alpha-unit")
+        directory = self.root / "state/stall-watch"
+        directory.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(stall_watch, "STATE_DIR", directory):
+            stretch = stall_watch.stretch_path("demo", "alpha-unit")
+            prompt = stall_watch.prompt_path("demo", "alpha-unit")
+            _ = stretch.write_text('{"since": 17}\n')
+            _ = prompt.write_text('{"key": "stall-watch:prompt:' + row.id + '"}\n')
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (stretch, prompt)}
+            self.assert_ok(self.transfer("apply"))
+            self.assertEqual(stall_watch.stretch_path("other", "alpha-unit"), stretch)
+            self.assertEqual(stall_watch.prompt_path("other", "alpha-unit"), prompt)
+            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before}, before)
 
     def test_plan_then_apply_finishes_source_updates_after_a_staff_move(self) -> None:
         row = unit_membership("demo", "alpha-unit")
@@ -114,8 +130,6 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertEqual(self.git("rev-parse", "demo", "other", "demo-alpha", "origin/demo-alpha"), tips)
         self.assertEqual(plan.read_bytes(), before)
         self.assertTrue(self.unit.is_dir())
-        self.assertEqual(self.stall_path("demo", "alpha-unit").read_text(), '{"stretch": 17}\n')
-        self.assertFalse(self.stall_path("other", "alpha-unit").exists())
         self.assert_ok(self.transfer("verify"))
 
 

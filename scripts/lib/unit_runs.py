@@ -15,17 +15,25 @@ Staff supplies each run's current owner. Run records keep task history.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import json
 import os
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from scripts.production import staff
+
 RUN_TEMP_NAME = "tmp"
-RUN_ROOT = Path("/tmp/claude/unit")
-FORMER_RUN_ROOT = Path("/tmp/claude/delegate")
+# SCRATCH_ROOT also selects the parent folder for temporary unit runs.
+RUN_ROOT = Path(os.environ.get("SCRATCH_ROOT") or "/tmp/claude/scratch").parent / "unit"
+FORMER_RUN_ROOT = RUN_ROOT.parent / "delegate"
 # Notifier instances a unit run once had; conversation_pause names them "status reports".
 INSTANCE_PREFIXES = ("unit-", "delegate-")
 # A run's shared liveness log, beaten every 60 s per worker while one runs.
@@ -35,6 +43,7 @@ HEARTBEAT = "heartbeat.log"
 LIVE_HEARTBEAT_SECS = 600
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
+OWNER_FIELD = "owner_staff_id"
 SERVER_FILE = "mesh_server.json"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
 # `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
@@ -51,6 +60,30 @@ new, former = state / '{HISTORY_NAME}', state / '{FORMER_HISTORY_NAME}'
 root = Path(sys.argv[1] or os.environ.get('UNIT_HISTORY_DIR') or os.environ.get('PLAN_DELEGATE_HISTORY_DIR')
             or (former if not new.exists() and former.exists() else new)).expanduser()
 """
+
+
+@dataclass(frozen=True)
+class RunOwnerUnrecorded:
+    reason: str
+
+
+def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnrecorded:
+    """Resolve a fixed owner first; older runs can still name their director."""
+    from scripts.production import staff
+
+    reference = fields.get(OWNER_FIELD)
+    if isinstance(reference, str) and reference:
+        row = record.by_id(staff.StaffId(reference))
+        if row is None or row.kind != "unit":
+            raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
+        return row
+    identity = fields.get("main_agent")
+    agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
+    reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
+    row = record.by_member_reference(reference) if isinstance(reference, str) and reference else None
+    if row is not None and row.kind == "worker":
+        row = record.parent_of(row)
+    return row if row is not None and row.kind == "unit" else RunOwnerUnrecorded("run has no unit staff owner")
 
 
 def environ(name: str) -> str:
@@ -130,13 +163,14 @@ def marker_must_stay(path: Path) -> bool:
 
 
 def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
-    """Find the run's current owner in staff."""
+    """Read the run owner's current session from staff."""
     from scripts.production import staff
+
     if dependencies is not None:
         dependencies(staff.record_path())
         dependencies(run / STATE_FILE)
-    find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
     try:
+        find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
         return find_parent(staff.local_snapshot(), run=run).current_session
     except (OSError, ValueError) as error:
         print(f"anomaly: {run}: {error}", file=sys.stderr)
@@ -190,6 +224,58 @@ def held(session_id: str, root_override: str | Path | None = None,
             seen.add(resolved)
             runs.append(folder)
     return runs
+
+
+def _json_object(text: str) -> dict[str, object]:
+    try:
+        raw = cast(object, json.loads(text))
+    except ValueError:
+        return {}
+    return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
+
+
+def migrate_owners(root: Path, *, dry_run: bool = False) -> int:
+    """Replace active run names with proved staff ids; keep history files unchanged."""
+    from scripts.lib import atomic_file
+    from scripts.production import staff
+
+    unavailable = False
+    for path in sorted(root.glob(f"*/{STATE_FILE}")):
+        try:
+            with (path.parent / ".progress_history.lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                fields = _json_object(path.read_text(encoding="utf-8"))
+                if not fields:
+                    raise ValueError(f"{path}: run state is unreadable")
+                if fields.get("status") != "active":
+                    continue
+                record = staff.snapshot()
+                owner = run_owner(fields, record)
+                if isinstance(owner, RunOwnerUnrecorded):
+                    production, unit = fields.get("production"), fields.get("unit")
+                    parents = {row.id for row in record.find(kind="showrunner") if row.name == production}
+                    matches = [row for row in record.find(kind="unit") if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents
+                               and isinstance(unit, str) and row.name.removesuffix("-unit") == unit.removesuffix("-unit")]
+                    if len(matches) != 1:
+                        raise staff.StaffUnreadable(f"{path}: run owner is unavailable")
+                    owner = matches[0]
+                changed = dict(fields)
+                changed[OWNER_FIELD] = owner.id
+                folder = fields.get("working_dir")
+                for key in ("plan_doc", "project_plan_doc"):
+                    value = fields.get(key)
+                    if isinstance(folder, str) and isinstance(value, str) and value.startswith(folder + "/"):
+                        changed[key] = str(Path(value).relative_to(folder))
+                for key in ("production", "unit", "working_dir", "worktree", "branch"):
+                    _ = changed.pop(key, None)
+                if changed != fields:
+                    if not dry_run:
+                        atomic_file.write_text_atomic(path, json.dumps(changed, indent=2, sort_keys=True) + "\n")
+                    print(f"{'would migrate' if dry_run else 'migrated'} {path}: {owner.id}")
+        except (OSError, ValueError) as error:
+            unavailable = True
+            print(f"run owner unavailable: {error}", file=sys.stderr)
+    return int(unavailable)
 
 
 class FormerOwner(NamedTuple):
@@ -282,6 +368,12 @@ def _held_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "migrate-owners":
+        parser = argparse.ArgumentParser(description="Migrate active run owners to staff ids.")
+        _ = parser.add_argument("--root", type=Path, required=True)
+        _ = parser.add_argument("--dry-run", action="store_true")
+        args = parser.parse_args(argv[1:])
+        return migrate_owners(cast(Path, args.root), dry_run=cast(bool, args.dry_run))
     if len(argv) == 3 and argv[0] == "activate":
         try:
             activate(Path(argv[1]), argv[2])

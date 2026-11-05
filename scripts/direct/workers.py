@@ -56,6 +56,7 @@ class WorkerArguments(argparse.Namespace):
     command: str = ""
     session_dir: Path = Path()
     role: str = ""
+    working_dir: str = ""
     owner_pid: int = 0
     model: str = ""
     effort: str = ""
@@ -465,13 +466,13 @@ def _next_worker_name(ledger: UnitWorkers, roster: Mapping[str, object], role: s
     return name
 
 
-def resolve(run: Path, role: str, *, model: str = "", effort: str = "") -> str:
+def resolve(run: Path, role: str, *, model: str = "", effort: str = "", working_dir: Path | None = None) -> str:
     """Return an idle worker, carry one over, reopen one, or open the next name."""
-    return _resolve(run, role, os.getpid(), model=model, effort=effort)
+    return _resolve(run, role, os.getpid(), model=model, effort=effort, working_dir=working_dir)
 
 
 def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: str = "",
-             new_name: str = "") -> str:
+             new_name: str = "", working_dir: Path | None = None) -> str:
     from scripts.agents import codex_mesh
     if role not in ROLES:
         raise WorkerUnavailable(f"unsupported worker role: {role}")
@@ -540,7 +541,8 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
             name = new_name
         record = codex_mesh.open_unit_worker(str(run), name, role,
             model=model or (carried.model if carried is not None else ""),
-            effort=effort or (carried.effort if carried is not None else ""))
+            effort=effort or (carried.effort if carried is not None else ""),
+            cwd=str(working_dir) if working_dir is not None else "")
         if carried is not None:
             record.update({"turn_model": carried.model, "turn_effort": carried.effort})
             with _roster_locked(run) as (handle, current):
@@ -833,6 +835,7 @@ def main() -> int:
     command = commands.add_parser("resolve")
     _ = command.add_argument("--session-dir", type=Path, required=True)
     _ = command.add_argument("--role", choices=ROLES, required=True)
+    _ = command.add_argument("--working-dir", default="", help="working directory for a new worker")
     _ = command.add_argument("--owner-pid", type=int, default=0)
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
@@ -848,7 +851,8 @@ def main() -> int:
             print(shown_name(run, args.name))
         else:
             print(_resolve(run, role, args.owner_pid or director_pid(run),
-                           model=args.model, effort=args.effort, new_name=args.name))
+                           model=args.model, effort=args.effort, new_name=args.name,
+                           working_dir=Path(args.working_dir) if args.working_dir else None))
         return 0
     except (WorkerUnavailable, OSError, ValueError) as error:
         print(f"workers: {error}", file=sys.stderr)
