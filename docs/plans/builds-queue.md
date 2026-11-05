@@ -235,40 +235,24 @@ Added during the phase (user ruling, 2026-11-05, after review round 1): the main
 
 ### Phase 12 — The merge gate reserves 4 GiB from config and no longer kills on memory  · status: done
 
-**Asked by:** the user, 2026-11-05 12:5x EST: "the merge gate CLEARLY does not use the 4-5GiB for MOST of the time it runs - i think we are safe to redue the reservagion that it currently requires from 6GiB to 4GiB - so that it blocks less until we fix the 4k issue". Then, 13:0x EST: "we should remove the memory limit entirely - we don't memory limit verify runs from rust do we?" (they do not: Rust verify runs have a queue reservation and no kill limit). The builds showrunner accepted 12 and asked that it run now, beside 10x, on its own checkpoint (its files do not overlap 10x). 10k later replaces the fixed size with its look-ahead rule and deletes the key.
+#### As-built
 
-#### Work Order
-
-**Goal:** A merge gate waits less in the build queue: it reserves 4 GiB from config, its own test runner keeps it within a configured 4 GiB, and it has no memory kill or memory fail.
-
-**Spec:**
-
-**Cause.** The 6 GiB is not config. `merge_gate.py:85` holds `DEFAULT_MEMORY_CAP_MIB = 6144`, and `--memory-cap-mib` passes one value to four uses:
-1. the queue reservation (`gate_reservation`, `FixedCapSizing(cap)` at `:343`);
-2. a kill of any test module whose sampled memory goes over it (`:1043`; added after a module grew to 28 GiB on 2026-10-18);
-3. a failed gate when the total sampled peak goes over it (`:1159`, `:1161`, `:1201`);
-4. the gate's own scheduler, which starts another module only while latest + reserved + expected stays within it (`SampledRSSAdmission.admits`, `:253`).
-Merge-gate peaks in the last day: median 4.53 GiB, max 4.74 GiB.
-
-**Changes.**
-1. New key `merge_gate_reservation_gib` in `config/build_admission.conf`, initial value 4, read at use by `gate_reservation`. It sizes only the queue reservation.
-2. Delete the memory kill (use 2) and the memory fail (use 3): no `killed_for` on memory, no "RED: sampled memory exceeded the cap", and the gate result and reservation status depend only on test results. Keep the printed peak line without the cap text.
-3. Keep use 4, the test runner governor, with its own key (user, 2026-11-05 13:2x: "yes the test runner should have a configurable value as to how much memory it takes - i think we shou set it to 4GiB"; 13:3x: "there should be a reservation and there should e a test runner governor - both"; 13:4x, told that the type check alone keeps aside 4.9 GiB so no test module starts beside it: "no i want it to be 4GiB"). New key `merge_gate_governor_gib` in `config/build_admission.conf`, initial value 4, read when the gate starts. The governor starts a module only when a CPU slot is free (at most `max_running_jobs`) and latest + reserved + expected stays within the key; with no module running it always starts one. Delete `--memory-cap-mib` (user, 13:2x): config is the one source of both values. Two keys, because 10k replaces the reservation size and deletes `merge_gate_reservation_gib`, and the governor stays.
-4. Tests: the reservation follows the key; an invalid key value with no valid committed value is an error that names the key (with one, `conf.number` recovers that value and warns, as for every key; review ruling 13:4x); a module over 6 GiB is not killed and the gate passes when its tests pass; the governor follows its key, holds a module back at the bound and starts one when none runs. Delete the tests of the kill and the memory fail (the Work Order removes that behavior).
+- `config/build_admission.conf` has two keys, each 4 GiB. `merge_gate_reservation_gib` sizes the merge gate's build queue reservation (`gate_reservation` reads it when the gate joins the queue, `FixedCapSizing`). `merge_gate_governor_gib` bounds the gate's own test runner (`run_suites` reads it at start). `merge_gate_memory_gib(key)` reads both and turns an unusable value into `GateRefused` naming the key.
+- `SampledRSSAdmission.governor_mib` starts a job only when latest + reserved + expected stays within it and a CPU slot is free; with no job running it always starts one. At 4 GiB the full type check (4.76 GiB reservation) runs with no test module beside it.
+- The gate has no memory kill and no memory fail: the result and the reservation status depend only on test results. A module still running at the time limit still fails the gate. `--memory-cap-mib`, `DEFAULT_MEMORY_CAP_MIB` and `GateRun.memory_within_cap` are gone.
+- The runner prints `memory governor N GiB`; the summary prints the sampled peak with no cap. Gate ledger records keep the field `cap_mib`, which now holds the governor bound.
 
 **Files:**
-- `scripts/production/merge_gate.py`
-- `config/build_admission.conf`
-- `scripts/production/test_merge_gate.py`
-- `scripts/production/test_merge_gate_suites.py`
-- `scripts/production/test_merge_gate_suites_resources.py`
-- `scripts/production/test_merge_gate_suites_admission.py`
-- `scripts/production/test_merge_gate_test_times.py`
-- `scripts/production/test_merge_gate_ledger.py`
+- `scripts/production/merge_gate.py` — the two key readers, the governor, no memory kill or fail
+- `config/build_admission.conf` — `merge_gate_reservation_gib`, `merge_gate_governor_gib`
+- `scripts/production/merge_gate_test_support.py` — `MergeGateFixture.configure_gate`
+- `scripts/production/test_merge_gate*.py` — key, governor and no-kill tests
+- `scripts/buildlog/index.py` — the `cap_mib` column label
+- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md`
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `merge_gate.py` and `config/build_admission.conf`; `test` owns `scripts/production/test_merge_gate*.py`. `merge_gate.py` is sdlc devtools-unit's file: name it in the notice's also-touches line.
+**Binds later work:** the percent-done keep-aside phase deletes `merge_gate_reservation_gib` and its reader when the gate switches to the profile rule; `merge_gate_governor_gib` stays.
 
-**Acceptance gate:** merge gate and memory suites pass; basedpyright 0/0/0 on the changed files. Change-Review: during a merge gate, `/build:queue` shows the gate with a 4 GiB need, and the gate summary shows its peak with no cap.
+**Ruled out:** one key for both uses; a `--memory-cap-mib` override beside config.
 
 ### Phase 13 — A caller test's fake clock skips the start spacing when no caller run is live  · status: todo
 
@@ -333,7 +317,7 @@ Merge-gate peaks in the last day: median 4.53 GiB, max 4.74 GiB.
 8. **Measured use (architect review of 10s, 2026-11-05).** Profiles and the use-now subtraction read the anonymous use that `run_memories` attributes, never resident bytes or swap. A run with `RunUseUnavailable` keeps its full keep-aside: it writes no profile sample and does not lower the remaining need. Name the no-counter and no-profile states as types, not `None`, and test them beside the phase-reset and growing-peak cases.
 9. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:407` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
 
-10. **Merge-gate caller (folded from 10e, builds ruling 2026-11-05).** `merge_gate.py:342` picks `FixedCapSizing` (6 GiB). Switch the gate to the 10k profile rule. Its suite counter feeds the profile.
+10. **Merge-gate caller (folded from 10e, builds ruling 2026-11-05).** `merge_gate.py:342` picks `FixedCapSizing` from `merge_gate_reservation_gib` (4 GiB since 12). Switch the gate to the 10k profile rule. Its suite counter feeds the profile.
    - Valid evidence is the 10s anonymous reading of the gate's process tree. `merge_gate.py:484` measures resident memory plus swap, and `merge_gate.py:1036` sends that peak to the reservation sampler; profiles never read it.
    - Records written before the change are legacy. A legacy record does not size a keep-aside. With no valid profile, the gate keeps its full keep-aside.
    - The gate's own internal memory limit stays apart from its keep-aside.
@@ -907,6 +891,7 @@ This rule holds under both answers to the held last step; the answer changes onl
 **Acceptance.** Two hana CI jobs that cannot fit together under the admission checks run one after the other, and two that fit run at the same time, shown in `/build:queue` with the CI label; no CI rustc dies at the slice cap. Change-Review: in the Build queue pane during a hana CI run, the CI step shows as "hana CI · <runner> · <job>" and waits behind a session build when memory is short.
 
 ### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
+**Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`, which no other open phase changes).
 **Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The naming map is a design call that the builds showrunner settles. The showrunner approved it on 2026-11-03 (map and rulings: the 10f design in the unit's phase folder), with one change: a remote mirror ends when its copies.py remote lease from verify P35 ends.
 
 **Scope (showrunner limits, 2026-11-03).** 10f does not change the callers that verify P18 moves to copies.py (merge_gate, bump_gate, fast_track, waiting, the style runs, rust_release). Its sweep never touches copies.py standing checkouts. Two checkpoints:
@@ -920,6 +905,7 @@ This rule holds under both answers to the held last step; the answer changes onl
 **Workers (checkpoint B):** `1 writer + 1 tester` — `impl` owns `scripts/lib/build_folders.py` (sweep and the record writer), the `tmp_sweep` call and the `linux_runner.py` record call (aws-unit reads the record: name it in the notice); `test` owns `scripts/lib/test_build_folders.py`, the `tmp_sweep` tests and the `linux_runner` record tests. B keeps the standing-copy exclusion and the remote-lease ownership.
 
 ### Phase 10g — The queue decides where every step runs  · status: todo
+**Depends on:** verify-unit's Phase 27 hotfix on builds (the Work Order follows it), 10z and 10x (it changes the admission request and the queue service).
 **Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` picks the host once at start and the queue admits memory only on natedev; at 14:04-14:17 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
 
 **Outline (the Work Order follows at phase start, after verify's Phase 27 hotfix lands):**
