@@ -45,7 +45,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("waiting.py")
-CI_POINTS = SCRIPT.with_name("ci_points.py")
 ALPHA = "alpha-unit"
 BETA = "beta-unit"
 GAMMA = "gamma-unit"
@@ -259,9 +258,7 @@ class WaitingTests(unittest.TestCase):
             "", "## Production Context", "", "- **Merge branch:** `production`",
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Showrunner session:** showrunner-example",
             "- **Log:** `production.log`", "- **User zone:** America/Los_Angeles",
-            "- **Updates:** every 15 minutes", "", "## Gates", "", "| Gate | Waiting | Waits on | Clears when |",
-            "| --- | --- | --- | --- |",
-            f"| G1 | {ALPHA} phase 2 | {BETA} phase 1 | beta code merged |",
+            "- **Updates:** every 15 minutes", "",
             "", "## Production rules", "", "- Merge each phase and push the merge branch.", "",
         )))
 
@@ -352,11 +349,11 @@ class WaitingTests(unittest.TestCase):
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
-                                     "alpha-branch", ("shared.txt",))
+                                     "alpha-branch")
         request = merge_checkpoint.MergeRequest(
-            production._replace(log=producer_log), unit, phase, unit_tip, (),
+            production._replace(log=producer_log), unit, phase, unit_tip,
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
-            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
         )
         with redirect_stdout(io.StringIO()):
@@ -438,7 +435,7 @@ class WaitingTests(unittest.TestCase):
         return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
 
 
-    def test_scratch_green_uses_detached_unit_tip_and_lift_accepts_its_log(self) -> None:
+    def test_scratch_green_uses_detached_unit_tip_and_preserves_its_log(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "unit work\n")
         merge_tip = self.commit(self.checkout, "merged.txt", "merge branch work\n")
         _ = self.commit(self.beta, "other-unit.txt", "unmerged work\n")
@@ -453,12 +450,6 @@ class WaitingTests(unittest.TestCase):
         log = self.scratch_log(result.stdout)
         self.assertIn("scratch green marker", log.read_text(encoding="utf-8"))
         self.assert_scratch_clean(before, unit_tip, merge_tip, local_refs, origin_refs)
-        lift = subprocess.run([sys.executable, str(CI_POINTS), "notice", "lift", "G1",
-                               "--production", str(self.doc), "--log", str(log)],
-                              cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
-        self.assertEqual(lift.returncode, 0, lift.stdout + lift.stderr)
-        self.assertIn(str(log), lift.stdout)
-        self.assertIn("G1 lifted", lift.stdout)
 
     def test_scratch_red_keeps_full_log_and_cleans_worktree_without_claiming_block(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "unit work\n")

@@ -10,7 +10,9 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
+
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from merge_checkpoint import ChildHandoffEntry, CodeCheckpoint, MergeEntry, NoMerge, ShrinkCommit, merge_branch_history
@@ -28,6 +30,13 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        staff_file = self.root / "staff.json"
+        _ = Path(self.env["STAFF_FILE"]).rename(staff_file)
+        _ = self.enterContext(isolated_staff_file(staff_file, self.env))
+
     # Keep the child CLI process boundary.
     @process_boundary
     def test_attached_child_handoff_merges_without_a_units_row_and_acknowledges_after_push(self) -> None:
@@ -258,12 +267,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertNotIn("hand-off acknowledgment:", result.stdout)
     def test_former_child_slug_resolves_to_the_canonical_doc_and_merge_subject(self) -> None:
         doc = self.child_production()
-        _ = doc.write_text(doc.read_text().replace(
-            "# Style production", "# Style production\n\n## Production Context\n- **Formerly:** `old-style`",
-        ))
-        timer = self.root / "notifier/showrunner-example-style/conf"
-        timer.parent.mkdir(parents=True)
-        _ = timer.write_text(f"TARGET=session:fake-child\nCHECK=zsh /unused/production_check.sh {doc}\n")
+        owner = recorded_showrunner("example-style", doc, parent="example")
+        journal = Path(self.env["SHOWRUNNER_STATE_DIR"]) / "example-style/rename.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "old-style", "new": "example-style", "staff_id": owner.id}))
         checkpoint = self.checkpoint()
         result = subprocess.run([
             sys.executable, str(SCRIPT), "--from-child", "old-style", "--checkpoint", checkpoint,
@@ -287,15 +294,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.stdout.strip(), "merge_checkpoint: --from-child is separate from unit checkpoint arguments")
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.events("send.py"), [])
-    def test_style_unit_none_owns_needs_explicit_ticket_file_allowance(self) -> None:
-        self.production_doc(owns=("none",))
-        checkpoint = self.checkpoint(relative="src/lib.rs", content="fn fixed() {}\n")
-        refused = self.run_checkpoint(checkpoint)
-        self.assertNotEqual(refused.process.returncode, 0)
-        self.assertIn("outside responsibilities: src/lib.rs", refused.process.stdout)
-        permitted = self.run_checkpoint(checkpoint, "--also", "src/lib.rs")
-        self.assertEqual(permitted.process.returncode, 0, permitted.process.stdout + permitted.process.stderr)
-        self.assertIn("scope: ok", permitted.process.stdout)
     def test_mixed_history_keeps_child_identity_separate_from_renamed_unit_phases(self) -> None:
         subjects = (
             "Merge old-unit phase 1 (aaaaaaa) into production",

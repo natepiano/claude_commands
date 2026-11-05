@@ -154,8 +154,6 @@ def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
                     cells["Plan"] = "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
                 if isinstance(config.port, unit_config.AppPort):
                     cells["Port"] = str(config.port.number)
-                if config.responsibilities:
-                    cells["Owns"] = ", ".join(config.responsibilities)
             else:
                 reason = config.reason if not isinstance(config, session_staff.NoUnitConfig) else "no unit configuration"
                 cells["Plan"] = "unavailable: " + reason
@@ -344,12 +342,11 @@ def _last_event(path: Path) -> dict[str, object] | None:
     return None
 
 
-def read_run_states() -> RunStates:
+def read_run_states(*, record: staff.StaffSnapshot | None = None) -> RunStates:
     """Join each run's director to its staff folder and read the newest run state."""
     directory = runs_dir()
     if not directory.exists():
         return RunStates({})
-    record: staff.StaffSnapshot | None = None
     newest: dict[str, _StartedRun] = {}
     for path in directory.iterdir():
         if path.suffix != ".jsonl":
@@ -549,7 +546,7 @@ def every_labeled_session(*, record: staff.StaffSnapshot | None = None,
 def labeled_sessions(slug: str, *, record: staff.StaffSnapshot | None = None,
                  sources: MemberSources | None = None) -> dict[str, LabeledSession]:
     """Return the selected process state for each unit."""
-    slug = _lookup_slug(slug)
+    slug = _lookup_slug(slug, record=record)
     found = every_labeled_session(record=record, sources=sources)
     return found.status_units(slug)
 
@@ -558,9 +555,9 @@ def labeled_session(slug: str, name: str, *, record: staff.StaffSnapshot | None 
                 sources: MemberSources | None = None,
                 running: Sequence[SessionRecord] | None = None) -> LabeledSession | None:
     """Return one unit of the production. Unreadable herdr raises OSError."""
-    slug = _lookup_slug(slug)
+    slug = _lookup_slug(slug, record=record)
     record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources()
+    sources = sources if sources is not None else member_sources(record=record)
     selected = sources.member(UnitMember(slug, name), record)
     label = selected.row.name if isinstance(selected, MemberFound) else name
     marked = observed_session_labels(record=record, running=running)

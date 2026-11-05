@@ -25,6 +25,92 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_withdraw_removes_one_open_item_without_an_answer_or_relay_and_retains_its_history(self) -> None:
+        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "sync decision",
+                                        "question": "Sync the document?", "asked_by": "alpha-unit"},
+                            {"since": "2026-10-06T08:00", "text": "Reminder"})
+        previous = self.open_rows()
+        path = self.outstanding()
+        history = path.with_suffix(".history.jsonl")
+        stamp = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        saved = {"time": stamp, "text": "sync decision", "question": "Sync the document?", "reviewed": "Sync it?"}
+        other = {**saved, "question": "Sync a different document?"}
+        _ = history.write_text(json.dumps(saved) + "\n" + json.dumps(other) + "\n")
+        answered = path.with_suffix(".answered.jsonl")
+        _ = answered.write_text(json.dumps({"time": stamp, "slug": "example", "text": "Earlier decision"}) + "\n")
+        answered_before = answered.read_bytes()
+        before = datetime.now(timezone.utc)
+        result = self.run_command("withdraw", "--item", "  sync decision  ")
+        after = datetime.now(timezone.utc)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["withdraw: ok — example: sync decision"])
+        self.assertNotIn("relay:", result.stdout)
+        self.assertEqual(self.open_rows(), [previous[0]])
+        self.assertEqual(answered.read_bytes(), answered_before)
+        records = [cast(dict[str, str], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual(len(records), 2)
+        withdrawn = records[0].pop("withdrawn")
+        self.assertEqual(records, [saved, other])
+        self.assertLessEqual(before, datetime.fromisoformat(withdrawn))
+        self.assertLessEqual(datetime.fromisoformat(withdrawn), after)
+        _ = self.run_questions(self.question_state(["Reminder", "Another reminder"]))
+        retained = [cast(dict[str, str], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual(retained[0], {**saved, "withdrawn": withdrawn})
+
+    def test_withdraw_records_a_descendant_item_without_existing_history(self) -> None:
+        for slug in ("top", "example", "kid"):
+            self.timer(slug)
+        self.attach("example", "top")
+        self.attach("kid", "example")
+        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "sync decision",
+                                    "question": "Sync the document?", "asked_by": "kid-unit"})
+        self.write_open_for("top", {"since": "2026-10-06T08:00", "text": "sync decision"})
+        path = self.outstanding().with_name(f"{self.fixture_staff_id(slug='kid')}.json")
+        before = datetime.now(timezone.utc)
+        result = self.run_command("withdraw", "--item", "sync decision")
+        after = datetime.now(timezone.utc)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["withdraw: ok — kid: sync decision"])
+        repeated = self.run_command("withdraw", "--item", "sync decision")
+        self.assertEqual(repeated.returncode, 2, repeated.stdout + repeated.stderr)
+        self.assertEqual(repeated.stdout.strip(),
+                         "withdraw: failed — 0 open items match 'sync decision'; name one by its exact text")
+        saved = cast(dict[str, str], json.loads(path.with_suffix(".history.jsonl").read_text()))
+        self.assertEqual((saved["text"], saved["question"]), ("sync decision", "Sync the document?"))
+        self.assertEqual(saved["time"], saved["withdrawn"])
+        self.assertLessEqual(before, datetime.fromisoformat(saved["withdrawn"]))
+        self.assertLessEqual(datetime.fromisoformat(saved["withdrawn"]), after)
+        above = self.outstanding().with_name(f"{self.fixture_staff_id(slug='top')}.json")
+        self.assertEqual([item["text"] for item in cast(list[dict[str, str]], json.loads(above.read_text()))],
+                         ["sync decision"])
+
+    def test_withdraw_requires_exact_open_text_and_changes_no_file_on_failure(self) -> None:
+        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "sync decision",
+                                        "question": "Sync the document?", "asked_by": "alpha-unit"})
+        answered = self.outstanding().with_suffix(".answered.jsonl")
+        _ = answered.write_text(json.dumps({"time": datetime.now(timezone.utc).isoformat(),
+                                            "slug": "example", "text": "Earlier decision"}) + "\n")
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        for wanted in ("sync", "Sync the document?", "Earlier decision", "missing"):
+            with self.subTest(wanted=wanted):
+                result = self.run_command("withdraw", "--item", wanted)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.strip(),
+                                 f"withdraw: failed — 0 open items match {wanted!r}; name one by its exact text")
+                self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+
+    def test_withdraw_refuses_the_same_exact_text_in_two_open_lists_without_changes(self) -> None:
+        for slug in ("example", "kid"):
+            self.timer(slug)
+            self.write_open_for(slug, {"since": "2026-10-06T08:00", "text": "sync decision"})
+        self.attach("kid", "example")
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        result = self.run_command("withdraw", "--item", "sync decision")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(),
+                         "withdraw: failed — 2 open items match 'sync decision'; name one by its exact text")
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+
     def test_ask_files_a_units_question_with_its_review_and_shows_the_asker(self) -> None:
         full = "Keep the old key binding? Keep (recommended — users know it) or drop it."
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(full + " Reviewed.")):

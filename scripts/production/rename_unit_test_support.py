@@ -1,7 +1,6 @@
 """Use private staff records and Git repositories for unit rename tests."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -104,7 +103,6 @@ class UnitRenameFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
-            "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
             # No waits by default: a test that needs one sets it.
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
@@ -171,7 +169,6 @@ class UnitRenameFixture(StaffTestCase):
 
     def seed_state(self) -> None:
         old = self.rust / "claude-demo-alpha"
-        self.write(self.stall_path("alpha-unit"), '{"stretch": 17}\n')
         run = self.root / "history/runs/run-1.jsonl"
         self.write(run, "\n".join(json.dumps(event) for event in (
             {"event_type": "run_started", "run_started_at": 1, "working_dir": str(old),
@@ -200,9 +197,6 @@ class UnitRenameFixture(StaffTestCase):
         self.assertEqual(result.returncode, 0, (arguments, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def stall_path(self, unit: str) -> Path:
-        digest = hashlib.sha256(f"{SLUG}\0{unit}".encode()).hexdigest()
-        return self.root / "state/stall-watch" / f"{digest}.json"
 
     def rename(self, action: str, old: str = "alpha", new: str = "gamma", *,
                refuse: str = "") -> subprocess.CompletedProcess[str]:

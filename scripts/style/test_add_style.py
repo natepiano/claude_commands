@@ -408,7 +408,7 @@ atomic_file.os.replace = interrupted_replace
         lines = self.doc.read_text().splitlines()
         for field, value in {
             "Kind": "style", "Repository": str(self.repo), "Branch point": "main",
-            "Parent production": str(self.parent), "Proposals": str(self.root / "parent-issues"),
+            "Proposals": str(self.root / "parent-issues"),
             "Log": "docs/sample-style-log.md", "Updates": "on demand", "Push": "git",
         }.items():
             self.assertEqual(production_field(lines, field), value)
@@ -537,14 +537,14 @@ atomic_file.os.replace = interrupted_replace
     def test_change_review_credits_the_parent_after_creation_and_reattach(self) -> None:
         _ = self.run_bootstrap()
         with self.subTest(destination="new production"):
-            self.assertEqual(change_review.credited(self.doc), self.parent)
+            self.assertEqual(change_review.credited(self.doc, staff.snapshot()), self.parent)
         lines = [line for line in self.doc.read_text().splitlines()
                  if not line.startswith("- **Parent production:**")]
         _ = self.doc.write_text("\n".join([*lines, f"- **Parent production:** {self.parent}", ""]))
         caller = self.parent_doc("next")
         _ = self.run_bootstrap(parent=caller)
         with self.subTest(destination="new parent"):
-            self.assertEqual(change_review.credited(self.doc), caller)
+            self.assertEqual(change_review.credited(self.doc, staff.snapshot()), caller)
 
     def test_missing_proposals_refuses_before_writes_in_check_and_apply(self) -> None:
         parent = self.parent_doc("missing", proposals=False)
@@ -590,7 +590,7 @@ atomic_file.os.replace = interrupted_replace
             f"1. read {caller}; repository {self.repo}; Proposals {self.root / 'next-issues'}",
             "2. attach standing sample-style under next; branch point main",
             *(f"{number}. skipped: sample-style already exists" for number in range(3, 7)),
-            "7. update Parent production and Proposals, run style_sync.py resume; synced tip unchanged",
+            "7. update Proposals, run style_sync.py resume; synced tip unchanged",
         ])
         self.assertEqual({path: (path.read_text(), path.stat().st_mtime_ns) for path in paths}, before)
         self.assertEqual((self.git("show-ref"), self.git("worktree", "list", "--porcelain"), self.sync(), self.calls()),
@@ -755,7 +755,7 @@ atomic_file.os.replace = interrupted_replace
         calls, sync = self.calls(), self.sync()
         result = self.run_bootstrap("--check", parent=caller)
         self.assertEqual(result.stdout.splitlines()[3],
-                         f"4. set Parent production and Proposals in existing production doc {self.doc}")
+                         f"4. set Proposals in existing production doc {self.doc}")
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
         self.assertEqual((self.calls(), self.sync()), (calls, sync))
         self.assertEqual(production_field(self.doc.read_text().splitlines(), "Proposals"), str(self.root / "parent-issues"))

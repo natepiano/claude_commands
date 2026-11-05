@@ -30,6 +30,15 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 setUpModule = support.setUpModule
 
 
+def write_settings(config: quota_alert.Config) -> None:
+    """Write the five settings with their configured types."""
+    _ = quota_alert.CONFIG.write_text(
+        f"# range: 0..\nthreshold_percent={config['threshold_percent']}\n"
+        + f"# range: 0..\nrepeat_minutes={config['repeat_minutes']}\n"
+        + f"# range: 0..\nstall_minutes={config['stall_minutes']}\n"
+        + f"faults_to={config['faults_to']}\nalways={' '.join(config['always'])}\n")
+
+
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_shutdown_hold_has_its_own_blocked_head_line(self) -> None:
         detail = "accounts: claude4 is held by a shutdown; no session was stopped"
@@ -93,33 +102,30 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         """Guard the fixture patch that prevents real phone sends."""
         self.assertIsNot(quota_alert.tell_user, REAL_TELL_USER)
 
-    def test_load_config_reads_the_named_object_layout_registry(self) -> None:
-        named_config = self.root / "named-showrunners.json"
-        _ = named_config.write_text(json.dumps({
-            "threshold_percent": 7,
-            "repeat_minutes": 45,
-            "stall_minutes": 9,
-            "faults_to": "fault-handler",
-            "always": ["always-there"],
-            "showrunners": [{
-                "session": "named-director",
-                "zone": "America/New_York",
-                "units": [{"session": "named-unit", "status": "run-finished"}],
-            }],
-        }), encoding="utf-8")
+    def test_load_config_reads_the_shared_configuration(self) -> None:
+        named_config = self.root / "named-showrunners.conf"
+        _ = named_config.write_text(("""# range: 0..
+threshold_percent=7
+# range: 0..
+repeat_minutes=45
+# range: 0..
+stall_minutes=9
+faults_to=fault-handler
+always=always-there
+"""), encoding="utf-8")
 
         with mock.patch.object(quota_alert, "CONFIG", named_config):
             config = quota_alert.load_config()
 
         self.assertEqual(config["threshold_percent"], 7)
         self.assertEqual(config["always"], ["always-there"])
-        # A list of showrunners left in the file is not read: they are found by their update timers.
+        # Read showrunners from the staff record.
         self.assertNotIn("showrunners", config)
 
     def test_codex_two_percent_reminder_pushes_once_per_episode_without_session_repeat(self) -> None:
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        write_settings(config)
         for minute, left in ((0, "3"), (2, "2"), (10, "1"), (32, "1")):
             _ = self.alert([self.note("codex1.md", "active", left)], self.now + timedelta(minutes=minute))
             self.assertEqual(len(self.noted), 0 if minute == 0 else 1)
@@ -140,7 +146,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_workers_self_target_keeps_the_low_reminder_due_without_pushing_a_fallback(self) -> None:
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        write_settings(config)
         entry = next_moves.add_next_move("workers", 1, "codex1")
         note = self.note("codex1.md", "active", "2")
         for minute in (0, 2, 32):
@@ -156,7 +162,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_runnable_workers_entry_keeps_the_reminder_due_until_removed(self) -> None:
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        write_settings(config)
         _ = next_moves.add_next_move("workers", 1, "codex2")
         note = self.note("codex1.md", "active", "2")
         _ = self.alert([note], self.now)

@@ -16,6 +16,7 @@ from unittest.mock import patch
 from scripts.maintenance import agent_notes_job as job
 from scripts.maintenance import vault_commit
 from scripts.maintenance.settings import Part, Schedule, settings
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 
 class JobTests(unittest.TestCase):
@@ -28,6 +29,7 @@ class JobTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.config = self.root / "job.toml"
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = self.config.write_text((job.ROOT / "config/agent_notes.toml").read_text())
         self.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root), "AGENT_NOTES_JOB_CONFIG": str(self.config)}))
@@ -92,13 +94,13 @@ class JobTests(unittest.TestCase):
         _ = hand.write_text("original hand note\n")
         old_note = vault / "showrunners/show/old-unit.md"
         old_note.parent.mkdir(parents=True)
-        _ = old_note.write_text("---\nphase_table: true\nproduction: show\nunit: old-unit\n---\nold unit\n")
+        _ = old_note.write_text(f"---\nphase_table: true\nunit: {unit_membership('show', 'old-unit').id}\n---\nold unit\n")
         _ = git("add", ".")
         _ = git("commit", "-qm", "Initial notes")
         original_head = git("rev-parse", "HEAD")
         old_note.unlink()
         note = old_note.with_name("new-unit.md")
-        note_text = "---\nphase_table: true\nproduction: show\nunit: new-unit\n---\nnew unit\n"
+        note_text = f"---\nphase_table: true\nunit: {unit_membership('show', 'new-unit').id}\n---\nnew unit\n"
         _ = note.write_text(note_text)
         _ = hand.write_text("unrelated hand change\n")
         _ = git("add", "hand.md")
@@ -140,7 +142,7 @@ class JobTests(unittest.TestCase):
         disabled = folder / "disabled.md"
         _ = disabled.write_text("---\nphase_table: false\nproduction: tools\nunit: disabled\n---\n")
         phase = folder / "unit.md"
-        phase_text = '---\nphase_table: true\nproduction_file: "[[tools-production]]"\nunit: tools-unit\n---\n'
+        phase_text = f"---\nphase_table: true\nunit: {unit_membership('tools', 'tools-unit').id}\n---\n"
         _ = phase.write_text(phase_text)
         _ = agent_note.write_text("changed agent note\n")
         with patch.object(Path, "home", return_value=self.root), patch("builtins.print"):

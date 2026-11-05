@@ -868,7 +868,48 @@ class AccountsTests(unittest.TestCase):
                 machines = document["accounts"][0]["role_counts_by_machine"]
                 self.assertEqual(machines[peer]["units"], count)
                 self.assertEqual(machines[here]["units"], {"busy": 1, "shell": 1, "idle": 2, "total": 4})
-                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 1, "shell": 1, "idle": 2, "total": 4}])
+                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 4, "shell": 3, "idle": 3, "total": 10}])
+                self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(4, 3, 3),))
+                self.assertIn("units 10 (busy 4, shell 3, idle 3)", accounts.render_status_table(
+                    accounts.StatusReading(rows, (), (), timezone.utc, now)))
+
+    def test_combined_role_counts_preserve_role_order_and_codex_has_no_shell(self) -> None:
+        now = datetime.now(timezone.utc)
+        row = replace(SharedStatusDocumentTests().row(), label="codex1", tool="codex",
+            roles=("workers", "units"), role_counts=(accounts.RoleSessionCounts(1, accounts.UnknownShellCount(), 2),))
+        peer = remote.other_machine()
+        _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {
+            "codex1": {"units": {"busy": 2, "shell": None, "idle": 1, "total": 3},
+                       "workers": {"busy": 3, "shell": None, "idle": 4, "total": 7}}}}))
+        rows, problems = machine_role_counts((row,), now)
+        reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        self.assertEqual(document["accounts"][0]["roles"], ["workers", "units"])
+        self.assertEqual(document["accounts"][0]["role_counts"], [
+            {"busy": 4, "shell": None, "idle": 6, "total": 10},
+            {"busy": 2, "shell": None, "idle": 1, "total": 3}])
+        table = accounts.render_status_table(reading)
+        self.assertIn("workers 10 (busy 4, idle 6)", table)
+        self.assertIn("units 3 (busy 2, idle 1)", table)
+        self.assertNotIn("shell", table)
+
+    def test_unreported_roles_have_zero_counts_and_spare_has_no_count(self) -> None:
+        now = datetime.now(timezone.utc)
+        peer = remote.other_machine()
+        _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {}}))
+        for tool in ("claude", "codex"):
+            for role in ("units", "spare"):
+                with self.subTest(tool=tool, role=role):
+                    row = replace(SharedStatusDocumentTests().row(), tool=tool, roles=(role,), role_counts=())
+                    rows, problems = machine_role_counts((row,), now)
+                    reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
+                    document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                    expected = None if role == "spare" else {
+                        "busy": 0, "shell": 0 if tool == "claude" else None, "idle": 0, "total": 0}
+                    self.assertEqual(document["accounts"][0]["role_counts"], [expected])
+                    text = "spare" if role == "spare" else (
+                        "units 0 (busy 0, shell 0, idle 0)" if tool == "claude" else "units 0 (busy 0, idle 0)")
+                    self.assertIn(text, accounts.render_status_table(reading))
 
     def test_session_counts_use_aliases_when_hostnames_differ(self) -> None:
         now = datetime.now(timezone.utc)

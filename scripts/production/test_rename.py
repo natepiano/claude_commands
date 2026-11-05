@@ -440,6 +440,53 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertIn(NEW, result.stdout)
         self.assertEqual(self.file_versions(), before)
 
+    def test_rename_preserves_staff_stores_and_parent_relationships(self) -> None:
+        row = self.production_row()
+        child = fixture_member("showrunner", name="child", parent=row.id)
+        listed = self.root / "lists/change-review - old.md"
+        rows = ["| # | Change | Merged | How to check | Production |",
+                "| --- | --- | --- | --- | --- |",
+                f"| C1 | own | m | try | {row.id} |",
+                f"| C2 | child's | m | try | {child.id} |",
+                f"| C3 | root's | m | try | {row.id} |"]
+        self.write(listed, "\n".join(rows) + "\n")
+        pins = self.home / ".local/state/next"
+        question = {"current": f"{row.id}: first",
+                    "ended": {f"{row.id}: earlier": "2026-10-27T01:00:00"},
+                    "moved": ["oldish: kept"]}
+        pin = pins / f"question-{row.id}.json"
+        aggregate = pins / f"next-{row.id}-all-below.json"
+        self.write(pin, json.dumps(question))
+        self.write(aggregate, json.dumps({"current": "C1", "source": "change-old"}))
+        bevy = self.home / ".local/state/bevy-upgrade"
+        watch = bevy / f"{row.id}.json"
+        lock = bevy / f"{row.id}.lock"
+        job = self.notifier / f"bevy-upgrade-{row.id}/conf"
+        self.write(watch, json.dumps({"staff_id": row.id, "entries": 3}))
+        self.write(lock, "")
+        self.write(job, f"EVERY=240\nRUN=py bevy_upgrade.py --staff-id {row.id} check --scheduled\n"
+                       + f"FROM=bevy-upgrade-{row.id}\n")
+        run = self.root / "runs/current/progress_history_state.json"
+        self.write(run, json.dumps({"owner_staff_id": row.id}))
+        fixed = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                 for path in (listed, pin, aggregate, watch, lock, job, run)}
+        displays = support.RenameDisplays(row)
+        with displays.installed():
+            self.assert_success(self.run_rename("apply"))
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in fixed}, fixed)
+        self.assertEqual(json.loads(pin.read_text()), question)
+        self.assertEqual(json.loads(aggregate.read_text()), {"current": "C1", "source": "change-old"})
+        for content in rows[2:]:
+            self.assertIn(content, listed.read_text())
+        self.assertEqual(json.loads(watch.read_text()), {"staff_id": row.id, "entries": 3})
+        self.assertEqual(lock.read_text(), "")
+        self.assertIn(f"--staff-id {row.id} check", job.read_text())
+        self.assertIn(f"FROM=bevy-upgrade-{row.id}\n", job.read_text())
+        self.assertEqual(json.loads(run.read_text()), {"owner_staff_id": row.id})
+        self.assertEqual(staff.by_id(row.id), replace(row, name=NEW))
+        self.assertEqual(staff.by_id(child.id), child)
+        self.assertEqual(child.parent, staff.ReportsTo(row.id))
+
     def test_invalid_staff_name_refuses_without_writes(self) -> None:
         before = self.snapshot()
         result = self.run_rename("apply", "../escape")
