@@ -1685,48 +1685,26 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Ruled out:** `target_folder` as the authoritative output root (builds ruling 2026-11-04).
 
 ### Phase 63 — The phone gets one low-disk push under the alert line, with a text that passes the review  · status: done
-**Depends on:** Phase 61 (both change `scripts/lint/sweep.py`).
 
-#### Work Order
+#### As-built
 
-**Goal:** when natedev free space falls under `sweep_phone_floor_gib`, the phone gets one push that passes the plain text review, and natedev still gets its alert.
-
-**Measured (Phase 58, builds ruling 2026-11-04 18:32 EST):** the plain review (`review.py texts --id sweep.disk_floor`, run 20261104T184217-1376377-29bf) failed both examples. Objections:
-- `typical`: every-choice-says-what-it-does and reader-starts-cold on the folder list. The reviewer asked which folder to delete and why, what the scratch folders hold, and what each deletion changes.
-- `no_free_space`: every-choice-says-what-it-does on the list total, and short-plain-sentences on "Deleting a folder removes its files."
-The rejected texts and the reviewer's suggested rewrites are in the resources run folder, `phases/58/impl_summary_floor-impl.txt`. Phase 58 sends the crossing to natedev only.
-
-**Spec:**
-1. Write the `sweep.disk_floor` text with the builds ruled header ("natedev disk is low; builds can fail"), action ("In the natedev Claude session, say which folders to delete.") and last line ("natedev checks your choice before it deletes anything."). Each listed folder says what it holds and what deleting it changes. Recommend one choice.
-2. Send the wording to the builds showrunner before the review (item 12). Run the plain review; record the approval with `review.py texts --id sweep.disk_floor --approve` only when every example passes. Never use `--user-spec`, and never write an approval record by hand.
-3. Send the push with the natedev alert on a crossing (`FloorAlertChannels.NATEDEV_AND_PHONE`). Keep one push per crossing.
-4. Use `sweep_push_text_limit` and `sweep_page_paths` in `config/lint.conf`, or remove them and their `config/README.md` rows. Phase 58 left them with no reader.
-5. Give the alert text a surface for each folder-choice state: measurements available (recommend one choice), measurement unavailable or stale (say so and name no folder), and no single choice frees enough (say what the largest choice frees). Never invent a deletion recommendation. Each state has a catalog example that passes the review.
-   - Protected folders (`NoRecordedEvidence`): since Phase 62 the natedev alert lists the largest of them with sizes (`protected_folder_lines`, from `FloorOutcome.protected`; `notify_floor_problem`, `sweep.py` :3525). The phone text uses the same measurement, labels these folders as protected (the floor never deletes them; only a person can), and says each one "holds" its size. They are never floor holders.
-6. Records from Phase 58 hold `PhoneCrossing.UNDER_PUSHED` after natedev delivery alone, so they prove no phone delivery. Keep the natedev and phone receipts as separate states for each crossing. An open episode in an old record gets its first phone push once, with no second natedev alert.
-   - Each crossing has a durable identity saved in the record before the first send (for example the time the pass first measured free space under the line). Each channel's send passes `send.py --key <channel>:<crossing identity>` with a `--repeat-minutes` window that covers a restart, so a send repeated after a crash between delivery and the saved receipt is skipped by `send.py`. The receipt is still saved after each accepted send.
-
-**Constraints from prior phases (Phase 61):**
-- `FloorOutcome` carries `assessment: tmp_sweep.SweepAssessment`; `notify_floor_problem` (`sweep.py` :3525) accepts `FloorOutcome | tmp_sweep.SweepAssessment`, and a skipped assessment changes no state.
-- `send_holder_message` is the natedev leg of `send_floor_alert` and returns `FloorChannelOutcome`; the phone leg is separate. Its log line reads "message to natedev ...".
-- A pass that sees no lock holder keeps a `DeliveredFloorLockAlert` receipt (`next_lock_alert`, `sweep.py` :1182). Keep `test_missing_lock_observation_preserves_the_delivered_holder_receipt` green and unchanged.
-- Workspace and temporary-sweep failures keep their own records (`workspace-<sha256>.json`, `temporary-sweep.json`) and never send a phone push.
-7. The `sweep_phone_floor_gib` comment ("Send one phone alert") and the `Phone` state names must be true at the checkpoint (builds 2026-11-04). If this phase cannot bring back the phone push, file the key rename with `/unit:question`: a rename deletes a key.
-8. If the text still fails the review, keep the alert natedev only and ask the builds showrunner.
+- When free space falls under `sweep_phone_floor_gib`, the floor finalizer sends one natedev message (`send_floor_alert`, key `natedev:<crossing identity>`) and, with a current text approval, one phone push (`send_phone_push`, key `phone:<crossing identity>`). Each channel keeps its own receipt in the floor record and retries alone. Both return `FloorChannelOutcome`.
+- The crossing identity is saved in the record before the first send. A crossing whose identity cannot be saved uses the key `natedev:unsaved-crossing` (`UNSAVED_CROSSING_KEY`) with the `sweep_alert_interval_seconds` window and sends no phone push. A failure message carries no crossing key; its acceptance stores `FailureReported`.
+- An old record with `PhoneCrossing.UNDER_PUSHED` gets its first phone push once, with no second natedev alert.
+- The `sweep.disk_floor` catalog text (`scripts/notify/push_catalog.py`) has four forms: available (recommends one choice), insufficient (says what the largest choice frees), protected (folders the floor never deletes, labelled as protected, with their sizes) and unavailable (names no folder). Each form ends with a do-nothing choice. Folder labels are full home-relative paths. `fit_disk_floor_push` trims the smallest choice to `sweep_push_text_limit` with the real values, then falls back to the unavailable form.
+- `disk_floor_channels()` keeps the phone off until `push_texts.approval_date("sweep.disk_floor")` exists. Until the user approves the text, `scripts/notify/test_push_texts.py` fails only on that missing approval.
 
 **Files:**
-- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` — the phone push, receipt states and their tests.
-- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — the low-space text and its review record.
-- `config/lint.conf`, `config/README.md` — `sweep_push_text_limit`, `sweep_page_paths` and the `sweep_phone_floor_gib` comment.
+- `scripts/lint/sweep.py` — crossing receipts, `send_floor_alert` (natedev only), `send_phone_push`, `run_send`, the folder choices and `fit_disk_floor_push`.
+- `scripts/notify/push_catalog.py` — the `sweep.disk_floor` template and its four examples.
+- `config/lint.conf`, `config/README.md` — `sweep_crossing_repeat_minutes`, `sweep_push_text_limit`, `sweep_page_paths`.
+- `scripts/lint/test_sweep.py` — crossing, receipt, key and text tests.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `sweep.py`, `push_catalog.py`, `push_texts_reviewed.json`, `config/lint.conf` and `config/README.md`.
-- `test` owns `test_sweep.py` and the channel-retry and folder-choice cases, and runs `scripts/notify/test_push_texts.py` and `scripts/lint/test_tmp_sweep.py`.
+**Gotchas:**
+- `send.py` exits 0 for a skipped repeat key. Never key a message whose acceptance records new state.
+- Only the user records the text approval (`review.py texts --id sweep.disk_floor --approve`).
 
-**Acceptance gate:**
-- Tests prove: a fall under the alert line sends one push and one natedev alert; a second pass under the line sends none; free space exactly at the line keeps the episode; a rise above the line and a new fall sends one more; a failed phone delivery with a sent natedev alert retries only the phone, and the reverse retries only natedev; a restart mid-episode sends nothing twice, also when the pass stops after a send and before its receipt is saved; an old record's open episode gets one phone push; a sweep-failure alert sends no phone push; the unavailable-measurement text names no folder; protected folders appear labelled as protected, with the same sizes on both channels, and are never floor holders.
-- `scripts/notify/test_push_texts.py` passes with a normal approval record. `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
-- Change-Review line: the phone gets one low-disk push | read the phone pushes after natedev free space falls under 150 GiB | one push arrives that says which folders to delete and what each one holds.
+**Ruled out:** Cargo labels for the measured folders (the measurement excludes Cargo targets); a director-recorded text approval (the approval is the user's).
 
 ### Phase 64 — Recorded step outputs have one owner, distinct rows and row facts  · status: todo
 **Depends on:** Phase 63 (both change `scripts/lint/sweep.py`); report-unit Phase 20 and its follow-up for `scripts/buildlog/memory.py` (merge `origin/builds` first).
@@ -1754,9 +1732,9 @@ The rejected texts and the reviewer's suggested rewrites are in the resources ru
 - report-unit edits `memory.py` in its Phase 20 and one follow-up. Make the `memory.py` part of Spec 3 after both merge.
 
 **Files:**
-- `scripts/buildlog/step_outputs.py` (new), `scripts/lint/build_shape.py` — the reader and its types.
+- `scripts/buildlog/step_outputs.py`, `scripts/lint/build_shape.py` — the reader and its types; `step_outputs.py` is new.
 - `scripts/lint/sweep.py`, `scripts/buildlog/memory.py` — the callers and their rules.
-- `scripts/buildlog/` test support module (new), `scripts/lint/test_build_shape.py`, `scripts/lint/test_sweep.py`, the memory tests — tests.
+- `scripts/buildlog/step_outputs_test_support.py`, `scripts/buildlog/test_step_outputs.py`, `scripts/lint/test_build_shape.py`, `scripts/lint/test_sweep.py` — tests; the support module and the reader tests are new. The memory tests that report-unit Phase 20 adds also import from it after that merge.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` owns the reader module, `build_shape.py`, `sweep.py` and `memory.py`.
@@ -1767,3 +1745,37 @@ The rejected texts and the reviewer's suggested rewrites are in the resources ru
 - `scripts/lint/test_build_shape.py`, `scripts/lint/test_sweep.py` and the memory tests pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
 - The reader's CPU time on natedev, before and after, is in the checkpoint notice. A floor-only dry run on natedev stays under 30 s.
 - Change-Review line: none — internal reader structure; sweep and memory behavior do not change.
+
+### Phase 65 — The floor takes evidence from target-folder override rows that the fixed recorder wrote  · status: todo
+**Depends on:** Phase 64 (the reader and sweep's rule move there); report-unit Phase 19 (`2ae242c18`) on `origin/builds`. Do not merge report's branch; start only when `git merge-base --is-ancestor 2ae242c18 origin/builds` succeeds.
+
+#### Work Order
+
+**Goal:** a step row whose argv sets its own target folder gives the floor evidence when the fixed recorder wrote it.
+
+**Measured (report-unit message, 2026-11-04):**
+- Since Phase 62, a row whose argv sets `--target-dir` or `--config …target-dir` gives sweep no evidence, because the recorder read Cargo metadata without the step's override (`scripts/buildlog/record.py` :925).
+- report-unit Phase 19 (`2ae242c18`) records those rows' pairs from Cargo metadata with the step's inputs, and skips a pair that differs from the captured target folder. Rows recorded before it stay wrong. Rows carry no recorder version.
+
+**Spec:**
+1. Find the time from which every recorded row comes from the fixed recorder: the time `2ae242c18` reached natedev's installed `~/.claude`. Read it from git, not by hand, and keep it in one named place.
+2. In sweep's rule (after Phase 64, sweep applies its own rule to the row facts): for a row recorded at or after that time, the target-folder check alone decides, and the argv override skip does not apply. An older override row still gives no evidence.
+3. Give the row time to sweep as a row fact from the reader, if the reader does not return it yet.
+
+**Constraints from prior phases:**
+- Keep the Phase 62 protections: a target with no recorded evidence is `NoRecordedEvidence` and is never deleted or a floor holder; an absolute `target_folder` that differs from `target_directory` gives no evidence; an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>`.
+- The current rule is safe; it only loses evidence. This phase must not make any old row give evidence.
+
+**Files:**
+- `scripts/buildlog/step_outputs.py` — the row time as a row fact.
+- `scripts/lint/sweep.py` — the override rule by row time.
+- `scripts/buildlog/test_step_outputs.py`, `scripts/lint/test_sweep.py` — tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `step_outputs.py` and `sweep.py`.
+- `test` owns the tests.
+
+**Acceptance gate:**
+- Tests prove, with a fixture index: an override row recorded at or after the cut gives evidence when its target folder matches; the same row recorded before the cut gives none; a row whose target folder differs gives none on both sides of the cut.
+- `scripts/buildlog/test_step_outputs.py` and `scripts/lint/test_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
+- Change-Review line: none — the floor finds more recorded targets; nothing the user sees changes.
