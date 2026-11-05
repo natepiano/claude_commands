@@ -8,13 +8,14 @@
 - **Project:** `~/.claude` scripts — the agent tooling.
 - **Project started:** 2026-11-02T13:25:43.957+00:00
 - **Stack:** Python 3.11+ through the `scripts/lib/py` shim, `unittest`, basedpyright; taplo 0.10.
-- **Source plan:** read its Delegation Context in `/home/natepiano/worktrees/claude-natedev-herdr/docs/plans/herdr-worker-panes.md`, mainly **Staff design (2026-10-31)**, **One identity join**, **No hard-coded config**, **Rerun-safe tools**, **One file writer** and **Isolation gate**. They apply to every phase here unchanged.
+- **Source plan:** read its Delegation Context in `docs/plans/herdr-worker-panes.md` in this checkout, mainly **Staff design (2026-10-31)**, **One identity join**, **No hard-coded config**, **Rerun-safe tools**, **One file writer** and **Isolation gate**. They apply to every phase here unchanged.
 - **Files this unit holds:** none beyond each phase's Files list. The 3k and Phase 4 hold on `staff_sources.py` and `staff_test_support.py` ended with those phases; devtools 3t edits `staff_test_support.py` (2026-11-05).
 - **Landing:** each phase lands alone through its own gate.
 - **Order (sdlc, 2026-11-02):** Phase 4 is on the rename path (devtools-unit's 3t waits for it); 3k is needed only before herdr 4c. When herdr-unit's 4h merges into `sdlc`, Phase 4 goes ahead of whatever is left of 3k.
 - **Test:** `env -u STAFF_OPERATION_FD -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --tests-only --checkout <tree>`, run from `~/.claude` main's copy after a merge of `origin/sdlc`.
 - **Lint:** `basedpyright <changed Python files> <every caller module of a changed file>`; pass is `0 errors, 0 warnings`.
 - **The four sdlc lines (2026-10-30):** good engineering first; no copies; when many things break the same way, the copy is the cause; fix at the cause.
+- **No unasked guards (user via sdlc, 2026-11-05):** add no guard, refusal or check that the Work Order did not ask for. A fix for a broken guard deletes the guard.
 
 ## Phases
 
@@ -242,6 +243,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 4. Do not edit the resume command: `resume_worker_command`, `_resume_task` and the fallback sentence belong to devtools-unit 3t.
 5. Delete the code this makes dead in the move's worker path. Keep `unit_runs.held` for its other caller (`unit_lookup.py:279`).
 6. Unexpected cases print one `anomaly:` line and continue (staff spec section 4).
+7. Carry the three results as one semantic type with variants Resumable, Idle and Unavailable, from `inventory.py` to the message text. `PausedSeat` (`inventory.py:812`) has required run fields and a `turn_live` Boolean, so it cannot hold an Unavailable child.
 
 **Files:**
 - `scripts/shutdown/stop_resume.py` — the workers line of the move (shutdown-unit's file, agreed).
@@ -254,7 +256,8 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 **Constraints from prior phases:**
 
 1. 3q: `stop_resume.release_source` and `ReleaseSource` stay as 3q left them; F007's `stop` deadline merges beside them.
-2. devtools-unit 3t owns the resume command's switch to `assign.sh`.
+2. devtools-unit 3t owns the resume command's switch to `assign.sh`. Keep one owner for each edit when 3s and 3t both edit `resume_message.py`.
+3. 5a: an agent start removes the operation snapshot with `models_registry.agent_environment` (Python) or the `models_config.sh` shell function. Keep that at every start this phase touches.
 
 **Acceptance gate:**
 
@@ -269,6 +272,8 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 **Owner:** models-unit. 3p Milestone 2 (Spec items 10-11) moved here so that 3p could land Milestone 1.
 
 **Depends on:** 3p, 3q, 5a, and the devtools one-launch-path change (assign.sh starts a Claude worker). sdlc tells models-unit when it lands. The proofs run on the final launcher code; a later launcher edit repeats the affected proof.
+
+**Order (sdlc, 2026-11-05):** "Start 3r item 7 now. Run the live switch proofs after I tell you the devtools main hash." Devtools hash 37faa1a05 removes the Codex-only exit at `assign.py:206`.
 
 #### Work Order
 
@@ -303,6 +308,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 1. 3q lands first; both phases edit the switch code.
 2. Live proofs use a throwaway fixture unit and never the live roster of a real unit.
+3. 5a: `codex_mesh.py` launch functions take a `models_registry.LaunchModelConfiguration` (`codex_mesh.py:6802`), and each later submission reads a fresh one. A fresh read runs catalog sync first; an inherited snapshot does not. Agent starts remove the operation variables after the environment loads. Item 7 keeps these, and the 5a lifetime and environment tests stay green.
 
 **Acceptance gate:**
 
@@ -313,113 +319,30 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 ### Phase 5a — Bash reads the resolved model registry in one call  · status: done
 
-**Owner:** models-unit (user via natedev and sdlc, 2026-11-03: "going forward herdr should not own changes to /default_models - it should be owned by the models unit under sdlc"). models-unit owns `commands/default_models.md`, `scripts/agents/default_models.sh`, `models_config.sh`, `sync_codex_catalog.sh`, `scripts/lib/models_registry.py` and `config/models.conf`.
+#### As-built
 
-**Depends on:** 3o and 3q. It does not wait for 3p; it waits for 3q because both edit `codex_mesh.py` and `workers.py`.
-
-**Order:** after 3o. It runs beside herdr Phase 7 when no file overlaps; it never delays 3n or 3o.
-
-#### Work Order
-
-**Goal:** Read the model registry once for each launch operation. Give every reader parsed values from that same read.
-
-**Spec:**
-
-1. Make `models_registry.py shell` read the registry through `registry_path()`.
-2. Return the selected path, exact source text, and parsed section, key, and value arrays from one read.
-3. Preserve empty sections, row order, comments, and editor source text.
-4. Quote generated Bash values safely.
-5. Remove default registry-path selection from `models_config.sh` and `sync_codex_catalog.sh`.
-6. Make Bash lookups compare parsed keys; remove raw registry-row parsing.
-7. Replace both registry-reading awk parsers in `sync_codex_catalog.sh` with parsed-value reads.
-8. Preserve transformations that produce edited text through the existing publication writer.
-9. Define a `LaunchModelConfiguration` lifetime of one launch or assignment operation.
-10. Share that configuration across implementation, review, allocation, and thread creation within the same operation.
-11. Acquire a fresh configuration for the next launch, including the next launch in a long-running process. Within one running launcher, each later submission (continuation, capacity retry, resident wake) also acquires a fresh configuration; the wake test at `test_codex_mesh.py:5317` requires a changed tier there. Today `codex_mesh.py:6151` resolves settings for each submission.
-12. Define a `RegistryEditBase` lifetime of one editor operation.
-13. Give editor validation and transformation the exact text and values from that same base.
-14. Preserve the existing locked delta replay against concurrent edits.
-15. Define `unit_effort.py`'s read lifetime as one command invocation.
-16. Cover `implement.sh`, `review.sh`, `assign.py`, `workers.py`, `codex_mesh.py`, `unit_effort.py`, and `agent_exec.sh`.
-17. Count registry snapshot reads across child processes, not only within one shell.
-18. Treat catalog synchronization as a separate edit operation before the launch snapshot.
-19. Preserve task resolution, caller-family behavior, overrides, effort validation, and service tiers.
-20. Make the retired-name check detect sentence punctuation, including `Use /agent.`.
-21. Change publication commit subjects and temporary prefixes from `agents` to `models`.
-22. Use semantic types for command configuration, edit bases, and domain absence states.
-23. Extend the existing parser and fixture tests; do not create a second parser.
+- `scripts/lib/models_registry.py` is the one registry parser. It reads the registry once for each operation: `launch_configuration` gives a `LaunchModelConfiguration` for one launch or assignment, and `edit_base` gives a `RegistryEditBase` for one editor operation. The path comes from `registry_path()`; an explicit `--registry` argument wins over `MODELS_CONFIG_FILE`.
+- A fresh read runs catalog sync first: `_snapshot(..., synchronize=True)` calls `_sync_catalog` only in its fresh branch. A child process inherits the encoded snapshot from `MODELS_LAUNCH_CONFIGURATION` or `MODELS_REGISTRY_EDIT_BASE` and never syncs. A sync failure prints `WARNING: Codex catalog sync failed; using the current model registry.` to stderr and continues.
+- `models_registry.py shell` emits quoted Bash arrays of section, key and value from one read, with the exact source text, empty sections, row order and comments. Bash lookups compare parsed keys. `models_config.sh` and `sync_codex_catalog.sh` have no own path selection and no awk parser.
+- `codex_mesh.py`, `workers.py`, `assign.py`, `implement.sh`, `review.sh`, `unit_effort.py` and the `progress_history.py` configuration digest take one configuration per operation. Each later submission of one launcher (continuation, capacity retry, resident wake) reads a fresh configuration.
+- Every agent start ends the operation: `models_registry.agent_environment` (Python) and one `models_config.sh` function (shell) remove both operation variables.
+- Publication commit subjects and temporary prefixes use `models`. The retired-name check catches sentence punctuation, such as `Use /agent.`.
 
 **Files:**
-- `scripts/lib/models_registry.py`
-- `scripts/agents/models_config.sh`
-- `scripts/agents/default_models.sh`
-- `scripts/agents/sync_codex_catalog.sh`
-- `scripts/agents/agent_exec.sh`
-- `scripts/agents/codex_mesh.py`
-- `scripts/direct/implement.sh`
-- `scripts/direct/review.sh`
-- `scripts/direct/assign.py`
-- `scripts/direct/workers.py`
-- `scripts/production/unit_effort.py`
-- `scripts/direct/progress_history.py` — its configuration digest reads the launch configuration, not the file
-- `commands/default_models.md`
-- `config/models.conf`
-- `scripts/lib/test_models_registry.py`
-- `scripts/lib/test_models_registry_fixture.py`
-- `scripts/lib/test_models_registry.sh`
-- `scripts/agents/test_models_config.sh`
-- `scripts/agents/test_sync_codex_catalog.sh`
-- `scripts/agents/test_models_conf_publish.py`
-- `scripts/agents/test_no_old_model_names.py`
-- `scripts/agents/test_agent_exec.py`
-- `scripts/agents/test_codex_mesh.py`
-- `scripts/direct/test_implement_launcher.py`
-- `scripts/direct/test_review_launcher.py`
-- `scripts/direct/test_assign_launcher.py`
-- `scripts/direct/test_assign_launcher_identity.py`
-- `scripts/direct/test_assign_launcher_reuse.py`
-- `scripts/direct/test_assign_launcher_review.py`
-- `scripts/direct/assign_launcher_test_support.py`
-- `scripts/direct/test_workers.py`
-- `scripts/production/test_unit_effort.py`
+- `scripts/lib/models_registry.py` — the parser, operation snapshots, the catalog sync trigger and `agent_environment`.
+- `scripts/agents/models_config.sh` — Bash reads through the parsed arrays; the operation strip function.
+- `scripts/agents/sync_codex_catalog.sh` — parses under the `sync.lock` folder and publishes through `store_registry`.
+- `scripts/agents/codex_mesh.py`, `scripts/direct/workers.py`, `scripts/direct/assign.py`, `scripts/direct/implement.sh`, `scripts/direct/review.sh`, `scripts/production/unit_effort.py`, `scripts/direct/progress_history.py` — one configuration per operation.
+- `scripts/lib/staff.py`, `scripts/accounts/accounts.py`, `relaunch.py`, `send.py`, `berth_fix/launch.sh`, `nix_env.py`, `cli_agent.sh`, `agent_exec.sh`, `agent_bg.sh`, `notify/review.py` — agent starts that remove the operation variables.
+- `scripts/lib/test_models_registry_fixture.py` — the sync-order test (fresh, stale, inherited and current state).
 
-**Workers:** `1 writer + 1 tester`
+**Binds later work:** `codex_mesh.py`, `implement.sh`, `workers.py` and `assign.py` read the registry through `models_registry.launch_configuration`; keep one configuration per launch. A set `MODELS_REGISTRY_EDIT_BASE` means no sync, because the sync lives in the fresh branch of `_snapshot` (`models_registry.py:70`). Agent starts in `resume_message.py` and `stop_resume.py` keep `agent_environment`. The repair-sensitive tests for `workers.resolve` reuse, the `default_models.sh` write path and the `sync.lock` folder belong to the 5a follow-ups phase.
 
-`impl` — Own the source and command files above; the shared interface is in `models_registry.py`.
-
-`test` — Own the listed test files; measure snapshot reads across complete launch paths and child processes.
-
-**Constraints from prior phases:**
-
-1. Follow the Delegation Context and preserve Phase 3o's staff and lifecycle behavior.
-2. Start after Phase 3o lands because both phases change shared launch files.
-3. Run beside herdr Phase 7 only when file ownership does not overlap.
-4. Keep `MODELS_CONFIG_FILE`, `AGENTS_CALLER_FAMILY`, and `AGENTS_CALLER_ASSIGNMENT`.
-5. Keep one parser and the existing atomic publication writer.
-6. Preserve concurrent row replay, additive catalog changes, and unrelated edits.
-7. Add no fallback to retired paths or variable names.
-8. Store no persistent configuration cache.
-9. Extend existing fixtures and publication tests.
-10. Keep staff identity changes outside this phase.
-11. Overlap with 3q and devtools one-launch-path: 5a starts after 3q lands. Serialize edits to `codex_mesh.py`, `assign.py` and `implement.sh` with the devtools launcher change. 3r's live switch proofs run on the combined result.
-12. `implement.sh` runs worker admission before it records a pass (3o merge).
-
-**Acceptance gate:**
-
-1. Test default and overridden registry paths through the Python path resolver.
-2. Test spaced rows, empty sections, comments, and quoted shell content.
-3. Prove that `direct = codex` resolves identically in Python and Bash.
-4. Prove one registry snapshot read for each complete launch operation, including allocation and thread creation.
-5. Prove that a registry edit during launch cannot mix configuration generations.
-6. Prove that the next launch reads the changed registry. Change the registry between submissions of one launcher (continuation, capacity retry, resident wake) and prove each submission uses one matching model, effort and tier.
-7. Prove that one editor read supplies matching exact text and parsed values.
-8. Preserve concurrent publication and additive catalog tests.
-9. Prove that `Use /agent.` fails the retired-name check.
-10. Assert `models` publication subjects and temporary prefixes.
-11. Pass affected Python and shell suites, including `test_implement_launcher_claude_accounts.py`, `test_implement_launcher_claude_follow.py` and `test_implement_launcher_follow.py`.
-12. Pass basedpyright with zero errors and warnings on changed Python files and caller modules.
-13. Pass the Delegation Context merge gate.
-14. Give herdr-unit the checkpoint hash for routed findings F002, F003, F004, F006, and F008.
+**Gotchas:**
+- `nix_env.exec` restores environment variables in `ensure()`, so the strip runs after it.
+- A test that makes fresh reads needs temporary catalog state and source files with fixed `os.utime` values, with the state newer than the sources. Otherwise every fresh read starts a live sync.
+- Isolated test copies take the whole `scripts/lib` folder with `shutil.copytree`, not a list of file names.
+- A merge that takes one side of a whole file drops this phase's fixture; use `git merge-file --theirs` for the conflict hunk only.
 
 ### Phase 5b — 5a follow-ups: tests that fail without the simplify repairs  · status: todo
 
@@ -427,26 +350,36 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 **Depends on:** 5a.
 
+**Order (models-unit, 2026-11-05):** starts when 3r item 7 lands, because both edit `test_codex_mesh.py`.
+
 #### Work Order
 
 **Goal:** Each 5a simplify repair has a test that fails when the repair is reverted.
 
 **Spec:**
 
-1. F005: A test proves that worker reuse in `codex_mesh.py` reads the registry zero times when the launch already holds a configuration.
-2. F007: The registry-read count test drives the editor path in `default_models.sh` with `MODELS_REGISTRY_EDIT_BASE` set, not `--check`. It proves the catalog sync gate does not run inside an edit.
-3. F009: A test proves that `sync_codex_catalog.sh` parses the registry only after it holds the publication lock.
-4. Revert each repair in a scratch copy and record that its test fails. Restore the repair.
+1. F005: A test proves that worker reuse reads the registry zero times. `workers.resolve` returns a reused worker at `workers.py:519`, before it acquires a configuration at `workers.py:540`. Test the reuse path with no inherited snapshot, so a read moved before line 519 fails the test.
+2. F007: The registry-read count test drives the `default_models.sh` write path (not `--check`) with `MODELS_REGISTRY_EDIT_BASE` set and stale catalog sources. It proves no catalog sync runs inside an edit. The sensitivity revert targets the inherited-snapshot branch of `models_registry._snapshot` (`models_registry.py:70`); `models_config.sh` has no sync gate now.
+3. F009: A test proves that `sync_codex_catalog.sh` parses the registry only after it holds the catalog synchronization lock (the `sync.lock` folder, `sync_codex_catalog.sh:64`). Run it in write mode: `--check` takes no synchronization lock.
+4. A test proves that a failed catalog sync prints `WARNING: Codex catalog sync failed; using the current model registry.` to stderr and returns the current configuration (`models_registry.py:108`). The fixture sync script exits nonzero.
+5. Revert each repair in a scratch copy and record that its test fails. Restore the repair.
 
 **Files:**
 - `scripts/agents/test_codex_mesh.py`
+- `scripts/direct/test_workers.py`
 - `scripts/agents/test_models_config.sh`
 - `scripts/agents/test_sync_codex_catalog.sh`
+- `scripts/lib/test_models_registry_fixture.py`
 
 **Workers:** `1 tester`
 
+**Constraints from prior phases:**
+
+1. 5a: a fresh `launch_configuration` or `edit_base` read runs catalog sync first; an inherited snapshot never does. Tests that make fresh reads set `CODEX_CATALOG_SYNC_STATE_FILE`, `CODEX_CONFIG_FILE` and `CODEX_MODELS_CACHE_FILE` to temp paths with fixed `os.utime` values, as `test_codex_mesh.py` `setUpModule` does.
+
 **Acceptance gate:**
 
-1. Each new test passes on the 5a tree and fails with its repair reverted. The summary quotes each failing assertion.
-2. Pass the three affected suites.
-3. Pass the Delegation Context merge gate.
+1. Each new test from items 1-3 passes on the 5a tree and fails with its repair reverted. The summary quotes each failing assertion.
+2. The item 4 test passes and covers the warning text and the returned configuration.
+3. Pass the five affected suites.
+4. Pass the Delegation Context merge gate.
