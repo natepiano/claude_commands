@@ -1008,6 +1008,13 @@ class RosterTests(unittest.TestCase):
             roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
 
+    def test_a_roster_build_reads_the_role_log_once(self) -> None:
+        with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
+            entries = self._entries()
+
+        self.assertGreater(sum(entry.role == "worker" for entry in entries.values()), 1)
+        self.assertEqual(read.call_count, 1)
+
     def test_mesh_assignment_states_come_from_records_and_not_names(self) -> None:
         self._write_mesh(self.director_run, {
             "arbitrary": {"thread_id": "c11994bc-45da-585c-bb8c-b9aa62be4800", "status": "done", "role": "impl"},
